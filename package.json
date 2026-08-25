@@ -37,6 +37,7 @@
     "verify:queue": "node scripts/verify-queue.mjs",
     "verify:bug-129": "node scripts/verify-bug-129-queue-durability.mjs",
     "verify:bug-149": "node scripts/verify-bug-149-live-elsewhere.mjs",
+    "verify:bug-153": "node scripts/verify-bug-153-detached-status-truth.mjs",
     "verify:detach": "node scripts/verify-detach.mjs",
     "verify:reload-live": "node scripts/verify-reload-live.mjs",
     "verify:agent-summary": "node scripts/verify-agent-summary.mjs",

@@ -226,7 +226,8 @@ const state = {
   // most-honest label by priority.
   sessPhase: 'thinking',
   sessReconnecting: false, // a resume's connect() is in flight — transport down, work status unknown
-  sessDetached: false,     // this session is running server-side without THIS tab driving it
+  // BUG-153: there is no `sessDetached` flag. "Running server-side without THIS
+  // tab driving it" is DERIVED — see isDriving() and computeSessState().
   sessError: null,         // last fatal/budget-stop message; cleared when a new turn starts
   // BUG-031 — the last TERMINAL provider-error event of the current turn
   // (kind/provider/detail/retryable…), so turn-end can label the ending with
@@ -4115,7 +4116,6 @@ async function openSession(p, sess, opts = {}) {
   state.sessError = null;
   state.provError = null; // BUG-031: nor its provider-error attribution
   state.lastTurnPrompt = null;
-  state.sessDetached = false;
   state.sessReconnecting = false;
   // BUG-079: the outgoing session's pending-delivery pointers (drain-wait
   // self-retry, force-send stash) and their live timers must not act on this
@@ -4243,12 +4243,17 @@ async function openSession(p, sess, opts = {}) {
       if (liveRec.drivenByDashboard) {
         // A dashboard bridge (detached after this or another tab looked away):
         // reattachable, and busy is knowable on a new-enough server.
+        /*
+         * FEAT-040: genuinely "detached (running headless)" — the server-side
+         * bridge is busy but THIS tab is not driving it (no `start`/resume sent
+         * yet). BUG-153: this used to ALSO raise `state.sessDetached`, a second
+         * flag saying the same thing that any later socket open then cleared
+         * while this one survived. `followingLive` is the durable half — it is
+         * cleared where it is actually resolved: by the `start` ack that makes
+         * us the driver, by refreshLive when the run really ends, and at the
+         * session boundary — so the status now derives from it and liveness.
+         */
         state.followingLive = true;
-        // FEAT-040: genuinely "detached (running headless)" — the server-side
-        // bridge is busy but THIS tab is not driving it (no `start`/resume
-        // sent yet). Distinct from every attached-and-running state until a
-        // message is sent and the ack:start branch above resolves it.
-        state.sessDetached = true;
         if (liveRec.busy !== false) {
           // BUG-033: adopt the server's REAL turn start; if it does not report
           // one (older server, or a turn whose start this process never saw),
@@ -6124,6 +6129,36 @@ function settleDecisionFromResult(card, e) {
 
 /* -------------------------------------------------------------- websocket */
 
+/*
+ * BUG-153 — THE liveness predicate. One question, asked in one place: does this
+ * tab hold a socket it can actually drive this session over, right now?
+ *
+ * It exists because the status the user READ and the guard that REFUSED their
+ * action were computed from different things. computeSessState() decided
+ * "Claude is working" from `state.busy` alone and decided "running in the
+ * background" from `state.sessDetached` — an EVENT-set flag, raised on one
+ * reopen path and cleared by ANY socket open, including one belonging to a
+ * different session or to a `start` the server went on to refuse. Meanwhile
+ * forceSend/flushQueue/the interrupt button asked the honest question
+ * (`state.live && state.ws`). Two answers that could not be reconciled: a
+ * session presented as attached and working, over which nothing could be sent.
+ *
+ * So the flag is gone, and every one of those callers now reads this. They can
+ * disagree again only by someone re-deriving liveness somewhere else.
+ *
+ * Three clauses, each carrying its own case:
+ *  - `state.live` — a socket was opened and has not closed.
+ *  - `readyState === OPEN` — and it is not mid-close; `send()` already refuses
+ *    a CLOSING socket, so anything gated on this predicate must too.
+ *  - `!state.deliveryRelay` — FEAT-065's relay socket is open but holds NO
+ *    session: it exists only to carry approvals for a turn delivered into a
+ *    drain-held survivor. Sending over it earns "no session on this socket",
+ *    which is precisely the refusal this predicate exists to predict.
+ */
+function isDriving() {
+  return !!(state.live && state.ws && state.ws.readyState === WebSocket.OPEN && !state.deliveryRelay);
+}
+
 function connect() {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://${location.host}/ws`);
@@ -6134,7 +6169,6 @@ function connect() {
       state.closingOnPurpose = false;
       state.dropped = false;
       state.sessReconnecting = false;
-      state.sessDetached = false;
       state.budgetLocked = false;
       state.budgetLockReason = '';
       state.pendingSend = null;
@@ -6975,6 +7009,13 @@ function armBusyWatchdog(why) {
  * is deliberate: a down transport outranks everything (we cannot vouch for
  * what is happening behind it), an explicit error outranks routine busy-ness,
  * and only true silence — nothing running, nothing pending — reads as idle.
+ *
+ * BUG-153 added the rule that was missing under all of that: NO label may
+ * promise something this tab cannot do. "Thinking…"/"Responding…" describe a
+ * turn the user can interrupt, queue into and force-send over, so they are
+ * gated on actually holding the socket those three act on (isDriving()). Work
+ * that is running where we cannot reach it gets the label that says so, and
+ * says what to do about it.
  */
 const SESS_STATUS_META = {
   thinking: { label: 'Thinking…', hint: 'Claude is working — no reply text yet.' },
@@ -6988,7 +7029,21 @@ const SESS_STATUS_META = {
 function computeSessState() {
   if (state.sessReconnecting || state.dropped) return 'reconnecting';
   if (state.sessError) return 'error';
-  if (state.sessDetached && !state.live) return 'detached';
+  /*
+   * BUG-153 — detachment is DERIVED, never remembered. A tab that holds no
+   * driving socket is not steering this session, whatever flags a past event
+   * left behind, so it may never say "Claude is working": that label promises
+   * a turn this tab can interrupt, queue into and force-send over, and the
+   * guards on all three refuse in exactly this state. Either something IS
+   * running out there (`busy` from the reopen path, `followingLive` from a run
+   * we only watch) — and then "running in the background · send to take it
+   * over" is both true and the way out — or nothing is, and it is idle.
+   *
+   * `state.sessDetached` used to gate this line and was cleared by any socket
+   * open; the honest state then silently downgraded to "Claude is working"
+   * while force-send answered "no live session". See isDriving().
+   */
+  if (!isDriving()) return (state.busy || state.followingLive) ? 'detached' : 'idle';
   if (state.busy) return state.sessPhase === 'streaming' ? 'streaming' : 'thinking';
   return 'idle';
 }
@@ -7373,7 +7428,7 @@ function onEvent(e) {
         }
         // Driving it now (this socket sent `start` and got acked) — whatever
         // detached/reconnecting state applied before this is resolved.
-        state.sessDetached = false;
+        // (`followingLive` is cleared just above, for the same reason.)
         state.sessReconnecting = false;
         paintSessStatus();
         if (e.effective) {
@@ -7999,7 +8054,10 @@ function onEvent(e) {
 
     case 'session-closed':
       say(`session closed (${e.reason})`);
-      state.sessDetached = false;
+      // BUG-153: the run is over, so nothing is "running in the background"
+      // either — this is the third place `sessDetached` was cleared, and the
+      // follow flag now carries that meaning on its own.
+      state.followingLive = false;
       setBusy(false);
       state.turnStartedAt = 0;
       state.pendingSend = null;
@@ -8369,7 +8427,7 @@ function paintQueue() {
    * The drain-wait rows are the exception and are handled ABOVE: those DO have
    * a self-retry loop that reconnects, so "not driving" would understate them.
    */
-  const notDriving = !state.live || !state.ws;
+  const notDriving = !isDriving(); // BUG-153: the same predicate the chip and the guards read
   const why = !pending.length
     // BUG-149: name the affordance that now exists, instead of asking the user
     // to select text out of a textarea by hand.
@@ -8382,7 +8440,11 @@ function paintQueue() {
       : state.dropped
         ? 'connection dropped — reconnect, then these deliver at the next pause'
         : notDriving
-        ? 'this tab is not driving the session — send a message (or reconnect) and these go with the next turn'
+        // BUG-153: name the way out. The row now carries "To composer" in this
+        // state, and a way out nobody can see is the dead end this fixes — the
+        // user's account of it was "id need to remove msg from queue and send
+        // again", which is what a person does when the affordance is invisible.
+        ? 'this tab is not driving the session — send a message (or reconnect) and these go with the next turn, or put one back in the composer'
         : state.busy
           /*
            * BUG-130: this said "one per turn", which is what the queue did
@@ -8429,7 +8491,14 @@ function paintQueue() {
     // not at some later repaint that may never come.
     ta.addEventListener('input', () => { item.text = ta.value; persistQueue(); });
     const acts = el('div', { class: 'cacts' });
-    if (!item.dead) {
+    /*
+     * BUG-153 — force-send is offered only where it can actually run. It is
+     * gated on the SAME predicate forceSend() itself refuses on, because the
+     * button that answers "no live session to force-send over" is a button that
+     * should not have been there: the only action it can perform in that state
+     * is to tell the user it cannot act.
+     */
+    if (!item.dead && isDriving() && !state.dropped) {
       // FEAT-031 Part A — unmistakably distinct from the normal queue (which
       // waits): this INTERRUPTS whatever is running and delivers NOW. Reuses
       // the existing `.mini.danger` treatment (the app's one destructive-
@@ -8440,26 +8509,41 @@ function paintQueue() {
       force.title = 'Interrupt in-flight work and deliver this message right now';
       force.addEventListener('click', () => forceSend(item));
       acts.append(force);
-    } else {
-      /*
-       * BUG-149 — a dead row was a dead end: the only ways out were selecting
-       * the textarea by hand or Discard, so "recoverable" meant "retypeable in
-       * practice". One click puts the text back in the composer where the next
-       * Enter sends it. Explicit by design — the app never re-sends a refused
-       * message on the user's behalf (see handleLiveElsewhere).
-       */
-      const back = el('button', { class: 'mini', text: 'To composer' });
-      back.title = 'Put this text back in the composer to send it again';
-      back.addEventListener('click', () => {
-        node.prompt.value = node.prompt.value ? `${node.prompt.value}\n\n${item.text}` : item.text;
-        state.queue.splice(state.queue.indexOf(item), 1);
-        paintQueue();
-        autosize();
-        node.prompt.focus();
-        say('put back in the composer — press Enter to send it');
-      });
-      acts.append(back);
     }
+    /*
+     * BUG-149 — a dead row was a dead end: the only ways out were selecting
+     * the textarea by hand or Discard, so "recoverable" meant "retypeable in
+     * practice". One click puts the text back in the composer where the next
+     * Enter sends it. Explicit by design — the app never re-sends a refused
+     * message on the user's behalf (see handleLiveElsewhere).
+     *
+     * BUG-153 widened it from dead rows to EVERY row, because the state the
+     * user actually got stuck in produces a live one. Reload a tab that is not
+     * driving a still-running session and the queued text comes back as
+     * `restored` — not dead, so no way back — offering only a Force send that
+     * refuses. Reported verbatim: "if i reload page it still shows the message
+     * in queue instead of input field, then id need to remove msg from queue
+     * and send again". Deleting and retyping IS losing the message, just
+     * slowly, so the way back out is unconditional now: a row is the user's
+     * own words, and reclaiming your own words needs no precondition.
+     */
+    const back = el('button', { class: 'mini', text: 'To composer' });
+    back.title = 'Put this text back in the composer to send it again';
+    back.addEventListener('click', () => {
+      node.prompt.value = node.prompt.value ? `${node.prompt.value}\n\n${item.text}` : item.text;
+      state.queue.splice(state.queue.indexOf(item), 1);
+      // BUG-153: this row may be the drain-wait retry's in-flight attempt — the
+      // text is leaving the queue, so the attempt must not keep pointing at it
+      // (a stale pointer makes the next refusal read as "already retried" and
+      // drop it — BUG-079's Finding A, in miniature).
+      if (state.drainWaitAttempt === item) state.drainWaitAttempt = null;
+      if (!drainWaitItem()) disarmDrainWaitRetry();
+      paintQueue();
+      autosize();
+      node.prompt.focus();
+      say('put back in the composer — press Enter to send it');
+    });
+    acts.append(back);
     const drop = el('button', { class: 'mini x', text: 'Discard' });
     drop.addEventListener('click', () => {
       state.queue.splice(state.queue.indexOf(item), 1);
@@ -8489,7 +8573,8 @@ function flushQueue() {
   // FEAT-065: a delivery-relay socket has no session behind it — flushing into
   // it would bounce every row. Queued rows wait for the drain-wait retry loop
   // (or a real bridge) instead.
-  if (!state.live || !state.ws || state.busy || state.dropped || state.deliveryRelay) { paintQueue(); return; }
+  // BUG-153: one predicate — `isDriving()` already excludes the relay socket.
+  if (!isDriving() || state.busy || state.dropped) { paintQueue(); return; }
   // BUG-045: a drain-wait row whose self-retry is IN FLIGHT is that retry's to
   // deliver (or put back) — flushing it too would send the same text twice.
   const items = state.queue.filter((q) => !q.dead && q.text.trim() && q !== state.drainWaitAttempt);
@@ -8544,9 +8629,10 @@ function flushQueue() {
 function forceSend(item) {
   const idx = state.queue.indexOf(item);
   if (idx !== -1) state.queue.splice(idx, 1);
-  if (!state.live || !state.ws || state.dropped) {
+  if (!isDriving() || state.dropped) {
     // No socket to interrupt over — same honesty rule as the detached-run
-    // guard on the stop button: put it back rather than pretend to act.
+    // guard on the stop button, and BUG-153: the same predicate, so the chip
+    // beside the composer cannot claim a turn this refusal denies exists.
     if (idx !== -1) state.queue.splice(idx, 0, item); else state.queue.push(item);
     paintQueue();
     return say('no live session to force-send over — reattach first, then force-send again', true);
@@ -8910,12 +8996,23 @@ node.prompt.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void submit(); }
 });
 node.go.addEventListener('click', () => {
-  // Following a detached run we don't drive: there is no socket to interrupt
-  // over. Be honest — a message reattaches, and THEN it can be steered/stopped.
-  if (state.followingLive && !state.live) {
-    return say('this run is detached — send a message to reattach, then you can steer or interrupt it', true);
+  /*
+   * BUG-153: the refusal belongs to the STOP half of this button only. It used
+   * to be the first line, tested on `followingLive && !state.live`, so a
+   * detached run that was NOT busy refused to send the message it was in the
+   * same breath asking for — the button read "Send", the click answered "send
+   * a message to reattach". Now: interrupting needs a socket to interrupt
+   * over (the same predicate the chip and force-send read); sending never did,
+   * because sending is what creates one.
+   */
+  if (state.busy) {
+    if (!isDriving()) {
+      return say('this run is detached — send a message to reattach, then you can steer or interrupt it', true);
+    }
+    send({ type: 'interrupt' });
+    say('interrupting…');
+    return;
   }
-  if (state.busy) { send({ type: 'interrupt' }); say('interrupting…'); return; }
   void submit();
 });
 $('#forkBtn').addEventListener('click', () => {
@@ -12483,7 +12580,10 @@ async function boot() {
     addProject,
     // FEAT-040: session-status ground truth, for verify scripts to assert
     // against without re-deriving the priority rules themselves.
-    computeSessState, paintSessStatus,
+    // BUG-153: `isDriving` alongside them, so a script can assert the CHIP and
+    // the GUARDS agree — the property whose absence was the bug — rather than
+    // testing each half against its own idea of liveness.
+    computeSessState, paintSessStatus, isDriving,
     // BUG-075: the crown/seal renderer, so a verify script can drive it against
     // a container vs direct project and assert the "+ Add mount" chip is gated
     // on isolation (same ground truth as the Direct/Container chip beside it).

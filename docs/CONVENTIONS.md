@@ -299,6 +299,15 @@ above). If you must use the shim `grep`, confirm a suspicious empty result again
 `rg` or `/usr/bin/grep -a` before concluding "absent" — a silent empty is a tool
 skip until proven otherwise. See BUG-103 for the reproduction and remedies.
 
+**Who this rule is addressed to (FEAT-096, 2026-08-25).** A DISPATCHED LANE, which
+is what does content hunts. The orchestrating session cannot follow it: with the
+orchestrator profile enabled — which it now is on every project — `rg`, `grep`,
+`cat` and friends are refused for the main thread, and the refusal names
+dispatching as the way through. That is not a conflict between the two rules, it is
+the division of labour they both assume: the orchestrator dispatches the hunt, the
+lane runs `rg` and reports. If you are the orchestrator and you find yourself
+reaching for this rule, the rule you actually want is the working agreement's §I.
+
 ## Git — never put an identity on a commit command line (BUG-148, 2026-08-25)
 
 `git -c user.email=… -c user.name=… commit`, `--author=…`, and `GIT_AUTHOR_EMAIL` /

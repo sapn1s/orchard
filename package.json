@@ -48,6 +48,7 @@
     "verify:browser": "node scripts/verify-browser.mjs",
     "verify:arch-007": "node scripts/verify-arch-007-lazy-browser.mjs",
     "verify:browser-close": "node scripts/verify-browser-close-command.mjs",
+    "verify:bug-151": "node scripts/verify-bug-151-playwright-first.mjs",
     "verify:bug-118": "node scripts/verify-bug-118-orchard-only-stop-hook.mjs",
     "verify:live": "node scripts/verify-live.mjs",
     "verify:snapshots": "node scripts/verify-snapshots.ts",
@@ -98,6 +99,7 @@
     "verify:bug-032-sidebar-wheel": "playwright test scripts/qa/BUG-032-sidebar-scroll-wheel.spec.ts",
     "verify:boot-aware": "node scripts/verify-boot-aware.mjs",
     "verify:template-readthrough": "node scripts/verify-template-readthrough.mjs",
+    "verify:feat-096-template-refresh": "node scripts/verify-feat-096-template-refresh.mts",
     "verify:pattern-templates": "node scripts/verify-pattern-templates.mjs",
     "verify:local-conventions": "node scripts/verify-local-conventions.mjs",
     "verify:wa-injected": "node scripts/verify-wa-injected.mjs",
@@ -231,7 +233,10 @@
     "verify:feat-097": "node scripts/verify-feat-097-board-tool.mjs",
     "verify:orchestrator-enforcement": "node scripts/verify-orchestrator-enforcement.mjs",
     "verify:orchestrator-enforcement-e2e": "node scripts/verify-orchestrator-enforcement-e2e.mts",
-    "verify:orchestrator-profile-registry": "node scripts/verify-orchestrator-profile-registry.mts"
+    "verify:orchestrator-profile-registry": "node scripts/verify-orchestrator-profile-registry.mts",
+    "verify:feat-096-fleet": "node scripts/verify-feat-096-fleet-enabled.mts",
+    "verify:feat-096-read-escapes": "node scripts/verify-feat-096-read-escapes.mjs",
+    "verify:feat-096-live-sessions": "node scripts/verify-feat-096-live-sessions.mts"
   },
   "keywords": [],
   "type": "module",

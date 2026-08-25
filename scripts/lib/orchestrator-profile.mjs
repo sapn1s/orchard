@@ -341,19 +341,116 @@ const EXEC_VERBS = new Set([
 ]);
 
 /**
+ * ARGUMENT rules for heads that are allowed but can be TALKED INTO A READ.
+ *
+ * FOUND LIVE, NOT IMAGINED (FEAT-096 phase 3). With the profile enabled on this
+ * repo's own project, a session was refused `ls -1 <repo>` and — with nobody
+ * suggesting it — came back with:
+ *
+ *   node -e "const f=require('fs').readdirSync('<repo>');console.log(f.join(' '))"
+ *
+ * and read the tree anyway. That is attack §3's escape channel again: deciding
+ * on the command HEAD alone is not enough when the head takes code as data.
+ * `node -e`, `npx <anything>`, `npm exec`, `docker run … cat`, `systemctl cat`,
+ * `curl file://` and `cp <file> /dev/stdout` are all `cat` wearing an allowed
+ * name.
+ *
+ * MEASURED BEFORE TIGHTENING, against the real transcript corpus (239 Bash
+ * calls since 2026-08-18), so this is a cost that was checked rather than
+ * assumed: `npx` 0, `npm exec` 0, `curl file://` 0, `docker run|exec|cp` 0,
+ * `systemctl cat` 0, `cp|mv` to a std stream 0 — and the only two real `node -e`
+ * calls in the whole corpus were THE ESCAPE ABOVE. Everything the orchestrator
+ * actually does with these heads keeps working: `systemctl --user show|status|
+ * list-units`, `docker ps`, `curl http://127.0.0.1:…`, `npm run gate`,
+ * `node scripts/leak-gate.mjs`.
+ *
+ * Each rule returns an offender string to refuse with, or null to allow. They
+ * are applied at EVERY pipeline stage, like EXEC_VERBS, because a filter stage
+ * that can eval is a filter stage that can read.
+ */
+
+/** Words that make `node` an evaluator rather than a script runner. */
+const NODE_EVAL_FLAG = /^(?:-{1,2}(?:e|p|print|eval)(?:=.*)?|-[A-Za-z]*[ep][A-Za-z]*|--input-type(?:=.*)?)$/;
+/** A word that looks like the script `node` was asked to run. */
+const SCRIPT_ARG = /\/|\.[cm]?[jt]sx?$/;
+/** Destinations that turn a copy into a print. */
+const STD_STREAM = /^(?:\/dev\/(?:stdout|stderr|fd\/)|\/proc\/self\/fd\/)/;
+
+/**
+ * `systemctl`/`docker`/`npm` subcommand: the first argument that is not a flag.
+ *
+ * Deliberately does NOT try to skip a flag's VALUE. The first draft did, and it
+ * read `systemctl --user cat <unit>` as "`--user` takes the value `cat`" and
+ * allowed a unit-file dump straight through. Every real invocation in the
+ * corpus puts the subcommand before any value-taking flag
+ * (`systemctl --user show <unit> -p X --value`, `docker ps --filter name=…`,
+ * `npm run gate`), so the simpler rule is both correct on the real traffic and
+ * safe in the direction it errs.
+ */
+function subcommandOf(words) {
+  return words.slice(1).find((w) => !w.startsWith('-')) ?? '';
+}
+
+const DOCKER_STATUS_SUBCOMMANDS = ['ps', 'images', 'image', 'inspect', 'stats', 'version', 'info', 'top', 'port'];
+
+const ENFORCE_HEAD_ARG_RULES = {
+  node(words) {
+    if (words.some((w) => NODE_EVAL_FLAG.test(w))) return 'node -e';
+    const args = words.slice(1);
+    if (args.some((w) => !w.startsWith('-') && SCRIPT_ARG.test(w))) return null;
+    if (args.length && args.every((w) => w === '--version' || w === '-v')) return null;
+    // No script to run: a REPL, a `node -`, or a heredoc-fed program. The
+    // heredoc body is cut off as DATA before this point, so without this the
+    // whole program would be invisible to the policy.
+    return 'node (stdin)';
+  },
+  npm(words) {
+    const sub = subcommandOf(words);
+    return sub === 'exec' || sub === 'x' ? `npm ${sub}` : null;
+  },
+  npx: () => 'npx',
+  docker(words) {
+    const sub = subcommandOf(words);
+    return sub && !DOCKER_STATUS_SUBCOMMANDS.includes(sub) ? `docker ${sub}` : null;
+  },
+  systemctl(words) {
+    const sub = subcommandOf(words);
+    return sub === 'cat' ? 'systemctl cat' : null;
+  },
+  curl(words) {
+    return words.some((w) => w.includes('file://')) ? 'curl file://' : null;
+  },
+  cp(words) { return words.slice(1).some((w) => STD_STREAM.test(w)) ? 'cp to a std stream' : null; },
+  mv(words) { return words.slice(1).some((w) => STD_STREAM.test(w)) ? 'mv to a std stream' : null; },
+};
+
+/**
  * The command head of one shell segment: the first bare word that is neither an
  * environment assignment nor a shell keyword. Returns '' when the segment holds
  * no command (trailing separators and bare `fi`/`done` are common and are not
  * commands).
  */
 export function bashSegmentHead(segment) {
+  return bashSegmentWords(segment)[0] ?? '';
+}
+
+/**
+ * The same segment, as the head followed by its ARGUMENTS — which is what the
+ * head-argument rules above need. Returned as one array (head at index 0) so
+ * there is exactly one place that decides where a segment's command begins;
+ * `bashSegmentHead` is now a view onto this rather than a second parser
+ * (ARCH-008 — a grammar implemented twice is two grammars).
+ */
+export function bashSegmentWords(segment) {
   const words = String(segment).trim().split(/\s+/).filter(Boolean);
   let i = 0;
   while (i < words.length && (ASSIGNMENT.test(words[i]) || SHELL_KEYWORDS.has(words[i]))) i++;
-  let head = words[i] ?? '';
+  const rest = words.slice(i);
+  if (!rest.length) return [];
   // A path-qualified invocation is still that command: /usr/bin/grep is grep.
+  let head = rest[0];
   if (head.includes('/') && !head.startsWith('-')) head = head.slice(head.lastIndexOf('/') + 1);
-  return head;
+  return [head, ...rest.slice(1)];
 }
 
 
@@ -478,10 +575,21 @@ export function decideBashCommand(command) {
   for (const pipeline of flattened.split(COMMAND_SPLIT)) {
     const stages = pipeline.split('|');
     for (let i = 0; i < stages.length; i++) {
-      const head = bashSegmentHead(stages[i]);
+      const words = bashSegmentWords(stages[i]);
+      const head = words[0] ?? '';
       if (!head) continue;
       // Re-entrant execution is refused at any depth.
       if (EXEC_VERBS.has(head)) return { allow: false, offender: head };
+      /*
+       * Head-argument rules are checked at EVERY stage too, for the same reason:
+       * `git status | node -e "…readFileSync…"` is a read, and its head sits in
+       * a filter position where stage-0 reasoning does not apply.
+       */
+      const argRule = ENFORCE_HEAD_ARG_RULES[head];
+      if (argRule) {
+        const offender = argRule(words);
+        if (offender) return { allow: false, offender };
+      }
       // Later stages are stdout filters; the read was already decided at stage 0.
       if (i > 0) continue;
       if (!ENFORCE_ALLOWED_BASH.includes(head)) return { allow: false, offender: head };

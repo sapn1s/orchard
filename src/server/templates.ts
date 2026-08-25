@@ -645,7 +645,12 @@ export function appendToSystemPrompt(
 /* ------------------------------------------------------------------ seeding */
 
 /**
- * Idempotent: seeds the two working-agreement docs if their files are absent.
+ * Idempotent: seeds the two working-agreement docs if their files are absent,
+ * and — FEAT-096 — REFRESHES the stored body of an already-seeded, still-
+ * source-backed seed when the source file has moved on (returned in
+ * `refreshed`). A template a user has detached or re-pointed is never rewritten;
+ * an unchanged body is a no-op (no write, no mtime churn); an unreadable source
+ * degrades to the stored copy for an existing template rather than throwing.
  *
  * FEAT-027: each seed now records `source` (relative to projectRoot()) in the
  * saved template's frontmatter, so readTemplate() resolves its body from the
@@ -665,9 +670,10 @@ export function appendToSystemPrompt(
  * template a user creates. They exist here purely so a new project can pick
  * a proven shape off the shelf instead of reinventing it.
  */
-export function seedTemplates(): { seeded: string[]; skipped: string[] } {
+export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshed: string[] } {
   const seeded: string[] = [];
   const skipped: string[] = [];
+  const refreshed: string[] = [];
   const seeds: (SaveTemplateInput & { sourceAbs: string })[] = [
     {
       id: 'working-agreement',
@@ -738,8 +744,67 @@ export function seedTemplates(): { seeded: string[]; skipped: string[] } {
   ];
   for (const s of seeds) {
     const id = safeId(s.id!);
-    if (fs.existsSync(fileFor(id))) {
-      skipped.push(id);
+    const file = fileFor(id);
+    if (fs.existsSync(file)) {
+      // FEAT-096: an already-seeded, source-backed template is no longer frozen
+      // forever. Refresh its STORED body from the source file it is (still)
+      // pointed at — but only when it is unambiguously THIS seed's own file, so
+      // a user who detached (`source` cleared) or re-pointed the template is
+      // never overwritten.
+      //
+      // The match is decided on the RESOLVED source (readTemplate().source),
+      // which folds in the DEFAULT_SEED_SOURCES read-through migration: the two
+      // pre-FEAT-027 Working Agreement seeds carry NO `source:` line on disk yet
+      // still resolve to their canonical repo path, and those must refresh too.
+      // A consequence of that same migration: for the two WA ids specifically,
+      // a deliberately-cleared `source:` re-adopts the default and so still
+      // matches here — but the read-through already serves the source body for
+      // those ids regardless, so aligning the stored body changes nothing a
+      // session ever sees. For every non-WA id (the four patterns) a cleared or
+      // re-pointed source is honored exactly.
+      try {
+        const existing = readTemplate(id);
+        if (!existing || !existing.source) {
+          skipped.push(id); // detached / not source-backed — leave it alone
+          continue;
+        }
+        const resolved = resolveSourcePath(existing.source);
+        if (!resolved || resolved !== s.sourceAbs) {
+          skipped.push(id); // re-pointed at a different source — leave it alone
+          continue;
+        }
+        if (existing.sourceMissing) {
+          skipped.push(id); // source unreadable — fail open, keep the stored copy
+          continue;
+        }
+        // `existing.body` is the fresh read-through source body. Rebuild the file
+        // preserving the curated frontmatter verbatim (including the literal
+        // `source:` line, or its absence for the pre-FEAT-027 WA seeds) and swap
+        // in the new body. Comparing the fully-serialized candidate against the
+        // current file is the churn-free no-op test: identical bytes → no write,
+        // no mtime bump; and it is self-consistent (a refreshed file re-serializes
+        // to itself, so it never churns on the next call).
+        const raw = fs.readFileSync(file, 'utf8');
+        const { meta } = parseFrontmatter(raw);
+        const candidate = serialize({
+          name: meta.name || id,
+          defaultMode: meta.defaultMode === 'replace' ? 'replace' : 'append',
+          living: meta.living === 'true',
+          description: meta.description ?? '',
+          body: existing.body,
+          source: meta.source && meta.source.trim() ? meta.source.trim() : undefined,
+        });
+        if (candidate === raw) {
+          skipped.push(id); // stored body already current — nothing to do
+          continue;
+        }
+        writeAtomic(file, candidate);
+        refreshed.push(id);
+      } catch {
+        // Any unexpected error refreshing an EXISTING template degrades to the
+        // stored copy rather than taking down a server boot — fail open.
+        skipped.push(id);
+      }
       continue;
     }
     let body: string;
@@ -752,5 +817,5 @@ export function seedTemplates(): { seeded: string[]; skipped: string[] } {
     saveTemplate({ ...rest, body, source: path.relative(projectRoot(), sourceAbs) });
     seeded.push(id);
   }
-  return { seeded, skipped };
+  return { seeded, skipped, refreshed };
 }

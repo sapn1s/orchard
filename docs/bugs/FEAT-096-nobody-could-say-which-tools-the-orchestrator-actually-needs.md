@@ -1,6 +1,6 @@
 # FEAT-096 — nobody could say which tools the orchestrator actually needs
 
-- **Status:** IN-VERIFICATION — phase 2 built. The open decision below is ANSWERED (option A,
+- **Status:** IN-VERIFICATION — enforcement is now ENABLED on all 13 registry projects and verified per project (197/197 config, 12/13 in real sessions, containers included). Takes effect at the service's next restart: the running server predates the code. A live-session escape (`node -e`) was found and closed. Independent clean-room pass still required.
   and then some): enforcement is built, per-project and default-off. Needs an independent
   clean-room pass before VERIFIED — see the 2026-08-25 entry.
 - **Severity:** low (it blocks nothing and changes no behaviour; it only records)
@@ -110,6 +110,13 @@ No workflow service, no gateway, no attestation runner, no signing authority. No
 this is a profile plus a log.
 
 ## Decision — leave the recorder running, or revert it?
+
+> **CLOSED 2026-08-25 — A, leave it recording.** Answered via the ticket view and acted on by
+> the phase-3 lane: the `PreToolUse` recorder block in `.claude/settings.json` stays exactly as
+> it is, nothing was reverted, and the log keeps accumulating toward the A-E1 finding. The
+> question below is kept verbatim as the record of what was asked; it is not open. The same
+> session also answered the *second* question this ticket had been carrying implicitly —
+> whether to enforce anywhere — with "every project in the registry" (see the phase-3 entry).
 
 The hook now runs ahead of every tool call in this repo, at a measured **21 ms per call**, and
 writes to a log outside the repo. It blocks nothing and reverts by deleting one block from
@@ -299,3 +306,124 @@ but the first thing the agent does it immediately runs commands on its own"*.
   ticket's own context pack pointing at `allowedTools` as the enforcement path — a field that
   cannot enforce. Both survived review because nothing in the pipeline confronts a named
   capability with the harness that must provide it. Worth an ARCH ticket if it recurs a third time.
+
+### 2026-08-25 — you (answer · via ticket view)
+- **Question:** leave the recorder running, or revert it?
+- **Chose:** A — leave it recording
+- **State:** answered — awaiting agent action (not dispatched)
+
+### 2026-08-25 — orchestrator-profile-fleet lane (phase 3)
+- **Enabled on every project — and one hole found live:** Both open questions on this ticket are now ANSWERED and ACTED ON, and the profile is enabled on all 13 registry projects.
+  - **Decision 1 — the recorder:** A, leave it recording. Nothing reverted; the `PreToolUse` block
+    in `.claude/settings.json` is untouched and still log-only. The Decision section above is marked
+    CLOSED and the Owner cell moves off 👤.
+  - **Decision 2 — where to enforce:** *"enable on all when possible no other project is running,
+    only be wary of orchard itself."* Enabled on **13/13** projects via the real
+    `validateProjectPatch` + `updateProject` path. Diffed against a pre-change backup
+    (`registry.json.pre-feat096-enable-all`): **only `orchestratorProfile` and `updatedAt` changed
+    on every row** — no other setting was rewritten.
+  - **Nothing else was running, checked rather than assumed.** One station session (this repo's own,
+    with one session host), one HAND-STARTED `claude` in an unrelated project (launched from a
+    terminal — it never goes through `ClaudeRuntime`, so a registry flag cannot reach it either way),
+    and one scratch server on port 48318 with its own isolated `CLAUDE_STATION_DATA`. Nothing was
+    touched, killed or restarted.
+  - **THE ONE THING THE USER MUST DO, and the reason it is not done here: the running service is on
+    PRE-FEAT-096 CODE.** `PATCH /api/projects/:id {orchestratorProfile:{enabled:true}}` against
+    127.0.0.1:4317 returned `unknown field "orchestratorProfile"` for all 13 projects, while
+    `validate.ts` on disk accepts it — proof, not inference, that the systemd service (started
+    08:54, main PID unchanged) predates commit cb12563 (16:23). So the registry now says enabled and
+    **the live server cannot act on it**: `registry.ts` `load()` re-reads the file per call, so the
+    running server SEES the flag (a live GET returns `{"enabled":true}`), but the enforcement hook
+    it would need lives in code it does not have. Enforcement begins at the service's next restart,
+    which this lane did not perform (standing rule; it would also have killed the dispatching
+    session). **Second-order risk while it stays stale:** the old `updateProject` enumerates known
+    settings keys, so any project settings edit made from the UI BEFORE the restart will silently
+    drop that project's `orchestratorProfile`. Re-run the enable for that project if so.
+  - **Orchard's own project was the one to think about, and it is safe — TESTED, not argued.** The
+    profile is composed once in `startSession()` and handed to `runtime.start()`; the project PATCH
+    route writes the registry and touches no live session. `verify:feat-096-live-sessions --immunity`
+    turns that argument into an experiment on REAL sessions in an isolated data dir: a session starts
+    with the profile OFF and runs its own shell (baseline); the registry is flipped ON mid-session
+    through the real writer; the SAME session takes another turn and **still has its shell, with no
+    denial delivered**; and a NEWLY launched session in that same project IS enforced. 6/6.
+  - **Verified PER PROJECT, not in aggregate.** `npm run verify:feat-096-fleet` → **197/197 across
+    13 projects (3 containerised)**, grading each row separately against the REAL live registry:
+    the row is enabled, the exact `agent-bridge` composition expression yields the flag, that
+    project's own paths are refused to the orchestrator with an actionable reason, a lane keeps
+    Bash and Read, and dispatch / AskUserQuestion / `npm run gate` / board bookkeeping / its own
+    commit all still run. Must-FAIL proof: flipping ONE project off in a copied registry fails
+    exactly that project's two checks (195/197) and exits 1.
+  - **And observed in REAL SESSIONS, which is the actual deliverable — 12 of 13 projects.** Each
+    got a real turn through the real `startSession()` with its real instruction stack (the WA is
+    seeded from the same repo sources the live data dir reads through), given work that used to
+    start with a shell command. In every one: the orchestrator's own `ls` was DENIED, the reason
+    reached the model, **it dispatched a lane**, the lane kept full Bash, the work got done, and a
+    no-tool question was still answered normally. **The drift is gone.** The 13th project
+    could not be exercised at all: its `hostPath` does not exist (a pre-existing dangling row,
+    BUG-138 territory) — enabled in the registry, unverifiable until repointed.
+  - **Containerised projects behave identically, and the mechanism does travel with the session.**
+    All three containerised projects each ran a genuine in-container session (the
+    refused command names `/workspace/<project>`), under throwaway project ids so no live container
+    was adopted; all three containers were removed afterwards. Nothing was written into any project
+    tree — asserted per project, because that is the specific way BUG-118 went wrong. DECLARED
+    DEVIATION: all three enable the stealth browser, and a browser-enabled project refuses to start
+    a session when the adapter is unconfigured (which it is on this machine, and on the live service
+    too — worth knowing independently of this ticket), so the mirror disabled the browser for the
+    run and says so on screen.
+  - **A REAL SESSION WALKED THROUGH A HOLE IN THE POLICY, unprompted, and it is now closed.** With
+    the profile on in this repo, a session refused `ls -1 <repo>` came back with
+    `node -e "require('fs').readdirSync(...)"` and read the tree anyway. Nobody told it to evade
+    anything — this is attack §3's escape channel for the third time, and it answers the phase-2
+    handoff's own question ("whether any allowed head can still read a file into context") with
+    *yes*. `node` was allowed because the orchestrator runs `node scripts/…` verifiers; `-e` turns
+    that head into `cat`. Closed by per-head ARGUMENT rules applied at every pipeline stage:
+    `node -e/-p/--eval`/bare-REPL/heredoc-fed, `npx`, `npm exec|x`, `docker` outside a status
+    subcommand, `systemctl cat`, `curl file://`, and `cp`/`mv` to a std stream. **The cost was
+    measured before tightening, not after:** across 239 real Bash calls since 2026-08-18, `npx` 0,
+    `npm exec` 0, `curl file://` 0, `docker run|exec|cp` 0, `systemctl cat` 0, `cp|mv` to a stream 0
+    — and the only two real `node -e` calls in the corpus were that same escape. Everything real
+    still runs (`npm run gate`, `node scripts/leak-gate.mjs 2>&1 | tail -1`, `docker ps`,
+    `systemctl --user show|status|list-units`, `curl http://127.0.0.1:4317/…`).
+  - **One draft of that fix leaked and is pinned.** A `subcommandOf()` that skipped a flag's VALUE
+    read `systemctl --user cat <unit>` as "`--user` takes the value `cat`" and allowed a unit-file
+    dump. Both that and the head-only rule are must-FAIL reconstructions in
+    `npm run verify:feat-096-read-escapes` → **41/41**.
+  - **The known cost, chased to its source: there is nothing in the repo to fix.** An audit of every
+    guidance surface (WA v2, patterns, CONVENTIONS, CLAUDE.md, board README, ticket templates,
+    `.claude/agents/worker.md`, `onboard.mjs` templates) found **zero** documented commands that mix
+    a gate/board check with a file read — the 32 refused combinations are ad-hoc model behaviour in
+    the transcript store, hard-coded nowhere, so "split them" is a behavioural change with no
+    callers to edit. The audit did find ONE real doc conflict: `docs/CONVENTIONS.md`'s BUG-103 rule
+    says "for any content hunt, use `rg`", which an enabled orchestrator is refused. Fixed there
+    with a carve-out naming who the rule is addressed to (a lane) rather than by weakening either
+    rule.
+  - **The stale stored template is fixed, not just noted.** `seedTemplates()` skipped any id whose
+    file existed, so the stored `working-agreement-v2.md` was frozen at 2026-08-04 (9,581 bytes)
+    forever — harmless only while the read-through exists, and already a stale DEGRADED FALLBACK.
+    It now refreshes the stored body of a seed that still resolves to its own source, preserving
+    curated frontmatter, never touching a detached or re-pointed template, and no-op when current.
+    The user's real files were refreshed (v2 9,581 → 31,011 bytes, now carrying the inline-work
+    threshold; v1 was stale too; the four `pattern-*` seeds were already current), backups kept
+    alongside. `npm run verify:feat-096-template-refresh` → 19/19 with a must-FAIL proof.
+  - **Anti-regressions, all run, exit status read directly:** `verify:orchestrator-enforcement`
+    **122/122** against 688 real tool calls (the gate/board split cost is unchanged at 32 of 64),
+    `verify:orchestrator-surface` **67/67**, `verify:template-readthrough` 18/18,
+    `verify:pattern-templates` 34/34, `verify:feat-077` 30/30, `verify:boot-aware` 12/12,
+    `verify:routing-inject` 18/18, `verify:local-conventions` 18/18, `npm run board:check` clean,
+    `npm run gate` exit 0.
+  - **Still open / handoff.** (1) The service restart is the user's, and until it happens nothing is
+    enforced. (2) One project is enabled but its directory is gone. (3) `isDispatchViaShell()`
+    still under-reports by 61% — untouched, still open. (4) `echo *` remains a directory listing an
+    orchestrator can run; it reads no file content and was left rather than adding glob heuristics
+    that would misfire on ordinary `echo`. (5) The A-E1 finding still needs unstaged sessions.
+  - **INDEPENDENT VERIFICATION REQUIRED, and more so than before.** This is squarely the
+    regression-prone bucket: a hook ahead of every tool call, now in EVERY project, beside BUG-118,
+    with a policy change written and self-verified by the same lane. Attack the new head-argument
+    rules with hostile shell (`$'…'`, nested substitution, `\` continuations, quoted `file://`,
+    `PATH`-relative spellings), look for another allowed head that can read, and re-examine the one
+    assumption everything rests on: that `agent_id` is absent on EVERY main-thread call.
+  - **Symptom of a deeper design flaw? Yes — and this is the THIRD instance the previous two entries
+    said to watch for, so ARCH-013 is filed.** (1) `Dispatch`, a tool that does not exist.
+    (2) `allowedTools`, a field that cannot enforce. (3) `node`/`npx`/`docker` admitted to the
+    surface by NAME, with nothing confronting what those names can actually do. Same flaw each time:
+    a capability is named at design time and never confronted with the runtime that must provide it.

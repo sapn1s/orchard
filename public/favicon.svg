@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Orchard mark, in the app's own grammar: the dark tile survives from the
+       old favicon, but the window rows have become a living stem — planted on
+       a short ground line (an orchard is rows: tended, not wild), one branch
+       reaching, and the single moss dot that everywhere in the app means
+       "alive" as the bud. The apex is left bare: still growing. -->
+  <rect x="1" y="1" width="30" height="30" rx="7.5" fill="#1B1F1D"/>
+  <rect x="1.5" y="1.5" width="29" height="29" rx="7" fill="none" stroke="#4A524D" stroke-width="1"/>
+  <path d="M10 25.5h12" stroke="#5A625E" stroke-width="2" stroke-linecap="round" fill="none"/>
+  <path d="M15.2 25.5C15.2 20.5 15.4 14 16.4 7.5" stroke="#AEB5B0" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+  <path d="M15.4 16.8C18 16.5 20.4 14.8 21.7 12.4" stroke="#AEB5B0" stroke-width="2.4" stroke-linecap="round" fill="none"/>
+  <circle cx="22.8" cy="10.2" r="3.5" fill="#7B8F5E"/>
+</svg>

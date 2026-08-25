@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Station (local dashboard/server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h = the user's home directory (systemd user-unit specifier). Adjust the
+# repo path if you cloned somewhere else.
+ExecStart=/usr/bin/node %h/projects/claude-station/src/server/index.ts
+WorkingDirectory=%h/projects/claude-station
+Environment=PORT=4317
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

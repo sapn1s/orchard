@@ -1,0 +1,1 @@
+can we get keyboard shortcuts for switching between projects and sessions, right now i have to reach for the mouse every single time i want to jump to another project, would be nice to have something like ctrl+k to jump around

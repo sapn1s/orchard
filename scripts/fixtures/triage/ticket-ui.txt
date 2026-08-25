@@ -1,0 +1,2 @@
+ticket system dashboard - no option to openit from anywhere in ui unless we have ticket link or manual url
+? and it could utilize more width for some items in ui, currently its all one column makes the whole thing extremely long. also ik we have minimal colors in our main interface, but ticket system might use some coloring for some things, its currently visually hard to read ALL INFO IS LIKE ONE GREY column

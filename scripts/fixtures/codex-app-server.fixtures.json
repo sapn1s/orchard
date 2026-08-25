@@ -1,0 +1,188 @@
+{
+  "$provenance": [
+    "SCHEMA-VALIDATED FIXTURES (FEAT-037 P2c, 2026-08-05). Every frame shape here was",
+    "checked against the REAL pinned binary's generated protocol schema:",
+    "`codex app-server generate-json-schema` from codex-cli 0.146.0 (~/.local/bin/codex,",
+    "run offline). Ground truth files consulted: ClientRequest/ServerRequest/",
+    "ServerNotification method unions, v1/Initialize{Params,Response},",
+    "v2/{ThreadStart,ThreadResume,ThreadFork,TurnStart,TurnInterrupt,ModelList}{Params,Response},",
+    "v2 notification param schemas (TurnCompleted, ItemStarted, ItemCompleted,",
+    "AgentMessageDelta, ThreadTokenUsageUpdated, ThreadStarted), ExecCommandApproval*/",
+    "ApplyPatchApproval* (ReviewDecision) and the v2 item/*/requestApproval families.",
+    "Key drift corrected vs the earlier DOCUMENTATION-DERIVED fixtures: thread/start",
+    "takes `sandbox` (SandboxMode string) and turn/start takes `sandboxPolicy` (object",
+    "with camelCase `type`), never `sandboxMode`; reasoning effort is `effort` on",
+    "turn/start (no `reasoningEffort` on thread/start); model/list returns",
+    "{data, nextCursor}; there is NO turn/failed — failure is turn/completed with",
+    "turn.status:'failed' + turn.error{message, codexErrorInfo}; Turn carries NO usage —",
+    "tokens arrive via thread/tokenUsage/updated{tokenUsage:{last,total}}; approval",
+    "decisions for execCommandApproval/applyPatchApproval are ReviewDecision",
+    "('approved' | 'approved_for_session' | {denied:{rejection}} | 'abort' | 'timed_out'),",
+    "NOT {decision:'allow'|'deny'}; approvalPolicy values are",
+    "'untrusted'|'on-request'|'never' (NOT 'unlessTrusted').",
+    "Framing: JSON-RPC 2.0, newline-delimited JSON over stdio.",
+    "SUBAGENT SCENARIOS (FEAT-037 subagents, 2026-08-06): subagentTurn / subagentInterruptTurn",
+    "are SCHEMA-DERIVED, not live-captured — shapes re-dumped 2026-08-06 from the same binary's",
+    "v2 schema (CollabAgentToolCallThreadItem: id/tool/status/senderThreadId/receiverThreadIds/",
+    "agentsStates{→CollabAgentState{status,message}}/prompt/model; SubAgentActivityThreadItem:",
+    "id/agentThreadId/agentPath/kind; Thread.agentRole/agentNickname +",
+    "SessionSource→SubAgentSource.thread_spawn{parent_thread_id,depth,agent_role,agent_nickname};",
+    "enums CollabAgentTool, CollabAgentToolCallStatus, CollabAgentStatus, SubAgentActivityKind).",
+    "Event ORDER/interleaving: partially LIVE-CAPTURED 2026-08-06 (real subscription probe,",
+    "codex features list: multi_agent stable default-ON, multi_agent_v2 stable opt-in OFF).",
+    "DEFAULT-ON v1 observed live: the spawn is announced ONLY by subAgentActivity kind:'started'",
+    "on the parent stream (agentPath is a virtual path like '/root/multiply'; NO",
+    "collabAgentToolCall spawnAgent item, NO sub-thread thread/started on this connection);",
+    "the CHILD thread's own turn/started, agentMessage items, tokenUsage and turn/completed",
+    "stream on the SAME connection under the child's threadId; the terminal `wait` collab call",
+    "carries EMPTY receiverThreadIds and EMPTY agentsStates. The richer spawnAgent/closeAgent/",
+    "agentsStates/thread_spawn frames in subagentTurn remain SCHEMA-DERIVED (v2 shapes, likely",
+    "multi_agent_v2); thr_sub_agent_3 below replays the LIVE-OBSERVED v1 shape verbatim."
+  ],
+  "initialize": {
+    "result": {
+      "userAgent": "codex/0.146.0-fixture",
+      "codexHome": "/tmp/fixture/.codex",
+      "platformFamily": "unix",
+      "platformOs": "linux"
+    }
+  },
+  "thread": {
+    "startResult": {
+      "thread": { "id": "thr_fixture_0001" },
+      "approvalPolicy": "untrusted",
+      "approvalsReviewer": "user",
+      "cwd": "/tmp/fixture",
+      "model": "gpt-5.2-codex",
+      "modelProvider": "openai",
+      "sandbox": { "type": "workspaceWrite" },
+      "reasoningEffort": "medium"
+    },
+    "startedNotification": { "method": "thread/started", "params": { "thread": { "id": "thr_fixture_0001" } } },
+    "resumeThreadId": "thr_fixture_resume_77",
+    "forkResult": {
+      "thread": { "id": "thr_fixture_fork_0002" },
+      "approvalPolicy": "untrusted",
+      "approvalsReviewer": "user",
+      "cwd": "/tmp/fixture",
+      "model": "gpt-5.2-codex",
+      "modelProvider": "openai",
+      "sandbox": { "type": "workspaceWrite" }
+    }
+  },
+  "modelList": {
+    "result": {
+      "data": [
+        {
+          "id": "gpt-5.2-codex",
+          "model": "gpt-5.2-codex",
+          "displayName": "GPT-5.2 Codex",
+          "description": "Default Codex agent model (fixture)",
+          "hidden": false,
+          "isDefault": true,
+          "defaultReasoningEffort": "medium",
+          "supportedReasoningEfforts": [
+            { "reasoningEffort": "low", "description": "Fastest" },
+            { "reasoningEffort": "medium", "description": "Balanced" },
+            { "reasoningEffort": "high", "description": "Deepest" }
+          ]
+        },
+        {
+          "id": "gpt-5.2",
+          "model": "gpt-5.2",
+          "displayName": "GPT-5.2",
+          "description": "General model (fixture)",
+          "hidden": false,
+          "isDefault": false,
+          "defaultReasoningEffort": "medium",
+          "supportedReasoningEfforts": []
+        }
+      ],
+      "nextCursor": null
+    }
+  },
+  "simpleTurn": {
+    "notifications": [
+      { "method": "turn/started", "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_0001", "status": "inProgress", "items": [] } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "startedAtMs": 1754350000000, "item": { "id": "item_msg_1", "type": "agentMessage", "text": "" } } },
+      { "method": "item/agentMessage/delta", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "itemId": "item_msg_1", "delta": "Hello from " } },
+      { "method": "item/agentMessage/delta", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "itemId": "item_msg_1", "delta": "fixture Codex." } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "startedAtMs": 1754350000100, "item": { "id": "item_reason_1", "type": "reasoning", "summary": [], "content": [] } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "completedAtMs": 1754350000200, "item": { "id": "item_reason_1", "type": "reasoning", "summary": ["thought about it"], "content": [] } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "completedAtMs": 1754350000300, "item": { "id": "item_msg_1", "type": "agentMessage", "text": "Hello from fixture Codex." } } },
+      { "method": "thread/tokenUsage/updated", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_0001", "tokenUsage": { "last": { "inputTokens": 12, "cachedInputTokens": 0, "outputTokens": 7, "reasoningOutputTokens": 0, "totalTokens": 19 }, "total": { "inputTokens": 12, "cachedInputTokens": 0, "outputTokens": 7, "reasoningOutputTokens": 0, "totalTokens": 19 }, "modelContextWindow": 272000 } } },
+      { "method": "turn/completed", "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_0001", "status": "completed", "items": [] } } }
+    ]
+  },
+  "subagentTurn": {
+    "notifications": [
+      { "method": "turn/started", "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_sub", "status": "inProgress", "items": [] } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "startedAtMs": 1754350100000, "item": { "id": "item_collab_spawn", "type": "collabAgentToolCall", "tool": "spawnAgent", "status": "inProgress", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_agent_1"], "agentsStates": { "thr_sub_agent_1": { "status": "pendingInit", "message": null } }, "prompt": "Compute 17*23 and report back.", "model": null, "reasoningEffort": null } } },
+      { "method": "thread/started", "params": { "thread": { "id": "thr_sub_agent_1", "agentRole": "worker", "agentNickname": "crimson-fox", "source": { "subAgent": { "thread_spawn": { "parent_thread_id": "thr_fixture_0001", "depth": 1, "agent_role": "worker", "agent_nickname": "crimson-fox", "agent_path": "worker" } } } } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350100200, "item": { "id": "item_collab_spawn", "type": "collabAgentToolCall", "tool": "spawnAgent", "status": "completed", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_agent_1"], "agentsStates": { "thr_sub_agent_1": { "status": "running", "message": null } }, "prompt": "Compute 17*23 and report back.", "model": null, "reasoningEffort": null } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "startedAtMs": 1754350100300, "item": { "id": "item_act_1", "type": "subAgentActivity", "agentThreadId": "thr_sub_agent_1", "agentPath": "worker", "kind": "started" } } },
+      { "method": "item/agentMessage/delta", "params": { "threadId": "thr_sub_agent_1", "turnId": "turn_sub_child", "itemId": "item_sub_msg_1", "delta": "SUB-THREAD-ONLY: 17*23 = 391" } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350100500, "item": { "id": "item_act_2", "type": "subAgentActivity", "agentThreadId": "thr_sub_agent_1", "agentPath": "worker", "kind": "interacted" } } },
+      { "method": "thread/started", "params": { "thread": { "id": "thr_sub_agent_2", "agentRole": "helper", "agentNickname": "amber-owl", "source": { "subAgent": { "thread_spawn": { "parent_thread_id": "thr_sub_agent_1", "depth": 2, "agent_role": "helper", "agent_nickname": "amber-owl", "agent_path": "helper" } } } } } },
+      { "method": "item/completed", "params": { "threadId": "thr_sub_agent_1", "turnId": "turn_sub_child", "completedAtMs": 1754350100700, "item": { "id": "item_act_3", "type": "subAgentActivity", "agentThreadId": "thr_sub_agent_2", "agentPath": "helper", "kind": "interrupted" } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "startedAtMs": 1754350100800, "item": { "id": "item_collab_wait", "type": "collabAgentToolCall", "tool": "wait", "status": "inProgress", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_agent_1"], "agentsStates": { "thr_sub_agent_1": { "status": "running", "message": null } }, "prompt": null, "model": null, "reasoningEffort": null } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350101000, "item": { "id": "item_collab_wait", "type": "collabAgentToolCall", "tool": "wait", "status": "completed", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_agent_1"], "agentsStates": { "thr_sub_agent_1": { "status": "completed", "message": "391" } }, "prompt": null, "model": null, "reasoningEffort": null } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350101100, "item": { "id": "item_collab_close", "type": "collabAgentToolCall", "tool": "closeAgent", "status": "completed", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_agent_1"], "agentsStates": { "thr_sub_agent_1": { "status": "shutdown", "message": null } }, "prompt": null, "model": null, "reasoningEffort": null } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "startedAtMs": 1754350101110, "item": { "id": "item_act_live_1", "type": "subAgentActivity", "agentThreadId": "thr_sub_agent_3", "agentPath": "/root/live-shaped", "kind": "started" } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350101111, "item": { "id": "item_act_live_1", "type": "subAgentActivity", "agentThreadId": "thr_sub_agent_3", "agentPath": "/root/live-shaped", "kind": "started" } } },
+      { "method": "turn/started", "params": { "threadId": "thr_sub_agent_3", "turn": { "id": "turn_sub3_child", "status": "inProgress", "items": [] } } },
+      { "method": "item/completed", "params": { "threadId": "thr_sub_agent_3", "turnId": "turn_sub3_child", "completedAtMs": 1754350101120, "item": { "id": "item_sub3_msg", "type": "agentMessage", "text": "SUB-THREAD-ONLY: live-shaped child answer" } } },
+      { "method": "thread/tokenUsage/updated", "params": { "threadId": "thr_sub_agent_3", "turnId": "turn_sub3_child", "tokenUsage": { "last": { "inputTokens": 9, "cachedInputTokens": 0, "outputTokens": 3, "reasoningOutputTokens": 0, "totalTokens": 12 }, "total": { "inputTokens": 9, "cachedInputTokens": 0, "outputTokens": 3, "reasoningOutputTokens": 0, "totalTokens": 12 } } } },
+      { "method": "turn/completed", "params": { "threadId": "thr_sub_agent_3", "turn": { "id": "turn_sub3_child", "status": "completed", "items": [] } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "startedAtMs": 1754350101130, "item": { "id": "item_collab_wait_empty", "type": "collabAgentToolCall", "tool": "wait", "status": "inProgress", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": [], "agentsStates": {}, "prompt": null, "model": null, "reasoningEffort": null } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350101140, "item": { "id": "item_collab_wait_empty", "type": "collabAgentToolCall", "tool": "wait", "status": "completed", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": [], "agentsStates": {}, "prompt": null, "model": null, "reasoningEffort": null } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "completedAtMs": 1754350101200, "item": { "id": "item_sub_final", "type": "agentMessage", "text": "The subagent reports 391." } } },
+      { "method": "thread/tokenUsage/updated", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_sub", "tokenUsage": { "last": { "inputTokens": 30, "cachedInputTokens": 0, "outputTokens": 11, "reasoningOutputTokens": 0, "totalTokens": 41 }, "total": { "inputTokens": 30, "cachedInputTokens": 0, "outputTokens": 11, "reasoningOutputTokens": 0, "totalTokens": 41 } } } },
+      { "method": "turn/completed", "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_sub", "status": "completed", "items": [] } } }
+    ]
+  },
+  "subagentInterruptTurn": {
+    "notifications": [
+      { "method": "turn/started", "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_subint", "status": "inProgress", "items": [] } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_subint", "startedAtMs": 1754350200000, "item": { "id": "item_collab_spawn_k", "type": "collabAgentToolCall", "tool": "spawnAgent", "status": "inProgress", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_kill_1"], "agentsStates": { "thr_sub_kill_1": { "status": "pendingInit", "message": null } }, "prompt": "Probe the long-running thing.", "model": null, "reasoningEffort": null } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_subint", "completedAtMs": 1754350200200, "item": { "id": "item_collab_spawn_k", "type": "collabAgentToolCall", "tool": "spawnAgent", "status": "completed", "senderThreadId": "thr_fixture_0001", "receiverThreadIds": ["thr_sub_kill_1"], "agentsStates": { "thr_sub_kill_1": { "status": "running", "message": null } }, "prompt": "Probe the long-running thing.", "model": null, "reasoningEffort": null } } },
+      { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_subint", "startedAtMs": 1754350200300, "item": { "id": "item_act_k1", "type": "subAgentActivity", "agentThreadId": "thr_sub_kill_1", "agentPath": "prober", "kind": "started" } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_subint", "completedAtMs": 1754350200600, "item": { "id": "item_act_k2", "type": "subAgentActivity", "agentThreadId": "thr_sub_kill_1", "agentPath": "prober", "kind": "interrupted" } } },
+      { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_subint", "completedAtMs": 1754350200700, "item": { "id": "item_subint_final", "type": "agentMessage", "text": "The subagent was interrupted before finishing." } } },
+      { "method": "thread/tokenUsage/updated", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_subint", "tokenUsage": { "last": { "inputTokens": 20, "cachedInputTokens": 0, "outputTokens": 8, "reasoningOutputTokens": 0, "totalTokens": 28 }, "total": { "inputTokens": 20, "cachedInputTokens": 0, "outputTokens": 8, "reasoningOutputTokens": 0, "totalTokens": 28 } } } },
+      { "method": "turn/completed", "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_subint", "status": "completed", "items": [] } } }
+    ]
+  },
+  "execApprovalTurn": {
+    "commandItemStarted": { "method": "item/started", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_exec", "startedAtMs": 1754350001000, "item": { "id": "item_cmd_1", "type": "commandExecution", "command": "rm -rf build", "commandActions": [], "cwd": "/tmp/fixture", "status": "inProgress" } } },
+    "approvalRequest": { "method": "execCommandApproval", "params": { "conversationId": "thr_fixture_0001", "callId": "call_cmd_1", "command": "rm -rf build", "cwd": "/tmp/fixture", "parsedCmd": [], "reason": "cleans the build dir" } },
+    "allowedItemCompleted": { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_exec", "completedAtMs": 1754350002000, "item": { "id": "item_cmd_1", "type": "commandExecution", "command": "rm -rf build", "commandActions": [], "cwd": "/tmp/fixture", "status": "completed", "exitCode": 0, "aggregatedOutput": "decision-echo: allow" } } },
+    "deniedItemCompleted": { "method": "item/completed", "params": { "threadId": "thr_fixture_0001", "turnId": "turn_exec", "completedAtMs": 1754350002000, "item": { "id": "item_cmd_1", "type": "commandExecution", "command": "rm -rf build", "commandActions": [], "cwd": "/tmp/fixture", "status": "declined", "aggregatedOutput": "decision-echo: deny" } } }
+  },
+  "patchApprovalRequest": {
+    "method": "applyPatchApproval",
+    "params": { "conversationId": "thr_fixture_0001", "callId": "call_patch_1", "fileChanges": { "/tmp/fixture/a.txt": { "kind": "modify" } }, "reason": "edit a.txt" }
+  },
+  "interruptedTurnCompleted": {
+    "method": "turn/completed",
+    "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_hang", "status": "interrupted", "items": [] } }
+  },
+  "failedTurns": {
+    "quotaWindow": {
+      "method": "turn/completed",
+      "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_fail_quota", "status": "failed", "items": [], "error": { "message": "You've hit your usage limit. Your limit resets in 3 hours.", "codexErrorInfo": "usageLimitExceeded" } } }
+    },
+    "badModel": {
+      "method": "turn/completed",
+      "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_fail_model", "status": "failed", "items": [], "error": { "message": "{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-definitely-not-real' model is not supported when using Codex with a ChatGPT account.\"}}", "codexErrorInfo": "other" } } }
+    },
+    "overloaded": {
+      "method": "turn/completed",
+      "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_fail_overload", "status": "failed", "items": [], "error": { "message": "The server is currently overloaded. Please try again later.", "codexErrorInfo": "serverOverloaded" } } }
+    },
+    "network": {
+      "method": "turn/completed",
+      "params": { "threadId": "thr_fixture_0001", "turn": { "id": "turn_fail_net", "status": "failed", "items": [], "error": { "message": "stream disconnected before completion", "codexErrorInfo": { "responseStreamDisconnected": { "httpStatusCode": null } } } } }
+    }
+  }
+}

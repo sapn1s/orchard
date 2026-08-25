@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Orchard</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/git-view.css" />
+  </head>
+  <body>
+    <!--
+      Structure is the approved mockup's. Every region that shows data is empty
+      here and filled by app.js from the live server; nothing is canned.
+    -->
+    <div class="window" id="win">
+
+      <!-- ───────── sidebar ───────── -->
+      <aside class="side">
+        <div class="side-chrome">
+          <!-- The Orchard mark: the session tree in miniature — a stem planted
+               on a row line, one branch reaching, the moss "alive" dot as its
+               bud. Inline so the strokes take currentColor and the bud takes
+               the theme's --live. -->
+          <span class="brand" title="Orchard">
+            <svg class="mark" width="17" height="17" viewBox="0 0 17 17" fill="none" aria-hidden="true">
+              <path d="M4.6 14.4h6.8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" opacity=".5"/>
+              <path d="M7.6 14.4C7.6 11.6 7.7 8 8.3 4.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              <path d="M7.7 9.6C9.2 9.4 10.5 8.4 11.2 7.1" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+              <circle cx="11.9" cy="5.9" r="1.8" fill="var(--live)"/>
+            </svg>
+            <span class="wordmark">Orchard</span>
+          </span>
+          <span class="spacer"></span>
+          <button class="ic" id="fold" title="Hide sidebar" aria-label="Hide sidebar">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="2" y="3" width="12" height="10" rx="2.2"/><path d="M6.3 3v10"/></svg>
+          </button>
+          <button class="ic" id="findBtn" title="Search titles and messages" aria-label="Search titles and messages">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 13.6 13.6"/></svg>
+          </button>
+          <!-- A plus, deliberately NOT a pencil: this button creates, it never
+               edits, and the icon must not promise otherwise. Its title names
+               the project the session will spawn in (kept current by
+               paintCrown), because "somewhere" is not a destination. -->
+          <button class="ic" id="newBtn" title="New session" aria-label="New session">
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M8 3.2v9.6M3.2 8h9.6"/></svg>
+          </button>
+        </div>
+
+        <div class="finder on" id="finder">
+          <input type="search" id="findInput" placeholder="Search titles and messages…" aria-label="Search titles and messages in registered projects" />
+        </div>
+
+        <!-- FEAT-070: project sort toggle — recency (default) ↔ alphabetical.
+             A small, low-chrome control so the ordering is discoverable and
+             opt-out-able without dominating the sidebar head. -->
+        <div class="sortbar">
+          <span class="sortbar-l">Projects</span>
+          <button class="sort-toggle" id="projSort" type="button" title="Sort projects">Recent</button>
+        </div>
+
+        <nav class="tree" id="tree" aria-label="Projects and sessions"></nav>
+
+        <div class="side-foot">
+          <button id="libBtn" title="Instruction templates">
+            <span class="g">▤</span>
+            <span class="lbl">Templates</span>
+            <span class="n" id="libCount"></span>
+          </button>
+          <button id="addProjBtn" title="Add a project">
+            <span class="g">＋</span>
+            <span class="lbl">Add project</span>
+          </button>
+          <button id="themeBtn" title="Appearance">
+            <span class="g">◐</span>
+            <span class="lbl">Appearance</span>
+            <span class="val" id="themeVal">system</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- ───────── main ───────── -->
+      <main class="main">
+
+        <div class="crown">
+          <div class="col">
+            <div class="where" id="where"></div>
+            <h1 id="title" class="crumbs">Orchard</h1>
+
+            <!-- FEAT-040: an ALWAYS-present, human half of the session's ground
+                 truth — names the real state (thinking / streaming / detached /
+                 reconnecting / idle / error) so a transitional state never
+                 reads as "broken". data-state drives the treatment in
+                 styles.css; idle is the only one that reads as "nothing". -->
+            <div class="sess-status" id="sessStatus" data-state="idle" role="status" aria-live="polite">
+              <span class="dot"></span>
+              <span class="lbl" id="sessStatusLbl">Idle</span>
+            </div>
+
+            <!-- FEAT-042: the LIVE resolved model, always visible beside the
+                 session status — the provider can switch models without user
+                 action (safeguard fallbacks), and this chip is how that gets
+                 caught at a glance. data-flag marks a change the user did NOT
+                 initiate (pulse + tinted hairline until acknowledged by a
+                 click); click opens the existing /model picker. -->
+            <button class="model-chip" id="modelChip" hidden aria-haspopup="true"
+                    aria-label="Current model — click to change">
+              <span class="g">◇</span>
+              <span class="m" id="modelChipName"></span>
+            </button>
+
+            <div class="seal" id="seal">
+              <!-- FEAT-066: the persistent entry to the ticket board. Shown for
+                   any project that HAS a board (toggled in renderRail); a plain
+                   nav pill so #/tickets is reachable without a deep link. -->
+              <a class="pill board-pill" id="boardBtn" href="#/tickets" hidden
+                 title="Open the ticket board for this project">
+                <span class="g">▤</span><span>Board</span><span class="bn" id="boardBtnN"></span>
+              </a>
+              <!-- FEAT-075: the persistent entry to the in-app Guide. The guide
+                   ships WITH the app (docs/guide/), so this is always shown — a
+                   low-chrome nav pill like the board pill, no per-project gate. -->
+              <a class="pill board-pill" id="guideBtn" href="#/guide"
+                 title="Open the Orchard guide — workflow &amp; features">
+                <span class="g">◈</span><span>Guide</span>
+              </a>
+              <button class="pill" id="isoBtn" aria-haspopup="true" aria-expanded="false" hidden>
+                <span class="g" id="isoG">○</span><span id="isoN">Direct</span>
+                <svg class="cx" width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.4 4 5 6.6 7.6 4"/></svg>
+              </button>
+              <button class="pill" id="insBtn" hidden>
+                <span class="g">▤</span><span id="insN">CLAUDE.md only</span><span class="plusn" id="insPlus"></span>
+              </button>
+              <!-- Git at a glance: "is my work safe?" — branch, dirty count,
+                   ahead/behind. Hidden for non-repos; click opens the drawer's
+                   Git group where the actions live. -->
+              <button class="pill" id="gitBtn" hidden>
+                <span class="g">⎇</span><span id="gitN"></span>
+              </button>
+              <!-- Ambient "running here" for the CURRENT project: ports and
+                   count, click opens the Running-here list in settings. -->
+              <button class="pill" id="procBtn" hidden>
+                <span class="g">▸</span><span id="procN"></span>
+              </button>
+              <!-- FEAT-051: the integrations strip — one chip per attached MCP
+                   capability (like browser extension icons). Hollow = planned
+                   for the next launch, filled = live-attached (session-init's
+                   own tool report). Hidden entirely when nothing attaches.
+                   Filled by paintIntegrations() in app.js. -->
+              <span class="integ" id="integStrip" hidden></span>
+              <span class="sep" id="sealSep" hidden></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- isolation popover -->
+        <div class="pop" id="pop" role="menu" aria-label="Isolation level">
+          <h4>Isolation</h4>
+          <button class="opt" role="menuitem" data-iso="container">
+            <span class="g">▣</span>
+            <span><span class="n">Container</span><span class="d">Runs in Docker. Only the mounts listed are visible; the rest of the disk isn't there.</span></span>
+          </button>
+          <button class="opt" role="menuitem" data-iso="sandbox">
+            <span class="g">◑</span>
+            <span><span class="n">Sandbox</span><span class="d">Runs on this machine with writes confined to the project and network calls logged.</span></span>
+          </button>
+          <button class="opt" role="menuitem" data-iso="direct">
+            <span class="g">○</span>
+            <span><span class="n">Direct</span><span class="d">Full access to your machine. Nothing is held back.</span></span>
+          </button>
+          <div class="pop-foot">
+            <button id="popSettings">Project settings <span class="cx">›</span></button>
+          </div>
+        </div>
+
+        <!-- model / effort picker, anchored to the composer tray's model button.
+             Same popover chrome as the isolation menu. Everything it sets is a
+             SESSION override, never a registry write. -->
+        <div class="pop" id="modelPop" role="menu" aria-label="Model for this session">
+          <h4>Model</h4>
+          <div id="modelOpts"></div>
+          <h4 class="sub">Effort</h4>
+          <div id="effortOpts"></div>
+          <div class="pop-foot">
+            <button id="modelPopSettings">Project defaults <span class="cx">›</span></button>
+          </div>
+        </div>
+
+        <!-- BUG-082: the proc chip's full port list. The crown chip previews
+             only the first few ports (:4317 first, then ascending) + a "+N"
+             overflow; this popover — same chip-popover chrome as model/provider
+             (FEAT-051) — lists every listening port, with a footer to the
+             drawer's Running-here list where a port can be acted on. -->
+        <div class="pop" id="procPop" role="menu" aria-label="Listening ports for this project">
+          <h4>Listening ports</h4>
+          <div id="procPorts"></div>
+          <div class="pop-foot">
+            <button id="procPopSettings">Running here <span class="cx">›</span></button>
+          </div>
+        </div>
+
+        <!-- FEAT-045: provider (engine) for the NEXT session, anchored to the
+             composer tray's provider button. Same popover chrome as the model
+             menu. Picking arms the per-launch override (start.overrides.provider
+             — the field FEAT-037 P3 built server-side), never a registry write;
+             the OpenAI row carries the live detectCodex() verdict from
+             /api/providers, exactly like the settings drawer. -->
+        <div class="pop" id="provPop" role="menu" aria-label="Provider for the next session">
+          <h4>Provider</h4>
+          <div id="provOpts"></div>
+          <div class="pop-foot">
+            <button id="provPopSettings">Project defaults <span class="cx">›</span></button>
+          </div>
+        </div>
+
+        <!-- Session row actions. Replaces the browser's native context menu on a
+             sidebar session row. One panel, several views: the root menu is a
+             real role="menu"; rename/fork/delete swap it to role="dialog"
+             because they contain fields and prose, not menu items. -->
+        <div class="pop rowmenu" id="rowMenu" role="menu" aria-label="Session actions" tabindex="-1"></div>
+
+        <!-- add-project picker: scan suggestions by default, or a real
+             directory browser — because typing a path from memory is the
+             worst of the three ways to name a directory. -->
+        <div class="pop wide" id="picker" role="dialog" aria-label="Add a project">
+          <h4>Add a project <button class="mini" id="pickMode" type="button">browse folders ›</button></h4>
+          <div class="pfilter">
+            <input id="pickFilter" type="search" spellcheck="false" placeholder="Filter by name or path…" aria-label="Filter list" />
+          </div>
+          <div class="plist" id="pickList"></div>
+          <div class="manual">
+            <label class="lbl" for="pickPath">Or type a path</label>
+            <input id="pickPath" type="text" spellcheck="false" placeholder="~/code/something" aria-label="Project path" />
+          </div>
+          <!-- FEAT-089: the method is applied automatically on add (board,
+               Working Agreement, response-format hook, gate). Reachable opt-out
+               AT ADD TIME for someone adding a repo purely to browse history —
+               unchecking writes nothing into the target repository. -->
+          <label class="pick-method" for="pickApplyMethod" title="Scaffolds the ticket board, attaches the Working Agreement, and installs the response-format hook + commit gate into this repo. Never overwrites existing files; idempotent.">
+            <input id="pickApplyMethod" type="checkbox" checked />
+            <span>Apply the Orchard method (board · Working Agreement · format hook · gate)</span>
+          </label>
+        </div>
+
+        <!-- context menu for the project list's empty space: an EXTRA way in
+             (right-click only), styled like the session row menu — compact
+             single-line items, not the wide descriptive popover. -->
+        <div class="pop rowmenu" id="treeMenu" role="menu" aria-label="Project list actions">
+          <button class="mi" role="menuitem" id="tmAdd"><span class="l">Add a project…</span></button>
+          <button class="mi" role="menuitem" id="tmCollapse"><span class="l">Collapse all projects</span></button>
+        </div>
+
+        <div class="scroll" id="scroll">
+          <!-- one .pane per thread: main, plus one per subagent. Switching
+               threads toggles .on, so main's live DOM is never thrown away. -->
+          <div class="col" id="panes"></div>
+        </div>
+
+        <div class="dock">
+          <!-- Only appears once the transcript is scrolled away from its end.
+               Absolute, so showing it never nudges the composer. -->
+          <button class="jump" id="jump" type="button" hidden title="Jump to the latest message">
+            <span class="dot"></span>
+            <span class="lbl">Latest</span>
+            <span class="g">↓</span>
+          </button>
+          <div class="col">
+            <div class="asks" id="asks" hidden></div>
+
+            <!-- Messages typed mid-turn wait HERE, in the dock — not in the
+                 transcript, where a position would lie about when they were
+                 said. Expand a row to read or edit it before it delivers. -->
+            <div class="qbox" id="queueBox" hidden></div>
+
+            <div class="strip" id="strip" hidden>
+              <button class="strip-top" id="stripTop" aria-expanded="true">
+                <span class="spark"></span>
+                <span class="lbl">Running</span>
+                <span class="sum" id="stripSum"></span>
+                <span class="clk" id="stripClk">0:00</span>
+                <svg class="cx" width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.4 4 5 6.6 7.6 4"/></svg>
+              </button>
+              <div class="strip-rows" id="stripRows"></div>
+            </div>
+
+            <!-- Effective permission mode. Hidden unless the session skips
+                 approvals; risk framing on a direct project, calm on a
+                 container. Text is set from the server's effective-config. -->
+            <div class="permline" id="permLine" hidden></div>
+
+            <!-- "/" autocomplete: the commands THIS session's CLI answered
+                 init with (cached across sessions as a hint). Typed commands
+                 go up as ordinary prompts; the CLI executes them itself. -->
+            <div class="slashpop" id="slashPop" hidden></div>
+
+            <div class="box" id="box">
+              <textarea id="prompt" rows="1" placeholder="Message Claude…" aria-label="Message Claude"></textarea>
+              <div class="tray">
+                <button class="ic" id="planBtn" title="Plan first — Claude reads and explores but cannot edit files or run mutating commands; it proposes a plan and waits for your approval" aria-label="Plan first" aria-pressed="false">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M3 4.4h10M3 8h7M3 11.6h4"/></svg>
+                </button>
+                <button class="ic" id="skipBtn" title="Skip permission prompts" aria-label="Skip permission prompts" aria-pressed="false">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2 3 4v3.4C3 10.4 5.1 12.7 8 14c2.9-1.3 5-3.6 5-6.6V4z"/></svg>
+                </button>
+                <button class="ic" id="provBtn" title="Choose the provider for the next session" aria-label="Choose a provider" aria-haspopup="true" aria-expanded="false" hidden>
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M8 1.9 13.3 5v6L8 14.1 2.7 11V5z"/><circle cx="8" cy="8" r="1.6"/></svg>
+                </button>
+                <button class="ic" id="modelBtn" title="Choose a model for this session" aria-label="Choose a model" aria-haspopup="true" aria-expanded="false">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="8" cy="8" r="5"/><circle cx="8" cy="8" r="1.6"/></svg>
+                </button>
+                <button class="ic" id="cogBtn" title="Project settings" aria-label="Project settings">
+                  <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><path d="M2.2 5.2h11.6M2.2 10.8h11.6"/><circle cx="5.6" cy="5.2" r="1.7"/><circle cx="10.4" cy="10.8" r="1.7"/></svg>
+                </button>
+                <button class="go" id="go" data-mode="send" aria-label="Send message" title="Send">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.8V3.4M4 7.4 8 3.4l4 4"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="frozen" id="frozen" hidden>
+              <span><b>Started on Windows.</b> The history reads here; it can't resume on this machine.</span>
+              <button class="pill" id="forkBtn">Fork to a Linux session</button>
+            </div>
+
+            <!-- shown instead of the composer while the view is parked in
+                 history with newer messages not yet fetched: a reply typed here
+                 would render directly under a message that is NOT the latest -->
+            <div class="frozen" id="history" hidden>
+              <span><b>Viewing history.</b> Newer messages exist below — scroll down to read on, or jump to the end.</span>
+              <button class="pill" id="historyLatestBtn">Jump to latest</button>
+            </div>
+
+            <!-- shown instead of the composer while viewing a subagent that has ended -->
+            <div class="frozen" id="agentDone" hidden>
+              <span id="agentDoneText"></span>
+              <button class="pill" id="backToMain">Back to main</button>
+            </div>
+
+            <!-- the socket dropped mid-session: refuse to send until resolved,
+                 and never discard the transcript that is already on screen -->
+            <div class="frozen" id="dropped" hidden>
+              <span id="droppedText"><b>The session connection dropped.</b> Nothing has been lost on screen — but this turn did not reach the agent.</span>
+              <button class="pill" id="reconnectBtn">Reconnect and resume</button>
+            </div>
+
+            <div class="fine" id="fine" hidden></div>
+          </div>
+        </div>
+
+      </main>
+
+      <!-- ───────── drawer ───────── -->
+      <aside class="drawer slide-panel" id="drawer" aria-label="Settings">
+        <div class="d-head">
+          <div class="d-top">
+            <button class="d-back" id="dBack" aria-label="Back" hidden>
+              <svg width="13" height="13" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 2.2 3.3 6 7 9.8"/></svg>
+            </button>
+            <div class="d-title">
+              <div class="e" id="dEyebrow"></div>
+              <div class="t" id="dTitle">Project settings</div>
+            </div>
+            <button class="ic" id="dClose" aria-label="Close panel">
+              <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.6 2.6 9.4 9.4M9.4 2.6 2.6 9.4"/></svg>
+            </button>
+          </div>
+          <div class="d-scope" id="dScope">
+            <button data-scope="project" aria-pressed="true">Project default</button>
+            <button data-scope="session" aria-pressed="false">This session</button>
+            <span class="hint" id="dHint">Sessions inherit these</span>
+          </div>
+        </div>
+
+        <div class="d-body" id="dBody">
+          <div class="view on" id="vSettings"></div>
+          <div class="view" id="vInstructions"></div>
+          <div class="view" id="vLibrary"></div>
+          <div class="view" id="vSnapshots"></div>
+          <div class="view" id="vMemories"></div>
+        </div>
+
+        <div class="view ed" id="vEditor">
+          <div class="ed-meta" id="edMeta"></div>
+          <textarea id="edText" spellcheck="false" aria-label="Template content"></textarea>
+          <div class="ed-foot">
+            <span id="edFoot"></span>
+            <button class="mini" id="edSave">Save</button>
+            <button class="mini" id="edUse">Add to this project</button>
+          </div>
+        </div>
+      </aside>
+
+      <!-- ───────── needs-you rail ─────────
+           The free ~20% desktop width, turned into a tracked list of the things
+           waiting on the user (👤 tickets on the project board) as interactive
+           cards, with the glanceable board below. Collapses to a floating badge
+           on narrow viewports. Filled by app.js from /api/projects/:id/board. -->
+      <aside class="rail" id="rail" aria-label="Needs you">
+        <!-- Hidden at desktop width purely by CSS (.rail-badge{display:none});
+             the narrow media query reveals it. No `hidden` attribute, or it
+             would override the media-query display. -->
+        <button class="rail-badge" id="railBadge" type="button" aria-label="Show what needs you">
+          <span class="g">👤</span><span class="n" id="railBadgeN">0</span>
+        </button>
+        <div class="rail-panel" id="railPanel">
+          <div class="rail-head">
+            <span class="lbl">Needs you</span>
+            <!-- FEAT-066: a second, in-context entry to the full board — the rail
+                 is the "now" surface, this opens the archive. Href set + shown in
+                 renderRail only when the project has a board. -->
+            <a class="rail-board" id="railBoardLink" href="#/tickets" hidden>Open board →</a>
+            <span class="ct" id="railCount"></span>
+          </div>
+          <!-- FEAT-067 — server-derived status summary: a Focus line + a counts
+               strip (done · needs · queued · running · stopped) indexing the
+               sections below. Painted in renderRail from state.board.summary
+               plus the already-fetched running-set/outcomes; a live index, never
+               a stored snapshot (BUG-041/074 — it must not go stale). Pinned at
+               the very top so "what's on my plate" is the first glance. -->
+          <div class="rail-summary" id="railSummary" hidden></div>
+          <!-- FEAT-057 — agent deaths the SERVER recorded, rendered with no
+               model in the loop. Above the needs cards on purpose: "3 agents
+               stopped — usage limit, resets 13:40" is the thing that changes
+               what you do next, and it must be visible on a fresh page load
+               even if the orchestrator never ran a turn to notice. -->
+          <div class="rail-sub" id="railStopped" hidden></div>
+          <div class="needs" id="railNeeds"></div>
+          <!-- FEAT-079 — OBSERVATIONS: automated, read-only findings
+               (WA-consolidation FEAT-047, architecture-recurrence FEAT-056).
+               Standing attention, NOT asks — kept OFF the decision rail above so
+               it doesn't train the user to ignore it (WA §H). Below needs on
+               purpose; absent when empty. Dismiss/ack still works per row. -->
+          <div class="rail-sub" id="railObservations" hidden></div>
+          <!-- FEAT-053 — the todo backlog: open tickets in flight nowhere and
+               waiting on nobody. Read-only rows (BUG-025); absent when empty. -->
+          <div class="rail-sub" id="railQueued" hidden></div>
+          <div class="rail-sub" id="railInflight" hidden></div>
+          <div class="rail-sub" id="railDone" hidden></div>
+        </div>
+      </aside>
+    </div>
+
+    <!-- ───────── ticket dashboard (FEAT-058 / FEAT-082) ─────────
+         A ROUTE, not a modal: meant to live in a SECOND browser tab so the
+         session tab stays live and the user can ask the orchestrator about a
+         ticket while reading it. Hidden until the route names it. FEAT-082 split
+         it three ways: #/tickets is the DIGEST (what awaits you), #/tickets/all
+         is the full sortable/searchable table (the former landing state), and
+         #/tickets/<ID> is one ticket's detail. Filled by app.js from BOTH
+         /api/projects/:id/board (lanes, counts) and .../tickets (recent). -->
+    <section class="tv slide-panel" id="ticketsView" hidden aria-label="Tickets">
+      <header class="tv-top">
+        <a class="tv-home" id="tvHome" href="#/" title="Back to sessions">← sessions</a>
+        <span class="tv-brand">Board</span>
+        <select class="tv-sel" id="tvProject" aria-label="Project"></select>
+        <span class="spacer"></span>
+        <!-- FEAT-082: the persistent escape hatch to the full corpus. Present on
+             the digest AND every ticket detail; hidden only while it's the
+             current view (app.js toggles .on). -->
+        <a class="tv-btn" id="tvAll" href="#/tickets/all" title="Open the full ticket list">All tickets</a>
+        <button class="tv-btn solid" id="tvNew" type="button">New ticket</button>
+      </header>
+      <!-- FEAT-063: ONE toolbar row — filters as compact controls + the search
+           field, tracker-style; sorting moved onto the column headers. -->
+      <div class="tv-filters" id="tvFilters">
+        <select class="tv-sel" id="tvStatus" aria-label="Filter by status">
+          <option value="all">all statuses</option>
+          <option value="open">open</option>
+          <option value="done">done</option>
+        </select>
+        <select class="tv-sel" id="tvOwner" aria-label="Filter by owner">
+          <option value="all">any owner</option>
+          <option value="you">👤 needs you</option>
+          <option value="agent">🤖 in flight</option>
+          <option value="none">— unassigned</option>
+        </select>
+        <select class="tv-sel" id="tvSev" aria-label="Filter by severity">
+          <option value="all">any severity</option>
+          <option value="high">high</option>
+          <option value="med">med</option>
+          <option value="low">low</option>
+        </select>
+        <input class="tv-find" id="tvSearch" type="search" autocomplete="off" spellcheck="false"
+               placeholder="Search id, title, or any line of any ticket body…" aria-label="Search tickets" />
+        <span class="tv-count" id="tvCount"></span>
+      </div>
+      <div class="tv-body">
+        <!-- FEAT-082 — the digest landing. Built entirely in app.js (renderDigest)
+             from the parallel board + tickets fetch; the counts strip, Awaiting-you
+             (Decide / Look at), Answered-awaiting, In flight, Recently updated and
+             the collapsed Observations all live in here. -->
+        <div class="tv-digest" id="tvDigest" hidden></div>
+        <div class="tv-list" id="tvList"></div>
+        <article class="tv-detail" id="tvDetail" hidden></article>
+      </div>
+    </section>
+
+    <!-- ───────── in-app guide reader (FEAT-075) ─────────
+         A ROUTE (#/guide, #/guide/<page>), a sibling of the ticket dashboard —
+         not a modal — so the session view underneath stays alive. A page list
+         on the left, the selected page's markdown (rendered by the app's own
+         prose() renderer, mermaid diagrams rendered offline from the vendored
+         bundle) on the right. Hidden until the route names it. -->
+    <section class="gv slide-panel" id="guideView" hidden aria-label="Guide">
+      <header class="gv-top">
+        <a class="gv-home" id="gvHome" href="#/" title="Back to sessions">← sessions</a>
+        <span class="gv-brand">Guide</span>
+        <span class="gv-sub" id="gvSub"></span>
+        <span class="spacer"></span>
+      </header>
+      <div class="gv-body">
+        <nav class="gv-nav" id="gvNav" aria-label="Guide pages"></nav>
+        <article class="gv-doc" id="gvDoc" tabindex="-1"></article>
+      </div>
+    </section>
+
+    <!-- ───────── rail ticket modal (FEAT-053) ─────────
+         Clicking any rail row opens the ticket's FULL markdown — the same file
+         the dispatched agents read — rendered by FEAT-058's ticketDetailNode
+         (one renderer, never a summary layer). The body scrolls independently
+         with a plain max-height + overflow; deliberately NO overscroll-behavior
+         anywhere in here (BUG-032: `contain` swallows wheel chaining). -->
+    <div class="tmodal" id="ticketModal" hidden role="dialog" aria-modal="true" aria-label="Ticket">
+      <div class="tmodal-back" id="ticketModalBack"></div>
+      <div class="tmodal-box">
+        <button class="ic tmodal-x" id="ticketModalClose" aria-label="Close ticket">
+          <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.6 2.6 9.4 9.4M9.4 2.6 2.6 9.4"/></svg>
+        </button>
+        <div class="tmodal-body" id="ticketModalBody"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,11 @@
+# Reference desktop entry — .desktop files cannot expand $HOME, so replace
+# /path/to/claude-station with the absolute repo path before installing to
+# ~/.local/share/applications/.
+[Desktop Entry]
+Type=Application
+Name=Claude Station
+Comment=Open the Claude Station dashboard
+Exec=/path/to/claude-station/scripts/station-open.sh
+Icon=/path/to/claude-station/public/favicon.svg
+Terminal=false
+Categories=Development;

@@ -1,0 +1,247 @@
+#!/usr/bin/env node
+/**
+ * leak-gate.mjs — private-artifact gate for public release (FEAT-049).
+ *
+ * Scans for private tokens (project names, home paths, usernames, email).
+ * Exits 1 with a file:line listing on any hit; exits 0 clean.
+ *
+ * TWO MODES (BUG-080):
+ *   - REPO MODE (no path arg): scan every git-TRACKED-or-new text file in the
+ *     repo at the current directory (git ls-files -co). This is what the
+ *     FEAT-050 gatekeeper invokes (cwd = target repo, no arg). Images are
+ *     SKIPPED here — the PRIVATE working repo legitimately holds raw dashboard
+ *     captures under docs/bugs/assets, and gating them would block every commit.
+ *   - TREE MODE (a directory path arg): scan the built mirror TREE the publish
+ *     pipeline hands us — literally every file destined for public release,
+ *     walked off the filesystem (the tree is not yet a git repo). Here images
+ *     ARE gated: any image NOT on the public allowlist (public/, docs/assets/)
+ *     is a HARD leak, because dashboard PNGs carry private paths / usernames /
+ *     session titles in their pixels that the text scan can never see.
+ *
+ * Pre-BUG-080 the path arg was ignored entirely: `node leak-gate.mjs <tree>`
+ * still scanned the source repo (via `git rev-parse --show-toplevel` from cwd),
+ * so the publish pipeline's "final gate" never looked at the tree it shipped.
+ *
+ * CONFIG — the token list. Each entry is { name, re }. NOTE: the literal
+ * private strings are deliberately split ('saa'+'sis') so this file does not
+ * trip its own gate when it ships in the public mirror.
+ *
+ * OUTPUT MODES (BUG-102):
+ *   - default: on FAIL, print every hit line + the per-file breakdown (this is
+ *     what the FEAT-050 gatekeeper captures verbatim; unchanged, do not touch).
+ *   - --summary / --quiet: on FAIL, print only a CAPPED hit list + the summary
+ *     line. This exists so a human/agent can READ the result without piping it
+ *     into `tail` — which was the BUG-102 defect: a pipeline's exit status is
+ *     the LAST command's, so `node leak-gate.mjs | tail -1` exits 0 even on
+ *     FAIL and any `gate && git commit` guard proceeds on a leak. The readable
+ *     invocation must BE the correct-exit invocation. The sanctioned entry
+ *     point is `npm run gate` (scripts/gate.mjs), which never pipes.
+ */
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const TOKENS = [
+  { name: 'private project A (bot)',      re: new RegExp('saa' + 'sis', 'i') },
+  { name: 'private project B (uploader)', re: new RegExp('img' + 'ixie', 'i') },
+  { name: 'private project C',            re: new RegExp('map' + '_of_' + 'world', 'i') },
+  { name: 'private project D',            re: new RegExp('job' + '_intel', 'i') },
+  { name: 'private project E',            re: new RegExp('reddit' + '_marketing', 'i') },
+  { name: 'private project F',            re: new RegExp('trump' + '[_-]muketika', 'i') },
+  { name: 'private project G',            re: new RegExp('gpu-' + 'research-lab', 'i') },
+  { name: 'private project H (win)',      re: new RegExp('shadow' + '[-_ ]studio', 'i') },
+  // I–P (FEAT-104): the class the gate was blind to — private project names that
+  // survived at HEAD in ticket prose because no token ever covered them. Each is
+  // aliased in the docs as `external-project-<letter>`; the alias note below is
+  // the only mapping key, and the real name deliberately appears NOWHERE in the
+  // repo (this gate now enforces that). O/P are matched on their distinctive
+  // stem so the short forms used in prose are caught too, not just the full name.
+  { name: 'private project I (-> external-project-I)', re: new RegExp('workspace' + '-to-text', 'i') },
+  { name: 'private project J (-> external-project-J)', re: new RegExp('discord' + '-mcp-bot', 'i') },
+  { name: 'private project K (-> external-project-K)', re: new RegExp('\\b' + 'ani' + 'wait\\b', 'i') },
+  { name: 'private project L (-> external-project-L)', re: new RegExp('chatbots' + '-tg', 'i') },
+  { name: 'private project M (-> external-project-M)', re: new RegExp('crypto' + '_gem', 'i') },
+  { name: 'private project N (-> external-project-N)', re: new RegExp('docs' + '-llm', 'i') },
+  { name: 'private project O (-> external-project-O)', re: new RegExp('docker' + '_template', 'i') },
+  { name: 'private project P (-> external-project-P)', re: new RegExp('remote' + '_wrapper', 'i') },
+  // Q (FEAT-049, second pass): found by a DIFFERENT method than remembering a
+  // name — enumerating every directory that actually exists under this
+  // machine's project roots and grepping the tree for each one. It had survived
+  // in an archived ticket's breadth-sweep notes since 2026-08-04.
+  { name: 'private project Q (-> external-project-Q)', re: new RegExp('bug' + '-bounty', 'i') },
+  // A CLASS THE PROJECT-NAME TOKENS DO NOT COVER (FEAT-049, second pass): words
+  // lifted verbatim out of the user's own session transcripts. A verifier that
+  // greps a REAL rollout needs a real needle, and the needle it hardcoded was a
+  // client's name and their product line. The names below are that incident;
+  // the general defence is the rule, not the list — a verifier must DERIVE its
+  // needle from the artifact it discovered, never carry one in its source.
+  { name: 'client name (transcript content)',   re: new RegExp('kna' + 'uf', 'i') },
+  { name: 'client product (transcript content)', re: new RegExp('sad' + 'olin', 'i') },
+  { name: 'client product (transcript content)', re: new RegExp('easy' + 'care', 'i') },
+  { name: 'client term (transcript content)',    re: new RegExp('sperr' + 'grund', 'i') },
+  { name: 'home path',                    re: new RegExp('/home/' + 'sa' + 'p\\b') },
+  { name: 'encoded home path',            re: new RegExp('-home-' + 'sa' + 'p\\b') },
+  { name: 'encoded win path',             re: new RegExp('C--Users-' + 'sa' + 'p\\b') },
+  { name: 'username (bare word)',         re: new RegExp('\\b' + 'sa' + 'p' + '\\b') },
+  { name: 'github handle',                re: new RegExp('sa' + 'pn1s', 'i') },
+  { name: 'email',                        re: new RegExp('sa' + 'ptional', 'i') },
+];
+
+/**
+ * THE ONE SANCTIONED EXCEPTION (FEAT-049 licence).
+ *
+ * Every token above is a leak everywhere — except the copyright line of the
+ * LICENSE file, where the licensor's identity is the POINT rather than a slip.
+ * PolyForm Noncommercial grants rights from "the licensor" and sends anyone
+ * wanting commercial terms to that licensor; a licence naming nobody grants
+ * from nobody and gives the reader no one to ask, which is precisely the
+ * failure mode of a hand-written licence. The repository is published under
+ * this handle, so the handle is public by construction the moment it ships.
+ *
+ * Scoped as narrowly as it can be, on purpose: ONE file, ONE token, and ONLY
+ * on a line matching PolyForm's own `Required Notice:` form. The same handle
+ * one line lower in LICENSE, or in any other file, still FAILS. This is an
+ * exemption from a token, never a hole in the gate — allowed hits are counted
+ * and REPORTED on every run (below), so the exception can never be silent.
+ */
+const ALLOWED_HITS = [
+  {
+    file: 'LICENSE',
+    token: 'github handle',
+    line: /^Required Notice: Copyright \d{4} /,
+    why: 'the licence must name an identifiable, contactable licensor to be worth anything',
+  },
+];
+const allowedHitFor = (rel, tokenName, line) =>
+  ALLOWED_HITS.find((a) => a.file === rel && a.token === tokenName && a.line.test(line));
+
+/** Image assets. In TREE mode these are allowlist-gated; in repo mode skipped. */
+const IMG_RE = /\.(png|jpe?g|gif|ico|webp|bmp|tiff?|svg)$/i;
+/** Non-image binaries — no scannable text, no pixel-leak risk; always skipped. */
+const BIN_SKIP_RE = /\.(woff2?|ttf|eot|pdf|zip)$/i;
+/**
+ * Public image allowlist (BUG-080): path prefixes whose images are CURATED for
+ * public release — the app-served assets (public/) and the screenshots the
+ * README embeds (docs/assets/, hand-picked in FEAT-049). Every other image
+ * (notably docs/bugs/assets/*.png — raw dashboard captures) is a leak.
+ * Configurable via LEAK_GATE_IMG_ALLOW (comma-separated path prefixes).
+ */
+const IMG_ALLOW = (process.env.LEAK_GATE_IMG_ALLOW ?? 'public/,docs/assets/')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const isAllowedImage = (rel) => IMG_ALLOW.some((p) => rel.startsWith(p));
+
+/** Recursively list every file under `root` (posix rel paths), skipping .git. */
+function walkTree(root) {
+  const out = [];
+  (function rec(dir) {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (ent.name === '.git') continue;
+      const abs = path.join(dir, ent.name);
+      if (ent.isDirectory()) rec(abs);
+      else if (ent.isFile() || ent.isSymbolicLink()) out.push(path.relative(root, abs).split(path.sep).join('/'));
+    }
+  })(root);
+  return out;
+}
+
+// Mode selection: a directory path arg → TREE mode (scan the built mirror);
+// otherwise REPO mode (scan the git repo at cwd, as the gatekeeper invokes it).
+// Flags (--summary/--quiet) are filtered out so they are never mistaken for the
+// tree path arg (BUG-102).
+const rawArgs = process.argv.slice(2);
+const SUMMARY = rawArgs.includes('--summary') || rawArgs.includes('--quiet');
+const argPath = rawArgs.find((a) => !a.startsWith('--'));
+const TREE_MODE = Boolean(argPath);
+
+let scanRoot;
+let files;
+if (TREE_MODE) {
+  scanRoot = path.resolve(argPath);
+  if (!fs.existsSync(scanRoot) || !fs.statSync(scanRoot).isDirectory()) {
+    console.error(`LEAK GATE: ABORT — '${argPath}' is not a directory to scan.`);
+    process.exit(2);
+  }
+  files = walkTree(scanRoot);
+} else {
+  scanRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  // -co --exclude-standard: tracked PLUS untracked-but-not-ignored files, so a
+  // new file headed for the public tree is gated before it is ever `git add`ed.
+  files = execFileSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: scanRoot, encoding: 'utf8' })
+    .split('\0').filter(Boolean);
+}
+
+let hits = 0;
+let imgHits = 0;
+const perFile = new Map();
+// Collect every hit line. In default mode we print each immediately (preserving
+// the exact verbatim output the gatekeeper/verify-gatekeeper depend on). In
+// --summary mode we defer and print a capped list at the end (BUG-102).
+const hitLines = [];
+/** Hits waived by ALLOWED_HITS. Always reported, so the waiver is never silent. */
+const allowedHits = [];
+const emitHit = (s) => { hitLines.push(s); if (!SUMMARY) console.error(s); };
+for (const rel of files) {
+  const abs = path.join(scanRoot, rel);
+  if (!fs.existsSync(abs)) continue; // deleted/renamed in working tree but still in index
+  // `ls-files -co` can emit DIRECTORY entries (a nested agent worktree with its
+  // own .git shows up as `path/`); reading one is EISDIR and killed the gate.
+  if (!fs.lstatSync(abs).isFile()) continue;
+
+  if (IMG_RE.test(rel)) {
+    // TREE mode: a non-allowlisted image IS a leak (pixels can carry private
+    // data the text scan cannot). REPO mode: images are fine in the private
+    // working repo — skip them (no regression for the gatekeeper).
+    if (TREE_MODE && !isAllowedImage(rel)) {
+      hits++; imgHits++;
+      perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
+      emitHit(`${rel}:0: [private image — not on public allowlist] binary image would ship in the public tree`);
+    }
+    continue;
+  }
+  if (BIN_SKIP_RE.test(rel)) continue;
+
+  const buf = fs.readFileSync(abs);
+  if (buf.includes(0)) continue; // binary
+  const lines = buf.toString('utf8').split('\n');
+  lines.forEach((line, i) => {
+    for (const t of TOKENS) {
+      if (t.re.test(line)) {
+        const allowed = allowedHitFor(rel, t.name, line);
+        if (allowed) {
+          allowedHits.push(`${rel}:${i + 1}: [${t.name}] ALLOWED — ${allowed.why}`);
+          continue;
+        }
+        hits++;
+        perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
+        emitHit(`${rel}:${i + 1}: [${t.name}] ${line.trim().slice(0, 160)}`);
+      }
+    }
+  });
+}
+
+const mode = TREE_MODE ? `TREE ${scanRoot}` : 'REPO (git-tracked)';
+// Report the sanctioned waivers on EVERY run, pass or fail. A gate that quietly
+// stops looking at something is how the next leak ships.
+// stdout, not stderr: on a PASS this is the only trace of the exemption, and it
+// must survive anyone reading the sanctioned output or dropping stderr. The
+// FAIL listing on stderr is untouched (verify-gatekeeper depends on it verbatim).
+for (const l of allowedHits) console.log(`LEAK GATE: waived ${l}`);
+if (hits > 0) {
+  if (SUMMARY) {
+    // Capped, readable-without-piping FAIL output (BUG-102). The hit lines were
+    // NOT streamed during the scan in this mode, so print a capped sample here.
+    const CAP = 10;
+    for (const l of hitLines.slice(0, CAP)) console.error(l);
+    if (hitLines.length > CAP) {
+      console.error(`… (+${hitLines.length - CAP} more hit line(s) — run 'node scripts/leak-gate.mjs' unpiped for the full listing)`);
+    }
+  } else {
+    console.error('\n--- hits per file ---');
+    for (const [f, n] of [...perFile.entries()].sort((a, b) => b[1] - a[1])) console.error(`${String(n).padStart(4)}  ${f}`);
+  }
+  const imgNote = imgHits > 0 ? ` (incl. ${imgHits} non-allowlisted image(s))` : '';
+  console.error(`\nLEAK GATE: FAIL — ${hits} hit(s)${imgNote} in ${perFile.size} file(s) across ${files.length} files [${mode}].`);
+  process.exit(1);
+}
+console.log(`LEAK GATE: PASS — 0 hits across ${files.length} files [${mode}].`);

@@ -1,0 +1,89 @@
+{
+  "docs": {
+    "architecture.md": {
+      "blessedAt": "2026-08-14",
+      "sources": {
+        "deploy/claude-station.service": "b9abe5f7ba5cfb87f9ee82532878dc6696a57a92",
+        "scripts/board.mjs": "cec33bcb45608dd5f1e166be7bffc1f667b58adc",
+        "scripts/check-docs-fresh.mjs": "85c744e917353badbf66116b7c6c1fc2460b84e2",
+        "scripts/gatekeeper.mjs": "6d215f86842a6287c9df8cfae92c363b40f1457c",
+        "scripts/independent-verify.mjs": "14bbeca4e945b847d27351792bea4c36fdd5483c",
+        "scripts/lib/verdict-contract.mjs": "611a97038df23e94a5c753a376882217370ed044",
+        "scripts/onboard.mjs": "0eb45857483076a12e0f09f7a71c8ef65486b936",
+        "src/lib/session-history.ts": "430e0bccb2ff688a2028997595938b54dadd02a3",
+        "src/server/agent-bridge.ts": "dfc7c748c5e6464f1422b36cba25799085ddbab2",
+        "src/server/board.ts": "4dcf036a375e44841ec43aa9d3f0d407036c659e",
+        "src/server/codex-native.ts": "dbfe05871395ed95bebba66d0b1dfe0a310d104c",
+        "src/server/container-manager.ts": "5d4964c1827b2dca27daa58ce6502a2d44cfde64",
+        "src/server/liveness.ts": "0d43eda5e471252ebab5f76e58b0078bf10ba68c",
+        "src/server/orchard-transcripts.ts": "66c249807bc62ca330084300fbb32fa374e06655",
+        "src/server/running-set.ts": "39b676f3a75db538d8b42abb9ebe3deee2a46ba8",
+        "src/server/runtime/claude-runtime.ts": "67b174326e0d257ca218c9ecf58e9f8e3deabe74",
+        "src/server/runtime/codex-runtime.ts": "910463887801e4da31dac862f94799b03a7db259",
+        "src/server/runtime/runtime.ts": "a8212363ae887c35997b14130c1b56599bbbe5e5",
+        "src/server/session-host.mjs": "d5d646d8549b76af272f65f94e9d5abca23e507a",
+        "src/server/survival.ts": "18c0322223f08b42ac1ce7b370a053bbe72573b9",
+        "src/server/survivor-delivery.ts": "4aa68364de6a1ec3832d0005f6cb1e926be6bcee",
+        "src/server/templates.ts": "8586bb0a028f508a7d6971da35a8e15dc4c92838",
+        "src/server/tickets.ts": "b37e4fe5ef7b578a581826bb81134dea8773608e",
+        "src/server/wiring.ts": "c072cb858c7bff50393fa5ea98fe50c7c9809149"
+      }
+    },
+    "integrations.md": {
+      "blessedAt": "2026-08-13",
+      "sources": {
+        ".mcp.json": "beb81dec9253dfe23badb87facfde11fe4253452",
+        "docs/CONVENTIONS.md": "9b0a45b9f1e5ab385e8eb57a7c79caf668aff1d3",
+        "docs/bugs/FEAT-025-serena-lsp-mcp-tier.md": "24b34077b06329e24a5b4400404ebf5187648694",
+        "docs/prompts/ROUTING.md": "4e04acbfbe8729a341881b5d3dc6f12fb61eeec4",
+        "scripts/verify-browser.mjs": "a85eab5b18c2ca94025459dd076e1c87be4c9ec4",
+        "src/server/browser.ts": "81b706aa5fdddd18fecbf939186df9cb13c6765d",
+        "src/server/runtime/claude-runtime.ts": "67b174326e0d257ca218c9ecf58e9f8e3deabe74",
+        "src/server/runtime/codex-runtime.ts": "910463887801e4da31dac862f94799b03a7db259"
+      }
+    },
+    "orchestration.md": {
+      "blessedAt": "2026-08-13",
+      "sources": {
+        ".claude/agents/worker.md": "0f405d5b0905d02e57da5a7958f7b75037c65bef",
+        "docs/prompts/ROUTING.md": "4e04acbfbe8729a341881b5d3dc6f12fb61eeec4",
+        "docs/prompts/WORKING_AGREEMENT.v2.md": "e91e75261dadd173e2e321583109e1afb7ebb8b9",
+        "scripts/dispatch.mjs": "9a41a189fb96d793bcff79ec39c30217c4bf5a5c"
+      }
+    },
+    "projects-and-sessions.md": {
+      "blessedAt": "2026-08-13",
+      "sources": {
+        "scripts/arch-watch.mjs": "ab2ff4bc1b19e2e2d18c902df496e783600cef53",
+        "scripts/board.mjs": "cec33bcb45608dd5f1e166be7bffc1f667b58adc",
+        "scripts/onboard.mjs": "0eb45857483076a12e0f09f7a71c8ef65486b936",
+        "src/server/registry.ts": "b2ad11e063eed65347110293c562f4990f8d15c1"
+      }
+    },
+    "verification.md": {
+      "blessedAt": "2026-08-13",
+      "sources": {
+        ".claude/agents/worker.md": "0f405d5b0905d02e57da5a7958f7b75037c65bef",
+        "docs/prompts/WORKING_AGREEMENT.v2.md": "e91e75261dadd173e2e321583109e1afb7ebb8b9",
+        "scripts/board.mjs": "cec33bcb45608dd5f1e166be7bffc1f667b58adc",
+        "scripts/independent-verify.mjs": "14bbeca4e945b847d27351792bea4c36fdd5483c",
+        "scripts/lib/verdict-contract.mjs": "611a97038df23e94a5c753a376882217370ed044",
+        "scripts/verify-fix-loop.mjs": "009c05be3c19e3086a96bb5daf50008401e221aa"
+      }
+    },
+    "working-agreement.md": {
+      "blessedAt": "2026-08-13",
+      "sources": {
+        "docs/CONVENTIONS.md": "9b0a45b9f1e5ab385e8eb57a7c79caf668aff1d3",
+        "docs/prompts/ROUTING.md": "4e04acbfbe8729a341881b5d3dc6f12fb61eeec4",
+        "docs/prompts/WORKING_AGREEMENT.v2.md": "e91e75261dadd173e2e321583109e1afb7ebb8b9",
+        "scripts/arch-watch.mjs": "ab2ff4bc1b19e2e2d18c902df496e783600cef53",
+        "scripts/sync-methodology.mjs": "1c178bf07016e2dd52710c8b50f4ce7c5ce5152a",
+        "scripts/wa-capture.mjs": "1b580737dd11b686fd0c95c605596c153e662844",
+        "scripts/wa-consolidate.mjs": "bc1e1be6602c306881828c262224be7a5cb00769",
+        "src/server/index.ts": "913fdc9b26b6e578996c891a92a8de5abed1d192",
+        "src/server/templates.ts": "9370bdf3d7eac5bdb45f1009983fc6b75d046b9e"
+      }
+    }
+  }
+}

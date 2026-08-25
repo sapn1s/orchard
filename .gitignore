@@ -1,0 +1,50 @@
+node_modules/
+data/
+*.log
+.attic/
+scratch/
+*.tmp
+
+# Serena MCP (machine-local: abs path + cache) — see FEAT-025
+.serena/
+.mcp.json
+test-results/
+
+# machine-local hands-off project ids for fleet-sync (private names stay untracked)
+.station-hands-off
+
+# machine-local root CLAUDE.md: a bare-session pointer to the WA that embeds this
+# checkout's ABSOLUTE home path — never publish (leak-gate catches it). Same class
+# as .serena/.mcp.json above; a scrubbed public copy, if ever wanted, would live
+# elsewhere. (FEAT-090: untracked + home-path leak blocked every commit.)
+/CLAUDE.md
+
+# Claude Code local session state: agent defs + leftover worktrees (never publish)
+.claude/
+
+# Internal ticket screenshots — dashboard captures embedding private UI chrome
+# (home path, session titles, project names). The README's CURATED public
+# screenshots live in docs/assets/ and stay tracked. See BUG-080.
+docs/bugs/assets/
+
+# EXPERIMENT (scripts/experiments): the corpus is DERIVED from real private
+# session transcripts (home paths, username, project names) — never publish.
+# The builder/checker/metrics SCRIPTS beside it are the reproducible artifacts
+# and stay tracked; only the derived data directory is ignored.
+scripts/experiments/corpus/
+
+# arch-watch.mjs LOCAL state (findings.json + acks.json): machine-local, derived
+# and regenerable from the board itself, and churny (rewritten on every watch
+# run) — never committed. This was previously ignored ONLY by a nested
+# `docs/bugs/.arch/.gitignore` containing `*`, which worked but was invisible to
+# anyone auditing this file; hoisted here so the repo's ignore surface is
+# readable in one place. See FEAT-104.
+docs/bugs/.arch/
+
+# migrate-tickets.mjs STAGING dir (`--out`, default docs/bugs/.migrated): the
+# staged rewrite, per-ticket attempt JSON, and the stderr/violation dumps of a
+# FAILED dispatch — the last of which quote raw dispatch logs carrying home
+# paths, so an untracked staging run made `npm run gate` fail for every lane in
+# the tree. Nothing here is ever committed; the migrated ticket lands in
+# docs/bugs/ and its pre-migration text in docs/bugs/archive/.
+docs/bugs/.migrated/

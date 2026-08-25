@@ -1,0 +1,15 @@
+perhaps its reasonable then, but yes eg if I want a simple ux fix on board, im already accustumed to deter as it feels like it will need to go trhough a 1h pipeline, we could actually test:
+
+- in main board, we have labels like feat/arch/bug. should be colored based on type, currently only "arch" is colored blue, others missing color for some reason
+
+
+pls dont make custom instreuctions , rather the same flow that you normally did for such type of me reporting
+
+
+my expectecation for what the issue actuallly is:
+> read file responsble
+> edit
+> confirm
+about 10mins of work, longest might be verificaiton IF its actually even neede for a simple scenario like this
+
+basically i wann asee how long it will really take

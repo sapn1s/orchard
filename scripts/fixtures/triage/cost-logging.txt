@@ -1,0 +1,5 @@
+we need to implement detailed automatic logging which logs each bug/feat/arch info about llm models used, what for, how much time it took, whats the estimated cost
+
+basically like jira where devs assign hours it took them, but we make it automatic data gathering, and more of a breakdown per things like: "finding bug", "fixing bug", "verifying fix" etc
+
+The goal is to see if our process seems to take reasonable time, eg, an ui fix taking 2 hours for llms might point to something broken in our architecture and make us re-think how to change it so such types of bugs in future solve in 10min, basically to have enough data to know what to even solve and how.

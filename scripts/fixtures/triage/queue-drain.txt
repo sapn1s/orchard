@@ -1,0 +1,1 @@
+btw anothe rproblem, it  sends only one message per turn? thats actually abug, it sohuld be sending all queued, its all part of same context

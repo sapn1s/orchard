@@ -1,0 +1,79 @@
+{
+  "_readme": [
+    "PROVISIONING MANIFEST — the single source of truth for every third-party tool",
+    "Claude Station installs on a user's behalf. Nothing here is fetched at session",
+    "start: a tool is installed ONCE, at provision time, into a durable location",
+    "(a baked image layer for isolation:container, a station-owned directory for",
+    "isolation:direct), and every session afterwards just executes it.",
+    "",
+    "CHANGING THIS FILE CHANGES THE IMAGE IDENTITY. src/server/provisioning.ts",
+    "hashes this file together with the Dockerfile, and container-manager.ts puts",
+    "that hash in the image tag — so a version bump here yields a different",
+    "artifact, the drift check sees it, and the container is recreated. That is",
+    "deliberate: a pin nobody rebuilds on is not a pin, it is a comment.",
+    "",
+    "A version bump NEVER installs itself. It marks the existing install stale and",
+    "waits for an explicit, user-initiated provision/update."
+  ],
+  "manifestVersion": 1,
+  "tools": {
+    "serena": {
+      "package": "serena-agent",
+      "version": "1.7.0",
+      "entrypoint": "serena",
+      "installer": "uv-tool",
+      "index": "https://pypi.org/simple",
+      "source": "https://github.com/oraios/serena",
+      "publisher": "Oraios AI <info@oraios-ai.de>",
+      "license": "MIT",
+      "requiresPython": ">=3.11,<3.15",
+      "sha256": {
+        "serena_agent-1.7.0-py3-none-any.whl": "6dbf1459670d96fb0595f84932adef34260a6fe14ba5135b901fdb3c8c76e891",
+        "serena_agent-1.7.0.tar.gz": "1ef15db14ee5426f3e3dc48fdd7bb7e864d1f35359115eaa3bdd7248b1533ce6"
+      },
+      "identityCheckedOn": "2026-08-18",
+      "identityEvidence": [
+        "PyPI serena-agent 1.7.0 — Author-email 'Oraios AI <info@oraios-ai.de>', Project-URL Homepage https://github.com/oraios/serena, License MIT.",
+        "oraios/serena@main pyproject.toml declares name = 'serena-agent' — the git source this replaced and the registry package are the same project.",
+        "The wheel's entry_points.txt maps console_script 'serena' -> serena.cli:top_level, so the binary we launch comes from THIS package.",
+        "The recorded wheel sha256 matches the digest PyPI serves for 1.7.0.",
+        "'serena-mcp' — the similarly named package the pin could have been misaimed at — returns 404 on PyPI; it is not a live package."
+      ]
+    },
+    "playwright": {
+      "package": "@playwright/mcp",
+      "version": "0.0.79",
+      "entrypoint": "playwright-mcp",
+      "installer": "npm-global",
+      "index": "https://registry.npmjs.org",
+      "source": "https://github.com/microsoft/playwright-mcp",
+      "publisher": "Microsoft Corporation",
+      "license": "Apache-2.0",
+      "integrity": "sha512-VpqD4a3vFyGQMY9sh3UJiO6wjcurggkljKfAyCHL0QWGY5m6Ehr3MNsAAHPDHO//n13g0PCjpHatAOiulrqdZQ==",
+      "sha256": {
+        "playwright-mcp-0.0.79.tgz-shasum": "28a1027e09873623be2534b29153c49a200fba99"
+      },
+      "browserNote": [
+        "@playwright/mcp launches a browser LAZILY (first browser_navigate), not at",
+        "server start — the MCP server lists its ~24 tools with no browser and no",
+        "network. Its DEFAULT is the 'chrome' channel (a SYSTEM Google Chrome at",
+        "/opt/google/chrome/chrome); with no browser present it returns an actionable",
+        "error telling you to install one — it does NOT auto-fetch at session start.",
+        "src/server/tools.ts points direct-isolation sessions at an existing browser",
+        "via --executable-path (the host's brave/chrome/chromium, or",
+        "CLAUDE_STATION_PLAYWRIGHT_BROWSER / CLAUDE_STATION_PLAYWRIGHT_CDP_ENDPOINT),",
+        "so a real navigate works fully offline. Baking a browser into the container",
+        "image is a deliberate open decision (image size / which browser); until then",
+        "a container session must be pointed at a browser via those env vars."
+      ],
+      "identityCheckedOn": "2026-08-18",
+      "identityEvidence": [
+        "npm @playwright/mcp 0.0.79 — author 'Microsoft Corporation', repository https://github.com/microsoft/playwright-mcp.git, license Apache-2.0, homepage https://playwright.dev.",
+        "Maintainers are the Playwright core team under Microsoft: pavelfeldman, yurys, dgozman-ms <dgozman@microsoft.com>, playwright-bot <playwright-npm-bot@microsoft.com>.",
+        "The package's bin map is { 'playwright-mcp': 'cli.js' }, so the binary we launch comes from THIS package; cli.js requires playwright-core (pinned dep 1.63.0-alpha-2026-08-05).",
+        "The recorded dist.integrity (sha512) and tarball shasum match what the npm registry serves for 0.0.79.",
+        "It is the SCOPED package under the @playwright org (Microsoft/Playwright), not an unscoped lookalike; the previous config fetched this exact scope via '@playwright/mcp@latest'."
+      ]
+    }
+  }
+}

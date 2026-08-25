@@ -16,8 +16,13 @@ Note what this is NOT protecting against: a lying agent. It is protecting
 against an honest one that could only test what it already thought of.
 
 ## When to use
-- Every `fix`, `plan+review` and `arch` build, once it is claimed done —
-  before you mark the ticket VERIFIED and before you commit on the claim.
+- **By HARM CLASS, not by dispatch class** — see the threshold table in the
+  Working Agreement §I. Silent loss, false proof, irreversible/project-wide and
+  claim-class changes buy rounds; a contained render / one-cell / CSS / copy
+  change and a test-suite-only change buy **zero**, and so do `trivial` and
+  docs-only. `fix` is not the trigger; what a defect would COST is.
+- When the class does buy a round: once the build is claimed done — before you
+  mark the ticket VERIFIED and before you commit on the claim.
 - Especially when the fix's own test is NEW. A fixer-authored fixture proves
   the fixer's hypothesis, not the requirement.
 - Non-vacuity ("the test FAILS before the fix") does not substitute for this.
@@ -25,12 +30,18 @@ against an honest one that could only test what it already thought of.
   case the fixer already had in mind. The one-page fixture is non-vacuous too.
 
 ## When NOT to use
-- `trivial` and docs-only work. The round trip costs more than the mistake,
-  and applying it everywhere is how it gets eroded by exception until it means
-  nothing. State the threshold; do not quietly extend it, and do not quietly
-  skip it for a real `fix` because you are confident.
+- Any class the table scores at ZERO rounds — `trivial`, docs-only,
+  contained render/CSS/copy, test-suite-only. Erosion is still the worry, which
+  is why the exemption is a LIST anyone can audit rather than a confidence call:
+  do not quietly extend the list, and do not quietly skip a class that buys one.
 - As a substitute for the fixer running their own tests. This is the second
   check, not the first.
+- **To repeat the fixer's own demonstration.** Re-run the fixer's recorded
+  command exactly once, as evidence item (i); everything after that must be a
+  case its fixture does not cover. A round that reproduces the fixer's check a
+  second way and agrees has bought nothing — that is duplicated work, not
+  independent verification. If you cannot NAME the attack before commissioning
+  the round, do not commission it.
 
 ## How to run it
 1. **Dispatch it out of process.** `node scripts/independent-verify.mjs

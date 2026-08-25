@@ -81,6 +81,12 @@ prevent.
   the fixer never imagined is invisible to it. Above `trivial`, the proof of a fix is a
   CLEAN-ROOM verifier in a separate process that never saw the fixer's prose and must paste
   real output from a case the fixture does not cover — see the `verify` step in §I.
+- **Your own handoff list is a work queue, not a disclosure.** No round is commissioned while the
+  fixer can NAME an untested attack: if the lane's "still open" names three attacks, the lane runs
+  them before returning, and the round exists to find the FOURTH. Measured over one window, a third
+  of independent rounds found only defects the fixer had already written down — whole clean-room
+  passes spent converting a paragraph into a bug report. Corollary: a general case a lane declines
+  to close becomes a filed ticket in the same turn, never a paragraph in an activity log.
 - **Runtime-proof bar:** "if you can't trigger it live, it's not done" — prefer an
   empirical reproduction over a second opinion.
 - **Never report a live-state / deployment conclusion from a single hand-run check**
@@ -136,6 +142,23 @@ OR it is the **Nth bug in a sibling class**. For those:
   the plan before a line is built. Reviewing only finished work catches bad execution
   of a bad plan, which is the expensive half already spent.
 Reversible, low-stakes changes stay fast and light — that's the point of the split.
+
+**The stopping rule — the round NUMBER is not the test; the CLASS changing between rounds is.**
+"Run an adversarial pass" above is unbounded, and an unbounded loop given a target will always
+return something. Before commissioning round N+1, classify round N's FINDING by harm class (§I),
+not by its existence:
+- Round N found **silent loss or false proof** → N+1 is automatic.
+- Round N found a **wrong claim a reader could act on** → one more, and only after fixing the
+  fixture defect that let it through.
+- **Two consecutive rounds returning wording-or-cosmetics-only → STOP.** Convert the remaining
+  budget into a standing property assertion, or into an ARCH question if the findings share an
+  invariant.
+- Round N's finding was already on round N−1's handoff list → the round bought nothing; the fault
+  is the handoff rule (§C), and the round count so far is not evidence of a hard problem.
+
+Measured: one ticket's five rounds each found a DIFFERENT class and every round earned its place,
+while another's six alternated between two readings of one boundary and bought nothing after the
+second. Yield decays, and "the round returned a finding" is insensitive to the decay.
 
 **Recurrence → raise an architecture question (don't just patch again).** A board
 optimises for closing tickets, and a per-ticket scope makes every fix local by
@@ -278,6 +301,21 @@ response contract makes a missing evidence block detectable without judgment. Th
 the answer to "how do you force it to actually run things": a clean-room verifier has no
 context to armchair-reason from, and an unexecuted answer is discarded.
 
+**Two roles, one demonstration each — the fixer DEMONSTRATES, the verifier ATTACKS.** "Generation
+must not verify itself" says the fixer cannot be the JUDGE; it never said the fixer stops showing
+its work, and reading it that way produces the opposite failure — the same check run twice, billed
+twice. Draw the line explicitly:
+- **The fixer** shows its change works and RECORDS the command and its real output. It does this
+  whether or not a round follows, and it does not defer to the round.
+- **The verifier**, when there is one, re-runs that recorded command **exactly once** — evidence
+  item (i) above, to establish the claim is not already false — and *everything after that must be
+  a case the fixer's fixture does not cover*. Its objective is to BREAK the claim, never to
+  confirm it.
+- **A verifier that reproduces the fixer's own demonstration a second way and agrees has bought
+  nothing.** That is duplicated work wearing the costume of independence, and it is a failed round
+  whatever verdict it returns. If you cannot NAME the attack the round will run before you
+  commission it, do not commission it.
+
 **A report-READER is not a verifier — and a clean verdict from one is an active hazard.**
 Positioning a model to CHECK agent reports against the evidence they cite does not substitute
 for re-running. Measured: a cheap model asked to do exactly that caught self-CONTRADICTING
@@ -293,9 +331,24 @@ reassurance the check cannot support. Rule: report-reading may be ADVISORY and m
 self-contradiction, but must **never emit or imply a verification verdict**, and its non-flag
 must **never be surfaced as assurance**.
 
-**Threshold, stated so it is not eroded by exception:** required for `fix`, `plan+review`
-and `arch`. NOT required for `trivial` or docs-only work — there the round trip costs more
-than the mistake. That line is the whole policy; "just this once" for a `fix` is how it dies.
+**Threshold — rounds are spent by HARM CLASS, not by dispatch class.** The old line keyed on
+`fix` vs `trivial`, which measures how well the CAUSE is understood and says nothing about what
+a defect COSTS: it gave a relay losing five replies and a one-line CSS clamp the identical
+obligation. Erosion is still the worry, so the exemption is a LIST anyone can audit, not a plea
+anyone can make. Classify the CHANGE, then spend:
+
+| Harm class of the change | Rounds |
+|---|---|
+| **Silent loss** — relay, parser, migration or renderer where failure produces NO error and the user sees a hang or missing content | Until a round returns only wording/cosmetics; then stop |
+| **False proof** — anything that can make a record claim work was verified when it was not | ≥1, cross-provider. Highest priority in the scheme |
+| **Irreversible / project-wide** — cutover, promotion or schema migration touching every file | Exactly 1, scoped to byte identity, refusal and recovery — NOT to reasoning |
+| **Claim class** — text asserting something about content it displays correctly | 1, and only once one-seed-per-hazard-class fixtures and two-directional claim assertions exist; otherwise you buy a fixture defect at clean-room prices |
+| **Contained render / one cell / CSS / copy / a scroll target** | **Zero** — a pixel-or-DOM property measured over the REAL page in both themes, with a synthesized pre-change must-FAIL, is the whole proof |
+| **Test-suite-only change** | **Zero** — one class sweep across sibling suites instead, and that sweep is mandatory |
+| **`trivial` or docs-only** | Zero, as before |
+
+A landing page that does not scroll to its form is the contained-render row: it gets no round,
+and commissioning one is a spend error, not a safety margin.
 
 **Recorded, not remembered:** the ticket carries a `Verified-by:` line naming the DISPATCH
 RUN (provider + run id) and the verdict, with fixer id ≠ verifier id. Naming a run is what

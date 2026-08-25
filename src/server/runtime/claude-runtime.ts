@@ -16,6 +16,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { query, type Options, type SDKMessage, type SDKUserMessage, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
+// FEAT-096: the policy is imported, never reimplemented — the enforcing hook and
+// the counting report must not each carry their own idea of "allowed" (ARCH-008).
+import { decide } from '../../../scripts/lib/orchestrator-profile.mjs';
 import type {
   AgentRuntime,
   ProviderError,
@@ -427,6 +430,63 @@ export class ClaudeRuntime implements AgentRuntime {
     if (config.effort) options.effort = config.effort as never;
     if (config.allowedTools?.length) options.allowedTools = config.allowedTools;
     if (config.disallowedTools?.length) options.disallowedTools = config.disallowedTools;
+    /*
+     * FEAT-096 phase 2 — the orchestrator tool profile, ENFORCED.
+     *
+     * This is an in-process `PreToolUse` callback rather than a hook script in
+     * a project's `.claude/settings.json`, and that is three decisions at once:
+     *
+     * - It is the ONLY point that can tell an orchestrator's call from its
+     *   lane's. `agent_id` is "present only when the hook fires from within a
+     *   subagent … Absent for the main thread" (sdk.d.ts:174-176). The
+     *   runtime's existing `canUseTool` callback carries no agent identity, and
+     *   `disallowedTools` is process-wide — a Bash deny there was PROVEN on
+     *   2026-08-25 to strip Bash from a dispatched general-purpose subagent.
+     * - It travels with the SESSION, not with the filesystem, so it works
+     *   identically for a container project (kenimai-website): the callback runs
+     *   here on the host over the SDK control channel while the CLI runs inside
+     *   the container. Nothing is written into the user's project, which is the
+     *   specific way BUG-118 went wrong — a hook file left in a tree told an
+     *   unrelated project's session it had broken this project's rules.
+     * - It is per-project and default-off (registry
+     *   `settings.orchestratorProfile.enabled`), so it reverts by a one-key
+     *   patch and the next session simply launches without this block.
+     *
+     * FAIL-OPEN, ALWAYS. Every failure path returns `{}` (= no decision, the
+     * call proceeds). A policy bug must degrade to today's behaviour, never to
+     * a session that cannot act and cannot say why.
+     */
+    if (config.orchestratorProfile) {
+      options.hooks = {
+        ...(options.hooks ?? {}),
+        PreToolUse: [
+          {
+            hooks: [
+              async (input) => {
+                try {
+                  const i = input as { tool_name?: string; tool_input?: unknown; agent_id?: string };
+                  const d = decide({
+                    toolName: i.tool_name ?? '',
+                    toolInput: i.tool_input,
+                    agentId: i.agent_id ?? null,
+                  });
+                  if (d.allow || !d.reason) return {};
+                  return {
+                    hookSpecificOutput: {
+                      hookEventName: 'PreToolUse' as const,
+                      permissionDecision: 'deny' as const,
+                      permissionDecisionReason: d.reason,
+                    },
+                  };
+                } catch {
+                  return {};
+                }
+              },
+            ],
+          },
+        ],
+      };
+    }
     if (config.resume) {
       options.resume = config.resume;
       /*

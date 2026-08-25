@@ -213,6 +213,14 @@ export interface RuntimeStartConfig {
   effort?: string;
   allowedTools?: string[];
   disallowedTools?: string[];
+  /**
+   * FEAT-096 phase 2. When true, the session is launched with a `PreToolUse`
+   * policy hook that refuses inline investigation tools on the MAIN THREAD ONLY
+   * — dispatched subagents keep their full toolset. Deliberately NOT expressed
+   * through the two fields above: `allowedTools` does not restrict (it is an
+   * auto-approve list) and `disallowedTools` strips the tool from subagents too.
+   */
+  orchestratorProfile?: boolean;
   resume?: string;
   forkSession?: boolean;
   mcpServers?: Record<string, unknown>;

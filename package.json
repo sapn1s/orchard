@@ -227,7 +227,10 @@
     "triage": "node scripts/triage.mjs",
     "verify:triage": "node scripts/verify-triage.mjs",
     "board:tool": "node scripts/board-tool.mjs",
-    "verify:feat-097": "node scripts/verify-feat-097-board-tool.mjs"
+    "verify:feat-097": "node scripts/verify-feat-097-board-tool.mjs",
+    "verify:orchestrator-enforcement": "node scripts/verify-orchestrator-enforcement.mjs",
+    "verify:orchestrator-enforcement-e2e": "node scripts/verify-orchestrator-enforcement-e2e.mts",
+    "verify:orchestrator-profile-registry": "node scripts/verify-orchestrator-profile-registry.mts"
   },
   "keywords": [],
   "type": "module",

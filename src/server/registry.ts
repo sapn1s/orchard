@@ -186,6 +186,38 @@ export function responseDigestOf(project: Project): ResponseDigestSettings {
 }
 
 /**
+ * FEAT-096 phase 2 — per-project enforcement of the orchestrator tool profile.
+ *
+ * DEFAULT OFF, and that is not timidity: turning this on removes tools from a
+ * session, so it is tried on ONE project before the fleet and reverts by
+ * setting `enabled: false` (no restart, no migration, nothing to undo — the
+ * next session simply launches without the hook).
+ *
+ * WHY IT IS NOT `allowedTools` / `disallowedTools`, which already exist two
+ * fields above and are what FEAT-096's ticket said to use: `allowedTools` is an
+ * auto-approve list and does not restrict anything (SDK sdk.d.ts:1368-1374),
+ * and `disallowedTools` is process-wide — it strips the tool from dispatched
+ * SUBAGENTS too, which was proven live on 2026-08-25 and is the one outcome
+ * this must not produce. The policy therefore rides a `PreToolUse` hook, the
+ * only place in this harness carrying `agent_id` (the orchestrator-vs-lane
+ * discriminator). The decision itself lives in
+ * `scripts/lib/orchestrator-profile.mjs#decide` and is imported, never
+ * reimplemented (ARCH-008). Consumed at claude-runtime.ts.
+ */
+export interface OrchestratorProfileSettings {
+  enabled: boolean;
+}
+
+export function defaultOrchestratorProfileSettings(): OrchestratorProfileSettings {
+  return { enabled: false };
+}
+
+/** Profile settings with defaults filled in for registries written before FEAT-096. */
+export function orchestratorProfileOf(project: Project): OrchestratorProfileSettings {
+  return { ...defaultOrchestratorProfileSettings(), ...(project.settings.orchestratorProfile ?? {}) };
+}
+
+/**
  * BUG-144 — the current Working-Agreement method version. Bumping this is how a
  * future method change re-qualifies every project for a re-backfill (a row
  * stamped at an older version becomes a candidate again). Kept deliberately
@@ -230,6 +262,8 @@ export interface ProjectSettings {
   snapshots?: SnapshotSettings;
   /** FEAT-083: optional in stored JSON; read it through `responseDigestOf()`. */
   responseDigest?: ResponseDigestSettings;
+  /** FEAT-096: optional in stored JSON; read it through `orchestratorProfileOf()`. */
+  orchestratorProfile?: OrchestratorProfileSettings;
   /**
    * BUG-144 — the Working-Agreement method version whose DECISION has been
    * recorded for this project. Absent/0 (`methodVersionOf`) = the row predates
@@ -370,6 +404,7 @@ export function defaultSettings(): ProjectSettings {
     tools: defaultToolSettings(),
     snapshots: defaultSnapshotSettings(),
     responseDigest: defaultResponseDigestSettings(),
+    orchestratorProfile: defaultOrchestratorProfileSettings(),
   };
 }
 
@@ -536,6 +571,12 @@ export function updateProject(id: string, patch: Partial<Omit<Project, 'id' | 'c
         responseDigest: patch.settings.responseDigest
           ? { ...defaultResponseDigestSettings(), ...(cur.settings.responseDigest ?? {}), ...patch.settings.responseDigest }
           : (cur.settings.responseDigest ?? defaultResponseDigestSettings()),
+        // FEAT-096: a PATCH that flips enforcement on/off merges over defaults,
+        // so turning it on for one project never rewrites the other fields and
+        // turning it off is a one-key patch.
+        orchestratorProfile: patch.settings.orchestratorProfile
+          ? { ...defaultOrchestratorProfileSettings(), ...(cur.settings.orchestratorProfile ?? {}), ...patch.settings.orchestratorProfile }
+          : (cur.settings.orchestratorProfile ?? defaultOrchestratorProfileSettings()),
       }
     : cur.settings;
   const next: Project = {

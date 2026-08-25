@@ -33,7 +33,7 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
   const SETTINGS = new Set([
     'provider', 'model', 'effort', 'maxBudgetUsd', 'permissionMode',
     'allowedTools', 'disallowedTools', 'mounts', 'instructions', 'container', 'browser', 'tools', 'snapshots',
-    'responseDigest', 'methodVersion',
+    'responseDigest', 'orchestratorProfile', 'methodVersion',
   ]);
 
   for (const k of Object.keys(b)) {
@@ -263,6 +263,26 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
     }
     settings.snapshots = patch as reg.SnapshotSettings;
   }
+  if ('orchestratorProfile' in src) {
+    // FEAT-096 phase 2: the whole server surface for enforcing the orchestrator
+    // tool profile is this one opt-IN flag. Default is DISABLED; a project sets
+    // `enabled: true` to have its sessions launched with the PreToolUse policy
+    // hook. Kept to a single boolean deliberately — the policy itself is code
+    // (scripts/lib/orchestrator-profile.mjs), not per-project configuration, so
+    // there is no way for a registry edit to widen or invent a tool surface.
+    const o = src.orchestratorProfile as Record<string, unknown> | null;
+    if (!o || typeof o !== 'object' || Array.isArray(o)) throw new Error('orchestratorProfile must be an object');
+    for (const k of Object.keys(o)) {
+      if (k !== 'enabled') throw new Error(`unknown orchestratorProfile field "${k}"`);
+    }
+    const patch: Partial<reg.OrchestratorProfileSettings> = {};
+    if ('enabled' in o) {
+      if (typeof o.enabled !== 'boolean') throw new Error('orchestratorProfile.enabled must be a boolean');
+      patch.enabled = o.enabled;
+    }
+    settings.orchestratorProfile = patch as reg.OrchestratorProfileSettings;
+  }
+
   if ('responseDigest' in src) {
     // FEAT-083: the only server surface for the structured response digest is
     // this opt-OUT flag. Default is enabled; a project sets `enabled: false` to

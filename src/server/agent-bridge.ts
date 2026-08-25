@@ -37,7 +37,7 @@ import { composeInstructions, appendToSystemPrompt, type ComposedPrompt } from '
 import { boardStateSection, boardAnswerBriefing, answeredAwaitingKeys } from './board.ts';
 import { OpenToolCalls } from './open-tool-calls.ts';
 import type { InstructionRef, ProjectSettings } from './registry.ts';
-import { browserSettingsOf, responseDigestOf, toolSettingsOf } from './registry.ts';
+import { browserSettingsOf, orchestratorProfileOf, responseDigestOf, toolSettingsOf } from './registry.ts';
 import * as browser from './browser.ts';
 import { MCP_SERVER_NAME } from './browser.ts';
 import * as dispatchBroker from './dispatch-broker.ts';
@@ -1144,6 +1144,10 @@ export class AgentSession {
         effort: s.effort || undefined,
         allowedTools: s.allowedTools.length ? s.allowedTools : undefined,
         disallowedTools: s.disallowedTools.length ? s.disallowedTools : undefined,
+        // FEAT-096 phase 2 — opt-IN per project, default off. See registry.ts
+        // `OrchestratorProfileSettings` for why this is not expressed through
+        // the two fields above.
+        orchestratorProfile: orchestratorProfileOf(opts.project).enabled || undefined,
         resume: opts.resumeSessionId ? (this.#forkPlan?.resumeSessionId ?? opts.resumeSessionId) : undefined,
         forkSession: opts.resumeSessionId && opts.fork ? true : undefined,
         mcpServers,

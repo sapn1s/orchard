@@ -112,7 +112,7 @@
   - The queue row: "To composer" on EVERY row, not only dead ones (BUG-149's
     scope), and "Force send" only when it could actually run. The reported
     state produces a `restored` — alive — row whose only action refused.
-- **Verified:** `npm run verify:bug-153` — **21 passed, 0 failed**. Real server,
+- **Verified:** `npm run verify:bug-153` — **20 passed, 0 failed**, re-run against the exact committed tree (an earlier run said 21/21 before a redundant check was dropped; the count is the later, committed one). Real server,
   real `claude` sessions holding a real in-flight turn, real headless browser
   doing the clicks; the must-FAIL leg is a constructed pre-fix client (7
   substitutions, each asserting a hit count of exactly 1), never `git show

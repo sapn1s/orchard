@@ -180,6 +180,41 @@ export function dispatchAvailabilityNote(enabled: boolean, route: string, unavai
   return `\n\n## OpenAI dispatch availability\nOpenAI dispatch is enabled for this session. Check it with \`${route} --check\`; dispatch with the same command plus \`--provider openai ...\`.`;
 }
 
+/*
+ * Why this note exists at all.
+ *
+ * The browser was attached SILENTLY: a session saw `mcp__stealth-browser__*`
+ * in its tool list and had to infer the rest. Two subagents in a container
+ * session on 2026-08-25 inferred wrong. They finished with the browser, wanted
+ * to close it, found no tool for it, and reached for the host process table —
+ * one ran `lsof -t -i:PORT` (not installed in the image), then fell back to
+ * `ps`/`kill` by pattern. That is the exact shape that ends with `pkill
+ * chromium` killing every Chrome window the user had open, including their own.
+ *
+ * The defect is DISCOVERABILITY, not obedience. The browser runs on the HOST,
+ * outside the sandbox; from inside a session there is nothing to see and
+ * nothing safe to kill, so any process-level reasoning is a guess. So state the
+ * three facts a model needs to stop guessing: the window is real and in the
+ * user's way, there is exactly one command that closes it, and killing is never
+ * the answer. Mirrors dispatchAvailabilityNote's three-state shape (FEAT-102):
+ * enabled / enabled-but-broken / not-enabled — never silence.
+ */
+export function browserAvailabilityNote(enabled: boolean, unavailableReason?: string): string {
+  const head = '\n\n## Browser availability';
+  if (!enabled) {
+    return `${head}\nThis project has NO browser. There are no \`mcp__stealth-browser__*\` tools in this session. Enable Settings › Tools › Browser and launch a new session. Do not try to start or install one yourself, and never launch or kill a browser process from the shell.`;
+  }
+  if (unavailableReason) {
+    return `${head}\nThis project's browser is enabled but currently UNAVAILABLE: ${unavailableReason}. Report that reason and stop; there is nothing to fix from inside this session. Do NOT start a browser yourself and do NOT kill any process.`;
+  }
+  return `${head}
+You have a browser via \`mcp__stealth-browser__*\`. It runs **on the host, outside your sandbox**, and opens a **real visible window in the user's workspace** — the user can see it and it is in their way while it is open.
+
+- **Opening is automatic.** The first tool call that needs a page (e.g. \`browser_navigate\`) starts it. Never start a browser yourself.
+- **Closing it is your job, and there is exactly one way:** call \`mcp__stealth-browser__browser_close\` as soon as you are done. It is safe, idempotent (closing an already-closed browser succeeds), and cheap — logins and cookies survive and the next browser call reopens it. Left alone it lingers for up to 15 idle minutes in the user's face.
+- **NEVER kill a browser process.** Not \`pkill\`, not \`killall\`, not \`kill\` by name, pattern or port, and do not go looking with \`ps\`/\`lsof\`/\`pgrep\`. The browser is not in your process table; anything you find and kill is something else — plausibly the user's own Chrome. If \`browser_close\` fails, say so and stop. There is no fallback and you are not expected to find one.`;
+}
+
 function pickOverridable(s: ProjectSettings): Overridable {
   return {
     // FEAT-037 P3: resolved, never absent — registries written before the
@@ -758,6 +793,16 @@ export class AgentSession {
       : `node ${dispatchBroker.dispatchClientPath()}`;
     const dispatchNote = dispatchAvailabilityNote(dispatchOn, dispatchRoute, opts.dispatchUnavailableReason);
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, dispatchNote) };
+    /*
+     * Gated on the SAME fact plannedMcpServers() gates the attach on
+     * (tools.ts: `browserSettingsOf(project).enabled`), so the note and the
+     * tools can never disagree. Isolation-independent on purpose: `direct` and
+     * `container` both reach the one host browser through the adapter's own
+     * entry point (ARCH-007), so the advice is identical and a session never
+     * has to work out which shape it is in.
+     */
+    const browserNote = browserAvailabilityNote(browserSettingsOf(opts.project).enabled);
+    this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, browserNote) };
     for (const missing of this.composed.missingIds) {
       this.#emit({ t: 'error', message: `instruction template not found: ${missing}`, fatal: false });
     }

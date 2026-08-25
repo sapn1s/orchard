@@ -47,6 +47,7 @@
     "verify:proc-chip": "node scripts/verify-bug-082-proc-chip.mjs",
     "verify:browser": "node scripts/verify-browser.mjs",
     "verify:arch-007": "node scripts/verify-arch-007-lazy-browser.mjs",
+    "verify:browser-close": "node scripts/verify-browser-close-command.mjs",
     "verify:bug-118": "node scripts/verify-bug-118-orchard-only-stop-hook.mjs",
     "verify:live": "node scripts/verify-live.mjs",
     "verify:snapshots": "node scripts/verify-snapshots.ts",

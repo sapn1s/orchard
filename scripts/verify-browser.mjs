@@ -158,9 +158,21 @@ try {
       `browser_read; repeat at most twice. Then tell me in one line: the page title, and one concrete job ` +
       `posting you can see (its job title and company). Use only the browser tools.`,
   }));
+  /*
+   * Sample DURING the turn, not after it. The claim this check exists to make is
+   * "Chrome really ran on the HOST, not inside the container" — it is not a claim
+   * that the browser is still up once the model is finished. Since `browser_close`
+   * exists and the launch prompt tells sessions to call it as soon as they are
+   * done, a well-behaved session now leaves nothing behind, and a post-turn sample
+   * legitimately reads zero. Sampling post-hoc made this assert the very behaviour
+   * the user complained about (a window lingering in their workspace).
+   */
+  let peakChromeA = 0;
+  const sampler = setInterval(() => { peakChromeA = Math.max(peakChromeA, chromePids('br-a').length); }, 250);
   const init = await waitEv(ev, (e) => e.t === 'session-init', 240000);
-  if (!init) throw new Error(`precondition failed: session never initialised. events=${JSON.stringify(ev.slice(-6))}`);
+  if (!init) { clearInterval(sampler); throw new Error(`precondition failed: session never initialised. events=${JSON.stringify(ev.slice(-6))}`); }
   const end = await waitEv(ev, (e) => e.t === 'turn-end', 420000);
+  clearInterval(sampler);
   const toolCalls = ev.filter((e) => e.t === 'tool-call');
   const browserCalls = toolCalls.filter((e) => /stealth-browser/.test(e.name));
   const navCall = browserCalls.find((e) => /browser_navigate/.test(e.name));
@@ -203,7 +215,9 @@ try {
     `subtype=${end?.subtype}; reply=${JSON.stringify(text.replace(/\s+/g, ' ').trim().slice(0, 240))}`,
   );
   const liveA = chromePids('br-a');
-  check('a real Chrome is running for project A on the HOST', liveA.length > 0, `${liveA.length} chrome process(es) with A's --user-data-dir`);
+  check('a real Chrome ran for project A on the HOST',
+    peakChromeA > 0,
+    `peak during turn=${peakChromeA} chrome process(es) with A's --user-data-dir; still live after turn=${liveA.length}`);
 
   section('4. isolation: A can never be handed B\'s socket');
   await api(`/api/projects/${b.id}`, 'PATCH', { browser: { enabled: true } });

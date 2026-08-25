@@ -293,7 +293,11 @@ function reapMyHosts() {
     out = execSync('ps -eo pid=,args=', { encoding: 'utf8' });
   } catch { return; }
   for (const line of out.split('\n')) {
-    if (!line.includes('session-host.mjs') || !line.includes(SCRATCH)) continue;
+    // The host AND the CLI it spawned: killing only the host orphans the
+    // `claude` child, which then sits out the rest of its sleep against a data
+    // dir that no longer exists (observed — three of them, after a clean run).
+    if (!line.includes(SCRATCH)) continue;
+    if (!line.includes('session-host.mjs') && !line.includes('claude-agent-sdk')) continue;
     const pid = Number(line.trim().split(/\s+/)[0]);
     if (!Number.isInteger(pid) || pid <= 1) continue;
     console.log(`        reaping my own leftover session host, pid ${pid}`);

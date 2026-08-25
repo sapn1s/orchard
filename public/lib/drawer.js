@@ -2070,6 +2070,23 @@ export function createDrawer(ctx) {
    * The consequence is stated in BOTH states — a warning that only appears
    * once the danger is accepted is not a warning — and switching it on takes a
    * second, deliberate click rather than happening on the first.
+   *
+   * BUG-154 — the wording keeps two things apart that the old text ran
+   * together. The GRANT is reversible: the flag is a bind, so turning it off
+   * and letting the container be recreated removes the socket exactly the way
+   * turning it on added it (containerManager `desiredBinds`, drift -> recreate).
+   * The CONSEQUENCE is not: through a rootful daemon the session can run a
+   * container of its own mounting any host path, so what it wrote or left
+   * running outlives the setting. Saying "this cannot be undone" of the switch
+   * itself is false, and a consent control that misstates what it is asking
+   * consent for teaches the reader to discount the true half.
+   *
+   * "any path the daemon can reach" is deliberate: it is exact on a rootless
+   * daemon too (everything that user owns — home, keys, every other project),
+   * where "root on this machine" would overstate it. The rootful clause is
+   * flagged as the usual case rather than asserted about a daemon the browser
+   * cannot inspect. Checked on this machine 2026-08-25: rootful
+   * (`docker info` Root=/var/lib/docker, socket root:docker, no name=rootless).
    */
   function dockerSocketBlock(readOnly = false) {
     const on = settings().container?.dockerSocket === true;
@@ -2080,18 +2097,21 @@ export function createDrawer(ctx) {
     const why = el('div', { class: 'why' });
     if (on) {
       why.append(
-        document.createTextNode('On. This session can start containers of its own, outside this one — the isolation you set above stops at the socket. '),
+        document.createTextNode('On. This session can start containers of its own, outside this one — the isolation you set above stops at the socket. '
+          + 'Turning it off takes the socket away at the next container rebuild; it undoes nothing already done through it. '),
         el('code', { text: DOCKER_SOCK }));
     } else if (d.armSocket) {
       why.append(
-        document.createTextNode('Turning this on hands the session the daemon socket. On a rootful daemon that is equivalent to root on this machine: it can mount any path into a container of its own making, so every limit set above stops applying. '),
+        document.createTextNode('Turning this on hands the session the daemon socket: containers of its own, mounting any path the daemon can reach. '
+          + 'On a rootful daemon — the usual kind — that is root on this machine, and every limit set above stops applying. '
+          + 'Turning it back off removes the socket at the next container rebuild; it does not undo what was done with it — files written anywhere on the host, and containers left running, outlive it. '),
         el('code', { text: DOCKER_SOCK }));
       const acts = el('div', { class: 'state-row' });
       const cancel = el('button', { class: 'mini', text: 'Cancel' });
       cancel.addEventListener('click', () => { d.armSocket = false; paint(); });
       const go = el('button', { class: 'mini', text: 'Turn it on anyway' });
       go.addEventListener('click', () => { d.armSocket = false; void putContainer({ dockerSocket: true }); });
-      acts.append(el('span', { class: 'txt', text: 'This cannot be undone for work already done inside the session.' }),
+      acts.append(el('span', { class: 'txt', text: 'The access is reversible. What it is used for is not.' }),
         el('span', { class: 'acts' }, cancel, go));
       why.append(acts);
     } else {
@@ -2218,6 +2238,13 @@ export function createDrawer(ctx) {
     else acts.append(act('Start', 'start'), act('Rebuild', 'rebuild'));
     stateRow.append(acts);
     frag.append(stateRow);
+    /* BUG-154 — the same precision the socket warning needed: a setting on this
+       screen is a REQUEST until the container is recreated on it. The server
+       already computes that (`drifted`), so say it rather than let the rows read
+       as a description of what is running right now. */
+    if (c.drifted === true) {
+      frag.append(note('Changed since this container started. It keeps the mounts, socket flag and limits it was created with until you rebuild.'));
+    }
     return frag;
   }
 

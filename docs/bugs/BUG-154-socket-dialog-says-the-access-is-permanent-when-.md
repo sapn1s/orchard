@@ -76,3 +76,6 @@
   Still open / handoff: the dialog cannot inspect the daemon, so the rootful clause stays a hedge. The server could report rootless-ness from `docker info` SecurityOptions and let the text state it flatly; that is a server+UI change and was left out of a wording fix. Risk bucket: security-surface copy plus one new UI line, no behaviour change - an independent clean-room pass is worth it for the claim's accuracy (does the new text survive a reader who has NOT read the code), not for regression risk.
 
   Symptom of a deeper design flaw? no - the mechanism was right, only the sentence describing it was imprecise. The neighbour drift line is the structural half and it is fixed here.
+
+### 2026-08-25 — worker
+- **committed:** Committed as 303f851 (public/lib/drawer.js, scripts/verify-bug-154-socket-consent-wording.mjs). Not pushed.

@@ -330,6 +330,47 @@ later agents the habit in the first place.
 Author metadata cannot be corrected by any ordinary commit, only by rewriting
 history, so this rule is cheap to follow and expensive to break.
 
+## Publishing — this is an ordinary git repo now; there is no mirror (2026-08-25)
+
+**How to publish: `git commit`, then `git push`. That is the whole procedure.**
+No mirror script, no scratch build tree, no scrub step, no force push.
+
+`main` tracks `origin/main` on the public GitHub repo already configured as
+`origin` (`git remote -v`), and the two are equal. Leave that remote as it is —
+it is the only one you need. The published history begins at a single root commit,
+`609db5e "Orchard — initial public release"`, whose tree is byte-identical to
+the working tree the 369-commit local history had produced. On 2026-08-25 local
+`main` was collapsed onto that commit, so local and published now share one
+history and a plain `git push` is an ordinary fast-forward.
+
+**Why it was collapsed, so nobody helpfully restores it.** Those 369 commits
+contain real, unremovable leaks — at a commit from that same day the leak gate
+fails with 12 hits across 3 files, including two real Codex session paths and a
+client's product terms. The leaks are in the *history*, which no later commit
+can fix. Collapsing is what makes local match published and is the only thing
+stopping that history being pushed later by someone treating this as a normal
+repo. If you find yourself about to publish "the full history", this paragraph
+is the answer to why you must not.
+
+**The old history is preserved, not lost:** local branch
+`local-history-before-collapse-20260825` (369 commits, tip `9e74119`), plus the
+bundle and `.git` copy under `~/scratch/orchard-backup-20260825/`, plus remote
+branch `backup-before-publish-20260825`. Do not delete any of these.
+
+**Never push the preserved branch.** It is exactly the leaking history. In
+practice that means: push `main` and ordinary feature branches; never
+`git push --all`, never `git push origin local-history-before-collapse-*`, and
+never `--force` to `main` in the routine path.
+
+`scripts/publish-public-mirror.sh` and the mirror-era verify scripts are
+**historical**. They existed to rebuild a clean tree because local history could
+not be published; that problem is solved and running them again would recreate
+the split this removed. Do not reach for them, and do not write a replacement.
+
+Because every commit on `main` is now directly publishable, `npm run gate` before
+committing is no longer a formality — it is the only thing standing between a new
+leak and the public repo.
+
 ## Relocated from the universal Working Agreement — 2026-08-10
 
 ### From WA §I "I. Orchestrate multi-item work; keep your own context lean"

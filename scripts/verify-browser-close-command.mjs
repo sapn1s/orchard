@@ -296,7 +296,7 @@ async function main() {
    */
   check('it is gated on the same setting that attaches the tools',
     /const stealthOn = browserSettingsOf\(opts\.project\)\.enabled;/.test(bridgeSrc)
-    && /browserAvailabilityNote\(stealthOn\)/.test(bridgeSrc));
+    && /browserAvailabilityNote\(stealthOn,\s*opts\.browserUnavailableReason\)/.test(bridgeSrc));
   check('the note claims a browser exactly when the setting is on',
     /You have a browser/.test(browserAvailabilityNote(true))
     && !/You have a browser/.test(browserAvailabilityNote(false)));

@@ -191,11 +191,22 @@ export interface McpPlan {
  * THE attach decision. Consults each per-project toggle and returns the exact
  * `mcpServers` map + strict flag a launched session receives. Order is stable
  * (browser, serena, playwright) but irrelevant to the SDK.
+ *
+ * BUG-152 — `browserUnavailableReason` is how a DEGRADED stealth browser stays
+ * out of the tool list. It is decided once in startSession (adapter missing, or
+ * its daemon would not come up) and threaded here rather than re-derived,
+ * because the system-prompt note is gated on the identical value: a session told
+ * "enabled but UNAVAILABLE" must not simultaneously be handed 24 browser tools
+ * that cannot work. Attaching them anyway is the failure this replaces — for a
+ * container the shim would point at a socket that was never bind-mounted, so
+ * every call fails mid-task instead of at launch.
  */
-export function plannedMcpServers(project: Project): McpPlan {
+export function plannedMcpServers(project: Project, opts?: { browserUnavailableReason?: string }): McpPlan {
   const servers: Record<string, McpStdioServer> = {};
   const browserSettings = browserSettingsOf(project);
-  if (browserSettings.enabled) servers[MCP_SERVER_NAME] = browserMcpServerFor(project, browserSettings.idleMs);
+  if (browserSettings.enabled && !opts?.browserUnavailableReason) {
+    servers[MCP_SERVER_NAME] = browserMcpServerFor(project, browserSettings.idleMs);
+  }
   const tools = toolSettingsOf(project);
   if (tools.serena) servers[SERENA_SERVER_NAME] = serenaMcpServerFor(project);
   if (tools.playwright) servers[PLAYWRIGHT_SERVER_NAME] = playwrightMcpServerFor(project);

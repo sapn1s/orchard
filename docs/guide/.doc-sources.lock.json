@@ -33,7 +33,7 @@
       "blessedAt": "2026-08-25",
       "sources": {
         ".mcp.json": "beb81dec9253dfe23badb87facfde11fe4253452",
-        "docs/CONVENTIONS.md": "b6adbceb8ad3d2cb6bf98caeb9c98eea24da76d3",
+        "docs/CONVENTIONS.md": "2f5e8369545cef17f7ac9559191f7fc213d0bb43",
         "docs/bugs/FEAT-025-serena-lsp-mcp-tier.md": "db764482bbdf73878aa969f572d26fe574b7921e",
         "docs/prompts/ROUTING.md": "c8e4350733d25c0bdddf80ab5993614e7c5d77ca",
         "scripts/verify-browser.mjs": "e3274dca67c8e497e633c67c34a9a4dc64ac0ae7",
@@ -42,7 +42,7 @@
         "src/server/container/provision.json": "acd6486426203b568753a53673dc31d92552f373",
         "src/server/runtime/claude-runtime.ts": "38bf77897d967c6d292df8da04f3e533bc79fc2b",
         "src/server/runtime/codex-runtime.ts": "db4b8091a8d48e82e64197636d817fd86e1a9290",
-        "src/server/tools.ts": "26ce998bf21a964e3985fee8d265bdf8efb46738"
+        "src/server/tools.ts": "3844688d8a8818c779352d7b9d2aad83b44202ae"
       }
     },
     "orchestration.md": {

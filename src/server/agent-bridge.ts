@@ -170,6 +170,8 @@ export interface StartOptions {
   forkPlan?: ForkPlan;
   /** Filled in by startSession(); callers never set this. */
   dispatchUnavailableReason?: string;
+  /** Filled in by startSession(); callers never set this. */
+  browserUnavailableReason?: string;
 }
 
 type Overridable = Pick<ProjectSettings, SessionOverridable>;
@@ -843,15 +845,17 @@ export class AgentSession {
     const dispatchNote = dispatchAvailabilityNote(dispatchOn, dispatchRoute, opts.dispatchUnavailableReason);
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, dispatchNote) };
     /*
-     * Gated on the SAME fact plannedMcpServers() gates the attach on
-     * (tools.ts: `browserSettingsOf(project).enabled`), so the note and the
-     * tools can never disagree. Isolation-independent on purpose: `direct` and
-     * `container` both reach the one host browser through the adapter's own
-     * entry point (ARCH-007), so the advice is identical and a session never
-     * has to work out which shape it is in.
+     * Gated on the SAME facts plannedMcpServers() gates the attach on
+     * (tools.ts: `browserSettingsOf(project).enabled` AND the absence of a
+     * `browserUnavailableReason`), so the note and the tools can never disagree:
+     * a session that is told "enabled but UNAVAILABLE" has no
+     * `mcp__stealth-browser__*` in its tool list either. Isolation-independent on
+     * purpose: `direct` and `container` both reach the one host browser through
+     * the adapter's own entry point (ARCH-007), so the advice is identical and a
+     * session never has to work out which shape it is in.
      */
     const stealthOn = browserSettingsOf(opts.project).enabled;
-    const browserNote = browserAvailabilityNote(stealthOn);
+    const browserNote = browserAvailabilityNote(stealthOn, opts.browserUnavailableReason);
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, browserNote) };
     /*
      * BUG-151 — gated on the SAME fact plannedMcpServers() attaches Playwright on
@@ -861,7 +865,11 @@ export class AgentSession {
      * the whole defect.
      */
     const pwNote = playwrightAvailabilityNote(toolSettingsOf(opts.project).playwright, {
-      stealthEnabled: stealthOn,
+      // Enabled-but-unavailable is NOT an alternative to offer. Telling a session
+      // "use the stealth browser instead" when its tools were not attached sends
+      // it looking for a toolset that is not there — the same guess-and-improvise
+      // the availability notes exist to prevent.
+      stealthEnabled: stealthOn && !opts.browserUnavailableReason,
       inContainer: opts.project.isolation === 'container',
     });
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, pwNote) };
@@ -1140,7 +1148,7 @@ export class AgentSession {
      * be in the repo's `.mcp.json` or the user's global ~/.claude settings, so a
      * session's tool surface is exactly what Claude Station handed it.
      */
-    const plan = plannedMcpServers(opts.project);
+    const plan = plannedMcpServers(opts.project, { browserUnavailableReason: opts.browserUnavailableReason });
     let mcpServers: Record<string, unknown> | undefined =
       Object.keys(plan.servers).length ? (plan.servers as Record<string, unknown>) : undefined;
     let strictMcpConfig = plan.strict;
@@ -3908,12 +3916,36 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
    * socket answers, having launched no browser; the first in-container tool call
    * launches Chrome on the host, through the mounted socket.
    *
-   * The AVAILABILITY check stays on both paths — and now also refuses an adapter
+   * The AVAILABILITY check stays on both paths — and also refuses an adapter
    * that cannot declare lazy start, because attaching an eager one would put the
-   * unwanted window straight back. If the adapter is missing or eager we refuse
-   * the session outright, because handing back a session silently missing the
-   * browser the user enabled just moves the failure to mid-task.
+   * unwanted window straight back.
+   *
+   * BUG-152 — AN UNAVAILABLE BROWSER DEGRADES THE SESSION; IT NO LONGER KILLS IT.
+   *
+   * This used to `fatal: true` and throw, on the reasoning that "handing back a
+   * session silently missing the browser the user enabled just moves the failure
+   * to mid-task". SILENTLY was the load-bearing word, and it is no longer what
+   * happens: FEAT-105's `browserAvailabilityNote` has an enabled-but-UNAVAILABLE
+   * state that states the reason in the system prompt, and the reason now also
+   * keeps the toolset out of the tool list (tools.ts `plannedMcpServers`), so
+   * there is nothing left to discover mid-task. What the refusal actually cost
+   * was everything else: an unavailable adapter turned EVERY session in EVERY
+   * browser-enabled project into "Error" at start.
+   *
+   * That is not hypothetical. `CLAUDE_STATION_SBMCP_REPO` is host configuration
+   * that lives outside the repo, so it can go missing for reasons that have
+   * nothing to do with the session being started — on 2026-08-25 a reboot
+   * dropped it from the user's systemd environment and a project that had not
+   * been touched in weeks could not start a session at all. Refusing to run an
+   * agent because an OPTIONAL tool is unconfigured trades the whole product for
+   * one feature. Same call the OpenAI dispatch broker above already makes
+   * (`prepareDispatchForSession`, FEAT-102) and the same call the README already
+   * documents for this toggle: "or the toggle degrades with a clear message".
+   *
+   * The error event stays — the user still sees, in red, exactly what is wrong
+   * and what to set. It is `fatal: false`, so the session lives.
    */
+  let browserUnavailableReason: string | undefined;
   if (browserSettingsOf(opts.project).enabled) {
     try {
       const avail = browser.available();
@@ -3944,9 +3976,12 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
     } catch (err) {
       const e = err as Error;
       const be = err instanceof browser.BrowserError ? err : null;
-      const msg = `stealth browser unavailable${be ? ` (${be.code})` : ''}: ${e.message}${be?.detail ? `\n${be.detail}` : ''}`;
-      opts.onEvent({ t: 'error', message: msg, fatal: true });
-      throw new Error(msg);
+      browserUnavailableReason = `${be ? `${be.code}: ` : ''}${e.message}${be?.detail ? `\n${be.detail}` : ''}`;
+      opts.onEvent({ t: 'error', message: `stealth browser unavailable — ${browserUnavailableReason}`, fatal: false });
+      opts.onEvent({
+        t: 'status',
+        status: 'starting session WITHOUT the stealth browser; no `mcp__stealth-browser__*` tools are attached',
+      });
     }
   }
 
@@ -4066,7 +4101,7 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
 
   let s: AgentSession;
   try {
-    s = new AgentSession(id, { ...opts, forkPlan, dispatchUnavailableReason });
+    s = new AgentSession(id, { ...opts, forkPlan, dispatchUnavailableReason, browserUnavailableReason });
   } catch (err) {
     discardStaged(forkPlan?.stagedFile ?? null);
     throw err;

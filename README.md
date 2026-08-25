@@ -95,7 +95,9 @@ Per-project toggles. None of these are bundled.
 - **playwright.** `@playwright/mcp` via `npx`, an ephemeral headless browser with a clean profile.
 - **A persistent browser profile.** Keeps its profile between sessions for sites you stay signed
   into. It is a separate local project, not published here; point `CLAUDE_STATION_SBMCP_REPO` at
-  it, or the toggle degrades with a clear message.
+  it, or the toggle degrades with a clear message — the session still starts, without the browser
+  tools, and says why. Set it where the server actually starts (a systemd unit drop-in, not a
+  shell): exported into a session manager's environment it disappears on the next reboot.
 
 ## Security posture
 

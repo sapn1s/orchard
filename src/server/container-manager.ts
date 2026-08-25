@@ -34,7 +34,7 @@ import { projectRoot, ensureDir } from '../lib/paths.ts';
 import type { Project, Mount, ContainerSettings } from './registry.ts';
 import { containerSettingsOf, browserSettingsOf, toolSettingsOf } from './registry.ts';
 import { provisionHash, serenaPin, type ProvisionState } from './provisioning.ts';
-import { browserBinds, containerEnv as browserContainerEnv, stateHome as browserStateHome, CONTAINER_MCP_DIR } from './browser.ts';
+import { available as browserAvailable, browserBinds, containerEnv as browserContainerEnv, socketPath as browserSocketPath, stateHome as browserStateHome, CONTAINER_MCP_DIR } from './browser.ts';
 import { dispatchBinds, dispatchSocketPath, dispatchStateHome, CONTAINER_DISPATCH_DIR, CONTAINER_DISPATCH_SOCKET_DIR } from './dispatch-broker.ts';
 
 /* --------------------------------------------------------------- constants */
@@ -290,7 +290,18 @@ export function desiredBinds(project: Project): BindSpec[] {
    * read-only single-file MCP shim. There is no TCP listener anywhere, so a
    * container gets exactly one browser: its own.
    */
-  if (browserSettingsOf(project).enabled) {
+  /*
+   * BUG-152 — an ENABLED browser whose adapter is not configured contributes no
+   * binds at all, and asking for them must not throw. `browserBinds` resolves
+   * the MCP shim through `requireRepoDir()`, which throws when
+   * CLAUDE_STATION_SBMCP_REPO is unset — so before this guard, a project with
+   * the toggle on and no adapter could not have its container ensured AT ALL:
+   * `POST /container/start|rebuild` and the drift check both died on a browser
+   * path, reporting an adapter error for a container operation. Session start
+   * degrades past an unavailable adapter now (agent-bridge), so this is the
+   * shape a real session reaches, not a corner.
+   */
+  if (browserSettingsOf(project).enabled && browserAvailable().ok) {
     /*
      * BUG-136 (THIRD report) — DO NOT BIND THE SOCKET WHEN IT IS NOT THERE.
      *
@@ -995,20 +1006,30 @@ async function doEnsure(project: Project, opts: { onLog?: (s: string) => void })
    * at the socket path this project owns, and any failure is reported and
    * ignored rather than failing the ensure.
    */
+  /*
+   * BUG-152 — this reads the socket path DIRECTLY rather than filtering
+   * `browserBinds()` for it. Same path, but `browserBinds` also resolves the MCP
+   * shim through `requireRepoDir()`, so asking it for the socket threw the whole
+   * ensure when CLAUDE_STATION_SBMCP_REPO was unset — and that is precisely the
+   * state in which this heal matters most, since an unconfigured adapter is one
+   * of the ways the daemon ends up down while a container is created. Guarding
+   * this block on `available()` instead would have disabled the repair exactly
+   * when it is needed. `socketPath` derives from the state dir and the project
+   * id; it needs no adapter checkout.
+   */
   if (browserSettingsOf(project).enabled) {
-    for (const b of browserBinds(project)) {
-      if (b.why !== 'stealth browser socket') continue;
-      let st: fs.Stats;
-      try { st = fs.lstatSync(b.hostPath); } catch { continue; }
-      if (!st.isDirectory()) continue;
+    const sock = browserSocketPath(project);
+    let st: fs.Stats | null = null;
+    try { st = fs.lstatSync(sock); } catch { st = null; }
+    if (st?.isDirectory()) {
       try {
-        fs.rmdirSync(b.hostPath); // fails loudly if non-empty — never recursive
+        fs.rmdirSync(sock); // fails loudly if non-empty — never recursive
         opts.onLog?.(
-          `[container] removed a directory left at the stealth browser socket path ${b.hostPath}. ` +
+          `[container] removed a directory left at the stealth browser socket path ${sock}. ` +
             'Docker created it from a missing mount source and it was blocking the browser daemon from ever starting.\n',
         );
       } catch (err) {
-        opts.onLog?.(`[container] could not clear ${b.hostPath} (${(err as Error).message}) — the stealth browser will not start until it is removed.\n`);
+        opts.onLog?.(`[container] could not clear ${sock} (${(err as Error).message}) — the stealth browser will not start until it is removed.\n`);
       }
     }
   }

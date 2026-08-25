@@ -1,7 +1,10 @@
 ---
 sources:
   - src/server/browser.ts
+  - src/server/tools.ts
+  - src/server/container/provision.json
   - scripts/verify-browser.mjs
+  - scripts/verify-bug-151-playwright-first.mjs
   - docs/CONVENTIONS.md
   - docs/bugs/FEAT-025-serena-lsp-mcp-tier.md
   - .mcp.json
@@ -15,9 +18,9 @@ Orchard attaches extra capabilities to sessions and routes whole tasks across a
 mixed model fleet. Three integrations matter, and two of them are commonly
 confused — so read the browser section first.
 
-## Browser: two DIFFERENT capabilities
+## Browser: three DIFFERENT capabilities
 
-Orchard uses a browser in two unrelated ways. They are not the same tool, not the
+Orchard uses a browser in three unrelated ways. They are not the same tool, not the
 same binary role, and are never used for the same purpose.
 
 ### 1. Browser for UI testing (drives Orchard's own dashboard)
@@ -55,9 +58,34 @@ attached to a session as an MCP integration; tools arrive as
   is gone — it refuses to report "stopped" if an orphaned Chrome survives
   (`ORPHANS REMAIN`).
 
+### 3. Playwright MCP for ordinary UI work (a tool the AGENT uses)
+
+The per-project **Playwright** toggle (`settings.tools.playwright`) attaches
+`@playwright/mcp` to a session; tools arrive as `mcp__playwright__*`. This is the
+browser an agent should use for **ordinary UI verification** — does the page
+render, does the link scroll to the form, does the flow click through, screenshot
+my own dev server. It is **headless and disposable**: no window, nothing in your
+workspace, nothing to close.
+
+- **What it is:** a pinned, baked `@playwright/mcp` (see `container/provision.json`)
+  driving a real Chromium. `direct` sessions use a browser already on the host
+  (brave/chrome/chromium); `container` sessions use a Chromium **baked into the
+  image** at build time. Neither fetches anything at session start.
+- **If a navigate fails** with `Executable doesn't exist` or `Chromium
+  distribution 'chrome' is not found`, the container image predates BUG-151 —
+  rebuild it. Never `playwright install` from inside a session.
+
+**Which browser should an agent use?** Playwright, unless the job needs a real,
+persistent, logged-in profile or has to survive bot protection — then the stealth
+browser. Enabling stealth without Playwright leaves a project with only the
+headful option, so an ordinary UI check pops a window into your workspace. A
+session is told this at launch (`playwrightAvailabilityNote` /
+`browserAvailabilityNote` in `src/server/agent-bridge.ts`), not left to infer it.
+
 **The distinction in one line:** capability #1 is *us testing our dashboard*;
-capability #2 is *the agent going out onto the web*. Different binaries' roles,
-different lifecycles, different reasons.
+#2 is *the agent going out onto the web behind bot-walls*; #3 is *the agent
+checking a UI, invisibly*. Different binaries' roles, different lifecycles,
+different reasons.
 
 ## Serena: the attachable LSP symbol tier (FEAT-025)
 

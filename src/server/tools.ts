@@ -85,6 +85,15 @@ export const PLAYWRIGHT_CDP_ENV = 'CLAUDE_STATION_PLAYWRIGHT_CDP_ENDPOINT';
 export const PLAYWRIGHT_EXECUTABLE_ENV = 'CLAUDE_STATION_PLAYWRIGHT_BROWSER';
 
 /**
+ * BUG-151 — the browser baked into the container image (container/Dockerfile,
+ * pinned in container/provision.json under `tools.playwright.browser`). Named
+ * here, not path-guessed: `--browser chromium` asks Playwright to use its OWN
+ * bundled Chromium build, which it locates under PLAYWRIGHT_BROWSERS_PATH (an
+ * image ENV) without us hard-coding a version-stamped directory.
+ */
+export const CONTAINER_PLAYWRIGHT_BROWSER = 'chromium';
+
+/**
  * Resolve how a Playwright MCP session reaches a browser WITHOUT fetching one.
  *
  * `@playwright/mcp` launches a browser LAZILY (only on the first navigate), and
@@ -99,18 +108,25 @@ export const PLAYWRIGHT_EXECUTABLE_ENV = 'CLAUDE_STATION_PLAYWRIGHT_BROWSER';
  *      found on PATH — this repo already ships/uses brave for its own checks.
  *
  * A CONTAINER is never PATH-scanned (the host's PATH is meaningless inside it);
- * it uses the env overrides only, pointed at a browser valid in the container.
+ * it uses the env overrides, else the browser BAKED INTO THE IMAGE (BUG-151).
  * None of these fetches anything.
+ *
+ * BUG-151 — the container branch used to `return []`, i.e. fall through to
+ * @playwright/mcp's default `chrome` CHANNEL: a system Google Chrome at
+ * /opt/google/chrome/chrome that the image did not contain. Every navigate in
+ * every container session failed, and the session did the reasonable thing with
+ * a broken tool — it used the other browser it had, the headful stealth one, and
+ * a window appeared in the user's workspace. Returning `--browser chromium` here
+ * is what makes "Playwright is enabled" mean "Playwright works".
  */
 export function playwrightBrowserArgs(inContainer: boolean): string[] {
   const cdp = process.env[PLAYWRIGHT_CDP_ENV];
   if (cdp && cdp.trim()) return ['--cdp-endpoint', cdp.trim()];
   const exe = process.env[PLAYWRIGHT_EXECUTABLE_ENV];
   if (exe && exe.trim()) return ['--executable-path', exe.trim()];
-  if (!inContainer) {
-    const found = findHostBrowserExecutable();
-    if (found) return ['--executable-path', found];
-  }
+  if (inContainer) return ['--browser', CONTAINER_PLAYWRIGHT_BROWSER];
+  const found = findHostBrowserExecutable();
+  if (found) return ['--executable-path', found];
   return [];
 }
 

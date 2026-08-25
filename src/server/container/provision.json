@@ -62,10 +62,32 @@
         "src/server/tools.ts points direct-isolation sessions at an existing browser",
         "via --executable-path (the host's brave/chrome/chromium, or",
         "CLAUDE_STATION_PLAYWRIGHT_BROWSER / CLAUDE_STATION_PLAYWRIGHT_CDP_ENDPOINT),",
-        "so a real navigate works fully offline. Baking a browser into the container",
-        "image is a deliberate open decision (image size / which browser); until then",
-        "a container session must be pointed at a browser via those env vars."
+        "so a real navigate works fully offline. CONTAINER isolation gets the browser",
+        "baked below — see `.browser` — because 'no browser in the container' was not a",
+        "neutral gap: BUG-151 showed a session reach for Playwright first (correctly),",
+        "get this exact error, and fall back to the HEADFUL stealth browser, putting a",
+        "window in the user's workspace for a job that should have been invisible."
       ],
+      "browser": {
+        "_readme": [
+          "BUG-151 — the browser Playwright drives inside the container image.",
+          "Installed at BUILD time by playwright-core's own installer (the same",
+          "playwright-core the pinned @playwright/mcp depends on, so the build is",
+          "resolved by the MCP pin above, not by a floating tag). Nothing is fetched",
+          "at session start: src/server/tools.ts passes `--browser chromium` and the",
+          "image exports PLAYWRIGHT_BROWSERS_PATH, so the MCP server finds a browser",
+          "that is already on disk. If it is missing, the error is honest and the",
+          "answer is to rebuild the image — never `playwright install` from a session."
+        ],
+        "name": "chromium",
+        "installer": "playwright-core-install",
+        "resolvedBy": "the playwright-core version depended on by @playwright/mcp above",
+        "installedTo": "/opt/ms-playwright",
+        "env": { "PLAYWRIGHT_BROWSERS_PATH": "/opt/ms-playwright" },
+        "source": "https://playwright.azureedge.net (Playwright's own browser CDN)",
+        "publisher": "Microsoft Corporation (Playwright)",
+        "license": "BSD-3-Clause (Chromium)"
+      },
       "identityCheckedOn": "2026-08-18",
       "identityEvidence": [
         "npm @playwright/mcp 0.0.79 — author 'Microsoft Corporation', repository https://github.com/microsoft/playwright-mcp.git, license Apache-2.0, homepage https://playwright.dev.",

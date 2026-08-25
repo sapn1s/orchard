@@ -285,8 +285,21 @@ async function main() {
   const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src/server/agent-bridge.ts'), 'utf8');
   check('the note is appended to the composed system prompt at launch',
     /appendToSystemPrompt\(this\.composed\.systemPrompt,\s*browserNote\)/.test(bridgeSrc));
+  /*
+   * BUG-151 — this used to assert the literal call text
+   * `browserAvailabilityNote(browserSettingsOf(opts.project).enabled)`, which
+   * broke the moment that value was hoisted into a const so the new Playwright
+   * note could share it. The PROPERTY is what matters: the note's claim and the
+   * attach decision come from the one setting. Assert that as behaviour, plus a
+   * source check that the argument still originates from `browserSettingsOf`
+   * rather than some other flag.
+   */
   check('it is gated on the same setting that attaches the tools',
-    /browserAvailabilityNote\(browserSettingsOf\(opts\.project\)\.enabled\)/.test(bridgeSrc));
+    /const stealthOn = browserSettingsOf\(opts\.project\)\.enabled;/.test(bridgeSrc)
+    && /browserAvailabilityNote\(stealthOn\)/.test(bridgeSrc));
+  check('the note claims a browser exactly when the setting is on',
+    /You have a browser/.test(browserAvailabilityNote(true))
+    && !/You have a browser/.test(browserAvailabilityNote(false)));
 
   console.log(`\n${'='.repeat(60)}\n${pass} passed, ${fail} failed`);
   if (fail) console.log(`failures:\n  - ${failures.join('\n  - ')}`);

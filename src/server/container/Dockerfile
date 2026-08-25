@@ -78,10 +78,6 @@ RUN set -eux; \
 # and is hashed into the image tag (src/server/provisioning.ts), so a bump here
 # rebuilds instead of being a silently ignored comment.
 #
-# NOTE — the browser is NOT baked here (a deliberate open decision: image size /
-# which browser). The MCP server lists its tools with no browser; a real
-# navigate needs a browser pointed at via --executable-path / --cdp-endpoint
-# (src/server/tools.ts). It never auto-fetches a browser at session start.
 RUN set -eux; \
     PW_PKG="$(jq -r '.tools.playwright.package' /etc/claude-station/provision.json)"; \
     PW_VER="$(jq -r '.tools.playwright.version' /etc/claude-station/provision.json)"; \
@@ -89,6 +85,42 @@ RUN set -eux; \
     test -n "${PW_VER}" && test "${PW_VER}" != "null"; \
     npm install -g --prefix /usr/local "${PW_PKG}@${PW_VER}"; \
     playwright-mcp --version | grep -F "${PW_VER}"
+
+# BUG-151 — BAKE THE BROWSER TOO. The MCP server alone is not a working tool.
+#
+# This used to end at the server, with a comment calling the browser "a deliberate
+# open decision (image size / which browser)". It was not neutral. A container
+# session with Playwright enabled listed ~24 browser tools that all failed on the
+# first navigate with `Chromium distribution 'chrome' is not found at
+# /opt/google/chrome/chrome`, because @playwright/mcp defaults to the system-Chrome
+# CHANNEL and the image had no Chrome. The observed consequence (2026-08-25,
+# a container-isolated project): the session reached for Playwright FIRST — the right
+# call for an ordinary "does this page scroll to the form" check — hit that error,
+# and fell back to the HEADFUL stealth browser, which put a real window in the
+# user's workspace for a job that should have left no trace. Availability, not
+# judgement, was the defect.
+#
+# Installed by playwright-core's OWN installer, run from the playwright-core that
+# the PINNED @playwright/mcp above depends on — so the browser build is determined
+# by that pin, not by a mutable tag, and the fetch happens once at build time in a
+# durable layer. Same policy as Serena and the MCP server: provisioned, pinned,
+# baked; never fetched at session start.
+#
+# PLAYWRIGHT_BROWSERS_PATH is a system location (not ~/.cache) because the build
+# runs as root and sessions run as `claude`; a per-user cache would be invisible to
+# the session that needs it. `--with-deps` pulls the Chromium shared libraries via
+# apt, which must also happen while we are still root.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN set -eux; \
+    PW_BROWSER="$(jq -r '.tools.playwright.browser.name' /etc/claude-station/provision.json)"; \
+    test -n "${PW_BROWSER}" && test "${PW_BROWSER}" != "null"; \
+    PW_CLI="$(find /usr/local/lib/node_modules/@playwright -path '*playwright-core/cli.js' | head -n 1)"; \
+    test -n "${PW_CLI}"; \
+    node "${PW_CLI}" install --with-deps "${PW_BROWSER}"; \
+    rm -rf /var/lib/apt/lists/*; \
+    chmod -R a+rX /opt/ms-playwright; \
+    test -d /opt/ms-playwright; \
+    test -n "$(find /opt/ms-playwright -type f -name 'headless_shell' -o -type f -name 'chrome' | head -n 1)"
 
 # Non-root user pinned to the HOST uid/gid. Native bind mounts do NOT translate
 # uids: without this every file the container writes into the bind-mounted repo

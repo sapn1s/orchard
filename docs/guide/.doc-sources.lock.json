@@ -30,16 +30,19 @@
       }
     },
     "integrations.md": {
-      "blessedAt": "2026-08-13",
+      "blessedAt": "2026-08-25",
       "sources": {
         ".mcp.json": "beb81dec9253dfe23badb87facfde11fe4253452",
-        "docs/CONVENTIONS.md": "9b0a45b9f1e5ab385e8eb57a7c79caf668aff1d3",
-        "docs/bugs/FEAT-025-serena-lsp-mcp-tier.md": "24b34077b06329e24a5b4400404ebf5187648694",
-        "docs/prompts/ROUTING.md": "4e04acbfbe8729a341881b5d3dc6f12fb61eeec4",
-        "scripts/verify-browser.mjs": "a85eab5b18c2ca94025459dd076e1c87be4c9ec4",
-        "src/server/browser.ts": "81b706aa5fdddd18fecbf939186df9cb13c6765d",
-        "src/server/runtime/claude-runtime.ts": "67b174326e0d257ca218c9ecf58e9f8e3deabe74",
-        "src/server/runtime/codex-runtime.ts": "910463887801e4da31dac862f94799b03a7db259"
+        "docs/CONVENTIONS.md": "b6adbceb8ad3d2cb6bf98caeb9c98eea24da76d3",
+        "docs/bugs/FEAT-025-serena-lsp-mcp-tier.md": "db764482bbdf73878aa969f572d26fe574b7921e",
+        "docs/prompts/ROUTING.md": "c8e4350733d25c0bdddf80ab5993614e7c5d77ca",
+        "scripts/verify-browser.mjs": "e3274dca67c8e497e633c67c34a9a4dc64ac0ae7",
+        "scripts/verify-bug-151-playwright-first.mjs": "327047160ac3733300f4f50122ebbcc0466028d1",
+        "src/server/browser.ts": "c917ea966d609bde918d6f2a0f8948ea8d472671",
+        "src/server/container/provision.json": "acd6486426203b568753a53673dc31d92552f373",
+        "src/server/runtime/claude-runtime.ts": "38bf77897d967c6d292df8da04f3e533bc79fc2b",
+        "src/server/runtime/codex-runtime.ts": "db4b8091a8d48e82e64197636d817fd86e1a9290",
+        "src/server/tools.ts": "26ce998bf21a964e3985fee8d265bdf8efb46738"
       }
     },
     "orchestration.md": {

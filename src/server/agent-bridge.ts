@@ -210,9 +210,58 @@ export function browserAvailabilityNote(enabled: boolean, unavailableReason?: st
   return `${head}
 You have a browser via \`mcp__stealth-browser__*\`. It runs **on the host, outside your sandbox**, and opens a **real visible window in the user's workspace** — the user can see it and it is in their way while it is open.
 
+- **It is not the default browser, and it is not for ordinary UI checks.** If this session also has \`mcp__playwright__*\`, use that instead: it is headless and leaves nothing on screen. Reach for the stealth browser only when the job genuinely needs a real, persistent, logged-in profile or has to survive bot protection. "Does this page render / scroll / click through" is Playwright's job, every time.
 - **Opening is automatic.** The first tool call that needs a page (e.g. \`browser_navigate\`) starts it. Never start a browser yourself.
 - **Closing it is your job, and there is exactly one way:** call \`mcp__stealth-browser__browser_close\` as soon as you are done. It is safe, idempotent (closing an already-closed browser succeeds), and cheap — logins and cookies survive and the next browser call reopens it. Left alone it lingers for up to 15 idle minutes in the user's face.
 - **NEVER kill a browser process.** Not \`pkill\`, not \`killall\`, not \`kill\` by name, pattern or port, and do not go looking with \`ps\`/\`lsof\`/\`pgrep\`. The browser is not in your process table; anything you find and kill is something else — plausibly the user's own Chrome. If \`browser_close\` fails, say so and stop. There is no fallback and you are not expected to find one.`;
+}
+
+/*
+ * BUG-151 — the other half of the browser story, and the half that was silent.
+ *
+ * A session was asked whether a landing page scrolled to a form. It reached for
+ * Playwright FIRST — exactly right — and got back `Chromium distribution 'chrome'
+ * is not found at /opt/google/chrome/chrome`, because the container image baked
+ * the MCP server and no browser. So it fell back to the only browser that
+ * answered: the HEADFUL stealth one, and a window appeared in the user's
+ * workspace for a job that should have left no trace.
+ *
+ * Two defects, both fixed here. The image now bakes a browser (Dockerfile,
+ * provision.json, tools.ts `playwrightBrowserArgs`) so the tool works. And the
+ * CHOICE is now stated at launch instead of being left to inference: with two
+ * browser toolsets attached and nothing saying which is for what, an agent picks
+ * either, and half the time it picks the one that interrupts the user.
+ *
+ * Three-state, like `dispatchAvailabilityNote` (FEAT-102) and
+ * `browserAvailabilityNote` (FEAT-105): enabled / enabled-but-broken / absent —
+ * never silence. Absence is stated loudest, because a session that silently
+ * lacks the right tool is precisely a session that reaches for the wrong one.
+ */
+export function playwrightAvailabilityNote(
+  enabled: boolean,
+  opts: { stealthEnabled: boolean; inContainer: boolean; unavailableReason?: string },
+): string {
+  const head = '\n\n## Playwright availability';
+  if (!enabled) {
+    const alt = opts.stealthEnabled
+      ? ' The only browser here is `mcp__stealth-browser__*`, which is HEADFUL and puts a real window in the user\'s workspace — use it if you must, keep it short, and close it with `mcp__stealth-browser__browser_close` the moment you are done.'
+      : ' This session has no browser at all; say so rather than working around it.';
+    return `${head}\nThis project has NO Playwright. There are no \`mcp__playwright__*\` tools in this session. Enable Settings › Tools › Playwright and launch a new session — the toolset is decided at launch, so flipping it mid-session changes nothing here. Never install Playwright or a browser yourself.${alt}`;
+  }
+  if (opts.unavailableReason) {
+    return `${head}\nPlaywright is enabled but currently UNAVAILABLE: ${opts.unavailableReason}. Report that and stop. Do NOT run \`playwright install\`, do NOT install a browser, and do NOT substitute the headful stealth browser for a check that was meant to be invisible.`;
+  }
+  const stale = opts.inContainer
+    ? '\n- If a navigate fails with `Executable doesn\'t exist` or `Chromium distribution ... is not found`, the container image predates its baked browser. **Report that the image needs rebuilding** (Settings › Container) — do not run `playwright install`, and do not fall back to the stealth browser.'
+    : '';
+  const choice = opts.stealthEnabled
+    ? '\n- This session ALSO has `mcp__stealth-browser__*`. That one is headful and visible; it exists for a persistent logged-in profile and bot protection, nothing else. **When both would work, Playwright wins.**'
+    : '';
+  return `${head}
+You have Playwright via \`mcp__playwright__*\`. It is **headless and disposable** — no window, nothing in the user's workspace, nothing to clean up.
+
+- **This is the default browser for ordinary UI work.** Checking a page renders, clicking a flow, measuring layout or scroll position, screenshotting your own dev server: all Playwright.
+- The browser is already installed and is launched lazily on the first navigate. Never install or download one.${choice}${stale}`;
 }
 
 function pickOverridable(s: ProjectSettings): Overridable {
@@ -801,8 +850,21 @@ export class AgentSession {
      * entry point (ARCH-007), so the advice is identical and a session never
      * has to work out which shape it is in.
      */
-    const browserNote = browserAvailabilityNote(browserSettingsOf(opts.project).enabled);
+    const stealthOn = browserSettingsOf(opts.project).enabled;
+    const browserNote = browserAvailabilityNote(stealthOn);
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, browserNote) };
+    /*
+     * BUG-151 — gated on the SAME fact plannedMcpServers() attaches Playwright on
+     * (tools.ts: `toolSettingsOf(project).playwright`), so the note and the tools
+     * can never disagree. Emitted next to the stealth note on purpose: the two
+     * together are what tell a session WHICH browser to use, and that choice was
+     * the whole defect.
+     */
+    const pwNote = playwrightAvailabilityNote(toolSettingsOf(opts.project).playwright, {
+      stealthEnabled: stealthOn,
+      inContainer: opts.project.isolation === 'container',
+    });
+    this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, pwNote) };
     for (const missing of this.composed.missingIds) {
       this.#emit({ t: 'error', message: `instruction template not found: ${missing}`, fatal: false });
     }

@@ -474,7 +474,12 @@ function scaffoldWaPointer(targetDir) {
 // of "done"), so an onboarded repo that lacks it cannot load either tool. It is
 // deliberately import-free — not even node builtins — so copying it out cannot
 // drag anything else along.
-const COPIED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs'];
+//
+// lib/board-path.mjs joins on the same terms (FEAT-106): it is the ONE place
+// that resolves where an onboarded project keeps its Orchard-generated files
+// (legacy scattered layout vs. the consolidated `.orchard/` one). It is plain
+// ESM, node builtins only, so it copies out cleanly and imports without a build.
+const COPIED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs', 'lib/board-path.mjs'];
 
 // ---------------------------------------------------------------------------
 // FEAT-089 — the method's runtime pieces that today live only in THIS repo:

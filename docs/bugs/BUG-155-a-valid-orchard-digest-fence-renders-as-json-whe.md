@@ -61,13 +61,13 @@
 
   HYPOTHESIS TESTED (dispatch): the digest reaches the user as raw/quoted JSON because the model emits the JSON WITHOUT a fence, or wrapped in quotes, or with a broken info-string. FALSIFIED against real data.
 
-  METHOD: scanned every local transcript (/home/sap/.claude/projects/*/*.jsonl), 1812 files, 14252 assistant text parts. Classified every message carrying digest-shaped JSON ("items"+"importance").
+  METHOD: scanned every local transcript (~/.claude/projects/*/*.jsonl), 1812 files, 14252 assistant text parts. Classified every message carrying digest-shaped JSON ("items"+"importance").
 
   COUNTS: 556 messages carry a digest. 538 render correctly (well-formed leading fence). 18 FAIL (3.2%). A separate loose scan for the hypothesised shapes — a LEADING JSON object or quoted-string digest not in a good fence, importance not required — found ZERO across all 14252 messages. So the imagined shapes (unfenced JSON / quoted string / broken info-string / too-few backticks) do not occur locally at all.
 
   FAILURE SHAPE, 18 of 18 (100%): a WELL-FORMED ```orchard-digest fence with valid JSON, preceded by a short lead-in sentence ("Found it.", "Here is the finished state", "Clear recommendation: ...", "Switching modes — this is advice"). The fence is correct; it is just not the FIRST non-blank line.
 
-  WHY IT RENDERS AS A JSON WALL (code trace, confirmed with the REAL modules against the REAL transcript message that IS the user verbatim example — BUG report #18, "Recommendation: make localhost prefer IPv4 ... /etc/gai.conf", from /home/sap/.claude/projects/-workspace-saasis-bot/a1abc3ed-...jsonl):
+  WHY IT RENDERS AS A JSON WALL (code trace, confirmed with the REAL modules against the REAL transcript message that IS the user verbatim example — BUG report #18, "Recommendation: make localhost prefer IPv4 ... /etc/gai.conf", from ~/.claude/projects/<a private-project bot workspace>/a1abc3ed-...jsonl):
     1. parseDigest -> sliceDigestFence (public/lib/digest.js:64) skips only blank lines, then requires DIGEST_OPEN_RE on the first non-blank line. The lead-in sentence is there, so it returns null -> NOT lifted. (Verified: parseDigest lifts it? false.)
     2. renderAssistantText falls through to parseResponseBlocks, which returns blocks [orchard-digest, orchard-ask, orchard-finding, orchard-finding, orchard-judgment] — orchard-digest IS in KNOWN_BLOCKS so it parses as a body block. (Verified.)
     3. blocksToNodes (public/lib/digest.js:389): pres = BLOCK_PRESENTATION["orchard-digest"] is UNDEFINED — there is no presentation row for orchard-digest — so it hits the final `else if (b.content.trim()) nodes.push(prose(b.content))` branch and renders the raw JSON body as prose. That is the wall of JSON the user copied (the surrounding quotes in their paste are their own quoting of the rendered code-block text; the backticks around `localhost` were dropped in their paste).
@@ -87,4 +87,4 @@
 
   COULD NOT TEST / UNTESTED: (a) I did not drive the real headless-brave renderer end-to-end — the proof above is the parse-level trace with the real pure module (response-blocks.js) plus the exact digest.js regexes, run over the real transcript text; the DOM "JSON wall" is inferred from the code path, not screenshotted. A fixer MUST do the real render + must-FAIL baseline per the charter. (b) Only local transcripts on this machine; the users "across projects / other machines" claim is consistent with this shape but unmeasured off-box. (c) The quoted-string shape the user pasted was NOT found as a stored shape — my read is that it is the users transcription of the rendered code block, not the stored text; a fixer should confirm by looking at the live rendered DOM.
 
-  Scratch (kept): /home/sap/scratch/digest-scan/ (scan.mjs, scan2.mjs, scan3.mjs, prove.mjs).
+  Scratch (kept): ~/scratch/digest-scan/ (scan.mjs, scan2.mjs, scan3.mjs, prove.mjs).

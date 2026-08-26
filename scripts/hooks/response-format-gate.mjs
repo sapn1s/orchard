@@ -105,6 +105,30 @@ function allow() {
   process.exit(0);
 }
 
+/**
+ * Import the FIRST of several relative module specifiers that loads (FEAT-106).
+ * The hook grades with two files — digest.js and response-blocks.js — that live
+ * at DIFFERENT relative paths depending on the project's layout:
+ *   - flat `.orchard/` layout (the consolidated onboard target): `../lib/<x>.js`
+ *     (the hook is at `.orchard/hooks/`, everything folds into `.orchard/lib/`);
+ *   - Orchard's own tree AND legacy onboarded targets: `../../public/lib/<x>.js`.
+ * The co-located `.orchard/lib` copy is tried FIRST so a flat target can never
+ * resolve a stale sibling. All-candidates-fail throws the last error, which the
+ * two call sites turn into the SAME `noteCannotGrade` diagnostics as before, so
+ * the fail-open behaviour and its (previously invisible) trace are unchanged.
+ */
+async function importFirst(specifiers) {
+  let lastErr;
+  for (const spec of specifiers) {
+    try {
+      return await import(spec);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr ?? new Error('importFirst: no candidates supplied');
+}
+
 /** Env truthiness used by every switch here: 1/true/yes (case-insensitive). */
 function isTruthyEnv(v) {
   if (typeof v !== 'string') return false;
@@ -591,7 +615,7 @@ async function main() {
   // Authoritative digest pass/fail: the SINGLE source of truth in digest.js.
   let parseDigest;
   try {
-    ({ parseDigest } = await import('../../public/lib/digest.js'));
+    ({ parseDigest } = await importFirst(['../lib/digest.js', '../../public/lib/digest.js']));
   } catch (err) {
     // Fail open, never wedge — but no longer in silence (round 4).
     noteCannotGrade('deps-digest-unloadable', err?.message, payload);
@@ -645,7 +669,7 @@ async function main() {
    * is imported lazily and dynamically so a target that lacks it (an older
    * onboarded copy) simply records nothing. */
   try {
-    const { parseResponseBlocks } = await import('../../public/lib/response-blocks.js');
+    const { parseResponseBlocks } = await importFirst(['../lib/response-blocks.js', '../../public/lib/response-blocks.js']);
     const parsed = parseResponseBlocks(text);
     try {
       const { recordTurn } = await import('../lib/format-metrics.mjs');

@@ -31,8 +31,13 @@ import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
-const LEAK_GATE = path.join(ROOT, 'scripts', 'leak-gate.mjs');
-const CHECK_NUL = path.join(ROOT, 'scripts', 'check-nul.mjs');
+// Resolve the sub-gates as SIBLINGS of this file (FEAT-106), not as ROOT/scripts.
+// Identical in Orchard's own tree (HERE === <orchard>/scripts) and correct under
+// a flat `.orchard/` layout where gate.mjs, leak-gate.mjs and check-nul.mjs are
+// all direct children of `.orchard/`. repoRoot() below still shells `git
+// rev-parse` with cwd: ROOT, which resolves at any nesting.
+const LEAK_GATE = path.join(HERE, 'leak-gate.mjs');
+const CHECK_NUL = path.join(HERE, 'check-nul.mjs');
 
 /** Repo root (so the gate scans the right tree even when invoked from a subdir). */
 function repoRoot() {

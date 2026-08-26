@@ -255,6 +255,32 @@ function mirrorFor(name) {
 }
 
 /**
+ * FEAT-106 — a mirror in the CONSOLIDATED `.orchard/` layout: the hook lives at
+ * `<name>/hooks/` and EVERY grading dependency is folded into ONE flat
+ * `<name>/lib/` (as `.orchard/lib/` will be), with NO `public/` anywhere. So the
+ * hook's `../../public/lib` candidate cannot resolve and the `../lib` candidate
+ * must. `opts.closure:false` omits the two grading files (digest/response-blocks)
+ * while keeping the STATIC deps present, so the hook still LOADS but its dynamic
+ * candidate loop genuinely fails — the non-vacuity case.
+ */
+function flatMirrorFor(name, { closure = true } = {}) {
+  const base = path.join(SCRATCH, name);
+  const hooks = path.join(base, 'hooks');
+  const lib = path.join(base, 'lib');
+  fs.mkdirSync(hooks, { recursive: true });
+  fs.mkdirSync(lib, { recursive: true });
+  // Statically-imported deps (the hook fails to LOAD without these).
+  const staticLib = [['scripts', 'lib', 'readability.mjs'], ['scripts', 'lib', 'structure.mjs'], ['scripts', 'lib', 'format-metrics.mjs']];
+  // The dynamically-imported grading closure (the candidate loop's target).
+  const closureLib = [['public', 'lib', 'digest.js'], ['public', 'lib', 'dom.js'], ['public', 'lib', 'route.js'], ['public', 'lib', 'response-blocks.js']];
+  for (const rel of [...staticLib, ...(closure ? closureLib : [])]) {
+    const dest = path.join(lib, rel[rel.length - 1]);
+    try { fs.symlinkSync(path.join(ROOT, ...rel), dest); } catch { /* exists */ }
+  }
+  return path.join(hooks, 'response-format-gate.mjs');
+}
+
+/**
  * Cut the CURRENT identity guard out of main(), whatever shape it has now.
  * Round 4 turned the one-line `if (!launchedByOrchard(payload)) return allow();`
  * into a block that also records the reason, and the old one-line regexes went
@@ -1071,6 +1097,71 @@ const main = async () => {
     check('G11 an UNPARSEABLE closure file is allowed through and recorded, not silently swallowed',
       brokeRun.code === 0 && brokeRec.some((r) => r?.verdict === 'deps-digest-unloadable'),
       { code: brokeRun.code, verdicts: brokeRec.map((r) => r?.verdict) });
+  }
+
+  /* ── H. FEAT-106 — THE GRADING CLOSURE RESOLVES IN BOTH LAYOUTS ─────────────
+   * Commit 2 made the hook's two dynamic imports (digest.js, response-blocks.js)
+   * a candidate loop: `../lib/<x>.js` (the consolidated `.orchard/` layout) is
+   * tried FIRST, then `../../public/lib/<x>.js` (Orchard's own tree + legacy
+   * onboarded targets). This section drives the REAL current hook from a mirror
+   * in EACH layout and proves the closure resolved — because a candidate loop
+   * that silently fell through would leave the hook fully inert while looking
+   * exactly like a compliant turn (the deps-* signature). It also drives the
+   * D-partial contract: compliant vs. missing-fence must produce DIFFERENT
+   * outcomes, in advisory AND enforce mode, in both layouts. */
+  console.log('\n=== H. FEAT-106: the grading closure resolves in BOTH layouts ===');
+  {
+    const readLogAt = (dir) => {
+      try {
+        return fs.readFileSync(path.join(dir, 'logs', 'stop-hook-advisory.log'), 'utf8')
+          .trim().split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } });
+      } catch { return []; }
+    };
+    // The exact signature of a candidate-import loop that failed: because the hook
+    // fails OPEN, this is otherwise completely invisible.
+    const depsFailed = (recs) => recs.some((r) => r?.mode === 'ungraded' && /^deps-(digest|blocks)-/.test(r?.verdict ?? ''));
+
+    // Copy the CURRENT hook into the mirror so its relative imports resolve
+    // against THAT mirror's layout, then grade a session the marker names.
+    const drive = (mirrorPath, dataDir, tp, extraEnv = {}) => {
+      fs.writeFileSync(mirrorPath, fs.readFileSync(HOOK));
+      return runHook(mirrorPath, { ...barePayload(tp), session_id: BARE_SESSION_ID },
+        { ORCHARD_SESSION: BARE_SESSION_ID, CLAUDE_STATION_DATA: dataDir, ...extraEnv });
+    };
+
+    for (const [layout, mkMirror] of [['LEGACY (../../public/lib)', () => mirrorFor('feat106-legacy')],
+      ['FLAT .orchard (../lib)', () => flatMirrorFor('feat106-flat')]]) {
+      const hookPath = mkMirror();
+      const data = path.join(SCRATCH, `feat106-${layout.startsWith('LEGACY') ? 'legacy' : 'flat'}-data`);
+      const bad = drive(hookPath, data, tpBad);
+      const good = drive(hookPath, data, tpGood);
+      check(`H1 ${layout}: a missing-fence reply is ADVISED (closure resolved)`, advised(bad), bad.stdout.slice(0, 90));
+      check(`H2 ${layout}: a compliant reply is SILENT — the two outcomes DIFFER`,
+        isSilent(good) && advised(bad), { good: good.stdout.slice(0, 40) || '(silent)', bad: bad.stdout.slice(0, 40) });
+      check(`H3 ${layout}: NO deps-digest/deps-blocks ungraded record (the loop did not silently fail)`,
+        !depsFailed(readLogAt(data)), readLogAt(data).map((r) => r?.verdict));
+
+      // D-partial in ENFORCE mode: compliant allows, missing-fence BLOCKS — differ.
+      const enfData = data + '-enf';
+      const badEnf = drive(hookPath, enfData, tpBad, { ORCHARD_STOP_HOOK_ENFORCE: '1' });
+      const goodEnf = drive(hookPath, enfData, tpGood, { ORCHARD_STOP_HOOK_ENFORCE: '1' });
+      check(`H4 ${layout}: ENFORCE mode blocks the missing-fence reply and allows the compliant one (differ)`,
+        /"decision":"block"/.test(badEnf.stdout) && isSilent(goodEnf), { bad: badEnf.stdout.slice(0, 40), good: goodEnf.stdout.slice(0, 40) || '(silent)' });
+      check(`H5 ${layout}: still no deps-* record under enforce`, !depsFailed(readLogAt(enfData)), readLogAt(enfData).map((r) => r?.verdict));
+    }
+
+    // H6 — NON-VACUITY. With the grading closure absent from BOTH candidate paths
+    // (static deps kept so the hook still loads), the loop genuinely fails: the
+    // turn stays silent AND a deps-digest-unloadable record IS written. Without
+    // this, H3/H5 could pass on a hook that never resolves anything.
+    const noClosure = flatMirrorFor('feat106-noclosure', { closure: false });
+    fs.writeFileSync(noClosure, fs.readFileSync(HOOK));
+    const ncData = path.join(SCRATCH, 'feat106-noclosure-data');
+    const ncRun = runHook(noClosure, { ...barePayload(tpBad), session_id: BARE_SESSION_ID },
+      { ORCHARD_SESSION: BARE_SESSION_ID, CLAUDE_STATION_DATA: ncData });
+    check('H6 NON-VACUITY: neither ../lib nor ../../public/lib present -> silent AND a deps-digest-unloadable record',
+      isSilent(ncRun) && readLogAt(ncData).some((r) => r?.verdict === 'deps-digest-unloadable'),
+      { silent: isSilent(ncRun), verdicts: readLogAt(ncData).map((r) => r?.verdict) });
   }
 };
 

@@ -68,6 +68,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+// FEAT-106 — resolve the deploy-context doc (legacy docs/DEPLOY-CONTEXT.md or
+// consolidated .orchard/DEPLOY-CONTEXT.md) for the repo under review.
+import { resolveDeployContextFile } from './lib/board-path.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -398,10 +401,11 @@ async function main() {
   const truncated = Buffer.byteLength(fullDiff, 'utf8') > opts.maxDiffBytes;
   const diff = truncated ? fullDiff.slice(0, opts.maxDiffBytes) : fullDiff;
 
-  const deployCtxPath = path.join(repo, 'docs', 'DEPLOY-CONTEXT.md');
+  const deployCtxPath = resolveDeployContextFile(repo);
+  const deployCtxRel = path.relative(repo, deployCtxPath).split(path.sep).join('/');
   const deployContext = fs.existsSync(deployCtxPath)
     ? fs.readFileSync(deployCtxPath, 'utf8')
-    : '(This repo declares NO docs/DEPLOY-CONTEXT.md — the production environment is UNDECLARED. Deployment assumptions cannot be checked against a known prod setup; flag any change that only works with a specific local setup.)';
+    : `(This repo declares NO ${deployCtxRel} — the production environment is UNDECLARED. Deployment assumptions cannot be checked against a known prod setup; flag any change that only works with a specific local setup.)`;
 
   if (truncated) {
     console.log(`\n  NOTE: diff truncated to ${opts.maxDiffBytes} of ${Buffer.byteLength(fullDiff, 'utf8')} bytes for reviewers — the verdict below covers ONLY the shown portion.`);

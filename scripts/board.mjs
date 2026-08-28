@@ -40,6 +40,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import { parseVerifiedBy } from './lib/verdict-contract.mjs';
+// FEAT-106 — the default board dir is resolved (docs/bugs legacy or .orchard/bugs
+// consolidated) rather than hard-coded, so this tool checks the right board in a
+// migrated project. An explicit --dir still wins. board.mjs is COPIED into
+// targets, so board-path.mjs (also copied) is a plain-ESM sibling import.
+import { resolveBoardDir } from './lib/board-path.mjs';
 // The ONE definition of the ticket format (plan §3 / §8 step 2). board.mjs used
 // to carry its own `isDoneStatus`, its own TICKET_FILE_RE, its own H1 regex and
 // its own row splitter; src/server/tickets.ts and scripts/arch-watch.mjs
@@ -695,7 +700,7 @@ function genBoard(dir) {
  */
 function parseArgs(argv) {
   const cmd = argv[0];
-  let dir = 'docs/bugs';
+  let dir = null; // null ⇒ not passed ⇒ resolve the default from the layout
   let strict = false;
   const unknown = [];
   for (const a of argv.slice(1)) {
@@ -704,7 +709,10 @@ function parseArgs(argv) {
     else if (a === '--strict') strict = true;
     else unknown.push(a);
   }
-  return { cmd, dir: path.resolve(dir), strict, unknown };
+  // Explicit --dir wins (resolved as given); otherwise the default is the
+  // resolver's answer for the cwd — docs/bugs on legacy, .orchard/bugs on flat.
+  const resolvedDir = dir === null ? resolveBoardDir(process.cwd()) : path.resolve(dir);
+  return { cmd, dir: resolvedDir, strict, unknown };
 }
 
 /**
@@ -781,7 +789,14 @@ async function reachabilityFails(dir) {
     return [];
   }
 
-  const hostPath = path.resolve(dir, '..', '..'); // dir === <host>/docs/bugs
+  // FEAT-106 — the board lives two levels below its host in BOTH supported
+  // layouts (<host>/docs/bugs and <host>/.orchard/bugs), so the grandparent is
+  // the host. Confirm it by round-tripping through the resolver rather than
+  // trusting the shape: if resolveBoardDir(host) does not name this same dir
+  // (e.g. a config-declared board elsewhere), skip the ride-along instead of
+  // reading the wrong board.
+  const hostPath = path.resolve(dir, '..', '..');
+  if (path.resolve(resolveBoardDir(hostPath)) !== path.resolve(dir)) return [];
   let board;
   try { board = readBoard(hostPath); } catch (err) {
     process.stderr.write(`board:check — reachability ride-along skipped: ${err?.message ?? err}\n`);

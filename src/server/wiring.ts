@@ -24,6 +24,12 @@ import path from 'node:path';
 
 import type { Project, InstructionRef } from './registry.ts';
 import { toolSettingsOf } from './registry.ts';
+// FEAT-106 — wiring must report a project's methodology layers wherever that
+// project actually keeps them: legacy (`docs/`, `scripts/`) or consolidated
+// (`.orchard/`). Every literal path here is resolved so a migrated project reads
+// as wired, not partial. The board tool has no dedicated resolver, so its two
+// candidate locations are probed inline with a legacy fallback.
+import { resolveBoardDir, resolveConventionsFile, resolveOrchardDir } from '../../scripts/lib/board-path.mjs';
 
 /**
  * The Working Agreement is a TWO-DOCUMENT stack, not one interchangeable id:
@@ -239,31 +245,38 @@ export function wiringStatus(project: Project): WiringStatus {
     });
   }
 
-  /* Local conventions — <hostPath>/docs/CONVENTIONS.md exists & non-empty. */
-  const convOk = fileHasContent(path.join(hostPath, 'docs', 'CONVENTIONS.md'));
+  /* Host-relative, POSIX-style rendering of a resolved path for the detail text. */
+  const relOf = (abs: string): string => path.relative(hostPath, abs).split(path.sep).join('/');
+
+  /* Local conventions — the resolved CONVENTIONS.md exists & non-empty. */
+  const convFile = resolveConventionsFile(hostPath);
+  const convRel = relOf(convFile);
+  const convOk = fileHasContent(convFile);
   checks.push({
     key: 'conventions',
     label: 'Local conventions',
     state: convOk ? 'ok' : 'missing',
     detail: convOk
-      ? 'docs/CONVENTIONS.md is present and non-empty — auto-injected alongside the Working Agreement.'
-      : 'No non-empty docs/CONVENTIONS.md. Project-specific rules are not injected into sessions.',
+      ? `${convRel} is present and non-empty — auto-injected alongside the Working Agreement.`
+      : `No non-empty ${convRel}. Project-specific rules are not injected into sessions.`,
     apply: convOk ? null : 'onboard',
   });
 
-  /* Ticket board — docs/bugs/INDEX.md AND README.md both exist. */
-  const boardIndex = fileExists(path.join(hostPath, 'docs', 'bugs', 'INDEX.md'));
-  const boardReadme = fileExists(path.join(hostPath, 'docs', 'bugs', 'README.md'));
+  /* Ticket board — the resolved board dir has INDEX.md AND README.md. */
+  const boardDir = resolveBoardDir(hostPath);
+  const boardRel = relOf(boardDir);
+  const boardIndex = fileExists(path.join(boardDir, 'INDEX.md'));
+  const boardReadme = fileExists(path.join(boardDir, 'README.md'));
   const boardOk = boardIndex && boardReadme;
   checks.push({
     key: 'board',
     label: 'Ticket board',
     state: boardOk ? 'ok' : boardIndex || boardReadme ? 'warn' : 'missing',
     detail: boardOk
-      ? 'docs/bugs/ board present (INDEX.md + README.md) — the accumulating-context tracker is in place.'
+      ? `${boardRel}/ board present (INDEX.md + README.md) — the accumulating-context tracker is in place.`
       : boardIndex || boardReadme
-        ? 'Partial board: one of docs/bugs/INDEX.md or README.md is missing. Scaffold to complete it.'
-        : 'No docs/bugs/ board. There is no durable, survives-compaction ticket tracker for this project.',
+        ? `Partial board: one of ${boardRel}/INDEX.md or README.md is missing. Scaffold to complete it.`
+        : `No ${boardRel}/ board. There is no durable, survives-compaction ticket tracker for this project.`,
     apply: boardOk ? null : 'onboard',
   });
 
@@ -273,18 +286,25 @@ export function wiringStatus(project: Project): WiringStatus {
     ? (pkg.scripts as Record<string, unknown>)
     : {};
   const hasCheckScript = typeof scripts['board:check'] === 'string' && scripts['board:check'] !== '';
-  const hasBoardTool = fileExists(path.join(hostPath, 'scripts', 'board.mjs'));
+  // The board tool lands at `.orchard/board.mjs` (flat) or `scripts/board.mjs`
+  // (legacy). No dedicated resolver, so probe the consolidated location first and
+  // fall back to the legacy one, so a mid-migration project is not called broken.
+  const orchardBoardTool = path.join(resolveOrchardDir(hostPath), 'board.mjs');
+  const legacyBoardTool = path.join(hostPath, 'scripts', 'board.mjs');
+  const boardToolPath = fileExists(orchardBoardTool) ? orchardBoardTool : legacyBoardTool;
+  const boardToolRel = relOf(boardToolPath);
+  const hasBoardTool = fileExists(boardToolPath);
   const guardOk = hasCheckScript && hasBoardTool;
   checks.push({
     key: 'drift-guard',
     label: 'Board drift-guard',
     state: guardOk ? 'ok' : hasCheckScript || hasBoardTool ? 'warn' : 'missing',
     detail: guardOk
-      ? 'board:check script + scripts/board.mjs present — the board can be reconciled against its tickets.'
+      ? `board:check script + ${boardToolRel} present — the board can be reconciled against its tickets.`
       : !pkg
-        ? 'No parseable package.json, so no board:check wiring. Scaffold installs scripts/board.mjs and (if a package.json exists) the npm script.'
+        ? `No parseable package.json, so no board:check wiring. Scaffold installs ${boardToolRel} and (if a package.json exists) the npm script.`
         : hasCheckScript || hasBoardTool
-          ? 'Partial: one of the board:check script or scripts/board.mjs is missing.'
+          ? `Partial: one of the board:check script or ${boardToolRel} is missing.`
           : 'No board drift-guard. Nothing catches an INDEX that has drifted from the ticket files.',
     apply: guardOk ? null : 'onboard',
   });

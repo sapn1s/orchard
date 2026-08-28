@@ -1,0 +1,54 @@
+# FEAT-109 — Run the session-host broker inside the container so container sessions inherit the background-lifetime machinery
+
+- **Status:** OPEN — BUILD ticket (ready to implement; not a decision). Filed by the round-2 BUG-157 lane as the durable fix for the class BUG-157 patched.
+- **Severity:** high (the cost of leaving it: container sessions keep losing live background work; every future lifetime fix has to be re-derived for the container arm or it is simply absent there)
+- **Area:** session lifecycle — the container isolation arm (`src/server/agent-bridge.ts`, `src/server/session-host.mjs`, `src/server/container-manager.ts`, `src/server/survival.ts`)
+- **Reported:** 2026-08-27 by the BUG-157 fix lane
+- **Recurrence evidence:** BUG-043, BUG-044, BUG-072, BUG-074, BUG-105, BUG-157 — every one is the background-work-lifetime property broken, and the container arm inherited a fix for none of them.
+
+This is written as a build brief for the engineer who will implement it, not as a fork for a reviewer to choose. There is no genuine project-direction decision here: the alternative to building this is BUG-157's targeted per-guard patching, and the recurrence record (six tickets, one class) is the evidence that per-guard patching does not converge. The one sub-choice that is a real engineering judgement (how the host reaches the in-container broker) is named in the migration path with a default and its trade-off; it does not need a human to pick before work starts.
+
+## Violated invariant
+A session's live background work is destroyed only when that work has actually finished or its process has actually died — never because the session's driving socket went away — **and this holds identically for every isolation mode.** Container sessions violate the "identically for every isolation mode" clause: the whole machinery that makes it true for `direct` (lifetime-aware drain, ground-truth process probe, out-of-band delivery) does not exist for them.
+
+## The design that produces this class
+For a `direct` survivable session the SDK's process seam (`spawnClaudeCodeProcess`) is filled by `spawnSurvivable`: the `claude` CLI runs under a **broker** (`session-host.mjs`) in its own systemd scope, and the server talks stream-json to it over a unix socket the broker owns. The broker is where the protections live — it holds stdin-EOF while a foreground turn is in flight, then CONSULTS the declared background lifetime before committing the drain (BUG-044), it records the CLI's pid and deletes its status file on exit so `processProbe()` can return real ground truth (BUG-033), and it can deliver a message out-of-band into a surviving CLI (FEAT-065). The server's `close()` therefore never EOFs a raw pipe into a live CLI.
+
+For a `container` session the SAME seam is filled by `execInContainer` — a bare host-side `docker exec -i` whose stdin pipes **directly** into the CLI. There is no broker in between. So: `#survivalConfigured` stays false → `survivable === false`, `processProbe()` is permanently `'unknown'` (no host pid to check), `deliverIntoSurvivor()` is unreachable, and none of the BUG-043/044/072/074 broker-side gating runs. `close()` → `InputQueue.end()` sends EOF straight into the container CLI, which exits at its next turn boundary and takes its background agents with it (`session-host.mjs` documents this exact failure at the drain-commit comment). The missing component is the ownership boundary the broker provides; the assumption that keeps turning out false is "a container's `docker exec` pipe can be treated like the broker socket." It cannot — the broker is not a transport, it is where the lifetime policy lives.
+
+## Why local patches did not hold
+- **BUG-043** guarded the socket-close decision and both fuses with `workLifetime()` — but only proved it on `direct`, and the broker-side half (the lifetime-aware drain) lives in `session-host.mjs`, which a container never runs.
+- **BUG-044** made the drain commit and the boot re-adopt lifetime-aware — again in `session-host.mjs`, unreachable for containers.
+- **BUG-072/074** made survivor delivery visible and unblocked stuck queues — all predicated on a broker (`survivingHostForSdkSession`, the status file, `midTurnSince`); a container has no host record because it has no broker.
+- **BUG-105** hardened the retired-task/level machinery in the bridge (which containers DO share) but its revival latch still made a container session more closeable while a revived agent ran (BUG-157 §4).
+- **BUG-157 (this round)** added container-specific guards inside the bridge: `busy` driven from the stream, a positive-quiet requirement before a container close, a bounded reapExec, and a revival liveness signal. These stop the bleeding, but they re-implement — in a second place, for one isolation mode — a weaker shadow of what the broker already does for `direct`. That is the class: a fact (is this work still live, is this process alive) owned by the broker, re-derived in the bridge for the arm that has no broker. Per CONVENTIONS "whoever owns a fact writes it down; no reader works it out again" (ARCH-010), the durable answer is to give the container arm the broker, not a second derivation.
+
+## The approach to build
+Fill the container arm's process seam with the SAME broker the direct arm uses, running INSIDE the container:
+1. Package `session-host.mjs` (and its deps) into the container image, or bind-mount the checkout's copy read-only, so the broker binary is reachable inside the container.
+2. For a container session, spawn the CLI under the in-container broker instead of a bare `docker exec -i`: the broker owns the CLI's stdin/stdout, applies the lifetime-aware drain, records the CLI's pid (a real pid now — inside the container's namespace), and writes its status file to a path the host can read.
+3. Expose the broker's control/stream socket to the host — bind-mount a unix socket from a container path to a host path under the session-hosts dir (the same shape `survival.ts` already scans), so `survivable`, `processProbe()`, `deliverIntoSurvivor()`, `survivingHostForSdkSession` and the drain gating all light up for containers with NO new code in the bridge — they already consult the broker; they just currently find none for a container.
+4. Retire BUG-157's container-specific guards once the broker covers them (or keep them as a cheap backstop and say so) — the point is the fact is owned in one place again.
+
+## Migration path (each step landable and verifiable on its own)
+1. **Broker reachable in-container, unused.** Add the broker to the image / bind-mount; prove it runs inside a throwaway container and speaks stream-json to a scripted CLI. Nothing in the session path changes yet; `verify:container` stays green. Rollback: drop the image change.
+2. **Container spawn routed through the in-container broker, host still talks the same stream-json.** Swap `execInContainer` for a broker-mediated spawn behind a per-project/env flag defaulting OFF. With the flag on, a container session's `#survivalConfigured` becomes true and `processProbe()` returns a real state. Prove parity: a normal container turn behaves identically with the flag on and off. Rollback: flag off.
+3. **The host reads the broker's status + socket.** Bind-mount the socket/status into the session-hosts dir; confirm `survivable`, the probe, `survivingHostForSdkSession` and the drain gating engage for containers. Re-run the BUG-043/044/072/074 suites against a CONTAINER session (they only ever ran direct). Rollback: flag off.
+4. **Flip the default on; retire (or demote to backstop) BUG-157's container guards.** Run the full lifecycle suite for both arms. Rollback: flag off restores today's behaviour + BUG-157's guards.
+
+The one real sub-choice, named: **how the host reaches the in-container broker.** Default = a unix socket bind-mounted from the container to a host path under the session-hosts dir, mirroring the direct-survival broker socket exactly (so `survival.ts`'s existing scan/cleanup applies unchanged — but note CONVENTIONS' warning that a host record names absolute paths in its body, so the container/host path rewrite must be deliberate). The alternative (a TCP control port per container) is simpler to plumb across the namespace but adds a listening port and an auth surface the unix socket avoids; the default is preferred on that trade-off. This is an implementation judgement, not a project-direction fork — build the default unless step 3 surfaces a concrete blocker.
+
+## Proof bar — what would have to be true to call this right
+- The BUG-043, BUG-044, BUG-072, BUG-074 verification suites — which today only exercise `direct` — PASS when run against a CONTAINER session, unmodified in intent. A suite that could only ever have passed on direct proves nothing; the load-bearing check is "a container session's live background agent runs to completion after its socket closes, and its exec is never reaped."
+- BUG-157's headline repro (`verify:bug-157-container-close-live-work.mjs`) passes with BUG-157's bridge-side container guards REMOVED — i.e. the broker alone now prevents the kill. If it only passes with those guards still in, the class is not actually fixed, just doubly patched.
+- `processProbe()` returns a non-`'unknown'` state for a live container session, and a genuinely dead container CLI closes the session promptly via the probe rung (not via a timeout).
+- Non-vacuity: a genuinely finished container session still closes and reaps — the broker's drain commits — so this is not "never close container sessions."
+- **What would falsify the redesign:** if putting the broker in the container measurably regresses container startup/latency, or if the bind-mounted socket cannot be made to survive a server restart the way the direct broker socket does (the whole point is re-adopt parity), then the container arm may need a different survival transport and this approach is wrong.
+
+## Activity log (APPEND-ONLY — never edit or delete a prior entry)
+
+### 2026-08-27 — worker (BUG-157 fix lane)
+- **Understood:** Container sessions fill the SDK process seam with a bare `docker exec -i` pipe, so they inherit none of the broker-mediated background-lifetime machinery that makes the "never kill live work on socket loss" invariant true for `direct`. BUG-157 patched the container arm inside the bridge; this ticket is the durable fix — give the container arm the broker.
+- **Changed:** nothing (ticket only). BUG-157's A+B land first as the stop-the-bleeding fix.
+- **Verified:** n/a (build ticket). Proof bar above is what the build must clear.
+- **Still open / handoff:** a build lane implements the migration path above, starting at step 1. Read BUG-043/044/072/074/105/157 first — this surface has the board's longest regression history and the proof bar deliberately requires the container arm to pass the EXISTING direct suites rather than new container-only ones.

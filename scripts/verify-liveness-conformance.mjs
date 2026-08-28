@@ -718,6 +718,17 @@ const GUARD_ALLOW = {
    * record goes through `livenessOfSurvivalHandle`.
    */
   'survival.ts': { 'broker-verdict': 1 },
+  /*
+   * BUG-157 (round 4) — the CONTAINER GROUND-TRUTH SOURCE, the container arm's
+   * parallel to the direct arm's broker (session-host.mjs, allowlisted '*' above).
+   * `classifyContainerLiveness` / `probeContainerLiveness` report RAW process facts
+   * — which tagged processes the container currently holds — by scanning /proc, the
+   * same source `reapExec` kills by. They are the source of ground truth for a
+   * container, not a second opinion about it: the keep/close DECISION still lives in
+   * agent-bridge's detached-close fuse (which consults these facts + the authority's
+   * probe rung). Counted exactly at two declarations; a third fails.
+   */
+  'container-manager.ts': { 'liveness-shaped-declaration': 2 },
   'index.ts': {},
   'agent-bridge.ts': {},
 };

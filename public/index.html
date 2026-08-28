@@ -124,6 +124,16 @@
                  title="Open the Orchard guide — workflow &amp; features">
                 <span class="g">◈</span><span>Guide</span>
               </a>
+              <!-- BUG-158: the deliberate, labelled entry to this project's
+                   settings. Before it, the drawer was only reachable as a side
+                   effect of clicking a status chip (perm / iso popover footers)
+                   or the unlabelled cog buried in the composer tray. A nav pill
+                   in the same cluster as Board & Guide, marked .settings-pill so
+                   it reads as an action, not a readout. -->
+              <button class="pill board-pill settings-pill" id="settingsBtn" hidden
+                      title="Open this project's settings — model, permissions, isolation, git (Ctrl/⌘ ,)">
+                <span class="g">⚙</span><span>Settings</span>
+              </button>
               <button class="pill" id="isoBtn" aria-haspopup="true" aria-expanded="false" hidden>
                 <span class="g" id="isoG">○</span><span id="isoN">Direct</span>
                 <svg class="cx" width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.4 4 5 6.6 7.6 4"/></svg>

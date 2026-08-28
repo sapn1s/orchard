@@ -54,7 +54,9 @@ import {
   execInContainer,
   memoryStatus,
   oomExplanation,
+  probeContainerLiveness,
   reapExec,
+  type ContainerLiveness,
   type MemoryStatus,
 } from './container-manager.ts';
 import { spawnSurvivable, survivalEnabled, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
@@ -409,6 +411,39 @@ export type AutonomousStopReason =
  */
 const AUTONOMOUS_MAX_TURNS_CEILING = 50;
 
+/*
+ * BUG-157 — a container close requires a POSITIVE quiet signal: NO frame for at
+ * least this long. It complements (does NOT replace) the container process probe
+ * (`#probeContainerLiveness`) — a session actively STREAMING frames (a woken
+ * turn's `init`/stream events, or a subagent between tool calls) is held open by
+ * frame recency even in the instant it has no tool subprocess, while a subagent
+ * inside a long silent tool call is held open by the live process. Both must be
+ * true to close: frame-quiet AND no live tool-work process. Round 4 replaced
+ * round 3's frame-STALENESS row bound (which reaped live silent work) with this
+ * pairing; see `classifyContainerLiveness` in container-manager.ts.
+ */
+const CONTAINER_QUIET_TO_CLOSE_MS = Number(process.env.CLAUDE_STATION_CONTAINER_QUIET_MS) || 10_000;
+/*
+ * BUG-157 — a SendMessage-revived task (a retired id the engine re-announces as
+ * live via a fresh `task_started`) is counted as live work for this long unless
+ * its own later terminal frame clears it first. Bounds the case where a revived
+ * task never reports a terminal frame, so a stuck revival cannot hold a
+ * container session open forever. Its running frames + terminal frame normally
+ * clear it well inside this window.
+ */
+const REVIVED_TASK_TTL_MS = Number(process.env.CLAUDE_STATION_REVIVED_TTL_MS) || 300_000;
+/*
+ * BUG-157 (round 4) — round 3's `UNSETTLED_ROW_STALE_MS` (a frame-staleness bound
+ * on a `running` agent row) was REMOVED. It could not serve both failure modes at
+ * once: a genuinely-live subagent in a long silent tool call emits no frame for
+ * the whole call, so any bound short enough to close a merely-stuck row also
+ * reaped live work (round-2 adversarial verify measured −121.7s of margin on a
+ * 7-minute Bash call — reproduced end-to-end data loss). The close decision now
+ * consults CONTAINER GROUND TRUTH (`#probeContainerLiveness` — is a tool process
+ * actually running) instead of guessing from frame timing. See
+ * `classifyContainerLiveness` in container-manager.ts and FEAT-109.
+ */
+
 /**
  * The continue-nudge sent to advance one autonomous turn. It re-states the §M
  * contract every turn (work only the agreed scope; do not invent new tasks) so
@@ -504,6 +539,39 @@ export class AgentSession {
    * engine emits. Zero until the first frame of the session's first turn.
    */
   lastFrameAt = 0;
+  /**
+   * BUG-159 — when the MAIN THREAD last emitted a frame (epoch ms), kept apart
+   * from `lastFrameAt` (which EVERY frame, including background-lane chatter,
+   * refreshes). A live lane can keep `lastFrameAt` fresh for hours while the
+   * main thread does nothing; the honest main-turn liveness gate (liveness.ts)
+   * needs to know when the main thread ITSELF last spoke. Stamped in #handle for
+   * frames with no `parent_tool_use_id` (main-thread assistant/user/stream
+   * deltas) plus the `init` that opens a self-woken main turn. Null until the
+   * first such frame; the gate falls back to `turnStartedAt`.
+   */
+  lastMainFrameAt: number | null = null;
+  /**
+   * BUG-159 — OPEN main-thread tool calls (a long silent main Bash/test/build is
+   * the BUG-033 guard). A `run_in_background` dispatch is deliberately EXCLUDED:
+   * it returns immediately and its work is a LANE, not the main turn. Populated
+   * in #handle on a main-thread `tool_use`, reclaimed on its `tool_result`, and
+   * cleared at every turn `result`. `hasMainThreadWork()` reads it.
+   */
+  #openMainToolCalls = new Set<string>();
+  /**
+   * BUG-159 (round 2) — is the CURRENT `busy` turn one the USER is awaiting (an
+   * explicit `send()`, an autonomous nudge, or the session's first prompt) — as
+   * opposed to a SELF-WOKEN notification turn (`#markForegroundTurnLive` on a
+   * lane-completion `init`)? This is the POSITIVE provenance signal S3 needs:
+   * a user-awaited main turn that goes momentarily frame-silent with no open
+   * tool call (API backoff, long non-streamed generation, a slow prompt hook)
+   * is INDISTINGUISHABLE from a stuck woken `busy` on timing/frames alone, so
+   * the honest-main-turn gate must not downgrade it on silence. Read by
+   * `hasMainThreadWork()`. Only meaningful while `busy`; set at every turn OPEN
+   * (true for user turns, false for woken turns) and cleared at `result`, so a
+   * stale value can never be consulted (the gate lives behind the `busy` check).
+   */
+  #turnUserInitiated = false;
   /**
    * FEAT-057 — the last provider/API failure the RUNTIME classified for the
    * turn currently in flight (BUG-031's taxonomy, verbatim), or null. Cleared
@@ -733,6 +801,24 @@ export class AgentSession {
    * death; the cost of the veto standing was a fabricated one.
    */
   #retiredTasks = new Set<string>();
+  /**
+   * BUG-157 — A RETIRED TASK THE ENGINE HAS RE-ANNOUNCED AS LIVE, and when.
+   *
+   * SendMessage to an already-finished agent revives it: the engine emits a
+   * FRESH `task_started` for a task id that already carries an established
+   * outcome. BUG-105's machinery deliberately keeps that id retired — the row is
+   * re-settled to its prior outcome and `#rebuildBackgroundLevel` filters it out
+   * of `#backgroundTasks` — so the revived agent is invisible to
+   * `workLifetime()`, counts 0 toward the background level, and makes the session
+   * MORE closeable while it is running. That is safe for the ROW/LEVEL staleness
+   * BUG-105 governs but wrong for the orthogonal LIFETIME question the close
+   * decision asks. This set is that separate liveness signal: a revived id is
+   * live work until its own next terminal frame clears it (or the TTL expires).
+   * It NEVER touches `#backgroundTasks`/`#establishedOutcomes`/`#retiredTasks`,
+   * so BUG-105's guarantees are untouched; it is read only by `workLifetime()`
+   * and the container-close quiet check.
+   */
+  #revivedTasks = new Map<string, number>();
   /**
    * BUG-105 (5th clean-room verdict) — THE ENGINE'S LAST LEVEL FRAME, UNFILTERED.
    * `#backgroundTasks` is a DERIVED view of this (minus `#retiredTasks`), so a veto
@@ -1224,6 +1310,7 @@ export class AgentSession {
 
     this.busy = true;
     this.turnStartedAt = Date.now(); // BUG-033: the ONE honest turn clock
+    this.#turnUserInitiated = true;  // BUG-159: the first prompt is a user-awaited turn
     this.lastFrameAt = Date.now();   // BUG-033: the frameless window starts now
     // FEAT-057: a new turn's failures are its own. Clearing here is what stops
     // last turn's quota wall from being blamed for this turn's death.
@@ -1263,6 +1350,12 @@ export class AgentSession {
         // `OrchestratorProfileSettings` for why this is not expressed through
         // the two fields above.
         orchestratorProfile: orchestratorProfileOf(opts.project).enabled || undefined,
+        // FEAT-108 round 2 — identity for the runtime git-write grant lookup and
+        // the host-readable repo path the mandatory leak gate scans. Keyed by
+        // project id (stable across isolation, unlike cwd).
+        gitGrantKey: opts.project.id,
+        gitRepoPath: opts.project.hostPath,
+        sessionLabel: this.id,
         resume: opts.resumeSessionId ? (this.#forkPlan?.resumeSessionId ?? opts.resumeSessionId) : undefined,
         forkSession: opts.resumeSessionId && opts.fork ? true : undefined,
         mcpServers,
@@ -1307,14 +1400,53 @@ export class AgentSession {
     return [answer, brief, prompt].filter((s): s is string => !!s).join('\n\n');
   }
 
-  /** Queue a follow-up turn into the SAME session. */
-  send(prompt: string): void {
+  /**
+   * Queue a follow-up turn into the SAME session.
+   *
+   * BUG-159 — a busy session HOLDS the message, it does not refuse it. Returns
+   * `{delivered, queued}`: `queued:true` means the text was pushed into the
+   * runtime's own input channel to run at the next turn boundary rather than
+   * opening a fresh turn now. See the `this.busy` branch below.
+   */
+  send(prompt: string): { delivered: boolean; queued: boolean } {
     if (this.closed) throw new Error('session is closed');
     if (this.budgetStopped) throw new Error('session stopped: budget exceeded');
-    if (this.busy) throw new Error('a turn is already running — interrupt it first');
+    if (this.busy) {
+      /*
+       * BUG-159 — HOLD, don't throw. A user's typed message must never be
+       * refused just because a turn is (or merely LOOKS) in flight — the
+       * incident was a stuck woken-turn `busy`, shielded by a live background
+       * lane, that stranded a message for 180 minutes.
+       *
+       * Push it into the runtime's InputQueue AT SEND TIME. That is the CLI's
+       * own multi-turn input channel: the message is held there and runs at the
+       * NEXT turn boundary, ahead of any self-woken notification turn — and a
+       * session that is actually foreground-idle behind a quiet lane (the exact
+       * strand) runs it immediately, whose real `result` also clears the stuck
+       * `busy`. Nothing waits on an Orchard-side boundary that may be hours away.
+       *
+       * EXACTLY ONCE: this is the only site that pushes the held text, and the
+       * InputQueue delivers each pushed item exactly once. The client no longer
+       * keeps its own copy to flush on `turn-end` (BUG-159 Part C), so a
+       * boundary and this interject cannot both deliver it.
+       *
+       * The turn clock and `busy` are deliberately left untouched — the current
+       * turn owns them, and the interjected turn inherits `busy` (its own
+       * `result` clears it) exactly as a queued follow-up always has.
+       */
+      const held = this.#withBriefing(prompt);
+      this.#runtime.send(held);
+      this.#recorder?.recordUserPrompt(held);
+      // BUG-159 (round 2): the user is now awaiting a reply on the main thread —
+      // even if the current `busy` was a stuck woken claim, this interject will
+      // drive a real turn, so the honest-main-turn gate must stop downgrading it.
+      this.#turnUserInitiated = true;
+      return { delivered: true, queued: true };
+    }
     const text = this.#withBriefing(prompt);
     this.busy = true;
     this.turnStartedAt = Date.now(); // BUG-033
+    this.#turnUserInitiated = true;  // BUG-159: an explicit send opens a user-awaited turn
     this.lastFrameAt = Date.now();   // BUG-033
     this.lastProviderError = null;   // FEAT-057: this turn's failures are its own
     this.#advisoryNotice = null;     // BUG-041: and last turn's notices are not its context
@@ -1332,6 +1464,7 @@ export class AgentSession {
     this.#runtime.send(text);
     // Covers user turns AND the autonomous nudge (which routes through here).
     this.#recorder?.recordUserPrompt(text);
+    return { delivered: true, queued: false };
   }
 
   async interrupt(): Promise<void> {
@@ -1581,6 +1714,20 @@ export class AgentSession {
     // way); the seam exists for a future runtime that must react to losing its
     // listener.
     this.#runtime.detach();
+    /*
+     * BUG-157 (round 4) — ARM THE FUSE ON EVERY DETACH PATH. The close-on-detach
+     * fuse used to be armed only by a later turn `result` or an empty level frame.
+     * But `releaseSocketSession` detaches AFTER the turn already ended (busy false,
+     * `workLifetime` `unknown`/`yes`), so no later `result` arrives; and the real
+     * CLI emits no level frame at all (ARCH-015). A detach on those paths therefore
+     * left the session with nothing that would ever decide its fate — a session +
+     * `docker exec` + CLI leak for the life of the server (round-2 adversarial
+     * verify, index.ts:3009-3015). Arming here makes the invariant hold: a detached
+     * session ALWAYS has the lifetime-aware fuse re-checking it. Harmless when
+     * armed mid-turn (the fuse bails on `busy` and `result` re-arms) and idempotent
+     * (`#armDetachedClose` no-ops if a timer is already pending).
+     */
+    this.#armDetachedClose();
   }
 
   /** A returning socket takes over the event stream of a detached session. */
@@ -1831,6 +1978,9 @@ export class AgentSession {
     this.#retiredTasks.add(taskId);
     this.#rebuildBackgroundLevel();
     this.#bgBornTasks.delete(taskId);
+    // BUG-157 — a terminal frame for a revived task ends its revival: the
+    // separate liveness signal is cleared so the session becomes closeable again.
+    this.#revivedTasks.delete(taskId);
 
     // EVIDENCE + CONFLICT. Tracked for every terminal frame, whatever it can
     // establish: two disagreeing frames are an upstream anomaly worth surfacing even
@@ -2180,6 +2330,44 @@ export class AgentSession {
   }
 
   /**
+   * BUG-159 — is a BACKGROUND lane alive in this session right now? The engine's
+   * own level (`#backgroundTasks`) plus the pre-level born tags (`#bgBornTasks`,
+   * a `run_in_background` dispatch already known to be background before its
+   * level frame lands). This is the SHIELD in the honest main-turn gate: it is
+   * why a stuck woken `busy` on an always-alive direct CLI kept reading as a
+   * running main turn. Reported to the authority via BridgeLike; the DECISION
+   * stays in liveness.ts.
+   */
+  hasLiveBackgroundLane(): boolean {
+    return this.#backgroundTasks.size > 0 || this.#bgBornTasks.size > 0;
+  }
+
+  /**
+   * BUG-159 — is the MAIN THREAD doing work right now? An open main-thread tool
+   * call (a long silent main Bash/test — the BUG-033 guard), or a running
+   * FOREGROUND agent (a background lane is excluded — it is not the main turn).
+   * TRUE keeps the running claim standing in the authority's alive branch.
+   */
+  hasMainThreadWork(): boolean {
+    // BUG-159 (round 2, S3) — a turn the USER is awaiting (explicit send / first
+    // prompt / autonomous nudge) is main-thread work in flight until its
+    // `result`, even when momentarily frame-silent with no open tool call (API
+    // backoff, long non-streamed generation, a slow prompt hook). Such a turn is
+    // indistinguishable from a stuck woken `busy` on timing alone, so provenance
+    // — not silence — is what keeps it from being downgraded. A SELF-WOKEN turn
+    // (`#turnUserInitiated` false) is left to the silence gate, which is the
+    // stuck-phantom shape it must catch.
+    if (this.#turnUserInitiated && this.busy) return true;
+    if (this.#openMainToolCalls.size > 0) return true;
+    for (const a of this.#agents.values()) {
+      if (a.status !== 'running') continue;
+      if (this.#backgroundTasks.has(a.agentId) || this.#bgBornTasks.has(a.agentId)) continue;
+      return true; // a foreground subagent is running → the main turn is in flight
+    }
+    return false;
+  }
+
+  /**
    * BUG-033 / ARCH-001 — is this session's claim to be RUNNING still true?
    *
    * A pure delegation to the single authority. The ordering that makes the
@@ -2284,14 +2472,33 @@ export class AgentSession {
     if (this.#execId) {
       const execId = this.#execId;
       const project = this.project;
-      setTimeout(() => {
+      /*
+       * BUG-157 (round 4) — this reap hard-kills the container exec, so it must NOT
+       * fire while a tool call is still legitimately draining after the stdin-EOF
+       * this close sent: the CLI exits only once its in-flight tool returns, and
+       * that tool is a live process we can see. Round 3's reschedule keyed on
+       * `lastFrameAt`, which FREEZES at close (`#runtime.close()` ends the message
+       * stream) — so it was inert, degenerating to an unconditional 15s kill
+       * (round-2 verify: chatty vs quiet both died at 15.3s, no differential). Key
+       * on the CONTAINER PROCESS PROBE instead: while a tool-work process is alive,
+       * reschedule (bounded); once the CLI is idle or gone, reap. This gives the
+       * reschedule the real, ground-truthed differential it always claimed.
+       */
+      const MAX_REAP_ATTEMPTS = 8; // ~2 min of 15s rechecks past the first
+      const attemptReap = (attempt: number): void => {
+        if (attempt < MAX_REAP_ATTEMPTS) {
+          const live = this.#probeContainerLiveness();
+          if (!live.cliAlive) return; // the CLI already exited on EOF — nothing to reap
+          if (live.workAlive) { setTimeout(() => attemptReap(attempt + 1), 15_000).unref(); return; }
+        }
         try {
           const n = reapExec(project, execId);
           if (n > 0) console.warn(`[orchard] reaped ${n} stranded exec(s) for session ${this.id} in ${containerName(project.id)}`);
         } catch {
           /* container already gone — nothing to reap */
         }
-      }, 15_000).unref();
+      };
+      setTimeout(() => attemptReap(0), 15_000).unref();
     }
     this.#emit({ t: 'session-closed', reason });
   }
@@ -2326,6 +2533,24 @@ export class AgentSession {
         outlivesTurn: 'yes',
         detail: `the engine reports ${ids.length} background task(s) still running (${ids.join(', ')})`,
         ids,
+      };
+    }
+    /*
+     * BUG-157 — a SendMessage-revived retired task is live work the level does
+     * not carry (BUG-105 keeps a re-announced id retired, so `#backgroundTasks`
+     * never lists it). Left out, the revival made the session MORE closeable
+     * while it ran. Answer `unknown` (biased to detach, per ARCH-002 — a wrong
+     * detach leaves a hand-closable CLI; a wrong close destroys running work) so
+     * `releaseSocketSession` detaches and the fuse re-arms instead of reaping.
+     */
+    const revived = this.#liveRevivedTasks();
+    if (revived.length > 0) {
+      return {
+        outlivesTurn: 'unknown',
+        detail:
+          `a retired background task was revived by SendMessage and is running again (${revived.join(', ')}) — ` +
+          'the engine keeps a re-announced id out of its background level, so this work is not in the level',
+        ids: revived,
       };
     }
     if (this.#runtime.capabilities.backgroundLifetime === 'reported') {
@@ -2384,6 +2609,98 @@ export class AgentSession {
   }
 
   /**
+   * BUG-157 — revived retired tasks (see `#revivedTasks`) still within their TTL,
+   * i.e. work the engine re-announced as live and that has not reported a
+   * terminal frame since. Prunes expired entries as it reads, so a revival the
+   * engine silently abandoned cannot hold a session open past the TTL.
+   */
+  #liveRevivedTasks(): string[] {
+    const now = Date.now();
+    const live: string[] = [];
+    for (const [id, at] of this.#revivedTasks) {
+      if (now - at < REVIVED_TASK_TTL_MS) live.push(id);
+      else this.#revivedTasks.delete(id);
+    }
+    return live;
+  }
+
+  /**
+   * BUG-157 (round 4) — CONTAINER GROUND TRUTH. `docker exec`-scan the container
+   * for processes tagged with this session's `#execId` and classify: is anything
+   * tagged alive (the CLI), and is a tool SHELL (or a descendant of one) running
+   * (a genuine tool call in flight). This replaces round-3's frame-staleness bound,
+   * which reaped a live subagent sitting in a long silent Bash call because such a
+   * call emits no frame for its whole duration (round-2 adversarial verify: a 7-min
+   * call went −121.7s past the 300s bound). The process is the truth the frames
+   * could not carry. A blocking `docker exec` (~tens of ms) is why this lives OUT
+   * of `processProbe()` (which liveness/health poll on a hot path) and is called
+   * ONLY from the low-frequency detached-close fuse and the post-close reap.
+   * Returns `cliAlive:false` when the container/CLI is gone (crash, OOM, removal).
+   */
+  #probeContainerLiveness(): ContainerLiveness {
+    if (!this.containerName || !this.#execId) return { cliAlive: false, workAlive: false, procCount: 0 };
+    try {
+      return probeContainerLiveness(this.project, this.#execId);
+    } catch {
+      // A probe error must not manufacture a close (bias-to-keep, ARCH-002) nor a
+      // leak (the fuse also consults processProbe's dead state). Treat as CLI up,
+      // work up — the safe answer that neither reaps nor commits a close.
+      return { cliAlive: true, workAlive: true, procCount: -1 };
+    }
+  }
+
+  /**
+   * BUG-157 — the POSITIVE quiet signal a CONTAINER close requires, now backed by
+   * container ground truth instead of a timeout. A `direct` session is governed by
+   * the survival-handle probe and needs no extra gate, so this is vacuously true
+   * there. A container has no host-side broker, so before it closes it must see
+   * BOTH: no frame for `CONTAINER_QUIET_TO_CLOSE_MS` (a session actively streaming
+   * frames — e.g. a woken turn's `init`/stream events, or a subagent between tool
+   * calls — is not quiet) AND no live tool-work process in the container (a
+   * subagent mid-Bash-call, however silent, has one). Together they make the two
+   * failure modes disjoint: genuinely-live silent work is kept by the process
+   * signal for any duration, and a merely-stuck row is closed once the CLI is idle.
+   */
+  #containerQuietToClose(live: ContainerLiveness, now = Date.now()): boolean {
+    if (!this.containerName) return true;
+    if (now - this.lastFrameAt < CONTAINER_QUIET_TO_CLOSE_MS) return false;
+    return !live.workAlive;
+  }
+
+  /**
+   * BUG-157 — `init` OPENS a foreground turn, so `busy` must be true for its
+   * duration even when the CLI STARTED the turn itself: a task-notification-woken
+   * surfacing turn emits a FRESH `init` (BUG-043 finding 5, probed on the real
+   * CLI). `busy` was set at only two sites — `start()` and `send()` — so a
+   * self-started turn left it false, which is exactly the `!this.busy`
+   * precondition the detached-close fuse required to fire mid-turn. Driving it
+   * from `init` removes that precondition for woken turns; `result` clears it
+   * exactly as before, closing the turn.
+   *
+   * DELIBERATELY DRIVEN ONLY FROM `init`, not from mid-turn assistant/stream
+   * frames. A trailing main-thread frame can arrive AFTER a turn's `result`
+   * (observed via verify-detach: pinning on those frames re-set `busy` after the
+   * boundary, so the fuse armed at `result` bailed on `!this.busy` and the
+   * detached session NEVER self-closed — a leak). `init` is the unambiguous
+   * turn-OPEN signal and cannot trail its own `result`. A woken turn that somehow
+   * emitted no `init` is still covered downstream: a live tool call keeps a
+   * container process alive, and the container quiet gate (frame silence + the
+   * process probe) will not close while that work runs.
+   */
+  #markForegroundTurnLive(): void {
+    if (this.closed || this.busy) return;
+    this.busy = true;
+    // BUG-159 (round 2): a SELF-WOKEN turn is not (yet) user-awaited — this is
+    // exactly the stuck-woken-`busy` shape the honest-main-turn gate must be
+    // able to downgrade. A user interject (send() above) re-marks it true.
+    this.#turnUserInitiated = false;
+    if (this.turnStartedAt == null) this.turnStartedAt = Date.now();
+    // BUG-034 — the running SET changed the instant the turn became live; a
+    // detached session's #emit is a no-op, so this only reaches an attached tab.
+    this.pushRunningSnapshot(true);
+  }
+
+  /**
    * BUG-043 — the close-on-detach fuse, made lifetime-aware and BOUNDED.
    *
    * A detached session that has finished its turn should close (that is what
@@ -2405,6 +2722,37 @@ export class AgentSession {
       this.#detachedCloseTimer = null;
       if (!this.detached || this.busy || this.closed) return;
       const lifetime = this.workLifetime();
+      /*
+       * BUG-157 (round 4) — a CONTAINER close is decided by CONTAINER GROUND TRUTH,
+       * not by the frame-timing guess round 3 used (which reaped a live subagent in
+       * a long silent Bash call). One `docker exec` process probe per tick:
+       *   - CLI gone (crash / OOM / container removed) → close now, whatever the
+       *     lifetime CLAIM says (a dead CLI is not running background work).
+       *   - CLI up, but frame-quiet AND no live tool-work process → the work is
+       *     genuinely done; close. This OVERRIDES an `unknown` lifetime (a revival
+       *     or a pre-signal-window dispatch that never resolved) because the process
+       *     is the truth the guess only approximates. It still defers to an explicit
+       *     `yes` level, the one case a future CLI could assert live background work
+       *     the process scan might miss (ARCH-015: today's CLI never emits a level).
+       *   - otherwise a live tool process (or an unquiet stream) is in flight → hold
+       *     open and re-check. A genuinely-live silent tool call is kept for ANY
+       *     duration, which is the data loss this ticket exists to stop.
+       */
+      if (this.containerName) {
+        const live = this.#probeContainerLiveness();
+        if (!live.cliAlive) {
+          void this.close('finished while detached (the container CLI is gone)');
+          return;
+        }
+        if (lifetime.outlivesTurn !== 'yes' && this.#containerQuietToClose(live)) {
+          void this.close('finished while detached (container quiet, no live tool-work process)');
+          return;
+        }
+        this.#armDetachedClose(30_000);
+        return;
+      }
+      // `direct` — the survival-handle probe is this session's ground truth and is
+      // unchanged by round 4 (#containerQuietToClose is vacuously true here).
       if (lifetime.outlivesTurn === 'no') {
         void this.close('finished while detached');
         return;
@@ -2890,6 +3238,20 @@ export class AgentSession {
      */
     this.lastFrameAt = Date.now();
     /*
+     * BUG-159 — the MAIN-THREAD clock, apart from `lastFrameAt` above. A frame is
+     * main-thread when it carries no `parent_tool_use_id` (assistant/user content
+     * and stream deltas — a background lane's frames all carry one), plus the
+     * `init` that OPENS a (possibly self-woken) main turn. A background
+     * `background_tasks_changed` LEVEL is lane bookkeeping, NOT main-thread work,
+     * and deliberately does not count — otherwise a chatty lane would keep the
+     * main clock fresh and hide a stuck woken `busy` (the exact 180-min strand).
+     */
+    if (m.parent_tool_use_id == null
+        && (m.type === 'assistant' || m.type === 'user' || m.type === 'stream_event'
+            || (m.type === 'system' && m.subtype === 'init'))) {
+      this.lastMainFrameAt = Date.now();
+    }
+    /*
      * BUG-031 — provider/API error relay. The RUNTIME owns the mapping from
      * its engine's native failure dialect to the provider-agnostic
      * `ProviderError` (see runtime.ts); the bridge only relays a non-null
@@ -3002,6 +3364,13 @@ export class AgentSession {
               this.#openToolCalls.issuedBySubagent(String(block.id), String(m.parent_tool_use_id));
             } else {
               this.#openToolCalls.issuedByMainThread(String(block.id));
+              // BUG-159 — a MAIN-THREAD tool call is open. Exclude a
+              // `run_in_background` dispatch: it returns at once and its work is a
+              // LANE, so counting it would make a live lane look like main-thread
+              // work and defeat the honest main-turn gate. Reclaimed on tool_result.
+              if ((block.input as Record<string, unknown> | undefined)?.run_in_background !== true) {
+                this.#openMainToolCalls.add(String(block.id));
+              }
             }
             // BUG-043 pre-signal race: a dispatch that will become a background
             // task (Task agents and background Bash both) is visible HERE,
@@ -3051,6 +3420,8 @@ export class AgentSession {
            * size policy that could not tell them from a live child's.
            */
           this.#openToolCalls.ended(String(block.tool_use_id));
+          // BUG-159 — a main-thread tool call (parent null) is done; reclaim it.
+          if (m.parent_tool_use_id == null) this.#openMainToolCalls.delete(String(block.tool_use_id));
           this.#emit({
             t: 'tool-result',
             toolUseId: String(block.tool_use_id),
@@ -3098,6 +3469,9 @@ export class AgentSession {
         this.#interruptRequested = false;
         this.busy = false;
         this.turnStartedAt = null; // BUG-033: a cleared busy clears its clock
+        this.#openMainToolCalls.clear(); // BUG-159: main-thread calls end with their turn
+        this.#turnUserInitiated = false; // BUG-159: the awaited turn is done; the next open re-marks
+        this.lastMainFrameAt = Date.now(); // BUG-159: the boundary is main-thread activity
         if (typeof m.total_cost_usd === 'number') this.totalCostUsd += m.total_cost_usd;
         /*
          * BUG-037 — "any agent still running at turn end has ended" was FALSE,
@@ -3435,6 +3809,11 @@ export class AgentSession {
          * semantics are the correction mechanism — every frame supersedes the
          * whole set, so a stale id cannot outlive the next frame.
          */
+        // BUG-157 (fix A): `init` opens a turn — including a fresh `init` the CLI
+        // emits when a task notification wakes it into a surfacing turn (the exact
+        // self-started turn `busy` never covered). Pin `busy` so the detached-close
+        // fuse cannot fire mid-turn.
+        this.#markForegroundTurnLive();
         this.sdkSessionId = String(m.session_id);
         this.cwd = String(m.cwd ?? this.cwd);
         // FEAT-037 P2b: the engine's session/thread id names the Orchard
@@ -3568,6 +3947,15 @@ export class AgentSession {
          */
         const reported = this.#establishedOutcomes.get(agent.agentId);
         if (reported) {
+          /*
+           * BUG-157 — this is a REVIVAL: a fresh `task_started` for a task that
+           * already established an outcome (SendMessage to a finished agent). The
+           * ROW/LEVEL treatment stays exactly as BUG-105 left it (settle to the
+           * prior outcome, keep the id retired — no staleness reopened), but the
+           * task IS live work again, so record it in the separate liveness signal
+           * the close decision reads. Cleared by its own next terminal frame.
+           */
+          this.#revivedTasks.set(agent.agentId, Date.now());
           agent.status = reported;
           agent.elapsedMs = Date.now() - agent.startedAt;
           this.#emit({ t: 'agent-completed', agent: { ...agent } });

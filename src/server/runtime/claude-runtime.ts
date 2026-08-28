@@ -12,6 +12,7 @@
  * This is the ONLY file above session-mutations.ts that imports the SDK.
  */
 import { randomUUID, createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,22 @@ import { query, type Options, type SDKMessage, type SDKUserMessage, type Permiss
 // FEAT-096: the policy is imported, never reimplemented — the enforcing hook and
 // the counting report must not each carry their own idea of "allowed" (ARCH-008).
 import { decide } from '../../../scripts/lib/orchestrator-profile.mjs';
+// FEAT-108 — git writes are denied for EVERY agent session (orchestrator AND
+// lane), a different axis from the orchestrator profile: `decide()` lets a lane
+// keep everything, but BUG-155 was a lane committing private paths. Same
+// PreToolUse callback, runs first, gated only by its own escape hatch.
+import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
+// FEAT-108 round 2 — the git-write decision is now grant-aware: a runtime,
+// per-project, revocable grant (git-grant-store.mjs, host-memory only) can lift
+// the block WITHOUT relaunching, and a granted commit/push still runs the
+// mandatory leak gate. evaluateGitWrite folds all three onto the round-1
+// classifier; the leak-gate runner is injected from here (a real subprocess).
+import { evaluateGitWrite } from '../../../scripts/lib/git-grant.mjs';
+// FEAT-106 — the Stop hook lands at `.orchard/hooks/…` in the consolidated layout
+// and `scripts/hooks/…` in the legacy one. Resolve BOTH ends through this:
+// the dest in the target project (cwd) AND the source in this repo (REPO_ROOT,
+// which has no `.orchard/` so it falls through to the legacy path).
+import { resolveStopHookFile } from '../../../scripts/lib/board-path.mjs';
 import type {
   AgentRuntime,
   ProviderError,
@@ -208,7 +225,6 @@ export const ORCHARD_SESSION_ENV = 'ORCHARD_SESSION';
  * stale copy would resume advising hand-started nested sessions. That trades the
  * quiet failure back for the loud one the ticket exists to kill.
  * ------------------------------------------------------------------------- */
-const STOP_HOOK_REL = 'scripts/hooks/response-format-gate.mjs';
 const RUNTIME_DIR = path.dirname(fileURLToPath(import.meta.url));
 /** This repo's root: src/server/runtime → src/server → src → repo. */
 const REPO_ROOT = path.resolve(RUNTIME_DIR, '..', '..', '..');
@@ -224,6 +240,46 @@ export type StopHookDelivery = {
 /** One announcement per (cwd, state) per server process — a repeat launch of an
  *  unrepairable project must not turn the log into a scroll. */
 const hookDeliveryAnnounced = new Set<string>();
+
+/** FEAT-108 — announce an OPEN git-write escape hatch at most once per process,
+ *  so `ORCHARD_ALLOW_GIT_WRITE` is never a silent bypass. */
+let gitHatchAnnounced = false;
+
+/**
+ * FEAT-108 round 2 — the mandatory leak gate for a GRANTED commit/push. Runs
+ * this repo's scripts/leak-gate.mjs (the SAME gate `npm run gate` uses) as a
+ * subprocess with cwd = the target project's repo, so it scans exactly the
+ * tree the write would publish for the user's private tokens. Exit 0 = clean;
+ * any non-zero (a leak, or the repo could not be scanned) FAILS CLOSED — a
+ * granted write is permitted only when the gate can be run AND passes. Returns
+ * `{ ok, detail }`; `detail` carries the gate's own capped output on failure.
+ */
+function runLeakGateForRepo(repoPath: string | undefined | null): { ok: boolean; detail: string } {
+  if (!repoPath) return { ok: false, detail: 'no repo path known for this session — cannot verify the leak gate; failing closed' };
+  try {
+    execFileSync(process.execPath, [path.join(REPO_ROOT, 'scripts', 'leak-gate.mjs'), '--summary'], {
+      cwd: repoPath,
+      stdio: 'pipe',
+      timeout: 30_000,
+    });
+    return { ok: true, detail: '' };
+  } catch (err) {
+    const e = err as { stdout?: Buffer; stderr?: Buffer; message?: string };
+    const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`.trim() || e.message || 'leak gate failed';
+    return { ok: false, detail: out.slice(0, 1500) };
+  }
+}
+
+/** FEAT-108 round 2 — one stderr line per permitted/blocked-by-gate agent git
+ *  write, so a runtime grant is never a silent standing permission. */
+function announceGitWrite(kind: 'permitted' | 'gate-blocked', offender: string, sessionLabel?: string): void {
+  const who = sessionLabel ? ` [session ${sessionLabel}]` : '';
+  if (kind === 'permitted') {
+    console.warn(`[orchard] git-write PERMITTED by a runtime grant: \`${offender}\`${who} (FEAT-108 grant — recorded).`);
+  } else {
+    console.warn(`[orchard] git-write GRANTED but the leak gate FAILED: \`${offender}\`${who} refused (FEAT-108 — the gate is never lifted).`);
+  }
+}
 
 function shortHash(buf: Buffer): string {
   return createHash('sha256').update(buf).digest('hex').slice(0, 8);
@@ -245,15 +301,21 @@ export function ensureCurrentStopHook(
   };
   try {
     if (!cwd) return { hook: 'not-onboarded', wiring: 'unknown', detail: 'no cwd' };
-    const dest = path.join(cwd, STOP_HOOK_REL);
+    // FEAT-106 — `.orchard/hooks/…` if the project is migrated, else legacy
+    // `scripts/hooks/…`. `destRel` names it host-relative for the diagnostics.
+    const dest = resolveStopHookFile(cwd);
+    const destRel = path.relative(cwd, dest).split(path.sep).join('/');
     if (!fs.existsSync(dest)) {
-      return { hook: 'not-onboarded', wiring: 'unknown', detail: `${STOP_HOOK_REL} absent — project not onboarded` };
+      return { hook: 'not-onboarded', wiring: 'unknown', detail: `${destRel} absent — project not onboarded` };
     }
 
     // Wiring: present-but-unwired is disabled just as silently as stale.
     let wiring: StopHookDelivery['wiring'] = 'unknown';
     try {
       const settings = fs.readFileSync(path.join(cwd, '.claude', 'settings.json'), 'utf8');
+      // FEAT-106 — the match is on the hook's BASENAME, so it accepts either
+      // command form: `scripts/hooks/response-format-gate.mjs` (legacy) or
+      // `.orchard/hooks/response-format-gate.mjs` (consolidated).
       wiring = settings.includes('response-format-gate.mjs') ? 'wired' : 'unwired';
     } catch {
       wiring = 'unwired'; // no settings file at all → Claude Code runs nothing
@@ -266,13 +328,15 @@ export function ensureCurrentStopHook(
       );
     }
 
+    const srcHook = resolveStopHookFile(REPO_ROOT);
+    const srcRel = path.relative(REPO_ROOT, srcHook).split(path.sep).join('/');
     let srcBytes: Buffer;
     try {
-      srcBytes = fs.readFileSync(path.join(REPO_ROOT, STOP_HOOK_REL));
+      srcBytes = fs.readFileSync(srcHook);
     } catch {
       announce(
         '::source-missing',
-        `[orchard] cannot read this repo's ${STOP_HOOK_REL} (${path.join(REPO_ROOT, STOP_HOOK_REL)}) — ` +
+        `[orchard] cannot read this repo's ${srcRel} (${srcHook}) — ` +
           'installed copies cannot be checked for staleness, so format grading may be running old code (BUG-118).',
       );
       return { hook: 'source-missing', wiring, detail: 'source hook unreadable' };
@@ -456,7 +520,24 @@ export class ClaudeRuntime implements AgentRuntime {
      * call proceeds). A policy bug must degrade to today's behaviour, never to
      * a session that cannot act and cannot say why.
      */
-    if (config.orchestratorProfile) {
+    /*
+     * FEAT-108 — the git-write block. FLEET-WIDE and orthogonal to the profile:
+     * it applies to every session this runtime launches (orchestrator AND lane,
+     * Claude AND container), because the leak that triggered it (BUG-155) came
+     * from a lane, which `decide()` deliberately exempts. It rides the SAME
+     * PreToolUse callback and runs FIRST, so a git write is refused even when the
+     * profile would allow the Bash command. Default ON; the user's own terminal
+     * git is untouched because that never enters this SDK tool path at all.
+     */
+    const gitBlockOn = gitWriteBlockEnabled();
+    if (!gitBlockOn && !gitHatchAnnounced) {
+      gitHatchAnnounced = true;
+      console.warn(
+        '[orchard] git-write block DISABLED via ORCHARD_ALLOW_GIT_WRITE — ' +
+          'agent sessions may commit/push/reset this run (FEAT-108 escape hatch).',
+      );
+    }
+    if (gitBlockOn || config.orchestratorProfile) {
       options.hooks = {
         ...(options.hooks ?? {}),
         PreToolUse: [
@@ -465,6 +546,35 @@ export class ClaudeRuntime implements AgentRuntime {
               async (input) => {
                 try {
                   const i = input as { tool_name?: string; tool_input?: unknown; agent_id?: string };
+                  // Git-write block first, for ALL sessions. `decide()` below
+                  // would allow `git commit` (an allowed Bash head), so order
+                  // matters. The decision is now grant-aware and evaluated PER
+                  // CALL (not captured at start), so a grant the user issues
+                  // mid-session takes effect on the next tool call with no
+                  // relaunch — and a single-use grant is consumed here.
+                  if (gitBlockOn && i.tool_name === 'Bash') {
+                    const cmd = i.tool_input && typeof i.tool_input === 'object'
+                      ? (i.tool_input as { command?: unknown }).command
+                      : '';
+                    const g = evaluateGitWrite({
+                      command: typeof cmd === 'string' ? cmd : '',
+                      projectKey: config.gitGrantKey ?? null,
+                      sessionLabel: config.sessionLabel ?? null,
+                      runLeakGate: () => runLeakGateForRepo(config.gitRepoPath),
+                    });
+                    if (!g.allow) {
+                      if (g.gateFailed) announceGitWrite('gate-blocked', g.offender ?? 'git', config.sessionLabel);
+                      return {
+                        hookSpecificOutput: {
+                          hookEventName: 'PreToolUse' as const,
+                          permissionDecision: 'deny' as const,
+                          permissionDecisionReason: g.reason ?? 'git writes are disabled for agent sessions',
+                        },
+                      };
+                    }
+                    if (g.granted) announceGitWrite('permitted', g.offender ?? 'git', config.sessionLabel);
+                  }
+                  if (!config.orchestratorProfile) return {};
                   const d = decide({
                     toolName: i.tool_name ?? '',
                     toolInput: i.tool_input,

@@ -276,6 +276,27 @@ export interface BridgeLike {
   /** The session's own ground-truth rung (a survival handle, or an honest 'unknown'). */
   processProbe(): { state: LivenessState; detail: string };
   /**
+   * BUG-159 — the MAIN-THREAD facts, kept SEPARATE from the process probe.
+   *
+   * A live background lane keeps the CLI process alive, so `processProbe()`
+   * answers 'alive' even when NO main turn is in flight — which is exactly how
+   * a stuck woken-turn `busy` (BUG-157's `#markForegroundTurnLive`) read as a
+   * running MAIN turn for 180 minutes. These let the authority tell "the process
+   * is up because a lane is running" from "a main turn is running":
+   *   - `hasLiveBackgroundLane()` — a background lane is alive right now.
+   *   - `hasMainThreadWork()` — a main-thread tool call is open, or a foreground
+   *      (non-background) agent is running. TRUE keeps the claim standing (the
+   *      BUG-033 long-silent-main-tool-call guard).
+   *   - `lastMainFrameAt` — when the MAIN thread last emitted a frame (NOT
+   *      refreshed by background-lane chatter, unlike `lastFrameAt`).
+   * All three are OPTIONAL: every existing caller/fixture still satisfies
+   * BridgeLike, and when they are absent the authority keeps its historical
+   * "alive process ⇒ running" answer unchanged.
+   */
+  hasLiveBackgroundLane?(): boolean;
+  hasMainThreadWork?(): boolean;
+  lastMainFrameAt?: number | null;
+  /**
    * FEAT-057 — the LAST provider/API error the runtime classified for the turn
    * currently in flight, or null. EVIDENCE the server actually received (a
    * frame the runtime classified), not an inference. It fills the `ended` slot
@@ -498,6 +519,61 @@ export function livenessOfSurvivalHandle(input: SurvivalHandleInput): Liveness {
  *     `unknown`, which is what tells the caller to REFUSE rather than race a
  *     second CLI onto a transcript it cannot prove is finished (BUG-022).
  */
+/**
+ * BUG-159 — is this session's `busy` a STUCK woken-turn claim that a live
+ * background lane is shielding from the frameless backstop, rather than a
+ * running MAIN turn? Consulted only in the `probe.state==='alive'` branch of
+ * `livenessOfBridge` (the process is up), where it decides whether "alive" means
+ * "a turn is running" or merely "a lane is keeping the CLI alive".
+ *
+ * TRUE requires ALL THREE, each POSITIVE — so any missing/optional fact
+ * (fixtures, older callers, a probe that cannot see the bridge internals) yields
+ * FALSE and the historical "alive ⇒ running" answer stands:
+ *   1. a background lane is alive (the shield — without it there is nothing
+ *      making a stuck `busy` look running, and a plain zombie busy is left to
+ *      the reaper/frameless paths untouched);
+ *   2. the main thread has NO work in flight — `hasMainThreadWork()` is false.
+ *      That covers the BUG-033 long-silent guard (an open main-thread tool call
+ *      or a running foreground agent) AND the S3 provenance guard: a turn the
+ *      USER is awaiting (an explicit send / first prompt / autonomous nudge)
+ *      reads as work-in-flight until its `result`, because a user-awaited turn
+ *      going momentarily frame-silent with no open tool call (API backoff, long
+ *      non-streamed generation, a slow hook) is indistinguishable from a stuck
+ *      woken `busy` on timing alone. Only a SELF-WOKEN turn can reach the clock;
+ *   3. the MAIN thread has emitted no frame for the whole frameless window
+ *      (`mainClock` = the LATER of `lastMainFrameAt` / `turnStartedAt`, so a
+ *      stale prior-turn stamp can never out-age this turn's own start — S2; and
+ *      background-lane chatter refreshes neither). A just-woken turn stamps a
+ *      fresh main frame at its `init`, so it is never caught here; only a
+ *      genuinely idle self-woken main thread ages past the window.
+ */
+/**
+ * BUG-159 (round 2, S2) — the main-thread clock, as the LATER of the two
+ * stamps. `lastMainFrameAt ?? turnStartedAt` let a PREVIOUS turn's `result`
+ * stamp (in `lastMainFrameAt`) out-age the `turnStartedAt` that a freshly
+ * opened turn just set to now — so a turn the user started seconds ago read as
+ * frame-silent for the whole PRIOR turn's dormancy. A turn's own start can
+ * never be out-aged by a stale prior-turn frame stamp; take the max. Both null
+ * ⇒ null (no clock to judge ⇒ keep the running claim).
+ */
+function mainClock(session: BridgeLike): number | null {
+  const frame = session.lastMainFrameAt ?? null;
+  const start = session.turnStartedAt ?? null;
+  if (frame == null && start == null) return null;
+  return Math.max(frame ?? 0, start ?? 0);
+}
+
+function mainTurnIdleBehindLane(session: BridgeLike, now: number): boolean {
+  if (typeof session.hasLiveBackgroundLane !== 'function') return false;
+  if (typeof session.hasMainThreadWork !== 'function') return false;
+  if (!(FRAMELESS_MS > 0)) return false;              // timer half disabled → never downgrade on silence
+  if (!session.hasLiveBackgroundLane()) return false; // no shield: not this ticket's shape
+  if (session.hasMainThreadWork()) return false;      // a real main-thread turn is in flight
+  const lastMain = mainClock(session);
+  if (lastMain == null) return false;                 // no main-thread clock to judge → keep the claim
+  return now - lastMain > FRAMELESS_MS;
+}
+
 export function livenessOfBridge(session: BridgeLike, now = Date.now()): Liveness {
   const probe = session.processProbe();
   /*
@@ -557,6 +633,28 @@ export function livenessOfBridge(session: BridgeLike, now = Date.now()): Livenes
     };
   }
   if (probe.state === 'alive') {
+    // BUG-159 — the HONEST MAIN-TURN gate. `probe.state==='alive'` proves the
+    // PROCESS is up, not that a MAIN turn is running: a live background lane
+    // keeps the broker+CLI alive, so a stuck woken-turn `busy` shielded by that
+    // lane short-circuits here and reads as a running main turn forever (the
+    // frameless backstop below is never reached). When a lane IS shielding the
+    // process AND the main thread has no work in flight AND has emitted no frame
+    // for the whole frameless window, the `busy` is that stuck woken-turn claim,
+    // not a running turn — report it not-running, but keep `live:true` (the lane
+    // is real work; the reaper must NOT drop the session). Every condition is
+    // POSITIVE evidence, and any unavailable/unknown fact keeps the historical
+    // "alive ⇒ running" answer, so a genuine long-silent MAIN tool call (BUG-033)
+    // is never downgraded.
+    if (mainTurnIdleBehindLane(session, now)) {
+      const mainSilentMs = now - (mainClock(session) ?? now);
+      return {
+        state: 'alive', running: false, live: true, kind: 'idle',
+        reason:
+          'the main thread is idle — the CLI process is kept alive by a live background lane, ' +
+          `not by a running turn (no main-thread frame for ${Math.round(mainSilentMs / 1000)}s)`,
+        evidence: { ...base, silentMs }, since: session.turnStartedAt,
+      };
+    }
     return {
       state: 'alive', running: true, live: true, kind: 'ok', reason: probe.detail,
       evidence: { ...base, silentMs }, since: session.turnStartedAt,

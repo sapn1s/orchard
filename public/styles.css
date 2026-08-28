@@ -610,6 +610,20 @@ a.board-pill[hidden] { display: none; }
 }
 .board-pill .bn:empty { display: none; }
 
+/* BUG-158 — the deliberate Settings opener. A nav pill in the Board/Guide
+   cluster, but marked as an ACTION: the gear reads clearly and hover fills the
+   pill (a control being pressed), where the status-y pills only lift their
+   border. This is the distinction the strip was missing — a chip you OPEN
+   something with, not a readout you happen to be able to click. */
+.settings-pill[hidden] { display: none; }
+.settings-pill .g { font-size: 11px; color: var(--ink-3); }
+button.settings-pill:hover,
+button.settings-pill:focus-visible {
+  border-color: var(--ink-4); color: var(--ink); background: var(--sunken);
+}
+button.settings-pill:hover .g,
+button.settings-pill:focus-visible .g { color: var(--ink); }
+
 .mnt { font-family: var(--mono); font-size: 11px; padding-right: 3px; }
 .mnt .ro { color: var(--ink-4); font-size: 9.5px; letter-spacing: .04em; }
 .mnt .x {
@@ -1076,8 +1090,14 @@ a.board-pill[hidden] { display: none; }
   box-shadow: 0 0 0 1.5px var(--window), 0 0 0 3px var(--ink-3);
 }
 
-/* Effective-mode chip in the crown seal. */
-.seal .perm { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--ink-3); }
+/* Effective-mode chip in the crown seal. It OPENS the settings drawer, but
+   borderless dot+label it was a visual twin of the informational .sess-status
+   ("Idle") readout above — the exact "status display used as a control"
+   confusion (BUG-158). A pointer cursor, a hover/focus lift and a focus ring
+   now signal it is interactive, distinct from the flat status line. */
+.seal .perm { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--ink-3); cursor: pointer; border-radius: 5px; padding: 1px 3px; margin: -1px -3px; transition: color .12s, background .12s; }
+.seal .perm:hover { color: var(--ink); background: var(--sunken); }
+.seal .perm:focus-visible { outline: none; color: var(--ink); box-shadow: 0 0 0 2px var(--focus, var(--ink-4)); }
 .seal .perm .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--idle); flex: none; }
 .seal .perm[data-risk="true"] { color: var(--ink-2); }
 .seal .perm[data-risk="true"] .dot { background: var(--ink); }
@@ -2620,6 +2640,17 @@ button.lag:hover { background: var(--rail); }
    a touch stronger than a standing ticket — a live session is waiting on it. */
 .needs-card.decision { border-left-color: var(--live); }
 .needs-card.decision .nc-id { letter-spacing: .01em; }
+
+/* FEAT-108 r3 — a git-write permission request reads as its own kind of ask:
+   a warmer accent than a plain decision, and its Allow (first option) is the
+   affirmative. One-click Allow / Decline, no free-text box. */
+.needs-card.git-write { border-left-color: var(--st-done, var(--live)); }
+.needs-card.git-write .nc-id { color: color-mix(in srgb, var(--st-done, var(--live)) 72%, var(--ink)); }
+.needs-card.git-write .nc-opt:first-child {
+  color: var(--on-solid); background: var(--st-done, var(--live));
+  border-color: var(--st-done, var(--live)); font-weight: 600;
+}
+.needs-card.git-write .nc-opt:first-child:hover { opacity: .88; }
 
 /* Option buttons for a decision that carries choices — greyscale, hairline,
    moss on hover; clicking one submits it as the answer. */

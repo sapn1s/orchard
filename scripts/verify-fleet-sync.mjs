@@ -11,7 +11,8 @@
  * Fixture projects:
  *   - "stale"     — onboarded, copied board.mjs deliberately diverged.
  *   - "identical" — onboarded, copied board.mjs already matches source.
- *   - "no-board"  — has a hostPath but was never onboarded (no docs/bugs).
+ *   - "no-board"  — has a hostPath but was never onboarded (no board layout:
+ *     neither docs/bugs nor .orchard/bugs — FEAT-106).
  *   - "hands-off-project" — onboarded + stale, but must be excluded BY
  *     DEFAULT (declared hands-off via STATION_HANDS_OFF in the child env).
  *   - "explicitly-excluded" — onboarded + stale, excluded via --exclude.
@@ -146,7 +147,7 @@ try {
   check('dry-run reports mode DRY-RUN', /DRY-RUN/.test(dry.out), dry.out);
   check('dry-run: stale-project reported STALE (would-update)', /STALE\s+stale-project\s+would-update/.test(dry.out), dry.out);
   check('dry-run: identical-project reported IDENT (identical)', /IDENT\s+identical-project\s+identical/.test(dry.out), dry.out);
-  check('dry-run: no-board-project SKIPPED (not onboarded)', /SKIP\s+no-board-project\s+skipped \(no docs\/bugs/.test(dry.out), dry.out);
+  check('dry-run: no-board-project SKIPPED (not onboarded)', /SKIP\s+no-board-project\s+skipped \(no board layout/.test(dry.out), dry.out);
   check('dry-run: hands-off-project SKIPPED by DEFAULT exclusion (hands-off)', /SKIP\s+hands-off-project\s+skipped \(excluded \(hands-off\)/.test(dry.out), dry.out);
   check('dry-run: explicitly-excluded-project SKIPPED via --exclude', /SKIP\s+explicitly-excluded-project\s+skipped \(excluded \(hands-off\)/.test(dry.out), dry.out);
 

@@ -378,8 +378,19 @@ export const gitAction = (id, action, body) =>
 export const gitFetch = (id) => gitAction(id, 'fetch');
 export const gitSwitchBranch = (id, name) => gitAction(id, 'switch-branch', { name });
 export const gitCreateBranch = (id, name) => gitAction(id, 'create-branch', { name });
+export const gitCheckoutRemote = (id, name) => gitAction(id, 'checkout-remote', { name });
 export const openTerminal = (id) =>
   api(`/api/projects/${encodeURIComponent(id)}/terminal`, { method: 'POST', body: '{}' });
+
+/* --- FEAT-108 r3: runtime git-write grant (whether AGENT sessions in this
+ * project may run git writes). The user's OWN commits through this panel go via
+ * the server git CLI and are never blocked — this only governs agent Bash git.
+ * null grant = agent git writes are blocked. */
+const gwBase = (id) => `/api/projects/${encodeURIComponent(id)}/git-write-grant`;
+export const gitWriteGrant = (id) => optional(gwBase(id));
+export const grantGitWrite = (id, body) =>
+  api(gwBase(id), { method: 'POST', body: JSON.stringify(body ?? {}) });
+export const revokeGitWrite = (id) => api(gwBase(id), { method: 'DELETE' });
 
 /* -------------------------------------------------------------- processes */
 /* What is running FROM this project's directory. null = route absent. */

@@ -1295,6 +1295,111 @@ export function reapExec(project: Project, execId: string, signal: 'TERM' | 'KIL
 }
 
 /**
+ * BUG-157 (round 4) — GROUND TRUTH for a container session's liveness, keyed by
+ * the same `CLAUDE_STATION_EXEC` tag `reapExec` kills by. A container session has
+ * no host-side broker, so `processProbe()` was permanently `'unknown'` and the
+ * close decision had to guess from frame timing — which reintroduced data loss on
+ * a long silent tool call (a subagent's 7-minute Bash call emits no frame for the
+ * whole call, so a frame-staleness bound reaped genuinely-live work). The process
+ * itself is the truth the frames could not carry: while a tool call runs there is
+ * a `/bin/bash -c …` (or its descendants) inside the container; when the CLI is
+ * idle waiting for input there is only the CLI (node) and its long-lived MCP
+ * servers / language servers (also node/python), never a `sh -c` tool shell.
+ *
+ * One process record per tagged pid: pid, ppid, and the space-joined cmdline.
+ * Root inside the container reads every environ, so this sees siblings too.
+ */
+export interface TaggedProc {
+  pid: number;
+  ppid: number;
+  cmd: string;
+}
+
+export function listTaggedProcs(project: Project, execId: string): TaggedProc[] {
+  if (!/^[A-Za-z0-9_-]+$/.test(execId)) throw new ContainerError('bad-exec-id', `refusing to probe unsafe exec id ${JSON.stringify(execId)}`);
+  // Same tag match as reapExec (grep -qz over /proc/<pid>/environ), then emit the
+  // pid/ppid/cmdline the host-side classifier needs. NUL separators in environ +
+  // cmdline are translated to spaces/newlines so a single tab-delimited line per
+  // process survives the round trip.
+  const script =
+    `for p in /proc/[0-9]*; do ` +
+    `if grep -qz "${EXEC_TAG_VAR}=${execId}" "$p/environ" 2>/dev/null; then ` +
+    `pid=\${p#/proc/}; ` +
+    `ppid=$(awk '/^PPid:/{print $2; exit}' "$p/status" 2>/dev/null); ` +
+    `cmd=$(tr '\\0' ' ' < "$p/cmdline" 2>/dev/null); ` +
+    `printf '%s\\t%s\\t%s\\n' "$pid" "$ppid" "$cmd"; fi; done`;
+  const r = dockerSync(['exec', containerName(project.id), 'sh', '-c', script], 15_000);
+  if (r.code !== 0) return [];
+  const out: TaggedProc[] = [];
+  for (const line of r.stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const [pidS = '', ppidS = '', ...rest] = line.split('\t');
+    const pid = Number(pidS);
+    if (!Number.isFinite(pid) || pid <= 0) continue;
+    out.push({ pid, ppid: Number(ppidS) || 0, cmd: rest.join('\t').trim() });
+  }
+  return out;
+}
+
+/**
+ * Is this process a SHELL invoked to run a command — the Bash tool's
+ * `/bin/bash -c source …snapshot… && eval '<command>' …`? The CLI (node), its
+ * MCP servers and language servers are never a `-c` shell, so this cleanly picks
+ * out tool work and its descendants without a per-image process allow-list.
+ */
+export function isShellToolProc(cmd: string): boolean {
+  const toks = cmd.trim().split(/\s+/).filter(Boolean);
+  if (toks.length === 0) return false;
+  const base = (toks[0].split('/').pop() ?? '').toLowerCase();
+  const isShell = base === 'sh' || base === 'bash' || base === 'dash' || base === 'ash' || base === 'zsh' || base === 'ksh';
+  return isShell && toks.includes('-c');
+}
+
+export interface ContainerLiveness {
+  /** Any tagged process at all — the CLI (and everything it spawned) is alive. */
+  cliAlive: boolean;
+  /** A live tool shell (or a descendant of one) — a tool call is genuinely running. */
+  workAlive: boolean;
+  procCount: number;
+}
+
+/**
+ * PURE classifier over a tagged-process list (unit-testable with no container).
+ * `cliAlive` is "is anything tagged still running"; `workAlive` is "is the CLI
+ * actively running a tool shell" — the signal that distinguishes a live
+ * background subagent mid-Bash-call from an idle CLI whose row is merely stuck.
+ *
+ * A tool shell counts as live work ONLY while its parent is ALSO tagged — i.e.
+ * the CLI (or a tagged tool) is still its parent and is waiting on it. A process
+ * the agent BACKGROUNDED (`&` / `setsid` / `nohup`) reparents to init (a ppid
+ * outside the tagged set): the CLI's turn is no longer blocked on it, so it is a
+ * reap-able orphan, not live work to hold the session open for — otherwise one
+ * lingering daemon would pin a container session open forever (a leak by another
+ * name). Descendants of a live tool shell (its `sleep`, a build's `node`/`cc`)
+ * are work too, by the ppid fixed-point.
+ */
+export function classifyContainerLiveness(procs: TaggedProc[]): ContainerLiveness {
+  if (procs.length === 0) return { cliAlive: false, workAlive: false, procCount: 0 };
+  const tagged = new Set<number>(procs.map((p) => p.pid));
+  const work = new Set<number>(
+    procs.filter((p) => isShellToolProc(p.cmd) && tagged.has(p.ppid)).map((p) => p.pid),
+  );
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const p of procs) {
+      if (!work.has(p.pid) && work.has(p.ppid)) { work.add(p.pid); changed = true; }
+    }
+  }
+  return { cliAlive: true, workAlive: work.size > 0, procCount: procs.length };
+}
+
+/** Convenience: probe + classify in one call for the bridge's close/reap paths. */
+export function probeContainerLiveness(project: Project, execId: string): ContainerLiveness {
+  return classifyContainerLiveness(listTaggedProcs(project, execId));
+}
+
+/**
  * Spawn the CLI inside the container. The returned ChildProcess already
  * satisfies the SDK's `SpawnedProcess` interface (stdin/stdout/kill/on/off).
  *

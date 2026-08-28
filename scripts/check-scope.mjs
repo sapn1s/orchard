@@ -37,6 +37,9 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+// FEAT-106 — find each project's local-conventions doc wherever it keeps it
+// (legacy docs/CONVENTIONS.md or consolidated .orchard/CONVENTIONS.md).
+import { resolveConventionsFile } from './lib/board-path.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 export const DEFAULT_WA_PATH = path.join(ROOT, 'docs', 'prompts', 'WORKING_AGREEMENT.v2.md');
@@ -161,7 +164,7 @@ export function discoverLocalDocs(roots) {
     }
     for (const e of entries) {
       if (!e.isDirectory() || e.name.startsWith('.')) continue;
-      const p = path.join(root, e.name, 'docs', 'CONVENTIONS.md');
+      const p = resolveConventionsFile(path.join(root, e.name));
       if (fs.existsSync(p)) found.push(p);
     }
   }

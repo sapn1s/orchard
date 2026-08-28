@@ -221,6 +221,19 @@ export interface RuntimeStartConfig {
    * auto-approve list) and `disallowedTools` strips the tool from subagents too.
    */
   orchestratorProfile?: boolean;
+  /**
+   * FEAT-108 round 2 — the STABLE per-project key (the project id) the runtime
+   * uses to look up a runtime git-write grant, and the host-accessible repo path
+   * the mandatory leak gate scans before a granted commit/push. `gitGrantKey` is
+   * deliberately the project id, not `cwd`: a container session's cwd is a
+   * `/workspace/<id>` path that never matches what the dashboard granted against.
+   * `gitRepoPath` is the project's hostPath (host-readable for direct AND
+   * container, whose repo is bind-mounted). `sessionLabel` is the station session
+   * id, recorded on each permitted write for the after-the-fact view.
+   */
+  gitGrantKey?: string;
+  gitRepoPath?: string;
+  sessionLabel?: string;
   resume?: string;
   forkSession?: boolean;
   mcpServers?: Record<string, unknown>;

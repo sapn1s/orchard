@@ -195,6 +195,43 @@ export function readRolloutHead(filePath: string, headBytes = HEAD_BYTES): Rollo
   return res;
 }
 
+/* --------------------------------------------------------- rollout head cache */
+
+interface HeadCacheEntry {
+  size: number;
+  mtimeMs: number;
+  head: RolloutHead;
+}
+
+/**
+ * `readRolloutHead` memoised by file path + size + mtime — the SAME invalidation
+ * `metaCache` (session-history.ts) uses for Claude sessions. A rollout's head
+ * (the `session_meta` line + the first user message) is immutable once written;
+ * only the single live session's file grows, and any size/mtime change forces a
+ * fresh read. Correct by construction: a changed file misses the cache.
+ *
+ * WHY (BUG-158): `listNativeCodexSessions` is called ONCE PER REGISTERED PROJECT
+ * on a single `GET /api/projects` request (13 projects here). Without this cache
+ * each call re-decoded the 256 KB head of all 620 rollouts — 1.33 GB of UTF-8
+ * decoding per request. With it the 620-file walk decodes each head at most once
+ * across every project on the request (and across requests until the file
+ * changes), so the 13 walks collapse to one walk plus cheap `stat`s.
+ */
+const headCache = new Map<string, HeadCacheEntry>();
+
+/** Drop all memoised rollout heads. Exposed for tests / forced refresh. */
+export function clearRolloutCache(): void {
+  headCache.clear();
+}
+
+function cachedRolloutHead(file: string, st: fs.Stats): RolloutHead {
+  const hit = headCache.get(file);
+  if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) return hit.head;
+  const head = readRolloutHead(file);
+  headCache.set(file, { size: st.size, mtimeMs: st.mtimeMs, head });
+  return head;
+}
+
 /* ------------------------------------------------------------- date-tree walk */
 
 /** Numeric-name subdirectories of `dir`, sorted DESCENDING (newest first). */
@@ -273,18 +310,20 @@ export function listNativeCodexSessions(hostPath: string, opts: ListOptions = {}
   const out: NativeCodexSession[] = [];
   const seenIds = new Set<string>();
   for (const file of listRolloutFiles(root, maxFiles)) {
-    const head = readRolloutHead(file);
-    if (!head.cwd || !head.sessionId) continue;
-    if (normCwd(head.cwd) !== target) continue; // other-cwd session — excluded
-    if (seenIds.has(head.sessionId)) continue;
-    seenIds.add(head.sessionId);
-
+    // Stat FIRST: the size+mtime is both the head-cache key and the row's own
+    // fileBytes/fileMtime, so a cache hit reads no rollout bytes at all. A file
+    // that vanished between the tree walk and here is simply skipped.
     let st: fs.Stats;
     try {
       st = fs.statSync(file);
     } catch {
       continue;
     }
+    const head = cachedRolloutHead(file, st);
+    if (!head.cwd || !head.sessionId) continue;
+    if (normCwd(head.cwd) !== target) continue; // other-cwd session — excluded
+    if (seenIds.has(head.sessionId)) continue;
+    seenIds.add(head.sessionId);
     // lastActivity from the file mtime (cheap + accurate to last write); the
     // start time from session_meta / the filename's leading ISO timestamp.
     const mtime = new Date(st.mtimeMs).toISOString();
@@ -297,6 +336,10 @@ export function listNativeCodexSessions(hostPath: string, opts: ListOptions = {}
       fileMtime: mtime,
       startedAt: head.startedAt,
       lastActivityAt: mtime,
+      // Codex rollouts are only head-scanned here, so the last human submit is
+      // not knowable cheaply; null makes the sidebar fall back to lastActivityAt
+      // for these rows (unchanged ordering for codex sessions).
+      lastUserMessageAt: null,
       messageCount: head.seenMessages, // lower bound (head only)
       models: head.model ? [head.model] : [],
       statsExact: false,

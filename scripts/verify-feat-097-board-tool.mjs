@@ -82,8 +82,11 @@ function setup() {
   fs.mkdirSync(path.join(ROOT, 'docs'), { recursive: true });
   fs.cpSync(REAL_BOARD, BOARD, { recursive: true });
   fs.mkdirSync(path.join(ROOT, 'scripts'), { recursive: true });
-  // The REAL gate, so `commit`'s refusal is the real gate's refusal.
-  for (const s of ['gate.mjs', 'leak-gate.mjs', 'check-nul.mjs']) {
+  // The REAL gate, so `commit`'s refusal is the real gate's refusal. leak-gate.mjs
+  // imports lib/leak-tokens.mjs (the shared token list), so that sibling must
+  // travel with it or the copied gate cannot resolve its import.
+  fs.mkdirSync(path.join(ROOT, 'scripts', 'lib'), { recursive: true });
+  for (const s of ['gate.mjs', 'leak-gate.mjs', 'check-nul.mjs', 'lib/leak-tokens.mjs']) {
     fs.copyFileSync(path.join(REPO, 'scripts', s), path.join(ROOT, 'scripts', s));
   }
   // No `typecheck` script: gate.mjs then reports it SKIPPED and the leak-gate is
@@ -314,10 +317,16 @@ async function main() {
   fs.appendFileSync(bystanderPath, '\n<!-- another lane was mid-write -->\n');
   const bystanderBytes = fs.readFileSync(bystanderPath, 'utf8');
 
-  // MUST-FAIL: a leaked home path. Written into the ticket the same way any
-  // content reaches it — through the tool's own log append.
+  // MUST-FAIL: a leaked home path the commit gate must catch. NOTE: the tool's
+  // own `update --log` now REFUSES this at authoring time (the leak-write guard,
+  // FEAT-110), so the leak is planted by a DIRECT file write — modelling a ticket
+  // authored OUTSIDE the tool (e.g. with the Write tool) that only the commit
+  // gate can still catch. (That the tool refuses it through --log is proven in
+  // scripts/verify-leak-write-guard.mjs.)
   const leak = `${'/ho'}${'me/'}${'sa'}p/projects/orchard/docs/bugs`;
-  await call('update', `--id=${FILED_ID}`, `--log=Reproduced under ${leak} while testing.`);
+  const guarded = await call('update', `--id=${FILED_ID}`, `--log=Reproduced under ${leak} while testing.`);
+  ok('the tool refuses to WRITE the leak through --log (FEAT-110 guard)', guarded.ok === false && guarded.refusal.code === 'private-token-leak', JSON.stringify(guarded.refusal ?? ''));
+  fs.appendFileSync(path.join(ROOT, filed.file), `\nReproduced under ${leak} while testing.\n`);
   const headBefore = git(ROOT, ['rev-parse', 'HEAD']);
   const redGate = await call('commit', `--ids=${FILED_ID}`, '--message=board tool: this must not land');
   ok('a red gate refuses the commit', redGate.ok === false && redGate.refusal.code === 'gate-failed');

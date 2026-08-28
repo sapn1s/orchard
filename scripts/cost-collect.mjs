@@ -87,6 +87,7 @@
  * What IS exact, checked against that same oracle to seven decimal places, is
  * the price model applied to a given set of tokens (`cost-model.mjs` costOf).
  */
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -109,6 +110,12 @@ import {
   DISPATCH_CLASSES,
   PHASES,
 } from './lib/cost-model.mjs';
+import {
+  extractRecordedShas,
+  parseNumstat,
+  attributeDiffs,
+  fixClassBaseline,
+} from './lib/diff-size.mjs';
 
 /* ----------------------------------------------------------------- locations */
 
@@ -470,6 +477,122 @@ function readLedger() {
   return [...byLane.values()];
 }
 
+/* ---------------------------------------------------------------- diff sizes */
+
+/**
+ * How big was the change each lane/ticket produced (FEAT-107).
+ *
+ * The shas come from the tickets themselves — the BUG-154 convention — read out
+ * of each ticket's Activity log prose, validated against the real object store,
+ * and turned into `git diff --numstat` figures. This is derivation over files
+ * already on disk (ticket markdown + the git object store), so like the rest of
+ * the collector it works retroactively and costs the measured pipeline nothing.
+ *
+ * Computed at REPORT time, NOT stored in the ledger on purpose: a ticket can
+ * record its commit sha AFTER the lane's transcript was last collected (BUG-154
+ * itself did exactly that in a later commit), so recomputing from git on every
+ * report is both cheaper than a schema migration and always current, where a
+ * frozen per-lane number in the ledger would silently go stale.
+ *
+ * Every git call is guarded: an unreadable repo, a sha that does not resolve to
+ * a commit, or a merge with an empty numstat degrades to a NAMED gap, never a
+ * fabricated zero — the whole point of the feature is that "we could not
+ * attribute this" is reported, not dropped.
+ */
+function gitRoot(projectDir) {
+  try {
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: projectDir, encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function ticketFiles(root) {
+  const dir = path.join(root, 'docs', 'bugs');
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((f) => /^(BUG|FEAT|ARCH|DEPLOY)-\d+.*\.md$/.test(f))
+      .map((f) => ({ id: /^((?:BUG|FEAT|ARCH|DEPLOY)-\d+)/.exec(f)[1], path: path.join(dir, f) }));
+  } catch {
+    return [];
+  }
+}
+
+/** Resolve a candidate sha to a canonical commit sha, or null if it is not one. */
+function resolveCommit(root, sha) {
+  try {
+    const full = execFileSync('git', ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], {
+      cwd: root,
+      encoding: 'utf8',
+    }).trim();
+    return full || null;
+  } catch {
+    return null;
+  }
+}
+
+/** `git show --numstat` for a resolved commit -> { added, deleted, files, at_ms }. */
+function numstatOf(root, fullSha) {
+  let out;
+  try {
+    out = execFileSync('git', ['show', '--numstat', '--format=%aI', fullSha], { cwd: root, encoding: 'utf8' });
+  } catch {
+    return null;
+  }
+  const firstLine = out.split('\n').find((l) => l.trim());
+  const at_ms = firstLine ? Date.parse(firstLine.trim()) : NaN;
+  const st = parseNumstat(out);
+  return { ...st, at_ms: Number.isFinite(at_ms) ? at_ms : null };
+}
+
+/**
+ * Read every ticket, pull its recorded shas, resolve + numstat each unique
+ * commit, then hand the plain data to the pure attributor. Returns null (with a
+ * stated reason) when git is not available, so the report can say so rather than
+ * print an empty table that looks like "no diffs".
+ */
+function collectDiffs(lanes, opts) {
+  const root = gitRoot(opts.project);
+  if (!root) return { unavailable: `git not available under ${opts.project}` };
+
+  const tickets = ticketFiles(root);
+  const ticketShas = new Map(); // ticket -> [canonical sha, ...]
+  const commitStats = new Map(); // canonical sha -> numstat
+  const unresolved = []; // { ticket, raw } — labelled like a sha, not a real commit
+  const resolvedCache = new Map(); // raw -> canonical|null
+
+  for (const { id, path: file } of tickets) {
+    let body;
+    try {
+      body = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue;
+    }
+    const shas = [];
+    for (const raw of extractRecordedShas(body)) {
+      let full = resolvedCache.get(raw);
+      if (full === undefined) {
+        full = resolveCommit(root, raw);
+        resolvedCache.set(raw, full);
+      }
+      if (!full) {
+        unresolved.push({ ticket: id, raw });
+        continue;
+      }
+      if (!commitStats.has(full)) {
+        const st = numstatOf(root, full);
+        if (st) commitStats.set(full, st);
+      }
+      if (!shas.includes(full)) shas.push(full);
+    }
+    if (shas.length) ticketShas.set(id, shas);
+  }
+
+  const attributed = attributeDiffs({ lanes, ticketShas, commitStats });
+  return { root, attributed, unresolved, baseline: fixClassBaseline(attributed, 20) };
+}
+
 /* -------------------------------------------------------------------- report */
 
 const hrs = (ms) => (ms / 3600e3).toFixed(2);
@@ -738,6 +861,96 @@ function printTicket(lanes, id) {
   return L.join('\n');
 }
 
+/**
+ * The diff-size section — how much code each ticket/lane actually produced,
+ * printed NEXT TO its verify rounds and verdicts because added lines are a proxy
+ * and a smaller diff that fails twice is a loss, not a win (FEAT-107).
+ */
+const numOrDash = (n) => (n == null ? '   —' : String(n));
+
+function printDiffs(diffs, opts) {
+  const L = [];
+  L.push('');
+  L.push('  ── DIFF SIZE (FEAT-107) ───────────────────────────────────────────────');
+  if (diffs?.unavailable) {
+    L.push(`  unavailable: ${diffs.unavailable}`);
+    return L.join('\n');
+  }
+  const a = diffs.attributed;
+  const c = a.counts;
+  L.push('  Source: git diff --numstat of the commit sha(s) recorded on each ticket');
+  L.push('  (the BUG-154 convention). Added lines are a PROXY, not a quality score —');
+  L.push('  read every row against its verdicts. A number here includes ticket-log and');
+  L.push('  verify-script churn: it is the whole commit, not just src/.');
+  L.push('');
+  L.push(
+    `  ticket->commit links: ${c.links_attributed_window + c.links_attributed_preceding} attributed ` +
+      `(window ${c.links_attributed_window}, preceding-lane ${c.links_attributed_preceding}) + ` +
+      `${c.links_unattributed} unattributable = ${c.links_total} across ${c.unique_commits} unique commits ` +
+      `(${c.shared_commits} shared across tickets)`,
+  );
+  L.push('  provenance: `window` = commit authored inside the lane; `preceding` = tied to the');
+  L.push('  most recent lane by recency because a human committed after the lane ended (inferred, not certain).');
+  L.push(`  lanes with an attributed commit: ${c.lanes_with_commit}/${c.lanes}   (${c.lanes_no_commit} produced no attributable commit — NOT counted as a zero-line change)`);
+  L.push(`  fleet total (deduped by sha): +${a.globalTotal.added} / -${a.globalTotal.deleted} across ${a.globalTotal.files} file-changes in ${a.globalTotal.commits} commits`);
+  if (diffs.unresolved.length) {
+    const sample = diffs.unresolved.slice(0, 4).map((u) => `${u.ticket}:${u.raw}`).join(', ');
+    L.push(`  ${diffs.unresolved.length} recorded sha(s) did not resolve to a commit and were dropped (not zeroed): ${sample}${diffs.unresolved.length > 4 ? ' …' : ''}`);
+  }
+
+  L.push('');
+  L.push('  MEDIAN ADDED LINES PER LANE, BY DISPATCH CLASS (attributed lanes only)');
+  L.push('  CLASS               lanes   med+   med-   medFiles   declared   verdicts');
+  for (const m of a.classMedians) {
+    const v = Object.entries(m.verdicts).map(([k, n]) => `${k}:${n}`).join(' ') || '—';
+    L.push(
+      `  ${m.dispatch_class.padEnd(18)}${String(m.lanes).padStart(6)}${numOrDash(m.median_added).padStart(7)}${numOrDash(m.median_deleted).padStart(7)}${numOrDash(m.median_files).padStart(11)}   ${m.declared_fraction.padStart(8)}   ${v}`,
+    );
+  }
+
+  const ticketsSorted = a.perTicket.filter((t) => t.total.commits > 0).sort((x, y) => y.total.added - x.total.added);
+  if (ticketsSorted.length) {
+    L.push('');
+    L.push('  PER TICKET — whole recorded diff, and how much was lane-attributable');
+    L.push('  TICKET               commits    added   deleted   files   unattributed(+)');
+    for (const t of ticketsSorted.slice(0, opts.top)) {
+      L.push(
+        `  ${t.ticket.padEnd(20)}${String(t.total.commits).padStart(7)}${String(t.total.added).padStart(9)}${String(t.total.deleted).padStart(10)}${String(t.total.files).padStart(8)}${String(t.unattributed.added).padStart(18)}`,
+      );
+    }
+  }
+
+  const b = diffs.baseline;
+  L.push('');
+  L.push(`  LAST ${b.requested} FIX-CLASS LANES WITH AN ATTRIBUTED COMMIT — the experiment baseline`);
+  if (!b.n) {
+    L.push('  none in this window: the sha-recording convention (BUG-154) is new, so no lane whose');
+    L.push('  DECLARED dispatch class is `fix` has yet produced an attributable commit. Until it does,');
+    L.push('  the best-available baseline is the "(unclassified)" row of the median table above — the');
+    L.push('  lanes that DID produce attributable commits, dispatch-class mostly undeclared (pre-FEAT-100).');
+  } else {
+    L.push(`  n=${b.n}   median added ${numOrDash(b.median_added)}   median deleted ${numOrDash(b.median_deleted)}   median files ${numOrDash(b.median_files)}   total added ${b.total_added}`);
+    const v = Object.entries(b.verdicts).map(([k, n]) => `${k}:${n}`).join(' ') || 'no verdicts recorded';
+    L.push(`  verdicts across the baseline: ${v}  (a small diff that BROKE verification is not a win)`);
+    L.push('  TICKET        round  class-src    added   deleted   files   verdict');
+    for (const l of b.lanes) {
+      L.push(
+        `  ${String(l.ticket ?? '—').padEnd(13)}${String(l.round ?? '—').padStart(5)}   ${String(l.class_source ?? '—').padEnd(9)}${String(l.added).padStart(8)}${String(l.deleted).padStart(10)}${String(l.files).padStart(8)}   ${l.verdict ?? '—'}`,
+      );
+    }
+  }
+  if (a.unattributed.length) {
+    L.push('');
+    L.push('  UNATTRIBUTABLE COMMITS — recorded on a ticket, not chargeable to one lane');
+    for (const u of a.unattributed.slice(0, 12)) {
+      L.push(`  ${u.ticket.padEnd(13)} ${u.sha.slice(0, 8)}  +${u.added}/-${u.deleted}  ${u.reason}`);
+    }
+    if (a.unattributed.length > 12) L.push(`  … and ${a.unattributed.length - 12} more.`);
+  }
+  L.push('');
+  return L.join('\n');
+}
+
 function checkRetention(lanes) {
   const oldest = lanes.reduce((a, l) => {
     const t = Date.parse(l.started_at ?? '');
@@ -780,8 +993,9 @@ async function main() {
   }
 
   const r = rollUp(lanes);
+  const diffs = collectDiffs(lanes, opts);
   if (opts.json) {
-    console.log(JSON.stringify({ rollup: r, lanes }, null, 2));
+    console.log(JSON.stringify({ rollup: r, diffs, lanes }, null, 2));
     return 0;
   }
   if (opts.ticket) {
@@ -789,6 +1003,7 @@ async function main() {
     return 0;
   }
   console.log(printReport(r, opts));
+  console.log(printDiffs(diffs, opts));
   if (opts.checkRetention) console.log(checkRetention(lanes));
   return 0;
 }
@@ -800,4 +1015,4 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   });
 }
 
-export { collect, buildLane, rollUp, appendLedger, readLedger, encodeProjectDir, ledgerFile };
+export { collect, buildLane, rollUp, appendLedger, readLedger, encodeProjectDir, ledgerFile, collectDiffs };

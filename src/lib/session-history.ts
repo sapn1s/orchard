@@ -91,6 +91,18 @@ export interface SessionMeta {
   startedAt: string | null;
   /** ISO timestamp of the last timestamped entry; falls back to file mtime. */
   lastActivityAt: string | null;
+  /**
+   * ISO timestamp of the last message the HUMAN actually submitted — the same
+   * "real user prompt" test `firstUserMessage` uses (tool_results, command
+   * wrappers, system-reminders, task-notifications, sidechain/meta entries are
+   * NOT user submits). Distinct from `lastActivityAt`, which moves on agent
+   * output too: this is the recency signal the sidebar orders by, so a session
+   * an agent has been grinding in for hours does not keep jumping to the top.
+   * Null when no human prompt was found in the scanned region (falls back to
+   * `lastActivityAt` at the call site). In sample mode it reflects the last
+   * user prompt within the head+tail window.
+   */
+  lastUserMessageAt: string | null;
   /** Count of non-meta, non-sidechain user+assistant entries. See `statsExact`. */
   messageCount: number;
   /** Distinct assistant models seen (synthetic entries excluded). See `statsExact`. */
@@ -467,9 +479,22 @@ interface CacheEntry {
 
 const metaCache = new Map<string, CacheEntry>();
 
+/**
+ * BUG-158 — `probeCwd` memoised by file PATH. A session file's `cwd` is written
+ * on the first line and never changes (even as the file grows, and Claude's
+ * store is append-only with per-session-id filenames that are never reused), so
+ * path alone is a sound, permanent key. This matters because `listProjectDirs`
+ * probes the newest file of every one of ~750 directories, and that probe — not
+ * the `stat` walk — is the bulk of its cost (~120 ms of ~135 ms measured); on a
+ * `GET /api/projects` request that runs it once per registered project the same
+ * newest files were re-read up to 13 times.
+ */
+const cwdProbeCache = new Map<string, string | null>();
+
 /** Drop all memoised session metadata. Exposed for tests / forced refresh. */
 export function clearSessionCache(): void {
   metaCache.clear();
+  cwdProbeCache.clear();
 }
 
 /* -------------------------------------------------------- project listing */
@@ -537,7 +562,7 @@ export function listProjectDirs(opts: ScanOptions = {}): ProjectDir[] {
 
     let cwd: string | null = null;
     if (newestFile) {
-      cwd = probeCwd(newestFile);
+      cwd = probeCwdCached(newestFile);
       if (!cwd) warnings.push('no cwd field found in the sampled head of the newest session file');
     }
 
@@ -580,6 +605,15 @@ export function listProjectDirs(opts: ScanOptions = {}): ProjectDir[] {
 
   out.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
   return out;
+}
+
+/** `probeCwd` behind the path-keyed memo (BUG-158). See `cwdProbeCache`. */
+function probeCwdCached(filePath: string): string | null {
+  const hit = cwdProbeCache.get(filePath);
+  if (hit !== undefined) return hit;
+  const cwd = probeCwd(filePath);
+  cwdProbeCache.set(filePath, cwd);
+  return cwd;
 }
 
 /** Read just enough of a file's head to find its `cwd`. */
@@ -659,6 +693,7 @@ export function readSessionMeta(
   let malformed = 0;
   let startedAt: string | null = null;
   let lastActivityAt: string | null = null;
+  let lastUserMessageAt: string | null = null;
   let title: string | null = null;
   let firstUserMessage: string | null = null;
   let firstCommand: string | null = null;
@@ -698,11 +733,16 @@ export function readSessionMeta(
       if (e.type === 'assistant') {
         const m = e.message?.model;
         if (typeof m === 'string' && m && !m.startsWith('<')) models.add(m);
-      } else if (!firstUserMessage) {
+      } else {
+        // Evaluate EVERY user entry (not just the first) so the LAST genuine
+        // human submit's timestamp is captured — the ordering signal. The
+        // text is bounded by contentToText's cap, and user prompts are sparse
+        // relative to tool_result turns, so this stays cheap.
         const text = contentToText(e.message?.content, FIRST_MESSAGE_CHARS * 4);
         if (isRealUserPrompt(e, text)) {
-          firstUserMessage = normaliseTitle(text).slice(0, FIRST_MESSAGE_CHARS);
-        } else if (!firstCommand) {
+          lastUserMessageAt = maxIso(lastUserMessageAt, ts);
+          if (!firstUserMessage) firstUserMessage = normaliseTitle(text).slice(0, FIRST_MESSAGE_CHARS);
+        } else if (!firstUserMessage && !firstCommand) {
           firstCommand = extractCommandName(text);
         }
       }
@@ -770,6 +810,7 @@ export function readSessionMeta(
     fileMtime: new Date(st.mtimeMs).toISOString(),
     startedAt,
     lastActivityAt: lastActivityAt ?? new Date(st.mtimeMs).toISOString(),
+    lastUserMessageAt,
     messageCount,
     models: Array.from(models).sort(),
     statsExact,

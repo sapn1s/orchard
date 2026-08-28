@@ -38,6 +38,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import { onboard } from './onboard.mjs';
+// FEAT-106 — a project is in scope if it has ANY board layout (legacy docs/bugs
+// OR consolidated .orchard/bugs), and a copied tool is compared wherever it
+// actually lands (`.orchard/<tool>` on a migrated project, `scripts/<tool>`
+// legacy). Report LABELS stay `scripts/<tool>` for now because onboard still
+// emits those — the label/dest rewrite belongs with the onboard cutover.
+import { boardLayout, resolveOrchardDir } from './lib/board-path.mjs';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
@@ -74,7 +80,19 @@ const repoRoot = path.resolve(__dirname, '..');
  * them and reads the output), which is why they were not moved onto the
  * always-current path with the hook — see the BUG-118 round-4 note.
  */
-const SYNCED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs', 'hooks/response-format-gate.mjs'];
+const SYNCED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs', 'lib/board-path.mjs', 'hooks/response-format-gate.mjs'];
+
+/**
+ * FEAT-106 — where a copied tool lands in a given project. Consolidated layout
+ * puts it under `.orchard/<tool>`; legacy puts it under `scripts/<tool>`. Prefer
+ * the consolidated copy if it exists, else the legacy path (returned regardless,
+ * so an absent tool still reports "would-create" against the legacy location).
+ */
+function toolDestPath(hostPath, tool) {
+  const orchardDest = path.join(resolveOrchardDir(hostPath), tool);
+  if (fs.existsSync(orchardDest)) return orchardDest;
+  return path.join(hostPath, 'scripts', tool);
+}
 const boardSourcePath = path.join(repoRoot, 'scripts', 'board.mjs');
 
 export const DEFAULT_BASE = 'http://127.0.0.1:4317';
@@ -121,9 +139,10 @@ export function planSweep(projects, { exclude = new Set() } = {}) {
       plan.push({ id, hostPath, action: 'skip', reason: 'excluded (hands-off)' });
       continue;
     }
-    const bugsDir = path.join(hostPath, 'docs', 'bugs');
-    if (!fs.existsSync(bugsDir)) {
-      plan.push({ id, hostPath, action: 'skip', reason: 'no docs/bugs (not onboarded)' });
+    // FEAT-106 — onboarded ⇔ ANY board layout present (legacy or consolidated),
+    // so a migrated project is not skipped as "not onboarded".
+    if (boardLayout(hostPath) === 'none') {
+      plan.push({ id, hostPath, action: 'skip', reason: 'no board layout (not onboarded)' });
       continue;
     }
     plan.push({ id, hostPath, action: 'sync' });
@@ -154,7 +173,7 @@ export function runSweep(plan, { apply = false } = {}) {
       // state across the tools (a stale arch-watch is as much drift as a stale
       // board.mjs), with the per-tool detail kept for the report.
       const per = SYNCED_TOOLS.map((tool) => {
-        const destPath = path.join(item.hostPath, 'scripts', tool);
+        const destPath = toolDestPath(item.hostPath, tool);
         if (!fs.existsSync(destPath)) return { tool, outcome: 'would-create' };
         return {
           tool,

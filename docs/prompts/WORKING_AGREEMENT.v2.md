@@ -109,7 +109,7 @@ prevent.
   verifies the component, not the value — an integrated-but-unused capability
   silently stops earning its keep (§L Q10), and nothing flags it unless a
   done-criterion of *demonstrated use* was set up front.
-- Never abandon, re-dispatch or overwrite live work on the strength of a STATUS REPORT alone. Reports (briefings, ledgers, dashboards, notifications) are ADVISORY: verify the work is genuinely dead with ground truth — its process, its output still growing, its artifacts — before acting destructively. Learned twice: a hand-check declared a working feature broken, and a false death ledger caused live agents to be abandoned and re-dispatched mid-flight; the report, not the failure, did the damage. _(captured 2026-08-10 — recurring ≥2×)_
+- Never abandon, re-dispatch or overwrite live work on the strength of a STATUS REPORT alone. Reports (briefings, ledgers, dashboards, notifications) are ADVISORY: verify the work is genuinely dead with ground truth — its process, its output still growing, its artifacts — before acting destructively. Learned twice: a hand-check declared a working feature broken, and a false death ledger caused live agents to be abandoned and re-dispatched mid-flight; the report, not the failure, did the damage. **A harness completion notification — and your own turn ending — are exactly such reports:** neither is evidence a background child died. Measured 2026-08-27, a harness emitted a completed status while a child was still live, the parent was told its child was probably dead and re-ran the child's whole ~1h suite, and the child then finished an identical verdict 7.6 min later — 51.6 duplicated lane-minutes for nothing. So never assert to a lane that its child is dead; have it confirm from ground truth (transcript still growing, a terminal result already in the transcript, the process itself — a harvest check reads that bounded tail without ingesting the whole transcript), and **when the child is alive, WAIT and harvest its result — re-running a live child's work is the destructive act this rule forbids.** _(captured 2026-08-10, recurring ≥3× — last 2026-08-27)_
 
 ### D. Recoverability is a layer of safety, not a consolation prize
 When the user's concern is destructive mistakes, treat **"can it be undone?"** as
@@ -160,6 +160,35 @@ Measured: one ticket's five rounds each found a DIFFERENT class and every round 
 while another's six alternated between two readings of one boundary and bought nothing after the
 second. Yield decays, and "the round returned a finding" is insensitive to the decay.
 
+**The file/build boundary — work stops at FILED for EXACTLY two reasons, and this
+governs every ticket** (not just the recurrence case below). A ticket is filed instead
+of built ONLY when:
+1. **The user asked for a ticket only** — an explicit "just file it, don't build".
+2. **It is a genuine architectural decision** — the right answer depends on knowledge of
+   the project's DIRECTION that a senior engineer cannot supply, so a human who holds
+   that knowledge must choose between real alternatives.
+
+Everything else gets BUILT. **Effort, size, blast radius, and "this feels architectural"
+are explicitly NOT reasons to stop** — a large, scary, or wide-blast fix that has one
+known-correct answer is still a build, dispatched at whatever rigor its cost-of-mistake
+earns (escalate per this section; that is about HOW carefully to build, never about
+WHETHER to). Do not convert work into a decision because it is expensive.
+
+**The self-check — is there actually a fork?** If the "options" reduce to *"keep the
+problem, because fixing it is work"* versus *"fix the problem, and it is work"*, there is
+NO fork: the answer is already known, and filing it as a human decision hands the user a
+non-choice. The operative test: if you cannot write ONE sentence naming the fork and the
+specific project knowledge that decides it, there is no decision to escalate — dispatch
+the build. (Learned the hard way: a data-loss bug with a single correct fix was filed as
+a human decision whose only two options were exactly those above; the user rightly
+rejected it — fixing something is not a reason to make the user choose whether to.)
+
+When a ticket genuinely IS file-only (reason 1 or 2), write it for the ENGINEER who will
+implement it — invariant, design, migration path, proof bar — not for a reviewer deciding
+WHETHER to build. Under reason 1 the build is merely deferred; under reason 2 only the
+option-choice is the human's, and once chosen the build proceeds. The ARCH-container
+content requirements below still apply in full.
+
 **Recurrence → raise an architecture question (don't just patch again).** A board
 optimises for closing tickets, and a per-ticket scope makes every fix local by
 construction, so this rule has to be triggered, not remembered:
@@ -174,8 +203,13 @@ construction, so this rule has to be triggered, not remembered:
   trade-offs** (including "keep patching", priced), a **migration path** in landable
   steps, and the **proof bar** — what must be true to call the new design right, and
   what would falsify it. Cannot state the invariant? It's still a BUG, not an ARCH.
-- An ARCH ticket is **not a licence to rewrite working code**: no build starts until
-  a human picks an option. Redesign is decided by humans; the loop only asks.
+- An ARCH ticket is **not a licence to rewrite working code** — but it is a build-blocker
+  ONLY when it clears reason 2 of the file/build boundary above: a genuine fork whose
+  answer needs project-direction knowledge. Recurrence raises the QUESTION mechanically
+  (`arch:watch`); it does not by itself prove the answer is unknown. If the class turns out
+  to have one correct redesign and only effort stands in the way, that is a `plan+review`
+  build sequenced through the migration path, not a decision parked on a human. When there
+  IS a real fork, the loop only asks and the human picks before the build starts.
 
 ## Working method
 
@@ -230,14 +264,32 @@ times.
   Downshift only for speed on genuinely low-stakes work.
 - **Kill dispatched subprocess work by process-group**, never a bare PID / `kill $!`,
   so no orphaned children survive.
-- **Never park long-running work behind your own turn end.** In harnesses where an
-  agent's background children are turn-scoped, "launch in background, end turn, wait
-  for a monitor/notification" orphans the work: the child dies with the turn and the
-  monitor watches a corpse — the lane stalls silently, indistinguishable from idle.
-  Run long verification/build steps SYNCHRONOUSLY in foreground calls (split into
-  sequential calls if one exceeds the timeout). Waiting on a notification is only
-  safe for work owned by a process that outlives you (a service, another session).
-  (Observed 2026-08-11: two agents, two stalls each, ~1h lost per stall.)
+- **Interleave long verification within a turn; never park it behind your turn END.**
+  Two distinct moves, routinely confused — getting them backwards is how 51 minutes
+  were lost (§C, 2026-08-27):
+  - **RIGHT — background within the turn, and overlap.** Launch a long
+    verification/build step in the background and keep doing independent work in the
+    SAME turn (read code, draft the next edit) while it runs, then harvest its result
+    from ground truth before the turn ends. Measured 2026-08-27: a clean-room lane that
+    backgrounded its suites and read code while they ran finished in ~12 minutes
+    against ~68 for lanes that blocked synchronously on every 4–5-minute suite.
+    Generation per tool call is near-constant fleet-wide, so the only structural
+    variable in lane wall-clock is whether verification needs a real process and
+    whether the lane overlaps its own thinking with it; overlapping recovers roughly
+    min(generation, tool-wall) — about 15–18 minutes per verification lane.
+  - **WRONG — end the turn and wait on a monitor/notification.** A background child is
+    turn-scoped for NOTIFICATION, not (necessarily) for lifetime: the notification can
+    fire the instant your turn ends even while the child is still live (§C — measured
+    2026-08-27, a child ran ~1h past its parent's turn end), and once your turn's
+    context is gone you may never be scheduled to read the result. So the earlier
+    inference that "the child dies with the turn" was too strong — the real failure is
+    that you cannot reliably harvest it, and a lane with no harvest path then re-runs
+    everything it could have waited for.
+  When you have nothing to overlap, run the step SYNCHRONOUSLY in foreground calls
+  (split into sequential calls if one exceeds the timeout) — simplest and safe.
+  Waiting on a notification is only safe for work owned by a process that outlives you
+  (a service, another session). (Observed 2026-08-11: two agents, two stalls each, ~1h
+  lost per stall; refined 2026-08-27 with the harvest-path measurement.)
 
 **Classify the dispatch BEFORE writing the charter — and record the class in it.**
 The orchestrator's context converges on one reading of the problem, and the charter
@@ -253,7 +305,7 @@ dispatches turned out to need `explore`?").
 | `fix` | You can name the CAUSE and the blast radius in one sentence each. |
 | `explore` | You cannot name the cause, or there is more than one defensible approach → the agent returns 2–3 approaches with trade-offs + a recommendation and **builds nothing**. |
 | `plan+review` | High cost-of-mistake (§N) → `explore` first, then an INDEPENDENT agent critiques the PLAN before any build. Cross-provider by default (ROUTING). |
-| `arch` | It is the Nth bug in one class → ARCH-### ticket, invariant first (§N), no build until a human picks an option. |
+| `arch` | It is the Nth bug in one class AND the redesign is a genuine fork needing project-direction knowledge (§N file/build boundary) → ARCH-### ticket, invariant first, human picks before the build. A recurring class with ONE known-correct redesign is a `plan+review` build, not `arch` — recurrence raises the question, it does not prove the answer is unknown. |
 | `verify` | Not an alternative to the others — the REQUIRED SECOND STEP after a `fix`/`plan+review`/`arch` build: a clean-room agent tries to BREAK the claim. See "generation must not verify itself" below. |
 
 Default UP when torn: an `explore` that concludes "the obvious fix was right" costs one

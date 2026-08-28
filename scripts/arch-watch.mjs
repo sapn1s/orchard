@@ -104,6 +104,9 @@ import {
   TICKET_FILE_RE,
   TICKET_ID_IN_TEXT_RE as ID_IN_TEXT_RE,
 } from './lib/ticket-schema.mjs';
+// FEAT-106 — default board dir resolved (docs/bugs legacy / .orchard/bugs flat)
+// rather than hard-coded; an explicit --dir still wins. Copied sibling import.
+import { resolveBoardDir } from './lib/board-path.mjs';
 
 export const DEFAULTS = {
   minTickets: 3,
@@ -621,7 +624,7 @@ export function persistArchFindings(dir, findings) {
  * answer. (Exit 2 = usage error, already this script's documented code.)
  */
 function parseArgs(argv) {
-  const out = { dir: 'docs/bugs', json: false, persist: false, quiet: false, unknown: [], opts: {} };
+  const out = { dir: null, json: false, persist: false, quiet: false, unknown: [], opts: {} };
   for (const a of argv) {
     let m;
     if ((m = /^--dir=(.*)$/.exec(a))) out.dir = m[1];
@@ -646,10 +649,10 @@ function main() {
   const a = parseArgs(process.argv.slice(2));
   if (a.unknown.length) {
     console.error(`arch-watch.mjs: unrecognised argument(s): ${a.unknown.join(' ')}`);
-    console.error('usage: node scripts/arch-watch.mjs [--dir=docs/bugs] [--json] [--quiet] [--all] [--persist]');
+    console.error('usage: node scripts/arch-watch.mjs [--dir=<board>] [--json] [--quiet] [--all] [--persist]  (default --dir resolves docs/bugs or .orchard/bugs)');
     process.exit(2);
   }
-  const dir = path.resolve(a.dir);
+  const dir = a.dir === null ? resolveBoardDir(process.cwd()) : path.resolve(a.dir);
   const res = archWatch(dir, a.opts);
   const findings = archFindings(dir, a.opts);
   if (a.persist) persistArchFindings(dir, findings);

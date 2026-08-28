@@ -21,6 +21,23 @@ import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
 
+/**
+ * FEAT-108 round 3 — a git-write PERMISSION request an agent raised. When a
+ * decision carries this, approving it (answer starts "Allow") is the single
+ * user action that mints a runtime git-write grant; the request route that
+ * created the record mints nothing (the record is inert until the user acts),
+ * which is the whole self-approval defence — an agent can raise requests all
+ * day and none becomes a grant without a human on the answer route.
+ */
+export interface GitWriteRequest {
+  /** 'once' = the next single permitted write; 'duration' = a time window. */
+  scope: 'once' | 'duration';
+  /** Window length in minutes for a 'duration' grant; null = the store default. */
+  minutes: number | null;
+  /** The agent's stated reason, shown on the card so the user approves in context. */
+  reason: string;
+}
+
 export interface DecisionRecord {
   id: string;
   projectId: string;
@@ -37,6 +54,8 @@ export interface DecisionRecord {
   answeredAt: string | null;
   /** Whether the answer was actually delivered to a live raising session. */
   delivered: boolean;
+  /** FEAT-108 r3 — present iff this decision is a git-write permission request. */
+  gitWrite?: GitWriteRequest | null;
 }
 
 function storeFile(): string {
@@ -69,6 +88,8 @@ export interface RaiseInput {
   sdkSessionId: string | null;
   question: string;
   options?: unknown;
+  /** FEAT-108 r3 — set only by the git-write-request route. */
+  gitWrite?: GitWriteRequest | null;
 }
 
 /** Normalise a raw `options` value into a clean string[] (drops empties). */
@@ -100,6 +121,7 @@ export function raise(input: RaiseInput): DecisionRecord {
     answer: null,
     answeredAt: null,
     delivered: false,
+    gitWrite: input.gitWrite ?? null,
   };
   const all = readAll();
   all.push(rec);

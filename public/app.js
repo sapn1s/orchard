@@ -381,6 +381,8 @@ const node = {
   isoBtn: $('#isoBtn'),
   isoG: $('#isoG'),
   isoN: $('#isoN'),
+  settingsBtn: $('#settingsBtn'), // BUG-158 — labelled seal-strip opener for the settings drawer
+
   insBtn: $('#insBtn'),
   insN: $('#insN'),
   insPlus: $('#insPlus'),
@@ -785,7 +787,7 @@ async function loadSessions(id, { force = false } = {}) {
   s.inflight = (async () => {
     try {
       const r = await api.projectSessions(id);
-      s.list = (r.sessions ?? []).slice().sort((a, b) => String(b.lastActivityAt ?? '').localeCompare(String(a.lastActivityAt ?? '')));
+      s.list = (r.sessions ?? []).slice().sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
       s.encodedDir = r.encodedDir ?? null;
       s.dirs = r.dirs ?? [];
       s.loaded = true;
@@ -1129,26 +1131,74 @@ function pendingNewFor(pid) {
  * newest-first. Ordering here rather than in loadSessions() means a pin the
  * server has just confirmed re-sorts on the next render.
  */
+/*
+ * The recency key is the last time the USER submitted a message, NOT transcript
+ * mtime (`lastActivityAt`). A session an agent has been grinding in for hours —
+ * live, streaming frames — must NOT keep climbing to the top: only a human
+ * submit reorders. mtime moved on every agent write, which reshuffled the list
+ * under the reader (the exact "it keeps reordering perma" the user reported).
+ * `lastUserMessageAt` is server-derived from the transcript (so it survives
+ * reload and is right for pre-existing sessions), stamped optimistically on a
+ * local send (recencyKey / stampUserSubmit) so the reorder is instant. It falls
+ * back to lastActivityAt for rows without a detected human prompt (codex, or a
+ * transcript whose user turn fell outside the sampled window). FOLDING stays
+ * keyed on LIVENESS, not this — a live agent session is never folded even
+ * though the human has not typed in it (see hasLiveWork / visibleSessions).
+ */
+const recencyKey = (x) => String(x?.lastUserMessageAt ?? x?.lastActivityAt ?? '');
 function orderedSessions(s) {
   const rank = (x) => (api.pinnedOf(x) ? 0 : 1);
   return (s.list ?? []).slice().sort((a, b) => rank(a) - rank(b)
-    || String(b.lastActivityAt ?? '').localeCompare(String(a.lastActivityAt ?? '')));
+    || recencyKey(b).localeCompare(recencyKey(a)));
 }
 
 /*
- * FEAT-070 — the default per-project view is a RECENCY WINDOW, not a flat 6.
- * Six sessions spanning three weeks is clutter; six from this week is the
- * working set. Sessions older than the window fold under the existing "N more"
- * (clicking it lifts the window, then reveals more — see the handler in
- * renderProjectGroup). One week keeps a normal week's work visible; it is a
- * documented constant for now (exposing it as an Appearance/sidebar setting is a
- * cheap, self-contained follow-up, noted on FEAT-070).
+ * A human just submitted into `sessionId` (composer send / resume / fork).
+ * Stamp its row's user-submit recency to now so the sidebar reorders it to the
+ * top IMMEDIATELY, before the transcript round-trips to disk and the next list
+ * fetch carries the server-derived value. Agent frames never call this — that is
+ * the client half of "only my submitted message reorders". A no-op for a
+ * not-yet-real session (no sessionId), whose row is the pinned pending-new row
+ * already at the top.
  */
-const RECENT_WINDOW_DAYS = 7;
-const withinRecentWindow = (sess) => {
-  const t = Date.parse(sess?.lastActivityAt ?? '');
-  return Number.isFinite(t) && (Date.now() - t) < RECENT_WINDOW_DAYS * 24 * 3600 * 1000;
+function stampUserSubmit(sessionId, encodedDir) {
+  if (!sessionId) return;
+  const iso = new Date().toISOString();
+  for (const [, s] of state.sessions) {
+    const row = (s.list ?? []).find((x) => x.sessionId === sessionId
+      && (encodedDir == null || x.encodedDir == null || x.encodedDir === encodedDir));
+    if (row) { row.lastUserMessageAt = iso; renderTree(); return; }
+  }
+}
+
+/*
+ * FEAT-070 / session-list-recency — the default per-project view is a RECENCY
+ * WINDOW, not a flat 6. But recency alone is a poor filter: the real store is
+ * mostly BRIEF throwaway sessions (median 3 renderable messages, p25=1), and a
+ * flat one-week window kept every one of them — clutter that took the same
+ * vertical space as the session being worked in right now.
+ *
+ * So the window is SUBSTANCE-SCALED: how long a session stays in the default
+ * view depends on how much work it holds.
+ *   - A SUBSTANTIAL session (>= SUBSTANTIAL_MSGS renderable messages — a real
+ *     back-and-forth you may be mid-way through) stays visible for days.
+ *   - A BRIEF session (a one-shot question, an abandoned start) drops out of the
+ *     default view within hours: a one-message session from an hour ago is
+ *     clutter, not the working set.
+ * Both fold under the SAME "N more" affordance (clicking it lifts the window and
+ * reveals everything — see renderProjectGroup). The open session and any session
+ * with LIVE work never fold, whatever their age (visibleSessions).
+ */
+const SUBSTANTIAL_MSGS = 6;          // >= this many renderable messages = a real session, not a one-shot
+const BRIEF_WINDOW_H = 2;            // a brief session leaves the default view this fast
+const SUBSTANTIAL_WINDOW_H = 72;     // a substantial one you may be mid-way through lingers ~3 days
+const hoursSince = (iso) => {
+  const t = Date.parse(iso ?? '');
+  return Number.isFinite(t) ? (Date.now() - t) / 3600000 : Infinity;
 };
+const isBriefSession = (sess) => (Number(sess?.messageCount) || 0) < SUBSTANTIAL_MSGS;
+const withinRecentWindow = (sess) =>
+  hoursSince(sess?.lastActivityAt) < (isBriefSession(sess) ? BRIEF_WINDOW_H : SUBSTANTIAL_WINDOW_H);
 /*
  * "Attention" = activity the user has not seen since they last had the session
  * open (the same signal `unseenCount`/the row `fresh` badge use). BUG-085: this
@@ -1173,35 +1223,76 @@ function isAttentionSession(sess) {
  * cap). Everything else — attention included — earns a capped seat.
  */
 const isAlwaysVisible = (sess) => sess?.sessionId === state.current.sessionId;
+/*
+ * A session with LIVE or background work in flight is NEVER folded, whatever its
+ * age or length — hiding a running session behind "N more" is the same class of
+ * defect as a status chip that cannot tell working from dead. `liveInfo` is the
+ * same alive signal the row's moss dot uses (this dashboard driving it, or
+ * another writer), so what the fold hides can never contradict what a visible
+ * row would claim is running.
+ */
+const hasLiveWork = (sess) => liveInfo(sess) != null;
+
+/*
+ * The default seat budget ADAPTS to how many sessions are genuinely recent,
+ * rather than a fixed slice. When a burst of recent work fills the window the
+ * budget opens up to the ceiling and the older tail folds ("show current
+ * sessions less"); on a quiet project it stays near the floor so the sidebar
+ * doesn't reserve dead space. Live/open/pinned bypass the budget entirely (see
+ * visibleSessions), so this only governs the ordinary recency tail.
+ *   MAX_SEATS holds the historical ≤6 ceiling (BUG-085's invariant that a day of
+ *   many "attention" sessions can never explode the list, and the one-screen-
+ *   third rationale that keeps every project on screen at once).
+ */
+const MIN_SEATS = 4;
+const MAX_SEATS = 6;
+const RECENT_SEAT_H = 24;            // "genuinely recent" for the purpose of sizing the budget
 
 /**
  * What the row cap actually shows. A pin hidden behind "N more" is a pin that
  * does nothing, so pinned rows are always present and the cap applies to the
- * unpinned remainder only. BUG-085: the cap is a HARD ≤6 default — the open
- * session is the single bypass; 24h attention only reorders WITHIN the cap
- * (priority for a seat), it never buys extra seats. Sessions outside the recency
- * window fold under "N more" unless attention keeps them competing. `hidden` is
- * the true number of unpinned rows off screen.
+ * unpinned remainder only.
+ *
+ * The default view is bounded by an ADAPTIVE budget (MIN..MAX_SEATS), sized by
+ * how many pool sessions are genuinely recent — not a fixed count. Bypasses that
+ * are never folded: the OPEN session (on screen) and any session with LIVE work
+ * (whatever its age). 24h "attention" only reorders WITHIN the budget (priority
+ * for a seat), it never buys extra seats (BUG-085). Sessions outside the
+ * substance-scaled recency window fold under "N more" unless attention keeps
+ * them competing. `hidden` is the true number of unpinned rows off screen.
  */
 function visibleSessions(s) {
   const ordered = orderedSessions(s);
   const pinned = ordered.filter((x) => api.pinnedOf(x));
   const rest = ordered.filter((x) => !api.pinnedOf(x)); // recency-ordered
   const windowed = s.windowed !== false;                // "N more" sets this false
-  // The open session is the one hard-cap bypass; add it back after capping.
-  const openIds = new Set(rest.filter(isAlwaysVisible).map((x) => x.sessionId));
-  // The pool competing for the cap budget: everything not already always-in,
-  // kept if it is within the recency window OR carries unseen attention (so an
-  // old-but-active session still competes rather than being folded outright).
-  // When the window is lifted by "N more", everything qualifies.
-  const pool = rest.filter((x) => !openIds.has(x.sessionId)
+  // Never folded, whatever the budget: the open session (on screen) and any
+  // session with live/background work in flight. Added back after capping.
+  const alwaysIds = new Set(rest.filter((x) => isAlwaysVisible(x) || hasLiveWork(x)).map((x) => x.sessionId));
+  // The pool competing for the budget: everything not already always-in, kept if
+  // it is within the (substance-scaled) recency window OR carries unseen
+  // attention (so an old-but-active session still competes rather than being
+  // folded outright). When the window is lifted by "N more", everything qualifies.
+  const pool = rest.filter((x) => !alwaysIds.has(x.sessionId)
     && (!windowed || withinRecentWindow(x) || isAttentionSession(x)));
-  // Attention ranks first WITHIN the pool — a stable sort preserves recency
-  // order among equals — then the HARD cap is applied.
+  // Adaptive seat budget: sized by how many pool sessions are genuinely recent,
+  // clamped to [MIN_SEATS, MAX_SEATS]. Lifting the window ("N more") hands the
+  // budget to s.shown — the progressive reveal.
+  const recentInPool = pool.filter((x) => hoursSince(x.lastActivityAt) < RECENT_SEAT_H).length;
+  const seats = windowed
+    ? Math.min(MAX_SEATS, Math.max(MIN_SEATS, recentInPool))
+    : Math.max(0, s.shown);
+  // Rank for the scarce seats: SUBSTANTIAL sessions first, then unseen
+  // attention, then recency (a stable sort preserves recency order among
+  // equals). Substance leads because a long session from yesterday you are
+  // mid-way through must outrank a one-message throwaway from an hour ago — the
+  // reverse (pure recency/attention) would fold the work and keep the clutter.
+  const briefRank = (x) => (isBriefSession(x) ? 1 : 0);
   const ranked = pool.slice().sort((a, b) =>
-    (isAttentionSession(b) ? 1 : 0) - (isAttentionSession(a) ? 1 : 0));
-  const capped = ranked.slice(0, Math.max(0, s.shown));
-  const keep = new Set([...openIds, ...capped.map((x) => x.sessionId)]);
+    briefRank(a) - briefRank(b)
+    || (isAttentionSession(b) ? 1 : 0) - (isAttentionSession(a) ? 1 : 0));
+  const capped = ranked.slice(0, seats);
+  const keep = new Set([...alwaysIds, ...capped.map((x) => x.sessionId)]);
   // Display in recency order — attention priority decides WHICH make the cut,
   // never the order the user reads the rows in.
   const shown = rest.filter((x) => keep.has(x.sessionId));
@@ -1572,7 +1663,13 @@ async function openSearchHit(h) {
 
 async function loadAllSessions() {
   if (state.searchLoaded) return;
-  for (const p of state.projects) await loadSessions(p.id);
+  // BUG-158: fetch every project's session list in PARALLEL, not one strictly
+  // after another. Each request keys on its own sessionState(id) and guards
+  // with s.loading, so concurrent loads never race; renderTree() is idempotent.
+  // The old serial `for … await` chained 13 round-trips end to end (~4 s of the
+  // measured 7.5 s boot); once the server-side scans are memoised each request
+  // is cheap, and firing them together collapses the chain to a single wave.
+  await Promise.all(state.projects.map((p) => loadSessions(p.id)));
   state.searchLoaded = true;
   renderTree();
 }
@@ -2111,6 +2208,7 @@ function paintCrown() {
   const has = !!p;
   paintModelChip(); // FEAT-042 — chip visibility tracks project selection
   node.isoBtn.hidden = !has;
+  node.settingsBtn.hidden = !has; // BUG-158 — visible whenever a project is selected
   node.insBtn.hidden = !has;
   node.sealSep.hidden = !has;
   for (const m of [...node.seal.querySelectorAll('.mnt, .addm')]) m.remove();
@@ -5107,13 +5205,19 @@ function needsCard(it) {
   // FEAT-029: a runtime-raised decision reads as '👤 decision' rather than a
   // ticket sev, and — when it carries options — offers them as buttons.
   const isDecision = it.kind === 'decision';
+  // FEAT-108 r3 — a git-write PERMISSION request is a decision that carries a
+  // gitWrite payload: an agent asked to commit/push and the user approves or
+  // declines with one click. It reads as a permission ask (not a generic
+  // decision) and offers ONLY Allow/Decline — no free-text box, since the
+  // grant is a yes/no. Approving ("Allow") is what mints the runtime grant.
+  const isGitWrite = isDecision && !!it.gitWrite;
   const opts = Array.isArray(it.options) ? it.options : [];
   const input = el('textarea', { class: 'nc-input', rows: '2', placeholder: 'Your response…', 'aria-label': `Response for ${it.id}` });
   const err = el('span', { class: 'nc-err' });
   const send = el('button', { class: 'nc-send', type: 'button', text: 'Respond' });
-  const card = el('div', { class: `needs-card${isDecision ? ' decision' : ''}`, 'data-id': it.id, 'data-kind': it.kind || 'ticket' },
+  const card = el('div', { class: `needs-card${isDecision ? ' decision' : ''}${isGitWrite ? ' git-write' : ''}`, 'data-id': it.id, 'data-kind': it.kind || 'ticket' },
     el('div', { class: 'nc-head' },
-      el('span', { class: 'nc-id', text: isDecision ? '👤 decision' : it.id }),
+      el('span', { class: 'nc-id', text: isGitWrite ? '🔑 git-write request' : isDecision ? '👤 decision' : it.id }),
       el('span', { class: 'nc-sev', text: isDecision ? '' : (it.sev || '') })),
     el('div', { class: 'nc-title', text: it.title }));
   // BUG-025: a ticket's `## Question` text can differ from the ticket H1
@@ -5164,14 +5268,19 @@ function needsCard(it) {
     card.append(row);
   }
 
-  card.append(el('div', { class: 'nc-form' },
-    input,
-    el('div', { class: 'nc-acts' }, err, send)));
-
-  send.addEventListener('click', () => void submit(input.value));
-  input.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); void submit(input.value); }
-  });
+  // A git-write request is answered ONLY by its Allow/Decline buttons (above) —
+  // it carries no free-text form, so approving is unambiguously "Allow".
+  if (!isGitWrite) {
+    card.append(el('div', { class: 'nc-form' },
+      input,
+      el('div', { class: 'nc-acts' }, err, send)));
+    send.addEventListener('click', () => void submit(input.value));
+    input.addEventListener('keydown', (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); void submit(input.value); }
+    });
+  } else {
+    card.append(el('div', { class: 'nc-form' }, el('div', { class: 'nc-acts' }, err)));
+  }
   wireTitleModal(card, it); // FEAT-053 — the title opens the full ticket in place
   return card;
 }
@@ -5655,6 +5764,24 @@ const dockLiveTools = () => (dockIsForeign() ? null : state.liveTools);
 const dockLiveModel = () => (dockIsForeign() ? null : liveWireModel);
 
 /**
+ * BUG-159 — the STRAND, read from the server's own authority. The session is
+ * live with background work in flight, but the honest liveness verdict says NO
+ * main turn is running (`turn.running:false` — liveness.ts now returns this for
+ * a stuck woken `busy` a live lane was shielding). In that state a typed message
+ * is NOT a mid-turn interject waiting on a far-off `turn-end`: the server holds
+ * it and the idle CLI runs it at the next boundary (Part A). So the tab routes
+ * it straight through and captions it "queued behind background work". Requires a
+ * visible background row so a just-started main turn (server not yet reporting
+ * running, no lanes) is never mistaken for the strand.
+ */
+function idleBehindBackground() {
+  const snap = dockSnap();
+  return !!snap
+    && !!snap.turn && snap.turn.running === false
+    && Array.isArray(snap.running) && snap.running.some((r) => r.row !== 'main');
+}
+
+/**
  * RECONCILE to the server's answer. The only writer of `state.snap`.
  *
  * It corrects in both directions — rows this tab never heard about appear, rows
@@ -5681,7 +5808,46 @@ function applySnapshot(snap, { trusted = false } = {}) {
   // one honesty invariant (derived live every poll, never a stored snapshot)
   // would break for that count alone.
   renderRailSummary();
+  // BUG-159 — the poll/push just told us the main turn is not running while a
+  // lane is live (the strand). Any message queued behind the stuck `busy` would
+  // otherwise wait for a `turn-end` that may be hours away; deliver it now.
+  deliverQueuedBehindBackground();
   return true;
+}
+
+/**
+ * BUG-159 — flush queued messages held behind the STRAND to the server, which
+ * holds+pushes them into the runtime queue (Part A) so the idle CLI runs them at
+ * the next boundary. This is the pre-queued counterpart to submit()'s direct
+ * route: a message queued while a turn was genuinely running, whose turn then
+ * stuck as a woken `busy`, would otherwise never flush (flushQueue waits for the
+ * busy→idle transition that never comes). Delivers ONLY when the authority
+ * confirms the strand shape, and does NOT touch `state.busy` — the composer
+ * stays consistent with the server, and once the CLI picks the message up the
+ * next snapshot reports the turn running again.
+ */
+function deliverQueuedBehindBackground() {
+  if (!state.busy || !idleBehindBackground()) return;
+  const items = state.queue.filter((q) => !q.dead && q.text.trim() && q !== state.drainWaitAttempt);
+  if (!items.length) return;
+  const text = items.map((q, i) => `${queueItemNote(q, i, items.length)}\n${q.text.trim()}`).join('\n\n');
+  // Hand the batch to the outbox before it leaves state.queue (BUG-129), then
+  // remove the delivered rows, keeping dead/drain-wait rows exactly as flushQueue does.
+  state.outbox = { texts: items.map((q) => q.text.trim()), at: Date.now() };
+  state.queue = state.queue.filter((q) => q.dead || q === state.drainWaitAttempt);
+  youBubble(mainThread(), text);
+  if (state.viewing === 'main') scrollDown();
+  if (!send({ type: 'send', prompt: text })) {
+    // Socket died between the decision and the send — put them ALL back.
+    for (let i = items.length - 1; i >= 0; i--) state.queue.unshift(items[i]);
+    state.outbox = null;
+    paintQueue();
+    return;
+  }
+  say(items.length === 1
+    ? 'delivered the queued message behind background work'
+    : `delivered ${items.length} queued messages behind background work`);
+  paintQueue();
 }
 
 /* -------------------------------------------- BUG-034: the correcting poll */
@@ -8454,10 +8620,18 @@ function paintQueue() {
            * describing the old behaviour, and a user read it and reported the
            * old bug. Say what actually happens, and say it in the plural only
            * when there IS a batch.
+           *
+           * BUG-159: when the server is idle behind a live background lane (the
+           * strand), "Claude is working … at the next pause" is a lie — no main
+           * turn is running and the pause is a lane-completion away, possibly
+           * hours. Say what is actually true: it is queued behind background work
+           * and the idle session picks it up promptly (deliverQueuedBehindBackground).
            */
-          ? (pending.length > 1
-              ? 'Claude is working — these deliver together at the next pause, as one turn'
-              : 'Claude is working — delivers at the next pause')
+          ? (idleBehindBackground()
+              ? 'queued behind background work — the idle session delivers it at the next pause'
+              : (pending.length > 1
+                  ? 'Claude is working — these deliver together at the next pause, as one turn'
+                  : 'Claude is working — delivers at the next pause'))
           : 'delivering…';
   /*
    * BUG-129: say it whatever else the dock is saying. A restored row is text
@@ -8758,6 +8932,13 @@ async function submit() {
     return say('a subagent takes no messages — return to main to steer the run', true);
   }
 
+  // A human submit is THE reorder trigger: stamp the target session's
+  // user-submit recency now so it climbs to the top immediately (the server's
+  // transcript-derived value confirms it on the next list fetch). This is the
+  // one path agent frames / drain-wait auto-retries never reach — only a real
+  // composer send lands here. No-op for a not-yet-real session.
+  stampUserSubmit(state.current.sessionId, state.current.encodedDir);
+
   /*
    * FEAT-065: the open socket is only the delivered turn's approval relay —
    * it has no session, so a raw 'send' would be refused. Close it (routine,
@@ -8775,7 +8956,15 @@ async function submit() {
      * Now it queues like the CLI queues: visibly marked, delivered one per
      * turn boundary, and marked NOT delivered if the session dies first.
      */
-    if (state.busy) {
+    // BUG-159 — while a MAIN turn is genuinely running, hold typed text in the
+    // queue (batched, editable, delivered together at the next pause). But when
+    // the server is idle behind a live background lane (the strand), holding it
+    // waits for a `turn-end` that may be hours away — route it straight to the
+    // server, which holds+pushes it into the runtime queue and the idle CLI runs
+    // it at the next boundary (Part A). The fall-through send path does exactly
+    // that; only the caption below marks it as behind-background.
+    const behindBackground = state.busy && idleBehindBackground();
+    if (state.busy && !behindBackground) {
       queueMessage(text);
       node.prompt.value = '';
       autosize();
@@ -8793,6 +8982,7 @@ async function submit() {
     state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
     setBusy(true);
     send({ type: 'send', prompt: text });
+    if (behindBackground) say('queued behind background work — the idle session delivers it at the next pause');
     return;
   }
 
@@ -9042,6 +9232,9 @@ $('#forkBtn').addEventListener('click', () => {
 node.planBtn.addEventListener('click', togglePlan);
 node.skipBtn.addEventListener('click', toggleSkip);
 $('#cogBtn').addEventListener('click', () => void drawer.open('settings'));
+// BUG-158 — the seal-strip Settings pill: the deliberate, labelled opener that
+// makes the drawer reachable without knowing which status chip is clickable.
+node.settingsBtn.addEventListener('click', () => void drawer.open('settings'));
 
 /* ------------------------------------------------------- model picker */
 /*
@@ -10043,6 +10236,19 @@ document.addEventListener('keydown', (e) => {
   if (hadPop) return;
   if (drawer.isOpen()) return drawer.close();
   backToMain(); // last: Esc walks out of a subagent thread
+});
+
+// BUG-158 — Ctrl/⌘ , is the conventional "settings" shortcut and is otherwise
+// unbound here; it toggles the project-settings drawer so the panel has a
+// keyboard path alongside the seal-strip Settings pill. Only acts when a
+// project is selected (nothing to configure otherwise). Works while typing —
+// the modifier chord never lands as a literal comma in a field.
+document.addEventListener('keydown', (e) => {
+  if (e.key !== ',' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
+  if (!currentProject()) return;
+  e.preventDefault();
+  if (drawer.isOpen()) drawer.close();
+  else void drawer.open('settings');
 });
 $('#backToMain').addEventListener('click', backToMain);
 $('#reconnectBtn').addEventListener('click', () => void reconnectDropped());
@@ -12415,9 +12621,15 @@ window.addEventListener('popstate', () => {
 });
 
 async function boot() {
+  // BUG-158: the shell (HTML/CSS) is painted by the browser well before this
+  // runs, but the sidebar tree stays empty until the project list arrives. Show
+  // a quiet loading row FIRST so a reload never looks frozen while that request
+  // is in flight; loadProjects() → renderTree() replaces it with the real tree.
+  node.tree.append(el('div', { class: 'hint-row', text: 'loading projects…' }));
   try {
     await loadProjects();
   } catch (err) {
+    node.tree.textContent = ''; // drop the "loading projects…" row
     node.tree.append(el('div', { class: 'hint-row', text: `the server is not answering: ${err.message}` }));
     return say(err.message, true);
   }
@@ -12502,7 +12714,12 @@ async function boot() {
     // FEAT-070: project ordering + session recency-window internals, so a verify
     // script can drive the sort/toggle and the window without re-deriving them.
     orderedProjects, resortProjects, toggleProjSort, paintProjSort,
-    withinRecentWindow, isAlwaysVisible, isAttentionSession, RECENT_WINDOW_DAYS,
+    withinRecentWindow, isAlwaysVisible, isAttentionSession, hasLiveWork,
+    isBriefSession, hoursSince, SUBSTANTIAL_MSGS, MIN_SEATS, MAX_SEATS, RECENT_SEAT_H,
+    // session-list-recency: order by last USER submit, not mtime. `recencyKey`
+    // is the sort key; `stampUserSubmit`/`orderedSessions` let a verify assert
+    // agent activity does NOT reorder while a human submit does.
+    orderedSessions, recencyKey, stampUserSubmit,
     // BUG-067: the transcript renderer + its main-thread accessor, exposed so a
     // verify script can render a fixture transcript and assert on which entries
     // become user bubbles vs collapsed system notices.

@@ -26,6 +26,10 @@ import * as smut from './session-mutations.ts';
 import * as search from './search.ts';
 import * as mem from './memories.ts';
 import * as gitcli from './git.ts';
+// FEAT-108 round 2 — the runtime, per-project git-write grant store. Host-memory
+// only (see git-grant-store.mjs): the ONLY mutator is these user-driven routes,
+// so an agent cannot plant a grant by writing config or exporting an env var.
+import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink } from '../../scripts/lib/git-grant-store.mjs';
 import * as procs from './processes.ts';
 import * as board from './board.ts';
 // FEAT-058 — the ticket dashboard's read/write layer over the SAME docs/bugs/
@@ -398,6 +402,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         busyClaimed: s.busy, // the raw in-memory flag, named as the claim it is
         // This entry is a live in-memory AgentSession this server is driving.
         adopted: true,
+        // FEAT-108 round 2 — is a runtime git-write grant currently ACTIVE for
+        // this session's project? Surfaced so the session can show that agent
+        // git writes are permitted; a grant must never be invisible.
+        gitWriteGrant: grantView(s.project.id),
         // Was survival even ATTEMPTED for this session (isolation "direct" +
         // survival enabled at spawn time)? A claim, not a verified fact.
         survivalConfigured: s.survivable,
@@ -877,7 +885,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           sendJson(res, 200, await gitcli.changes(p.hostPath));
           return true;
         }
-        if (m === 'GET' && action === 'branches') { sendJson(res, 200, await gitcli.branches(p.hostPath)); return true; }
+        if (m === 'GET' && action === 'branches') {
+          // Carry an authoritative live-session count so the panel can WARN
+          // before a switch changes the ground under a running agent (the
+          // user's "sessions keep working on some branch" hazard). The count is
+          // the liveness authority's, not a client re-derivation.
+          sendJson(res, 200, { ...(await gitcli.branches(p.hostPath)), liveSessions: liveSessionsForProject(id).length });
+          return true;
+        }
         if (m === 'GET' && action === 'stashes') { sendJson(res, 200, await gitcli.stashList(p.hostPath)); return true; }
         if (m === 'GET' && action === 'stash-show') {
           sendJson(res, 200, await gitcli.stashShow(p.hostPath, url.searchParams.get('ref'), url.searchParams.has('path') ? url.searchParams.get('path') : undefined));
@@ -901,6 +916,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
             case 'fetch': sendJson(res, 200, await gitcli.fetch(p.hostPath)); return true;
             case 'switch-branch': sendJson(res, 200, await gitcli.switchBranch(p.hostPath, body.name)); return true;
             case 'create-branch': sendJson(res, 200, await gitcli.createBranch(p.hostPath, body.name)); return true;
+            case 'checkout-remote': sendJson(res, 200, await gitcli.checkoutRemote(p.hostPath, body.name)); return true;
             case 'create-repo':
               sendJson(res, 200, await gitcli.createRepo(p.hostPath, String(body.name ?? path.basename(p.hostPath)), { public: body.public === true }));
               return true;
@@ -922,6 +938,50 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         sendJson(res, err instanceof gitcli.GitError ? err.status : 500, { error: (err as Error).message });
       }
       return true;
+    }
+
+    /*
+     * FEAT-108 round 2 — the runtime git-write grant, per project.
+     *   GET    /api/projects/:id/git-write-grant  → { grant, recentWrites }
+     *   POST   /api/projects/:id/git-write-grant  → grant one occasion or a window
+     *          body: { scope:'once'|'duration', minutes? }  (default: once)
+     *   DELETE /api/projects/:id/git-write-grant  → revoke
+     * This is a USER action surface: the grant lives only in this host process's
+     * memory (git-grant-store.mjs) and is consulted by the runtime's PreToolUse
+     * git-write decision, so it lifts the block for a LIVE session with no
+     * relaunch. It never lifts the mandatory leak gate (a granted commit/push is
+     * still refused on a leak — see claude-runtime.ts / git-grant.mjs).
+     */
+    if (id && rest[2] === 'git-write-grant' && rest.length === 3) {
+      const p = reg.getProject(id);
+      if (!p) return notFound(res, `git-write-grant: no project ${JSON.stringify(id)}`);
+      if (m === 'GET') {
+        sendJson(res, 200, { projectId: p.id, grant: grantView(p.id), recentWrites: listGitWrites(p.id, 50) });
+        return true;
+      }
+      if (m === 'POST') {
+        const body = (await readBody(req)) as Record<string, unknown>;
+        const scope = body.scope === 'duration' ? 'duration' : 'once';
+        const minutes = Number(body.minutes);
+        const ttlMs = Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60_000) : undefined;
+        const grant = grantGitWrite(p.id, {
+          scope,
+          ttlMs,
+          grantedVia: 'dashboard',
+          note: typeof body.note === 'string' ? body.note : '',
+        });
+        // Visible, never silent: the server log records who was granted what.
+        console.warn(`[orchard] git-write GRANTED for project ${p.id} (${p.name}) — scope=${grant.scope}, expires ${grant.expiresAt} (FEAT-108).`);
+        sendJson(res, 200, { ok: true, projectId: p.id, grant });
+        return true;
+      }
+      if (m === 'DELETE') {
+        const had = revokeGitWrite(p.id);
+        console.warn(`[orchard] git-write grant REVOKED for project ${p.id} (${p.name}) — ${had ? 'was active' : 'none active'} (FEAT-108).`);
+        sendJson(res, 200, { ok: true, projectId: p.id, revoked: had, grant: null });
+        return true;
+      }
+      return notFound(res, `git-write-grant: no route ${m} ${url.pathname}`);
     }
 
     /* processes: what is running FROM this project's directory */
@@ -1004,6 +1064,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
             kind: 'decision',
             question: d.question,
             options: d.options,
+            // FEAT-108 r3 — a git-write permission request rides the same rail;
+            // the marker tells the client to render Allow/Decline in context.
+            gitWrite: d.gitWrite ?? null,
           }));
           if (open.length) {
             b.needsYou = [...open, ...b.needsYou];
@@ -1119,6 +1182,32 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // the rail. If that session is gone, the answer is still recorded.
           const rec = decisions.get(ticketId);
           if (rec && rec.projectId === id) {
+            // FEAT-108 r3 — a git-write REQUEST is a decision that carries a
+            // gitWrite payload. Approving it (answer begins "Allow") is the ONE
+            // user action that mints a runtime grant: the request route that
+            // created this record minted nothing, so an agent that raised the
+            // request cannot grant itself — it can only produce inert pending
+            // records until a human acts HERE. (An agent curling this route is
+            // the same pre-existing no-auth residual that already lets it curl
+            // the grant route directly; folding the mint in here does not add a
+            // new class of exposure. Declining, or any non-"Allow" answer, mints
+            // nothing.) The mandatory leak gate on a permitted commit/push is
+            // untouched — a grant never lifts it (git-grant.mjs).
+            if (rec.gitWrite) {
+              if (/^allow\b/i.test(answer.trim())) {
+                const mins = rec.gitWrite.minutes;
+                const ttlMs = typeof mins === 'number' && mins > 0 ? Math.round(mins * 60_000) : undefined;
+                const grant = grantGitWrite(id, {
+                  scope: rec.gitWrite.scope,
+                  ttlMs,
+                  grantedVia: 'request-approval',
+                  note: rec.gitWrite.reason,
+                });
+                console.warn(`[orchard] git-write GRANTED via request approval for project ${id} — scope=${grant.scope}, expires ${grant.expiresAt} (FEAT-108).`);
+              } else {
+                console.warn(`[orchard] git-write request ${ticketId} DECLINED for project ${id} — no grant minted (FEAT-108).`);
+              }
+            }
             const target =
               (getSession(rec.sessionId) && !getSession(rec.sessionId)!.closed ? getSession(rec.sessionId) : null) ??
               liveSessions().find((s) => !s.closed && s.sdkSessionId && s.sdkSessionId === rec.sdkSessionId) ??
@@ -1339,6 +1428,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           messageCount: s.messageCount,
           statsExact: s.statsExact,
           lastActivityAt: s.lastActivityAt,
+          // The recency signal the sidebar ORDERS by: the last HUMAN submit,
+          // not transcript mtime (which moves on agent output too). Null for
+          // rows where no human prompt was found — the client falls back to
+          // lastActivityAt.
+          lastUserMessageAt: s.lastUserMessageAt,
           startedAt: s.startedAt,
           gitBranch: s.gitBranch,
           os: s.os,
@@ -1984,6 +2078,68 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       sessionId: rec.sessionId,
       question: rec.question,
       options: rec.options,
+      createdAt: rec.createdAt,
+    });
+    return true;
+  }
+
+  /*
+   * FEAT-108 round 3 — an agent REQUESTS permission to run git writes.
+   *
+   *   POST /api/sessions/:sid/git-write-request  { reason, scope?, minutes? }
+   *
+   * This raises a git-write permission card on the SAME Needs-You rail the user
+   * already uses (FEAT-029 reuse — no second approval surface). It creates an
+   * INERT pending request and NOTHING ELSE: no grant, ever, no matter how many
+   * times an agent calls it. Only the user answering the card with "Allow" (the
+   * board/answer route) mints the grant, so an agent cannot approve its own
+   * request — that is the self-grant defence, structural, not a check. Requires
+   * a LIVE raising session so the Allow/Decline is delivered back to it (the
+   * agent learns the outcome, then does the git work the user approved). The
+   * grant that an Allow eventually mints still runs the mandatory leak gate on
+   * every commit/push (git-grant.mjs) — this path never lifts it.
+   */
+  if (rest[0] === 'sessions' && rest[1] && rest[2] === 'git-write-request' && rest.length === 3 && m === 'POST') {
+    const sid = rest[1];
+    const target =
+      getSession(sid) ??
+      liveSessions().find((s) => s.sdkSessionId === sid) ??
+      null;
+    if (!target || target.closed) {
+      sendJson(res, 400, { error: `git-write-request: no live session ${JSON.stringify(sid)} to raise a request from` });
+      return true;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      sendJson(res, err instanceof HttpError ? err.status : 400, { error: (err as Error).message });
+      return true;
+    }
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!reason) { sendJson(res, 400, { error: 'git-write-request: a reason is required and must be a non-empty string' }); return true; }
+    const scope: 'once' | 'duration' = body.scope === 'duration' ? 'duration' : 'once';
+    const minsRaw = Number(body.minutes);
+    const minutes = scope === 'duration' && Number.isFinite(minsRaw) && minsRaw > 0 ? Math.round(minsRaw) : null;
+    const scopeLabel = scope === 'duration' ? `${minutes ?? 30}-minute window` : 'one write';
+    const rec = decisions.raise({
+      projectId: target.project.id,
+      sessionId: target.id,
+      sdkSessionId: target.sdkSessionId,
+      question: `Allow git writes (commit/push) for “${target.project.name}”? ${reason} — grant: ${scopeLabel}.`,
+      options: ['Allow', 'Decline'],
+      gitWrite: { scope, minutes, reason },
+    });
+    // Visible, never silent — and explicitly NOT a grant: the request is inert.
+    console.warn(`[orchard] git-write REQUEST raised by session ${target.id} for project ${target.project.id} (${target.project.name}) — scope=${scope}, reason=${JSON.stringify(reason)}. INERT until the user approves (FEAT-108).`);
+    sendJson(res, 201, {
+      id: rec.id,
+      projectId: rec.projectId,
+      sessionId: rec.sessionId,
+      question: rec.question,
+      gitWrite: rec.gitWrite,
+      pending: true,
+      granted: false,
       createdAt: rec.createdAt,
     });
     return true;
@@ -3004,12 +3160,31 @@ function releaseSocketSession(session: AgentSession | null, reason: string): voi
   if (!session || session.closed) return;
   // BUG-018: a busy session detaches — an open approval card and the running
   // turn must survive an ordinary "I'm looking at something else now".
+  // BUG-157 (round 4): `detach()` now ARMS the close-on-detach fuse on every path
+  // (it used to rely on a later `result` or an empty level frame, neither of which
+  // arrives on these post-turn detaches — the real CLI emits no level at all, and
+  // the turn has already ended — so the session leaked). The fuse re-checks and
+  // closes once the work is actually done; for a container that verdict is a
+  // process probe, not a timeout.
   if (session.busy) { session.detach(); return; }
   const lifetime = session.workLifetime();
   if (lifetime.outlivesTurn !== 'no') {
     console.log(
       `[orchard] ${reason}: session ${session.id} detached instead of closed — ` +
       `work outlives the turn (${lifetime.outlivesTurn}: ${lifetime.detail})`,
+    );
+    session.detach();
+    return;
+  }
+  // BUG-157: a container session has no host-side broker, so an empty level (or a
+  // `no` lifetime) is not enough to reap it in the same instant — a still-running
+  // tool call the level never carried would be destroyed. DETACH instead and let
+  // the fuse's container ground-truth probe decide the real close. `detach()` arms
+  // the fuse, so this is bounded (a genuinely-idle container closes within seconds).
+  if (session.containerName != null) {
+    console.log(
+      `[orchard] ${reason}: container session ${session.id} detached instead of closed — ` +
+      'deferring the close to the container-ground-truth fuse (process probe, not a timeout)',
     );
     session.detach();
     return;
@@ -3493,8 +3668,12 @@ wss.on('connection', (ws: WebSocket) => {
             });
             return send({ t: 'ack', of: 'send', delivered: false, targetAgentId: cmd.targetAgentId });
           }
-          session.send(cmd.prompt);
-          return send({ t: 'ack', of: 'send', delivered: true });
+          // BUG-159 — send() no longer throws when a turn is in flight; it HOLDS
+          // the message in the runtime input queue and reports `queued:true`. The
+          // ack carries that through so the tab can caption it honestly ("queued
+          // behind background work") instead of the old bare marker or a refusal.
+          const sent = session.send(cmd.prompt);
+          return send({ t: 'ack', of: 'send', delivered: sent.delivered, queued: sent.queued });
         }
         case 'interrupt':
           if (!session) return send({ t: 'error', message: 'no session on this socket', fatal: false });
@@ -3743,6 +3922,22 @@ server.listen(PORT, HOST, () => {
    */
   startZombieReaper();
   console.log(`[orchard] zombie reaper armed (${livenessWindowsSummary()})`);
+  /*
+   * FEAT-108 round 2 — durable trail of PERMITTED agent git writes. The store's
+   * ledger is memory-only (cleared on restart, fail-closed); this appends each
+   * record to a host-side log under the data dir so the user can see, after the
+   * fact, exactly which grants let which git writes through. dataDir() is host-
+   * only, never the project repo, so nothing is written into a public-bound tree.
+   */
+  try {
+    const auditFile = path.join(dataDir(), 'git-write-audit.jsonl');
+    setGitWriteAuditSink((rec) => {
+      try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); } catch { /* audit must never break a decision */ }
+    });
+    console.log(`[orchard] git-write audit log: ${auditFile} (FEAT-108)`);
+  } catch (err) {
+    console.warn(`[orchard] could not arm git-write audit log: ${(err as Error).message}`);
+  }
   /*
    * FEAT-019 (2026-08-05, user decision): automatic Working-Agreement consolidation.
    * Every project captures into the same canonical methodology repo, so drift

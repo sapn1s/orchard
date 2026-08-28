@@ -524,6 +524,10 @@ const METHOD_FILES = [
   // The sanctioned pre-commit gate wrapper + its one dependency (the leak-gate).
   'scripts/gate.mjs',
   'scripts/leak-gate.mjs',
+  // The shared private-token list leak-gate.mjs now imports. Must travel with
+  // it, or the copied gate fails to resolve its import and goes dark — the exact
+  // invisible-false-negative hazard the gate exists to prevent.
+  'scripts/lib/leak-tokens.mjs',
   // BUG-103: the NUL-in-source guard `gate.mjs` invokes. Must travel with the
   // gate, or the copied gate fails to spawn it and the onboarded repo carries
   // the exact invisible-false-negative hazard this guard exists to prevent.

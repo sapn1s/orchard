@@ -15,6 +15,13 @@ import * as path from 'node:path';
 // ONE definition of the ticket format (plan §3 / §8 step 2): board.ts was the
 // fourth H1 parser and the third INDEX-row splitter.
 import { indexRowCells, parseTicket, parseTitleLine } from '../../scripts/lib/ticket-schema.mjs';
+// FEAT-106 — one resolver decides where a project keeps its board, whether that
+// project is on the legacy `docs/bugs` layout or the consolidated `.orchard/`
+// one. boardDir() below is the single door every reader here comes through
+// (readBoard, the .arch findings/acks paths, the launch snapshot), so routing it
+// through the resolver moves them all at once. For Orchard's own repo (no
+// `.orchard/`) the resolver falls through to `docs/bugs` by construction.
+import { resolveBoardDir } from '../../scripts/lib/board-path.mjs';
 // FEAT-095 — the ordering rule, kept out of this file because it is a policy
 // (what is a ticket worth answering?) over a parser (what does INDEX.md say?).
 import { rankLane, rankRows } from './board-rank.ts';
@@ -104,6 +111,15 @@ export interface BoardItem {
   rank?: number;
   rankWhy?: string;
   rankSettles?: string[];
+  /**
+   * FEAT-108 round 3 — present iff this decision card is a git-write PERMISSION
+   * request (kind:'decision' raised via /git-write-request). The rail renders it
+   * as a one-click Allow/Decline permission ask rather than a generic decision,
+   * and approving it (answer "Allow") is what mints the runtime grant. Carries
+   * the requested scope/window and the agent's reason so the user decides in
+   * context. Absent on every other row.
+   */
+  gitWrite?: { scope: 'once' | 'duration'; minutes: number | null; reason: string } | null;
 }
 export interface Board {
   hasBoard: boolean;
@@ -179,7 +195,7 @@ const IN_FLIGHT = '\u{1F916}'; // 🤖
 const ID_RE = /^[A-Z]+-\d+$/;
 
 export function boardDir(hostPath: string): string {
-  return path.join(hostPath, 'docs', 'bugs');
+  return resolveBoardDir(hostPath);
 }
 
 /**
@@ -779,10 +795,15 @@ export function boardStateSection(
     ? `${board.needsYou[0] ? '\u{1F464}' : '\u{1F916}'} ${focusItem.id} — ${short(focusItem.title, 88)}`
     : 'board is clear — nothing open';
 
+  // FEAT-106 — name the board where it ACTUALLY lives (docs/bugs or .orchard/bugs),
+  // resolved for this project rather than hard-coded, so a migrated project's
+  // snapshot points a session at the real path. Host-relative, POSIX-style.
+  const boardRel = path.relative(hostPath, boardDir(hostPath)).split(path.sep).join('/') || 'docs/bugs';
+
   const parts: string[] = [
     '# Project state (live board snapshot)',
     '',
-    `_Auto-injected at launch from docs/bugs/ (read-only). Re-read docs/bugs/INDEX.md for the authoritative board; answer 👤 items via the dashboard's Needs-You rail._`,
+    `_Auto-injected at launch from ${boardRel}/ (read-only). Re-read ${boardRel}/INDEX.md for the authoritative board; answer 👤 items via the dashboard's Needs-You rail._`,
     '',
     `**Focus:** ${focus}`,
     '',

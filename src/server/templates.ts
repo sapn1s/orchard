@@ -9,6 +9,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { templatesDir, slugify, writeAtomic, ensureDir, projectRoot, backupOnce, isInside } from '../lib/paths.ts';
 import type { InstructionRef } from './registry.ts';
+// FEAT-106 — resolve the local-conventions doc wherever the project keeps it
+// (legacy `docs/CONVENTIONS.md` or consolidated `.orchard/CONVENTIONS.md`).
+import { resolveConventionsFile } from '../../scripts/lib/board-path.mjs';
 
 export type TemplateMode = 'append' | 'replace';
 
@@ -299,7 +302,10 @@ export const LOCAL_CONVENTIONS_RELPATH = path.join('docs', 'CONVENTIONS.md');
  * universal then local), live board state layered last by the caller.
  */
 export function localConventionsSection(hostPath: string, opts?: { maxChars?: number }): string | null {
-  const file = path.join(hostPath, LOCAL_CONVENTIONS_RELPATH);
+  // FEAT-106 — resolved, not the bare legacy relpath: a migrated project's doc
+  // lives under `.orchard/`. `convRel` names it host-relative for the footer.
+  const file = resolveConventionsFile(hostPath);
+  const convRel = path.relative(hostPath, file).split(path.sep).join('/') || LOCAL_CONVENTIONS_RELPATH;
   let raw: string;
   try {
     raw = fs.readFileSync(file, 'utf8');
@@ -313,7 +319,7 @@ export function localConventionsSection(hostPath: string, opts?: { maxChars?: nu
   const parts = [
     '# Project Conventions (local)',
     '',
-    `_Auto-injected at launch from ${LOCAL_CONVENTIONS_RELPATH} (read-only). Project-specific rules ` +
+    `_Auto-injected at launch from ${convRel} (read-only). Project-specific rules ` +
       'only — anything universal belongs in the shared Working Agreement instead (see WA §L / ' +
       '`scripts/check-scope.mjs`).',
     '',

@@ -47,6 +47,10 @@ import {
   boardDir, ticketFile, composeAnswerEntry, ticketDecision, ticketAnswerState,
   type ReplyKind, type TicketDecision, type TicketAnswerState,
 } from './board.ts';
+// FEAT-106 — the template fallback resolves THIS station's own board dir through
+// the resolver too, so it finds docs/bugs (legacy) or .orchard/bugs (flat)
+// without assuming the layout.
+import { resolveBoardDir } from '../../scripts/lib/board-path.mjs';
 
 export type { ReplyKind } from './board.ts';
 
@@ -693,10 +697,11 @@ export function slugify(title: string): string {
 /** The project's own template, falling back to this repo's copy. */
 function templateFor(dir: string, prefix: string): string {
   const name = prefix === 'ARCH' ? 'TEMPLATE-ARCH.md' : 'TEMPLATE.md';
-  for (const candidate of [path.join(dir, name), path.join(path.resolve(import.meta.dirname, '..', '..'), 'docs', 'bugs', name)]) {
+  const stationBoard = resolveBoardDir(path.resolve(import.meta.dirname, '..', '..'));
+  for (const candidate of [path.join(dir, name), path.join(stationBoard, name)]) {
     try { return fs.readFileSync(candidate, 'utf8'); } catch { /* try the next */ }
   }
-  throw new TicketError(`no ${name} to file from (looked in ${dir} and this station's docs/bugs/)`, 400);
+  throw new TicketError(`no ${name} to file from (looked in ${dir} and this station's ${stationBoard})`, 400);
 }
 
 export interface NewTicketInput {
@@ -723,7 +728,7 @@ export function createTicket(hostPath: string, input: NewTicketInput): { id: str
   try {
     if (!fs.statSync(dir).isDirectory()) throw new Error('not a directory');
   } catch {
-    throw new TicketError(`this project has no docs/bugs/ board (${dir}) — onboard it first`, 400);
+    throw new TicketError(`this project has no ticket board (${dir}) — onboard it first`, 400);
   }
   const id = nextTicketId(hostPath, prefix);
   const file = path.join(dir, `${id}-${slugify(title)}.md`);

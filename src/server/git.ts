@@ -342,8 +342,8 @@ export async function branches(hostPath: string): Promise<{ branches: GitBranch[
   const format = '%(refname:short)%1f%(upstream:short)%1f%(upstream:track)%1f%(HEAD)%1e';
   const local = await git(hostPath, ['for-each-ref', `--format=${format}`, 'refs/heads']);
   if (local.code !== 0) throw new GitError(500, `git branches failed: ${local.err}`);
-  const list = local.out.split('\x1e').filter(Boolean).map((record): GitBranch => {
-    const [name, upstream, track, head] = record.replace(/^\n|\n$/g, '').split('\x1f');
+  const list = local.out.split('\x1e').map((record) => record.replace(/^\n|\n$/g, '')).filter(Boolean).map((record): GitBranch => {
+    const [name, upstream, track, head] = record.split('\x1f');
     const ahead = track?.match(/ahead (\d+)/)?.[1];
     const behind = track?.match(/behind (\d+)/)?.[1];
     return { name, upstream: upstream || null, ahead: upstream ? Number(ahead ?? 0) : null, behind: upstream ? Number(behind ?? 0) : null, current: head === '*' };
@@ -379,6 +379,32 @@ export async function createBranch(hostPath: string, name: unknown): Promise<{ c
   const r = await git(hostPath, ['switch', '-c', name]);
   if (r.code !== 0) throw new GitError(409, r.err || r.out);
   return { created: name, status: await statusOf(hostPath) };
+}
+
+/**
+ * Check out a remote-tracking branch (e.g. `origin/rebrand/kenimai`) as a new
+ * LOCAL branch that tracks it. The remote ref must be one the repo actually
+ * carries (validated against `branches().remotes`), never free-form. Like every
+ * other switch here it REFUSES on a dirty tree rather than carrying or
+ * discarding the user's work, and surfaces git's own message on any conflict.
+ * If a local branch of the same short name already exists, this switches to it
+ * rather than erroring — the row is a "check this out" action, and the local
+ * branch is where its tracking already lives.
+ */
+export async function checkoutRemote(hostPath: string, remoteRef: unknown): Promise<{ checkedOut: string; tracking: string; status: GitStatus }> {
+  if (typeof remoteRef !== 'string' || remoteRef.startsWith('-')) throw new GitError(400, 'checkout-remote: invalid remote branch name');
+  const actual = await branches(hostPath);
+  if (!actual.remotes.includes(remoteRef)) throw new GitError(400, `checkout-remote: unknown remote branch ${JSON.stringify(remoteRef)}`);
+  // `origin/rebrand/kenimai` → local `rebrand/kenimai`; a bare remote name or a
+  // `.../HEAD` symref is not a checkoutable branch.
+  const slash = remoteRef.indexOf('/');
+  const local = slash >= 0 ? remoteRef.slice(slash + 1) : remoteRef;
+  if (!local || local === 'HEAD' || local.endsWith('/HEAD')) throw new GitError(400, `checkout-remote: ${JSON.stringify(remoteRef)} is not a checkoutable branch`);
+  await refuseDirty(hostPath);
+  const existing = actual.branches.some((branch) => branch.name === local);
+  const r = await git(hostPath, existing ? ['switch', local] : ['switch', '--track', remoteRef]);
+  if (r.code !== 0) throw new GitError(409, r.err || r.out, await statusOf(hostPath));
+  return { checkedOut: local, tracking: remoteRef, status: await statusOf(hostPath) };
 }
 
 export interface GitStash { ref: string; branch: string | null; subject: string; timestamp: string }

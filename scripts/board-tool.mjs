@@ -92,6 +92,10 @@ import {
   classifyLegacyStatus, statusIssue, typeFromId,
 } from './lib/ticket-schema.mjs';
 import { genBoard, checkBoard, decisionShapeFails, reachabilityFails } from './board.mjs';
+// FEAT-106 — resolve the board dir (docs/bugs legacy / .orchard/bugs flat) for
+// whatever root the tool is pointed at; ORCHARD_BOARD_TOOL_ROOT semantics are
+// unchanged (it still names the host, the resolver just finds the board under it).
+import { resolveBoardDir } from './lib/board-path.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = path.resolve(HERE, '..');
@@ -121,6 +125,62 @@ async function ticketsApi() {
   }
   TICKETS = await import(url.pathToFileURL(mod).href);
   return TICKETS;
+}
+
+/**
+ * The private-token detector, loaded lazily and by name — the SAME token list
+ * the commit-time leak-gate uses (scripts/lib/leak-tokens.mjs), never a second
+ * matcher. This is the authoring-time half of the defence: a ticket carrying a
+ * home path, username or private project name is REFUSED before it is written,
+ * so the leak never reaches a public-bound file (this board is public; a leaked
+ * path is an exposure the moment it is pushed, and the recovery is a history
+ * rewrite — BUG-155, BUG-156). Detection at commit already worked; what was
+ * missing was a stop at the moment of writing.
+ *
+ * FAIL CLOSED: if the detector module is absent this REFUSES the write rather
+ * than writing unscanned. board-tool.mjs runs only in Orchard's own tree, where
+ * the module is always present; a missing one means a broken checkout, not a
+ * reason to ship a ticket past no guard.
+ */
+let LEAK = null;
+async function leakScanner() {
+  if (LEAK) return LEAK;
+  const mod = path.resolve(HERE, 'lib', 'leak-tokens.mjs');
+  if (!fs.existsSync(mod)) {
+    throw new Refusal('no-leak-detector', `scripts/lib/leak-tokens.mjs is not present at ${path.relative(DEFAULT_ROOT, mod)} — refusing to write a ticket that was never scanned for private tokens`);
+  }
+  LEAK = await import(url.pathToFileURL(mod).href);
+  return LEAK;
+}
+
+/**
+ * Refuse a ticket write whose content carries a private token. `fields` is a
+ * list of `{ label, text }` — only the free text the caller is INTRODUCING, so
+ * a pre-existing leak in an untouched body never blocks an unrelated update.
+ * The offending line + token class come back as data (the gate's own shape), so
+ * the author can redact — path → `~`, private project → a neutral description —
+ * and retry. Legitimate discussion of a token SHAPE does not trip this: the
+ * detector matches literal values, and the convention (used by leak-tokens.mjs
+ * on itself) is to describe the shape or split the literal, never paste it —
+ * exactly what the commit-time gate already requires, moved one step earlier.
+ */
+async function assertNoLeak(fields, where) {
+  const { findLeaks } = await leakScanner();
+  const hits = [];
+  for (const { label, text } of fields) {
+    if (!text) continue;
+    for (const h of findLeaks(text)) {
+      const at = h.lineNo > 1 ? `${label} (line ${h.lineNo})` : label;
+      hits.push(`${at}: [${h.token}] ${h.line.trim().slice(0, 160)}`);
+    }
+  }
+  if (hits.length) {
+    throw new Refusal(
+      'private-token-leak',
+      `${where}: ${hits.length} private-token hit(s) — this board is public, so nothing was written. Redact home paths to \`~\`, name private projects neutrally, keep the facts, and retry.`,
+      hits,
+    );
+  }
 }
 
 /** A refusal the caller should READ, not a crash. Carries a machine code. */
@@ -187,7 +247,7 @@ function csv(raw) {
 /* ─────────────────────────────────────────────────────────────────── reading */
 
 function boardDirOf(root) {
-  return path.join(root, 'docs', 'bugs');
+  return resolveBoardDir(root);
 }
 
 /** Repo-relative, always. An absolute home path in output is a leak-gate hit. */
@@ -441,7 +501,11 @@ async function verbFile(root, flags) {
   }
   if (fs.existsSync(file)) throw new Refusal('exists', `file: refusing to overwrite ${rel(root, file)}`);
 
-  fs.writeFileSync(file, formatTicket(record, body), { flag: 'wx' });
+  // THE LEAK REFUSAL. Scan the FULLY-rendered ticket (every byte headed for this
+  // public-bound file) against the shared leak-gate token list, before the write.
+  const content = formatTicket(record, body);
+  await assertNoLeak([{ label: `${base} content`, text: content }], `file ${id}`);
+  fs.writeFileSync(file, content, { flag: 'wx' });
 
   // The row is PLACED by the board tool, which is the code that knows which
   // columns are curated. No string surgery on INDEX.md happens anywhere here.
@@ -490,6 +554,15 @@ async function verbUpdate(root, flags) {
   // Optimistic concurrency for the CALLER: if they read the ticket and it moved
   // underneath them, the whole update is refused before any part of it lands.
   if (flags.has('rev')) assertFresh(file, flags.get('rev'));
+
+  // THE LEAK REFUSAL. Only the free text this update INTRODUCES is scanned — a
+  // pre-existing leak in the untouched body must not block an unrelated update
+  // (and is caught by the commit-time gate regardless). Enum fields cannot leak.
+  await assertNoLeak([
+    { label: '--log', text: flags.get('log') },
+    { label: '--status-line', text: flags.get('status-line') },
+    { label: '--current-need', text: flags.get('current-need') },
+  ], `update ${id}`);
 
   const wantsRecordChange = [...Object.keys(RECORD_SETTERS)].some((f) => flags.has(f) && f !== 'owner');
   const parsed = parseTicket(detail.markdown, { file: base, mode: 'auto' });

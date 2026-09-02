@@ -109,6 +109,7 @@ export function createDrawer(ctx) {
     back: $('#dBack'),
     views: {
       settings: $('#vSettings'),
+      globals: $('#vGlobals'),
       instructions: $('#vInstructions'),
       library: $('#vLibrary'),
       snapshots: $('#vSnapshots'),
@@ -479,13 +480,40 @@ export function createDrawer(ctx) {
     if (p.hostPath) wrap.append(directoryBlock(p));
 
     /* ---- Model & behaviour: the settings almost every session touches ---- */
+    // FEAT-118: pull the machine-wide defaults so the Model row can say what an
+    // unset value actually inherits, instead of the bare word "inherit".
+    ensureGlobals();
+    const gModel = d.globals?.model ?? null;
     const model = el('div', { class: 'grp' }, groupLabel('Model'));
-    model.append(row('model', 'Model', '--model', { cycle: MODEL_CYCLE }));
+    const modelInheritsGlobal = !sessionScope && val('model') == null && gModel;
+    // FEAT-118: cycle over the SAME derived catalog the header popover and the
+    // global-defaults picker use (d.modelCatalog, filled by ensureGlobals from
+    // the CLI's own supportedModels) — so a versioned model the CLI reports is
+    // reachable here too, not just the three hand-written aliases. Until that
+    // list is learned (first session), fall back to the alias cycle so the row
+    // is never dead. Labels come from modelLabel, so a raw value like
+    // 'claude-fable-5[1m]' still shows its friendly name.
+    const mCatalog = d.modelCatalog ?? [];
+    const modelCycle = mCatalog.length ? [null, ...mCatalog.map((m) => m.value)] : MODEL_CYCLE;
+    const mVal = val('model');
+    model.append(row('model', 'Model', '--model', {
+      cycle: modelCycle,
+      text: modelInheritsGlobal
+        ? `global default · ${modelLabel(gModel)}`
+        : (mVal != null ? modelLabel(mVal) : undefined),
+    }));
     model.append(row('effort', 'Effort', '--effort', { cycle: EFFORT_CYCLE }));
     model.append(row('maxBudgetUsd', 'Spend cap', '--max-budget-usd', {
       cycle: BUDGET_CYCLE,
       text: val('maxBudgetUsd') == null ? 'none' : `$${Number(val('maxBudgetUsd')).toFixed(2)}`,
     }));
+    if (!sessionScope) {
+      const gLink = el('button', { class: 'addrow', text: gModel
+        ? `Machine-wide default: ${modelLabel(gModel)} · manage ›`
+        : 'Set a machine-wide default model ›' });
+      gLink.addEventListener('click', () => open('globals', 'settings'));
+      model.append(gLink);
+    }
 
     const perms = el('div', { class: 'grp', 'data-focus': 'permissionMode' }, groupLabel('Permissions'));
     perms.append(row('permissionMode', 'Permission mode', '--permission-mode', { cycle: PERM_CYCLE }));
@@ -557,7 +585,7 @@ export function createDrawer(ctx) {
        that PREVENTS damage, snapshots are the layer that UNDOES it, and a
        container does not undo anything because it bind-mounts the real dir. */
     wrap.append(section('iso', 'Isolation & environment', true,
-      [runtime, access, snapshotsGroup(p, sessionScope)]));
+      [runtime, access, servicesGroup(p, sessionScope), snapshotsGroup(p, sessionScope)]));
 
     /* ---- Instructions & tools: the working-agreement stack and the
        attachable integrations (browser, MCPs) a session can reach for. ---- */
@@ -2065,6 +2093,82 @@ export function createDrawer(ctx) {
   }
 
   /**
+   * FEAT-112 — per-project service sidecars (Redis, Mongo, …). Container-only,
+   * and it mirrors the mounts section: a repeatable list of rows plus a quick-add
+   * form. A service is reachable from inside the session by its `name`; declaring
+   * one and starting a session brings it up on the project's own Docker network.
+   * Empty by default, so a project pays nothing until it adds one.
+   */
+  function servicesGroup(p, sessionScope) {
+    if ((p.isolation ?? project().isolation) !== 'container') return null;
+    const g = el('div', { class: 'grp', 'data-focus': 'services' }, groupLabel('Services'));
+    const services = settings().services ?? [];
+    if (!services.length) {
+      g.append(note('No service sidecars. Add one (e.g. redis  redis:7-alpine) and it comes up on a per-project network at that hostname when a session starts.'));
+    }
+    for (const [i, s] of services.entries()) {
+      const r = el('div', { class: 'mrow' });
+      r.append(el('span', { class: 'p' },
+        el('span', { class: 'dst', text: s.name }),
+        el('span', { class: 'to', text: '  ·  ' }),
+        document.createTextNode(s.image)));
+      if (s.dataPath) r.append(el('span', { class: 'm', text: 'data' }));
+      if (Array.isArray(s.env) && s.env.length) r.append(el('span', { class: 'm', text: `${s.env.length} env` }));
+      if (!sessionScope) {
+        const x = el('button', { class: 'x', 'aria-label': 'Remove service', text: '×' });
+        x.addEventListener('click', () => put('services', services.filter((_, j) => j !== i)));
+        r.append(x);
+      }
+      g.append(r);
+    }
+    if (!sessionScope) {
+      if (d.addingService) g.append(serviceForm(services));
+      else {
+        const add = el('button', { class: 'addrow', text: '+ Add service' });
+        add.addEventListener('click', () => { d.addingService = true; paint(); });
+        g.append(add);
+      }
+    } else {
+      g.append(projectOnlyNote('Services'));
+    }
+    return g;
+  }
+
+  function serviceForm(services) {
+    const box = el('div', { class: 'mrow' });
+    const input = el('input', {
+      class: 'vin',
+      type: 'text',
+      spellcheck: 'false',
+      placeholder: 'name  image  [/data-path]   e.g.  redis  redis:7-alpine  /data',
+      'aria-label': 'New service',
+    });
+    input.style.width = '100%';
+    input.style.textAlign = 'left';
+    box.append(input);
+    const commit = () => {
+      const raw = input.value.trim();
+      d.addingService = false;
+      if (!raw) return paint();
+      const [name, image, dataPath] = raw.split(/\s+/);
+      if (!name || !image) { ctx.notify('a service needs a name and an image', true); return paint(); }
+      void put('services', [...services, {
+        name: name.toLowerCase(),
+        image,
+        env: [],
+        dataPath: dataPath && dataPath.startsWith('/') ? dataPath : null,
+      }]);
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') { d.addingService = false; paint(); }
+    });
+    input.addEventListener('blur', commit);
+    queueMicrotask(() => input.focus());
+    return box;
+  }
+
+  /**
    * Docker socket is a first-class registry flag, not a mount we fake.
    *
    * The consequence is stated in BOTH states — a warning that only appears
@@ -2608,10 +2712,184 @@ export function createDrawer(ctx) {
     paint();
   });
 
+  /* --------------------------------------- FEAT-118: global defaults */
+  /*
+   * Machine-wide defaults every new session starts from — the lever for the
+   * orchestrator's cost, which is dominated by context maintenance, so the
+   * thing that pays off is dropping the DEFAULT model tier once here rather
+   * than project by project. The resolution order is stated on the surface so
+   * "why isn't my change taking?" has an answer without reading code:
+   *
+   *     global default → project override → session override
+   *
+   * The model list is the SAME derived catalog the header chip uses (the CLI's
+   * own display names, versions included) — never a hand-written set, so a new
+   * model the CLI ships appears here the first time a session reports it.
+   */
+  function ensureGlobals() {
+    if (d.globals !== undefined || d.globalsInflight) return;
+    d.globalsInflight = true;
+    Promise.all([
+      api.getSettings(),
+      api.models('anthropic'),
+      api.listProjects().catch(() => []),
+    ]).then(([g, models, projects]) => {
+      d.globals = g ?? { model: null, effort: null };
+      d.modelCatalog = Array.isArray(models) ? models : [];
+      d.globalProjects = Array.isArray(projects) ? projects : [];
+    }).catch(() => {
+      d.globals = { model: null, effort: null };
+      d.modelCatalog = [];
+      d.globalProjects = [];
+    }).finally(() => {
+      d.globalsInflight = false;
+      if (d.view === 'globals' || d.view === 'settings') paint();
+    });
+  }
+
+  async function saveGlobal(field, value) {
+    try {
+      const next = await api.patchSettings({ [field]: value });
+      d.globals = next;
+      // A project the user is looking at inherits this — refresh so the settings
+      // view's "inherits global" line is truthful on the next visit.
+      d.globalProjects = undefined;
+      ctx.notify?.(value == null ? `global default ${field} cleared` : `global default ${field} set to ${value}`);
+      // Reload the override list against the just-saved value.
+      api.listProjects().then((ps) => { d.globalProjects = Array.isArray(ps) ? ps : []; if (d.view === 'globals') paint(); }).catch(() => {});
+      paint();
+    } catch (err) {
+      ctx.notify(`could not save global ${field}: ${err.message}`, true);
+    }
+  }
+
+  /** The display name for a model value in the derived catalog, or the raw value. */
+  function modelLabel(value) {
+    if (value == null) return null;
+    const m = (d.modelCatalog ?? []).find((x) => x.value === value);
+    return m ? (m.displayName || m.value) : value;
+  }
+
+  function globalsView() {
+    const wrap = document.createDocumentFragment();
+    if (d.globals === undefined) {
+      ensureGlobals();
+      wrap.append(el('div', { class: 'grp' }, note('Loading global defaults…')));
+      return wrap;
+    }
+    const g = d.globals;
+    const catalog = d.modelCatalog ?? [];
+
+    const intro = el('div', { class: 'grp' }, groupLabel('What these are'));
+    intro.append(note('The defaults every new session starts from, on this machine. A project can override any of these, and a single session can override its project — so the order that decides what runs is: global default → project → session.'));
+    wrap.append(intro);
+
+    /* ---- default model: a real picker over the derived catalog ---- */
+    const mg = el('div', { class: 'grp', 'data-focus': 'globalModel' }, groupLabel('Default model'));
+    // A CUSTOM sentinel value that isn't a real model id — selecting it reveals a
+    // free-text field. The CLI accepts model ids it does NOT advertise in its
+    // catalog (a versioned id like `claude-opus-4-8` the user pinned in the plain
+    // CLI is not in supportedModels()), so the picker must not be stricter than
+    // the tool it drives: the catalog is a convenience, free-text is the escape
+    // hatch. The server validates the shape (global-settings MODEL_RE) and the
+    // CLI validates the value itself at launch.
+    const CUSTOM = '__custom__';
+    const inCatalog = g.model != null && catalog.some((mm) => mm.value === g.model);
+    const isCustom = g.model != null && !inCatalog;
+    const sel = el('select', { class: 'gsel', id: 'gModelSel', 'aria-label': 'Global default model' });
+    sel.append(el('option', { value: '', text: 'No global default — let the engine pick' }));
+    for (const mopt of catalog) {
+      const o = el('option', { value: mopt.value, text: mopt.displayName || mopt.value });
+      if (g.model === mopt.value) o.selected = true;
+      sel.append(o);
+    }
+    // A stored value the current catalog does not list (a versioned id typed in
+    // the plain CLI, or an older cache) is shown as a real selected row so the
+    // setting never silently vanishes — and editable via the custom field below.
+    if (isCustom) {
+      const o = el('option', { value: g.model, text: `${g.model} (custom — not in the CLI’s list)` });
+      o.selected = true;
+      sel.append(o);
+    }
+    const customOpt = el('option', { value: CUSTOM, text: 'Other model id — type it…' });
+    sel.append(customOpt);
+
+    // The free-text row: hidden until the user chooses "Other…", or shown open
+    // when the current value is already a custom id so it can be edited in place.
+    const customRow = el('div', { class: 'gcustom', id: 'gModelCustom' });
+    const customInput = el('input', {
+      type: 'text', class: 'gtext', id: 'gModelCustomInput',
+      placeholder: 'e.g. claude-opus-4-8',
+      'aria-label': 'Custom global default model id',
+      value: isCustom ? g.model : '',
+    });
+    const customApply = el('button', { type: 'button', class: 'gbtn', id: 'gModelCustomApply', text: 'Set' });
+    const applyCustom = () => {
+      const v = customInput.value.trim();
+      if (!v) { saveGlobal('model', null); return; }
+      // Mirror the server's MODEL_RE so a bad shape is caught before the round trip.
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,79}$/.test(v)) {
+        ctx.notify('model id has forbidden characters — letters, digits and . _ : - [ ] only', true);
+        return;
+      }
+      saveGlobal('model', v);
+    };
+    customApply.addEventListener('click', applyCustom);
+    customInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); applyCustom(); } });
+    customRow.append(customInput, customApply);
+    customRow.hidden = !isCustom;
+
+    sel.addEventListener('change', () => {
+      if (sel.value === CUSTOM) { customRow.hidden = false; customInput.focus(); return; }
+      customRow.hidden = true;
+      saveGlobal('model', sel.value || null);
+    });
+    mg.append(sel);
+    mg.append(customRow);
+    mg.append(note(catalog.length
+      ? 'From the CLI’s own model list — versions included. Not listed? Choose “Other model id” and type it (e.g. claude-opus-4-8); the CLI accepts ids it doesn’t advertise. Setting this drops the tier for every project that hasn’t chosen its own.'
+      : 'No model list learned yet — start one session and the engine’s own models fill this in, or choose “Other model id” and type one (e.g. claude-opus-4-8).'));
+    wrap.append(mg);
+
+    /* ---- default effort ---- */
+    const eg = el('div', { class: 'grp' }, groupLabel('Default effort'));
+    const esel = el('select', { class: 'gsel', id: 'gEffortSel', 'aria-label': 'Global default effort' });
+    esel.append(el('option', { value: '', text: 'No global default' }));
+    for (const ev of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      const o = el('option', { value: ev, text: ev });
+      if (g.effort === ev) o.selected = true;
+      esel.append(o);
+    }
+    esel.addEventListener('change', () => saveGlobal('effort', esel.value || null));
+    eg.append(esel);
+    wrap.append(eg);
+
+    /* ---- which projects override the model default ---- */
+    const overriders = (d.globalProjects ?? []).filter((p) => p?.settings && p.settings.model != null);
+    const og = el('div', { class: 'grp' }, groupLabel('Projects that override the model'));
+    if (d.globalProjects === undefined) {
+      og.append(note('Checking projects…'));
+    } else if (!overriders.length) {
+      og.append(note('No project overrides the default model — every project inherits the global default above.'));
+    } else {
+      og.append(note(`${overriders.length} project${overriders.length === 1 ? '' : 's'} set${overriders.length === 1 ? 's' : ''} its own model, so the global default does not apply there:`));
+      for (const p of overriders) {
+        const r = el('div', { class: 'set' });
+        r.append(el('span', { class: 'l', text: p.name }));
+        r.append(el('span', { class: 'v', text: modelLabel(p.settings.model) ?? p.settings.model }));
+        og.append(r);
+      }
+    }
+    wrap.append(og);
+
+    return wrap;
+  }
+
   /* -------------------------------------------------------------- paint */
 
   const VIEWS = {
     settings: { el: 'settings', title: 'Project settings', build: settingsView, scope: true },
+    globals: { el: 'globals', title: 'Global defaults', build: globalsView, scope: false },
     instructions: { el: 'instructions', title: 'Instructions', build: instructionsView, scope: true },
     snapshots: { el: 'snapshots', title: 'Snapshots', build: snapshotsView, scope: false },
     library: { el: 'library', title: 'Templates', build: libraryView, scope: false },
@@ -2682,7 +2960,9 @@ export function createDrawer(ctx) {
     node.editor.classList.remove('on');
     node.body.hidden = false;
     node.title.textContent = v.title;
-    node.eyebrow.textContent = d.view === 'library' ? 'Shared across projects' : (project()?.name ?? '');
+    node.eyebrow.textContent = d.view === 'library' ? 'Shared across projects'
+      : d.view === 'globals' ? 'Every project on this machine'
+      : (project()?.name ?? '');
     node.scope.hidden = !v.scope;
     node.back.hidden = !d.back;
     node.hint.textContent = d.scope === 'project' ? 'Sessions inherit these' : 'Changes apply to this session only';

@@ -69,6 +69,58 @@ export function containerSettingsOf(project: Project): ContainerSettings {
 }
 
 /**
+ * FEAT-112 — a per-project service sidecar (Redis, Mongo, Postgres, …). Each
+ * declared service is a container Claude Station brings up on a per-project
+ * Docker network alongside the session container, reachable from inside the
+ * session by `name` over embedded DNS. This is the standard dev-container model:
+ * it needs no elevated capability (unlike the docker-socket toggle) and keeps the
+ * per-project isolation boundary intact.
+ *
+ * Services are OFF by default — the array is empty — so a project pays nothing
+ * until it declares one. A user turns a service off by deleting its row; the next
+ * `ensureServices` reconciles the running container away (see service-manager.ts).
+ */
+export interface ServiceEnvVar {
+  key: string;
+  value: string;
+}
+export interface ServiceSpec {
+  /**
+   * Hostname the session container reaches this service by, unique within the
+   * project. Must be a DNS label: lowercase, starts with a letter,
+   * `[a-z][a-z0-9-]{0,30}`. It is the network alias, so `redis` resolves to this
+   * container from inside the session.
+   */
+  name: string;
+  /** Image to run, e.g. `redis:7-alpine`, `mongo:7`. */
+  image: string;
+  /** Environment passed to the service container (`POSTGRES_PASSWORD`, …). */
+  env?: ServiceEnvVar[];
+  /**
+   * Container path to persist to a per-project named Docker VOLUME (`/data` for
+   * Redis, `/data/db` for Mongo). Empty/null = ephemeral (data is discarded when
+   * the service container is removed). The volume lives in Docker's own storage,
+   * NEVER in the user's project repo, and survives a session-container rebuild.
+   */
+  dataPath?: string | null;
+}
+
+/**
+ * Declared services with per-item defaults filled in. Read services through this,
+ * never `project.settings.services` directly, so a caller never re-derives the
+ * `env: []` / `dataPath: null` defaults (CONVENTIONS: whoever owns a fact writes
+ * it once).
+ */
+export function servicesOf(project: Project): ServiceSpec[] {
+  return (project.settings.services ?? []).map((s) => ({
+    name: s.name,
+    image: s.image,
+    env: s.env ?? [],
+    dataPath: s.dataPath ?? null,
+  }));
+}
+
+/**
  * Per-project stealth browser. Only meaningful when `enabled`; the browser
  * itself always runs on the HOST regardless of isolation (see browser.ts).
  */
@@ -221,9 +273,11 @@ export function orchestratorProfileOf(project: Project): OrchestratorProfileSett
  * BUG-144 — the current Working-Agreement method version. Bumping this is how a
  * future method change re-qualifies every project for a re-backfill (a row
  * stamped at an older version becomes a candidate again). Kept deliberately
- * simple: the coherent v1+v2 stack is version 1.
+ * simple: the coherent v1+v2 stack is version 1, the standalone condensed v3
+ * default is version 2, and the standalone v4 default (supersedes v1/v2/v3) is
+ * version 3.
  */
-export const CURRENT_METHOD_VERSION = 1;
+export const CURRENT_METHOD_VERSION = 3;
 
 /**
  * The recorded method version for a project. 0 = no decision recorded yet (the
@@ -254,6 +308,12 @@ export interface ProjectSettings {
   instructions: InstructionRef[];
   /** Optional in stored JSON; read it through `containerSettingsOf()`. */
   container?: ContainerSettings;
+  /**
+   * FEAT-112: per-project service sidecars. Optional in stored JSON (absent =
+   * none); read it through `servicesOf()`. An array PATCH REPLACES the whole list
+   * (like `mounts`), which is how deleting a row removes a service.
+   */
+  services?: ServiceSpec[];
   /** Optional in stored JSON; read it through `browserSettingsOf()`. */
   browser?: BrowserSettings;
   /** Optional in stored JSON; read it through `toolSettingsOf()`. */

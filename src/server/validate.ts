@@ -19,6 +19,62 @@ function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((x) => typeof x === 'string');
 }
 
+/** DNS-label rule for a service's network hostname (RFC-1123-ish, lowercased). */
+const SERVICE_NAME_RE = /^[a-z][a-z0-9-]{0,30}$/;
+/**
+ * Names that would collide with the network's own plumbing or with the session
+ * container's reachability, so a service must not claim them.
+ */
+const RESERVED_SERVICE_NAMES = new Set(['localhost', 'host', 'gateway', 'session', 'workspace']);
+
+/**
+ * FEAT-112 — validate a declared service array. Exported so the agent-propose
+ * route (services-request) rejects a bad proposal with the SAME dialect the
+ * settings PATCH uses, rather than a second implementation that could drift.
+ * Throws on the first problem with a message the UI/agent can read.
+ */
+export function validateServices(raw: unknown): reg.ServiceSpec[] {
+  if (!Array.isArray(raw)) throw new Error('services must be an array');
+  const seen = new Set<string>();
+  return raw.map((item, i) => {
+    const r = item as Record<string, unknown>;
+    if (!r || typeof r !== 'object' || Array.isArray(r)) throw new Error(`services[${i}] must be an object`);
+    for (const k of Object.keys(r)) {
+      if (!['name', 'image', 'env', 'dataPath'].includes(k)) throw new Error(`services[${i}]: unknown field "${k}"`);
+    }
+    if (typeof r.name !== 'string' || !SERVICE_NAME_RE.test(r.name)) {
+      throw new Error(`services[${i}].name must be a DNS label [a-z][a-z0-9-]{0,30} (got ${JSON.stringify(r.name)})`);
+    }
+    if (RESERVED_SERVICE_NAMES.has(r.name)) throw new Error(`services[${i}].name "${r.name}" is reserved`);
+    if (seen.has(r.name)) throw new Error(`services[${i}].name "${r.name}" is declared twice`);
+    seen.add(r.name);
+    if (typeof r.image !== 'string' || !r.image.trim()) throw new Error(`services[${i}].image must be a non-empty string`);
+    // Keep the image reference to a sane shape; docker will reject a truly bad one
+    // at pull time with a specific message, but a control char here is never valid.
+    if (/\s/.test(r.image)) throw new Error(`services[${i}].image must not contain whitespace`);
+    let env: reg.ServiceEnvVar[] = [];
+    if ('env' in r && r.env != null) {
+      if (!Array.isArray(r.env)) throw new Error(`services[${i}].env must be an array`);
+      env = r.env.map((e, j) => {
+        const ev = e as Record<string, unknown>;
+        if (!ev || typeof ev.key !== 'string' || !ev.key.trim() || typeof ev.value !== 'string') {
+          throw new Error(`services[${i}].env[${j}] must be { key: non-empty string, value: string }`);
+        }
+        if (/[=\0]/.test(ev.key)) throw new Error(`services[${i}].env[${j}].key must not contain '=' or NUL`);
+        return { key: ev.key, value: ev.value };
+      });
+    }
+    let dataPath: string | null = null;
+    if ('dataPath' in r && r.dataPath != null && r.dataPath !== '') {
+      if (typeof r.dataPath !== 'string' || !r.dataPath.startsWith('/')) {
+        throw new Error(`services[${i}].dataPath must be an absolute container path or empty`);
+      }
+      dataPath = r.dataPath;
+    }
+    return { name: r.name, image: r.image.trim(), env, dataPath };
+  });
+}
+
 /**
  * Whitelist + type-check a PATCH body. An unvalidated pass-through would let a
  * typo'd field land in the registry and only fail much later, inside docker.
@@ -33,7 +89,7 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
   const SETTINGS = new Set([
     'provider', 'model', 'effort', 'maxBudgetUsd', 'permissionMode',
     'allowedTools', 'disallowedTools', 'mounts', 'instructions', 'container', 'browser', 'tools', 'snapshots',
-    'responseDigest', 'orchestratorProfile', 'methodVersion',
+    'responseDigest', 'orchestratorProfile', 'methodVersion', 'services',
   ]);
 
   for (const k of Object.keys(b)) {
@@ -165,6 +221,9 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
       patch.pidsLimit = c.pidsLimit;
     }
     settings.container = patch as reg.ContainerSettings;
+  }
+  if ('services' in src) {
+    settings.services = validateServices(src.services);
   }
   if ('browser' in src) {
     const b2 = src.browser as Record<string, unknown> | null;

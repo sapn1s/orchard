@@ -120,6 +120,14 @@ export interface BoardItem {
    * context. Absent on every other row.
    */
   gitWrite?: { scope: 'once' | 'duration'; minutes: number | null; reason: string } | null;
+  /**
+   * FEAT-112 — present iff this decision card is a service-sidecar PROPOSAL
+   * (kind:'decision' raised via /services-request). The rail renders the proposed
+   * services with a one-click Allow/Decline; approving (answer "Allow") writes
+   * them into the project settings. Carries the specs and the agent's reason so
+   * the user decides in context. Absent on every other row.
+   */
+  services?: { services: { name: string; image: string }[]; reason: string } | null;
 }
 export interface Board {
   hasBoard: boolean;
@@ -804,6 +812,13 @@ export function boardStateSection(
     '# Project state (live board snapshot)',
     '',
     `_Auto-injected at launch from ${boardRel}/ (read-only). Re-read ${boardRel}/INDEX.md for the authoritative board; answer 👤 items via the dashboard's Needs-You rail._`,
+    '',
+    // FEAT-119 — a STATIC pointer (no live numbers, so it never busts the cached
+    // prefix) to the on-demand usage/burn command. Before fanning out a fleet,
+    // run it to see how much of each provider's window is gone, the burn rate
+    // against the reset, and this workspace's own spend — so tier and go/park are
+    // decided on data, not a guess. A running session gets it the same way.
+    "_Before dispatching a fleet, run `npm run usage` (add `-- --json` to parse) for live provider rate-limit headroom, burn rate vs reset, and this workspace's spend — decide model tier and go/park from it._",
     '',
     `**Focus:** ${focus}`,
     '',

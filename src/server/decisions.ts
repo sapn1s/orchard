@@ -38,6 +38,20 @@ export interface GitWriteRequest {
   reason: string;
 }
 
+/**
+ * FEAT-112 — a set of service sidecars an agent PROPOSED. Same shape of defence
+ * as GitWriteRequest: the request route mints nothing and writes no settings; the
+ * record is inert until the user answers "Allow" on the rail, and only the answer
+ * route writes the proposed services into the project. An agent proposing is
+ * never an agent applying.
+ */
+export interface ServiceRequest {
+  /** The proposed service specs (already validated by the request route). */
+  services: import('./registry.ts').ServiceSpec[];
+  /** The agent's stated reason, shown on the card so the user approves in context. */
+  reason: string;
+}
+
 export interface DecisionRecord {
   id: string;
   projectId: string;
@@ -56,6 +70,8 @@ export interface DecisionRecord {
   delivered: boolean;
   /** FEAT-108 r3 — present iff this decision is a git-write permission request. */
   gitWrite?: GitWriteRequest | null;
+  /** FEAT-112 — present iff this decision is a service-sidecar proposal. */
+  services?: ServiceRequest | null;
 }
 
 function storeFile(): string {
@@ -90,6 +106,8 @@ export interface RaiseInput {
   options?: unknown;
   /** FEAT-108 r3 — set only by the git-write-request route. */
   gitWrite?: GitWriteRequest | null;
+  /** FEAT-112 — set only by the services-request route. */
+  services?: ServiceRequest | null;
 }
 
 /** Normalise a raw `options` value into a clean string[] (drops empties). */
@@ -122,6 +140,7 @@ export function raise(input: RaiseInput): DecisionRecord {
     answeredAt: null,
     delivered: false,
     gitWrite: input.gitWrite ?? null,
+    services: input.services ?? null,
   };
   const all = readAll();
   all.push(rec);

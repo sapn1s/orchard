@@ -27,6 +27,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
 
 async function freePort() {
   const net = await import('node:net');
@@ -39,6 +40,11 @@ const PORT = Number(process.env.VERIFY_ASB_PORT ?? await freePort());
 const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-asb-data-'));
+// This suite creates a REAL (PONG) session and then reads it BACK — both by
+// walking the store and via the server's subagents/live APIs. So isolate the
+// CLI writer AND Orchard's reader to the same scratch store (alsoReader), and
+// walk THAT store below instead of ~/.claude/projects.
+const STORE_ENV = isolatedStoreEnv(path.join(DATA, 'store'), { alsoReader: true });
 const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-asb-chrome-'));
 const BRAVE = process.env.VERIFY_ROUTING_BROWSER ?? 'brave';
 
@@ -120,7 +126,7 @@ async function newPage(devPort) {
 
 async function main() {
   server = spawn(process.execPath, [path.join(ROOT, 'src', 'server', 'index.ts')], {
-    cwd: ROOT, env: { ...process.env, PORT: String(PORT), CLAUDE_STATION_DATA: DATA },
+    cwd: ROOT, env: { ...process.env, PORT: String(PORT), CLAUDE_STATION_DATA: DATA, ...STORE_ENV },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   server.stderr?.on('data', (d) => process.stderr.write(`  [server!] ${d}`));
@@ -170,7 +176,7 @@ async function main() {
   // Locate the REAL jsonl the SDK wrote (its own path encoding), derive the store dir.
   let jsonl = null;
   for (let i = 0; i < 40 && !jsonl; i++) {
-    const root = path.join(os.homedir(), '.claude', 'projects');
+    const root = STORE_ENV.CLAUDE_PROJECTS_DIR;
     const hit = (function walk(dir) {
       let out = null;
       for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -182,7 +188,7 @@ async function main() {
     })(root);
     if (hit) jsonl = hit; else await sleep(250);
   }
-  if (!jsonl) throw new Error(`could not find the session jsonl for ${sid} under ~/.claude/projects`);
+  if (!jsonl) throw new Error(`could not find the session jsonl for ${sid} under the isolated store ${STORE_ENV.CLAUDE_PROJECTS_DIR}`);
   const store = path.dirname(jsonl);
   const encoded = path.basename(store);
   cleanupDirs.push(store);

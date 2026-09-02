@@ -141,7 +141,10 @@ console.log('\n[0] capabilities are the appendix verdict, exactly');
   // subagent threads but has no "this work outlives the turn" signal), so the
   // close decision answers `unknown` while an agent row is still running and
   // `no` once every row settled (idle codex sessions close as before).
-  const want = { approvals: true, permissionModes: true, structuredCost: false, modelList: true, subagents: true, persistedTranscript: false, fork: true, effort: true, planMode: false, mcpConfig: false, backgroundLifetime: 'absent' };
+  // permissionModeMidTurn:false — Codex app-server has no mid-turn permission
+  // switch (a change rides the NEXT turn/start), so the bridge/UI must not claim
+  // a live toggle is in force while the running turn still prompts.
+  const want = { approvals: true, permissionModes: true, permissionModeMidTurn: false, structuredCost: false, modelList: true, subagents: true, persistedTranscript: false, fork: true, effort: true, planMode: false, mcpConfig: false, backgroundLifetime: 'absent' };
   check('capabilities match appendix + 2026-08-06 subagent re-check', JSON.stringify(caps) === JSON.stringify(want), caps);
 }
 

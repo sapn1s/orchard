@@ -36,6 +36,11 @@ import { evaluateGitWrite } from '../../../scripts/lib/git-grant.mjs';
 // the dest in the target project (cwd) AND the source in this repo (REPO_ROOT,
 // which has no `.orchard/` so it falls through to the legacy path).
 import { resolveStopHookFile } from '../../../scripts/lib/board-path.mjs';
+// Fixture-pollutes-reality guard: refuse to spawn a session that would write a
+// throwaway transcript into the user's REAL ~/.claude/projects store. Inert in
+// production; fires only for a verification harness that isolated its data dir
+// but forgot to isolate the CLI's transcript store (CLAUDE_CONFIG_DIR).
+import { assertSessionStoreIsolated } from '../../lib/paths.ts';
 import type {
   AgentRuntime,
   ProviderError,
@@ -381,6 +386,9 @@ export class ClaudeRuntime implements AgentRuntime {
   readonly capabilities: RuntimeCapabilities = {
     approvals: true,
     permissionModes: true,
+    // The SDK's setPermissionMode switches the query already in flight, so a live
+    // change governs the running turn (see setPermissionMode below).
+    permissionModeMidTurn: true,
     structuredCost: true,
     modelList: true,
     subagents: true,
@@ -617,6 +625,18 @@ export class ClaudeRuntime implements AgentRuntime {
     }
     if (config.systemPrompt) options.systemPrompt = config.systemPrompt;
 
+    // STRUCTURAL LEAK GUARD — only for a REAL host `claude` spawn, which is the
+    // one path that writes the user's ~/.claude/projects store. A scripted fake
+    // bin (CLAUDE_STATION_CLAUDE_BIN / spawnProcess) or a container executable
+    // (pathToExecutable) writes elsewhere, so the guard would be a false
+    // positive there. The CLI child inherits `options.env`, so the guard sees
+    // the same CLAUDE_CONFIG_DIR the child will. Half-isolated harness (isolated
+    // data dir, real store) is refused here rather than left to silently write.
+    const usingRealHostCli =
+      !options.pathToClaudeCodeExecutable && !options.spawnClaudeCodeProcess;
+    if (usingRealHostCli) {
+      assertSessionStoreIsolated(options.env, { label: config.sessionLabel ?? declaredSessionId });
+    }
     this.#query = query({ prompt: this.#input, options });
     /*
      * FEAT-055 — a session's first turn must HAVE its configured MCP tools (or

@@ -15,6 +15,52 @@
  */
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
+
+/**
+ * Isolate the spawned `claude` CLI's TRANSCRIPT store away from the user's real
+ * ~/.claude/projects — the second half of isolation that `CLAUDE_STATION_DATA`
+ * does NOT cover.
+ *
+ * The trap this exists to close: `CLAUDE_STATION_DATA` isolates the STATION's
+ * own data dir, but the `claude` child still writes its `<id>.jsonl` transcript
+ * to `<CLAUDE_CONFIG_DIR else ~/.claude>/projects/<encoded-cwd>/`. A suite that
+ * sets only `CLAUDE_STATION_DATA` therefore looks isolated (its own state is
+ * scratch) while every probe session it drives pollutes the user's real store —
+ * the "fixture pollutes reality" failure. The matching runtime guard
+ * (`assertSessionStoreIsolated` in src/lib/paths.ts) now REFUSES such a session,
+ * so a suite that forgets this fails loudly instead of leaking.
+ *
+ * `CLAUDE_CONFIG_DIR` redirects the CLI's whole `~/.claude` (so its transcripts
+ * land under scratch) — this alone STOPS the leak and satisfies the runtime
+ * guard. OAuth still needs the real `.credentials.json` (and `settings.json`),
+ * so those are SYMLINKED in — a symlink, not a copy, so no secret bytes are
+ * written to scratch.
+ *
+ * By default Orchard's own READER is left pointed at the real store, because
+ * many suites deliberately list REAL past sessions of a registered project as a
+ * precondition (the CLI-write and the Orchard-read are DIFFERENT knobs, so
+ * isolating the writer does not blind the reader). Pass `alsoReader: true` to
+ * ALSO set `CLAUDE_PROJECTS_DIR` at the scratch store — for a fully-isolated
+ * suite that reads back its OWN freshly-created sessions and wants no real data.
+ *
+ * `dir` must be a scratch directory the caller owns; it is created if absent.
+ */
+export function isolatedStoreEnv(dir, { alsoReader = false } = {}) {
+  const configDir = path.resolve(dir);
+  const projects = path.join(configDir, 'projects');
+  fs.mkdirSync(projects, { recursive: true });
+  for (const f of ['.credentials.json', 'settings.json']) {
+    const real = path.join(os.homedir(), '.claude', f);
+    const link = path.join(configDir, f);
+    if (fs.existsSync(real) && !fs.existsSync(link)) {
+      try { fs.symlinkSync(real, link); } catch { /* best-effort: absent creds surface as an auth error, not a leak */ }
+    }
+  }
+  return alsoReader
+    ? { CLAUDE_CONFIG_DIR: configDir, CLAUDE_PROJECTS_DIR: projects }
+    : { CLAUDE_CONFIG_DIR: configDir };
+}
 
 /** The shared/production data dir this must never resolve to. */
 export function sharedDataDir(env = process.env) {

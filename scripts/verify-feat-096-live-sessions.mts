@@ -42,6 +42,14 @@ const realRegistry = path.join(
   'registry.json',
 );
 process.env.CLAUDE_STATION_DATA = isolated;
+// Isolate the CLI transcript store too: these turns run in the REAL project
+// cwds (mirrored rows keep their real hostPath), so without this every probe
+// session would write a real transcript into ~/.claude/projects/<real-project>.
+// startSession/ClaudeRuntime inherit process.env, so setting it here reaches the
+// spawned CLI. Grading reads the live message stream, not the store, so the
+// reader is left alone (CLAUDE_CONFIG_DIR only).
+const { isolatedStoreEnv } = await import('./lib/station-boot.mjs');
+Object.assign(process.env, isolatedStoreEnv(path.join(scratch, 'store')));
 
 const reg = await import('../src/server/registry.ts');
 const { validateProjectPatch } = await import('../src/server/validate.ts');

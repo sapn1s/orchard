@@ -13,6 +13,7 @@
  * Run: npm run verify:orchestrator-enforcement-e2e
  */
 import { ClaudeRuntime } from '../src/server/runtime/claude-runtime.ts';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -22,6 +23,12 @@ import path from 'node:path';
 const scratch = path.join(os.homedir(), 'scratch', 'orchestrator-e2e');
 fs.mkdirSync(scratch, { recursive: true });
 fs.writeFileSync(path.join(scratch, 'notes.txt'), 'kenimai reference file\n');
+
+// Isolate the CLI transcript store so these real "kenimai / 391 / SUB_BASH_OK"
+// probe sessions land under scratch, not the user's ~/.claude/projects. The
+// ClaudeRuntime below inherits process.env, so setting it here reaches the CLI.
+// (Creds are symlinked in by isolatedStoreEnv so OAuth still resolves.)
+Object.assign(process.env, isolatedStoreEnv(path.join(scratch, 'store')));
 
 type Seen = { text: string[]; tools: { name: string; input: unknown }[]; results: string[] };
 

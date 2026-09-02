@@ -85,6 +85,101 @@ export function assertDataDirIntent(env: NodeJS.ProcessEnv = process.env, throwO
   return reason;
 }
 
+/**
+ * Where a spawned `claude` CLI child WRITES its transcript store.
+ *
+ * The CLI resolves `~/.claude` against `CLAUDE_CONFIG_DIR` when set (that is the
+ * env var the Agent SDK's session-mutation APIs honour), else `$HOME/.claude`.
+ * Transcripts land in `<that>/projects/<encoded-cwd>/<id>.jsonl`. NOTE this is a
+ * DIFFERENT knob from `CLAUDE_PROJECTS_DIR`: that one only steers Orchard's own
+ * READER (session-history.defaultRoot); it does NOT change where the CLI writes.
+ * A suite that sets `CLAUDE_PROJECTS_DIR` alone believes it is isolated and is
+ * not — every session it creates still writes the user's real store.
+ */
+export function claudeStoreDir(env: NodeJS.ProcessEnv = process.env): string {
+  const cfg = env.CLAUDE_CONFIG_DIR;
+  const base = cfg && cfg.trim() ? path.resolve(cfg) : path.join(os.homedir(), '.claude');
+  return path.join(base, 'projects');
+}
+
+/** The user's REAL transcript store, ignoring any override — the one to protect. */
+export function realClaudeStoreDir(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(os.homedir(), '.claude', 'projects');
+}
+
+/**
+ * The ONE process that is allowed to write real ~/.claude/projects transcripts
+ * through `ClaudeRuntime`: the production station server (index.ts marks itself
+ * at boot). Everything else that reaches a `ClaudeRuntime` real-store write is a
+ * verification harness — the server is the only production `ClaudeRuntime` user
+ * (dispatch.mjs spawns the `claude` binary directly, never through the runtime,
+ * so its real agent sessions never pass this seam). A module-level flag, not an
+ * env var: env inherits to children and to a spawned test server, which would
+ * defeat it; a fresh `import` in a verify script's own process starts `false`.
+ */
+let sanctionedRealStoreWriter = false;
+export function markSanctionedRealStoreWriter(): void {
+  sanctionedRealStoreWriter = true;
+}
+export function isSanctionedRealStoreWriter(): boolean {
+  return sanctionedRealStoreWriter;
+}
+
+/**
+ * BUG (fixture-pollutes-reality) — refuse to spawn a session that would write a
+ * throwaway transcript into the user's REAL ~/.claude/projects store.
+ *
+ * Two structural signals, either of which condemns a real-store write:
+ *
+ *  1. `CLAUDE_STATION_DATA` set (isolated data dir) — the signature of a harness
+ *     that isolated its station state but forgot the CLI's transcript store
+ *     (`CLAUDE_CONFIG_DIR`). Half-isolated: its own state is scratch while every
+ *     probe it drives pollutes the user's history. This closes the exact trap on
+ *     the board — a suite that sets the WRONG data var (e.g. STATION_DATA_DIR)
+ *     or the reader-only `CLAUDE_PROJECTS_DIR` and *believes* it is isolated.
+ *
+ *  2. Not the sanctioned production server (marker unset). The server is the
+ *     only production caller of `ClaudeRuntime`, so an unmarked process reaching
+ *     a real-store write is a verification harness driving the runtime in-process
+ *     (e.g. an e2e suite that isolates nothing) — a leak even though it looks
+ *     production-shaped. Zero production risk: nothing but the server marks
+ *     itself, and nothing but the server drives `ClaudeRuntime` in production.
+ *
+ * A real-store write is allowed ONLY when it is the sanctioned server running in
+ * the normal shared-data-dir mode. If the store is already isolated
+ * (`CLAUDE_CONFIG_DIR` points off the real store) nothing fires — that is the
+ * intended fix and the common correct case.
+ *
+ * `childEnv` is the environment the CLI child will actually run with (the server
+ * merges `process.env` with per-session overrides), so the check sees the same
+ * `CLAUDE_CONFIG_DIR` the child will.
+ */
+export function assertSessionStoreIsolated(
+  childEnv: NodeJS.ProcessEnv = process.env,
+  { label }: { label?: string } = {},
+): void {
+  const store = claudeStoreDir(childEnv);
+  if (path.resolve(store) !== path.resolve(realClaudeStoreDir(childEnv))) return; // isolated store: fine.
+  // The write targets the user's REAL store. Allow ONLY the production server in
+  // its normal shared-data-dir mode.
+  if (sanctionedRealStoreWriter && dataDirMode(childEnv) === 'shared') return;
+
+  const who = label ? ` (session: ${label})` : '';
+  const why = dataDirMode(childEnv) === 'isolated'
+    ? `this process isolated its station data dir (CLAUDE_STATION_DATA=${childEnv.CLAUDE_STATION_DATA}) but NOT the ` +
+      `claude transcript store` +
+      ((childEnv.CLAUDE_PROJECTS_DIR ?? '').trim()
+        ? ' (CLAUDE_PROJECTS_DIR only steers Orchard\'s reader, not the CLI writer — setting it is not isolation)'
+        : '')
+    : `this is not the production station server (a verification harness driving ClaudeRuntime in-process)`;
+  throw new Error(
+    `REFUSING to create a session${who}: ${why}, so the session would write a real transcript into the ` +
+    `user's store ${store}. A verification harness must set CLAUDE_CONFIG_DIR to a scratch dir (the CLI writes ` +
+    `<CLAUDE_CONFIG_DIR>/projects) — see isolatedStoreEnv() in scripts/lib/station-boot.mjs. ` +
+    `Refusing rather than quietly polluting ~/.claude/projects (fixture-pollutes-reality guard).`,
+  );
+}
+
 export function templatesDir(): string {
   return path.join(dataDir(), 'templates');
 }
@@ -110,6 +205,17 @@ export function scratchDir(): string {
 
 export function registryFile(): string {
   return path.join(dataDir(), 'registry.json');
+}
+
+/**
+ * App-wide (global) defaults, sibling to the per-project `registry.json`.
+ * FEAT-118: the ONE place a machine-wide default (e.g. the model tier every new
+ * session should start on) is written down, so a project that sets nothing
+ * inherits it rather than each session re-deciding. Per-project settings still
+ * live in `registry.json`; this file only holds the global fallback layer.
+ */
+export function globalSettingsFile(): string {
+  return path.join(dataDir(), 'settings.json');
 }
 
 export function ensureDir(dir: string): void {

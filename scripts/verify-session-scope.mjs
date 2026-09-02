@@ -168,15 +168,21 @@ async function main() {
   check('initial row shows the live model (haiku) tagged "inherited" — nothing overridden yet',
     before?.txt === 'haiku' && before?.tag === 'inherited', before);
 
-  console.log('\n=== cycle Model twice (haiku -> inherit -> opus): the row must visibly change ===');
+  // FEAT-118: the Model cycle now walks the CLI's DERIVED catalog (default,
+  // opus[1m], fable, sonnet, haiku, …), not the old hand-written alias list
+  // [null,opus,sonnet,haiku]. So "twice from an unlisted live value" lands on
+  // the catalog's first entry, whatever the CLI named it — this test guards the
+  // MECHANISM (the row visibly changes off the inherited value and records a
+  // real override), not a specific model string, which is now catalog-defined.
+  console.log('\n=== cycle Model twice: the row must visibly change off the inherited value and record an override ===');
   const afterCycle = await cdp.eval(`${PRE}; (function(){ modelRow().click(); modelRow().click(); return readRow(modelRow()); })()`);
-  check('(a) the row\'s displayed value CHANGES to the picked value ("opus"), not stuck on "haiku"/inherited',
-    afterCycle?.txt === 'opus' && afterCycle?.tag === 'overridden', afterCycle);
+  check('(a) the row\'s displayed value CHANGES to a concrete overridden model, not stuck on the inherited value',
+    !!afterCycle?.txt && afterCycle.txt !== before?.txt && afterCycle?.tag === 'overridden', afterCycle);
   check('(b) the revert affordance appears once the row is overridden',
     afterCycle?.hasRevert === true, afterCycle);
   const overridesAfterCycle = await cdp.eval(`window.__station.state.overrides.model ?? null`);
   check('(c) state.overrides.model reflects the local edit — this is what the NEXT session will launch with',
-    overridesAfterCycle === 'opus', overridesAfterCycle);
+    overridesAfterCycle != null, overridesAfterCycle);
 
   console.log('\n=== revert: the arrow must actually put the row back ===');
   const afterRevert = await cdp.eval(`${PRE}; (function(){ modelRow().querySelector('.rev').click(); return readRow(modelRow()); })()`);

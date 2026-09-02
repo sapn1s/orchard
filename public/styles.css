@@ -577,13 +577,57 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 }
 
 /* seal strip — isolation + mounts, as quiet text affordances */
+/* Two tiers, wrapping. The old row was overflow-x:auto with a hidden
+   scrollbar, so anything past the visible width (procs, integrations,
+   permission) was silently clipped and unreachable on a desktop with no
+   horizontal scroll. It now WRAPS: a full-width .seal-break drops the
+   informational readouts onto their own line beneath the interactive
+   controls, and every chip stays visible at any width. */
 .seal {
-  display: flex; align-items: center; gap: 6px;
+  display: flex; flex-wrap: wrap; align-items: center;
+  column-gap: 6px; row-gap: 7px;
   margin-top: 12px;
-  overflow-x: auto; padding-bottom: 3px;
-  scrollbar-width: none;
 }
-.seal::-webkit-scrollbar { display: none; }
+/* Forces tier 2 (git · procs · integrations · permission) onto its own line. */
+.seal-break { flex-basis: 100%; width: 100%; height: 0; margin: 0; }
+/* A quiet hairline between the navigation entries and the session selectors,
+   so the strip reads as grouped rather than one undifferentiated run. */
+.seal-vdiv { flex: none; width: 1px; height: 15px; background: var(--hair); margin: 0 2px; }
+.seal-vdiv[hidden] { display: none; }
+
+/* A session selector — isolation, provider. The chevron already signals a
+   menu; the hover just firms the border so it reads as pressable. */
+.pill.sel { cursor: pointer; }
+.pill.sel:hover, .pill.sel:focus-visible { border-color: var(--ink-4); color: var(--ink); outline: none; }
+.pill.sel .cx { opacity: .55; margin-left: 1px; }
+.pill.sel .g { color: var(--ink-3); }
+#provSel[data-provider="openai"] .g { color: var(--live); }
+
+/* A readout — git, processes. Informational, not a control: no button chrome
+   at rest, so the eye separates "what I can press" (tier 1) from "what this is
+   telling me" (tier 2). Still clickable to deep-link; hover reveals that. */
+.seal .readout {
+  border-color: transparent; background: transparent;
+  color: var(--ink-3); padding: 3px 5px;
+}
+.seal .readout .g { color: var(--ink-4); }
+.seal .readout:hover, .seal .readout:focus-visible {
+  border-color: var(--hair); color: var(--ink-2); background: var(--window); outline: none;
+}
+.seal .readout[hidden] { display: none; }
+/* FEAT-116 — provider rate-limit readout severity. Quiet at rest; the binding
+   window's fill tints the readout so a near-full window catches the eye without
+   a competing chip. `unknown` reads as dim (nothing to show), never as "0%". */
+.seal .readout.usage.unknown { color: var(--ink-4); }
+.seal .readout.usage.unknown .g { color: var(--ink-4); opacity: 0.7; }
+.seal .readout.usage.warn { color: var(--warn, #B0703C); }
+.seal .readout.usage.warn .g { color: var(--warn, #B0703C); }
+.seal .readout.usage.danger { color: var(--danger, #c0392b); }
+.seal .readout.usage.danger .g { color: var(--danger, #c0392b); }
+
+/* The sidebar toggle mirrors its glyph when collapsed so the panel bar sits on
+   the side the sidebar will grow toward — reading as "expand", not "collapse". */
+#fold.is-collapsed svg { transform: scaleX(-1); }
 .pill {
   flex: none;
   display: inline-flex; align-items: center; gap: 6px;
@@ -680,6 +724,17 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   padding: 11px 15px;
   font-size: 15px; line-height: 1.5;
   color: var(--ink);
+  /* The user's own message is rendered as PLAIN TEXT (youBubble uses a text
+     node, not prose()) — it is composer input, not authored markdown, so the
+     line breaks the user typed are their words and must survive. Default
+     `white-space: normal` collapsed every run of newlines/spaces to one space,
+     so a multi-line message rendered as one run-on blob (BUG report: newlines
+     lost at render). pre-wrap keeps the breaks AND the blank-line paragraph
+     gaps exactly as typed while still wrapping long lines; overflow-wrap keeps
+     a pasted URL or unbroken log line from bursting the bubble. This is a
+     display rule only — the stored transcript already holds the real newlines,
+     so the model always received what the user wrote. */
+  white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .claude { display: grid; grid-template-columns: 24px minmax(0,1fr); gap: 14px; margin: 0 0 36px; }
 
@@ -963,6 +1018,74 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .jump .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--idle); flex: none; }
 .jump.new .dot { background: var(--live); }
 .jump[hidden] { display: none; }
+
+/* ═══════════════ FEAT-118 — within-session marks ═══════════════
+   The AUTO "you were here" line and the MANUAL bookmark. Two deliberately
+   DISTINCT visual languages so they never read as the same thing:
+     • the read-line is a DASHED, quiet full-width rule — a boundary, not an
+       object; it says "everything below arrived after you left".
+     • the bookmark is a SOLID moss ribbon anchored to one message — an object
+       you placed. */
+
+/* The auto read boundary: a hairline dashed rule with a small centred label,
+   sitting between the last-read and first-unread message. Amber-tinted so it
+   reads as "new / attention" but stays a rule, not a shout. */
+.readline {
+  position: relative; display: flex; align-items: center; gap: 10px;
+  margin: 2px 0 30px; padding: 0;
+  color: var(--st-needs);
+}
+.readline::before, .readline::after {
+  content: ''; height: 0; flex: 1 1 auto;
+  border-top: 1px dashed color-mix(in srgb, var(--st-needs) 55%, transparent);
+}
+.readline .rl-label {
+  flex: none; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+  color: var(--st-needs); white-space: nowrap;
+}
+
+/* The manual bookmark ribbon: a solid moss bar down the leading edge of the
+   bookmarked message, plus a small ribbon tab. Distinct from the dashed rule. */
+[data-i].bookmarked { position: relative; }
+[data-i].bookmarked::before {
+  content: ''; position: absolute; left: -14px; top: -2px; bottom: -2px;
+  width: 3px; border-radius: 2px; background: var(--live);
+}
+
+/* The "you left off here" jump pill — the one-action return. Twin of `.jump`,
+   mounted on the OPPOSITE (leading) side of the dock so the two never overlap,
+   and amber-accented to match the read-line it returns to. */
+.leftoff {
+  position: absolute; left: 32px; top: -34px; z-index: 3;
+  display: flex; align-items: center; gap: 7px;
+  height: 26px; padding: 0 11px; border-radius: 13px;
+  border: 1px solid color-mix(in srgb, var(--st-needs) 45%, var(--hair));
+  background: var(--window);
+  color: var(--st-needs); font-family: var(--mono); font-size: 11px; letter-spacing: .02em;
+  cursor: pointer; transition: color .14s, border-color .14s, background .14s;
+}
+.leftoff:hover { border-color: var(--st-needs); }
+.leftoff .a { font-size: 12px; line-height: 1; }
+.leftoff .g {
+  font-size: 9.5px; padding: 0 5px; line-height: 14px;
+  border: 1px solid color-mix(in srgb, var(--st-needs) 45%, transparent); border-radius: 999px;
+}
+.leftoff .g:empty { display: none; }
+.leftoff[hidden] { display: none; }
+
+/* The bookmark toggle — a small ribbon-glyph button beside "Latest". Hollow
+   when no bookmark, filled moss when one is set (the pin's own language). */
+.bkmk {
+  position: absolute; right: 96px; top: -34px; z-index: 3;
+  display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; border-radius: 13px;
+  border: 1px solid var(--hair); background: var(--window);
+  color: var(--ink-4); cursor: pointer; transition: color .14s, border-color .14s;
+}
+.bkmk:hover { color: var(--ink-2); border-color: var(--ink-4); }
+.bkmk svg { display: block; }
+.bkmk.set { color: var(--live); border-color: color-mix(in srgb, var(--live) 45%, var(--hair)); }
+.bkmk[hidden] { display: none; }
 
 /* the "reading older messages…" / "beginning of this session" rails */
 .hint-row.older { color: var(--ink-3); font-family: var(--mono); font-size: 11px; }
@@ -1436,6 +1559,36 @@ button.set:hover { background: var(--window); }
   display: block; text-align: left;
 }
 .addrow:hover { color: var(--ink-2); }
+
+/* FEAT-118 — global-default pickers in the drawer */
+.gsel {
+  width: 100%; margin-top: 6px; padding: 7px 9px;
+  font: inherit; font-size: 13px; color: var(--ink-1);
+  background: var(--bg-2); border: 1px solid var(--line-1); border-radius: 7px;
+  cursor: pointer;
+}
+.gsel:hover { border-color: var(--line-2); }
+.gsel:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Free-text model id, revealed when the picker's "Other model id…" is chosen —
+   the escape hatch for a CLI-accepted id the catalog does not advertise. */
+.gcustom { display: flex; gap: 6px; margin-top: 6px; }
+.gcustom[hidden] { display: none; }
+.gtext {
+  flex: 1; min-width: 0; padding: 7px 9px;
+  font: inherit; font-size: 13px; font-family: var(--mono); color: var(--ink-1);
+  background: var(--bg-2); border: 1px solid var(--line-1); border-radius: 7px;
+}
+.gtext:hover { border-color: var(--line-2); }
+.gtext:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gbtn {
+  flex: none; padding: 7px 12px;
+  font: inherit; font-size: 12.5px; color: var(--ink-1);
+  background: var(--bg-2); border: 1px solid var(--line-1); border-radius: 7px;
+  cursor: pointer;
+}
+.gbtn:hover { border-color: var(--line-2); background: var(--sunken); }
+.gbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* elevated-risk toggle: warning as text and a hairline, no red */
 .risk { margin: 10px -8px 0; padding: 10px 8px; border-radius: 8px; }
@@ -2356,13 +2509,49 @@ button.lag:hover { background: var(--rail); }
   border-radius: 999px; padding: 0 6px; line-height: 14px;
 }
 .proj .ago + .unseen { margin-left: 6px; }
-/* A session row with unlooked-at activity: a quiet moss tick before the
-   timestamp — enough to scan for, no colour flood. */
-.row.fresh .when { color: var(--live); }
-.row.fresh::before {
-  content: ''; display: inline-block; width: 4px; height: 4px; border-radius: 50%;
-  background: var(--live); margin-right: 5px; vertical-align: 2px;
+/* FEAT-118 — a session row with unlooked-at activity (UNREAD). Reworked so the
+   unread cue no longer sits on the LEADING rail, where it doubled up with the
+   lifecycle dot (running/finished/died) — five states there would collapse into
+   noise. Unread is now an ORTHOGONAL, quiet pairing: a small moss tick on the
+   TRAILING edge (`.unread`, below) plus a slight title-ink lift, so read rows
+   recede and unread ones read as "there's something new" without competing with
+   the leading marker for the same pixels. The timestamp stays moss so a fast
+   vertical scan of the trailing column still finds unread rows. */
+.row.fresh { color: color-mix(in srgb, var(--ink) 62%, var(--ink-2)); }
+.row.fresh .when { color: var(--live); opacity: 1; }
+.row .unread {
+  float: right; margin-left: 8px; margin-top: 5px;
+  width: 5px; height: 5px; border-radius: 50%; background: var(--live);
 }
+
+/* FEAT-118 — session-list LIFECYCLE markers, one per row on the leading rail
+   (the column the `.alive` moss dot already owns). Three salience tiers, so a
+   dense list reads as a hierarchy rather than five colours:
+     • DIED without answering — the one ALARM, and the one place boldness is
+       spent: an amber filled triangle (a distinct SHAPE, legible without colour
+       and at a glance), because a session that died in the background and never
+       answered is what silently loses work. Ground truth: the agent-outcomes
+       ledger. The row's timestamp also turns amber and stays visible — "when did
+       it die" is load-bearing here.
+     • RECENTLY FINISHED — a running session that just went quiet: the same moss
+       as `.alive` but a STILL, hollow ring (no motion). It pairs with the live
+       dot so the eye groups "alive / just-alive" apart from the amber alarm. */
+.row .stopped {
+  position: absolute; left: 7px; top: 50%; margin-top: -4px;
+  width: 0; height: 0;
+  border-left: 4px solid transparent; border-right: 4px solid transparent;
+  border-bottom: 7px solid var(--st-needs);
+}
+.row.died .when { color: var(--st-needs); opacity: 1; }
+.row .settled {
+  position: absolute; left: 8px; top: 50%; margin-top: -2.5px;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: none; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--live) 70%, transparent);
+}
+/* RECENTLY VISITED — the quietest tier: no glyph, no colour, just the muted
+   timestamp held visible (normally hover-only) so rows you touched today group
+   without adding a fifth accent. Never shown on a died row (amber wins there). */
+.row.visited:not(.died) .when { opacity: .5; }
 
 /* ── edit-diff chips ── */
 /* The change itself, not its JSON envelope. Additions wear the moss accent;
@@ -2651,6 +2840,17 @@ button.lag:hover { background: var(--rail); }
   border-color: var(--st-done, var(--live)); font-weight: 600;
 }
 .needs-card.git-write .nc-opt:first-child:hover { opacity: .88; }
+
+/* FEAT-112 — a service-sidecar proposal reads as its own kind of ask: an agent
+   proposed services and the user applies them with one click. Same one-click
+   Allow / Decline shape as git-write, with a distinct accent. */
+.needs-card.services { border-left-color: var(--live); }
+.needs-card.services .nc-id { color: color-mix(in srgb, var(--live) 78%, var(--ink)); }
+.needs-card.services .nc-opt:first-child {
+  color: var(--on-solid); background: var(--solid);
+  border-color: var(--solid); font-weight: 600;
+}
+.needs-card.services .nc-opt:first-child:hover { opacity: .88; }
 
 /* Option buttons for a decision that carries choices — greyscale, hairline,
    moss on hover; clicking one submits it as the answer. */

@@ -59,6 +59,8 @@ import {
   type ContainerLiveness,
   type MemoryStatus,
 } from './container-manager.ts';
+import { ensureServices, connectSessionToServices, ServiceError } from './service-manager.ts';
+import { applyGlobalDefaults } from './global-settings.ts';
 import { spawnSurvivable, survivalEnabled, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
 /*
  * ARCH-001: the bridge no longer decides its own liveness. It supplies the
@@ -77,6 +79,7 @@ import { snapshotOfSession, type RunningSnapshot } from './running-set.ts';
 import * as outcomes from './outcomes.ts';
 import { TranscriptRecorder, resolveOrchardSessionFile } from './orchard-transcripts.ts';
 import { encodeCwd } from '../lib/session-history.ts';
+import { recordSessionProvenance } from '../lib/session-provenance.mjs';
 
 /* ---------------------------------------------------------- slash commands */
 /*
@@ -160,6 +163,14 @@ export interface StartOptions {
   resumeEncodedDir?: string;
   /** Overrides the project's instruction stack for this session only. */
   instructions?: InstructionRef[];
+  /**
+   * Who started this session, DECLARED not inferred (session-provenance.mjs).
+   * Default 'user' — an interactive/UI start, and the safe default that keeps a
+   * row visible in the picker. A caller that spawns a session on an agent's
+   * behalf passes 'agent' to fold it out of the human's way. Recorded write-once
+   * at `system:init`, once the engine's session id exists.
+   */
+  startedBy?: 'user' | 'agent';
   /**
    * Per-session settings overrides. Already validated by validate.ts. Applied to
    * this session only; nothing here is ever written back to the registry.
@@ -269,12 +280,22 @@ You have Playwright via \`mcp__playwright__*\`. It is **headless and disposable*
 }
 
 function pickOverridable(s: ProjectSettings): Overridable {
+  /*
+   * FEAT-118: this is the ONE place the global-default layer is merged under a
+   * project's own settings, so a session's effective config has a single
+   * authority. `model` and `effort` both default to null on a project ("unset"),
+   * so where a project has not chosen one the machine-wide default from
+   * settings.json applies; an explicit project value overrides it, and a session
+   * override (layered on above at start) overrides that. Provider is not global
+   * (every project persists its own), so it is resolved from the project alone.
+   */
+  const merged = applyGlobalDefaults({ model: s.model, effort: s.effort });
   return {
     // FEAT-037 P3: resolved, never absent — registries written before the
     // field existed must read as the default engine.
     provider: s.provider ?? 'anthropic',
-    model: s.model,
-    effort: s.effort,
+    model: merged.model,
+    effort: merged.effort,
     permissionMode: s.permissionMode,
     maxBudgetUsd: s.maxBudgetUsd,
     allowedTools: s.allowedTools,
@@ -470,6 +491,17 @@ export class AgentSession {
   readonly ignoredOverrides: { field: string; value: unknown; reason: string }[];
   /** Where the effective permissionMode came from — lets the UI label it. */
   permissionModeSource: 'session-override' | 'container-default' | 'project' | 'live-change';
+  /**
+   * A live permission-mode change ACCEPTED by the engine but not yet in force,
+   * because it was made DURING a turn on an engine with no mid-turn switch
+   * (`capabilities.permissionModeMidTurn === false`, i.e. Codex). The engine has
+   * already stashed it for the next turn/start; here we hold the REPORTING flip
+   * so `effective`/the UI keep saying the running turn's real mode (which still
+   * prompts) until the next turn actually opens (`send()` applies it). null =
+   * nothing pending. This is why "skip enabled" can no longer read as in force
+   * while the in-flight Codex turn keeps asking.
+   */
+  #deferredPermissionMode: string | null = null;
   /** Staged transcript copy for a cross-OS fork; deleted once the fork owns a file. */
   #forkPlan: ForkPlan | null;
   /** The ORIGINAL session id a fork branched from (what the user clicked). */
@@ -490,6 +522,8 @@ export class AgentSession {
   #recorder: TranscriptRecorder | null = null;
   #emit: (e: StationEvent) => void;
   #pump: Promise<void> | null = null;
+  /** Declared provenance for this session; recorded at init. Default 'user'. */
+  #startedBy: 'user' | 'agent';
 
   /**
    * FEAT-090 — answered-awaiting tickets already ANNOUNCED to this session, keyed
@@ -902,6 +936,7 @@ export class AgentSession {
     this.project = opts.project;
     this.cwd = opts.project.hostPath;
     this.#emit = opts.onEvent;
+    this.#startedBy = opts.startedBy ?? 'user';
 
     const refs = opts.instructions ?? opts.project.settings.instructions ?? [];
     // FEAT-039 gap #1: fold this project's docs/CONVENTIONS.md (if any) onto the
@@ -1100,6 +1135,27 @@ export class AgentSession {
         }
       }
       this.#runtime = new CodexRuntime();
+      /*
+       * FEAT-096 — the orchestrator tool profile is a `ClaudeRuntime` PreToolUse
+       * callback keyed on `agent_id`; the Codex protocol has no equivalent read
+       * gate (its approval channel only sees command execution and file changes,
+       * never file reads — codex-runtime.ts EXEC/PATCH_APPROVAL_METHODS), so a
+       * profile-enabled project silently gets NO enforcement on this provider.
+       * Enforcing it here would be a half-build (reads can't be refused), so the
+       * gap is not closed — it is made VISIBLE instead, the way a silent
+       * security-shaped setting that quietly does nothing is the worse failure.
+       * Same class of gap as FEAT-108's git-write block, which is likewise
+       * ClaudeRuntime-only.
+       */
+      if (orchestratorProfileOf(opts.project).enabled) {
+        this.#emit({
+          t: 'status',
+          status:
+            'orchestrator profile NOT enforced: this is an OpenAI Codex session, and the ' +
+            'tool profile is a Claude-runtime mechanism. Inline reads/searches are not blocked ' +
+            'here — dispatch discipline is advisory on this provider (FEAT-096).',
+        });
+      }
     } else {
       this.#runtime = new ClaudeRuntime();
     }
@@ -1255,16 +1311,32 @@ export class AgentSession {
     if (mcpServers && plan.servers[MCP_SERVER_NAME]) this.browserAttached = true;
 
     /*
-     * BOOT AWARE (FEAT-021). For a board-having project, fold a compact, capped
-     * live "Project state" snapshot onto the composed Working-Agreement prompt so
-     * the session boots already aware of where the project is (needs-you items,
-     * in-flight work, a one-line focus) instead of re-syncing by hand. It is
-     * ADDED to the WA content, never replacing it; a project with no docs/bugs/
-     * yields null and injects nothing (opt-in). Refreshed on every launch.
+     * BOOT AWARE (FEAT-021). For a board-having project, a compact, capped live
+     * "Project state" snapshot boots the session already aware of where the
+     * project is (needs-you items, in-flight work, a one-line focus) instead of
+     * re-syncing by hand. A project with no docs/bugs/ yields null and injects
+     * nothing (opt-in). Refreshed on every launch/resume.
+     *
+     * FEAT-113 — this snapshot rides the FIRST TURN (a user-side preamble,
+     * folded into `firstPrompt` below), NOT the system prompt. It is the only
+     * per-resume-VOLATILE thing the launch assembled: the board changes every
+     * time a ticket is filed or a status flips, so injecting it into the system
+     * block rewrote the whole cached system prefix on every resume — the
+     * provider attributes it as `cache_miss_reason: system_changed`, measured at
+     * ~$318/month of full-prefix cache rebuilds on the real orchestrator session
+     * (see FEAT-113 analysis + docs/analysis/COST-METHOD.md). Anthropic's prompt
+     * cache keys the entire system block as one prefix segment, so a volatile
+     * tail still busts the whole segment; the fix is to move it OUT of the system
+     * prompt, not merely to the end of it. The session loses nothing — it still
+     * gets the same snapshot at launch, and can re-read the live board on demand
+     * (it has the board tool + the INDEX.md the snapshot names). The system
+     * prompt (WA + local conventions + routing + response-format, all
+     * repo-file-backed) is now byte-stable across a session's resumes unless a
+     * doc genuinely changed, so the cached prefix survives.
      */
     let sp = this.composed.systemPrompt;
-    sp = appendToSystemPrompt(sp, boardStateSection(opts.project.hostPath));
     sp = appendToSystemPrompt(sp, opts.extraAppend);
+    const boardSnapshot = boardStateSection(opts.project.hostPath);
 
     // FEAT-090: the snapshot above ALREADY carries the answered-awaiting lane, so
     // seed the seen-set with what it just stated — the open-session briefing
@@ -1281,7 +1353,15 @@ export class AgentSession {
      * at most once per death; a healthy session gets NOTHING — see
      * `outcomes.takeBriefing`.
      */
-    const firstPrompt = this.#withBriefing(opts.firstPrompt, opts.resumeSessionId ?? null);
+    // FEAT-113 — the boot snapshot (assembled above, now kept OUT of the system
+    // prompt) leads the first turn as an orientation preamble, ahead of the
+    // user's prompt and any "while you were away" briefing. Injected once per
+    // launch/resume, exactly as before — only its LOCATION moved (system → first
+    // user turn), so the cached system prefix stays byte-stable across resumes.
+    const orientedFirst = [boardSnapshot, opts.firstPrompt]
+      .filter((s): s is string => !!s && !!s.trim())
+      .join('\n\n---\n\n');
+    const firstPrompt = this.#withBriefing(orientedFirst, opts.resumeSessionId ?? null);
 
     /*
      * FEAT-037 P2b — arm Orchard-owned transcript capture for engines with no
@@ -1411,6 +1491,20 @@ export class AgentSession {
   send(prompt: string): { delivered: boolean; queued: boolean } {
     if (this.closed) throw new Error('session is closed');
     if (this.budgetStopped) throw new Error('session stopped: budget exceeded');
+    /*
+     * A permission-mode change deferred while a Codex turn was in flight becomes
+     * REAL at the next turn/start — which this message is. The engine already
+     * stashed it; flip the REPORTING mirror now so effective-config catches up to
+     * the mode the message will actually run under, and clear the pending state
+     * (the UI's ARMED-for-next-turn badge resolves to the confirmed mode). Applied
+     * for both a fresh turn and an interject: either way the user has committed
+     * their next message. See setPermissionMode's deferred-reporting gate.
+     */
+    if (this.#deferredPermissionMode != null) {
+      const pending = this.#deferredPermissionMode;
+      this.#deferredPermissionMode = null;
+      this.#applyPermissionMode(pending, 'client');
+    }
     if (this.busy) {
       /*
        * BUG-159 — HOLD, don't throw. A user's typed message must never be
@@ -1560,7 +1654,7 @@ export class AgentSession {
    *   - 'auto' on a model that has no auto-mode classifier
    * `default` / `acceptEdits` / `plan` switch freely, armed or not.
    */
-  async setPermissionMode(mode: string): Promise<{ ok: boolean; mode: string; error?: string }> {
+  async setPermissionMode(mode: string): Promise<{ ok: boolean; mode: string; error?: string; appliesFrom?: 'now' | 'next-turn' }> {
     if (!LIVE_PERMISSION_MODES.has(mode)) {
       return { ok: false, mode, error: `permissionMode must be one of ${[...LIVE_PERMISSION_MODES].join(', ')}` };
     }
@@ -1571,8 +1665,27 @@ export class AgentSession {
       // The CLI's message is specific and user-actionable; do not paraphrase it.
       return { ok: false, mode, error: (err as Error).message || String(err) };
     }
+    /*
+     * DEFERRED-REPORTING GATE. The engine has accepted the change and stashed it
+     * for its next turn either way. But when the change lands DURING a turn on an
+     * engine that cannot switch mid-turn (Codex — permissionModeMidTurn:false),
+     * the RUNNING turn keeps its old policy to the end, so flipping `effective`
+     * now would make the UI claim skip is in force while that turn is still
+     * prompting (the reported "I enabled skip and it still asks" defect). Hold the
+     * flip: record it as pending, report `appliesFrom:'next-turn'`, and let the
+     * next `send()` apply it at the real boundary. Claude (true) and an idle
+     * session (no running turn to contradict) apply immediately as before.
+     */
+    if (this.busy && !this.#runtime.capabilities.permissionModeMidTurn) {
+      this.#deferredPermissionMode = mode;
+      // Re-report so the UI can paint the ARMED-for-next-turn state; effective is
+      // deliberately UNCHANGED (the running turn's real mode is still authoritative).
+      this.#emit({ t: 'effective-config', ...this.effectiveConfig() });
+      return { ok: true, mode, appliesFrom: 'next-turn' };
+    }
+    this.#deferredPermissionMode = null; // a fresh immediate change supersedes any pending one
     this.#applyPermissionMode(mode, 'client');
-    return { ok: true, mode };
+    return { ok: true, mode, appliesFrom: 'now' };
   }
 
   /**
@@ -3020,6 +3133,11 @@ export class AgentSession {
       overridden: [...this.overriddenFields],
       ignoredOverrides: [...this.ignoredOverrides],
       permissionModeSource: this.permissionModeSource,
+      // Present ONLY while a live change is accepted-but-not-yet-in-force (a Codex
+      // mid-turn toggle): the mode that will govern from the next turn, so the UI
+      // shows the toggle as armed instead of claiming it is already skipping while
+      // the running turn still prompts. Cleared the moment the next turn opens.
+      ...(this.#deferredPermissionMode != null ? { permissionModePendingNextTurn: this.#deferredPermissionMode } : {}),
       instructionMode: this.composed.mode,
       appliedTemplates: [...this.composed.appliedIds],
     };
@@ -3816,6 +3934,10 @@ export class AgentSession {
         this.#markForegroundTurnLive();
         this.sdkSessionId = String(m.session_id);
         this.cwd = String(m.cwd ?? this.cwd);
+        // Declare who started this session, write-once, now that the engine's
+        // session id exists (session-provenance.mjs). Default 'user' keeps a row
+        // visible; the picker folds only rows explicitly recorded 'agent'.
+        recordSessionProvenance(this.sdkSessionId, this.#startedBy, { source: 'agent-bridge' });
         // FEAT-037 P2b: the engine's session/thread id names the Orchard
         // transcript file (it IS the resume handle). Buffered entries (the
         // first prompt) flush here; a resume already adopted the same id.
@@ -4376,11 +4498,31 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
   const dispatchUnavailableReason = await prepareDispatchForSession(opts);
 
   if (iso === 'container') {
+    /*
+     * FEAT-112 — bring declared service sidecars up BEFORE the session container,
+     * so the network exists to join. A service that will not start FAILS session
+     * start loudly and specifically (a silent no-Redis is worse than a refusal);
+     * the pull is bounded so an unreachable registry cannot hang us here.
+     */
+    try {
+      await ensureServices(opts.project, (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }));
+    } catch (err) {
+      const e = err as Error;
+      const detail = err instanceof ServiceError && err.detail ? `\n${err.detail}` : '';
+      const msg =
+        err instanceof ServiceError
+          ? `service sidecar unavailable (${err.code}): ${e.message}${detail}`
+          : `service sidecar unavailable: ${e.message}`;
+      opts.onEvent({ t: 'error', message: msg, fatal: true });
+      throw new Error(msg);
+    }
     try {
       const st = await ensureContainer(opts.project, { onLog: (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }) });
       if (st.state !== 'running') {
         throw new ContainerError('not-running', `container ${st.containerName} is "${st.state}" — refusing to start a session on the host instead`);
       }
+      // Join the session container to the service network AFTER it is running.
+      connectSessionToServices(opts.project.id, (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }));
     } catch (err) {
       const e = err as Error;
       /*

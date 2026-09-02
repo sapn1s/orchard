@@ -433,7 +433,7 @@ async function main() {
   /* ═════════ the end-to-end claim ═════════ */
   console.log('\n=== END-TO-END: a NEW session receives the reopened ticket in its board snapshot ===');
   const { boardStateSection } = await import(path.join(ROOT, 'src', 'server', 'board.ts'));
-  const { composeInstructions, appendToSystemPrompt, seedTemplates } =
+  const { composeInstructions, seedTemplates } =
     await import(path.join(ROOT, 'src', 'server', 'templates.ts'));
   seedTemplates();
   const section = boardStateSection(WORK);
@@ -441,11 +441,17 @@ async function main() {
     typeof section === 'string' && section.includes(DONE_ID) && /Needs you \(2\)/.test(section),
     (section ?? '').split('\n').filter((l) => l.includes(DONE_ID) || l.includes('Needs you')).join(' ⏎ '));
   const composed = composeInstructions([{ templateId: 'working-agreement-v2' }]);
-  const folded = appendToSystemPrompt(composed.systemPrompt, section);
-  const foldedText = typeof folded === 'string' ? folded : folded?.append ?? '';
-  check('(8b) …and it survives the real fold onto the Working Agreement (this is the exact prompt a launch builds)',
-    foldedText.includes(DONE_ID) && foldedText.includes('# Working Agreement v2'),
-    `WA present=${foldedText.includes('# Working Agreement v2')} ticket present=${foldedText.includes(DONE_ID)}`);
+  const foldedText = typeof composed.systemPrompt === 'string'
+    ? composed.systemPrompt : composed.systemPrompt?.append ?? '';
+  // FEAT-113 — the launch keeps the volatile board snapshot OUT of the (cached,
+  // byte-stable) system prompt and rides it in the FIRST TURN instead. So the
+  // real launch prompt = the composed WA system block + a first-turn preamble
+  // that carries the snapshot; assert BOTH halves the way the launch now builds
+  // them (WA in system, ticket in the turn).
+  const firstTurn = [section, 'orchestrator: continue'].filter((s) => s && s.trim()).join('\n\n---\n\n');
+  check('(8b) …the WA is the system prompt and the reopened ticket rides the first turn (the exact split a launch builds)',
+    foldedText.includes('# Working Agreement v2') && !foldedText.includes(DONE_ID) && firstTurn.includes(DONE_ID),
+    `WA in system=${foldedText.includes('# Working Agreement v2')} ticket off-system=${!foldedText.includes(DONE_ID)} ticket in turn=${firstTurn.includes(DONE_ID)}`);
 
   if (NO_MODEL) {
     console.log('  SKIP  (8c) live-model leg skipped (--no-model)');
@@ -456,8 +462,8 @@ async function main() {
     await new Promise((res, rej) => { ws.once('open', res); ws.once('error', rej); });
     ws.send(JSON.stringify({
       type: 'start', projectId: pid,
-      prompt: 'Do not use any tool. Your system prompt contains a "Project state (live board snapshot)" section. '
-        + 'Reply with ONLY the ticket ids listed under "Needs you" in it, comma-separated, and nothing else.',
+      prompt: 'Do not use any tool. This session was launched with a "Project state (live board snapshot)" section '
+        + 'injected into its opening context. Reply with ONLY the ticket ids listed under "Needs you" in it, comma-separated, and nothing else.',
     }));
     const waitEv = async (pred, ms) => {
       const t0 = Date.now();

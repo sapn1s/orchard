@@ -342,6 +342,15 @@ export const models = (provider) =>
 /** FEAT-045: live provider availability (detectCodex verdicts). null = route absent. */
 export const providers = () => optional('/api/providers').then((r) => r?.providers ?? null);
 
+/** FEAT-118: app-wide default layer (model/effort a project inherits when unset). */
+export const getSettings = () => optional('/api/settings').then((r) => r?.settings ?? null);
+export const patchSettings = (patch) =>
+  api('/api/settings', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
+    .then((r) => r.settings);
+
+/** FEAT-116: per-provider rate-limit window usage snapshots. null = route absent. */
+export const usage = () => optional('/api/usage').then((r) => r?.providers ?? null);
+
 /** FEAT-040/BUG-027 ground truth (survival scoping, broker state, adopted
  * survivors) — see src/server/index.ts's health route. null = route absent
  * or unreachable; callers must treat null as "unknown", never as "false". */

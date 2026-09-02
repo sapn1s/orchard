@@ -292,6 +292,11 @@ export class CodexRuntime implements AgentRuntime {
   readonly capabilities: RuntimeCapabilities = {
     approvals: true,
     permissionModes: true,
+    // app-server has NO mid-turn switch: setPermissionMode stashes #mode for the
+    // next turn/start, so a change made DURING a turn does not touch that turn's
+    // approvalPolicy (live-proven — see setPermissionMode/#startTurn). false so the
+    // bridge/UI never claim skip is in force while the running turn still prompts.
+    permissionModeMidTurn: false,
     structuredCost: false,
     modelList: true,
     subagents: true, // flipped 2026-08-06 per the ticket's subagent capability re-check (see doc above)

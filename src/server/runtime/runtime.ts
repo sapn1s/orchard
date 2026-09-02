@@ -28,6 +28,29 @@ export interface RuntimeCapabilities {
   approvals: boolean;
   /** Live permission-mode switching (default/acceptEdits/plan/bypassPermissions). */
   permissionModes: boolean;
+  /**
+   * Does a LIVE permission-mode change take the RUNNING turn along, or only
+   * govern from the NEXT turn?
+   *
+   * `true`  — the engine applies the change to the turn already in flight
+   *           (Claude: the SDK's `setPermissionMode` control request switches the
+   *           running query). Telling the user "in force for this running session"
+   *           is honest.
+   * `false` — the engine has NO mid-turn switch; the new mode is stashed and rides
+   *           the NEXT turn/start (Codex app-server: proven live — a turn started
+   *           `untrusted` keeps prompting to its end; only the following turn
+   *           carries `approvalPolicy:never`). Reporting the change as immediately
+   *           effective while an in-flight turn keeps prompting is exactly the
+   *           "I enabled skip and it still asks" lie (the home-directory Codex
+   *           session incident). The bridge defers the effective-config flip to the next
+   *           turn and the UI shows the toggle as ARMED-for-next-turn meanwhile.
+   *
+   * NOTE: this does NOT change what the engine is TOLD — `setPermissionMode`
+   * already stashes the mode for the next turn on both engines. It only governs
+   * WHEN the UI is allowed to claim the change is in force, so the display can
+   * never run ahead of the enforcement.
+   */
+  permissionModeMidTurn: boolean;
   /** Per-turn structured cost, so the budget guardrail can enforce a cap. */
   structuredCost: boolean;
   /** A queryable list of models with display names (supportedModels). */

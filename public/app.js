@@ -69,6 +69,20 @@ const state = {
   projOrder: [],
   current: { projectId: null, encodedDir: null, sessionId: null, title: null, os: null },
   /*
+   * session-list-recency — the client's optimistic "the human just submitted
+   * here" stamps, keyed by sessionId → ISO time. stampUserSubmit writes this on a
+   * composer send; recencyKey reads MAX(server lastUserMessageAt, this stamp) so
+   * the reorder-to-top SURVIVES the wholesale s.list replacement in loadSessions.
+   * Without it, any refetch that re-derives an OLDER server value — a large
+   * SAMPLED transcript whose true last user message sits beyond the tail window,
+   * or a refetch that races the transcript write — silently reverted the reorder,
+   * so the session only rose to the top on a full reload (the reported bug). An
+   * entry is dropped in loadSessions once the server value catches up (>=), so a
+   * stamp can never PIN a session past the truth; only stampUserSubmit (a real
+   * human send) ever writes here, so agent activity still never reorders.
+   */
+  userSubmitAt: new Map(),
+  /*
    * BUG-106 — the project that OWNS the session currently open in the transcript
    * dock (its running strip, permission hairline, driving socket, running poll).
    * Distinct from current.projectId, which follows the SIDEBAR selection:
@@ -215,6 +229,8 @@ const state = {
   followingLive: false, // opened a session still running server-side (e.g. after reload)
   followingExternal: false, // opened a session written live by ANOTHER process (a terminal) — no bridge to drive it; a toggle only arms the takeover
   seen: new Map(), // `${dir} ${sessionId}` -> ISO of when the user last had it open
+  readMarks: new Map(), // FEAT-118 — seenKey -> last-read absolute message index (auto "you were here")
+  bookmarks: new Map(), // FEAT-118 — seenKey -> manually-bookmarked absolute message index
   procSummary: null, // projectId -> {count, ports, hasSelf} — ambient "running here"
   board: null,       // {hasBoard, needsYou, queued, inflight, doneToday} for the current project
   boardProjectId: null, // which project state.board belongs to
@@ -254,6 +270,13 @@ const state = {
 
 const EXPANDED_KEY = 'cs-expanded';
 const SEEN_KEY = 'cs-seen';
+// FEAT-118 — within-session marks, persisted per session so they survive a
+// reload AND a switch away and back. `cs-readmark` is the AUTOMATIC "you were
+// here" boundary (the highest absolute message index the user has actually
+// read); `cs-bookmark` is the MANUAL bookmark the user dropped deliberately.
+// Both are keyed by seenKey(dir, sessionId) and hold an absolute message index.
+const READMARK_KEY = 'cs-readmark';
+const BOOKMARK_KEY = 'cs-bookmark';
 
 function saveExpanded() {
   try { localStorage.setItem(EXPANDED_KEY, JSON.stringify([...state.expanded])); } catch { /* private mode — volatile is fine */ }
@@ -274,6 +297,31 @@ function saveSeenSoon() {
   }, 400);
 }
 const seenKey = (dir, sessionId) => `${dir ?? ''} ${sessionId}`;
+
+/* FEAT-118 — load/save the per-session read-mark and manual-bookmark maps. Same
+   shape and debounce as the seen map: an index per seenKey, JSON in one key. A
+   garbage or private-mode store is simply an empty map, never an error. */
+function loadMarks() {
+  const into = (key, map) => {
+    try {
+      for (const [k, v] of Object.entries(JSON.parse(localStorage.getItem(key) ?? '{}'))) {
+        if (Number.isInteger(v)) map.set(k, v);
+      }
+    } catch { /* garbage — start fresh */ }
+  };
+  into(READMARK_KEY, state.readMarks);
+  into(BOOKMARK_KEY, state.bookmarks);
+}
+let marksSaveTimer = null;
+function saveMarksSoon() {
+  clearTimeout(marksSaveTimer);
+  marksSaveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(READMARK_KEY, JSON.stringify(Object.fromEntries(state.readMarks)));
+      localStorage.setItem(BOOKMARK_KEY, JSON.stringify(Object.fromEntries(state.bookmarks)));
+    } catch { /* full/private */ }
+  }, 300);
+}
 
 /** Stamp the open session as seen NOW — the user is literally looking at it. */
 function stampSeenCurrent() {
@@ -320,6 +368,94 @@ async function refreshProcSummary() {
 function startProcPolling() {
   void refreshProcSummary();
   setInterval(() => void refreshProcSummary(), PROC_POLL_MS);
+}
+
+/* FEAT-116 — provider rate-limit window usage: "how much of each provider's
+   window have I burned, and when does it reset?", so the answer to "dispatch
+   this lane now, or park a ticket until the window resets?" is on-screen instead
+   of guessed. Sourced server-side from each provider's OWN interface (never our
+   token accounting); polled slowly, and the server read is cached + non-blocking
+   so a slow/hung provider can never delay this poll or the UI. */
+const USAGE_POLL_MS = 30_000;
+state.usage = state.usage ?? null; // [{provider, available, asOf, windows, plan, note}] | null
+
+async function refreshUsage() {
+  try {
+    const list = await api.usage();
+    if (list === null) return; // route not on this server yet — show nothing
+    state.usage = list;
+    paintCrown();
+  } catch { /* transient — keep the last honest answer, with its own as-of */ }
+}
+function startUsagePolling() {
+  void refreshUsage();
+  setInterval(() => { if (!document.hidden) void refreshUsage(); }, USAGE_POLL_MS);
+}
+
+/** Short relative countdown to a reset (unix seconds): "now" | "40m" | "4h" | "5d". */
+function usageResetShort(sec) {
+  if (sec == null) return '';
+  const mins = Math.round((sec * 1000 - Date.now()) / 60000);
+  if (mins <= 0) return 'now';
+  if (mins < 60) return `${mins}m`;
+  const hrs = mins / 60;
+  if (hrs < 48) return `${Math.round(hrs)}h`;
+  return `${Math.round(hrs / 24)}d`;
+}
+/** Absolute reset time for the tooltip. */
+function usageResetAbs(sec) {
+  if (sec == null) return 'unknown';
+  return new Date(sec * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+function usageAsOf(asOf) {
+  if (asOf == null) return 'never read';
+  return new Date(asOf).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+/** The full both-providers detail — the decision surface lives in the tooltip. */
+function usageTitle() {
+  const list = state.usage ?? [];
+  const name = (pv) => (pv === 'openai' ? 'OpenAI' : 'Claude');
+  const lines = [];
+  for (const pv of ['anthropic', 'openai']) {
+    const s = list.find((x) => x.provider === pv);
+    if (!s) continue;
+    if (!s.available) {
+      lines.push(`${name(pv)} — not available${s.note ? ` (${s.note})` : ''}${s.asOf ? ` · last read ${usageAsOf(s.asOf)}` : ''}`);
+      continue;
+    }
+    lines.push(`${name(pv)}${s.plan ? ` (${s.plan})` : ''} — as of ${usageAsOf(s.asOf)}`);
+    for (const w of s.windows) {
+      lines.push(`  ${w.label}: ${w.usedPercent}%${w.binding ? ' (binding)' : ''} · resets ${usageResetAbs(w.resetsAt)}`);
+    }
+  }
+  lines.push('Rate-limit windows — decide whether a lane fits before dispatching.');
+  return lines.join('\n');
+}
+
+function paintUsageChip() {
+  const btn = node.usageBtn; const lab = node.usageN;
+  if (!btn || !lab) return; // markup not present (older shell)
+  const p = currentProject();
+  if (!p) { btn.hidden = true; return; }
+  const provider = providerView(); // the engine THIS project's next lane would use
+  const snap = (state.usage ?? []).find((s) => s.provider === provider);
+  btn.classList.remove('warn', 'danger', 'unknown');
+  if (!snap || !snap.available) {
+    lab.textContent = 'usage —';
+    btn.classList.add('unknown');
+    btn.title = usageTitle() || 'Provider usage — not available';
+    btn.hidden = false;
+    return;
+  }
+  // The binding window is the one that will actually stop the next lane.
+  const b = snap.windows.find((w) => w.binding) ?? snap.windows[0];
+  const short = /weekly/i.test(b.label) ? (b.label.includes('·') ? b.label.replace(/^weekly\s*·\s*/i, 'wk ') : 'wk') : b.label;
+  const reset = usageResetShort(b.resetsAt);
+  lab.textContent = `${b.usedPercent}% ${short}${reset ? ` · ${reset}` : ''}`;
+  if (b.usedPercent >= 90) btn.classList.add('danger');
+  else if (b.usedPercent >= 75) btn.classList.add('warn');
+  btn.title = usageTitle();
+  btn.hidden = false;
 }
 
 /** The station's own port — always shown first in the proc chip preview. */
@@ -381,6 +517,11 @@ const node = {
   isoBtn: $('#isoBtn'),
   isoG: $('#isoG'),
   isoN: $('#isoN'),
+  provSel: $('#provSel'),   // this-feat — header provider selector (opens #provPop)
+  provSelG: $('#provSelG'),
+  provSelN: $('#provSelN'),
+  sealBreak: $('#sealBreak'), // this-feat — the tier divider; mounts insert before it
+  fold: $('#fold'),
   settingsBtn: $('#settingsBtn'), // BUG-158 — labelled seal-strip opener for the settings drawer
 
   insBtn: $('#insBtn'),
@@ -391,6 +532,8 @@ const node = {
   procBtn: $('#procBtn'),
   procN: $('#procN'),
   procPop: $('#procPop'),
+  usageBtn: $('#usageBtn'),   // FEAT-116 — provider rate-limit window readout
+  usageN: $('#usageN'),
   procPorts: $('#procPorts'),
   sealSep: $('#sealSep'),
   pop: $('#pop'),
@@ -788,6 +931,15 @@ async function loadSessions(id, { force = false } = {}) {
     try {
       const r = await api.projectSessions(id);
       s.list = (r.sessions ?? []).slice().sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+      // session-list-recency — retire an optimistic user-submit stamp once the
+      // server's derived value has reached it (the transcript write settled and
+      // the scan saw it). Retiring keeps a stamp from PINNING a session past the
+      // truth; keeping it while the server still lags is exactly what holds the
+      // just-submitted session at the top across this refetch.
+      for (const row of s.list) {
+        const stamp = state.userSubmitAt.get(row.sessionId);
+        if (stamp && String(row.lastUserMessageAt ?? '') >= stamp) state.userSubmitAt.delete(row.sessionId);
+      }
       s.encodedDir = r.encodedDir ?? null;
       s.dirs = r.dirs ?? [];
       s.loaded = true;
@@ -1145,9 +1297,33 @@ function pendingNewFor(pid) {
  * keyed on LIVENESS, not this — a live agent session is never folded even
  * though the human has not typed in it (see hasLiveWork / visibleSessions).
  */
-const recencyKey = (x) => String(x?.lastUserMessageAt ?? x?.lastActivityAt ?? '');
+const recencyKey = (x) => {
+  // MAX(server-derived last-user-submit, client optimistic stamp). ISO strings
+  // compare chronologically, so `>` picks the later of the two. The stamp keeps
+  // a just-submitted session at the top across a refetch whose re-derived server
+  // value has not caught up (or, for a large sampled transcript, never will);
+  // it is cleared in loadSessions the moment the server value reaches it.
+  const stamp = state.userSubmitAt.get(x?.sessionId);
+  const server = x?.lastUserMessageAt ?? null;
+  const submit = stamp && (!server || stamp > server) ? stamp : server;
+  return String(submit ?? x?.lastActivityAt ?? '');
+};
 function orderedSessions(s) {
-  const rank = (x) => (api.pinnedOf(x) ? 0 : 1);
+  // The session the user is CURRENTLY in leads its own group's recency tail, so
+  // opening or switching to a session makes it the top row and it is never
+  // something to re-hunt for on the next switch (the reported "keep refinding
+  // when switching until i page reload"). This is a TRANSIENT ordering tier, not
+  // a durable recency stamp: it follows state.current, so switching away lets the
+  // previous session fall straight back to its true last-user-submit recency (no
+  // accumulation), and an AGENT frame — which never changes state.current — can
+  // never move the list, preserving the "only my own action reorders" property.
+  // It sits BELOW an explicit pin (a pin is a stronger, durable "keep at top"
+  // choice) and is reload-consistent because the open session is restored from
+  // the URL before this runs.
+  const isOpen = (x) => state.current.sessionId != null
+    && x?.sessionId === state.current.sessionId
+    && x?.encodedDir === state.current.encodedDir;
+  const rank = (x) => (api.pinnedOf(x) ? 0 : (isOpen(x) ? 1 : 2));
   return (s.list ?? []).slice().sort((a, b) => rank(a) - rank(b)
     || recencyKey(b).localeCompare(recencyKey(a)));
 }
@@ -1164,11 +1340,20 @@ function orderedSessions(s) {
 function stampUserSubmit(sessionId, encodedDir) {
   if (!sessionId) return;
   const iso = new Date().toISOString();
+  // The DURABLE half: recencyKey reads this map, so the reorder survives the
+  // wholesale s.list replacement a turn-end/live-poll refetch performs (which
+  // re-derives an older server lastUserMessageAt and, without this, reverted the
+  // session back down — the reported "only reorders after a reload"). Cleared in
+  // loadSessions once the server value catches up.
+  state.userSubmitAt.set(sessionId, iso);
   for (const [, s] of state.sessions) {
     const row = (s.list ?? []).find((x) => x.sessionId === sessionId
       && (encodedDir == null || x.encodedDir == null || x.encodedDir === encodedDir));
-    if (row) { row.lastUserMessageAt = iso; renderTree(); return; }
+    // Mutating the on-hand row too keeps the immediate render correct even before
+    // the next sort reads the map; both agree because both take the max.
+    if (row) { row.lastUserMessageAt = iso; break; }
   }
+  renderTree();
 }
 
 /*
@@ -1234,6 +1419,87 @@ const isAlwaysVisible = (sess) => sess?.sessionId === state.current.sessionId;
 const hasLiveWork = (sess) => liveInfo(sess) != null;
 
 /*
+ * An AGENT-started session (an orchestrator's dispatched worker lane), declared
+ * at creation by the server (`startedBy`, from session-provenance). These bury
+ * the human's own conversations in a project agents actually work in — a busy
+ * project accretes far more dispatched rows than human ones, all titled with
+ * ticket ids. So they FOLD out of the default view like an out-of-window row:
+ * revealed by the SAME "N more" affordance, always reachable by URL/search, and
+ * NEVER folded while live or open (those bypass the pool via alwaysIds below —
+ * hiding running work is a defect class this app has hit before). A row with no
+ * declared provenance defaults to 'user' server-side, so pre-existing human
+ * sessions stay visible.
+ */
+const isAgentStarted = (sess) => sess?.startedBy === 'agent';
+
+/*
+ * ── FEAT-118 — the picker's per-row LIFECYCLE state, read from GROUND TRUTH ──
+ *
+ * Five states the user asked to tell apart, resolved WITHOUT inventing a sixth
+ * notion of "is this alive": running comes from the liveness authority (the same
+ * /api/sessions/live signal the moss dot already uses), a death comes from the
+ * server-recorded agent-outcomes ledger (outcomes.ts — the "what died and why"
+ * store), unread/visited come from the seen map. `sessionLifecycle` returns the
+ * single leading-rail marker (mutually exclusive, priority order); unread and
+ * recently-visited are ORTHOGONAL emphases layered on top by sessionRow.
+ *
+ *   'running'  — liveInfo(sess) != null. The authority vouches for it now.
+ *   'stopped'  — NOT live, and an UNDISMISSED still-recent agent-outcome (a
+ *                server-recorded DEATH, kind ≠ completed) names this session.
+ *                THIS is "it was working in the background and died without
+ *                answering", surfaced in the list where it was invisible before.
+ *                Same isRecentOutcome view the death rail renders, so the row
+ *                marker and the rail can never disagree about what died.
+ *   'finished' — NOT live, NO death on record, but written to within
+ *                FINISHED_WINDOW_MS: almost certainly running moments ago, just
+ *                gone quiet. Claimed ONLY when activity is genuinely that recent
+ *                — a session whose fate is UNKNOWN carries a death record and
+ *                reads 'stopped', so an unknown fate is NEVER dressed up as a
+ *                clean finish (WA §C: never claim a state you cannot know).
+ *   null       — an ordinary idle/older row: no rail marker.
+ */
+const FINISHED_WINDOW_MS = 8 * 60 * 1000;   // "just went quiet" ⇒ recently-finished
+const VISITED_WINDOW_MS = 2 * 3600 * 1000;  // opened within this ⇒ recently-visited
+
+/** The undismissed, still-recent DEATH record for this session, or null. Reads
+ *  the same state.outcomes the death rail renders (scoped to the current project
+ *  — see refreshOutcomes), matched on either id the ledger keys deaths by. */
+function endedUnanswered(sess) {
+  const id = sess?.sessionId;
+  if (!id || !Array.isArray(state.outcomes)) return null;
+  for (const o of state.outcomes) {
+    if (!isRecentOutcome(o)) continue;
+    if (o.sdkSessionId === id || o.stationSessionId === id) return o;
+  }
+  return null;
+}
+
+function sessionLifecycle(sess) {
+  if (hasLiveWork(sess)) return 'running';
+  if (endedUnanswered(sess)) return 'stopped';
+  if (hoursSince(sess?.lastActivityAt) * 3600000 <= FINISHED_WINDOW_MS) return 'finished';
+  return null;
+}
+
+/** The user OPENED this row within the recent-visit window (the quietest tier —
+ *  a persistent muted timestamp, no glyph, no colour). */
+function recentlyVisited(sess) {
+  if (!sess || sess.sessionId === state.current.sessionId) return false;
+  const t = Date.parse(state.seen.get(seenKey(sess.encodedDir, sess.sessionId)) ?? '');
+  return Number.isFinite(t) && (Date.now() - t) <= VISITED_WINDOW_MS;
+}
+
+/** A short, honest tooltip for a died-without-answering row, from the ledger's
+ *  own words — never a fabricated cause. */
+function stoppedTip(o) {
+  if (!o) return 'Ended without answering';
+  const why = o.kind === 'provider-error' && o.providerError
+    ? `${o.providerError.kind} (${o.providerError.provider})`
+    : (o.kind === 'unknown' ? 'reason unknown' : o.kind);
+  return `Ended without answering — ${why} · ${datedTime(o.at)}`;
+}
+
+/*
  * The default seat budget ADAPTS to how many sessions are genuinely recent,
  * rather than a fixed slice. When a burst of recent work fills the window the
  * budget opens up to the ceiling and the older tail folds ("show current
@@ -1273,8 +1539,12 @@ function visibleSessions(s) {
   // it is within the (substance-scaled) recency window OR carries unseen
   // attention (so an old-but-active session still competes rather than being
   // folded outright). When the window is lifted by "N more", everything qualifies.
+  // AGENT-started rows fold out of the DEFAULT view (a dispatched worker lane is
+  // clutter the human never opened); "N more" (windowed === false) reveals them
+  // like any other folded row, and a live/open one already bypassed the pool via
+  // alwaysIds above, so running agent work is never hidden.
   const pool = rest.filter((x) => !alwaysIds.has(x.sessionId)
-    && (!windowed || withinRecentWindow(x) || isAttentionSession(x)));
+    && (!windowed || (!isAgentStarted(x) && (withinRecentWindow(x) || isAttentionSession(x)))));
   // Adaptive seat budget: sized by how many pool sessions are genuinely recent,
   // clamped to [MIN_SEATS, MAX_SEATS]. Lifting the window ("N more") hands the
   // budget to s.shown — the progressive reveal.
@@ -1319,8 +1589,17 @@ function sessionRow(p, sess) {
   const k = seenKey(sess.encodedDir, sess.sessionId);
   const fresh = !active
     && String(sess.lastActivityAt ?? '') > (state.seen.get(k) ?? new Date(Date.now() - 24 * 3600 * 1000).toISOString());
+  // FEAT-118 — the leading-rail lifecycle marker (ground truth) plus the two
+  // quiet orthogonal cues. Row-level classes carry the persistent-timestamp
+  // treatments (amber "when" for a death, muted "when" for a recent visit).
+  const life = pendingRow ? null : sessionLifecycle(sess);
+  const visited = !pendingRow && recentlyVisited(sess);
+  // Unread is silent while running (content is arriving) — so the class that
+  // carries the unread type-lift is withheld there too, not just the tick.
+  const showUnread = fresh && life !== 'running';
   const b = el('button', {
-    class: `row${isWin ? ' win' : ''}${pendingRow ? ' pending' : ''}${pinned ? ' pinned' : ''}${renamed ? ' named' : ''}${fresh ? ' fresh' : ''}`,
+    class: `row${isWin ? ' win' : ''}${pendingRow ? ' pending' : ''}${pinned ? ' pinned' : ''}${renamed ? ' named' : ''}${showUnread ? ' fresh' : ''}`
+      + `${life === 'stopped' ? ' died' : ''}${visited ? ' visited' : ''}`,
     'aria-current': String(active),
     title: pendingRow ? 'New session — not sent yet' : rowTooltip(sess, pinned, renamed),
   });
@@ -1344,18 +1623,43 @@ function sessionRow(p, sess) {
       title: 'recorded by the OpenAI Codex engine — reopening resumes the same thread',
     }));
   }
-  const alive = liveInfo(sess);
-  if (alive) {
-    // Ambient, not an alert: the same moss dot the rest of the app uses for
-    // alive, with the title carrying the only words. `drivenByDashboard` is
-    // the difference between "you are running this" and "something else is".
+  /*
+   * FEAT-118 — ONE leading-rail marker, chosen by lifecycle (ground truth). The
+   * five states resolve into three salience tiers so a dense list reads as a
+   * hierarchy, not five competing colours:
+   *   ALARM  — a death (amber filled triangle: a distinct SHAPE, not just a hue,
+   *            so it survives colour-blindness and a fast scan). The one bold
+   *            thing; boldness is spent here because a silently-died session is
+   *            what loses work.
+   *   ACTIVE — running (the existing moss breathing dot) and recently-finished
+   *            (the same moss, a STILL hollow ring). One family, differentiated
+   *            by motion, so the eye groups "alive / just-alive" apart from the
+   *            amber alarm.
+   *   QUIET  — unread (a moss tick on the TRAILING edge + title lift, off the
+   *            leading rail so it never doubles up with a lifecycle dot) and
+   *            recently-visited (a persistent muted timestamp, no glyph at all).
+   */
+  if (life === 'running') {
+    const alive = liveInfo(sess);
     b.append(el('span', {
-      class: `alive${alive.drivenByDashboard ? ' here' : ''}`,
-      title: alive.drivenByDashboard
+      class: `alive${alive?.drivenByDashboard ? ' here' : ''}`,
+      title: alive?.drivenByDashboard
         ? 'running now — this dashboard is driving it'
         : 'running now — another process is writing this session',
     }));
-    b.dataset.live = alive.drivenByDashboard ? 'here' : 'true';
+    b.dataset.live = alive?.drivenByDashboard ? 'here' : 'true';
+  } else if (life === 'stopped') {
+    const o = endedUnanswered(sess);
+    b.append(el('span', { class: 'stopped', 'aria-hidden': 'true', title: stoppedTip(o) }));
+    b.dataset.stopped = '1';
+  } else if (life === 'finished') {
+    b.append(el('span', { class: 'settled', 'aria-hidden': 'true', title: 'Just finished — no turn is running now' }));
+  }
+  // Unread is orthogonal to lifecycle, but silent while running (content is
+  // arriving; a "new since you looked" tick there is only noise). A trailing
+  // moss tick keeps it clear of the leading rail's lifecycle marker.
+  if (showUnread) {
+    b.append(el('span', { class: 'unread', 'aria-hidden': 'true', title: 'New activity since you last looked' }));
   }
   // FEAT-073: the pending-new row IS the open session already — clicking it just
   // returns focus to the composer. It has no on-disk session, so openSession /
@@ -2202,14 +2506,17 @@ function paintCrown() {
   $('#newBtn').setAttribute('aria-label', 'New scratch session');
   paintGitChip();
   paintProcChip();
+  paintUsageChip(); // FEAT-116 — provider rate-limit window (dispatch-now vs park)
   paintIntegrations(); // FEAT-051 — the attached-capability strip tracks the project too
   paintCrumbs();
 
   const has = !!p;
   paintModelChip(); // FEAT-042 — chip visibility tracks project selection
+  paintProvSel();   // this-feat — header provider selector tracks selection too
   node.isoBtn.hidden = !has;
   node.settingsBtn.hidden = !has; // BUG-158 — visible whenever a project is selected
   node.insBtn.hidden = !has;
+  node.seal.querySelector('.seal-vdiv').hidden = !has; // no stray hairline with nothing to divide
   node.sealSep.hidden = !has;
   for (const m of [...node.seal.querySelectorAll('.mnt, .addm')]) m.remove();
   if (!has) return;
@@ -2264,11 +2571,13 @@ function paintCrown() {
         } catch (err) { say(`could not remove mount: ${err.message}`, true); }
       });
       pill.append(x);
-      node.seal.append(pill);
+      // Mounts are container config — keep them in the interactive (top) tier,
+      // before the tier break, not trailing after the status readouts.
+      node.sealBreak.before(pill);
     }
     const add = el('button', { class: 'pill addm', text: '+ Add mount' });
     add.addEventListener('click', () => void drawer.open('settings', { focus: 'mounts' })); // FEAT-054
-    node.seal.append(add);
+    node.sealBreak.before(add);
   }
 
   paintPerm();
@@ -2422,6 +2731,11 @@ function effectivePerm() {
       source: eff.permissionModeSource ?? 'project',
       iso: eff.isolation ?? currentProject()?.isolation ?? 'direct',
       live: true,
+      // A live change accepted but not yet in force (a Codex mid-turn toggle): the
+      // running turn still uses `mode` above and keeps prompting, so this is the
+      // mode the NEXT turn will adopt. Drives the armed-for-next-turn indicator so
+      // the toggle never claims skip is on while the in-flight turn asks.
+      pendingNextTurn: eff.permissionModePendingNextTurn ?? null,
     };
   }
   const p = currentProject();
@@ -2492,6 +2806,12 @@ function paintPerm() {
   // effect when the next send resumes the session. (A LIVE session switches
   // in place the moment the server confirms; no restart is ever scheduled.)
   const armedPending = !info?.live && info?.source === 'session-override';
+  // A live change ACCEPTED mid-turn on an engine with no mid-turn switch (Codex):
+  // the running turn keeps prompting to its end, so the toggle is armed for the
+  // NEXT message, not in force now. `mode` above is still the running turn's real
+  // mode, so this never lets the toggle claim skip is on while approvals fire.
+  const pendingNextTurn = info?.pendingNextTurn ?? null;
+  const armedNextSkip = pendingNextTurn === 'bypassPermissions';
   // An EXTERNAL follow (a terminal writes this session; the dashboard has no
   // bridge to it) can only ARM the takeover — it cannot touch the mode the
   // terminal is running under right now. Say exactly that, so the toggle never
@@ -2500,15 +2820,20 @@ function paintPerm() {
   const armedNote = external
     ? ' — armed; applies ONLY if you take over this session from the dashboard (your terminal session keeps its own mode until then)'
     : ' — armed; takes effect on your next send, when the session resumes';
-  node.skipBtn.dataset.pending = String(permModePending?.next === 'bypassPermissions' || (armedPending && skipping));
+  // The running Codex turn cannot switch, so a skip armed here applies to your
+  // NEXT message — said plainly so "I enabled skip and it still asks" cannot recur.
+  const nextTurnNote = ' — armed; the running turn finishes under approval prompts, your next message skips them';
+  node.skipBtn.dataset.pending = String(permModePending?.next === 'bypassPermissions' || (armedPending && skipping) || armedNextSkip);
   node.skipBtn.dataset.external = String(external && armedPending);
   node.skipBtn.title = skipping
     ? `Permissions skipped${armedPending ? armedNote : ''} — click to require approvals`
-    : external
-      ? 'Skip permission prompts — this session is driven by your terminal; toggling here only applies if you take it over from the dashboard'
-      : planning
-        ? 'Skip permission prompts for this session (replaces plan mode)'
-        : 'Skip permission prompts for this session';
+    : armedNextSkip
+      ? `Skip permission prompts${nextTurnNote}`
+      : external
+        ? 'Skip permission prompts — this session is driven by your terminal; toggling here only applies if you take it over from the dashboard'
+        : planning
+          ? 'Skip permission prompts for this session (replaces plan mode)'
+          : 'Skip permission prompts for this session';
 
   /*
    * FEAT-037 P3 — capabilities-driven degradation, not a provider check: an
@@ -2533,8 +2858,8 @@ function paintPerm() {
   if (has) {
     // Three states, not two: "asks first" is not an honest label for plan mode,
     // where Claude cannot act at all until you approve a plan.
-    const pendingChip = armedPending && (skipping || planning);
-    const chipNote = pendingChip ? (external ? ' · if you take over' : ' · from next send') : '';
+    const pendingChip = (armedPending && (skipping || planning)) || armedNextSkip;
+    const chipNote = armedNextSkip ? ' · skip from next msg' : pendingChip ? (external ? ' · if you take over' : ' · from next send') : '';
     const chip = el('span', { class: 'perm', role: 'button', tabindex: '0', 'data-risk': String(!!risky), 'data-skip': String(!!skipping), 'data-pending': String(pendingChip), 'data-external': String(pendingChip && external) },
       el('span', { class: 'dot' }),
       el('span', { text: (skipping ? 'skips prompts' : planning ? 'plans first' : 'asks first') + chipNote }));
@@ -2544,13 +2869,15 @@ function paintPerm() {
     chip.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); void drawer.open('settings', { focus: 'permissionMode' }); }
     });
-    chip.title = info.live
-      ? 'Permission mode, confirmed by the running session'
-      : pendingChip
-        ? (external
-            ? 'Armed — this session is driven by your terminal, which the dashboard only follows. It applies ONLY if you take over by sending a message here; nothing running is changed now.'
-            : 'Armed for this session — it takes effect when your next message resumes it. Nothing running is interrupted.')
-        : 'Permission mode (applies on next launch)';
+    chip.title = armedNextSkip
+      ? 'Skip armed — this engine cannot switch mid-turn, so the running turn finishes under approval prompts and your next message runs with them skipped. Nothing running is changed.'
+      : info.live
+        ? 'Permission mode, confirmed by the running session'
+        : pendingChip
+          ? (external
+              ? 'Armed — this session is driven by your terminal, which the dashboard only follows. It applies ONLY if you take over by sending a message here; nothing running is changed now.'
+              : 'Armed for this session — it takes effect when your next message resumes it. Nothing running is interrupted.')
+          : 'Permission mode (applies on next launch)';
     node.sealSep.before(chip);
   }
 
@@ -2562,7 +2889,23 @@ function paintPerm() {
   // posture, so a foreign dock never asserts A's "permissions skipped · container
   // is the boundary" under B — while B's OWN predicted skip (a container B) still
   // shows. Restored to A's live posture on switch-back.
-  if (!skipping) { line.hidden = true; return; }
+  if (!skipping) {
+    // Skip accepted mid-turn on a no-mid-turn-switch engine (Codex): the running
+    // turn still asks, so say plainly that skip applies from the NEXT message
+    // rather than hiding the line and leaving the toggle looking broken.
+    if (armedNextSkip) {
+      line.hidden = false;
+      line.dataset.risk = 'false';
+      clear(line);
+      line.title = 'Skip armed — this engine cannot switch mid-turn, so the running turn finishes under approval prompts; your next message runs with prompts skipped. Nothing running is changed.';
+      line.append(el('span', { class: 'g', text: '◷' }),
+        el('b', { text: 'Skip armed' }),
+        document.createTextNode(' · the running turn still asks; your next message skips'));
+    } else {
+      line.hidden = true;
+    }
+    return;
+  }
   line.hidden = false;
   line.dataset.risk = String(!!risky);
   clear(line);
@@ -2644,7 +2987,7 @@ function setPermissionMode(next, opts = {}) {
  * Settle a live mode change. `ok` comes from the server's ack — never from the
  * fact that we managed to send something.
  */
-function finishPermMode(requestId, ok, why) {
+function finishPermMode(requestId, ok, why, appliesFrom) {
   if (!permModePending || permModePending.requestId !== requestId) return;
   clearTimeout(permModePending.timer);
   const { next } = permModePending;
@@ -2655,17 +2998,32 @@ function finishPermMode(requestId, ok, why) {
     paintPerm();
     return;
   }
-  // The server confirmed, so the live effective-config is now this. An
-  // `effective-config` event may also arrive and will simply agree.
-  if (state.effective?.effective) state.effective.effective.permissionMode = next;
-  else state.effective = { ...(state.effective ?? {}), effective: { permissionMode: next } };
-  // Mirror into the session's overrides too: after a reload this session
-  // RESUMES with `start.overrides`, and it must resume in the mode the
-  // server just confirmed — not silently fall back to the project default.
+  // Mirror into the session's overrides so a reload RESUMES in the accepted mode —
+  // done for both immediate and deferred, since the engine has accepted it either way.
   if (next === 'default') delete state.overrides.permissionMode;
   else state.overrides.permissionMode = next;
   persistOverrides();
   const iso = state.effective?.isolation ?? currentProject()?.isolation ?? 'direct';
+  /*
+   * DEFERRED (Codex mid-turn): the engine accepted the change but the RUNNING turn
+   * keeps its old policy to the end. Do NOT flip `effective.permissionMode` — that
+   * would make the toggle claim skip is in force while the in-flight turn is still
+   * asking (the reported defect). The server's effective-config carries
+   * `permissionModePendingNextTurn`, which paintPerm turns into the armed-for-next
+   * -turn indicator; here we just tell the user honestly where it applies.
+   */
+  if (appliesFrom === 'next-turn') {
+    say(`${describeMode(next, iso)} · armed — the running turn finishes under approval prompts; your next message runs under the new mode`,
+      next === 'bypassPermissions' && iso !== 'container');
+    paintPerm();
+    paintModelBtn();
+    drawer.repaintLive?.();
+    return;
+  }
+  // Immediate: the server confirmed and it governs the running session now. An
+  // `effective-config` event may also arrive and will simply agree.
+  if (state.effective?.effective) state.effective.effective.permissionMode = next;
+  else state.effective = { ...(state.effective ?? {}), effective: { permissionMode: next } };
   say(`${describeMode(next, iso)} · confirmed by the server — in force for this running session`,
     next === 'bypassPermissions' && iso !== 'container');
   paintPerm();
@@ -3157,11 +3515,22 @@ function scrollDown() {
   if (th.stick === false) {
     th.unseen = true;
     paintJump();
+    // FEAT-118 — new content while scrolled away is unread: the read boundary is
+    // frozen, so the "you were here" line grows below it.
+    if (th.key === 'main') paintReadLine(th);
     return;
   }
   const s = node.scroll;
   s.scrollTop = s.scrollHeight;
   th.scrollTop = s.scrollTop;
+  // At the live bottom: content is read as it arrives ONLY while the user is
+  // actually looking (tab visible). While the tab is hidden the autoscroll still
+  // runs but the boundary FREEZES — that is the whole point, so returning shows
+  // where they left off instead of "all read" (Discord's over-eager clear).
+  if (th.key === 'main') {
+    if (!document.hidden) advanceReadMark(th);
+    else paintReadLine(th);
+  }
 }
 
 function onScroll() {
@@ -3171,6 +3540,11 @@ function onScroll() {
   th.scrollTop = node.scroll.scrollTop;
   if (bottom) th.unseen = false;
   paintJump();
+  // FEAT-118 — advance the read boundary as the user reads DOWN, but never while
+  // the tab is hidden (autoscroll-while-AFK must not mark content read — that is
+  // exactly Discord's over-eager clear) and never during a programmatic scroll
+  // (opening / jumping must not clear the mark it was meant to restore).
+  if (th.key === 'main' && !document.hidden && Date.now() > suppressAdvanceUntil) advanceReadMark(th);
   void maybeLoadOlder();
   void maybeLoadNewer();
   syncUrlSoon();
@@ -3187,6 +3561,215 @@ function paintJump() {
   const show = away > JUMP_SHOW_PX || gap;
   node.jump.hidden = !show;
   node.jump.classList.toggle('new', show && th.unseen === true);
+}
+
+/* ═══════════════════════════════ FEAT-118 — within-session marks ═══════════
+ *
+ * TWO marks, both persisted per session (survive a reload AND a switch away and
+ * back), both reachable in ONE action:
+ *
+ *   • the AUTOMATIC "you were here" line — the stated pain. The transcript
+ *     autoscrolls while the user is away, so returning means losing their place.
+ *     We remember the highest message index they have actually READ and draw a
+ *     divider before the first unread message. IMPROVEMENT OVER DISCORD: the
+ *     boundary FREEZES while the tab is hidden or they have scrolled up, and
+ *     clears ONLY when they scroll down THROUGH it — never on mere focus/switch,
+ *     which is Discord's over-eager clear.
+ *
+ *   • the MANUAL bookmark — what the user literally asked for. A spot they drop
+ *     deliberately (the message at the top of the viewport), rendered as a solid
+ *     ribbon distinct from the dashed read-line, and returned to in one click.
+ *
+ * The read-mark and bookmark live in localStorage (state.readMarks/bookmarks),
+ * keyed by seenKey; in-memory th.readIndex is the working copy for the open
+ * thread. Only the MAIN thread carries marks — a subagent view is transient.
+ */
+
+// A programmatic scroll (open, jump-to) fires a `scroll` event ASYNCHRONOUSLY,
+// so a boolean cleared on the next tick reopens the gate before that event
+// arrives — and the restore then reads as the user having read to the bottom,
+// wiping the very mark it was meant to reveal. A short timestamp window instead
+// covers the queued event however late it lands.
+let suppressAdvanceUntil = 0;
+function withoutReadAdvance(fn) {
+  suppressAdvanceUntil = Date.now() + 300;
+  return fn();
+}
+
+function currentMarkKey() {
+  const { encodedDir, sessionId } = state.current;
+  return sessionId ? seenKey(encodedDir, sessionId) : null;
+}
+
+/** Highest absolute message index currently rendered in a thread, or null. */
+function maxRenderedIndex(th) {
+  let max = null;
+  for (const m of th.paneEl.querySelectorAll('[data-i]')) {
+    const i = Number(m.dataset.i);
+    if (Number.isInteger(i) && (max === null || i > max)) max = i;
+  }
+  return max;
+}
+
+/**
+ * Seed the working read boundary when a session opens. A persisted mark wins
+ * (so unread survives a reload/switch); otherwise everything on screen at open
+ * is the baseline — a first visit is not a wall of "unread". Never advanced past
+ * what is rendered here, so a deep-history restore cannot mislabel the tail.
+ */
+function seedReadMark(th) {
+  const key = currentMarkKey();
+  if (!key || th.key !== 'main') return;
+  const saved = state.readMarks.get(key);
+  th.readIndex = Number.isInteger(saved) ? saved : (maxRenderedIndex(th) ?? -1);
+}
+
+/** Advance the read boundary as the user reads down, and persist it. At the
+ *  live bottom everything rendered is read; mid-history the top-visible message
+ *  is the frontier. Monotonic — the boundary never retreats. */
+function advanceReadMark(th) {
+  const key = currentMarkKey();
+  if (!key || th.key !== 'main') return;
+  const frontier = atBottom() ? maxRenderedIndex(th) : topVisibleIndex(th);
+  if (!Number.isInteger(frontier)) return;
+  const prev = Number.isInteger(th.readIndex) ? th.readIndex : -1;
+  if (frontier > prev) {
+    th.readIndex = frontier;
+    state.readMarks.set(key, frontier);
+    saveMarksSoon();
+  }
+  paintReadLine(th);
+}
+
+/**
+ * Draw (or clear) the "you were here" divider. It sits before the first message
+ * whose index is beyond the read boundary — i.e. the boundary between read and
+ * unread. Absent when nothing rendered is unread. Also drives the "Resume"
+ * pill: offered whenever the divider is above the current viewport.
+ */
+function paintReadLine(th = viewedThread()) {
+  if (!node.leftoff) return;
+  // `data-i` rides nested assistant nodes (inside .claude .body), not only
+  // top-level children, so every mark query here searches the whole pane —
+  // never `:scope >`, which would miss them and let dividers accumulate.
+  for (const n of th.paneEl.querySelectorAll('.readline')) n.remove();
+  if (th.key !== 'main') { node.leftoff.hidden = true; return; }
+  const readIndex = Number.isInteger(th.readIndex) ? th.readIndex : -1;
+  const maxIdx = maxRenderedIndex(th);
+  // Nothing unread on screen, or a forward gap not yet paid: no line.
+  if (maxIdx === null || maxIdx <= readIndex) { node.leftoff.hidden = true; return; }
+  // First rendered message beyond the boundary.
+  let target = null;
+  for (const m of th.paneEl.querySelectorAll('[data-i]')) {
+    if (Number(m.dataset.i) > readIndex) { target = m; break; }
+  }
+  if (!target) { node.leftoff.hidden = true; return; }
+  const unread = maxIdx - readIndex;
+  const line = el('div', { class: 'readline', 'data-readline': '1' },
+    el('span', { class: 'rl-label', text: `You left off here${unread > 0 ? ` · ${unread} new below` : ''}` }));
+  target.before(line);
+  // Offer the one-action jump whenever the line is above the viewport.
+  const above = line.getBoundingClientRect().bottom < node.scroll.getBoundingClientRect().top;
+  node.leftoff.hidden = !above;
+  node.leftoff.querySelector('.g').textContent = unread > 0 ? `${unread} new` : 'resume';
+}
+
+/** One-action return to the read boundary. An INSTANT scroll — a smooth
+ *  animation fires a stream of scroll events, and any that land after the
+ *  suppression window would advance the very mark this jump exists to reveal. */
+function jumpToReadLine() {
+  const th = viewedThread();
+  const readIndex = Number.isInteger(th.readIndex) ? th.readIndex : -1;
+  withoutReadAdvance(() => {
+    const line = th.paneEl.querySelector('.readline');
+    const s = node.scroll;
+    if (line) {
+      s.scrollTop = Math.max(0, line.getBoundingClientRect().top - s.getBoundingClientRect().top + s.scrollTop - s.clientHeight / 2);
+      th.scrollTop = s.scrollTop;
+      th.stick = atBottom();
+      paintJump();
+    } else {
+      scrollToIndex(th, readIndex + 1);
+    }
+  });
+  // Recompute the pill: the line is now in view, so the Resume offer retracts.
+  paintReadLine(th);
+}
+
+/** Is a rendered node currently within the scroller's viewport? */
+function isOnScreen(m) {
+  if (!m) return false;
+  const r = m.getBoundingClientRect();
+  const s = node.scroll.getBoundingClientRect();
+  return r.bottom > s.top && r.top < s.bottom;
+}
+
+/* ── manual bookmark ─────────────────────────────────────────────────────── */
+
+/** Draw (or clear) the bookmark ribbon on its message, and refresh the button. */
+function paintBookmark(th = viewedThread()) {
+  const old = th.paneEl.querySelector('[data-i].bookmarked');
+  if (old) old.classList.remove('bookmarked');
+  const key = currentMarkKey();
+  const idx = key ? state.bookmarks.get(key) : null;
+  if (Number.isInteger(idx)) {
+    // Ribbon rides the nearest rendered message at or before the index.
+    let best = null;
+    for (const m of th.paneEl.querySelectorAll('[data-i]')) {
+      if (Number(m.dataset.i) <= idx) best = m; else break;
+    }
+    if (best) best.classList.add('bookmarked');
+  }
+  paintBookmarkBtn(th);
+}
+
+/** The bookmark control cycles set → jump → clear from one button, mirroring the
+ *  pin's "filled when set" language. */
+function paintBookmarkBtn(th = viewedThread()) {
+  const btn = node.bookmark;
+  if (!btn) return;
+  if (th.key !== 'main') { btn.hidden = true; return; }
+  btn.hidden = false;
+  const key = currentMarkKey();
+  const idx = key ? state.bookmarks.get(key) : null;
+  const set = Number.isInteger(idx);
+  btn.classList.toggle('set', set);
+  const onScreen = set && isOnScreen(th.paneEl.querySelector('[data-i].bookmarked'));
+  btn.title = !set ? 'Bookmark this spot' : (onScreen ? 'Clear bookmark' : 'Jump to bookmark');
+  btn.setAttribute('aria-pressed', String(set));
+}
+
+/** Click handler: set when none, jump when off-screen, clear when on-screen. */
+function toggleBookmark() {
+  const th = viewedThread();
+  const key = currentMarkKey();
+  if (!key || th.key !== 'main') return;
+  const idx = state.bookmarks.get(key);
+  if (!Number.isInteger(idx)) {
+    const here = topVisibleIndex(th);
+    if (!Number.isInteger(here)) return;
+    state.bookmarks.set(key, here);
+    saveMarksSoon();
+    paintBookmark(th);
+    say('Bookmarked — the ▸ control returns you here');
+    return;
+  }
+  const mark = th.paneEl.querySelector('[data-i].bookmarked');
+  const onScreen = isOnScreen(mark);
+  if (onScreen) {
+    state.bookmarks.delete(key);
+    saveMarksSoon();
+    paintBookmark(th);
+  } else {
+    withoutReadAdvance(() => scrollToIndex(th, idx));
+    paintBookmarkBtn(th);
+  }
+}
+
+/** Repaint both marks — called after render, on scroll settle, and on return. */
+function paintMarks(th = viewedThread()) {
+  paintReadLine(th);
+  paintBookmark(th);
 }
 
 /* ------------------------------------------------- reverse pagination */
@@ -4272,7 +4855,14 @@ async function openSession(p, sess, opts = {}) {
       // watcher starts at the file's current end, so this order cannot duplicate
       // what was just fetched, and the index dedupe covers any millisecond overlap.
       followCurrent();
-      if (at != null) scrollToIndex(th, at); else scrollToBottom(th);
+      // FEAT-118 — seed the read boundary from the persisted mark BEFORE the
+      // programmatic scroll, then land at the newest page as before. The scroll
+      // is suppressed from advancing the mark, so a restored "unread" boundary
+      // survives the open (the divider shows above + the Resume pill offers the
+      // one-action return) instead of being cleared by landing at the bottom.
+      seedReadMark(th);
+      withoutReadAdvance(() => { if (at != null) scrollToIndex(th, at); else scrollToBottom(th); });
+      paintMarks(th);
       say(`${shown} of ${t.total}${t.totalIsLowerBound ? '+' : ''} messages · newest page · ${(t.tookMs ?? 0)} ms`
         + `${th.page.done ? '' : ' · scroll up for older'}`
         + `${frozen ? ' · read-only, Windows origin' : ''}`);
@@ -4367,7 +4957,22 @@ async function openSession(p, sess, opts = {}) {
           setBusy(true);
         }
         paintSessStatus();
-        say('this session is still running (it kept working after the tab looked away) — following live. Send a message to take over and steer it.');
+        say('this session is still running (it kept working after the tab looked away) — reattaching to drive it here.');
+        /*
+         * BUG-160: a SOLE tab that reloaded holds its own still-alive bridge,
+         * but the code above only FOLLOWS it — `isDriving()` stays false, so the
+         * tab reads "not driving the session" though nothing else drives it, and
+         * any message restored from before the reload can never flush. Re-take
+         * the driving socket automatically. Safe: a bridge driven in ANOTHER tab
+         * is not detached and comes back `live-elsewhere`, so a genuine second
+         * tab still follows read-only (the honest "not driving" state stands).
+         *
+         * ONLY when viewing the live tail (`at == null`): a deep history-parked
+         * restore holds the pane at an old index with a forward gap, and driving
+         * would splice live bridge frames onto it (the BUG-004 shape). There the
+         * user keeps following read-only until they scroll to the end and send.
+         */
+        if (at == null && !th.gap) void reattachDriving(sess);
       } else {
         // External: written by another process (your terminal). The live badge
         // and file-follow already track it; we just must not fake a summary.
@@ -4534,8 +5139,13 @@ async function refreshOutcomes() {
   catch { return; /* transient — the rail keeps its last honest answer */ }
   if (list === null) { state.caps.outcomes = false; return; } // older server
   state.caps.outcomes = true;
+  // FEAT-118 — the sidebar's died-without-answering marker reads state.outcomes,
+  // so a poll that changes the death set must repaint the tree too, or a session
+  // that just died would keep reading 'finished' until some unrelated re-render.
+  const before = (state.outcomes ?? []).map((o) => `${o.id}:${o.dismissedAt ? 'd' : ''}`).join(',');
   state.outcomes = list;
   renderOutcomes();
+  if (before !== list.map((o) => `${o.id}:${o.dismissedAt ? 'd' : ''}`).join(',')) renderTree();
 }
 
 /** BUG-070 — the recent-view predicate: within 48h and not dismissed. */
@@ -5211,15 +5821,26 @@ function needsCard(it) {
   // decision) and offers ONLY Allow/Decline — no free-text box, since the
   // grant is a yes/no. Approving ("Allow") is what mints the runtime grant.
   const isGitWrite = isDecision && !!it.gitWrite;
+  // FEAT-112 — a service-sidecar PROPOSAL: an agent proposed a set of services and
+  // the user approves or declines with one click. Like git-write, it offers ONLY
+  // Allow/Decline (no free-text) and approving ("Allow") writes the services into
+  // the project settings. The proposing agent never applies its own proposal.
+  const isServices = isDecision && !!it.services;
   const opts = Array.isArray(it.options) ? it.options : [];
   const input = el('textarea', { class: 'nc-input', rows: '2', placeholder: 'Your response…', 'aria-label': `Response for ${it.id}` });
   const err = el('span', { class: 'nc-err' });
   const send = el('button', { class: 'nc-send', type: 'button', text: 'Respond' });
-  const card = el('div', { class: `needs-card${isDecision ? ' decision' : ''}${isGitWrite ? ' git-write' : ''}`, 'data-id': it.id, 'data-kind': it.kind || 'ticket' },
+  const card = el('div', { class: `needs-card${isDecision ? ' decision' : ''}${isGitWrite ? ' git-write' : ''}${isServices ? ' services' : ''}`, 'data-id': it.id, 'data-kind': it.kind || 'ticket' },
     el('div', { class: 'nc-head' },
-      el('span', { class: 'nc-id', text: isGitWrite ? '🔑 git-write request' : isDecision ? '👤 decision' : it.id }),
+      el('span', { class: 'nc-id', text: isGitWrite ? '🔑 git-write request' : isServices ? '🧩 services request' : isDecision ? '👤 decision' : it.id }),
       el('span', { class: 'nc-sev', text: isDecision ? '' : (it.sev || '') })),
     el('div', { class: 'nc-title', text: it.title }));
+  // Show exactly what would be added, so the user approves in context.
+  if (isServices && Array.isArray(it.services.services)) {
+    const list = el('div', { class: 'nc-question' },
+      document.createTextNode(it.services.services.map((s) => `${s.name} → ${s.image}`).join('  ·  ')));
+    card.append(list);
+  }
   // BUG-025: a ticket's `## Question` text can differ from the ticket H1
   // title — show it explicitly so the card asks something concrete. A
   // decision's `question` already equals `title` (server sets both), so
@@ -5268,9 +5889,10 @@ function needsCard(it) {
     card.append(row);
   }
 
-  // A git-write request is answered ONLY by its Allow/Decline buttons (above) —
-  // it carries no free-text form, so approving is unambiguously "Allow".
-  if (!isGitWrite) {
+  // A git-write request and a services proposal are answered ONLY by their
+  // Allow/Decline buttons (above) — no free-text form, so approving is
+  // unambiguously "Allow".
+  if (!isGitWrite && !isServices) {
     card.append(el('div', { class: 'nc-form' },
       input,
       el('div', { class: 'nc-acts' }, err, send)));
@@ -7521,7 +8143,7 @@ function onEvent(e) {
         // `ok` is the server's word for "the SDK accepted it". `matched` keeps
         // the same meaning as the approval acks.
         const good = e.ok === true || (e.ok === undefined && e.matched !== false && !e.error);
-        finishPermMode(e.requestId, good, e.error || e.reason || 'the server declined the change');
+        finishPermMode(e.requestId, good, e.error || e.reason || 'the server declined the change', e.appliesFrom);
         return;
       }
       if (e.of === 'set-model') {
@@ -7662,12 +8284,23 @@ function onEvent(e) {
                 paintQueue();
               } else queueMessage(t);
             }
-            say('re-attached — this session was still working; your message is queued for the next pause');
+            // BUG-160: a promptless reattach (reattachDriving) carries no `t`, so
+            // there may be nothing pending — say what is true either way. A
+            // restored queue row (if any) delivers at this turn's boundary; the
+            // boundary flush (setBusy(false)/turn-end) owns it now we drive.
+            say(state.queue.some((q) => !q.dead)
+              ? 're-attached — this session is still working; your queued message goes at the next pause'
+              : 're-attached — this session is still working here');
           } else {
             // Idle reattach: the server delivered this start's prompt as a new
             // turn — a drain-wait retry's row is settled (BUG-045), exactly once.
             settleDrainWaitDelivery();
             say('re-attached to the running session');
+            // BUG-160: now that we hold the driving socket and the session is
+            // idle, THIS is the boundary a message queued before a reload was
+            // waiting for — deliver it (flushQueue is guarded on isDriving() &&
+            // !busy, so it only fires here because the reattach just made both true).
+            flushQueue();
           }
           state.pendingStart = null;
           state.pendingStartResume = null;
@@ -8179,6 +8812,27 @@ function onEvent(e) {
        */
       if (e.code === 'live-elsewhere') {
         handleLiveElsewhere(e.message);
+        return;
+      }
+      /*
+       * BUG-160: a promptless reattach (reattachDriving) found the bridge gone —
+       * the session is no longer running here. Roll the half-open socket back
+       * quietly and let refreshLive/the "To composer" affordance take it from
+       * here; never latch sessError or mark queued rows dead for a reattach that
+       * simply had nothing to attach to. (No pendingStart to reclaim — promptless.)
+       */
+      if (e.code === 'nothing-to-reattach') {
+        state.pendingStartResume = null;
+        state.followingLive = false;
+        if (state.ws) {
+          state.closingOnPurpose = true;
+          try { state.ws.close(); } catch { /* already gone */ }
+          state.ws = null;
+          state.live = false;
+        }
+        setBusy(false);
+        paintSessStatus();
+        paintQueue();
         return;
       }
       say(e.message, true);
@@ -9009,6 +9663,52 @@ async function submit() {
 }
 
 /*
+ * BUG-160 — re-take the driving socket of a still-running session WITHOUT
+ * sending a turn. A sole tab that reloaded (or reopened) a dashboard-driven,
+ * detached bridge follows it read-only until the user sends; that leaves
+ * `isDriving()` false — the tab claims "not driving the session" though it is
+ * the only client, and a queued message restored from before the reload has no
+ * path to delivery (flushQueue needs a driving socket). This opens the socket
+ * and reattaches with a PROMPTLESS `start`: the server turns a promptless
+ * resume into a pure attach (it only delivers a turn `if (cmd.prompt)`, and
+ * answers `nothing-to-reattach` when no bridge survives). On the `reattached`
+ * ack `followingLive` clears, `isDriving()` becomes true, and the boundary
+ * flush finally delivers the restored message (into an idle session at once, a
+ * busy one at its next pause — never into a running turn). A bridge driven in
+ * ANOTHER tab is not detached and comes back `live-elsewhere`, so a genuine
+ * second tab keeps following read-only.
+ */
+async function reattachDriving(sess) {
+  const p = currentProject();
+  if (!p || !sess?.sessionId) return;
+  // Already driving, a socket is up, or a start is in flight — nothing to do.
+  if (isDriving() || state.live || state.pendingStart != null || state.pendingStartResume != null) return;
+  const scope = state.txScope; // bail if the user switches sessions mid-connect
+  state.sessReconnecting = true;
+  paintSessStatus();
+  let ws;
+  try { ws = await connect(); }
+  catch { state.sessReconnecting = false; paintSessStatus(); return; }
+  // Switched away (or a real send opened its own socket) while connecting — this
+  // one is not ours to keep; close it rather than drive a session off-screen.
+  if (scope !== state.txScope || state.ws !== ws) {
+    state.closingOnPurpose = true;
+    try { ws.close(); } catch { /* already gone */ }
+    return;
+  }
+  state.sessReconnecting = false;
+  state.pendingStartResume = sess.sessionId; // a live-elsewhere refusal re-arms the next Enter
+  send({
+    type: 'start',
+    projectId: p.id,
+    resumeSessionId: sess.sessionId,
+    resumeEncodedDir: sess.encodedDir ?? state.current.encodedDir ?? undefined,
+    // No prompt: this is a pure reattach — the server attaches the detached
+    // bridge and starts no turn (index.ts: it delivers a turn only `if (cmd.prompt)`).
+  });
+}
+
+/*
  * BUG-132: `keepComposer` — this start's text did NOT come from the composer, so
  * the composer must not be touched by it. The self-retry of a drain-wait row
  * (attemptDrainRetry, every 7s for as long as the drain is held) re-sends text
@@ -9357,6 +10057,7 @@ function refreshProvVerdicts() {
     provVerdicts = p; // null when the route is absent
     if (node.provPop.classList.contains('open')) paintProvPop();
     paintProvBtn();
+    paintProvSel();
   }).catch(() => { provVerdictsInflight = null; });
   return provVerdictsInflight;
 }
@@ -9375,6 +10076,35 @@ function paintProvBtn() {
   const inherited = 'provider' in state.overrides ? ' (this session only)' : ' (project default)';
   node.provBtn.title = `Provider: ${opt?.n ?? cur}${inherited} — applies when the next session starts. Click to change`;
 }
+
+// this-feat — the header twin of paintProvBtn. Same source of truth
+// (providerView / state.overrides), same visibility rule (a project is
+// selected and nothing is live), so the labelled selector in the strip and the
+// icon in the composer tray never disagree. Short engine names keep the strip
+// tight; the popover carries the full description.
+const PROV_SHORT = { anthropic: 'Anthropic', openai: 'OpenAI' };
+function paintProvSel() {
+  const show = !!currentProject() && !dockLive();
+  node.provSel.hidden = !show;
+  if (!show) return;
+  const cur = providerView();
+  const opt = PROVIDER_OPTS.find((o) => o.v === cur);
+  node.provSelN.textContent = PROV_SHORT[cur] ?? opt?.n ?? cur;
+  node.provSel.dataset.provider = cur;
+  node.provSel.dataset.set = String('provider' in state.overrides);
+  const inherited = 'provider' in state.overrides ? ' (this session only)' : ' (project default)';
+  node.provSel.title = `Engine: ${opt?.n ?? cur}${inherited} — Anthropic (Claude) or OpenAI (Codex). Applies when the next session starts; click to change.`;
+}
+node.provSel.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (node.provPop.classList.contains('open')) return closePops();
+  closePops();
+  void refreshProvVerdicts();
+  paintProvPop();
+  place(node.provPop, node.provSel, 292);
+  node.provPop.classList.add('open');
+  node.provSel.setAttribute('aria-expanded', 'true');
+});
 
 function openaiVerdict() {
   return provVerdicts?.openai ?? null;
@@ -9446,6 +10176,7 @@ function pickProvider(next) {
     say(`provider: ${opt?.n ?? next} — applies when the next session starts${dropped}`);
   }
   paintProvBtn();
+  paintProvSel();
   paintProvPop();
   paintModelBtn();
   paintModelChip();
@@ -9559,6 +10290,7 @@ function paintModelBtn() {
   // FEAT-045: the provider control lives beside this button and repaints on
   // exactly the same beats (project switch, launch, override churn).
   paintProvBtn();
+  paintProvSel();
 }
 
 /* ------------------------------------------- live model chip (FEAT-042) */
@@ -9866,6 +10598,7 @@ function closePops() {
   node.isoBtn.setAttribute('aria-expanded', 'false');
   node.modelBtn.setAttribute('aria-expanded', 'false');
   node.provBtn.setAttribute('aria-expanded', 'false');
+  node.provSel.setAttribute('aria-expanded', 'false');
   node.procBtn.setAttribute('aria-expanded', 'false');
 }
 
@@ -10138,7 +10871,23 @@ async function addProject(hostPath, name) {
 
 /* -------------------------------------------------------------- chrome bits */
 
-$('#fold').addEventListener('click', () => node.win.classList.toggle('collapsed'));
+/*
+ * The sidebar toggle. It always reopens what it closed, but before this the
+ * button kept its "Hide sidebar" label and icon while collapsed — so a person
+ * who hid the sidebar had no signal that the same button brings it back, and a
+ * pane you cannot tell how to reopen reads as gone. paintFold() reflects the
+ * live state into the title, aria-label, aria-expanded and a mirror class, so
+ * the way back is always legible.
+ */
+function paintFold() {
+  const collapsed = node.win.classList.contains('collapsed');
+  node.fold.title = collapsed ? 'Show sidebar' : 'Hide sidebar';
+  node.fold.setAttribute('aria-label', collapsed ? 'Show sidebar' : 'Hide sidebar');
+  node.fold.setAttribute('aria-expanded', String(!collapsed));
+  node.fold.classList.toggle('is-collapsed', collapsed);
+}
+node.fold.addEventListener('click', () => { node.win.classList.toggle('collapsed'); paintFold(); });
+paintFold();
 // FEAT-070 — restore the saved sort and wire the toggle.
 state.projSort = loadProjSort();
 paintProjSort();
@@ -10259,6 +11008,31 @@ node.jump.addEventListener('click', () => {
   if (th.key === 'main' && th.gap) return void reopenAtLatest();
   scrollToBottom();
 });
+
+/* FEAT-118 — the two within-session-mark affordances, built in JS (not the
+   contended index.html) and mounted beside the "Latest" pill in the dock:
+     • #leftoff — the one-action return to the auto read boundary. Sits opposite
+       the Latest pill; appears only while the "you were here" line is above.
+     • #bookmark — the manual bookmark toggle (set → jump → clear from one
+       control), reusing the pin ribbon glyph the user's "a bookmark like book"
+       maps to. */
+(() => {
+  const dock = node.jump.parentNode;
+  if (!dock) return;
+  const leftoff = el('button', { class: 'leftoff', id: 'leftoff', type: 'button', hidden: '', title: 'Jump to where you left off' },
+    el('span', { class: 'a', text: '↑' }),
+    el('span', { class: 'lbl', text: 'You left off here' }),
+    el('span', { class: 'g', text: '' }));
+  leftoff.addEventListener('click', jumpToReadLine);
+  dock.append(leftoff);
+  node.leftoff = leftoff;
+
+  const bookmark = el('button', { class: 'bkmk', id: 'bookmark', type: 'button', hidden: '', 'aria-pressed': 'false', title: 'Bookmark this spot' },
+    svg(MENU_ICON.pin, 12));
+  bookmark.addEventListener('click', toggleBookmark);
+  dock.append(bookmark);
+  node.bookmark = bookmark;
+})();
 node.historyLatestBtn.addEventListener('click', () => reopenAtLatest());
 // The viewport height is part of "am I at the bottom" — a resize that shortens
 // the scroller must not silently strand a stuck thread above the end.
@@ -10266,6 +11040,19 @@ window.addEventListener('resize', () => {
   const th = viewedThread();
   if (th.stick !== false) scrollToBottom(th);
   else paintJump();
+});
+// FEAT-118 — returning to the tab must NOT advance the read boundary (that is
+// Discord's over-eager clear): it only REPAINTS, so the "you left off here" line
+// the frozen boundary produced becomes visible where the user last read.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) paintMarks(viewedThread());
+});
+// A reload within the save debounce must not drop a just-advanced read mark.
+window.addEventListener('pagehide', () => {
+  try {
+    localStorage.setItem(READMARK_KEY, JSON.stringify(Object.fromEntries(state.readMarks)));
+    localStorage.setItem(BOOKMARK_KEY, JSON.stringify(Object.fromEntries(state.bookmarks)));
+  } catch { /* full/private */ }
 });
 
 /* ═══════════════════════════════════ in-app guide reader (FEAT-075) ═══════
@@ -12638,6 +13425,7 @@ async function boot() {
   node.libCount.textContent = String(drawer.templates().length);
   loadExpanded(); // the user's working set of open projects survives reloads
   loadSeen();
+  loadMarks(); // FEAT-118 — read-marks and bookmarks survive a reload
   // A project restored as expanded must get its list NOW — without this its
   // kids sit empty until the background sweep happens to reach it.
   for (const id of state.expanded) if (state.projects.some((p) => p.id === id)) void loadSessions(id);
@@ -12675,6 +13463,7 @@ async function boot() {
   watch();
   startLivePolling();
   startProcPolling();
+  startUsagePolling(); // FEAT-116 — provider rate-limit window readout
   // BUG-034: the strip's correcting poll, and FEAT-057's death ledger — both
   // are server-authored and both must be right on a FRESH LOAD with no socket
   // and no orchestrator turn, so they are fetched at boot, not on first event.
@@ -12780,6 +13569,13 @@ async function boot() {
     // that switching back restores them) without re-deriving the rules.
     selectProject, dockIsForeign, paintPerm, renderRailSummary,
     refreshOutcomes, renderOutcomes, outcomesHeadline,
+    // FEAT-118 — session-list lifecycle markers + within-session read-mark and
+    // manual bookmark, exposed so a verify script can drive the real fold/row
+    // render and the real transcript marks (seed/advance/paint/jump/toggle)
+    // instead of re-deriving the rules.
+    sessionLifecycle, endedUnanswered, recentlyVisited, sessionRow,
+    seedReadMark, advanceReadMark, paintReadLine, paintMarks, paintBookmark,
+    jumpToReadLine, toggleBookmark, maxRenderedIndex, FINISHED_WINDOW_MS,
     // BUG-017: openSession() runs synchronously up to its first `await`
     // (closeSocket() included) before returning its promise — exposing it lets
     // a verify script set `state.live = true` right after calling it, landing

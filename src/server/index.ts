@@ -9,12 +9,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
 
-import { projectRoot, dataDir, dataDirMode, assertDataDirIntent, ensureDir, isInside } from '../lib/paths.ts';
+import { projectRoot, dataDir, dataDirMode, assertDataDirIntent, ensureDir, isInside, markSanctionedRealStoreWriter } from '../lib/paths.ts';
 import * as hist from '../lib/session-history.ts';
+import { loadProvenanceMap, resolveStartedBy } from '../lib/session-provenance.mjs';
 import * as reg from './registry.ts';
 import * as tpl from './templates.ts';
 import { wiringStatus, coherentWaStack, hasEnabledWaRef } from './wiring.ts';
 import * as cm from './container-manager.ts';
+import * as svc from './service-manager.ts';
 import * as sub from './subagents.ts';
 import * as browser from './browser.ts';
 import * as tx from './transcript.ts';
@@ -45,8 +47,9 @@ import * as decisions from './decisions.ts';
  */
 import * as outcomes from './outcomes.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
-import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam } from './validate.ts';
+import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
 import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, knownSlashCommands, knownModels, startZombieReaper, type AgentSession } from './agent-bridge.ts';
+import { readGlobalDefaults, patchGlobalDefaults } from './global-settings.ts';
 import { adoptSurvivingHosts, survivingHostForSdkSession, survivingHostForSession, scanSurvivingHosts, dropDeadSurvivorHost, type HostStatus } from './survival.ts';
 import { activeDeliveryFor, deliverIntoSurvivor, deliveryEvidenceFor, survivorDeliveryEnabled, type SurvivorDelivery } from './survivor-delivery.ts';
 /*
@@ -57,6 +60,9 @@ import { livenessOfSurvivor, livenessWire, livenessWindowsSummary, sessionStateL
 // BUG-046 — the stall escalation threshold, for the advisory rail card.
 import { stallEscalated } from './stalls.ts';
 import { detectCodex } from './runtime/codex-runtime.ts';
+// FEAT-116 — provider rate-limit window usage (dispatch-now-vs-park); a cached,
+// bounded, fail-quiet reader that never blocks the request path.
+import * as providerUsage from './provider-usage.ts';
 import type { ClientCommand, StationEvent } from './events.ts';
 // FEAT-038 UI action: the server route reuses the SAME onboarding core the CLI
 // runs (`node scripts/onboard.mjs`) — imported, not reimplemented, so the button
@@ -1067,6 +1073,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
             // FEAT-108 r3 — a git-write permission request rides the same rail;
             // the marker tells the client to render Allow/Decline in context.
             gitWrite: d.gitWrite ?? null,
+            // FEAT-112 — a service-sidecar proposal rides the same rail too.
+            services: d.services
+              ? { services: d.services.services.map((s) => ({ name: s.name, image: s.image })), reason: d.services.reason }
+              : null,
           }));
           if (open.length) {
             b.needsYou = [...open, ...b.needsYou];
@@ -1206,6 +1216,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
                 console.warn(`[orchard] git-write GRANTED via request approval for project ${id} — scope=${grant.scope}, expires ${grant.expiresAt} (FEAT-108).`);
               } else {
                 console.warn(`[orchard] git-write request ${ticketId} DECLINED for project ${id} — no grant minted (FEAT-108).`);
+              }
+            }
+            // FEAT-112 — a services PROPOSAL. Approving it (answer begins "Allow")
+            // is the ONE action that writes the proposed services into the
+            // project; the request route wrote nothing, so a proposing agent
+            // cannot apply its own proposal. The services take effect on the next
+            // session start / container ensure (consistent with the drift model:
+            // a live container keeps its config until rebuilt). Declining writes
+            // nothing.
+            if (rec.services) {
+              if (/^allow\b/i.test(answer.trim())) {
+                try {
+                  const patch = validateProjectPatch({ settings: { services: rec.services.services } });
+                  reg.updateProject(id, patch);
+                  console.warn(`[orchard] services APPLIED via proposal approval for project ${id} — ${rec.services.services.map((s) => s.name).join(', ')} (FEAT-112). Effective next session start.`);
+                } catch (err) {
+                  console.warn(`[orchard] services proposal ${ticketId} approved but could not be applied: ${(err as Error).message}`);
+                }
+              } else {
+                console.warn(`[orchard] services proposal ${ticketId} DECLINED for project ${id} — no settings written (FEAT-112).`);
               }
             }
             const target =
@@ -1364,6 +1394,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         } catch (err) {
           container = { error: (err as Error).message };
         }
+        // FEAT-112: the project is gone, so its service sidecars, network AND
+        // data volumes go with it — this is the one teardown that purges data.
+        try {
+          svc.teardownServices(p.id, { removeVolumes: true });
+        } catch { /* best-effort; the orphan sweep is the backstop */ }
       }
       // The session history under ~/.claude/projects/-workspace-<id> is the
       // user's own transcript data and is deliberately KEPT — reported, not deleted.
@@ -1393,6 +1428,12 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       const liveNow = new Set(
         [...watcher.liveSessions(), ...watcher.orchardLiveSessions()].map((s) => `${s.dir}\0${s.sessionId}`),
       );
+      // Session provenance (who STARTED each row) for the picker's fold. Loaded
+      // ONCE per request (not a read per row — BUG-158 keeps listing cheap); a
+      // row with no record falls back to the conservative declaration-line test,
+      // then to 'user'. Presentation only: the row, its transcript and its URL
+      // are unaffected — the client just folds 'agent' rows out of the default view.
+      const provenance = loadProvenanceMap();
       sendJson(res, 200, {
         projectId: p.id,
         encodedDir: hist.encodeCwd(p.hostPath),
@@ -1413,6 +1454,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           live: liveNow.has(`${s.encodedDir}\0${s.sessionId}`),
           sessionId: s.sessionId,
           encodedDir: s.encodedDir,
+          // Who started this session: 'user' or 'agent'. Explicit record wins;
+          // else the conservative pre-existing fallback; else 'user'. The picker
+          // folds non-live 'agent' rows by default (still reachable via "N more"/URL).
+          startedBy: resolveStartedBy({
+            sessionId: s.sessionId,
+            firstUserMessage: s.firstUserMessage,
+            record: provenance.get(s.sessionId),
+          }),
           // FEAT-037 P2b: which engine recorded this session. 'anthropic' for
           // the Claude store; Orchard-owned rows carry their provider dir.
           provider: (s as { provider?: string }).provider ?? 'anthropic',
@@ -1456,6 +1505,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     sendJson(res, 200, { commands: knownSlashCommands() });
     return true;
   }
+  /* FEAT-116: provider rate-limit window usage, for the dispatch-now-vs-park
+   * decision. Serves the CACHED per-provider snapshots and never awaits the
+   * network — `getUsageSnapshots` revalidates in the background, so this route
+   * cannot block a UI control (each snapshot carries its own `asOf`). */
+  if (rest[0] === 'usage' && rest.length === 1 && m === 'GET') {
+    sendJson(res, 200, { providers: providerUsage.getUsageSnapshots(), at: Date.now() });
+    return true;
+  }
   /* models: the CLI's own names/descriptions — versions included.
    * FEAT-045: per-provider — `?provider=openai` serves the Codex catalog
    * (`model/list`, remembered from that engine's sessions); no query keeps the
@@ -1485,6 +1542,28 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         openai: detectCodex(),
       },
     });
+    return true;
+  }
+
+  /*
+   * FEAT-118 — app-wide (global) defaults. The GET is what the settings surface
+   * reads to show the current global default and to seed its picker; the PATCH
+   * writes a partial change (a field absent is left as-is, an explicit null
+   * clears it). The merge under each project happens in pickOverridable, not
+   * here — this route only owns the global layer itself.
+   */
+  if (rest[0] === 'settings' && rest.length === 1 && m === 'GET') {
+    sendJson(res, 200, { settings: readGlobalDefaults() });
+    return true;
+  }
+  if (rest[0] === 'settings' && rest.length === 1 && m === 'PATCH') {
+    const body = await readBody(req);
+    const result = patchGlobalDefaults(body);
+    if (!result.ok) {
+      sendJson(res, 400, { error: result.error });
+      return true;
+    }
+    sendJson(res, 200, { settings: result.value });
     return true;
   }
 
@@ -2146,6 +2225,66 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   /*
+   * FEAT-112 — an agent PROPOSES a set of service sidecars; the user approves in
+   * one click on the Needs-You rail. Mirrors git-write-request exactly: this
+   * route validates the proposal and raises an INERT decision — it writes NO
+   * project settings and brings up NO container. Only the user answering "Allow"
+   * on the answer route writes the services into the project (an agent proposing
+   * is never an agent applying). The verdict is delivered back to the raising
+   * session so the agent learns whether to expect the services next start.
+   */
+  if (rest[0] === 'sessions' && rest[1] && rest[2] === 'services-request' && rest.length === 3 && m === 'POST') {
+    const sid = rest[1];
+    const target =
+      getSession(sid) ??
+      liveSessions().find((s) => s.sdkSessionId === sid) ??
+      null;
+    if (!target || target.closed) {
+      sendJson(res, 400, { error: `services-request: no live session ${JSON.stringify(sid)} to raise a request from` });
+      return true;
+    }
+    let body: Record<string, unknown>;
+    try {
+      body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      sendJson(res, err instanceof HttpError ? err.status : 400, { error: (err as Error).message });
+      return true;
+    }
+    const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+    if (!reason) { sendJson(res, 400, { error: 'services-request: a reason is required and must be a non-empty string' }); return true; }
+    let services;
+    try {
+      services = validateServices(body.services);
+    } catch (err) {
+      sendJson(res, 400, { error: `services-request: ${(err as Error).message}` });
+      return true;
+    }
+    if (services.length === 0) { sendJson(res, 400, { error: 'services-request: propose at least one service' }); return true; }
+    const names = services.map((s) => `${s.name} (${s.image})`).join(', ');
+    const rec = decisions.raise({
+      projectId: target.project.id,
+      sessionId: target.id,
+      sdkSessionId: target.sdkSessionId,
+      question: `Add service sidecars to “${target.project.name}”? ${reason} — proposed: ${names}.`,
+      options: ['Allow', 'Decline'],
+      services: { services, reason },
+    });
+    // Visible, never silent — and explicitly NOT applied: the proposal is inert.
+    console.warn(`[orchard] services PROPOSAL raised by session ${target.id} for project ${target.project.id} (${target.project.name}) — ${names}. INERT until the user approves (FEAT-112); no settings written, no container touched.`);
+    sendJson(res, 201, {
+      id: rec.id,
+      projectId: rec.projectId,
+      sessionId: rec.sessionId,
+      question: rec.question,
+      services: rec.services,
+      pending: true,
+      applied: false,
+      createdAt: rec.createdAt,
+    });
+    return true;
+  }
+
+  /*
    * SESSION MUTATION — rename, pin, delete. `live` is a route, not a session id.
    */
   if (rest[0] === 'sessions' && rest[1] && rest[1] !== 'live' && (m === 'PATCH' || m === 'DELETE' || m === 'POST')) {
@@ -2230,7 +2369,12 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       return true;
     }
     if (m === 'POST') {
-      sendJson(res, 200, { removed: orphans.map((o) => cm.removeContainerByName(o.name)) });
+      const removed = orphans.map((o) => cm.removeContainerByName(o.name));
+      // FEAT-112: orphan SERVICE CONTAINERS are already in `orphans` (they carry
+      // claude-station=1), but their network + data volumes are not containers —
+      // reap those for any project no longer in the registry too.
+      const infra = svc.reapOrphanServiceInfra(new Set(reg.listProjects().map((p) => p.id)));
+      sendJson(res, 200, { removed, serviceInfra: infra });
       return true;
     }
   }
@@ -3035,18 +3179,52 @@ async function handleContainerRoute(
     const withCasualties = (status: unknown) =>
       forcedOver.length ? { ...(status as object), forcedOverLiveSessions: forcedOver } : status;
     switch (action) {
-      case 'start':
-        sendJson(res, 200, withCasualties(await cm.ensureContainer(project)));
+      case 'start': {
+        const st = await cm.ensureContainer(project);
+        // FEAT-112 defect 4 (sibling path): `ensureContainer` recreates the
+        // container on config drift, which — like rebuild — drops it off the
+        // service network. Re-join so a manual container start keeps declared
+        // services resolvable. Idempotent; no-op without a service network.
+        try {
+          svc.connectSessionToServices(project.id);
+        } catch (err) {
+          (st as { serviceRejoin?: string }).serviceRejoin = (err as Error).message;
+        }
+        sendJson(res, 200, withCasualties(st));
         return true;
-      case 'stop':
-        sendJson(res, 200, withCasualties(await cm.stopContainer(project)));
+      }
+      case 'stop': {
+        const st = await cm.stopContainer(project);
+        // FEAT-112: services live and die with the session container. Keep their
+        // data volumes (a Stop is not a purge) so the next session resumes them.
+        svc.teardownServices(project.id, { removeVolumes: false });
+        sendJson(res, 200, withCasualties(st));
         return true;
-      case 'rebuild':
-        sendJson(res, 200, withCasualties(await cm.rebuildContainer(project)));
+      }
+      case 'rebuild': {
+        const st = await cm.rebuildContainer(project);
+        // FEAT-112 defect 4: rebuild rm+recreates the session container by the same
+        // name, which drops it off the service network (sidecars keep running,
+        // detached). `service-manager` documents Rebuild as a rejoin point but only
+        // `startSession` was wired to connect. Re-join here so a rebuild under a live
+        // session keeps `redis`/`mongo` resolvable instead of silently losing DNS
+        // until the next session start. No-op when the project declares no services.
+        try {
+          svc.connectSessionToServices(project.id);
+        } catch (err) {
+          // A rejoin failure must not mask a successful rebuild; surface it as a
+          // status note rather than turning the rebuild into a 500.
+          (st as { serviceRejoin?: string }).serviceRejoin = (err as Error).message;
+        }
+        sendJson(res, 200, withCasualties(st));
         return true;
-      case 'remove':
-        sendJson(res, 200, withCasualties(await cm.removeProjectContainer(project)));
+      }
+      case 'remove': {
+        const st = await cm.removeProjectContainer(project);
+        svc.teardownServices(project.id, { removeVolumes: false });
+        sendJson(res, 200, withCasualties(st));
         return true;
+      }
       default:
         return notFound(res, `no container action "${action}"`);
     }
@@ -3420,6 +3598,24 @@ wss.on('connection', (ws: WebSocket) => {
               return;
             }
             /*
+             * BUG-160 — a PROMPTLESS resume is a request to re-take the driving
+             * socket of a bridge this server still holds (a sole tab that
+             * reloaded; see reattachDriving in public/app.js). If we reached here
+             * the bridge is gone (never held, or just reaped as a zombie above),
+             * so there is nothing to reattach to. Refuse rather than fall through
+             * and spawn a `claude --resume` with no prompt — an empty turn. This
+             * is inert for every existing caller: the client always sends a
+             * non-empty prompt with `start`, so only reattachDriving hits it.
+             */
+            if (!(typeof cmd.prompt === 'string' && cmd.prompt.trim().length > 0)) {
+              return send({
+                t: 'error',
+                code: 'nothing-to-reattach',
+                fatal: false,
+                message: 'this session is no longer running here — send a message to resume it.',
+              });
+            }
+            /*
              * BUG-022: the in-memory check above only sees sessions driven by
              * THIS process. Right after a restart that map is empty, but a
              * prior server's FEAT-015 survivor broker may still be alive and
@@ -3738,7 +3934,7 @@ wss.on('connection', (ws: WebSocket) => {
           void session
             .setPermissionMode(cmd.mode)
             .then((r) =>
-              send({ t: 'ack', of: 'set-permission-mode', requestId: cmd.requestId, mode: r.mode, ok: r.ok, error: r.error }),
+              send({ t: 'ack', of: 'set-permission-mode', requestId: cmd.requestId, mode: r.mode, ok: r.ok, error: r.error, appliesFrom: r.appliesFrom }),
             )
             .catch((err: Error) =>
               send({ t: 'ack', of: 'set-permission-mode', requestId: cmd.requestId, mode: cmd.mode, ok: false, error: err.message }),
@@ -3888,6 +4084,15 @@ try {
   console.error(`[orchard] REFUSING TO START — ${(err as Error).message}`);
   process.exit(78); // EX_CONFIG
 }
+
+// This process IS the production station server — the one sanctioned writer of
+// real ~/.claude/projects transcripts through ClaudeRuntime. Mark it so the
+// fixture-pollutes-reality guard (assertSessionStoreIsolated) lets the user's
+// real sessions through while still refusing an in-process verification harness
+// that reaches a real-store write. A spawned TEST server also runs this line,
+// but such suites isolate CLAUDE_STATION_DATA, which the guard's other arm
+// catches independently.
+markSanctionedRealStoreWriter();
 
 ensureDir(dataDir());
 const seedResult = tpl.seedTemplates();

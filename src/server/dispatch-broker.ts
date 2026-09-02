@@ -71,7 +71,10 @@ function validate(raw: unknown): { ok: true; r: Record<string, unknown> } | { ok
   if (r.op !== 'dispatch') return { ok: false, kind: 'invalid-operation', text: 'op must be capabilities or dispatch' };
   if (r.provider !== 'openai') return { ok: false, kind: 'invalid-provider', text: 'provider must be openai' };
   if (typeof r.prompt !== 'string' || !r.prompt.trim()) return { ok: false, kind: 'invalid-prompt', text: 'prompt must be a non-empty string' };
-  if (r.model != null && (typeof r.model !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(r.model))) return { ok: false, kind: 'invalid-model', text: 'model contains forbidden characters' };
+  // Square brackets permitted: the CLI's own model ids carry them (`opus[1m]`,
+  // the 1M-context variants). Still anchored, length-capped, alphanumeric-led,
+  // no shell metacharacters — the value is an argv element, never shell-parsed.
+  if (r.model != null && (typeof r.model !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,79}$/.test(r.model))) return { ok: false, kind: 'invalid-model', text: 'model contains forbidden characters' };
   if (r.sandbox != null && !SANDBOXES.has(String(r.sandbox))) return { ok: false, kind: 'invalid-sandbox', text: 'sandbox must be read-only or workspace-write' };
   if (r.timeoutMin != null && (typeof r.timeoutMin !== 'number' || !Number.isFinite(r.timeoutMin) || r.timeoutMin <= 0)) return { ok: false, kind: 'invalid-timeout', text: 'timeoutMin must be a positive number' };
   if (r.phase != null && (typeof r.phase !== 'string' || !PHASES.has(r.phase))) return { ok: false, kind: 'invalid-phase', text: 'phase is not allowed' };

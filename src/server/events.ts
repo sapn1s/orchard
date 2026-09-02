@@ -58,6 +58,15 @@ export interface EffectiveConfig {
    *                          the session started, and the CLI accepted it
    */
   permissionModeSource: 'session-override' | 'container-default' | 'project' | 'live-change';
+  /**
+   * A live permission-mode change the engine ACCEPTED but that is not in force
+   * yet: made mid-turn on an engine with no mid-turn switch (Codex), it governs
+   * from the NEXT turn. Present only during that window; `effective.permissionMode`
+   * still reflects the mode the RUNNING turn actually uses (which keeps prompting).
+   * The UI paints the toggle as armed-for-next-turn rather than claiming skip is
+   * already in force. Absent (undefined) whenever nothing is pending.
+   */
+  permissionModePendingNextTurn?: string;
   instructionMode: 'none' | 'append' | 'replace';
   appliedTemplates: string[];
 }
@@ -339,8 +348,13 @@ export type StationEvent =
        * structural). A client that understands this code must keep the user's
        * typed text instead of treating the refusal as a dead end — that loss is
        * the bug this code exists to end.
+       *
+       * 'nothing-to-reattach' (BUG-160): a PROMPTLESS resume (reattachDriving)
+       * found no surviving bridge to re-take. Not a dead end for any typed text
+       * — the reattach carried none — so the client rolls the socket back quietly
+       * and leaves the restored queue for the "To composer" affordance.
        */
-      code?: 'live-elsewhere' }
+      code?: 'live-elsewhere' | 'nothing-to-reattach' }
   /**
    * A `send` carried `targetAgentId`, and the Agent SDK has no channel for it.
    *

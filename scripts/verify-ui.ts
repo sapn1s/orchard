@@ -24,6 +24,7 @@ import * as path from 'node:path';
 import { Window } from 'happy-dom';
 import WebSocket from 'ws';
 import { findNeighborProject } from './lib/neighbor-project.mjs';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
 
 /* Never a fixed port: two suites defaulting to the same number collide the
    moment both run (observed: verify-ui + verify-sessions on 4319). The OS
@@ -39,6 +40,10 @@ const PORT = Number(process.env.VERIFY_UI_PORT ?? await freePort());
 const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-station-ui-'));
+// Isolate the CLI transcript store too: this suite drives a REAL session
+// (STATION-UI-OK), whose transcript would otherwise leak into the user's real
+// ~/.claude/projects. See isolatedStoreEnv / the fixture-pollutes-reality guard.
+const STORE_ENV = isolatedStoreEnv(path.join(DATA, 'store'));
 const OFFLINE = process.argv.includes('--offline');
 
 let pass = 0;
@@ -82,7 +87,7 @@ process.on('unhandledRejection', (err) => failLoudly('unhandledRejection', err))
 async function main(): Promise<void> {
   server = spawn(process.execPath, [path.join(ROOT, 'src', 'server', 'index.ts')], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), CLAUDE_STATION_DATA: DATA },
+    env: { ...process.env, PORT: String(PORT), CLAUDE_STATION_DATA: DATA, ...STORE_ENV },
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });

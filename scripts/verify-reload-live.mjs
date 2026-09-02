@@ -129,18 +129,23 @@ async function main() {
   await sleep(2000); // firmly mid-turn — socket about to die on reload
   await cdp.eval('location.reload()'); // ← the Ctrl+Shift+R moment
   await cdp.waitFor('boot after reload', `window.__station !== undefined`, 30_000);
-  // The reloaded page restores the session from the URL, then reflects live state.
-  const reflected = await cdp.waitFor('busy reflected after reload',
-    `window.__station.state.current.sessionId === ${JSON.stringify(sid)} && window.__station.state.followingLive === true && window.__station.state.busy === true`, 30_000);
+  // The reloaded page restores the session from the URL, reflects live state,
+  // and — BUG-160 — a SOLE tab AUTO-REATTACHES: it re-takes the driving socket
+  // (isDriving() true, followingLive cleared) rather than passively following
+  // and waiting for the user to send. Still busy, still shows the interrupt
+  // button; the honesty property (not idle history) is unchanged.
+  const reflected = await cdp.waitFor('driving reflected after reload',
+    `window.__station.state.current.sessionId === ${JSON.stringify(sid)} && window.__station.isDriving() === true && window.__station.state.busy === true`, 30_000);
   const after = await cdp.eval(`({
     sid: window.__station.state.current.sessionId,
     busy: window.__station.state.busy,
     following: window.__station.state.followingLive,
+    driving: window.__station.isDriving(),
     goMode: document.querySelector('#go').dataset.mode,
     fine: document.querySelector('#fine')?.textContent?.slice(0, 60),
   })`);
-  check('reloaded tab reflects the STILL-RUNNING session as busy/following (not idle history)',
-    reflected && after.busy === true && after.following === true && after.goMode === 'stop',
+  check('reloaded SOLE tab auto-reattaches to DRIVE the still-running session (not idle, not passive-follow)',
+    reflected && after.busy === true && after.driving === true && after.following === false && after.goMode === 'stop',
     JSON.stringify(after));
 
   console.log('\n=== the answer lands, then it flips to idle ===');

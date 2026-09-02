@@ -16,17 +16,38 @@ export class GitError extends Error {
   constructor(status: number, message: string, gitStatus?: GitStatus) { super(message); this.status = status; this.gitStatus = gitStatus; }
 }
 
-function git(cwd: string, args: string[], timeoutMs = 15_000): Promise<{ code: number; out: string; err: string }> {
+function git(cwd: string, args: string[], timeoutMs = 15_000, env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string; err: string }> {
   return new Promise((resolve) => {
     execFile('git', ['-C', cwd, ...args],
       // execFile has no shell and pipes stdout/stderr by definition.
-      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 },
+      { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, env: env ?? process.env },
       (error, stdout, stderr) => resolve({
         code: error ? (typeof (error as { code?: unknown }).code === 'number' ? (error as { code: number }).code : -1) : 0,
         out: stdout ?? '',
         err: (stderr || error?.message || '').trim(),
       }));
   });
+}
+
+/**
+ * fetch/push/pull are the only git ops that touch the network, and a network op
+ * with no bound is how the sync control ends up stuck on "Working…" forever: a
+ * remote that prompts for a credential/passphrase/host-key with no tty, or a
+ * black-hole that accepts the connection and never answers, hangs `git` for the
+ * full hard timeout (a minute) — long enough that any panel navigation in the
+ * meantime strands the client's in-flight flag permanently. Force every network
+ * op to fail fast and honestly instead: never prompt (fail closed with no tty),
+ * cap ssh connect/banner time, and abort a stalled HTTP transfer in seconds with
+ * a real reason rather than riding the whole timeout.
+ */
+const NET_ENV: NodeJS.ProcessEnv = {
+  ...process.env,
+  GIT_TERMINAL_PROMPT: '0',
+  GIT_SSH_COMMAND: `${process.env.GIT_SSH_COMMAND ?? 'ssh'} -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=accept-new`,
+};
+const NET_CONF = ['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=15'];
+function netGit(cwd: string, args: string[], timeoutMs = 60_000): Promise<{ code: number; out: string; err: string }> {
+  return git(cwd, [...NET_CONF, ...args], timeoutMs, NET_ENV);
 }
 
 export interface GitStatus {
@@ -308,7 +329,7 @@ export async function push(hostPath: string): Promise<{ pushed: true; detail: st
   if (!s.repo) throw new GitError(409, 'not a git repository');
   if (!s.remoteUrl) throw new GitError(409, 'no remote named origin — create the GitHub repo first');
   const args = s.upstream ? ['push'] : ['push', '-u', 'origin', s.branch ?? 'HEAD'];
-  const r = await git(hostPath, args, 60_000);
+  const r = await netGit(hostPath, args, 60_000);
   if (r.code !== 0) throw new GitError(502, `git push failed: ${r.err || r.out}`);
   return { pushed: true, detail: (r.err || r.out).trim().slice(0, 500), status: await statusOf(hostPath) };
 }
@@ -318,7 +339,7 @@ export async function pull(hostPath: string): Promise<{ pulled: true; detail: st
   const s = await statusOf(hostPath);
   if (!s.repo) throw new GitError(409, 'not a git repository');
   if (!s.upstream) throw new GitError(409, 'no upstream to pull from');
-  const r = await git(hostPath, ['pull', '--ff-only'], 60_000);
+  const r = await netGit(hostPath, ['pull', '--ff-only'], 60_000);
   if (r.code !== 0) throw new GitError(502, `git pull --ff-only failed: ${r.err || r.out}`);
   return { pulled: true, detail: (r.err || r.out).trim().slice(0, 500), status: await statusOf(hostPath) };
 }
@@ -329,7 +350,7 @@ export async function fetch(hostPath: string): Promise<{ fetched: true; detail: 
   if (!s.repo) throw new GitError(409, 'not a git repository');
   const remote = s.upstream?.split('/')[0] ?? (s.remoteUrl ? 'origin' : null);
   if (!remote) throw new GitError(409, 'no remote to fetch from');
-  const r = await git(hostPath, ['fetch', remote], 60_000);
+  const r = await netGit(hostPath, ['fetch', remote], 60_000);
   if (r.code !== 0) throw new GitError(502, `git fetch failed: ${r.err || r.out}`.trim());
   return { fetched: true, detail: (r.err || r.out).trim().slice(0, 500), status: await statusOf(hostPath) };
 }

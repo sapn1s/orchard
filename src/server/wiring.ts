@@ -32,24 +32,18 @@ import { toolSettingsOf } from './registry.ts';
 import { resolveBoardDir, resolveConventionsFile, resolveOrchardDir } from '../../scripts/lib/board-path.mjs';
 
 /**
- * The Working Agreement is a TWO-DOCUMENT stack, not one interchangeable id:
- *   - `working-agreement`    (v1) is the STABLE BASE — it carries the numbered
- *     core: definition of done, evidence-over-narrative, blocked ≠ stopped,
- *     decision authority, autonomy limits, parallelism/escalation, the quality
- *     bar, and THE FINAL REPORT. It is self-contained.
- *   - `working-agreement-v2` (v2) is a LIVING EXTENSION whose body opens with
- *     "v1 is the stable base: read it first" and "## Everything in v1, plus:".
- *     It has zero content overlap with v1 and is NOT standalone — attaching it
- *     alone silently drops the entire core and leaves a dangling "read v1 first"
- *     pointer that resolves only by luck.
- * So a coherent attach is v1 FIRST, then v2. See BUG-099.
+ * v4 is the standalone default (supersedes v1/v2/v3). The v1/v2/v3 ids remain
+ * recognised so historical project rows and explicit user selections keep
+ * resolving and coherentWaStack() strips any of them when re-attaching v4.
  */
 export const WA_BASE_ID = 'working-agreement';
 export const WA_EXT_ID = 'working-agreement-v2';
-/** The coherent attach set, in injection order (base first, then extension). */
-export const WA_COHERENT_IDS = [WA_BASE_ID, WA_EXT_ID] as const;
+export const WA_V3_ID = 'working-agreement-v3';
+export const WA_DEFAULT_ID = 'working-agreement-v4';
+/** The coherent default attach set. */
+export const WA_COHERENT_IDS = [WA_DEFAULT_ID] as const;
 /** All template ids recognised as part of the Working Agreement stack. */
-export const WA_TEMPLATE_IDS = [WA_BASE_ID, WA_EXT_ID] as const;
+export const WA_TEMPLATE_IDS = [WA_BASE_ID, WA_EXT_ID, WA_V3_ID, WA_DEFAULT_ID] as const;
 
 export type WiringState = 'ok' | 'warn' | 'missing' | 'info';
 /** What an Apply click on this row does; null = nothing to apply (informational). */
@@ -147,7 +141,8 @@ export function waRefState(project: Project): WaRefState {
     .map((ref) => ref.templateId);
   const hasBase = enabledIds.includes(WA_BASE_ID);
   const hasExt = enabledIds.includes(WA_EXT_ID);
-  return { enabledIds, hasBase, hasExt, coherent: hasBase, extensionOnly: hasExt && !hasBase };
+  const hasDefault = enabledIds.includes(WA_DEFAULT_ID);
+  return { enabledIds, hasBase: hasBase || hasDefault, hasExt, coherent: hasDefault || hasBase, extensionOnly: hasExt && !hasBase && !hasDefault };
 }
 
 /**
@@ -170,28 +165,10 @@ export function hasEnabledWaRef(project: Project): boolean {
  * validated PATCH path (BUG-099) rather than hand-rolling it twice.
  */
 export function coherentWaStack(project: Project): InstructionRef[] {
-  const stack: InstructionRef[] = (project.settings?.instructions ?? []).map((r) => ({ ...r }));
-  const findIdx = (tid: string) => stack.findIndex((r) => r.templateId === tid);
-  // Enable any existing WA refs in place (never duplicate them).
-  for (const ref of stack) {
-    if (ref.templateId === WA_BASE_ID || ref.templateId === WA_EXT_ID) ref.enabled = true;
-  }
-  // Ensure the base (v1) is present — insert before v2 if v2 exists, else append.
-  if (findIdx(WA_BASE_ID) === -1) {
-    const extIdx = findIdx(WA_EXT_ID);
-    const baseRef: InstructionRef = { templateId: WA_BASE_ID, enabled: true };
-    if (extIdx === -1) stack.push(baseRef);
-    else stack.splice(extIdx, 0, baseRef);
-  }
-  // Ensure the extension (v2) is present.
-  if (findIdx(WA_EXT_ID) === -1) stack.push({ templateId: WA_EXT_ID, enabled: true });
-  // Guarantee base-before-extension order (repairs a pre-existing v2-then-v1 stack).
-  const baseIdx = findIdx(WA_BASE_ID);
-  const extIdx = findIdx(WA_EXT_ID);
-  if (baseIdx > extIdx) {
-    const [baseRef] = stack.splice(baseIdx, 1);
-    stack.splice(extIdx, 0, baseRef!);
-  }
+  const stack: InstructionRef[] = (project.settings?.instructions ?? [])
+    .filter((r) => !WA_TEMPLATE_IDS.includes(r.templateId as typeof WA_TEMPLATE_IDS[number]))
+    .map((r) => ({ ...r }));
+  stack.push({ templateId: WA_DEFAULT_ID, enabled: true });
   return stack;
 }
 

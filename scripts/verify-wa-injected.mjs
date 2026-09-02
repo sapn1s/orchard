@@ -16,14 +16,8 @@
  * src/server/agent-bridge.ts does), then asserts distinctive WA body text is
  * actually present in the composed system prompt.
  *
- * Both WA templates are required, and in that order:
- *   working-agreement      (v1) — the stable base: definition of done, evidence
- *                                 over narrative, autonomy limits, final report
- *   working-agreement-v2   (v2) — the living extension; it literally opens with
- *                                 "Everything in v1, plus:" and shares no
- *                                 sections with v1, so v2 alone injects a
- *                                 document that references a base that is never
- *                                 loaded.
+ * The standalone v4 template is required (supersedes v1/v2/v3). v1, v2 and v3
+ * remain available as archived versions but are no longer the default stack.
  *
  * MUST-FAIL CONTROL: the same markers are asserted ABSENT when the instruction
  * stack is empty. Without that, a marker string that happened to live in
@@ -39,12 +33,10 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 
 /** Body text unique to each WA template — absent from every other injected section. */
 const MARKERS = [
-  { tpl: 'working-agreement', text: 'build it to production confidence' },
-  { tpl: 'working-agreement', text: '### 2. Evidence over narrative' },
-  { tpl: 'working-agreement-v2', text: '### C. Make verification fail loudly' },
-  { tpl: 'working-agreement-v2', text: 'Everything in v1, plus:' },
+  { tpl: 'working-agreement-v4', text: 'Executed evidence, or the verdict does not count.' },
+  { tpl: 'working-agreement-v4', text: 'the fixer DEMONSTRATES, the verifier ATTACKS' },
 ];
-const REQUIRED_TEMPLATES = ['working-agreement', 'working-agreement-v2'];
+const REQUIRED_TEMPLATES = ['working-agreement-v4'];
 
 let pass = 0;
 let fail = 0;
@@ -91,11 +83,7 @@ async function main() {
   for (const tpl of REQUIRED_TEMPLATES) {
     check(`instruction stack has an ENABLED ref to ${tpl}`, enabled.includes(tpl), `enabled refs: [${enabled.join(', ')}]`);
   }
-  check(
-    'v1 (base) is ordered before v2 (extension)',
-    enabled.indexOf('working-agreement') >= 0 && enabled.indexOf('working-agreement') < enabled.indexOf('working-agreement-v2'),
-    `order: [${enabled.join(', ')}]`,
-  );
+  check('legacy v1/v2/v3 stack is not also enabled', !enabled.includes('working-agreement') && !enabled.includes('working-agreement-v2') && !enabled.includes('working-agreement-v3'), `enabled refs: [${enabled.join(', ')}]`);
 
   /* The real launch composition — mirrors agent-bridge.ts. */
   const composed = composeInstructions(refs, { hostPath: project.hostPath, routing: true });
@@ -130,9 +118,9 @@ function report() {
   if (fail) {
     console.log('failed checks:\n  - ' + failures.join('\n  - '));
     console.log(
-      '\nFIX: attach both WA templates through the validated path (do NOT hand-edit registry.json):\n' +
+      '\nFIX: attach the condensed WA template through the validated path (do NOT hand-edit registry.json):\n' +
         `  curl -X PATCH localhost:4317/api/projects/<id> -H 'content-type: application/json' \\\n` +
-        `    -d '{"settings":{"instructions":[{"templateId":"working-agreement","enabled":true},{"templateId":"working-agreement-v2","enabled":true}]}}'`,
+        `    -d '{"settings":{"instructions":[{"templateId":"working-agreement-v4","enabled":true}],"methodVersion":3}}'`,
     );
     process.exitCode = 1;
   }

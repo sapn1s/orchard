@@ -44,6 +44,8 @@ const METHODOLOGY_DIR =
 const FILES = [
   { name: 'WORKING_AGREEMENT.md', mirror: path.join('docs', 'prompts', 'WORKING_AGREEMENT.md') },
   { name: 'WORKING_AGREEMENT.v2.md', mirror: path.join('docs', 'prompts', 'WORKING_AGREEMENT.v2.md') },
+  { name: 'WORKING_AGREEMENT.v3.md', mirror: path.join('docs', 'prompts', 'WORKING_AGREEMENT.v3.md') },
+  { name: 'WORKING_AGREEMENT.v4.md', mirror: path.join('docs', 'prompts', 'WORKING_AGREEMENT.v4.md') },
   // FEAT-043: provider/model routing guidance for the mixed Claude+GPT fleet.
   // The mirror is what templates.ts#routingSection injects into sessions.
   { name: 'ROUTING.md', mirror: path.join('docs', 'prompts', 'ROUTING.md') },

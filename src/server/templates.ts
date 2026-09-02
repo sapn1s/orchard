@@ -84,6 +84,8 @@ function serialize(t: Pick<Template, 'name' | 'defaultMode' | 'living' | 'descri
 const DEFAULT_SEED_SOURCES: Record<string, string> = {
   'working-agreement': path.join('docs', 'prompts', 'WORKING_AGREEMENT.md'),
   'working-agreement-v2': path.join('docs', 'prompts', 'WORKING_AGREEMENT.v2.md'),
+  'working-agreement-v3': path.join('docs', 'prompts', 'WORKING_AGREEMENT.v3.md'),
+  'working-agreement-v4': path.join('docs', 'prompts', 'WORKING_AGREEMENT.v4.md'),
 };
 
 /**
@@ -698,6 +700,24 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
       description: 'Living copy — appended to whenever a preference or failure mode shows up in practice.',
       body: '',
       sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.v2.md'),
+    },
+    {
+      id: 'working-agreement-v3',
+      name: 'Working Agreement v3 (condensed)',
+      defaultMode: 'append',
+      living: true,
+      description: 'Standalone condensed default; preserves the universal working contract at lower context cost.',
+      body: '',
+      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.v3.md'),
+    },
+    {
+      id: 'working-agreement-v4',
+      name: 'Working Agreement v4',
+      defaultMode: 'append',
+      living: true,
+      description: 'Standalone default; supersedes v1/v2/v3 — the full universal working contract, deduplicated, with stable section anchors.',
+      body: '',
+      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.v4.md'),
     },
     {
       id: 'pattern-manager-subagent-tree',

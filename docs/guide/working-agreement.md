@@ -24,7 +24,7 @@ There are two kinds of rule doc, and the split is load-bearing:
 - **Universal rules** live in the WA. The canonical source lives in a *separate
   methodology repo* (`~/projects/methodology`, overridable via `METHODOLOGY_DIR`).
   A **committed mirror** of it lives in this repo at
-  `~/projects/orchard/docs/prompts/WORKING_AGREEMENT.v2.md` (plus `ROUTING.md`),
+  `~/projects/orchard/docs/prompts/WORKING_AGREEMENT.v3.md` (plus the archived v1/v2 and `ROUTING.md`),
   kept current by `~/projects/orchard/scripts/sync-methodology.mjs` (`npm run
   sync:methodology`). The canonical repo is the source of truth; **edit the
   canonical copy, then sync** — never hand-edit the mirror.
@@ -40,7 +40,7 @@ system prompt** at launch by `~/projects/orchard/src/server/templates.ts`. The
 composer `composeInstructions(refs, { hostPath, routing })` layers the prompt in a
 fixed order:
 
-1. **Universal WA** — resolved from the `working-agreement*` templates. Those are
+1. **Universal WA** — resolved from the standalone `working-agreement-v3` default template. The templates
    read-through templates (`source:` frontmatter) that pull their body live from the
    `docs/prompts/WORKING_AGREEMENT*.md` mirror, so editing the mirror propagates with
    no re-seed.

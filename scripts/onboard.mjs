@@ -272,12 +272,12 @@ function bugsTemplateArch() {
  * target into an operator-specific absolute location anyway (`../../home/<user>/…`).
  */
 function waPointerPath() {
-  const waAbs = path.join(repoRoot, 'docs', 'prompts', 'WORKING_AGREEMENT.v2.md');
+  const waAbs = path.join(repoRoot, 'docs', 'prompts', 'WORKING_AGREEMENT.v3.md');
   const home = os.homedir();
   if (home && (waAbs === home || waAbs.startsWith(home + path.sep))) {
     return '~/' + path.relative(home, waAbs).split(path.sep).join('/');
   }
-  return '$ORCHARD_HOME/docs/prompts/WORKING_AGREEMENT.v2.md';
+  return '$ORCHARD_HOME/docs/prompts/WORKING_AGREEMENT.v3.md';
 }
 
 function claudeMd() {

@@ -70,6 +70,11 @@ import {
   DECLARED_PHASES,
   DISPATCH_CLASSES,
 } from './lib/cost-model.mjs';
+// A dispatched lane is an AGENT-started session by construction — this script
+// only ever runs because an orchestrator invoked it. Declare that provenance at
+// creation so the picker can fold these rows out of the human's way (they are
+// still reachable by URL/search/"N more"). Best-effort and never fatal.
+import { recordSessionProvenance } from '../src/lib/session-provenance.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -362,6 +367,11 @@ async function dispatchAnthropic() {
 
     let parsed = null;
     try { parsed = JSON.parse(stdoutBuf); } catch { /* not JSON — handled below */ }
+    // Provenance is declared the moment the session id is known — on success OR
+    // failure, since a failed turn still wrote a row into the store.
+    if (parsed && typeof parsed.session_id === 'string') {
+      recordSessionProvenance(parsed.session_id, 'agent', { source: 'dispatch:anthropic' });
+    }
     if (!parsed) {
       progress(`dispatch failed [transport] (provider anthropic): unparseable output (exit ${code}) — ${(stdoutBuf || stderrBuf || 'no output').slice(0, 200)}`);
       writeMeta({ exitCode: 1, failureKind: 'transport' });
@@ -436,6 +446,10 @@ async function dispatchOpenai() {
       if (m.type === 'system' && m.subtype === 'init') {
         recorder.adoptSessionId(String(m.session_id ?? ''));
         openaiSessionId = m.session_id ?? null;
+        // Same as the anthropic path: a dispatched codex run is agent-started.
+        if (typeof openaiSessionId === 'string') {
+          recordSessionProvenance(openaiSessionId, 'agent', { source: 'dispatch:openai' });
+        }
         recorder.setModel(opts.model ?? null);
         progress(`thread ${m.session_id} started (model ${opts.model ?? 'codex default'}, sandbox ${opts.sandbox}, cwd ${opts.cwd})`);
         continue;

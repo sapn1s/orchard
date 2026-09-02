@@ -48,3 +48,14 @@ docs/bugs/.arch/
 # the tree. Nothing here is ever committed; the migrated ticket lands in
 # docs/bugs/ and its pre-migration text in docs/bugs/archive/.
 docs/bugs/.migrated/
+
+# Ad-hoc adversarial/verification scratch scripts the user drops at the repo
+# root during private modelling work — their names + contents embed a home
+# path, a username and a PRIVATE project name, so an untracked copy made
+# `npm run gate` fail for every lane in the tree. They are the user's local
+# artifacts, predate this checkout's public history, and are never published.
+# Ignored by exact name rather than a broad `*.py` so a future tracked Python
+# tool would still show up. See FEAT-118.
+/adversarial_twosided_budget_fill.py
+/adversarial_twosided_price_drift.py
+/verify_brake_adv.py

@@ -32,7 +32,13 @@
             <span class="wordmark">Orchard</span>
           </span>
           <span class="spacer"></span>
-          <button class="ic" id="fold" title="Hide sidebar" aria-label="Hide sidebar">
+          <!-- A single toggle for the project sidebar. When collapsed its title,
+               aria-label and icon all flip to "Show sidebar" so the way back is
+               discoverable — before, the button kept saying "Hide" while
+               collapsed and a pane the user could not tell how to reopen read as
+               a dead end. The panel glyph mirrors (CSS scaleX on .is-collapsed)
+               so the bar sits on the side the sidebar will grow toward. -->
+          <button class="ic" id="fold" title="Hide sidebar" aria-label="Hide sidebar" aria-expanded="true">
             <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="2" y="3" width="12" height="10" rx="2.2"/><path d="M6.3 3v10"/></svg>
           </button>
           <button class="ic" id="findBtn" title="Search titles and messages" aria-label="Search titles and messages">
@@ -109,6 +115,16 @@
               <span class="m" id="modelChipName"></span>
             </button>
 
+            <!-- FEAT (session-header): the strip is TWO tiers, so the row never
+                 clips off the right edge the way a single overflow-scroll row
+                 did. Tier 1 (before .seal-break) is INTERACTIVE — nav entries
+                 and session selectors, styled as pills you press. Tier 2 (after
+                 the break) is INFORMATIONAL — git / processes / integrations /
+                 permission, styled as quiet readouts, not buttons. flex-wrap +
+                 a full-width .seal-break keeps them on their own lines and lets
+                 each tier reflow instead of hiding chips a person can't reach.
+                 Kept FLAT (all direct children of #seal) so paintPerm's
+                 sealSep.before() and the mount/perm removal queries still hold. -->
             <div class="seal" id="seal">
               <!-- FEAT-066: the persistent entry to the ticket board. Shown for
                    any project that HAS a board (toggled in renderRail); a plain
@@ -134,23 +150,46 @@
                       title="Open this project's settings — model, permissions, isolation, git (Ctrl/⌘ ,)">
                 <span class="g">⚙</span><span>Settings</span>
               </button>
-              <button class="pill" id="isoBtn" aria-haspopup="true" aria-expanded="false" hidden>
+              <span class="seal-vdiv" aria-hidden="true"></span>
+              <!-- FEAT-045 + this-feat: the provider (engine) selector, promoted
+                   from the composer tray into the header so the Anthropic ↔
+                   OpenAI choice reads as a first-class selector next to
+                   isolation. Opens the SAME #provPop the tray button does
+                   (armProvider / paintProvPop), so there is one source of truth.
+                   Shown only when >1 provider is actually available. -->
+              <button class="pill sel" id="provSel" aria-haspopup="true" aria-expanded="false" hidden>
+                <span class="g" id="provSelG">◆</span><span id="provSelN">Anthropic</span>
+                <svg class="cx" width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.4 4 5 6.6 7.6 4"/></svg>
+              </button>
+              <button class="pill sel" id="isoBtn" aria-haspopup="true" aria-expanded="false" hidden
+                      title="Isolation for the next session — how much of this machine the agent may reach">
                 <span class="g" id="isoG">○</span><span id="isoN">Direct</span>
                 <svg class="cx" width="8" height="8" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2.4 4 5 6.6 7.6 4"/></svg>
               </button>
-              <button class="pill" id="insBtn" hidden>
+              <button class="pill" id="insBtn" hidden
+                      title="Instruction templates layered into this project's sessions — click to manage">
                 <span class="g">▤</span><span id="insN">CLAUDE.md only</span><span class="plusn" id="insPlus"></span>
               </button>
+              <span class="seal-break" id="sealBreak" aria-hidden="true"></span>
               <!-- Git at a glance: "is my work safe?" — branch, dirty count,
                    ahead/behind. Hidden for non-repos; click opens the drawer's
-                   Git group where the actions live. -->
-              <button class="pill" id="gitBtn" hidden>
+                   Git group where the actions live. A .readout, not a pill —
+                   it reports, it does not toggle. -->
+              <button class="pill readout" id="gitBtn" hidden>
                 <span class="g">⎇</span><span id="gitN"></span>
               </button>
               <!-- Ambient "running here" for the CURRENT project: ports and
                    count, click opens the Running-here list in settings. -->
-              <button class="pill" id="procBtn" hidden>
+              <button class="pill readout" id="procBtn" hidden>
                 <span class="g">▸</span><span id="procN"></span>
+              </button>
+              <!-- FEAT-116: provider rate-limit window at a glance — "how much of
+                   this engine's window is burned, and when does it reset?" so the
+                   dispatch-now-vs-park call is on-screen. A .readout, not a
+                   button; the full both-providers detail (percent, reset time,
+                   as-of) lives in the tooltip. Painted by paintUsageChip(). -->
+              <button class="pill readout usage" id="usageBtn" hidden>
+                <span class="g">◷</span><span id="usageN"></span>
               </button>
               <!-- FEAT-051: the integrations strip — one chip per attached MCP
                    capability (like browser extension icons). Hollow = planned
@@ -383,6 +422,7 @@
 
         <div class="d-body" id="dBody">
           <div class="view on" id="vSettings"></div>
+          <div class="view" id="vGlobals"></div>
           <div class="view" id="vInstructions"></div>
           <div class="view" id="vLibrary"></div>
           <div class="view" id="vSnapshots"></div>
@@ -406,12 +446,6 @@
            cards, with the glanceable board below. Collapses to a floating badge
            on narrow viewports. Filled by app.js from /api/projects/:id/board. -->
       <aside class="rail" id="rail" aria-label="Needs you">
-        <!-- Hidden at desktop width purely by CSS (.rail-badge{display:none});
-             the narrow media query reveals it. No `hidden` attribute, or it
-             would override the media-query display. -->
-        <button class="rail-badge" id="railBadge" type="button" aria-label="Show what needs you">
-          <span class="g">👤</span><span class="n" id="railBadgeN">0</span>
-        </button>
         <div class="rail-panel" id="railPanel">
           <div class="rail-head">
             <span class="lbl">Needs you</span>
@@ -448,6 +482,20 @@
           <div class="rail-sub" id="railDone" hidden></div>
         </div>
       </aside>
+      <!-- BUG-160: the narrow-width reopen badge is a SIBLING of .rail, not a
+           child. Below 1040px .rail is slid off-screen with `transform`, which
+           makes a transformed ancestor the containing block for any
+           position:fixed descendant — so a badge nested inside .rail resolved
+           its `position:fixed` against the off-screen rail, not the viewport,
+           and vanished with it. As a sibling it has no transformed ancestor and
+           its fixed position lands on the viewport as intended. Hidden at
+           desktop purely by CSS (.rail-badge{display:none}); the narrow media
+           query reveals it. No `hidden` attribute, or it would override the
+           media-query display. app.js's outside-click handler already treats
+           node.railBadge separately, so the move does not affect open/close. -->
+      <button class="rail-badge" id="railBadge" type="button" aria-label="Show what needs you">
+        <span class="g">👤</span><span class="n" id="railBadgeN">0</span>
+      </button>
     </div>
 
     <!-- ───────── ticket dashboard (FEAT-058 / FEAT-082) ─────────

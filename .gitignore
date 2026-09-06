@@ -54,6 +54,12 @@ docs/bugs/.migrated/
 # path, a username and a PRIVATE project name, so an untracked copy made
 # `npm run gate` fail for every lane in the tree. They are the user's local
 # artifacts, predate this checkout's public history, and are never published.
+# Browser MCP scratch snapshots (page-*.yml, console/network logs). Untracked
+# working captures of a live dashboard — they carry private project names/paths
+# and must never be committed; ignoring them keeps the commit-time leak gate
+# clean. See FEAT-125.
+/.playwright-mcp/
+
 # Ignored by exact name rather than a broad `*.py` so a future tracked Python
 # tool would still show up. See FEAT-118.
 /adversarial_twosided_budget_fill.py

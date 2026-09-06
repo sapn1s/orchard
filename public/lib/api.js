@@ -694,6 +694,19 @@ export async function sessionRunning(sessionId) {
   return s && s.v === 1 ? s : null;
 }
 
+/**
+ * FEAT-126 — the DECLARED user-request bindings for a session (binding + title +
+ * source + tickets, NO status). `null` = the route is absent (older server) so
+ * the rail renders exactly as it did before; `[]` = a session that declared
+ * none, which renders the same (no empty section). Every status is joined live
+ * client-side from the board / running snapshot — this fetch carries no status.
+ */
+export async function sessionRequests(sessionId) {
+  const r = await optional(`/api/sessions/${encodeURIComponent(sessionId)}/requests`);
+  if (r === null) return null;
+  return Array.isArray(r.requests) ? r.requests : [];
+}
+
 /* ------------------------------------------------- agent outcomes (FEAT-057) */
 /*
  * What ended and why, recorded by the server with no model in the loop, so it

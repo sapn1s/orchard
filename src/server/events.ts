@@ -110,6 +110,19 @@ export interface LiveAgent {
    * events from an older server (no field) simply carry no stall evidence.
    */
   lastProgressAt?: number;
+  /*
+   * FEAT-126 — the DECLARED attribution of this lane, read once from its charter's
+   * `Dispatch:` line (the tool_use that dispatched it) and stamped at task_started.
+   * This is NOT a derived value the ARCH-003 note forbids: it is a fact the
+   * charter states, keyed 1:1 to the dispatching tool_use_id, stable for the
+   * lane's life. It lets the "Your requests" surface attribute a LIVE lane to the
+   * specific request/ticket it is working, instead of gating the whole session's
+   * liveness onto the board's owner column. Absent ⇒ the lane declared nothing
+   * (undeclared, a gap not a guess) or an older server — the surface degrades to
+   * the owner-column read.
+   */
+  ticket?: string[];
+  request?: string | null;
 }
 
 /**

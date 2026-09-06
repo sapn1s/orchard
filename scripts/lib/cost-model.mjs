@@ -506,10 +506,14 @@ export const DECLARED_PHASES = ['finding', 'fixing', 'verifying'];
 /** The dispatch classes Working Agreement §I defines. */
 export const DISPATCH_CLASSES = CLASS_WORDS;
 
-export const DISPATCH_DECL_KEYS = ['ticket', 'phase', 'round', 'class'];
+export const DISPATCH_DECL_KEYS = ['ticket', 'phase', 'round', 'class', 'request'];
 
 const DECL_LINE_RE = /^\s*dispatch\s*:\s*(.*)$/i;
 const TICKET_ID_ONE = /^(BUG|FEAT|ARCH|TASK)-\d{3,}$/;
+// FEAT-126 — a user-request id the orchestrator DECLARES on the Dispatch line to
+// bind this lane (and, via the ticket id already there, this ticket) to a
+// request. Same shape of fact as `ticket=`: an id, validated, never guessed.
+const REQUEST_ID_ONE = /^REQ-\d+$/;
 
 /** An empty declaration — every field absent, nothing claimed. */
 function emptyDecl() {
@@ -519,6 +523,7 @@ function emptyDecl() {
     phase: null,
     round: null,
     class: null,
+    request: null,
     lines_seen: 0,
     lines_in_fence: 0,
     conflict: false,
@@ -569,6 +574,12 @@ function declValue(key, raw, out) {
     const n = Number(raw);
     if (Number.isInteger(n) && n >= 1) return n;
     out.rejected.push(`round=${raw} (not a positive integer)`);
+    return null;
+  }
+  if (key === 'request') {
+    const id = String(raw).trim();
+    if (REQUEST_ID_ONE.test(id)) return id;
+    out.rejected.push(`request=${raw} (not a request id like REQ-7)`);
     return null;
   }
   // class
@@ -667,13 +678,14 @@ export function stripDispatchDeclarations(text) {
  * CLI formats, then parses its own output back and refuses if it does not
  * round-trip, which makes an unreadable declaration impossible to emit.
  */
-export function formatDispatchDeclaration({ ticket, phase, round, class: cls } = {}) {
+export function formatDispatchDeclaration({ ticket, phase, round, class: cls, request } = {}) {
   const parts = [];
   const t = Array.isArray(ticket) ? ticket.join(',') : ticket;
   if (t) parts.push(`ticket=${t}`);
   if (phase) parts.push(`phase=${phase}`);
   if (round != null) parts.push(`round=${round}`);
   if (cls) parts.push(`class=${cls}`);
+  if (request) parts.push(`request=${request}`);
   return parts.length ? `Dispatch: ${parts.join(' ')}` : null;
 }
 

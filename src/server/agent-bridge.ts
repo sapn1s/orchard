@@ -77,9 +77,11 @@ import { livenessOfBridge, REAP_SWEEP_MS, type EndProviderError, type Liveness }
  */
 import { snapshotOfSession, type RunningSnapshot } from './running-set.ts';
 import * as outcomes from './outcomes.ts';
+import * as requests from './requests.ts';
 import { TranscriptRecorder, resolveOrchardSessionFile } from './orchard-transcripts.ts';
 import { encodeCwd } from '../lib/session-history.ts';
 import { recordSessionProvenance } from '../lib/session-provenance.mjs';
+import { parseDispatchDeclaration } from '../../scripts/lib/cost-model.mjs';
 
 /* ---------------------------------------------------------- slash commands */
 /*
@@ -651,6 +653,16 @@ export class AgentSession {
   #agents = new Map<string, LiveAgent>();
   /** Task tool_use_id -> task_id. Subagent inner messages carry the tool_use_id. */
   #toolUseToAgent = new Map<string, string>();
+  /*
+   * FEAT-126 — the DECLARED attribution of a dispatched lane, read from the
+   * charter's `Dispatch:` line at the tool_use that dispatched it and keyed by that
+   * tool_use_id. Consumed (and deleted) by the matching `task_started`, which
+   * stamps it onto the LiveAgent — a 1:1, exact, charter-stated fact, not the
+   * arrival-time owner resolution ARCH-003 forbids. Bounded by consumption; a
+   * dispatch that never becomes a task simply leaves one stale entry, cleared
+   * wholesale on the turn boundary (`#sweepTurn`-adjacent resets clear the maps).
+   */
+  #dispatchDeclByToolUse = new Map<string, { ticket: string[] | null; request: string | null }>();
   /**
    * ARCH-003 — the SUBAGENT-ISSUED TOOL CALLS THAT ARE CURRENTLY OPEN.
    *
@@ -3457,8 +3469,15 @@ export class AgentSession {
          * assistant text, which renders as if the model said it.
          */
         if (m.is_api_error_message === true) return;
+        // FEAT-126 — observe the ORCHESTRATOR's own turn for a declared
+        // `orchard-request` block and upsert the server-owned binding store.
+        // Main thread only (subagents do not open user requests); the store holds
+        // ONLY the binding+title+source, never a status. Written from a frame this
+        // session already receives — the outcomes.ts precedent, zero model tokens.
+        let mainText = '';
         for (const block of (m.message?.content ?? []) as Record<string, any>[]) {
           if (block.type === 'text' && typeof block.text === 'string' && block.text.length) {
+            if (m.parent_tool_use_id == null) mainText += (mainText ? '\n' : '') + block.text;
             this.#emit({ t: 'text', text: block.text, agentId, agentType });
           } else if (block.type === 'thinking' || block.type === 'redacted_thinking') {
             // Thinking text is empty by design — only the token estimate is real.
@@ -3510,6 +3529,33 @@ export class AgentSession {
               agentId,
               agentType,
             });
+            // FEAT-126 — a Task dispatch carries its lane's charter as `prompt`,
+            // whose first line is the `Dispatch:` declaration. Read the declared
+            // ticket/request ONCE, here, and remember it by this tool_use_id; the
+            // lane's `task_started` (same id) consumes it and stamps the LiveAgent.
+            // Only the main thread opens lanes with a request binding; a subagent's
+            // own Task calls are attributed by ticket alone if it declares one.
+            if (String(block.name) === 'Task') {
+              const prompt = (block.input as Record<string, unknown> | undefined)?.prompt;
+              if (typeof prompt === 'string' && prompt.length) {
+                const d = parseDispatchDeclaration(prompt);
+                if (d.present && (d.tickets || d.request)) {
+                  this.#dispatchDeclByToolUse.set(String(block.id), {
+                    ticket: d.tickets ?? null,
+                    request: d.request ?? null,
+                  });
+                }
+              }
+            }
+          }
+        }
+        // FEAT-126 — after collecting this main turn's text, upsert any request
+        // it declared. Guarded internally to a no-op when nothing was declared.
+        if (mainText) {
+          try {
+            requests.observeAssistantText(this.id, this.project?.id ?? null, mainText);
+          } catch {
+            /* a store write must never take a turn down — the binding is advisory */
           }
         }
         return;
@@ -3588,6 +3634,9 @@ export class AgentSession {
         this.busy = false;
         this.turnStartedAt = null; // BUG-033: a cleared busy clears its clock
         this.#openMainToolCalls.clear(); // BUG-159: main-thread calls end with their turn
+        // FEAT-126 — any dispatch decl not consumed by a task_started this turn
+        // never became a lane; drop it so the map cannot grow across turns.
+        this.#dispatchDeclByToolUse.clear();
         this.#turnUserInitiated = false; // BUG-159: the awaited turn is done; the next open re-marks
         this.lastMainFrameAt = Date.now(); // BUG-159: the boundary is main-thread activity
         if (typeof m.total_cost_usd === 'number') this.totalCostUsd += m.total_cost_usd;
@@ -3991,6 +4040,19 @@ export class AgentSession {
           // BUG-046: the stall detector's evidence clock starts at the start.
           lastProgressAt: Date.now(),
         };
+        // FEAT-126 — stamp the DECLARED attribution the dispatching tool_use
+        // recorded for this exact tool_use_id. A charter-stated, 1:1 fact — not
+        // the arrival-time owner resolution ARCH-003 forbids (that resolved
+        // parentage from a side map whose answer depended on frame order; this is
+        // the lane's own charter, keyed to its own dispatch id). Consumed here.
+        if (agent.toolUseId) {
+          const decl = this.#dispatchDeclByToolUse.get(agent.toolUseId);
+          if (decl) {
+            if (decl.ticket && decl.ticket.length) agent.ticket = decl.ticket;
+            if (decl.request) agent.request = decl.request;
+            this.#dispatchDeclByToolUse.delete(agent.toolUseId);
+          }
+        }
         this.#agents.set(agent.agentId, agent);
         if (agent.toolUseId) this.#toolUseToAgent.set(agent.toolUseId, agent.agentId);
         /*

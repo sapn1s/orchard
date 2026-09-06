@@ -462,6 +462,16 @@
                a stored snapshot (BUG-041/074 — it must not go stale). Pinned at
                the very top so "what's on my plate" is the first glance. -->
           <div class="rail-summary" id="railSummary" hidden></div>
+          <!-- FEAT-126 — "Your requests": the persistent, request-centred status
+               surface. The rail's primary top section (above #railNeeds, which is
+               reused unchanged for real blockers). Each row is a DECLARED user
+               request with two INDEPENDENT channels — execution (is work running
+               now) and completion (are its tickets done) — so "0 lanes running"
+               can never read as "done". Purely additive: a session that declared
+               no requests renders this hidden, and the rail is exactly as before.
+               Painted in renderRail from state.requests joined live against the
+               board + running snapshot; the store holds no status to go stale. -->
+          <div class="rail-sub rail-requests" id="railRequests" hidden></div>
           <!-- FEAT-057 — agent deaths the SERVER recorded, rendered with no
                model in the loop. Above the needs cards on purpose: "3 agents
                stopped — usage limit, resets 13:40" is the thing that changes

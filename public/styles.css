@@ -1084,7 +1084,14 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 }
 .bkmk:hover { color: var(--ink-2); border-color: var(--ink-4); }
 .bkmk svg { display: block; }
-.bkmk.set { color: var(--live); border-color: color-mix(in srgb, var(--live) 45%, var(--hair)); }
+/* `.bkmk.marked`, NOT `.bkmk.set` — a bare `.set` modifier collides with the
+   settings-row rule below (styles.css ~1480), which is same-specificity but
+   later in source order and so blew the 26px pill out to a full-width bar. */
+.bkmk.marked { color: var(--live); border-color: color-mix(in srgb, var(--live) 45%, var(--hair)); }
+/* Filled glyph when a bookmark exists — a persistent, at-a-glance "this session
+   HAS a bookmark" signal (the ribbon it points to is usually scrolled away).
+   currentColor is --live via .bkmk.marked, so no new token is introduced. */
+.bkmk.marked svg path { fill: currentColor; }
 .bkmk[hidden] { display: none; }
 
 /* the "reading older messages…" / "beginning of this session" rails */
@@ -1847,6 +1854,26 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
 }
 .pop .manual input:focus { outline: none; border-color: var(--ink-4); }
 .pop .manual .lbl { font-size: 10.5px; color: var(--ink-4); display: block; margin-bottom: 5px; }
+
+/* FEAT-118 — free-text model escape hatch in the session model popover, so a
+   versioned id the CLI accepts but does not advertise (e.g. claude-opus-4-8)
+   can be set for THIS session, matching the global-defaults drawer. */
+.modelfree { border-top: 1px solid var(--hair-2); margin: 4px 0 2px; padding: 7px 9px 4px; }
+.modelfree .lbl { font-size: 10.5px; color: var(--ink-4); display: block; margin-bottom: 5px; }
+.modelfree-row { display: flex; gap: 6px; }
+.modelfree-row input {
+  flex: 1; min-width: 0; font: inherit; font-family: var(--mono); font-size: 11px;
+  padding: 6px 8px; border-radius: 7px; border: 1px solid var(--hair);
+  background: var(--window); color: var(--ink);
+}
+.modelfree-row input:focus { outline: none; border-color: var(--ink-4); }
+.modelfree-row input::placeholder { color: var(--ink-4); }
+.modelfree-set {
+  font: inherit; font-size: 11px; padding: 6px 11px; border-radius: 7px;
+  border: 1px solid var(--hair); background: var(--window); color: var(--ink); cursor: pointer;
+}
+.modelfree-set:hover { border-color: var(--line-2); background: var(--sunken); }
+.modelfree-set:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* FEAT-089 — reachable "apply the method" opt-out at add time. */
 #picker .pick-method {
@@ -2948,6 +2975,101 @@ button.lag:hover { background: var(--rail); }
 .needs-card.finding.promoted { border-left-color: color-mix(in srgb, var(--live) 65%, transparent); }
 .needs-card .nc-question.ask { margin-top: 6px; font-size: 12px; color: var(--ink); }
 .needs-card .nc-detail { margin-top: 4px; font-size: 11px; color: var(--ink-3); line-height: 1.4; }
+
+/* FEAT-126 — "Your requests": the persistent, request-centred status surface.
+   Strictly the rail's existing visual language — reuses --ink ramp, --hair-2
+   hairlines, the --live moss (execution) and the --st-* status tints
+   (completion), the mono eyebrow/id type, and the .rail-sub .sub-h header. No
+   new hue, no new card primitive; the row is the same title + quiet-metadata
+   shape the board rows (.brow) use, with the two channels as two chips. */
+.rail-sub.requests { display: flex; flex-direction: column; gap: 0; margin-top: 2px; }
+/* The PRIMARY top section: give it more room than a secondary rail section's
+   22vh so a busy session's requests read as a hierarchy rather than scrolling
+   two-at-a-time behind a cap; still bounded so an extreme case can't eat the
+   whole rail (it scrolls past ~half the rail height, like the strip does). */
+.rail-sub.requests { max-height: 46vh; }
+.rail-sub.requests .sub-h { margin-bottom: 4px; }
+.req-row {
+  padding: 8px 2px; border-top: 1px solid var(--hair-2);
+}
+.req-row:first-of-type { border-top: 0; }
+/* The row is a <details>: the SUMMARY (id + title + the two channels) is the
+   always-visible state surface; the body (ticket chips + next-step/source) is
+   collapsed by default so routine detail never occupies the main surface. */
+.req-head {
+  display: flex; flex-direction: column; gap: 5px; cursor: pointer;
+  list-style: none;
+}
+.req-head::-webkit-details-marker { display: none; }
+.req-head:focus-visible { outline: 2px solid var(--st-prog); outline-offset: 2px; border-radius: 4px; }
+.req-head-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+/* A quiet disclosure cue that flips when the row is open. */
+.req-head-line::after {
+  content: '›'; margin-left: auto; color: var(--ink-4); font-size: 11px; flex: none;
+  transition: transform .12s ease;
+}
+.req-row[open] .req-head-line::after { transform: rotate(90deg); }
+.req-id { font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); flex: none; letter-spacing: .04em; }
+.req-title {
+  font-size: 12px; color: var(--ink); min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+/* The two channels: two distinct chips, side by side, so execution and
+   completion never read as one field. Neutral base; only the token tint. */
+.req-badges { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.req-ch {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: .04em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ink) 14%, transparent);
+  color: var(--ink-3); background: var(--sunken);
+}
+.req-ch .req-gl { font-size: 8px; display: inline-block; }
+/* Execution channel — the live moss when running (a slow turn, same as .lag.run),
+   muted when idle, the stall amber (never moss) when stalled. */
+.req-exec.run { color: var(--live); border-color: color-mix(in srgb, var(--live) 45%, transparent); }
+.req-exec.run .req-gl { color: var(--live); animation: turn 3.2s linear infinite; }
+.req-exec.idle { color: var(--ink-4); }
+.req-exec.stall { color: var(--warn, #B0703C); border-color: color-mix(in srgb, var(--warn, #B0703C) 45%, transparent); }
+/* Completion channel — the FEAT-066 status tints, from the board STATUS only. */
+.req-comp.st-done { color: var(--st-done); border-color: color-mix(in srgb, var(--st-done) 45%, transparent); }
+.req-comp.st-prog { color: var(--st-prog); border-color: color-mix(in srgb, var(--st-prog) 45%, transparent); }
+.req-comp.st-needs { color: var(--st-needs); border-color: color-mix(in srgb, var(--st-needs) 45%, transparent); }
+.req-comp.none { color: var(--ink-4); }
+/* Ticket chips — the bound tickets, each tinted by its own board state; a
+   missing one is muted and inert (named honestly, never a fake status). */
+.req-tickets { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.req-tk {
+  appearance: none; cursor: pointer; font: inherit;
+  font-family: var(--mono); font-size: 9px; letter-spacing: .02em;
+  padding: 1px 6px; border-radius: 4px;
+  border: 1px solid var(--hair-2); background: transparent; color: var(--ink-3);
+}
+.req-tk:hover:not(:disabled) { background: color-mix(in srgb, var(--ink) 4%, transparent); color: var(--ink); }
+.req-tk.st-done { color: var(--st-done); }
+.req-tk.st-prog { color: var(--st-prog); }
+.req-tk.st-needs { color: var(--st-needs); }
+.req-tk.missing { color: var(--ink-4); cursor: default; text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--ink-4) 60%, transparent); }
+/* Step 3/4 — the next-step / source meta line inside the collapsed body. Quiet,
+   text-weight affordances; they never compete with the two channel chips above. */
+.req-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 6px; }
+.req-needs, .req-source {
+  appearance: none; cursor: pointer; font: inherit; background: transparent; border: 0; padding: 0;
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; letter-spacing: .02em; color: var(--ink-3);
+}
+.req-needs:hover, .req-source:hover { color: var(--ink); }
+/* The needs dot reuses the decision tint so the route reads as "a blocker below". */
+.req-needs { color: var(--st-needs); }
+.req-needs:hover { color: color-mix(in srgb, var(--st-needs) 70%, var(--ink)); }
+.req-needs-dot { font-size: 7px; }
+.req-source-gl { font-size: 11px; color: var(--ink-4); }
+/* Step 4 — a brief highlight on the message a source jump lands on. */
+.source-flash { animation: source-flash 1.6s ease; }
+@keyframes source-flash {
+  0%, 30% { background: color-mix(in srgb, var(--st-prog) 22%, transparent); }
+  100% { background: transparent; }
+}
 
 /* FEAT-067 — the top-of-rail status summary: a Focus line + a counts strip that
    INDEXES the sections below (it is not a fifth list). Greyscale base; the only

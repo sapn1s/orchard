@@ -46,6 +46,7 @@ import * as decisions from './decisions.ts';
  * renders is authored HERE, not assembled from whatever events it caught.
  */
 import * as outcomes from './outcomes.ts';
+import * as requests from './requests.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
 import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
 import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, knownSlashCommands, knownModels, startZombieReaper, type AgentSession } from './agent-bridge.ts';
@@ -2066,6 +2067,19 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
             ended,
           ),
     });
+    return true;
+  }
+
+  // FEAT-126 — the DECLARED request bindings for a session. Server-owned store,
+  // NO status (every status is joined live client-side from board/snapshot). An
+  // id this server is not driving is not a 404 — it is an honest empty list.
+  if (rest[0] === 'sessions' && rest[1] && rest[2] === 'requests' && rest.length === 3 && m === 'GET') {
+    const sid = rest[1];
+    const s = getSession(sid) ?? liveSessions().find((x) => x.sdkSessionId === sid) ?? null;
+    const ids = [sid, s?.id, s?.sdkSessionId].filter((x): x is string => !!x);
+    const seen = new Set<string>();
+    const list = ids.flatMap((id) => (seen.has(id) ? [] : (seen.add(id), requests.listForSession(id))));
+    sendJson(res, 200, { requests: list });
     return true;
   }
 

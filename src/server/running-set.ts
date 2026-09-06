@@ -80,6 +80,16 @@ export interface RunningEntry {
   state?: 'running' | 'stalled';
   /** Present iff `state === 'stalled'` — the ⚠'s quotable evidence. */
   stall?: StallEvidence;
+  /*
+   * FEAT-126 — the DECLARED attribution carried from the lane's charter Dispatch
+   * line (see LiveAgent.ticket/request). Optional on the wire: an older server, a
+   * survivor lane, or an undeclared dispatch simply carries neither, and the
+   * "Your requests" join falls back to the board owner-column read. This is what
+   * lets a live lane be attributed to a SPECIFIC request rather than lighting up
+   * every request in a session that merely has one lane alive.
+   */
+  ticket?: string[];
+  request?: string | null;
 }
 
 export interface RunningSnapshot {
@@ -160,6 +170,11 @@ function entryFor(a: LiveAgent, source: SnapshotSource, now: number): RunningEnt
     totalTokens: a.totalTokens ?? 0,
     state: verdict.stalled ? 'stalled' : 'running',
     ...(verdict.stalled && verdict.evidence ? { stall: verdict.evidence } : {}),
+    // FEAT-126 — carry the lane's declared attribution through onto the snapshot
+    // entry, so the request surface can read it per-lane. Only present when the
+    // charter declared it (a gap stays a gap, never a fabricated binding).
+    ...(a.ticket && a.ticket.length ? { ticket: a.ticket } : {}),
+    ...(a.request ? { request: a.request } : {}),
   };
 }
 

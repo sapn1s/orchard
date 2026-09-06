@@ -19,6 +19,7 @@ import { parseQuestions, parsePlan, createQuestionCard, createPlanCard, markUnan
 import { createDecideCard } from './lib/decide.js';
 import { ticketView, NOT_RECORDED, WORK_STATE_LABEL, HUMAN_ACTION_LABEL, outstandingBroken, INVISIBLE_CLAIM } from './lib/ticket-record.js';
 import { renderAssistantText } from './lib/digest.js';
+import { renderRequestsInto } from './lib/requests-view.js';
 import { parseHash, formatHash, sameRoute, parseTicketsHash, formatTicketsHash, parseGuideHash, formatGuideHash, parseGitHash, formatGitHash } from './lib/route.js';
 
 /*
@@ -148,13 +149,14 @@ const state = {
   snapStaleAt: 0,
   /** FEAT-057 — undismissed agent deaths the server recorded (rail items). */
   outcomes: [],
+  requests: [],      // FEAT-126 — declared user-request bindings for the open session (no status)
   /** BUG-070 — false = recent/undismissed only; true = "show all" (old + dismissed). */
   showAllOutcomes: false,
   agentText: new Map(), // agentId -> accumulated text
   asks: new Map(),
   threads: new Map(), // 'main' | agentId -> thread (own .pane, own render cursor)
   viewing: 'main',
-  caps: { subagents: null, live: null, running: null, outcomes: null }, // null = unprobed, false = route absent on this server
+  caps: { subagents: null, live: null, running: null, outcomes: null, requests: null }, // null = unprobed, false = route absent on this server
   effective: null,         // EffectiveConfig — what the session really runs with
   /* FEAT-051 — the LIVE session's own tool list (session-init.tools), the
      ground truth for which MCP servers actually attached: an attached server
@@ -587,6 +589,7 @@ const node = {
   boardBtn: $('#boardBtn'),           // FEAT-066 — persistent topbar board entry
   boardBtnN: $('#boardBtnN'),
   railSummary: $('#railSummary'), // FEAT-067 — server-derived top-of-rail status index
+  railRequests: $('#railRequests'), // FEAT-126 — "Your requests" persistent status surface
   railNeeds: $('#railNeeds'),
   railObservations: $('#railObservations'), // FEAT-079 — read-only findings lane
   railStopped: $('#railStopped'), // FEAT-057 — agents that stopped, and why
@@ -3733,9 +3736,23 @@ function paintBookmarkBtn(th = viewedThread()) {
   const key = currentMarkKey();
   const idx = key ? state.bookmarks.get(key) : null;
   const set = Number.isInteger(idx);
-  btn.classList.toggle('set', set);
+  // FEAT-118 r2: `marked`, NOT `set` — `.set` is the settings-row rule
+  // (styles.css) and collides (full-width bar over the transcript).
+  btn.classList.toggle('marked', set);
   const onScreen = set && isOnScreen(th.paneEl.querySelector('[data-i].bookmarked'));
-  btn.title = !set ? 'Bookmark this spot' : (onScreen ? 'Clear bookmark' : 'Jump to bookmark');
+  // One control cycles set → jump → clear; the label names the NEXT action AND
+  // says the cycle, so the button explains itself on hover / to a screen reader
+  // even though the moss ribbon it drops is usually scrolled off screen.
+  if (!set) {
+    btn.title = 'Bookmark this spot — drop a marker here you can jump back to (sets → jumps → clears)';
+    btn.setAttribute('aria-label', 'Set bookmark at the top of the view');
+  } else if (onScreen) {
+    btn.title = 'Bookmark is here — click to clear it';
+    btn.setAttribute('aria-label', 'Clear bookmark');
+  } else {
+    btn.title = 'Jump to your bookmark — then click again there to clear it';
+    btn.setAttribute('aria-label', 'Jump to bookmark');
+  }
   btn.setAttribute('aria-pressed', String(set));
 }
 
@@ -3751,7 +3768,7 @@ function toggleBookmark() {
     state.bookmarks.set(key, here);
     saveMarksSoon();
     paintBookmark(th);
-    say('Bookmarked — the ▸ control returns you here');
+    say('Bookmark set here — the filled bookmark button (top right) jumps you back to it');
     return;
   }
   const mark = th.paneEl.querySelector('[data-i].bookmarked');
@@ -4614,9 +4631,13 @@ function renderMessages(th, messages) {
     // Marker for the scroll<->index mapping: the element(s) this stored message
     // produced carry its absolute index, so the URL can name — and later land
     // on — "the message at the top of the viewport".
-    const mark = Number.isInteger(m.index)
-      ? (n) => { if (n) n.dataset.i = String(m.index); return n; }
-      : (n) => n;
+    const mark = (n) => {
+      if (n && Number.isInteger(m.index)) n.dataset.i = String(m.index);
+      // FEAT-126 Step 4 — stamp the server-generated message uuid so a request's
+      // declared `source` can deep-link to the exact message that opened it.
+      if (n && typeof m.uuid === 'string' && m.uuid) n.dataset.uuid = m.uuid;
+      return n;
+    };
     if (m.role === 'user') {
       for (const b of useful) {
         if (b.type !== 'text') continue;
@@ -4791,6 +4812,9 @@ async function openSession(p, sess, opts = {}) {
   // FEAT-022: a different session must never inherit this one's autonomous mode
   // or station id. Cleared here; re-learned from the `start` ack + refreshAuto.
   state.stationSessionId = null;
+  // FEAT-126 — the outgoing session's request bindings must never show under the
+  // incoming one; cleared here, refetched once this session's id is known.
+  state.requests = [];
   state.autonomous = { autonomous: false, maxTurns: null, turnsDone: 0, remaining: null, stopReason: null };
   // A newly-opened session starts from a clean status slate — none of the
   // PREVIOUS session's error/detached/reconnecting flags may leak into it.
@@ -5093,6 +5117,7 @@ async function refreshRail(force = false) {
     renderRail();
   }
   void refreshOutcomes(); // FEAT-057 — deaths are project-scoped too
+  void refreshRequests(); // FEAT-126 — declared request bindings for the open session
 }
 
 /* ══════════════════════════ FEAT-057 — agents that stopped, and why ═══════
@@ -5146,6 +5171,27 @@ async function refreshOutcomes() {
   state.outcomes = list;
   renderOutcomes();
   if (before !== list.map((o) => `${o.id}:${o.dismissedAt ? 'd' : ''}`).join(',')) renderTree();
+}
+
+/**
+ * FEAT-126 — fetch the DECLARED request bindings for the open session. The
+ * bindings change rarely (only when the orchestrator declares a new request or
+ * updates one), so this is fetched on session/rail changes, not on every running
+ * poll — the live join (execution/completion) is recomputed on every snapshot in
+ * applySnapshot without a refetch. `null` from the API means the route is absent
+ * (older server): the section stays hidden and the rail is exactly as before.
+ */
+async function refreshRequests() {
+  if (state.caps.requests === false) return;
+  const sid = state.stationSessionId || state.sdkSessionId || state.current.sessionId;
+  if (!sid) { state.requests = []; renderRailRequests(); return; }
+  let list;
+  try { list = await api.sessionRequests(sid); }
+  catch { return; /* transient — keep the last honest answer */ }
+  if (list === null) { state.caps.requests = false; return; } // older server — degrade to today's rail
+  state.caps.requests = true;
+  state.requests = list;
+  renderRailRequests();
 }
 
 /** BUG-070 — the recent-view predicate: within 48h and not dismissed. */
@@ -5405,6 +5451,10 @@ function renderRail() {
   // FEAT-067: the server-derived status summary card at the very top of the rail.
   renderRailSummary();
 
+  // FEAT-126: "Your requests" — the persistent, request-centred status surface,
+  // the rail's primary top section above the reused Needs-You cards.
+  renderRailRequests();
+
   reconcileNeeds(needs);
 
   // FEAT-079: OBSERVATIONS — automated, read-only findings (WA-consolidation /
@@ -5574,6 +5624,70 @@ function renderRailSummary() {
     strip.append(chip);
   }
   host.append(strip);
+}
+
+/**
+ * FEAT-126 — paint "Your requests": the persistent, request-centred status
+ * surface. Each row is a DECLARED user request (the server-owned binding store)
+ * joined LIVE against the board + running snapshot into TWO INDEPENDENT CHANNELS:
+ *
+ *   · execution  — is work RUNNING for this request now (moss ▶ N running / idle
+ *                  / stalled), driven by lane/owner presence only.
+ *   · completion — is this request DONE (open · N/M verified · done), driven by
+ *                  ticket STATUS only.
+ *
+ * They are two separate elements from two separate reads (see requests-view.js),
+ * which is the structural guarantee that "0 lanes running" can never render as
+ * "done": completion:'done' requires every bound ticket done regardless of the
+ * lane count, and an idle request with any open ticket reads `idle · open`.
+ *
+ * DEGRADES GRACEFULLY: no declared requests (or an older server with no route) →
+ * the section stays hidden and the rail is exactly as it was before this feature.
+ * The store holds no status, so this join is recomputed every repaint and cannot
+ * go stale. Reads state directly so both renderRail and applySnapshot can repaint
+ * it the instant either the board or the running snapshot changes.
+ */
+function renderRailRequests() {
+  const host = node.railRequests;
+  if (!host) return;
+  renderRequestsInto(host, state.requests ?? [], { board: state.board, snap: state.snap }, {
+    el, clear,
+    onTicket: (id) => void openTicketModal(id),
+    // Step 3 — a 👤 ticket's blocker lives in the REUSED Needs-You rail below; the
+    // row's next-step routes there rather than inventing a second blocker surface.
+    onNeeds: () => {
+      const t = node.railNeeds;
+      if (t && !t.hidden) t.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    },
+    // Step 4 — jump to the user message that opened this request.
+    onSource: (source) => goToSource(source),
+  });
+}
+
+/**
+ * FEAT-126 Step 4 — jump to the message that opened a request. The orchestrator
+ * declares `source`; a transcript entry carries a server-generated `uuid`
+ * (orchard-transcripts.ts) which the user renderer stamps as `data-uuid`, so an
+ * exact uuid match scrolls precisely. Because the orchestrator rarely holds that
+ * server uuid, we ALSO accept a short quote: the first user bubble whose text
+ * contains `source` wins. No match on screen → a quiet no-op (the window renderer
+ * may not have this message loaded); never an error, never a wrong jump.
+ */
+function goToSource(source) {
+  const s = String(source ?? '').trim();
+  if (!s) return;
+  const pane = node.panes ?? document;
+  let target = pane.querySelector?.(`[data-uuid="${(window.CSS?.escape ? CSS.escape(s) : s)}"]`);
+  if (!target) {
+    for (const b of pane.querySelectorAll?.('.you, [data-uuid]') ?? []) {
+      if ((b.textContent ?? '').includes(s)) { target = b; break; }
+    }
+  }
+  if (target) {
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    target.classList.add('source-flash');
+    setTimeout(() => target.classList.remove('source-flash'), 1600);
+  }
 }
 
 /**
@@ -6430,6 +6544,12 @@ function applySnapshot(snap, { trusted = false } = {}) {
   // one honesty invariant (derived live every poll, never a stored snapshot)
   // would break for that count alone.
   renderRailSummary();
+  // FEAT-126 — "Your requests" execution channel reads THIS snapshot's live
+  // running set, so it repaints every time the set changes, for the same honesty
+  // reason as the summary card above: execution status must track the live truth,
+  // never a stored copy. The bindings are not refetched here — only the live join
+  // is recomputed, so idle→running→done moves the instant the snapshot does.
+  renderRailRequests();
   // BUG-159 — the poll/push just told us the main turn is not running while a
   // lane is live (the strand). Any message queued behind the stuck `busy` would
   // otherwise wait for a `turn-end` that may be hours away; deliver it now.
@@ -8213,6 +8333,7 @@ function onEvent(e) {
         if (e.stationSessionId) {
           state.stationSessionId = e.stationSessionId;
           void refreshAuto();
+          void refreshRequests(); // FEAT-126 — the real key for the binding store is known now
         }
         // Driving it now (this socket sent `start` and got acked) — whatever
         // detached/reconnecting state applied before this is resolved.
@@ -10435,8 +10556,25 @@ function paintModelPop() {
    * unseen version) — without this fallback NO row would light up at all,
    * even though the field is plainly inherited, not overridden.
    */
-  const curModelOpt = resolveCurrentModelOpt(POPTS, cur)
-    ?? (('model' in state.overrides) ? null : (POPTS.find((o) => o.v == null) ?? null));
+  const resolvedModelOpt = resolveCurrentModelOpt(POPTS, cur);
+  // FEAT-118: a model the CLI accepts but does NOT advertise in its catalog
+  // (a versioned id like `claude-opus-4-8`, set via the free-text escape hatch
+  // below) resolves to no catalog row. Show it as its own lit row rather than
+  // letting the fallback light "Project default", which would misreport what
+  // this session is actually running. The sentinel is never an element of
+  // POPTS, so no catalog row lights when the current value is custom.
+  // Only a genuine OVERRIDE to a custom id gets its own row: an INHERITED
+  // custom wire id (no session override) must still light the "Project default"
+  // row with its concrete resolved label + "inherited" tag (BUG-021), never a
+  // custom row — otherwise the readout would claim the session overrode a model
+  // it merely inherited.
+  const modelOverridden = ('model' in state.overrides)
+    || !!dockEffective()?.overridden?.includes('model');
+  const curIsCustom = cur != null && resolvedModelOpt == null && modelOverridden;
+  const CUSTOM_CUR = {};
+  const curModelOpt = resolvedModelOpt
+    ?? (curIsCustom ? CUSTOM_CUR
+      : (('model' in state.overrides) ? null : (POPTS.find((o) => o.v == null) ?? null)));
   const fill = (host, opts, current, field, currentOpt) => {
     clear(host);
     for (const o of opts) {
@@ -10489,6 +10627,70 @@ function paintModelPop() {
       text: 'The Codex catalog is reported by the engine itself — it fills in when a Codex session runs.',
     }));
   }
+
+  /*
+   * FEAT-118: the free-text escape hatch for THIS session, mirroring what round
+   * 3 gave the global-defaults drawer. The CLI accepts model ids it does not
+   * advertise in its catalog (a versioned id like `claude-opus-4-8` is not in
+   * supportedModels()), so the session picker must not be stricter than the
+   * tool it drives: the catalog is a convenience, free-text is the escape. The
+   * server validates the shape (dispatch-broker/global-settings MODEL_RE) and
+   * the CLI validates the value at launch. A live session in view switches live
+   * (setModelLive); anything else arms an override for the next session — the
+   * exact same branch the catalog rows above take.
+   */
+  const applyModel = (v) => {
+    if (dockLive()) { setModelLive(v); return; } // BUG-106 — only a live session IN VIEW takes a live change
+    if (v === null) delete state.overrides.model; else state.overrides.model = v;
+    persistOverrides();
+    const live = dockEffective()?.effective;
+    say(live
+      ? `model: ${v ?? 'project default'} — applies to the NEXT session; the one running keeps ${live.model ?? 'its current value'}`
+      : `model: ${v ?? 'project default'} for this session`);
+    paintModelBtn();
+    paintModelPop();
+    paintCrown();
+    drawer.repaintLive?.();
+  };
+  // The currently-set custom value as a real, lit row so it never silently
+  // vanishes into a mislabelled "Project default".
+  if (curIsCustom) {
+    const b = el('button', { class: 'opt', role: 'menuitem', 'aria-pressed': 'true' });
+    b.append(el('span', { class: 'g', text: '●' }));
+    const mid = el('span');
+    mid.append(el('span', { class: 'n', text: cur }));
+    mid.append(el('span', { class: 'd', text: 'custom — not in the CLI’s list' }));
+    b.append(mid);
+    b.addEventListener('click', () => applyModel(cur)); // idempotent re-apply
+    node.modelOpts.append(b);
+  }
+  const free = el('div', { class: 'modelfree' });
+  free.append(el('span', { class: 'lbl', text: 'Other model id' }));
+  const freeRow = el('div', { class: 'modelfree-row' });
+  const freeIn = el('input', {
+    type: 'text',
+    placeholder: 'e.g. claude-opus-4-8',
+    'aria-label': 'Set a model id for this session',
+    value: curIsCustom ? cur : '',
+  });
+  const freeSet = el('button', { type: 'button', class: 'modelfree-set', text: 'Set' });
+  const doSet = () => {
+    const v = freeIn.value.trim();
+    if (!v) return;
+    // Mirror the server's MODEL_RE so a bad shape is caught before the round trip.
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,79}$/.test(v)) {
+      say('model id has forbidden characters — letters, digits and . _ : - [ ] only', true);
+      return;
+    }
+    applyModel(v);
+  };
+  freeSet.addEventListener('click', (e) => { e.stopPropagation(); doSet(); });
+  freeIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); doSet(); } });
+  freeIn.addEventListener('click', (e) => e.stopPropagation());
+  freeRow.append(freeIn, freeSet);
+  free.append(freeRow);
+  node.modelOpts.append(free);
+
   fill(node.effortOpts, EFFORT_OPTS, curE, 'effort');
 }
 
@@ -11027,7 +11229,7 @@ node.jump.addEventListener('click', () => {
   dock.append(leftoff);
   node.leftoff = leftoff;
 
-  const bookmark = el('button', { class: 'bkmk', id: 'bookmark', type: 'button', hidden: '', 'aria-pressed': 'false', title: 'Bookmark this spot' },
+  const bookmark = el('button', { class: 'bkmk', id: 'bookmark', type: 'button', hidden: '', 'aria-pressed': 'false', 'aria-label': 'Set bookmark', title: 'Bookmark this spot — drop a marker here you can jump back to (sets → jumps → clears)' },
     svg(MENU_ICON.pin, 12));
   bookmark.addEventListener('click', toggleBookmark);
   dock.append(bookmark);

@@ -32,6 +32,13 @@ drifts from a short digest format. It is advisory and switchable off per project
 
 ## Quick start
 
+**Platform: Linux, or Windows via WSL2.** The core shells out to Unix commands with no
+portable fallback — `git`, `rg` (ripgrep, for session search), and `cp --reflink=always`
+(for snapshots). Optional extras need more: systemd for the background service and restart
+survival, Docker for container isolation. On native Windows the server boots but these
+features fail one by one without saying why; run it under WSL2 (with `systemd=true` in
+`/etc/wsl.conf` for the background service) instead. macOS is untested.
+
 ```sh
 npm install                       # first time only
 npm start                         # -> http://127.0.0.1:4317

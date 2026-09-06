@@ -9,6 +9,9 @@
  */
 import { execFile, execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export class GitError extends Error {
   readonly status: number;
@@ -307,6 +310,42 @@ export async function init(hostPath: string): Promise<GitStatus> {
   return statusOf(hostPath);
 }
 
+/**
+ * FEAT-130 — the mandatory, fail-closed leak gate on the UI/CLI commit path.
+ *
+ * The UI/CLI `commit()` used to run `git commit` with no gate call, so a commit
+ * from the app bypassed everything on a PUBLIC-bound repo. This runs THIS repo's
+ * scripts/leak-gate.mjs (the SAME gate `npm run gate` and the FEAT-108 agent
+ * path use) against the target repo's STAGED INDEX (--staged), committer identity
+ * AND the pending commit message. FEAT-130 round 2: the gate MUST scan the index,
+ * not the working tree — `git commit` records the staged bytes, so a
+ * working-tree scan was bypassable by staging a secret then cleaning/deleting the
+ * worktree copy. Any hit — or any inability to RUN the gate — REFUSES the commit
+ * (fail-closed): a gate that can be skipped when it errors is not a gate. The
+ * message is written to a temp file so it is scanned exactly as it will be
+ * recorded, without ever becoming shell.
+ */
+const ORCHARD_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+function runCommitLeakGate(hostPath: string, message: string): { ok: boolean; detail: string } {
+  const gate = path.join(ORCHARD_ROOT, 'scripts', 'leak-gate.mjs');
+  if (!fs.existsSync(gate)) return { ok: false, detail: `leak gate not found at ${gate} — refusing to commit unscanned (fail-closed)` };
+  let msgFile = '';
+  try {
+    msgFile = fs.mkdtempSync(path.join(os.tmpdir(), 'orchard-commit-')) + '/COMMIT_MSG';
+    fs.writeFileSync(msgFile, message, 'utf8');
+    execFileSync(process.execPath, [gate, '--summary', '--staged', '--identity', `--commit-msg=${msgFile}`], {
+      cwd: hostPath, stdio: 'pipe', timeout: 60_000,
+    });
+    return { ok: true, detail: '' };
+  } catch (err) {
+    const e = err as { stdout?: Buffer; stderr?: Buffer; message?: string };
+    const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`.trim() || e.message || 'leak gate failed';
+    return { ok: false, detail: out.slice(0, 1500) };
+  } finally {
+    try { if (msgFile) fs.rmSync(path.dirname(msgFile), { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
+  }
+}
+
 /** Commit the index exactly as staged; never stages working-tree files. */
 export async function commit(hostPath: string, input: string | { title?: unknown; description?: unknown; message?: unknown }): Promise<{ committed: string; status: GitStatus }> {
   const title = (typeof input === 'string' ? input : String(input.title ?? input.message ?? '')).trim();
@@ -317,6 +356,9 @@ export async function commit(hostPath: string, input: string | { title?: unknown
   if (!before.dirty) throw new GitError(409, 'nothing to commit — the working tree is clean');
   const staged = await git(hostPath, ['diff', '--cached', '--quiet', '--exit-code']);
   if (staged.code === 0) throw new GitError(409, 'nothing staged to commit');
+  // FEAT-130 — fail-closed leak gate before the commit is created.
+  const gate = runCommitLeakGate(hostPath, description ? `${title}\n\n${description}` : title);
+  if (!gate.ok) throw new GitError(422, `commit refused — leak gate:\n${gate.detail}`);
   const c = await git(hostPath, ['commit', '-m', title, ...(description ? ['-m', description] : []), '--']);
   if (c.code !== 0) throw new GitError(500, `git commit failed: ${c.err || c.out}`);
   const sha = (await git(hostPath, ['rev-parse', '--short', 'HEAD'])).out.trim();

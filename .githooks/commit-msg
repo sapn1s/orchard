@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# FEAT-130 — scan the pending commit MESSAGE for private tokens / credentials /
+# personal email. Git passes the message file path as $1. Fail-closed.
+set -euo pipefail
+
+MSG_FILE="$1"
+ROOT="$(git rev-parse --show-toplevel)"
+GATE="$ROOT/scripts/leak-gate.mjs"
+
+if [ ! -f "$GATE" ]; then
+  echo "commit-msg: leak gate not found at $GATE — refusing (fail-closed)." >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "commit-msg: node not found on PATH — cannot scan the message; refusing (fail-closed)." >&2
+  exit 1
+fi
+
+node "$GATE" --summary --commit-msg="$MSG_FILE"

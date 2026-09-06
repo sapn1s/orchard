@@ -48,7 +48,7 @@ import { fileURLToPath } from 'node:url';
 // detectors that disagree would be a worse bug than the leak. The literals are
 // still split ('saa'+'sis') at their new home, so nothing here or there trips
 // its own gate. See scripts/lib/leak-tokens.mjs.
-import { TOKENS, allowedHitFor } from './lib/leak-tokens.mjs';
+import { scanLine, scanIdentity, scanKeyShapes, allowedHitFor } from './lib/leak-tokens.mjs';
 
 /** Image assets. In TREE mode these are allowlist-gated; in repo mode skipped. */
 const IMG_RE = /\.(png|jpe?g|gif|ico|webp|bmp|tiff?|svg)$/i;
@@ -85,11 +85,29 @@ function walkTree(root) {
 // tree path arg (BUG-102).
 const rawArgs = process.argv.slice(2);
 const SUMMARY = rawArgs.includes('--summary') || rawArgs.includes('--quiet');
+// FEAT-130 — also scan the commit itself, not just working-tree files:
+//   --identity            scan `git config user.name`/`user.email` in the repo
+//   --commit-msg=<path>   scan the pending commit message file
+const SCAN_IDENTITY = rawArgs.includes('--identity');
+// FEAT-130 round 2 — the ENFORCEMENT flag. `git commit` records the STAGED
+// INDEX, not the working tree, so the round-1 working-tree scan could be
+// bypassed by staging a secret and then cleaning/deleting the worktree copy: the
+// gate read the clean/absent worktree, passed, and the commit captured the
+// staged secret. With --staged, REPO mode scans the exact bytes that will be
+// committed — each staged blob read from the index (`git show :<path>`) — for the
+// files `git diff --cached` reports. The COMMIT-BLOCKING paths (git.ts commit(),
+// the pre-commit hook, the agent git-write gate) pass this; `npm run gate` does
+// NOT — it stays a working-tree "am I about to be safe" preflight.
+const STAGED = rawArgs.includes('--staged');
+const COMMIT_MSG_PATH = (rawArgs.find((a) => a.startsWith('--commit-msg=')) ?? '').split('=').slice(1).join('=') || null;
 const argPath = rawArgs.find((a) => !a.startsWith('--'));
 const TREE_MODE = Boolean(argPath);
 
 let scanRoot;
 let files;
+// In --staged mode the file bytes come from the index, not the worktree; readBuf
+// is set to a git-show-of-the-blob reader so the scan loop is source-agnostic.
+let readBuf = (abs) => fs.readFileSync(abs);
 if (TREE_MODE) {
   scanRoot = path.resolve(argPath);
   if (!fs.existsSync(scanRoot) || !fs.statSync(scanRoot).isDirectory()) {
@@ -99,10 +117,35 @@ if (TREE_MODE) {
   files = walkTree(scanRoot);
 } else {
   scanRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
-  // -co --exclude-standard: tracked PLUS untracked-but-not-ignored files, so a
-  // new file headed for the public tree is gated before it is ever `git add`ed.
-  files = execFileSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: scanRoot, encoding: 'utf8' })
-    .split('\0').filter(Boolean);
+  if (STAGED) {
+    // ENFORCEMENT: the bytes to be committed are the STAGED INDEX. Enumerate the
+    // paths git will record (Added/Copied/Modified/Renamed — a Deletion carries
+    // no content to leak) and read each blob straight from the index. This is
+    // immune to any index≠worktree divergence: it never touches the worktree.
+    // Only REGULAR-FILE blobs (mode 100644/100755) are scanned — symlinks
+    // (120000) and gitlinks/submodules (160000) are skipped, matching worktree
+    // mode's `isFile()` skip; `git show :<symlink>` would otherwise scan the raw
+    // link TARGET path (a scratch symlink to this repo would false-positive on
+    // the home path in its target), not committed file content.
+    const staged = execFileSync('git', ['ls-files', '-s', '-z'],
+      { cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).split('\0').filter(Boolean);
+    const modeOf = new Map();
+    for (const rec of staged) {
+      const m = rec.match(/^(\d{6}) [0-9a-f]+ \d\t(.*)$/s);
+      if (m) modeOf.set(m[2], m[1]);
+    }
+    files = execFileSync('git', ['diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z'],
+      { cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+      .split('\0').filter(Boolean)
+      .filter((rel) => { const m = modeOf.get(rel); return m === '100644' || m === '100755'; });
+    readBuf = (_abs, rel) => execFileSync('git', ['show', `:${rel}`],
+      { cwd: scanRoot, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+  } else {
+    // -co --exclude-standard: tracked PLUS untracked-but-not-ignored files, so a
+    // new file headed for the public tree is gated before it is ever `git add`ed.
+    files = execFileSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: scanRoot, encoding: 'utf8' })
+      .split('\0').filter(Boolean);
+  }
 }
 
 let hits = 0;
@@ -117,10 +160,16 @@ const allowedHits = [];
 const emitHit = (s) => { hitLines.push(s); if (!SUMMARY) console.error(s); };
 for (const rel of files) {
   const abs = path.join(scanRoot, rel);
-  if (!fs.existsSync(abs)) continue; // deleted/renamed in working tree but still in index
-  // `ls-files -co` can emit DIRECTORY entries (a nested agent worktree with its
-  // own .git shows up as `path/`); reading one is EISDIR and killed the gate.
-  if (!fs.lstatSync(abs).isFile()) continue;
+  // In --staged mode the content is read from the INDEX (`git show :path`), so
+  // the worktree copy being clean, modified, or absent is irrelevant — that
+  // divergence was the exact round-1 bypass. In worktree/tree mode, skip
+  // deleted/renamed-away paths and non-files (a nested worktree's `path/` dir).
+  if (!STAGED) {
+    if (!fs.existsSync(abs)) continue; // deleted/renamed in working tree but still in index
+    // `ls-files -co` can emit DIRECTORY entries (a nested agent worktree with its
+    // own .git shows up as `path/`); reading one is EISDIR and killed the gate.
+    if (!fs.lstatSync(abs).isFile()) continue;
+  }
 
   if (IMG_RE.test(rel)) {
     // TREE mode: a non-allowlisted image IS a leak (pixels can carry private
@@ -133,28 +182,80 @@ for (const rel of files) {
     }
     continue;
   }
-  if (BIN_SKIP_RE.test(rel)) continue;
-
-  const buf = fs.readFileSync(abs);
-  if (buf.includes(0)) continue; // binary
+  let buf;
+  try { buf = readBuf(abs, rel); }
+  catch (e) {
+    // Fail-closed: a staged blob we cannot read is not a blob we can clear.
+    console.error(`LEAK GATE: ABORT — cannot read ${STAGED ? 'staged blob' : 'file'} '${rel}': ${e.message}`);
+    process.exit(2);
+  }
+  // FEAT-130 — binary / skipped files were a blind spot: a secret embedded in a
+  // font/pdf/zip or any NUL-containing blob was never scanned. We do not run the
+  // full text scan (email/assignment classes flood on binary noise), but we DO
+  // look for the high-signal KEY/PEM shapes, which have negligible false-positive
+  // risk. Images are excluded — their pixels are handled by TREE-mode allowlist.
+  if (BIN_SKIP_RE.test(rel) || buf.includes(0)) {
+    for (const { token, match } of scanKeyShapes(buf.toString('latin1'))) {
+      hits++;
+      perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
+      emitHit(`${rel}:0: [${token}] embedded in binary/skipped file: ${String(match).slice(0, 80)}`);
+    }
+    continue;
+  }
   const lines = buf.toString('utf8').split('\n');
   lines.forEach((line, i) => {
-    for (const t of TOKENS) {
-      if (t.re.test(line)) {
-        const allowed = allowedHitFor(rel, t.name, line);
-        if (allowed) {
-          allowedHits.push(`${rel}:${i + 1}: [${t.name}] ALLOWED — ${allowed.why}`);
-          continue;
-        }
-        hits++;
-        perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
-        emitHit(`${rel}:${i + 1}: [${t.name}] ${line.trim().slice(0, 160)}`);
+    for (const { token } of scanLine(line)) {
+      const allowed = allowedHitFor(rel, token, line);
+      if (allowed) {
+        allowedHits.push(`${rel}:${i + 1}: [${token}] ALLOWED — ${allowed.why}`);
+        continue;
       }
+      hits++;
+      perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
+      emitHit(`${rel}:${i + 1}: [${token}] ${line.trim().slice(0, 160)}`);
     }
   });
 }
 
-const mode = TREE_MODE ? `TREE ${scanRoot}` : 'REPO (git-tracked)';
+// FEAT-130 — scan the commit itself: the message and the committer identity.
+// These carry the SAME token set as file content (a personal email in a commit
+// message, or a personal address as `git config user.email`, is just as public
+// once pushed). Fail-closed: if the identity cannot be read, that is a refusal.
+if (COMMIT_MSG_PATH) {
+  let msg = '';
+  try { msg = fs.readFileSync(path.resolve(COMMIT_MSG_PATH), 'utf8'); }
+  catch (e) {
+    console.error(`LEAK GATE: ABORT — cannot read commit-msg file '${COMMIT_MSG_PATH}': ${e.message}`);
+    process.exit(2);
+  }
+  msg.split('\n').forEach((line, i) => {
+    for (const { token } of scanLine(line)) {
+      hits++;
+      perFile.set('COMMIT_MSG', (perFile.get('COMMIT_MSG') ?? 0) + 1);
+      emitHit(`COMMIT_MSG:${i + 1}: [${token}] ${line.trim().slice(0, 160)}`);
+    }
+  });
+}
+if (SCAN_IDENTITY) {
+  let name = '';
+  let email = '';
+  try {
+    name = execFileSync('git', ['config', 'user.name'], { cwd: scanRoot, encoding: 'utf8' }).trim();
+  } catch { /* unset name is allowed; email is what matters */ }
+  try {
+    email = execFileSync('git', ['config', 'user.email'], { cwd: scanRoot, encoding: 'utf8' }).trim();
+  } catch {
+    console.error('LEAK GATE: ABORT — committer email is unset; refusing to commit without a verifiable identity.');
+    process.exit(2);
+  }
+  for (const { token, match } of scanIdentity(name, email)) {
+    hits++;
+    perFile.set('IDENTITY', (perFile.get('IDENTITY') ?? 0) + 1);
+    emitHit(`IDENTITY: [${token}] ${String(match).slice(0, 160)}`);
+  }
+}
+
+const mode = TREE_MODE ? `TREE ${scanRoot}` : STAGED ? 'REPO (staged index)' : 'REPO (git-tracked)';
 // Report the sanctioned waivers on EVERY run, pass or fail. A gate that quietly
 // stops looking at something is how the next leak ships.
 // stdout, not stderr: on a PASS this is the only trace of the exemption, and it

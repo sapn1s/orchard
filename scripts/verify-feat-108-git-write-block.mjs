@@ -62,7 +62,7 @@ const WRITES = [
   'git rm file', 'git mv a b', 'git commit --amend', 'git tag v1', 'git merge x',
   'git rebase main', 'git cherry-pick abc', 'git revert abc', 'git clean -fd',
   'git pull', 'git fetch', 'git clone https://x', 'git init', 'git gc',
-  'git config user.email a@b.com', 'git config --global user.name X',
+  'git config user.email a@example.invalid', 'git config --global user.name X',
   'git remote add origin url', 'git branch newbranch', 'git worktree add /tmp/x',
   'git update-ref refs/heads/x HEAD', 'git symbolic-ref HEAD refs/heads/y',
   'git notes add -m x', 'git submodule update --init', 'git filter-branch',
@@ -154,7 +154,7 @@ try {
 const EVASIONS_CAUGHT = [
   ['git -C /some/repo commit -m x', 'git -C <path>'],
   ['git --git-dir=/r/.git --work-tree=/r commit -m x', 'git --git-dir='],
-  ['git -c user.email=a@b.com commit -m x', 'git -c <config>'],
+  ['git -c user.email=a@example.invalid commit -m x', 'git -c <config>'],
   ['git ci', 'git-internal alias (deny-by-default)'],
   ['git zzznewverb', 'unknown/future subcommand (deny-by-default)'],
   ['echo hi && git commit -m x', 'chained after &&'],

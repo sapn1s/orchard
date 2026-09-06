@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# FEAT-130 — unbypassable-by-default leak gate for HAND `git commit`.
+#
+# Runs THIS repo's scripts/leak-gate.mjs over the STAGED INDEX (--staged) AND the
+# committer identity before any commit is created. FEAT-130 round 2: the gate
+# scans the index, not the working tree — `git commit` records the staged bytes,
+# so a working-tree scan was bypassable by staging a secret then cleaning the
+# worktree copy. Fail-closed: a leak, OR any inability to run the gate, refuses
+# the commit. Wired via `git config core.hooksPath .githooks`
+# so it is active without living in the untracked .git/hooks (and is reviewable in
+# the tree). NOTE: `git commit --no-verify` still bypasses hooks — that residual is
+# why the app/agent commit paths gate IN CODE (src/server/git.ts, claude-runtime.ts),
+# where --no-verify is not reachable.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+GATE="$ROOT/scripts/leak-gate.mjs"
+
+if [ ! -f "$GATE" ]; then
+  echo "pre-commit: leak gate not found at $GATE — refusing to commit unscanned (fail-closed)." >&2
+  exit 1
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "pre-commit: node not found on PATH — cannot run the leak gate; refusing (fail-closed)." >&2
+  exit 1
+fi
+
+node "$GATE" --summary --staged --identity

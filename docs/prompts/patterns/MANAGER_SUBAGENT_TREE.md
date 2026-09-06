@@ -34,6 +34,13 @@ managers, never reaches past them into their sub-agents.
 4. The orchestrator only reads domain-level reports — never raw sub-agent
    output — keeping its own context budget flat regardless of how many
    sub-agents any one domain used internally.
+5. Every charter — the orchestrator's brief to a manager, and a manager's brief
+   to a sub-agent — instructs the lane to END with a **compact handoff, not a
+   report** (WA §I): a verdict + the decisions the caller must take + a durable
+   pointer (ticket id + Activity-log entry, report id + timestamp). Full detail
+   goes to the Activity log; the caller harvests it on demand. A manager
+   synthesizes its sub-agents' handoffs into ONE compact domain handoff — it does
+   not forward their prose upward.
 
 ## Failure modes to avoid
 - Orchestrator bypassing a manager to talk to its sub-agents directly —

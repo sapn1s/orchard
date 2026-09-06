@@ -45,7 +45,28 @@ Round 14's +1.5 KB is the one place that ratio was knowingly not met, and the
 justification is recorded under "Inside a block" below: the addition is a WORKED
 EXAMPLE, and an example is the part that cannot be moved below the end marker —
 the agent writing the reply never reads this file, only the core.
+
+ARCH-016 added the lane-final-message contract (a definition + one rule, +~440
+bytes, core section observed 5687), and the budget assertion in verify:feat-084
+was raised 5500 -> 5900 with the reasoning recorded at the check. It meets the
+ratio (one rule, ~six lines) and it is the enforcement surface for the ticket's
+primary lever: the money is the parent REPLAYING lane-result prose every turn,
+not this one-time per-session core, so paying ~440 bytes here to make every lane's
+FINAL message compact at the source is the trade the ticket decided from data.
+
+FEAT-125 added the "How much to write" length budget (a word ceiling + the
+deletion test + a do-not-cut list, ~775 bytes) IN PLACE OF round 14's worked
+narrative/shaped EXAMPLE, which it removed from the core (net section 5687 ->
+5880, cap unchanged at 5900). This deliberately reverses round 14's "the example
+cannot leave the core" call, and here is why the trade is right: the user's live,
+repeated complaint is total VOLUME ("they all talk too much"), which two prior
+"be concise" rules failed to move; the in-block SHAPE rules the example
+illustrated survive in full above, and the fuller worked examples still live
+below this marker for humans. A quantity budget the agent must obey outranks a
+second in-core illustration of a rule already stated. Enforcement is still docs
+only (advice); a mechanical length gate is filed as the follow-up.
 -->
+
 
 <!-- response-format-inject:start -->
 ## Response format (agent core)
@@ -65,12 +86,14 @@ message with one fenced block, info-string `orchard-digest`, holding JSON:
 
 - At most once, at the very top; only whitespace may precede it.
 - One sentence per item — a scan surface, not the explanation.
-- `kind`: `decision` | `done` | `in-flight` | `fyi`. Aliases: `decision-needed`/
-  `needs-you`→decision, `changed`/`completed`→done, `in-progress`/`wip`→in-flight,
-  `info`/`note`→fyi; unknown→fyi.
+- `kind`: `decision` | `done` | `in-flight` | `fyi` (common aliases map in;
+  unknown→fyi).
 - `importance`: `high` | `med` | `low` (default `med`). **No emojis, ever.**
-- `ref` (optional): a ticket id becomes a deep link; any other string is an inert label.
+- `ref` (optional): a ticket id → a deep link; any other string is an inert label.
 - Ephemeral: THIS turn's state only. Do not accumulate or duplicate the board.
+
+**Opening a request.** When the user asks for something NEW, lead with an
+`orchard-request` fence — `{ "id":"REQ-N", "title":"…", "source":"<short quote>", "tickets":["FEAT-1"] }` — for the "Your requests" rail. Latest-wins per id.
 
 **Layer 2 — every part of the reply carries a category.** Each is a fenced
 block; **open with 4 backticks** so ordinary ```code``` fences inside survive:
@@ -103,36 +126,42 @@ Six names, three pairs. One question picks each pair, one word picks within it:
 - **Repeat freely, in any order** (the digest is the exception: once, first).
   Blocks never nest. `orchard-*` is a reserved namespace — do not invent names.
   An `orchard-*` fence inside a COLLAPSED block (`orchard-finding`,
-  `orchard-narration`) ends the fold there — never, not even as an example.
+  `orchard-narration`) ends the fold there — never, even as an example.
 
 **Inside a block: lines, not paragraphs.** The category says what a passage IS;
 this is its shape. A reader takes one fact without reading a sentence to its end.
 
-- **One line, one job.** Claim, evidence, consequence are separate lines, never
-  one sentence carrying all three. The lead line is the claim, no wind-up.
+- **One line, one job.** Claim, evidence, consequence on separate lines, never
+  one sentence. The lead line is the claim, no wind-up.
 - **Every line is a complete claim, not a fragment.** Shape is not compression.
 - **Cut flow-only connectives** — "which is why", "the honest part is". Carries
-  a reason → make it its own lead line; only smooths → delete it.
-- **Parallel things, parallel slots**, same order every time — options, lanes,
-  defects — one per line, its cost in the same position, so the reader compares
-  down a column instead of re-reading.
+  a reason → its own lead line; only smooths → delete.
+- **Parallel things, parallel slots**, same order every time — one per line, its
+  cost in the same position, so the reader compares columns.
 - `ask` and `judgment` keep the whole argument: an option without its price is
   not a decision. Shape it, do not shorten it — recommendation, then one line
   per alternative with what that alternative costs.
 
-Narrative, four facts, read as a story:
+**How much to write — length is a budget, not a target.** Default: **≤120 words
+of prose**; **≤250 only** for a final handoff or a pending decision. Block
+wrappers (digest, fences) don't count.
 
-    The renderer had its own idea of what a code fence is, which is why a `#`
-    inside a tilde block became a real heading — and the honest part is that it
-    also leaked `>` markers into code boxes. It is now gone entirely.
+- Keep a sentence only if it adds new evidence, a changed outcome, a material
+  limitation, or a requested decision. Else delete it.
+- Report an unchanged lane or blocker ONCE. Don't spend a turn only confirming a
+  save, a re-read, or that a lane still runs.
+- One sentence of pre-result diagnosis; no hypothesis narration unless it changes
+  an action.
+- **Never cut** (not licence to under-report): an unverified admission;
+  before/after counts and real evidence; anything affecting how a commit is
+  reviewed or staged; a retraction of an earlier claim.
 
-Shaped, same four facts, same length:
-
-    **The renderer had a private fence model.** Split text on backtick runs,
-    called every other chunk code.
-    - `#` in a tilde block -> real heading.
-    - Quoted fence -> `>` markers leaked into the code box.
-    - Deleted; the grammar's own walk now decides.
+**Your FINAL message to your orchestrator is a compact handoff, not a report.**
+State only: the verdict (done / refuted / needs-you + which decision); the
+decisions the orchestrator must take; and a durable pointer — the ticket id + its
+Activity-log entry, and your report id + timestamp. Full detail goes to the
+Activity log, NOT into this message as prose to replay. Use `orchard-outcome` /
+`orchard-finding`; never paste the report body.
 <!-- response-format-inject:end -->
 
 ## Why named fenced blocks, and not one JSON object
@@ -487,6 +516,23 @@ This is also what makes "split a compound passage" a cheap instruction rather
 than a restructuring: the two halves just become two adjacent blocks. The renderer keeps document order. `orchard-digest` is the one
 exception: at most once, and it must lead.
 
+**The renderer is lenient about "must lead", so a lead-in never costs the rail
+(BUG-155).** Authors should still put the digest first — that is the injected
+rule. But 3.2% of real digests shipped one short sentence below the top ("Found
+it.", "Clear recommendation: …") and were dropped, their raw JSON dumped as a
+wall of prose. The renderer now:
+
+- **Lifts a well-formed fence behind a SHORT lead-in** — at most 3 non-blank
+  lines and 200 characters, with no code fence before it — and renders the
+  lead-in as prose *above* the rail. The bound is deliberate: a digest deep in a
+  message, or after a code block, is body content, not the message's summary, so
+  it is not lifted here.
+- **Never renders a digest's raw JSON as prose, at any position (the floor).** A
+  digest that beat the lead-in bound, or a genuine second digest in the body, is
+  painted as a real rail in document order if its JSON is valid; a malformed one
+  degrades to a *contained code block*, exactly the fallback a malformed leading
+  digest already gets. The worse-than-nothing JSON wall is structurally gone.
+
 ### What makes a region inert
 
 Four rounds of this grammar shipped the same defect in different clothes: each
@@ -761,9 +807,15 @@ Consequences:
   This is the reported half of "uncertainty resolves visible **and** reported":
   the reader loses nothing, and the author is told their block did not take.
 - Malformed `orchard-digest` JSON → unchanged FEAT-083 behaviour: the digest is
-  dropped and the whole message renders as ordinary prose. (This is rule 4, not an
-  exception to rule 3: the digest is *structured data*, and a message whose lead
-  envelope will not parse has no reliable structure to trust.)
+  dropped and the whole message renders as ordinary prose, its fence shown as an
+  ordinary code block. (This is rule 4, not an exception to rule 3: the digest is
+  *structured data*, and a message whose lead envelope will not parse has no
+  reliable structure to trust.)
+- Body-position `orchard-digest` (behind a lead-in past the tolerance bound, or a
+  second digest) → **never raw JSON prose (BUG-155)**. Valid JSON paints a real
+  rail in document order; malformed JSON degrades to a contained code block, the
+  same fallback as a malformed leading digest. This is the *floor*: no code path
+  renders a digest's JSON body as prose, for any fence position.
 - A message with no blocks, or one whose only fence is unterminated, is rule 4:
   one prose render, byte-for-byte as before the feature existed.
 

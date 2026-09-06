@@ -176,11 +176,16 @@ async function main() {
   // 3716). Round 14 added the in-block prose shape — rules plus a worked
   // narrative/shaped pair — for +1529 bytes, deliberately, because "be concise" as an
   // assertion had already failed here repeatedly and a demonstration is what changes
-  // output. Raised to 5500, which keeps ~250 bytes of headroom AND stays under the
+  // output. Raised to 5500, which kept ~250 bytes of headroom AND stayed under the
   // default maxChars (6000) so the core is delivered whole rather than truncated
-  // mid-rule. Growing past this is a decision, not an accident.
+  // mid-rule. ARCH-016 added the lane-final-message contract (a definition + one rule,
+  // +~440 bytes, observed 5687): the whole point of that change is to cut the parent's
+  // per-turn REPLAY of lane-result prose, a far larger pool than this one-time
+  // per-session core, so paying ~440 bytes here to stop that replay is the trade the
+  // ticket decided from data. Raised to 5900, still under the 6000 maxChars cap so the
+  // core is delivered whole. Growing past this is a decision, not an accident.
   check('responseFormatSection() (default path) reads it, stays condensed (marked core only)',
-    typeof realSec === 'string' && realSec.length > 300 && realSec.length <= 5500
+    typeof realSec === 'string' && realSec.length > 300 && realSec.length <= 5900
       && realSec.length < 6000
       && realSec.includes('orchard-digest') && !realSec.includes('How it degrades (the UI contract)'),
     `len=${realSec?.length}`);

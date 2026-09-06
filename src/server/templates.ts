@@ -302,6 +302,22 @@ export const LOCAL_CONVENTIONS_RELPATH = path.join('docs', 'CONVENTIONS.md');
  *   )
  * i.e. shared WA + project-local conventions first (composed together,
  * universal then local), live board state layered last by the caller.
+ *
+ * TRUNCATION (fixed here after a real, expensive failure): the cap used to cut
+ * mid-word and end with a bare `…`, which is the worst of both worlds — a
+ * project whose doc outgrew the cap silently lost its tail, the SESSION had no
+ * way to know content was missing, and the project author had no signal at all.
+ * On a live-money project that meant a half-delivered safety rule read as a
+ * whole one. Three changes, all universal:
+ *   1. The cap is 6000, not 4000 — the same call already made for
+ *      `responseFormatSection()`: a mid-sentence ellipsis in a RULES document is
+ *      worse than the tokens it saves. This is the project's own operating
+ *      rules; it earns the same headroom the response-format core gets.
+ *   2. Truncation lands on a MARKDOWN BOUNDARY (the last blank line before the
+ *      limit), so a rule is delivered whole or not at all — never half.
+ *   3. Truncation is LOUD: an explicit notice states how many characters were
+ *      dropped and names the file to read, so the omission is a known unknown.
+ * Unchanged for every doc that fits (the common case): byte-identical output.
  */
 export function localConventionsSection(hostPath: string, opts?: { maxChars?: number }): string | null {
   // FEAT-106 — resolved, not the bare legacy relpath: a migrated project's doc
@@ -317,19 +333,40 @@ export function localConventionsSection(hostPath: string, opts?: { maxChars?: nu
   const body = raw.trim();
   if (!body) return null;
 
-  const maxChars = Math.max(200, opts?.maxChars ?? 4000);
-  const parts = [
+  const maxChars = Math.max(200, opts?.maxChars ?? 6000);
+  const header = [
     '# Project Conventions (local)',
     '',
     `_Auto-injected at launch from ${convRel} (read-only). Project-specific rules ` +
       'only — anything universal belongs in the shared Working Agreement instead (see WA §L / ' +
       '`scripts/check-scope.mjs`).',
     '',
-    body,
-  ];
-  let text = parts.join('\n');
-  if (text.length > maxChars) text = `${text.slice(0, maxChars - 1).trimEnd()}…`;
-  return text;
+  ].join('\n');
+
+  const full = header + body;
+  if (full.length <= maxChars) return full;
+
+  // Over the cap. Reserve room for the notice, then cut the BODY at the last
+  // markdown boundary (blank line) that fits, falling back to a hard slice only
+  // when a single block is itself bigger than the budget.
+  const notice = (dropped: number) =>
+    `\n\n---\n\n⚠ **TRUNCATED — ${dropped} of ${body.length} characters of ${convRel} are NOT in this ` +
+    `prompt.** Only the top of the file is injected. The omitted tail may contain rules that apply to ` +
+    `you: READ \`${convRel}\` in full before acting on anything it governs, and do not assume the ` +
+    `rules you can see here are all of them._`;
+  // Two passes: the notice length depends on `dropped`, which depends on the
+  // cut — one re-fit converges because the length only varies by a digit or two.
+  let budget = maxChars - header.length - notice(body.length).length;
+  const cut = (b: number) => {
+    if (b <= 0) return '';
+    const slice = body.slice(0, b);
+    const brk = slice.lastIndexOf('\n\n');
+    return (brk > b * 0.5 ? slice.slice(0, brk) : slice).trimEnd();
+  };
+  let kept = cut(budget);
+  budget = maxChars - header.length - notice(body.length - kept.length).length;
+  kept = cut(budget);
+  return header + kept + notice(body.length - kept.length);
 }
 
 /* ------------------------------------------------------- provider routing */

@@ -1451,8 +1451,13 @@ async function main() {
       !sec.includes('Why named fenced blocks') && !sec.includes('Per-project override'), true);
     // THE COST DISCIPLINE, restated for round 12: the vocabulary tripled, so the
     // budget is the thing that has to hold. Six names + a fallback, one line each.
+    // This bound is the SAME budget verify:feat-084 pins; keep the two in step. It
+    // was left at 4000 when round 14 (FEAT-098) grew the core to ~5245 and raised
+    // only feat-084's copy to 5500; ARCH-016 added the lane-final-message contract
+    // (+~440, observed 5687) and both are now 5900, still under the 6000 maxChars
+    // cap so the core is delivered whole. Growing past this is a decision.
     check('the injected core stays inside its stated budget',
-      sec.length < 4000, { sectionChars: sec.length });
+      sec.length <= 5900 && sec.length < 6000, { sectionChars: sec.length });
   }
 
   if (docPresent) {

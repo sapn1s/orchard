@@ -61,6 +61,17 @@ user — that analysis is the work they delegated. Format: *"I recommend X. Y is
 override. If a question has an obvious or conventional answer, don't ask it — decide, note the
 choice, and move on. (On *where* the decision goes in the reply, see §H.)
 
+**Not every question is the user's to answer — apply the ownership test before every ask.** An
+ask is legitimate ONLY if you can name, in one sentence, both the fork AND the user-held thing that
+decides it: their taste, priority, spend, risk appetite, or project direction. If you cannot name
+that thing, it is not their decision — it is yours. **Sequencing, implementation approach, and
+"which of these should I do first" are never the user's**; pick the best one, note it, proceed.
+Handing over an implementation-ordering choice ("carry the id onto running lanes, or do steps 3-5,
+or prove it end-to-end?") is the neutral-menu defect wearing the costume of deference: it pushes
+your own work back onto the user, who has no stake in the answer and often cannot even tell what is
+being asked. This is checkable per ask, by you or an auditor: no nameable user-held decider →
+delete the ask and decide.
+
 ### F. Own mistakes plainly and briefly
 When wrong — a bad test, a wrong claim, a garbled output — say so in one line, correct it, move
 on. No elaborate justification, no defensive framing, no inventing a rationale for something that
@@ -225,10 +236,27 @@ triggered, not remembered:
 
 ## Working method
 
-### B. Check what already exists before proposing to build or install
+### B. Check what already exists before proposing to build, install — or ASK
 Survey the system / codebase for an existing mechanism before recommending new machinery. Users
 often already have the capability and don't know it. (This is a check of *what exists*, done by
 dispatch or from context you already hold — not licence to read the codebase inline; see §I.)
+
+**The same check gates QUESTIONS, not just builds.** A long-running project accumulates settled
+decisions and standing authorisations; a fresh session that doesn't find them re-asks what the user
+already answered, and re-dispatches work already done. Both spend the thing that is actually
+scarce — the user's attention — on nothing. So **before you put a question to the user, or dispatch
+an agent to build or fix something, confirm from the project's own durable record that it is not
+already settled or already done:** the project's canonical entry doc, its handoff/state doc, the
+owning ticket's log, and whatever ground-truth check the project ships. If the answer is there,
+act on it; don't ask. If you genuinely cannot find it, ask — but say what you checked, so the
+answer can be filed where the next session will find it. (§A decides whether a question is *yours
+or theirs*; this decides whether it is *already answered*. Both must pass.)
+
+**A settled decision that lives only in chat is already lost.** When the user grants a standing
+authorisation or closes a question for good, write it into the project's durable, *auto-loaded*
+context — not just a ticket the next session may never open (§H, §L). Correct any older note that
+now contradicts it in the same pass: a stale line asserting the opposite is worse than silence,
+because it will be believed.
 Treat pre-existing and unrelated changes as user-owned, and **preserve intentional deviations**:
 if something looks "wrong," check whether it is deliberate before normalising it, and ask rather
 than silently "fixing" it.
@@ -242,6 +270,28 @@ disjoint files.**
 **Your context is a liability, not an asset.** Its only defensible contents are what must survive
 across dispatches: decisions, the plan, what each lane was told. File contents, search output, and
 test logs are read once and re-read on every subsequent request.
+
+**What a lane RETURNS is a compact handoff, not a report — the reciprocal rule, and where the
+saving lives.** The orchestrator keeping its own context lean only holds if the lane's FINAL message
+is lean at the source: that message is delivered back as the tool result and then replayed in the
+orchestrator's context every subsequent turn for the life of the session, whether its detail is ever
+needed again or not. So a dispatched lane's final message is exactly three things: **(1) a compact
+verdict/outcome** — done / refuted / needs-you, and which decision it turns on; **(2) the decisions
+or actions the orchestrator must take**; **(3) a durable pointer to the full detail** — the ticket
+id and its Activity-log entry, plus the lane's own report id and timestamp. The full detail goes to
+the ticket Activity log and stays on disk; it does NOT belong in the final message as prose. The
+orchestrator relays the compact form and **never pastes a lane's report into its own context** —
+measured, lane-result prose replayed every turn was the single largest reducible line of a long
+session's cost, buying recall that was almost never exercised from context.
+
+**Harvest on demand — the retrieval is a machine-detectable trigger, not a default carry.** Because
+the detail is deliberately not held, the orchestrator MUST fetch a lane's full report from ground
+truth (the project's report-by-id read path — this project's is `scripts/harvest-agent.mjs
+<agent-id>`) BEFORE it does any of four things to a detail-dependent finding: **revisits,
+challenges, merges, or implements** it. Those four verbs are the trigger list precisely so a later
+audit can catch a silent non-retrieval — acting on remembered detail instead of harvested detail is
+the failure. The pointer carries a stable report id + timestamp, and the Activity-log entry is the
+durable anchor, so a re-fetch can never resolve to a moved or stale artifact.
 
 **The inline-work threshold — a decision procedure, not a slogan.** Before any tool call of your
 own, ask: **does this need to read anything I do not already have in context?**

@@ -30,7 +30,7 @@ import { TICKET_FILE_RE, parseTicket } from './lib/ticket-schema.mjs';
 import { extractVerifications, provenanceOf } from './provenance-check.mjs';
 import {
   buildPrompt, compose, extractGivens, extractJson, extractVerificationRecords,
-  grade, reconcileRelations, splitAtActivityLog, validateSet,
+  grade, parseArchiveIndex, reconcileRelations, splitAtActivityLog, validateSet,
 } from './migrate-tickets.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
@@ -474,6 +474,138 @@ section('promotion, rehearsed on a COPY of the real corpus (never the real tree)
   ok('the staging dir is drained by promotion',
     fs.readdirSync(out).filter((f) => TICKET_FILE_RE.test(f)).length === 0);
   fs.rmSync(scratch, { recursive: true, force: true });
+}
+
+/* ═════════════════ 7c. BUG-133 — the archive index is CUMULATIVE, never rewritten */
+section('the archive index survives a partial promotion (BUG-133)');
+
+{
+  // parseArchiveIndex on the REAL archive index — the exact artifact a real
+  // incremental promotion would read back and merge into.
+  const realIndexPath = path.join(BUGS, 'archive/INDEX.md');
+  if (fs.existsSync(realIndexPath)) {
+    const p = parseArchiveIndex(fs.readFileSync(realIndexPath, 'utf8'));
+    const dataRows = fs.readFileSync(realIndexPath, 'utf8').split('\n').filter((l) => /^\| \[/.test(l)).length;
+    ok(`parseArchiveIndex reads back every row of the real ${dataRows}-row archive index with no parseError`,
+      p.hadTable && p.parseError === null && p.rows.length === dataRows, `parsed ${p.rows.length}/${dataRows}, err=${p.parseError}`);
+    ok('every parsed row carries id, file, a 64-hex sha256 and an archived date',
+      p.rows.every((r) => r.id && r.file && /^[0-9a-f]{64}$/.test(r.sha256) && r.archived));
+  }
+  // A table whose row cannot be read back is a REFUSE signal, never a silent 0.
+  const mangled = '# Archive\n\n| ID | Original title | Bytes | sha256 | Archived |\n|---|---|---|---|---|\n| [BUG-001](BUG-001-x.md) | title | 12 | not-a-sha | 2026-08-20 |\n';
+  ok('parseArchiveIndex flags an unreadable data row as parseError, not as zero rows',
+    parseArchiveIndex(mangled).parseError !== null);
+  // No table at all → clean empty, no false alarm.
+  ok('parseArchiveIndex returns hadTable:false with no error when there is no table', parseArchiveIndex('# nothing here\n').hadTable === false);
+
+  // A cumulative-promotion rehearsal on a COPY of the real corpus. Seed the
+  // archive index with the REAL index MINUS the rows for the tickets we promote,
+  // so those are genuinely new; then assert the prior rows survive byte-for-byte.
+  const promoteFiles = ticketFiles.slice(0, 6);
+  const promoteSet = new Set(promoteFiles);
+  const realIndex = fs.existsSync(realIndexPath) ? fs.readFileSync(realIndexPath, 'utf8') : null;
+  const priorLines = realIndex
+    ? realIndex.split('\n').filter((l) => { const m = /^\| \[[^\]]+\]\(([^)]+)\)/.exec(l); return /^\| \[/.test(l) ? !(m && promoteSet.has(m[1])) : true; })
+    : null;
+
+  const mkFixture = (name, seedIndex) => {
+    const scratch = path.join(SCRATCH_ROOT, `bug133-${name}`);
+    fs.rmSync(scratch, { recursive: true, force: true });
+    const dir = path.join(scratch, 'bugs');
+    const out = path.join(scratch, 'staged');
+    const archive = path.join(dir, 'archive');
+    fs.mkdirSync(archive, { recursive: true });
+    fs.mkdirSync(out, { recursive: true });
+    for (const f of promoteFiles) {
+      fs.copyFileSync(path.join(BUGS, f), path.join(dir, f));
+      const g = extractGivens(f, readOrig(f));
+      fs.writeFileSync(path.join(out, f), compose(g, goodAnswer(g), { today: '2026-08-19' }).text);
+    }
+    if (seedIndex !== null) fs.writeFileSync(path.join(archive, 'INDEX.md'), seedIndex);
+    spawnSync('git', ['init', '-q', scratch], { encoding: 'utf8' });
+    spawnSync('git', ['-C', scratch, 'add', '-A'], { encoding: 'utf8' });
+    spawnSync('git', ['-C', scratch, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'base'], { encoding: 'utf8' });
+    return { scratch, dir, out, archive };
+  };
+  const apply = (dir, out) => spawnSync(process.execPath,
+    [path.join(HERE, 'migrate-tickets.mjs'), '--promote', '--apply', '--dir', dir, '--out', out, '--today', '2026-08-19'],
+    { cwd: path.dirname(dir), encoding: 'utf8' });
+  const indexOf = (archive) => { const p = path.join(archive, 'INDEX.md'); return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : ''; };
+
+  if (priorLines) {
+    // (1) THE BUG: a small batch onto a many-row index KEEPS every prior row.
+    const seed = priorLines.join('\n');
+    const priorRows = parseArchiveIndex(seed).rows;
+    const { dir, out, archive } = mkFixture('merge', seed);
+    const r = apply(dir, out);
+    const after = indexOf(archive);
+    const afterRows = parseArchiveIndex(after).rows;
+    const afterFiles = new Set(afterRows.map((x) => x.file));
+    ok(`a ${promoteFiles.length}-ticket promotion onto a ${priorRows.length}-row index yields ${priorRows.length + promoteFiles.length} rows, not ${promoteFiles.length}`,
+      r.status === 0 && afterRows.length === priorRows.length + promoteFiles.length, `exit ${r.status}, ${afterRows.length} rows\n${r.stderr?.slice(-300)}`);
+    ok('every pre-existing row survives — none dropped by the partial promotion',
+      priorRows.every((x) => afterFiles.has(x.file)));
+    // Byte-for-byte survival of the prior rows' data lines (title + sha + date).
+    const afterLineSet = new Set(after.split('\n'));
+    const priorDataLines = seed.split('\n').filter((l) => /^\| \[/.test(l));
+    ok('each surviving row is BYTE-IDENTICAL — checksums, titles and archived dates untouched',
+      priorDataLines.every((l) => afterLineSet.has(l)), `${priorDataLines.filter((l) => !afterLineSet.has(l)).length} rows altered`);
+    ok('the merged index is in stable filename order',
+      afterRows.map((x) => x.file).join('\n') === [...afterRows].sort((a, b) => a.file.localeCompare(b.file)).map((x) => x.file).join('\n'));
+  }
+
+  // (2) EMPTY existing index (no INDEX.md at all): the run writes its own rows.
+  {
+    const { dir, out, archive } = mkFixture('empty', null);
+    const r = apply(dir, out);
+    ok('an empty (absent) archive index is populated, not an error',
+      r.status === 0 && parseArchiveIndex(indexOf(archive)).rows.length === promoteFiles.length, `exit ${r.status}`);
+  }
+
+  // (3) DUPLICATE row, same checksum: merging does not double-insert.
+  {
+    const f = promoteFiles[0];
+    const realSha = sha(readOrig(f));
+    const title = /^#\s+(.+)$/m.exec(readOrig(f))?.[1] ?? 'x';
+    const dupSeed = `# Archive\n\n| ID | Original title | Bytes | sha256 | Archived |\n|---|---|---|---|---|\n`
+      + `| [${f.replace(/-.*/, '')}](${f}) | ${title.replace(/[|<]/g, ' ')} | ${Buffer.byteLength(readOrig(f))} | \`${realSha}\` | 2026-08-01 |\n`;
+    const { dir, out, archive } = mkFixture('dup-same', dupSeed);
+    const r = apply(dir, out);
+    const rows = parseArchiveIndex(indexOf(archive)).rows;
+    const forF = rows.filter((x) => x.file === f);
+    ok('a batch that re-lists an already-indexed file (same sha) does not double-insert it',
+      r.status === 0 && forF.length === 1 && rows.length === promoteFiles.length, `exit ${r.status}, ${forF.length} rows for ${f}, ${rows.length} total`);
+  }
+
+  // (4) DUPLICATE row, DIFFERENT checksum: refuses, writes nothing.
+  {
+    const f = promoteFiles[0];
+    const wrongSha = 'a'.repeat(64);
+    const conflictSeed = `# Archive\n\n| ID | Original title | Bytes | sha256 | Archived |\n|---|---|---|---|---|\n`
+      + `| [${f.replace(/-.*/, '')}](${f}) | old title | 999 | \`${wrongSha}\` | 2026-08-01 |\n`;
+    const { dir, out, archive } = mkFixture('conflict', conflictSeed);
+    const before = fs.readFileSync(path.join(archive, 'INDEX.md'), 'utf8');
+    const r = apply(dir, out);
+    ok('a checksum CONFLICT on an already-indexed file refuses (exit 1) and names it',
+      r.status === 1 && /PROMOTION REFUSED/.test(r.stderr) && /already records sha256/.test(r.stderr), `exit ${r.status}\n${r.stderr?.slice(-300)}`);
+    ok('the conflict refusal left the on-disk index BYTE-IDENTICAL',
+      fs.readFileSync(path.join(archive, 'INDEX.md'), 'utf8') === before);
+    ok('the conflict refusal moved NO original into the archive',
+      !fs.existsSync(path.join(archive, f)) && fs.existsSync(path.join(dir, f)));
+  }
+
+  // (5) UNPARSEABLE existing index: refuses rather than silently overwriting it.
+  {
+    const badSeed = `# Archive\n\n| ID | Original title | Bytes | sha256 | Archived |\n|---|---|---|---|---|\n`
+      + `| [BUG-001](BUG-001-x.md) | title | 12 | not-a-real-sha | 2026-08-20 |\n`;
+    const { dir, out, archive } = mkFixture('unparseable', badSeed);
+    const before = fs.readFileSync(path.join(archive, 'INDEX.md'), 'utf8');
+    const r = apply(dir, out);
+    ok('an existing index this fix cannot parse back refuses (exit 1), never silently replaced',
+      r.status === 1 && /PROMOTION REFUSED/.test(r.stderr) && /cannot fully read back/.test(r.stderr), `exit ${r.status}\n${r.stderr?.slice(-300)}`);
+    ok('the unparseable-index refusal left the on-disk index BYTE-IDENTICAL',
+      fs.readFileSync(path.join(archive, 'INDEX.md'), 'utf8') === before);
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════ 8. prompt shape */

@@ -1351,6 +1351,57 @@ export function reconcileRelations(opts) {
 /* ═══════════════════════════════════════════════════════════════ promotion */
 
 /**
+ * READ THE EXISTING ARCHIVE INDEX so a later promotion MERGES into it instead of
+ * rewriting it from its own run (BUG-133). Returns `{ rows, hadTable, parseError }`:
+ *
+ *   rows        the originals table, one `{ id, file, title, bytes, sha256,
+ *               archived }` per data row, with `title` kept EXACTLY as written
+ *               (already table-escaped) so re-emitting it does not double-escape.
+ *   hadTable    the originals header was found at all.
+ *   parseError  non-null when the table was found but a data row could not be
+ *               read back with confidence. This is a REFUSE signal, never a
+ *               "0 rows" fallback: an index we cannot parse is an index whose
+ *               rows we must not silently drop.
+ *
+ * Only the ORIGINALS table is parsed. The "Deliberately NOT migrated" legacy
+ * section is regenerated every run from `--allow-legacy`, and a promotion that
+ * would drop a still-legacy ticket without naming it already REFUSES upstream
+ * (unnamedLegacy), so that section has no silent-loss path of its own.
+ */
+export function parseArchiveIndex(text) {
+  const s = String(text || '');
+  const headerRe = /^\|\s*ID\s*\|\s*Original title\s*\|\s*Bytes\s*\|\s*sha256\s*\|\s*Archived\s*\|\s*$/m;
+  const hm = headerRe.exec(s);
+  if (!hm) return { rows: [], hadTable: false, parseError: null };
+  const lines = s.slice(hm.index).split('\n');
+  // lines[0] header, lines[1] the |---| separator, then data rows.
+  const rows = [];
+  let parseError = null;
+  for (let i = 2; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim()) break;            // blank line ends the table
+    if (/^\s*#/.test(line)) break;      // next `## …` section ends the table
+    if (!/^\s*\|/.test(line)) break;    // anything not a table row ends the table
+    // Split on UNescaped pipes only — a `\|` inside a cell is literal, not a
+    // delimiter (escapeTableCell writes it). A row that does not split into the
+    // five cells the writer emits is not silently reshaped: parseError refuses.
+    const cells = line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map((c) => c.trim());
+    if (cells.length !== 5) {
+      parseError = `a data row split into ${cells.length} cells, not the 5 this index format emits (${JSON.stringify(line.slice(0, 90))})`;
+      break;
+    }
+    const idm = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(cells[0]);
+    const sham = /^`([0-9a-f]{64})`$/.exec(cells[3]);
+    if (!idm || !sham) {
+      parseError = `a data row is missing its linked id or its 64-hex sha256 (${JSON.stringify(line.slice(0, 90))})`;
+      break;
+    }
+    rows.push({ id: idm[1], file: idm[2], title: cells[1], bytes: cells[2], sha256: sham[1], archived: cells[4] });
+  }
+  return { rows, hadTable: true, parseError };
+}
+
+/**
  * §5.6 step 3, as ONE commit's worth of file moves so `git revert` is a complete
  * rollback:
  *   originals  docs/bugs/<f>.md      → docs/bugs/archive/<f>.md   (git mv, verbatim)
@@ -1437,6 +1488,45 @@ export function promote(opts) {
     };
   });
   const today = opts.today ?? new Date().toISOString().slice(0, 10);
+
+  // BUG-133: the archive index is CUMULATIVE PROOF, not this run's manifest. A
+  // previous promotion's rows MUST survive this one. Read the existing index and
+  // MERGE the run's rows into it, in stable filename order — never rewrite the
+  // file from `indexRows` alone (which erased 194 rows with a 2-ticket run).
+  const indexPath = path.join(archiveDir, 'INDEX.md');
+  const prior = parseArchiveIndex(fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '');
+  const byFile = new Map();
+  for (const r of prior.rows) byFile.set(r.file, { ...r, escaped: true });
+  const conflicts = [];
+  for (const r of indexRows) {
+    const ex = byFile.get(r.file);
+    if (ex && ex.sha256 !== r.sha256) {
+      // A file already recorded, now claimed with a DIFFERENT checksum: writing
+      // it would overwrite the proof the old row stood for. Not a merge — a loss.
+      conflicts.push(`${r.file}: the archive index already records sha256 ${ex.sha256} for this file, `
+        + `but this run would write ${r.sha256}. Refusing — overwriting a recorded checksum destroys its proof.`);
+      continue;
+    }
+    // New row, or an identical re-promotion of the same file: set, never append,
+    // so a duplicate is neither double-inserted nor allowed to silently replace.
+    byFile.set(r.file, { id: r.id, file: r.file, title: r.title, bytes: String(r.bytes), sha256: r.sha256, archived: today, escaped: false });
+  }
+  const mergedRows = [...byFile.values()].sort((a, b) => String(a.file).localeCompare(String(b.file)));
+
+  // WOULD-DROP GUARD (success criterion 4): a promotion that would lose or corrupt
+  // an existing entry FAILS LOUDLY and writes NOTHING, rather than truncating the
+  // record. Three ways it could drop: an index we could not parse (rows unknown,
+  // so writing would silently replace them), a sha256 conflict, or — belt and
+  // braces — any prior row absent from the merge.
+  const dropped = prior.rows.filter((r) => !byFile.has(r.file));
+  if (prior.parseError || conflicts.length || dropped.length) {
+    console.error('PROMOTION REFUSED — writing the archive index would drop or corrupt existing rows (BUG-133); nothing was written:');
+    if (prior.parseError) console.error(`  ${indexPath}: ${prior.rows.length} row(s) parsed, then ${prior.parseError}. Refusing rather than overwriting an index this fix cannot fully read back.`);
+    for (const c of conflicts) console.error(`  ${c}`);
+    for (const r of dropped) console.error(`  existing row ${r.id} (${r.file}) would be dropped`);
+    return 1;
+  }
+
   const legacyRows = namedLegacy.map((f) => {
     const id = idFromFilename(f);
     return { id, file: f, reason: allow.get(id) || '(no reason recorded)' };
@@ -1462,7 +1552,7 @@ derived from, so "what did the original say" is one \`rg\` away, permanently.
 
 | ID | Original title | Bytes | sha256 | Archived |
 |---|---|---|---|---|
-${indexRows.map((r) => `| [${r.id}](${r.file}) | ${escapeTableCell(r.title)} | ${r.bytes} | \`${r.sha256}\` | ${today} |`).join('\n')}
+${mergedRows.map((r) => `| [${r.id}](${r.file}) | ${r.escaped ? r.title : escapeTableCell(r.title)} | ${r.bytes} | \`${r.sha256}\` | ${r.archived} |`).join('\n')}
 ${legacySection}`;
 
   // BUG-127: escaping a cell is lossy — a newline becomes a space, `<` becomes
@@ -1476,6 +1566,7 @@ ${legacySection}`;
   ].filter((r) => escapeTableCell(r.raw) !== String(r.raw));
 
   const reportLeftBehind = () => {
+    console.log(`  ARCHIVE INDEX        ${mergedRows.length} rows (${prior.rows.length} kept from the existing index + ${mergedRows.length - prior.rows.length} added by this run)`);
     for (const r of rewritten) {
       console.log(`  CELL ESCAPED         ${String(r.id).padEnd(9)} ${r.field} contained a cell, row or region terminator; the archive index shows ${JSON.stringify(escapeTableCell(r.raw))}`);
     }

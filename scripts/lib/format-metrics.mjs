@@ -58,6 +58,10 @@ const MAX_LINE_BYTES = 24 * 1024;  // one turn's record
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const UNSTRUCTURED_EXCERPT = 240;  // expected case: characterise, do not archive
 
+/* FEAT-125 length budget, read back as measurement ceilings (FEAT-127). */
+const DEFAULT_WORD_CEILING = 120;  // default per-turn prose budget
+const HANDOFF_WORD_CEILING = 250;  // the higher budget for a handoff / pending decision
+
 /* ── paths ──────────────────────────────────────────────────────────────────── */
 
 /** dataDir() mirror — same resolution the Stop hook uses; no server-graph import. */
@@ -71,6 +75,46 @@ export function dataDir() {
 
 export function metricsPath(dir) {
   return path.join(dir ?? dataDir(), 'logs', 'response-format-metrics.jsonl');
+}
+
+/* ── prose-volume metric (FEAT-127) ──────────────────────────────────────────
+ * FEAT-125 gave the length budget as INJECTED ADVICE; discipline has failed the
+ * user twice, so the two failure modes are now MEASURED per graded turn:
+ *   - proseWords : the words a reader actually reads — every category block's
+ *                  body plus loose prose — EXCLUDING the `orchard-digest` JSON and
+ *                  the fence wrappers themselves (block bodies already have their
+ *                  fences stripped by the parser; the digest block is skipped).
+ *   - askBlocks  : how many `orchard-ask` blocks the turn handed over. A turn with
+ *                  more than one ask, or an ask over a decision that was not the
+ *                  user's, is the second failure mode this ticket exists to watch.
+ * ADVISORY BY NATURE: this records numbers, it does not truncate or block. The
+ * Stop hook already cannot cost a turn (advisory), and neither can this — it is a
+ * lens on the transcript, not a gate.
+ *
+ * The word rule matches characterise() EXACTLY (`[A-Za-z][A-Za-z'-]*`), so a
+ * block body and a loose run are counted the same way and proseWords is the sum
+ * of comparable units. */
+const WORD_RE = /[A-Za-z][A-Za-z'-]*/g;
+function wordCount(s) {
+  return (String(s ?? '').match(WORD_RE) || []).length;
+}
+
+/**
+ * Prose words a reader reads this turn, and the number of asks. Pure; derived
+ * from the parseResponseBlocks() result so it needs no transcript re-read.
+ * Digest JSON and fence wrappers are excluded (see the note above).
+ */
+export function proseVolume(parsed) {
+  const blocks = Array.isArray(parsed?.blocks) ? parsed.blocks : [];
+  let words = 0;
+  for (const b of blocks) {
+    if (!b || b.name === 'orchard-digest') continue; // JSON, not prose
+    words += wordCount(b.content);
+  }
+  const runs = Array.isArray(parsed?.fallbackRuns) ? parsed.fallbackRuns : [];
+  for (const r of runs) words += typeof r?.words === 'number' ? r.words : wordCount(r?.text);
+  const askBlocks = Number(parsed?.counts?.['orchard-ask'] || 0);
+  return { proseWords: words, askBlocks };
 }
 
 /* ── record ─────────────────────────────────────────────────────────────────── */
@@ -105,9 +149,12 @@ export function buildRecord(parsed, meta = {}) {
       tags: d.tags,
       excerpt: d.excerpt,
     }));
+  const volume = proseVolume(parsed);
   return {
     v: 2,
     ts: new Date().toISOString(),
+    proseWords: volume.proseWords,
+    askBlocks: volume.askBlocks,
     session_id: typeof meta.session_id === 'string' ? meta.session_id : null,
     cwd: typeof meta.cwd === 'string' ? meta.cwd : null,
     shape: parsed?.shape ?? 'unstructured',
@@ -205,6 +252,17 @@ export function summariseMetrics(file = metricsPath()) {
     /** Co-occurring tag signatures, most frequent first — the "what shape is it" view. */
     signatures: {},
     samples: [],
+    /* ── PROSE VOLUME & ASKS (FEAT-127) — the two failure modes, measured.
+     * proseWords per turn is collected so the report can give mean/median and
+     * count turns over each ceiling; asks are the second axis. Advisory. */
+    proseWordSamples: [],
+    proseWordsMax: 0,
+    overDefaultCeiling: 0,   // > 120 words (the FEAT-125 default budget)
+    overHandoffCeiling: 0,   // > 250 words (the handoff/decision budget)
+    asksTotal: 0,
+    turnsWithAsk: 0,         // >= 1 orchard-ask
+    turnsWithMultipleAsks: 0, // >= 2 orchard-ask in one turn
+    biggestProseTurns: [],   // {ts, proseWords, askBlocks}
   };
   let raw;
   try { raw = fs.readFileSync(file, 'utf8'); } catch { return out; }
@@ -216,6 +274,20 @@ export function summariseMetrics(file = metricsPath()) {
     if (!rec || typeof rec !== 'object') { out.skippedLines++; continue; }
     out.turns++;
     if (rec.shape === 'structured') out.structured++; else out.unstructured++;
+
+    // PROSE VOLUME & ASKS (FEAT-127). Older records (before this field existed)
+    // simply do not contribute — proseWords is absent, not zero, so it is skipped.
+    if (typeof rec.proseWords === 'number') {
+      out.proseWordSamples.push(rec.proseWords);
+      if (rec.proseWords > out.proseWordsMax) out.proseWordsMax = rec.proseWords;
+      if (rec.proseWords > DEFAULT_WORD_CEILING) out.overDefaultCeiling++;
+      if (rec.proseWords > HANDOFF_WORD_CEILING) out.overHandoffCeiling++;
+      out.biggestProseTurns.push({ ts: rec.ts, proseWords: rec.proseWords, askBlocks: Number(rec.askBlocks || 0) });
+    }
+    const asks = Number(rec.askBlocks || rec.counts?.['orchard-ask'] || 0);
+    out.asksTotal += asks;
+    if (asks >= 1) out.turnsWithAsk++;
+    if (asks >= 2) out.turnsWithMultipleAsks++;
     out.fallbackCharsTotal += rec.fallbackChars || 0;
     out.blockCharsTotal += rec.blockChars || 0;
     if (rec.shape === 'structured') {
@@ -262,6 +334,15 @@ export function summariseMetrics(file = metricsPath()) {
   out.fallbackShareStructured = out.structuredTotalChars
     ? out.structuredFallbackChars / out.structuredTotalChars
     : 0;
+
+  // Prose-volume summary stats (FEAT-127).
+  const pv = out.proseWordSamples.slice().sort((a, b) => a - b);
+  out.proseWordsTurns = pv.length;
+  out.proseWordsMean = pv.length ? pv.reduce((n, x) => n + x, 0) / pv.length : 0;
+  out.proseWordsMedian = pv.length ? pv[Math.floor((pv.length - 1) / 2)] : 0;
+  out.asksPerTurn = out.turns ? out.asksTotal / out.turns : 0;
+  out.biggestProseTurns.sort((a, b) => b.proseWords - a.proseWords);
+  out.biggestProseTurns = out.biggestProseTurns.slice(0, 5);
   return out;
 }
 
@@ -278,6 +359,18 @@ export function formatReport(s) {
     `  chars                 : blocks ${s.blockCharsTotal}, fallback ${s.fallbackCharsTotal}`,
     '  blocks used (by category):',
     top(s.blockCounts, 12),
+    '',
+    '  PROSE VOLUME & ASKS (FEAT-127) — the two failure modes, MEASURED not enforced.',
+    '  Advisory: these numbers do not block or truncate a turn; they say whether the',
+    '  FEAT-125 length budget and the ask-ownership rule (WA §A) are actually holding.',
+    `    prose words/turn       : mean ${s.proseWordsMean.toFixed(0)}, median ${s.proseWordsMedian}, max ${s.proseWordsMax}  (over ${s.proseWordsTurns} turns with the field)`,
+    `    over ${DEFAULT_WORD_CEILING}-word budget    : ${s.overDefaultCeiling} turns${s.proseWordsTurns ? ` (${pct(s.overDefaultCeiling / s.proseWordsTurns)})` : ''}`,
+    `    over ${HANDOFF_WORD_CEILING}-word handoff cap: ${s.overHandoffCeiling} turns${s.proseWordsTurns ? ` (${pct(s.overHandoffCeiling / s.proseWordsTurns)})` : ''}`,
+    `    orchard-ask blocks     : ${s.asksTotal} total, ${s.asksPerTurn.toFixed(2)} per turn; ${s.turnsWithAsk} turns had an ask, ${s.turnsWithMultipleAsks} had MORE THAN ONE`,
+    '    biggest prose turns (words / asks):',
+    (s.biggestProseTurns.length
+      ? s.biggestProseTurns.map((t) => `      ${String(t.proseWords).padStart(5)}w  ${t.askBlocks} ask  ${t.ts}`).join('\n')
+      : '      (none)'),
     '',
     '  DECLARED UNCATEGORIZED — the author reached for the vocabulary and nothing fit.',
     '  This is the signal the design exists to produce: a repeated label here NAMES',

@@ -240,6 +240,74 @@ try {
     '(g) fresh onboard-authored CLAUDE.md is not double-appended by --wa-pointer',
     (freshClaudeMd.match(/orchard:wa-pointer:start/g) ?? []).length === 0
   );
+
+  // -------------------------------------------------------------------
+  // (h) FEAT-121 — a target with NO package.json: onboard now CREATES a
+  // minimal one wiring the board scripts, so the emitted docs' `npm run`
+  // commands actually resolve (the trading_volume half-onboarding trap),
+  // and the post-onboard smoke check PASSES + exits 0.
+  // -------------------------------------------------------------------
+  const noPkgDir = path.join(tmpRoot, 'scratch-no-package-json');
+  fs.mkdirSync(noPkgDir, { recursive: true });
+  const noPkgRun = runOnboard(noPkgDir);
+  check('(h) onboard on a dir with no package.json exits 0', noPkgRun.code === 0, noPkgRun.out);
+  check('(h) onboard CREATED a minimal package.json', fs.existsSync(path.join(noPkgDir, 'package.json')));
+  const createdPkg = JSON.parse(fs.readFileSync(path.join(noPkgDir, 'package.json'), 'utf8'));
+  check(
+    '(h) created package.json wires board:check/board:gen/arch:watch',
+    createdPkg.scripts?.['board:check'] === 'node scripts/board.mjs check' &&
+      createdPkg.scripts?.['board:gen'] === 'node scripts/board.mjs gen' &&
+      createdPkg.scripts?.['arch:watch'] === 'node scripts/arch-watch.mjs --persist',
+    JSON.stringify(createdPkg.scripts)
+  );
+  check('(h) onboard output reports the post-onboard SMOKE PASS', /SMOKE PASS/.test(noPkgRun.out), noPkgRun.out);
+  const noPkgBoardCheck = runBoardCheck(noPkgDir);
+  check('(h) the documented `npm run board:check` actually runs via the created package.json', noPkgBoardCheck.code === 0, noPkgBoardCheck.out);
+
+  // -------------------------------------------------------------------
+  // (i) FEAT-121 — standalone `--verify-only` FAILS loudly and specifically
+  // on a half-onboarded project (docs reference npm-run commands, no
+  // package.json to resolve them), exiting 1 and naming the dead script +
+  // the file that references it. This is the trading_volume class.
+  // -------------------------------------------------------------------
+  const halfDir = path.join(tmpRoot, 'scratch-half-onboarded');
+  fs.mkdirSync(path.join(halfDir, 'docs', 'bugs'), { recursive: true });
+  // Emit the same docs onboard writes, but withhold the package.json.
+  fs.writeFileSync(
+    path.join(halfDir, 'CLAUDE.md'),
+    'This board (`docs/bugs/`) tracker — `npm run board:check` catches drift.\n'
+  );
+  fs.writeFileSync(
+    path.join(halfDir, 'docs', 'bugs', 'README.md'),
+    '`npm run board:check` reconciles. `npm run board:gen` rewrites. `npm run arch:watch` clusters.\n'
+  );
+  const verifyHalf = runOnboard(halfDir, ['--verify-only']);
+  check('(i) --verify-only on a half-onboarded (no package.json) project exits 1', verifyHalf.code === 1, verifyHalf.out);
+  check('(i) --verify-only names the dead `npm run board:check` reference', /npm run board:check/.test(verifyHalf.out), verifyHalf.out);
+  check('(i) --verify-only names the file that references it', /CLAUDE\.md/.test(verifyHalf.out), verifyHalf.out);
+  check('(i) --verify-only says the target has NO package.json', /NO package\.json/.test(verifyHalf.out), verifyHalf.out);
+  check('(i) --verify-only wrote NOTHING to the target (no package.json created)', !fs.existsSync(path.join(halfDir, 'package.json')));
+
+  // -------------------------------------------------------------------
+  // (j) FEAT-121 — `--verify-only` PASSES (exit 0) against a properly
+  // onboarded project (the projDir onboarded in (a)-(f) above).
+  // -------------------------------------------------------------------
+  const verifyGood = runOnboard(projDir, ['--verify-only']);
+  check('(j) --verify-only on a properly onboarded project exits 0', verifyGood.code === 0, verifyGood.out);
+  check('(j) --verify-only reports SMOKE PASS', /SMOKE PASS/.test(verifyGood.out), verifyGood.out);
+
+  // -------------------------------------------------------------------
+  // (k) FEAT-121 — an UNPARSEABLE existing package.json is never
+  // overwritten, but onboard fails loudly (exit 1) rather than silently
+  // leaving dead documented commands.
+  // -------------------------------------------------------------------
+  const badPkgDir = path.join(tmpRoot, 'scratch-bad-package-json');
+  fs.mkdirSync(badPkgDir, { recursive: true });
+  fs.writeFileSync(path.join(badPkgDir, 'package.json'), '{ not valid json ');
+  const badPkgRun = runOnboard(badPkgDir);
+  check('(k) onboard with an unparseable package.json exits 1 (loud, not silent)', badPkgRun.code === 1, badPkgRun.out);
+  check('(k) onboard did NOT overwrite the unparseable package.json', fs.readFileSync(path.join(badPkgDir, 'package.json'), 'utf8') === '{ not valid json ');
+  check('(k) onboard reports SMOKE FAIL naming a dead command', /SMOKE FAIL[\s\S]*board:check/.test(badPkgRun.out), badPkgRun.out);
 } finally {
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 }

@@ -482,6 +482,30 @@ function scaffoldWaPointer(targetDir) {
 const COPIED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs', 'lib/board-path.mjs'];
 
 // ---------------------------------------------------------------------------
+// FEAT-121 — the SINGLE SOURCE of the `npm run <x>` commands onboarding wires
+// into a target's package.json. installBoardTool() wires exactly these, and
+// verifyEmittedNpmScripts() (the post-onboard smoke check) reads the SAME map
+// plus the npm-run references parsed out of the emitted DOC templates below, so
+// the checker can never fall behind by "whatever nobody typed" — the recurring
+// hardcoded-list defect class this project keeps hitting. A doc referencing
+// `npm run board:check` in a project with no matching script (or no
+// package.json at all — the trading_volume half-onboarding trap) is now caught
+// loudly at the end of every onboard, and by a standalone `--verify-only` run
+// against an existing project.
+// ---------------------------------------------------------------------------
+const WIRED_NPM_SCRIPTS = {
+  'board:check': 'node scripts/board.mjs check',
+  'board:gen': 'node scripts/board.mjs gen',
+  'arch:watch': 'node scripts/arch-watch.mjs --persist',
+  // FEAT-089: the sanctioned pre-commit gate (leak-gate + typecheck),
+  // invoked as `npm run gate`. Never overwrites a target's own `gate`.
+  gate: 'node scripts/gate.mjs',
+  // BUG-103: the NUL-in-source guard, also run inside `gate`. Wired standalone
+  // too for discoverability. Never overwrites a target's own.
+  'check:nul': 'node scripts/check-nul.mjs',
+};
+
+// ---------------------------------------------------------------------------
 // FEAT-089 — the method's runtime pieces that today live only in THIS repo:
 // the readability/response-format Stop hook and the sanctioned pre-commit gate.
 // Both are general Claude-Code / node capabilities (nothing Orchard-specific in
@@ -708,29 +732,17 @@ function installBoardTool(targetDir, { forceBoardTool }) {
     }
   }
 
-  // Wire npm scripts, if the target has a package.json. Never overwrite an
-  // existing board:check/board:gen script (someone may have customized it) —
-  // only add the two keys if absent.
+  // Wire npm scripts. Never overwrite an existing board:check/board:gen script
+  // (someone may have customized it) — only add the keys if absent.
   const pkgPath = path.join(targetDir, 'package.json');
   if (fs.existsSync(pkgPath)) {
     const pkg = readJson(pkgPath);
     if (pkg) {
       pkg.scripts ??= {};
       let changed = false;
-      const wanted = {
-        'board:check': 'node scripts/board.mjs check',
-        'board:gen': 'node scripts/board.mjs gen',
-        'arch:watch': 'node scripts/arch-watch.mjs --persist',
-        // FEAT-089: the sanctioned pre-commit gate (leak-gate + typecheck),
-        // invoked as `npm run gate`. Never overwrites a target's own `gate`.
-        gate: 'node scripts/gate.mjs',
-        // BUG-103: the NUL-in-source guard, also run inside `gate`. Wired
-        // standalone too for discoverability. Never overwrites a target's own.
-        'check:nul': 'node scripts/check-nul.mjs',
-      };
       const added = [];
       const already = [];
-      for (const [key, value] of Object.entries(wanted)) {
+      for (const [key, value] of Object.entries(WIRED_NPM_SCRIPTS)) {
         if (pkg.scripts[key] === undefined) {
           pkg.scripts[key] = value;
           added.push(key);
@@ -753,16 +765,153 @@ function installBoardTool(targetDir, { forceBoardTool }) {
               : `already had [${already.join(', ')}]`,
       });
     } else {
-      reports.push({ path: pkgPath, label: 'package.json scripts', status: 'SKIPPED (package.json unparseable)' });
+      // Unparseable existing package.json: we must NOT overwrite it (it is the
+      // user's own file). Leave it, and let the smoke check at the end of
+      // onboard() fail loudly — the emitted docs reference npm-run commands
+      // that cannot resolve here, and silently proceeding is the exact
+      // half-onboarding trap FEAT-121 exists to close.
+      reports.push({ path: pkgPath, label: 'package.json scripts', status: 'SKIPPED (package.json unparseable — not overwritten; smoke check will flag the dead npm-run refs)' });
     }
   } else {
+    // FEAT-121: NO package.json. Previously onboarding SKIPPED wiring here and
+    // moved on — leaving a CLAUDE.md / docs/bugs/README.md that reference
+    // `npm run board:check` etc. with NOTHING to resolve them (the
+    // trading_volume half-onboarding: every documented board command failed
+    // outright, undetected). Onboarding writes those docs, so onboarding owns
+    // making them TRUE: create a minimal package.json exposing exactly the
+    // board scripts the docs reference. Chosen over rewriting the docs to
+    // `node scripts/board.mjs …` because the method's whole UX is `npm run
+    // board:*` — one dialect everywhere beats a second, no-package.json-only
+    // dialect that every other doc example contradicts. A minimal, private,
+    // dependency-free package.json is small and standard, and makes every
+    // emitted npm-run reference resolve uniformly.
+    const pkg = {
+      name: path.basename(path.resolve(targetDir)).toLowerCase().replace(/[^a-z0-9._-]+/g, '-') || 'onboarded-project',
+      version: '0.0.0',
+      private: true,
+      scripts: { ...WIRED_NPM_SCRIPTS },
+    };
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
     reports.push({
       path: path.relative(process.cwd(), pkgPath),
-      label: 'package.json scripts',
-      status: 'SKIPPED (no package.json — run `node scripts/board.mjs check` directly)',
+      label: 'package.json',
+      status: `created (minimal — wired [${Object.keys(WIRED_NPM_SCRIPTS).join(', ')}] so the emitted docs' npm-run commands resolve)`,
     });
   }
 
+  return reports;
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-121 — post-onboard smoke check: every `npm run <x>` command onboarding
+// EMITS into a project's docs must resolve to a real script in that project's
+// package.json. Derives the command list from the actual doc templates onboard
+// injects (not a hand-typed list), so it can never be short by "whatever nobody
+// typed".
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse concrete `npm run <name>` references out of an emitted doc string.
+ * Runs against the EVALUATED template constants (so escaped backticks are real
+ * backticks and line-wrapped references — the docs wrap `npm run` onto the next
+ * line before `board:gen` — are joined via the `\s+`). Skips obvious
+ * placeholders like `npm run verify:<x>` (a "add one if none exists" stand-in,
+ * not a command onboard promises exists).
+ */
+function extractNpmRunRefs(text) {
+  const refs = new Set();
+  const re = /npm run\s+`?([^\s`]+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    let tok = m[1].replace(/[`.,;:)]+$/, '');
+    if (/[<>{}]/.test(tok) || tok.includes('…')) continue; // placeholder, not a real command
+    if (!/^[a-zA-Z][\w:-]*$/.test(tok)) continue;
+    refs.add(tok);
+  }
+  return refs;
+}
+
+/**
+ * The doc templates onboard writes into a target, mapped to the repo-relative
+ * path onboard writes each one to. This is the "single source both the injector
+ * and the checker read" the FEAT asks for: the very strings onboard injects are
+ * what the checker parses, so a new `npm run` reference added to any template is
+ * automatically covered.
+ */
+function emittedDocTemplates() {
+  return [
+    { file: 'docs/bugs/README.md', text: BUGS_README },
+    { file: 'docs/bugs/INDEX.md', text: BUGS_INDEX },
+    { file: 'docs/bugs/TEMPLATE.md', text: BUGS_TEMPLATE },
+    { file: 'CLAUDE.md', text: claudeMd() },
+    { file: 'docs/CONVENTIONS.md', text: CONVENTIONS_STUB },
+  ];
+}
+
+/**
+ * Map every emitted `npm run <x>` reference -> the doc file(s) that reference
+ * it, parsed from the templates above. This is the authoritative "what
+ * onboarding emits" set, scoped strictly to onboard's own output (it never
+ * flags a target's unrelated npm scripts).
+ */
+function emittedNpmScriptRefs() {
+  const byScript = new Map();
+  for (const { file, text } of emittedDocTemplates()) {
+    for (const script of extractNpmRunRefs(text)) {
+      if (!byScript.has(script)) byScript.set(script, new Set());
+      byScript.get(script).add(file);
+    }
+  }
+  return byScript;
+}
+
+/**
+ * Assert that every `npm run <x>` command onboarding emits into `targetDir`'s
+ * docs resolves to a real script in that project's package.json. Pure/read-only
+ * — writes nothing — so it doubles as the standalone `--verify-only` a session
+ * can run against an existing project. Returns { ok, failures:[{script,files}],
+ * hasPkg, pkgParseable }.
+ */
+export function verifyEmittedNpmScripts(targetDir) {
+  const resolved = path.resolve(targetDir);
+  const pkgPath = path.join(resolved, 'package.json');
+  const hasPkg = fs.existsSync(pkgPath);
+  const pkg = hasPkg ? readJson(pkgPath) : null;
+  const pkgParseable = !hasPkg ? true : pkg !== null;
+  const scripts = pkg && pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
+  const failures = [];
+  for (const [script, files] of emittedNpmScriptRefs()) {
+    if (scripts[script] === undefined) {
+      failures.push({ script, files: [...files] });
+    }
+  }
+  return { ok: failures.length === 0, failures, hasPkg, pkgParseable, pkgPath: resolved };
+}
+
+/** Render the smoke check as onboard report lines (loud + specific on FAIL). */
+function smokeCheckReports(targetDir) {
+  const res = verifyEmittedNpmScripts(targetDir);
+  if (res.ok) {
+    return [{ path: '', label: 'npm-run smoke check', status: 'SMOKE PASS (every emitted `npm run <x>` resolves to a package.json script)' }];
+  }
+  const reports = [];
+  const missingPkgNote = !res.hasPkg
+    ? ' — target has NO package.json'
+    : !res.pkgParseable
+      ? ' — target package.json is unparseable'
+      : '';
+  reports.push({
+    path: '',
+    label: 'npm-run smoke check',
+    status: `SMOKE FAIL: ${res.failures.length} emitted npm-run command(s) resolve to no package.json script${missingPkgNote}`,
+  });
+  for (const f of res.failures) {
+    reports.push({
+      path: '',
+      label: '  dead npm-run ref',
+      status: `SMOKE FAIL: \`npm run ${f.script}\` referenced by ${f.files.join(', ')} has no matching script in ${path.relative(process.cwd(), path.join(res.pkgPath, 'package.json'))}`,
+    });
+  }
   return reports;
 }
 
@@ -777,16 +926,18 @@ function parseArgs(argv) {
   let forceHook = false;
   let waPointer = false;
   let deployContext = false;
+  let verifyOnly = false;
   for (const a of argv) {
     if (a === '--no-board') noBoard = true;
     else if (a === '--force-board-tool') forceBoardTool = true;
     else if (a === '--force-hook') forceHook = true;
     else if (a === '--wa-pointer') waPointer = true;
     else if (a === '--deploy-context') deployContext = true;
+    else if (a === '--verify-only') verifyOnly = true;
     else if (a.startsWith('--dir=')) targetDir = a.slice('--dir='.length);
     else if (!a.startsWith('--')) targetDir = a;
   }
-  return { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext };
+  return { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly };
 }
 
 export function onboard(targetDir, { noBoard = false, forceBoardTool = false, forceHook = false, waPointer = false, deployContext = false } = {}) {
@@ -821,15 +972,51 @@ export function onboard(targetDir, { noBoard = false, forceBoardTool = false, fo
   reports.push(...installBoardTool(resolved, { forceBoardTool }));
   // FEAT-089: the format/readability Stop hook + the sanctioned gate wrapper.
   reports.push(...installMethod(resolved, { forceHook }));
+  // FEAT-121: prove the instructions we just wrote actually work — every
+  // `npm run <x>` the emitted docs reference must resolve to a real script.
+  // A fresh onboard that left dead commands now fails LOUDLY here.
+  reports.push(...smokeCheckReports(resolved));
   return reports;
 }
 
+function reportTag(status) {
+  if (status.startsWith('SMOKE FAIL')) return 'FAIL   ';
+  if (status.startsWith('SMOKE PASS')) return 'SMOKE  ';
+  if (status.startsWith('created') || status.startsWith('added') || status.startsWith('appended')) return 'CREATED';
+  if (status.startsWith('merged')) return 'MERGED ';
+  if (status.startsWith('SKIPPED')) return 'SKIPPED';
+  if (status.startsWith('re-synced')) return 'RESYNC ';
+  return 'EXISTS ';
+}
+
 function main() {
-  const { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext } = parseArgs(process.argv.slice(2));
+  const { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly } = parseArgs(process.argv.slice(2));
   if (!targetDir) {
-    console.error('usage: node scripts/onboard.mjs <target-dir> [--no-board] [--force-board-tool] [--force-hook] [--wa-pointer] [--deploy-context]');
+    console.error('usage: node scripts/onboard.mjs <target-dir> [--no-board] [--force-board-tool] [--force-hook] [--wa-pointer] [--deploy-context] [--verify-only]');
     process.exit(2);
   }
+
+  // FEAT-121: standalone verify mode — writes NOTHING, just asserts every
+  // `npm run <x>` command onboarding's docs reference resolves in the target's
+  // package.json. A session can run this against an already-onboarded project
+  // (the trading_volume half-onboarding class) to catch dead documented
+  // commands. Exit 0 = all resolve, 1 = at least one dead reference.
+  if (verifyOnly) {
+    const resolved = path.resolve(targetDir);
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+      console.error(`onboard --verify-only: not a directory: ${resolved}`);
+      process.exit(2);
+    }
+    console.log(`onboard --verify-only — ${resolved}`);
+    const smoke = smokeCheckReports(resolved);
+    let failed = false;
+    for (const r of smoke) {
+      if (r.status.startsWith('SMOKE FAIL')) failed = true;
+      console.log(`  ${reportTag(r.status)}  ${r.label.padEnd(24)} ${r.status}`);
+    }
+    process.exit(failed ? 1 : 0);
+  }
+
   let reports;
   try {
     reports = onboard(targetDir, { noBoard, forceBoardTool, forceHook, waPointer, deployContext });
@@ -838,17 +1025,14 @@ function main() {
     process.exit(1);
   }
   console.log(`onboard — ${path.resolve(targetDir)}`);
+  let smokeFailed = false;
   for (const r of reports) {
-    const tag = r.status.startsWith('created') || r.status.startsWith('added') || r.status.startsWith('appended')
-      ? 'CREATED'
-      : r.status.startsWith('merged')
-        ? 'MERGED '
-        : r.status.startsWith('SKIPPED')
-          ? 'SKIPPED'
-          : r.status.startsWith('re-synced')
-            ? 'RESYNC '
-            : 'EXISTS ';
-    console.log(`  ${tag}  ${r.label.padEnd(24)} ${r.status}`);
+    if (r.status.startsWith('SMOKE FAIL')) smokeFailed = true;
+    console.log(`  ${reportTag(r.status)}  ${r.label.padEnd(24)} ${r.status}`);
+  }
+  if (smokeFailed) {
+    console.error('\nonboard: FAILED post-onboard smoke check — the docs it wrote reference `npm run` commands that do not resolve. See SMOKE FAIL lines above. (exit 1)');
+    process.exit(1);
   }
   process.exit(0);
 }

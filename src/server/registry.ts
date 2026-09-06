@@ -261,7 +261,16 @@ export interface OrchestratorProfileSettings {
 }
 
 export function defaultOrchestratorProfileSettings(): OrchestratorProfileSettings {
-  return { enabled: false };
+  // FEAT-096 (fixing round 3): the orchestrator profile is on by default.
+  // It only strips inline read tools so an orchestrator session dispatches
+  // instead of investigating inline; it does NOT isolate a session from the
+  // host, so it is safe for every project (including live-bot ones). The user
+  // endorsed profile-on fleet-wide, so a newly-created/added project — and any
+  // legacy registry row written before FEAT-096 with no field — reads as
+  // enabled unless a stored `enabled: false` explicitly turns it off (the
+  // per-project toggle remains the escape hatch; an explicit false persists
+  // through updateProject's merge).
+  return { enabled: true };
 }
 
 /** Profile settings with defaults filled in for registries written before FEAT-096. */

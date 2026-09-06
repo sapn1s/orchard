@@ -709,6 +709,24 @@ function rollUp(lanes) {
     else g.cost += l.cost_usd;
     byRound.set(l.round, g);
   }
+  // FEAT-124 option B / ARCH-016 tier-visibility flag — READ-ONLY surfacing, no
+  // gate. A lane that ran on Fable while its DECLARED dispatch class is one of the
+  // cheap-work classes {trivial, fix, explore} OR was never declared is a
+  // likely-misroute: Fable is the premium tier, and cheap/undeclared work does not
+  // justify it. Keyed on the MODEL, not the class, because 98% of lanes declare no
+  // class (FEAT-124) — a class-keyed rule would be inert. Absent-class counts as a
+  // flag on purpose: an undeclared Fable lane is exactly the case the flag exists to
+  // make visible. This surfaces waste for a human to correct; it never denies.
+  const tierMisroutes = lanes.filter(fableMisroute).map((l) => ({
+    lane_id: l.lane_id,
+    ticket: l.declared?.tickets?.[0] ?? l.primary_ticket ?? l.tickets?.[0]?.id ?? null,
+    declared_class: l.declared?.class ?? null,
+    models: l.models ?? [],
+    cost_usd: l.cost_usd,
+    description: l.description ?? null,
+    started_at: l.started_at ?? null,
+  })).sort((a, b) => (b.cost_usd ?? 0) - (a.cost_usd ?? 0));
+
   return {
     lanes: lanes.length,
     cost_usd: anyUnpriced ? null : Math.round(sum((l) => l.cost_usd) * 100) / 100,
@@ -726,7 +744,30 @@ function rollUp(lanes) {
     byClass: [...byClass.values()].sort((a, b) => b.cost - a.cost),
     byModel: [...byModel.values()].sort((a, b) => b.tokens - a.tokens),
     byRound: [...byRound.values()].sort((a, b) => a.round - b.round),
+    tierMisroutes,
   };
+}
+
+/**
+ * FEAT-124 option B — did this lane use Fable on cheap/undeclared work?
+ * True when ANY model the lane ran on is a Fable tier AND its declared dispatch
+ * class is absent, or one of {trivial, fix, explore}. `plan+review`, `arch` and
+ * `verify` are the classes whose cost-of-mistake can justify the premium tier, so
+ * a declared one of those is NOT flagged.
+ */
+const FABLE_JUSTIFIED_CLASSES = new Set(['plan+review', 'arch', 'verify']);
+export function fableMisroute(lane) {
+  // Only a DISPATCHED lane's model is a routing decision. `orchestrator` is the
+  // human's own main session — its tier is the user's choice, not a per-lane
+  // route, and it merely TOUCHING Fable (via any turn) would otherwise dominate
+  // the flag with the whole session's cost. Flag `subagent` (in-process Agent
+  // tool, model chosen at dispatch) and `process` (a dispatched external
+  // provider process); never the orchestrator session itself.
+  if (lane?.kind !== 'subagent' && lane?.kind !== 'process') return false;
+  const usedFable = (lane?.models ?? []).some((m) => /fable/i.test(String(m)));
+  if (!usedFable) return false;
+  const cls = lane?.declared?.class ?? null;
+  return cls == null || !FABLE_JUSTIFIED_CLASSES.has(cls);
 }
 
 function printReport(r, opts) {
@@ -767,6 +808,8 @@ function printReport(r, opts) {
   }
   L.push('');
   L.push(...lifecycleSection(r, opts));
+  L.push('');
+  L.push(...tierMisrouteSection(r, opts));
   L.push('');
   L.push('  Floor: transcript-derived cost is a LOWER BOUND. The CLI makes one small');
   L.push('  auxiliary (title) request per session that it does not write to the');
@@ -949,6 +992,41 @@ function printDiffs(diffs, opts) {
   }
   L.push('');
   return L.join('\n');
+}
+
+/**
+ * FEAT-124 option B / ARCH-016 — the tier-visibility flag, printed.
+ *
+ * Read-only. Surfaces every lane that ran on Fable (the premium tier) while its
+ * declared dispatch class was absent or a cheap-work class, so a human can decide
+ * whether the routing was justified. It does NOT gate — the Fable-gate (FEAT-124
+ * option A) is a separate, escalation-only change conditional on this flag showing
+ * waste continuing. The cost column is the API-equivalent estimate for that lane.
+ */
+function tierMisrouteSection(r, opts) {
+  const L = [];
+  const rows = r.tierMisroutes ?? [];
+  L.push('  ── TIER FLAG: FABLE ON CHEAP/UNDECLARED WORK (FEAT-124) ────────────────');
+  if (!rows.length) {
+    L.push('  none: no lane ran on Fable while its declared class was absent or cheap-work');
+    L.push('  (trivial/fix/explore). This is READ-ONLY surfacing, not a gate.');
+    return L;
+  }
+  const total = rows.reduce((a, l) => a + (l.cost_usd ?? 0), 0);
+  L.push(`  ${rows.length} lane(s) ran on Fable with an absent or cheap-work class — est. ${usd(total)} total.`);
+  L.push('  Fable is the premium tier; trivial/fix/explore and undeclared do not justify it.');
+  L.push('  Keyed on the MODEL, not the class (98% of lanes declare none). READ-ONLY — no gate.');
+  L.push('');
+  L.push('  TICKET            class      est. cost   models                 what');
+  for (const l of rows.slice(0, opts.top)) {
+    const models = (l.models ?? []).join(',');
+    const what = (l.description ?? '').slice(0, 24);
+    L.push(
+      `  ${String(l.ticket ?? '—').padEnd(18)}${String(l.declared_class ?? 'absent').padEnd(11)}${usd(l.cost_usd).padStart(9)}   ${models.padEnd(22)} ${what}`,
+    );
+  }
+  if (rows.length > opts.top) L.push(`  … and ${rows.length - opts.top} more.`);
+  return L;
 }
 
 function checkRetention(lanes) {

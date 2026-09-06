@@ -31,6 +31,12 @@ import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs'
 // mandatory leak gate. evaluateGitWrite folds all three onto the round-1
 // classifier; the leak-gate runner is injected from here (a real subprocess).
 import { evaluateGitWrite } from '../../../scripts/lib/git-grant.mjs';
+// FEAT-124 — an UNJUSTIFIED Fable (`model: fable`) dispatch is rerouted UP to
+// Opus on this same PreToolUse callback. A different axis again: model-keyed, not
+// tool-name-keyed, and it REWRITES (updatedInput) rather than denies, so the lane
+// still runs — on the sanctioned ceiling. Fleet-wide like the git block. See the
+// module header for the reroute-not-deny and hard-coded-Opus rationale.
+import { decideFableTier, fableTierGateEnabled } from '../../../scripts/lib/fable-tier-policy.mjs';
 // FEAT-106 — the Stop hook lands at `.orchard/hooks/…` in the consolidated layout
 // and `scripts/hooks/…` in the legacy one. Resolve BOTH ends through this:
 // the dest in the target project (cwd) AND the source in this repo (REPO_ROOT,
@@ -250,6 +256,43 @@ const hookDeliveryAnnounced = new Set<string>();
  *  so `ORCHARD_ALLOW_GIT_WRITE` is never a silent bypass. */
 let gitHatchAnnounced = false;
 
+/** FEAT-124 — announce an OPEN Fable-gate escape hatch at most once per process,
+ *  so `ORCHARD_ALLOW_FABLE` is never a silent bypass. */
+let fableHatchAnnounced = false;
+
+/**
+ * FEAT-124 — record a Fable-tier gate event on stderr, so both an OVERRIDE that
+ * kept Fable and a REROUTE down to Opus are visible in the run log. `kind`:
+ *  - 'rerouted'  : unjustified `model: fable` → rewritten to Opus (the lane runs on Opus).
+ *  - 'justified' : `fable-justified: <reason>` present → Fable kept, reason recorded.
+ *  - 'hatch'     : the escape hatch is open → Fable kept ungated.
+ */
+function announceFableTier(
+  kind: 'rerouted' | 'justified' | 'hatch',
+  d: { requested?: string | null; label?: string | null; justification?: string | null },
+  sessionLabel?: string,
+): void {
+  const who = sessionLabel ? ` [session ${sessionLabel}]` : '';
+  const lane = d.label ? ` lane="${d.label}"` : '';
+  const req = d.requested ?? 'fable';
+  if (kind === 'rerouted') {
+    console.warn(
+      `[orchard] Fable gate: \`model: ${req}\` REROUTED to \`opus\`${who}${lane} — ` +
+        'no `fable-justified:` reason in the prompt (FEAT-124; fail-safe UP, never down).',
+    );
+  } else if (kind === 'justified') {
+    console.warn(
+      `[orchard] Fable gate: \`model: ${req}\` PERMITTED${who}${lane} — ` +
+        `justified: "${d.justification ?? ''}" (FEAT-124 override — recorded).`,
+    );
+  } else {
+    console.warn(
+      `[orchard] Fable gate: \`model: ${req}\` PERMITTED ungated${who}${lane} — ` +
+        'ORCHARD_ALLOW_FABLE hatch open (FEAT-124).',
+    );
+  }
+}
+
 /**
  * FEAT-108 round 2 — the mandatory leak gate for a GRANTED commit/push. Runs
  * this repo's scripts/leak-gate.mjs (the SAME gate `npm run gate` uses) as a
@@ -261,18 +304,32 @@ let gitHatchAnnounced = false;
  */
 function runLeakGateForRepo(repoPath: string | undefined | null): { ok: boolean; detail: string } {
   if (!repoPath) return { ok: false, detail: 'no repo path known for this session — cannot verify the leak gate; failing closed' };
-  try {
-    execFileSync(process.execPath, [path.join(REPO_ROOT, 'scripts', 'leak-gate.mjs'), '--summary'], {
-      cwd: repoPath,
-      stdio: 'pipe',
-      timeout: 30_000,
-    });
-    return { ok: true, detail: '' };
-  } catch (err) {
-    const e = err as { stdout?: Buffer; stderr?: Buffer; message?: string };
-    const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`.trim() || e.message || 'leak gate failed';
-    return { ok: false, detail: out.slice(0, 1500) };
-  }
+  const gate = path.join(REPO_ROOT, 'scripts', 'leak-gate.mjs');
+  // FEAT-130 round 2 — this gate runs as a PRE-EXECUTION guard on an arbitrary
+  // git-write Bash command, so it must catch BOTH shapes of the index bypass:
+  //   • `git add secret && git commit`  — nothing is staged yet at guard time,
+  //     so the STAGED-INDEX scan would see an empty index → the WORKING-TREE
+  //     scan is what catches this.
+  //   • stage the secret, clean/delete the worktree copy, then `git commit` —
+  //     the working tree is clean, so the STAGED-INDEX scan (`--staged`) is what
+  //     catches this (the round-1 bypass the git.ts/hook fixes also close).
+  // Scan both; fail closed if EITHER the working tree or the staged index leaks,
+  // or if either scan cannot be RUN. (git.ts commit() and the pre-commit hook run
+  // AFTER staging, so --staged alone is complete there; only this pre-exec guard
+  // needs the union.)
+  const run = (args: string[]): { ok: boolean; detail: string } => {
+    try {
+      execFileSync(process.execPath, [gate, ...args], { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
+      return { ok: true, detail: '' };
+    } catch (err) {
+      const e = err as { stdout?: Buffer; stderr?: Buffer; message?: string };
+      const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`.trim() || e.message || 'leak gate failed';
+      return { ok: false, detail: out.slice(0, 1500) };
+    }
+  };
+  const tree = run(['--summary']);
+  if (!tree.ok) return tree;
+  return run(['--summary', '--staged']);
 }
 
 /** FEAT-108 round 2 — one stderr line per permitted/blocked-by-gate agent git
@@ -545,7 +602,22 @@ export class ClaudeRuntime implements AgentRuntime {
           'agent sessions may commit/push/reset this run (FEAT-108 escape hatch).',
       );
     }
-    if (gitBlockOn || config.orchestratorProfile) {
+    /*
+     * FEAT-124 — the Fable-tier gate. FLEET-WIDE like the git block and on the
+     * same axis of "applies to every session this runtime launches": the measured
+     * waste was DISPATCHED lanes (a lane can itself dispatch a Fable sub-lane), so
+     * the gate must not be scoped to the orchestrating session. Model-keyed and
+     * REWRITE-not-deny (see fable-tier-policy.mjs), so it never aborts a dispatch.
+     */
+    const fableGateOn = fableTierGateEnabled();
+    if (!fableGateOn && !fableHatchAnnounced) {
+      fableHatchAnnounced = true;
+      console.warn(
+        '[orchard] Fable-tier gate DISABLED via ORCHARD_ALLOW_FABLE — ' +
+          'unjustified `model: fable` dispatches run ungated this run (FEAT-124 escape hatch).',
+      );
+    }
+    if (gitBlockOn || config.orchestratorProfile || fableGateOn) {
       options.hooks = {
         ...(options.hooks ?? {}),
         PreToolUse: [
@@ -581,6 +653,33 @@ export class ClaudeRuntime implements AgentRuntime {
                       };
                     }
                     if (g.granted) announceGitWrite('permitted', g.offender ?? 'git', config.sessionLabel);
+                  }
+                  /*
+                   * FEAT-124 — Fable-tier gate, for ALL sessions, only on `Agent`
+                   * calls. Runs after the git block (different tool, no conflict)
+                   * and before the profile `decide()` (which allows `Agent`
+                   * regardless). An unjustified `model: fable` is ALLOWED but with
+                   * `model` rewritten to `opus` (updatedInput), so the lane runs on
+                   * the ceiling rather than the premium tier — the dispatch is
+                   * never aborted. A justified one (or an open hatch) is logged and
+                   * falls through unchanged.
+                   */
+                  if (i.tool_name === 'Agent') {
+                    const ft = decideFableTier({ toolName: i.tool_name, toolInput: i.tool_input });
+                    if (ft.action === 'reroute') {
+                      announceFableTier('rerouted', ft, config.sessionLabel);
+                      return {
+                        hookSpecificOutput: {
+                          hookEventName: 'PreToolUse' as const,
+                          permissionDecision: 'allow' as const,
+                          updatedInput: ft.updatedInput,
+                        },
+                      };
+                    }
+                    if (ft.action === 'allow' && ft.requested) {
+                      announceFableTier(ft.hatch ? 'hatch' : 'justified', ft, config.sessionLabel);
+                      // Fall through: `Agent` is allowed by the profile anyway.
+                    }
                   }
                   if (!config.orchestratorProfile) return {};
                   const d = decide({

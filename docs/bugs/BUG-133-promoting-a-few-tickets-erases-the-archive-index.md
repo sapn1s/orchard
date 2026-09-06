@@ -11,9 +11,9 @@
   "reported": "2026-08-20",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-08-20",
+  "updated": "2026-09-05",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -103,3 +103,71 @@ diff at all.
   defects blocking real use are fixed now.
 - **Still open:** the fix is scoped — keep the existing index's rows, merge the
   run's rows in, sort by filename — and deliberately not written.
+
+### 2026-09-05 — fixed: the archive index is now cumulative, and a would-drop refuses
+
+- **Hypothesis confirmed (not assumed).** The diagnosis holds exactly: `promote()`
+  built `indexRows` from `moves` (the current run's tickets) and wrote
+  `fs.writeFileSync(archive/INDEX.md, index)` UNCONDITIONALLY, with no read of the
+  existing index and no merge. Nothing filters and no checksum step is involved —
+  the loss is a pure overwrite. `scripts/migrate-tickets.mjs`, `promote()`.
+
+- **Must-FAIL reproduced FIRST, on the real artifact.** Seeded a fixture archive
+  index from the REAL `docs/bugs/archive/INDEX.md` (194 rows) minus the 6 rows for
+  the tickets promoted = **188 pre-existing rows**, then ran the PRE-FIX `promote()`
+  (a `git show HEAD:` copy) applying a 6-ticket batch:
+  `node ~/scratch/bug133-repro.mjs <old-module> OLD` →
+  `PRIOR archive index: 188 rows` … `AFTER: 6 rows` … `PRIOR ROWS SURVIVED: 0/188
+  LOST: 188` … `>>> DATA LOSS: promotion reported success (rc=0) yet erased 188
+  prior archive rows <<<`. The wipe is real and silent (rc=0).
+
+- **Same test after the fix:** `AFTER: 194 rows` … `PRIOR ROWS SURVIVED: 188/188
+  LOST: 0` … `NEW ROWS PRESENT: 6/6` … `>>> CORRECT: 188 + 6 = 194 <<<`. A separate
+  line-by-line check confirmed **188/188 prior data lines byte-identical** in the
+  merged index (titles, sha256s and original archived dates untouched, not
+  re-escaped, not re-dated to today).
+
+- **Changed (one file, `scripts/migrate-tickets.mjs`):**
+  - Added `export function parseArchiveIndex(text)` — reads the originals table
+    back into `{id,file,title,bytes,sha256,archived}` rows, keeping titles exactly
+    as written (already table-escaped) so re-emitting cannot double-escape, and
+    splitting on UNescaped pipes only. A row it cannot read back sets `parseError`
+    — a REFUSE signal, never a silent "0 rows".
+  - `promote()` now reads the existing index, MERGES the run's rows into it keyed
+    by filename (set-not-append, so a duplicate neither double-inserts nor silently
+    replaces), sorts by filename, and renders prior rows verbatim with their
+    original archived date.
+  - **Would-drop guard:** if the existing index has a `parseError`, or a promoted
+    file is already indexed under a DIFFERENT sha256 (conflict), or any prior row
+    is absent from the merge, the promotion prints `PROMOTION REFUSED … (BUG-133)`
+    and returns 1 **before any write or any `git mv`** — the on-disk index is left
+    byte-identical. Fails loudly instead of writing a truncated record.
+
+- **Verified — `scripts/verify-migrate-tickets.mjs`, extended (not a new harness):
+  68/68 PASS** (was 53; +15 for BUG-133). New cases, each on a fixture derived from
+  the REAL index or a realistic seed: parseArchiveIndex reads the real 194-row
+  index with no error; a 6-onto-188 promotion yields 194 not 6; every prior row
+  survives byte-identical; stable filename order; empty/absent index populates;
+  duplicate same-sha does not double-insert; **checksum conflict refuses (exit 1)
+  and leaves the index byte-identical and moves no original**; **unparseable index
+  refuses (exit 1), byte-identical**. Anti-regression: the full pre-existing suite
+  (sections 1–7, 8) still 53/53, so extraction, the acceptance gate, quarantine,
+  provenance and the existing promotion rehearsal are unaffected.
+
+- **Gate:** `npm run gate` → PASS (leak-gate, check-nul, typecheck), exit 0.
+  `npm run board:check` → 1 pre-existing DRIFT (ARCH-007 rail reachability),
+  UNRELATED to this change; no INDEX.md edited.
+
+- **Scope note (stated, not hidden):** only the ORIGINALS table is merged. The
+  "Deliberately NOT migrated" legacy section is regenerated each run from
+  `--allow-legacy`; a promotion that would drop a still-legacy ticket without
+  naming it already REFUSES upstream (`unnamedLegacy`), so that section has no
+  silent-loss path of its own. Not addressed here by design.
+
+- **Still open / handoff:** this is a DATA-LOSS + regression-prone fix, so per the
+  standing rule it warrants an INDEPENDENT clean-room verify pass
+  (`scripts/independent-verify.mjs`, not a Task subagent) before `verified`. A
+  case the fixer's own fixture does not cover: promote onto an index whose LAST
+  promotion itself left it in the newly-merged (multi-date) shape — i.e. two
+  successive incremental promotions — to confirm the merge is stable across
+  generations, not just once. Left at `in_verification`.

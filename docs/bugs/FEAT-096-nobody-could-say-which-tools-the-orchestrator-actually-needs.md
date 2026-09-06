@@ -427,3 +427,36 @@ but the first thing the agent does it immediately runs commands on its own"*.
     (2) `allowedTools`, a field that cannot enforce. (3) `node`/`npx`/`docker` admitted to the
     surface by NAME, with nothing confronting what those names can actually do. Same flaw each time:
     a capability is named at design time and never confronted with the runtime that must provide it.
+
+### 2026-09-06 — orchestrator-profile-default lane (fixing round 3)
+
+  - **Straggler enable (live state, via the settings API — no hand-edit of the registry).** Enumerated
+    the registry: 17 projects, 4 with `orchestratorProfile.enabled` not true —
+    `trading-volume`, `busy-board`, a private project (neutral id `external-project-K`), and
+    `letschess` (all explicit `false`). None looked
+    deliberately off (the profile does not isolate from the host, and the user endorsed profile-on
+    fleet-wide), so all four were flipped through `PATCH /api/projects/:id` with
+    `{"settings":{"orchestratorProfile":{"enabled":true}}}` on the running server (port 4317), the
+    same validated path the UI uses. Read back via a fresh `GET /api/projects`: **still-OFF = []**,
+    all 17 now enabled. Before: 4 off / 13 on. After: 0 off / 17 on. The flag binds at each session's
+    NEXT start — the service was NOT restarted, so already-running sessions keep their prior profile
+    until they next launch.
+  - **Onboard default is now on (code change).** `onboard.mjs` is docs-scaffolding only — it never
+    creates a registry entry — so the real locus for "a newly-onboarded/added project is profiled
+    unless explicitly turned off" is `defaultOrchestratorProfileSettings()` in
+    `src/server/registry.ts`, which feeds `defaultSettings()` → `createProject`'s
+    `{...defaultSettings(), ...input.settings}`. Flipped its return from `{ enabled: false }` to
+    `{ enabled: true }`. This also makes any legacy pre-FEAT-096 row with no field READ as enabled
+    (all 17 live rows carry an explicit field, so no silent live change); an explicit stored
+    `enabled: false` still persists through `updateProject`'s merge — the per-project toggle remains
+    the escape hatch.
+  - **Verification.** Must-FAIL first: `createProject` in an isolated `CLAUDE_STATION_DATA` temp dir
+    on the pre-change tree → `enabled = false`. Post-change → `enabled = true` (node exit 0). Onboard
+    regression suite `node scripts/verify-onboard.mjs` **51/51**. `npm run gate` exit 0 (leak-gate,
+    check-nul, typecheck all PASS), read directly, unpiped.
+  - **Files changed:** `src/server/registry.ts` (one hunk, ~10 lines, not in the prior dirty tree —
+    entirely this lane's). The four project enablements are live registry state written by the
+    service via its own API, not a git change.
+  - **Independent verify:** low-risk single-line default flip on an already-fleet-endorsed setting;
+    an independent pass is not required for this hunk. The broader FEAT-096 enforcement work above
+    still carries its own standing "INDEPENDENT VERIFICATION REQUIRED" note.

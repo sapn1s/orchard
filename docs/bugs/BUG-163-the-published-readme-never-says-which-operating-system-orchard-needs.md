@@ -1,6 +1,6 @@
 # BUG-163 — The published README never says which operating system Orchard needs
 
-- **Status:** OPEN
+- **Status:** VERIFIED
 - **Severity:** medium
 - **Area:** docs / README
 - **Reported:** 2026-09-02 by exploration lane (Windows-viability investigation)
@@ -142,3 +142,37 @@ tolerance, not Windows support, and it should not be mistaken for one.
   independent features each degrade in their own private way rather than one
   check saying "this is not a supported host". Worth an ARCH only if a
   boot-time notice is ever actually wanted.
+
+### 2026-09-05 — fix lane (docs-only, XS)
+
+- **Understood:** README Quick start (`README.md`) states no platform; a
+  Windows reader follows install, succeeds, then degrades silently. Fix is one
+  block stating the requirement *before* the install command.
+- **Verified the handoff sentence against current code before writing it** — all
+  named shell-outs still present, no drift: `rg` (`src/server/search.ts:155`,
+  `spawn('rg', …)`), `cp --reflink=always` (`src/server/snapshots.ts:352`,
+  `spawnSync('cp', ['--reflink=always', …])`), `git` (`src/server/git.ts:21`,
+  `execFile('git', …)`), `systemd-run` for survival
+  (`src/server/survival.ts:182` version-probe, `:337` scope launch), Docker for
+  container isolation (`src/server/provisioning.ts`, `container-manager.ts`
+  et al.). Nothing named that the code does not do; nothing dropped.
+- **Changed:** `README.md` only — added a bold **Platform: Linux, or Windows via
+  WSL2.** paragraph immediately under `## Quick start`, above the `npm install`
+  fence (line 35, install now at line 43 — order confirmed by grep). Names the
+  three core Unix shell-outs (`git`, `rg`, `cp --reflink=always`), the two
+  optional extras and what each needs (systemd → background service + restart
+  survival, Docker → container isolation), the native-Windows silent-degrade
+  outcome, the WSL2 remedy incl. `systemd=true` in `/etc/wsl.conf`, and "macOS
+  untested". No restructure, no reformat of unrelated sections.
+- **Deliberately not done:** `docs/guide/README.md` left untouched — it is a
+  workflow guide, not the install entry-point a stranger follows, so the
+  omission that misleads is only in `README.md`. Left out of scope to keep XS.
+  No boot-time platform check (that is the separate larger step the prior
+  handoff flagged, not this ticket).
+- **Verified:** grep confirms `**Platform:` (line 35) precedes `npm install`
+  (line 43). Each shell-out quoted above was read at its file:line. No board/
+  docs gate applies to a top-level `README.md` edit (`docs:fresh` covers only
+  `docs/guide/` pages with `sources:` frontmatter; `board:*` covers the ticket
+  board). Did not run `board:gen` — INDEX is orchestrator-owned.
+- **Still open / handoff:** status set VERIFIED; orchestrator to flip INDEX row
+  and close to DONE. Optional follow-up (own ticket): boot-time platform notice.

@@ -11,9 +11,9 @@
   "reported": "2026-08-25",
   "reported_by": "agent",
   "owner": "you",
-  "work_state": "open",
+  "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-09-05",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -88,3 +88,33 @@
   COULD NOT TEST / UNTESTED: (a) I did not drive the real headless-brave renderer end-to-end — the proof above is the parse-level trace with the real pure module (response-blocks.js) plus the exact digest.js regexes, run over the real transcript text; the DOM "JSON wall" is inferred from the code path, not screenshotted. A fixer MUST do the real render + must-FAIL baseline per the charter. (b) Only local transcripts on this machine; the users "across projects / other machines" claim is consistent with this shape but unmeasured off-box. (c) The quoted-string shape the user pasted was NOT found as a stored shape — my read is that it is the users transcription of the rendered code block, not the stored text; a fixer should confirm by looking at the live rendered DOM.
 
   Scratch (kept): ~/scratch/digest-scan/ (scan.mjs, scan2.mjs, scan3.mjs, prove.mjs).
+
+### 2026-09-05 — worker (fixing, round 1)
+- **Built BOTH halves the owner approved (floor + position tolerance); status → in_verification.** Dispatch: ticket=BUG-155 phase=fixing round=1 class=fix. The prior round's cause is confirmed against the real modules; no third path found.
+
+  **CAUSE RE-CONFIRMED (not merely trusted).** `sliceDigestFence` skipped only blank lines then required the fence on the first non-blank line, so a lead-in dropped the lift; `blocksToNodes` had no `orchard-digest` case, so a body-position digest fell through to `else if (b.content.trim()) prose(b.content)` — the raw-JSON wall. Verified by the must-FAIL run below (the pre-change module fails the exact `no raw JSON in prose` assertions).
+
+  **THE FIX (public/lib/digest.js only):**
+  1. **Floor (never raw JSON, any position).** `blocksToNodes` now has an explicit `orchard-digest` branch: valid JSON → `renderDigest()` (a real rail, in document order); malformed → a *contained* `<pre>` code block (the same fallback FEAT-083 gives a malformed leading digest). It is NOT a `BLOCK_PRESENTATION` row and NOT `renderFold` — the single hiding branch stays gated on `COLLAPSED_BLOCKS`, so the fold-guard invariant is untouched.
+  2. **Position tolerance (lift behind a short lead-in).** `sliceDigestFence` scans a bounded lead-in before the fence and returns it as `before`; `parseDigest` returns `{ items, rest, before }`; `renderAssistantText` renders `before` as prose ABOVE the rail, then the rail, then the body.
+  3. **Item parsing refactored** into a shared `digestItemsFromJson()` so the leading lift and the body floor agree on what a usable digest is.
+
+  **THE BOUND, chosen and justified.** A lead-in is lifted only if it is ≤ `LEAD_IN_MAX_LINES` (3) non-blank lines AND ≤ `LEAD_IN_MAX_CHARS` (200) chars, with NO code fence before the digest. Rationale: the longest real lead-in measured ~85 chars on one line; 3 lines / 200 chars clears every observed case with headroom for a two-sentence intro, while refusing a digest deep in a body or after a code block (that is body content, not the message summary). Beyond the bound the fence is NOT lifted — the floor still renders it as a real rail, so "not lifted" never means "raw JSON".
+
+  **MUST-FAIL PROOF (real DOM via happy-dom, real digest.js module).** New suite `scripts/verify-bug-155-digest-leadin.mjs` (registered `npm run verify:bug-155`). Covers: digest at top (control), short lead-in (lifted, lead-in above via `compareDocumentPosition`), the ticket #18 verbatim-style lead-in, a digest beyond the bound (not lifted, floor rail), a digest after a code fence (not lifted, floor rail), malformed leading JSON, malformed body JSON (floor code block), two digests in one message, plain reply, digest-only.
+    - Pre-change module: `DIGEST_PATH=public/lib/_digest_orig_bug155.js node scripts/verify-bug-155-digest-leadin.mjs` → **23 passed, 18 FAILED** (incl. `lead-in: NO raw JSON in prose (the bug)`, `ticket#18: no raw JSON wall`, `malformed-body: NOT raw JSON in prose`, `two-digests: BOTH render as rails`).
+    - Fixed module: `node scripts/verify-bug-155-digest-leadin.mjs` → **41 passed, 0 failed.**
+
+  **VERIFIED AGAINST THE USER'S REALITY (not just fixtures).** Ran the fixed renderer over every real local transcript (`~/.claude/projects/*/*.jsonl`): 968 messages carry a digest, **58** have this exact fail shape (grown from 18 at filing). After the fix: **36 lifted (short lead-in → rail above), 22 floor-rendered as a rail (beyond bound / after code), 0 still a raw-JSON wall, 0 failing to produce a rail.** Every real failing message now renders as a real digest. (Harvest script: `~/scratch/digest-scan/verify-real-155.mjs`.)
+
+  **CONTRACT UPDATED (docs/prompts/RESPONSE_FORMAT.md).** NOT a mirror — it is absent from `scripts/sync-methodology.mjs`'s manifest (only the WORKING_AGREEMENT files + ROUTING.md are mirrored), so it is hand-editable. The injected core (between the inject markers) was left untouched — the authoring rule "lead with the digest" is still correct guidance and the size budget is unchanged (`verify:feat-084` 37/37). The renderer's leniency + the floor are documented in the human sections ("Repetition and ordering", "Malformed input").
+
+  **GRAMMAR UNCHANGED.** `orchard-digest` was already in `KNOWN_BLOCKS`; the fix is entirely in the renderer (`digest.js`). `scripts/verify-feat-091-response-blocks.mjs` needed no edit and passes 277/277.
+
+  **REGRESSIONS RUN:** `npm run verify:feat-091` 277/0; `npm run verify:feat-084` 37/0; `npm run gate` PASS (leak-gate + check-nul + typecheck, exit 0). Browser-driven suites (`verify:feat-082/083`) were not run — this environment has no browser; the happy-dom suite + the real-transcript harvest cover the render path at the DOM level instead.
+
+  **SIBLING CLASS (dispatch step 4 / success criterion 5) checked:** a stray `orchard-finding` (or any non-digest known block) still routes through `renderVisible`/`renderFold` and never dumped raw JSON — only `orchard-digest` lacked a presentation path, which is now the explicit floor branch. An unknown `orchard-*` name still renders its content as fallback prose (that content is prose, not structured JSON, so it is not the worse-than-nothing shape).
+
+  **INDEPENDENT VERIFY WARRANTED (bucket: regression-prone / data-integrity).** The change touches the digest render path and asserts a "never raw JSON" invariant; a clean-room pass (`scripts/independent-verify.mjs`, or a second fresh-context agent excluding this ticket's diff) should re-attack the bound (a 4-line / 201-char lead-in must NOT lift), the malformed-body floor, and the two-digest ordering. Self-verified only; not VERIFIED.
+
+  Files left unstaged: public/lib/digest.js, docs/prompts/RESPONSE_FORMAT.md, package.json, scripts/verify-bug-155-digest-leadin.mjs, docs/bugs/BUG-155-*.md.

@@ -59,47 +59,86 @@ const TICKET_RE = /^[A-Za-z][A-Za-z0-9]*-\d+$/;
  */
 const DIGEST_OPEN_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*orchard-digest[ \t]*$/i;
 const DIGEST_CLOSE_RES = { '`': /^ {0,3}(`{3,})[ \t]*$/, '~': /^ {0,3}(~{3,})[ \t]*$/ };
+/* ANY fenced-code opener (either character), digest or not. A non-digest fence
+   appearing before the digest means the digest is genuinely IN THE BODY (after a
+   code block), not behind a lead-in, so the lift is refused and the floor in
+   blocksToNodes handles it instead. */
+const ANY_FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
 
-/** The leading digest fence's body and the text after it, or null. */
+/*
+ * POSITION TOLERANCE (BUG-155). The contract asks the digest to LEAD, and 96.8%
+ * of real digests do. The remaining 3.2% are all one shape: a well-formed fence
+ * sitting one short sentence below the top ("Found it.", "Clear recommendation:
+ * …"). Those were dropped entirely — the fence was not the first non-blank line —
+ * and their raw JSON fell through to prose. So a SHORT prose lead-in is now
+ * tolerated: the fence is still lifted and the lead-in renders as prose above it.
+ *
+ * THE BOUND, and why it is bounded. "Short" is at most LEAD_IN_MAX_LINES non-blank
+ * lines AND at most LEAD_IN_MAX_CHARS characters of lead-in, with NO fenced code
+ * before the digest. The values are picked to clear every observed failure (the
+ * longest real lead-in measured ~85 chars on one line) with headroom for a two-
+ * sentence intro, while refusing a digest that sits deep in a real message — a
+ * digest 400 lines down is not a lead-in, and a digest after a code block is body
+ * content, not the message's summary. Beyond the bound the fence is NOT lifted
+ * here; it is rendered readably by the blocksToNodes floor, never as raw JSON.
+ */
+const LEAD_IN_MAX_LINES = 3;
+const LEAD_IN_MAX_CHARS = 200;
+
+/**
+ * The leading digest fence's body, the text after it, and any short prose lead-in
+ * before it, or null.
+ * @returns {null | { json: string, rest: string, before: string }}
+ */
 function sliceDigestFence(lines) {
-  let at = 0;
-  while (at < lines.length && !lines[at].trim()) at++;
-  const om = DIGEST_OPEN_RE.exec(lines[at] ?? '');
-  if (!om) return null;
+  let start = 0;
+  while (start < lines.length && !lines[start].trim()) start++;
+  if (start >= lines.length) return null;
+
+  // Find the digest fence, tolerating a bounded prose lead-in ahead of it.
+  let at = -1;
+  let proseLines = 0;
+  let chars = 0;
+  for (let i = start; i < lines.length; i++) {
+    const line = lines[i];
+    if (DIGEST_OPEN_RE.test(line)) { at = i; break; }
+    if (ANY_FENCE_OPEN_RE.test(line)) return null; // a code fence precedes it -> body position
+    if (line.trim()) {
+      proseLines++;
+      chars += line.length;
+      if (proseLines > LEAD_IN_MAX_LINES || chars > LEAD_IN_MAX_CHARS) return null;
+    }
+  }
+  if (at < 0) return null;
+
+  const om = DIGEST_OPEN_RE.exec(lines[at]);
   const run = om[1];
   const closeRe = DIGEST_CLOSE_RES[run[0]];
   for (let j = at + 1; j < lines.length; j++) {
     const cm = closeRe.exec(lines[j]);
     if (cm && cm[1].length >= run.length) {
-      return { json: lines.slice(at + 1, j).join('\n'), rest: lines.slice(j + 1).join('\n') };
+      return {
+        json: lines.slice(at + 1, j).join('\n'),
+        rest: lines.slice(j + 1).join('\n'),
+        before: lines.slice(0, at).join('\n'),
+      };
     }
   }
   return null; // unterminated -> not a digest; the caller renders the whole message
 }
 
 /**
- * Pull a leading orchard-digest envelope out of an assistant message.
- *
- * @returns {null | { items: Array, rest: string }}
- *   null  -> no leading orchard-digest fence at all (caller renders prose as-is)
- *   object with a NON-EMPTY items array -> a valid digest; `rest` is the prose
- *            below with the fence removed.
- *   If a fence is present but the JSON is malformed or yields no usable items,
- *   this returns null too — so the caller falls back to rendering the FULL
- *   original text (fence included) as ordinary prose. Content is never lost.
+ * Parse a digest JSON body into usable items, or null. Shared by parseDigest (the
+ * leading/lead-in lift) and the blocksToNodes floor (a body-position digest), so
+ * both agree on exactly what a usable digest is. Returns a NON-EMPTY items array
+ * or null (malformed JSON, wrong shape, or no usable items).
  */
-export function parseDigest(text) {
-  // Same boundary rule: a lone-CR transcript must find the leading digest fence
-  // exactly as an LF one does, and `rest` must hand normalised text downstream.
-  const src = String(text ?? '').replace(/\r\n?/g, '\n');
-  const m = sliceDigestFence(src.split('\n'));
-  if (!m) return null;
-
+function digestItemsFromJson(jsonText) {
   let parsed;
   try {
-    parsed = JSON.parse(m.json);
+    parsed = JSON.parse(jsonText);
   } catch {
-    return null; // malformed JSON -> fall back to plain prose (fence shows as code)
+    return null;
   }
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items)) return null;
 
@@ -113,9 +152,32 @@ export function parseDigest(text) {
     const ref = typeof raw.ref === 'string' && raw.ref.trim() ? raw.ref.trim() : null;
     items.push({ text: t, kind, importance, ref });
   }
-  if (!items.length) return null; // nothing usable -> plain prose, nothing hidden
+  return items.length ? items : null;
+}
 
-  return { items, rest: m.rest };
+/**
+ * Pull a leading orchard-digest envelope out of an assistant message.
+ *
+ * @returns {null | { items: Array, rest: string, before: string }}
+ *   null  -> no leading orchard-digest fence at all (caller renders prose as-is)
+ *   object with a NON-EMPTY items array -> a valid digest; `before` is any short
+ *            prose lead-in above the fence (rendered as prose ABOVE the rail), and
+ *            `rest` is the prose below with the fence removed.
+ *   If a fence is present but the JSON is malformed or yields no usable items,
+ *   this returns null too — so the caller falls back to rendering the FULL
+ *   original text (fence included) as ordinary prose. Content is never lost.
+ */
+export function parseDigest(text) {
+  // Same boundary rule: a lone-CR transcript must find the leading digest fence
+  // exactly as an LF one does, and `rest` must hand normalised text downstream.
+  const src = String(text ?? '').replace(/\r\n?/g, '\n');
+  const m = sliceDigestFence(src.split('\n'));
+  if (!m) return null;
+
+  const items = digestItemsFromJson(m.json);
+  if (!items) return null; // malformed / no usable items -> plain prose, nothing hidden
+
+  return { items, rest: m.rest, before: m.before };
 }
 
 /** One reference: a ticket id becomes a deep link; anything else is an inert label. */
@@ -392,9 +454,19 @@ function blocksToNodes(parsed, projectId) {
     // certainty guard, and that disagreement is the whole hidden-content class.
     if (pres && COLLAPSED_BLOCKS.includes(b.name)) nodes.push(renderFold(b.content, pres));
     else if (pres) nodes.push(renderVisible(b.content, pres, b.label));
-    // A stray orchard-digest in the BODY (spec: digest is once, first, and is
-    // lifted above). Render its content as ordinary prose so nothing is lost; we
-    // never paint a second structured digest.
+    // THE FLOOR (BUG-155). A body-position orchard-digest — one that beat the
+    // lead-in bound, or a genuine second digest — must NEVER dump its raw JSON as
+    // prose. A well-formed one is painted as a real digest in document order; a
+    // malformed one degrades to a CONTAINED code block (the same "the fence just
+    // renders as a normal code block" fallback FEAT-083 gives a malformed LEADING
+    // digest), never a wall of JSON prose.
+    else if (b.name === 'orchard-digest') {
+      const items = digestItemsFromJson(b.content);
+      if (items) nodes.push(renderDigest(items, { projectId }));
+      else if (b.content.trim()) nodes.push(el('div', { class: 'out' }, el('pre', { text: b.content })));
+    }
+    // Any OTHER stray/unknown block: render its content as ordinary prose so
+    // nothing is lost.
     else if (b.content.trim()) nodes.push(prose(b.content));
   }
   return nodes;
@@ -468,6 +540,10 @@ export function renderAssistantText(text, opts = {}) {
   const d = parseDigest(src);
   if (d) {
     const wrap = el('div', { class: 'msg-with-digest' });
+    // A short prose lead-in that preceded the fence (BUG-155) renders ABOVE the
+    // rail, in document order. It carries no fences (the lift refuses one), so a
+    // plain prose() render is exact.
+    if (d.before && d.before.trim()) wrap.append(prose(d.before));
     wrap.append(renderDigest(d.items, { projectId }));
     // The body below the digest. Skip entirely for a digest-only message.
     if (d.rest.trim()) for (const n of renderBody(d.rest, projectId)) wrap.append(n);

@@ -337,6 +337,28 @@ it.
   sequential calls if one exceeds the timeout). Waiting on a notification is only safe for work
   owned by a process that outlives you (a service, another session).
 
+**Fan out as one batch, not N background lanes.** When you dispatch several independent lanes at
+once, emit them as ONE assistant message of N parallel Agent calls awaited together (foreground, not
+backgrounded). They still run concurrently, but every result lands in the SAME turn and the
+orchestrator writes ONE synthesis. Backgrounding each lane instead makes the harness wake the
+orchestrator once PER completion — a full-context turn each, and each writes a partial answer it will
+then supersede. Measured on one real session: 641 of 1,240 orchestrator turns were completion
+wakeups costing $509; the floor cost of a wakeup that only reads and speaks is ~$0.33 of pure
+context replay, and 197 of them spent $145 to produce under 400 characters; the follow-on (2nd..Nth)
+wakeups in a burst — exactly what a batched await removes — were 390 turns and $312, ~15% of that
+session's attributed spend.
+- **RIGHT — one message, N awaited lanes, one synthesis** when nothing can be decided until all
+  lanes are in (the research/exploration fan-out).
+- **WRONG — N backgrounded lanes** for the same batch: N wakeups, N partial answers, one bill per
+  replay.
+
+  Keep a lane backgrounded only when you genuinely have independent work to overlap with it in the
+  same turn (the interleave rule above), or it outlives your turn by design. The trade is real: one
+  slow lane in a batch holds the others' results hostage — usually worth it for a fan-out where
+  nothing decides until all are in. Caveat: a long foreground lane sits on the least
+  liveness-protected path, so do not use the batched shape for very long-running work without a
+  harvest path.
+
 **Classify the dispatch BEFORE writing the charter — and record the class in it.** The
 orchestrator's context converges on one reading of the problem, and the charter ENCODES that
 reading; the agent then executes the framing instead of testing it. The fix is not more

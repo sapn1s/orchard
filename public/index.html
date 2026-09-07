@@ -68,19 +68,16 @@
         <nav class="tree" id="tree" aria-label="Projects and sessions"></nav>
 
         <div class="side-foot">
-          <button id="libBtn" title="Instruction templates">
-            <span class="g">▤</span>
-            <span class="lbl">Templates</span>
-            <span class="n" id="libCount"></span>
-          </button>
           <button id="addProjBtn" title="Add a project">
             <span class="g">＋</span>
             <span class="lbl">Add project</span>
           </button>
-          <button id="themeBtn" title="Appearance">
-            <span class="g">◐</span>
-            <span class="lbl">Appearance</span>
-            <span class="val" id="themeVal">system</span>
+          <!-- FEAT-139: Templates and Appearance no longer have their own doors
+               here — they live inside the one Settings panel, under the Machine
+               scope. The single door is the navbar cog (#cogBtn). -->
+          <button id="settingsFootBtn" title="Settings — machine, project and session">
+            <span class="g">⚙</span>
+            <span class="lbl">Settings</span>
           </button>
         </div>
       </aside>
@@ -413,9 +410,10 @@
               <svg width="14" height="14" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.6 2.6 9.4 9.4M9.4 2.6 2.6 9.4"/></svg>
             </button>
           </div>
-          <div class="d-scope" id="dScope">
-            <button data-scope="project" aria-pressed="true">Project default</button>
-            <button data-scope="session" aria-pressed="false">This session</button>
+          <div class="d-scope" id="dScope" role="tablist" aria-label="Settings scope">
+            <button data-scope="machine" role="tab" aria-pressed="false">Machine</button>
+            <button data-scope="project" role="tab" aria-pressed="true">This project</button>
+            <button data-scope="session" role="tab" aria-pressed="false">This session</button>
             <span class="hint" id="dHint">Sessions inherit these</span>
           </div>
         </div>

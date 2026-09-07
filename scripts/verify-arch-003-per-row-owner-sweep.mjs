@@ -164,7 +164,7 @@ async function startSession(port, projectId, prompt) {
   return { c, stationId: ack.stationSessionId };
 }
 async function register(port, cwd, name) {
-  const r = await (await fetch(`http://127.0.0.1:${port}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: cwd, name }) })).json();
+  const r = await (await fetch(`http://127.0.0.1:${port}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: cwd, name, isolation: 'direct' }) })).json(); // FEAT-131: pin direct (container-default off)
   if (!r.project?.id) throw new Error(`register(${name}) failed ` + JSON.stringify(r));
   return r.project.id;
 }

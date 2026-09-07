@@ -25,6 +25,7 @@ import { decide } from '../../../scripts/lib/orchestrator-profile.mjs';
 // keep everything, but BUG-155 was a lane committing private paths. Same
 // PreToolUse callback, runs first, gated only by its own escape hatch.
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
+import { installGitShim } from '../../../scripts/lib/git-shim.mjs';
 // FEAT-108 round 2 — the git-write decision is now grant-aware: a runtime,
 // per-project, revocable grant (git-grant-store.mjs, host-memory only) can lift
 // the block WITHOUT relaunching, and a granted commit/push still runs the
@@ -37,6 +38,16 @@ import { evaluateGitWrite } from '../../../scripts/lib/git-grant.mjs';
 // still runs — on the sanctioned ceiling. Fleet-wide like the git block. See the
 // module header for the reroute-not-deny and hard-coded-Opus rationale.
 import { decideFableTier, fableTierGateEnabled } from '../../../scripts/lib/fable-tier-policy.mjs';
+// FEAT-129 — the advisory "file busy" lock. A different axis again from the three
+// above: PATH-keyed, not tool- or model-keyed. Many lanes/sessions share ONE
+// working tree, so a whole-file `Write` or a git-tree Bash mutation (`git checkout
+// -- f`, `reset --hard`, `stash`, `show HEAD:f > f`, `echo … > f`) silently drops a
+// concurrent lane's uncommitted hunk — none of which carries the Edit tool's
+// staleness guard. This claims a per-path lockfile before such a mutation and DENIES
+// a foreign-live collision with a "file locked by lane X" signal. Rides the SAME
+// PreToolUse callback; fleet-wide; default ON; reaps dead/stale locks so it never
+// wedges. See file-lock.mjs for the reclaim-when-dead-or-stale reliability argument.
+import { evaluateFileLock, fileLockEnabled, refreshOwnedLocks, heartbeatIntervalMs } from '../../../scripts/lib/file-lock.mjs';
 // FEAT-106 — the Stop hook lands at `.orchard/hooks/…` in the consolidated layout
 // and `scripts/hooks/…` in the legacy one. Resolve BOTH ends through this:
 // the dest in the target project (cwd) AND the source in this repo (REPO_ROOT,
@@ -46,7 +57,7 @@ import { resolveStopHookFile } from '../../../scripts/lib/board-path.mjs';
 // throwaway transcript into the user's REAL ~/.claude/projects store. Inert in
 // production; fires only for a verification harness that isolated its data dir
 // but forgot to isolate the CLI's transcript store (CLAUDE_CONFIG_DIR).
-import { assertSessionStoreIsolated } from '../../lib/paths.ts';
+import { assertSessionStoreIsolated, dataDir } from '../../lib/paths.ts';
 import type {
   AgentRuntime,
   ProviderError,
@@ -259,6 +270,21 @@ let gitHatchAnnounced = false;
 /** FEAT-124 — announce an OPEN Fable-gate escape hatch at most once per process,
  *  so `ORCHARD_ALLOW_FABLE` is never a silent bypass. */
 let fableHatchAnnounced = false;
+
+/** FEAT-129 — announce an OPEN file-lock escape hatch at most once per process,
+ *  so `ORCHARD_ALLOW_FILE_CLOBBER` is never a silent bypass. */
+let fileLockHatchAnnounced = false;
+
+/** FEAT-129 — record a denied colliding write on stderr, so a "file busy" refusal is visible in the run log. */
+function announceFileBusy(kind: string | undefined, holder: unknown, sessionLabel?: string): void {
+  const who = sessionLabel ? ` [session ${sessionLabel}]` : '';
+  const h = holder && typeof holder === 'object' ? (holder as { owner?: string }).owner : null;
+  const owned = h ? ` (held by \`${h}\`)` : '';
+  console.warn(
+    `[orchard] file-busy lock: \`${kind ?? 'write'}\` DENIED${who}${owned} — ` +
+      'a concurrent lane holds this path (FEAT-129; serialize, never clobber).',
+  );
+}
 
 /**
  * FEAT-124 — record a Fable-tier gate event on stderr, so both an OVERRIDE that
@@ -487,6 +513,14 @@ export class ClaudeRuntime implements AgentRuntime {
    */
   #declaredSessionId: string | null = null;
   #sessionIdSeen = new Set<string>();
+  /**
+   * FEAT-129 — the file-lock HEARTBEAT timer. Re-stamps this process's held locks
+   * on an interval INDEPENDENT of tool calls, so a lane in one long tool call
+   * never lets its lock go stale (the round-1 clobber), and releases a finished
+   * lane's lock the moment it leaves the running-set. Cleared in close(); unref'd
+   * so it never keeps the process alive on its own.
+   */
+  #fileLockHeartbeat: ReturnType<typeof setInterval> | null = null;
 
   start(config: RuntimeStartConfig): void {
     /*
@@ -505,6 +539,38 @@ export class ClaudeRuntime implements AgentRuntime {
      * loud, that it could not.
      */
     ensureCurrentStopHook(config.cwd);
+    /*
+     * FEAT-135 — ACTIVATION of the subprocess git-write shim (Decision A).
+     *
+     * FEAT-108's git-write block is a Bash-command-STRING scan in the PreToolUse
+     * hook below; git spawned from INSIDE a subprocess (`node -e …execFileSync
+     * ("git",["reset","--hard"])…`, `python -c`, any wrapper script) never shows
+     * `git` in the command string, so the hook allows it and a lane's script can
+     * commit/reset/checkout/push freely — destroying the tree's uncommitted work.
+     * `installGitShim` prepends a `git` shim onto THIS session's subprocess PATH
+     * so every PATH-resolved git — from bash, node, python, any language — is
+     * classified with the SAME read/write logic as the hook and a write is
+     * refused loudly regardless of how it was spawned. The sanctioned temp-index
+     * snapshot (FEAT-134) is allowed only under GIT_INDEX_FILE-in-tmpdir.
+     *
+     * SCOPE: `installGitShim` is PURE — it returns a COPY of the env with the
+     * shim dir prepended; it does NOT touch the host process's PATH or the user's
+     * login shell, so the host's own git bookkeeping and the user's hand-typed
+     * git are untouched (the FEAT-108 structural distinction is preserved). This
+     * env is what the SDK hands to `spawnLocalProcess` (direct), the survival
+     * broker, and the container `spawnClaudeCodeProcess` override alike (SDK
+     * `W.env = options.env`), so the shim rides the direct, survival, and resume
+     * paths that flow through this single `start()`. (Inside a CONTAINER the shim
+     * dir is a host temp path that does not exist in the container filesystem, so
+     * container-internal git is NOT shimmed — a pre-existing structural boundary,
+     * the container tree being separate. The OpenAI/codex runtime builds its own
+     * session env and carries no FEAT-108 hook at all — see FEAT-135 log.)
+     *
+     * Guarded by `gitWriteBlockEnabled()`: with the ORCHARD_ALLOW_GIT_WRITE hatch
+     * open the shim is not installed, mirroring the hook's own kill-switch.
+     */
+    const baseSessionEnv = { ...process.env, ...(config.env ?? {}), [ORCHARD_SESSION_ENV]: declaredSessionId };
+    const sessionEnv = gitWriteBlockEnabled() ? installGitShim(baseSessionEnv).env : baseSessionEnv;
     const options: Options = {
       cwd: config.cwd,
       includePartialMessages: true,
@@ -542,7 +608,7 @@ export class ClaudeRuntime implements AgentRuntime {
        * boot-augmented PATH that BUG-091 exists to deliver (that suite asserts
        * the fake-CLI child still carries it).
        */
-      env: { ...process.env, ...(config.env ?? {}), [ORCHARD_SESSION_ENV]: declaredSessionId },
+      env: sessionEnv,
     };
     // Isolation seams — set only when the session hands them over, exactly as the
     // container / survival (FEAT-015) branches did inline. `pathToExecutable` is
@@ -617,7 +683,60 @@ export class ClaudeRuntime implements AgentRuntime {
           'unjustified `model: fable` dispatches run ungated this run (FEAT-124 escape hatch).',
       );
     }
-    if (gitBlockOn || config.orchestratorProfile || fableGateOn) {
+    /*
+     * FEAT-129 — the advisory file-busy lock. FLEET-WIDE like the git/Fable gates.
+     * `fileLockOwner` is as fine as available: the STATION session id, distinct per
+     * session so two sessions on one project contend correctly; the per-lane
+     * `agent_id` (present only inside a subagent) is folded in PER CALL below so
+     * lanes within one session are distinguished too. `fileLockDir` is per-project
+     * under the data dir (NOT inside the tree — never committed, shared by every
+     * session of the project), so cross-session coordination is a shared artifact.
+     */
+    const fileLockOn = fileLockEnabled();
+    if (!fileLockOn && !fileLockHatchAnnounced) {
+      fileLockHatchAnnounced = true;
+      console.warn(
+        '[orchard] file-busy lock DISABLED via ORCHARD_ALLOW_FILE_CLOBBER — ' +
+          'concurrent lanes may overwrite each other\'s uncommitted work this run (FEAT-129 escape hatch).',
+      );
+    }
+    const fileLockProjectKey = config.gitGrantKey ?? null; // the stable per-project id
+    const fileLockDir = fileLockOn && fileLockProjectKey
+      ? path.join(dataDir(), 'file-locks', fileLockProjectKey.replace(/[^A-Za-z0-9._-]/g, '_'))
+      : null;
+    const fileLockSessionOwner = config.sessionLabel ?? declaredSessionId;
+    /*
+     * FEAT-129 — start the HEARTBEAT. This is the round-2 fix for the reaper-vs-
+     * live-lock clobber: rather than a TTL deciding a live lane's lock is stale,
+     * a lock is live for exactly as long as its owning lane is a live TASK. This
+     * timer re-stamps every lock this process holds whose owner is still in the
+     * running-set, and releases the locks of lanes that have left it — both from
+     * GROUND TRUTH (`config.liveLaneIds`, the bridge's `liveAgents()`), never a
+     * clock. It runs independently of tool calls, so a single >TTL tool call can
+     * no longer let a live lock lapse. `isOwnerLive` maps a lock owner back to its
+     * lane: the session-main owner is live while the session is open; a
+     * `sessionOwner:agentId` lane is live iff the running-set still lists agentId.
+     * Anything unresolved is treated as live (fail toward never-clobber).
+     */
+    if (fileLockDir) {
+      const liveLaneIds = config.liveLaneIds;
+      const ownerPrefix = fileLockSessionOwner ? `${fileLockSessionOwner}:` : null;
+      const isOwnerLive = (owner: string): boolean => {
+        if (this.#closed) return false;                         // the whole session is gone
+        if (!ownerPrefix || owner === fileLockSessionOwner) return !this.#closed; // the main owner
+        if (!owner.startsWith(ownerPrefix)) return true;        // a foreign session's owner — not ours to judge
+        const agentId = owner.slice(ownerPrefix.length);
+        if (typeof liveLaneIds !== 'function') return true;     // no running-set wired → keep it (never clobber)
+        try { return liveLaneIds().includes(agentId); } catch { return true; }
+      };
+      const tick = () => {
+        try { refreshOwnedLocks({ lockDir: fileLockDir, isOwnerLive }); } catch { /* best effort; the TTL still backstops */ }
+      };
+      const timer = setInterval(tick, heartbeatIntervalMs());
+      if (typeof timer.unref === 'function') timer.unref();     // never keep the process alive on the heartbeat alone
+      this.#fileLockHeartbeat = timer;
+    }
+    if (gitBlockOn || config.orchestratorProfile || fableGateOn || fileLockDir) {
       options.hooks = {
         ...(options.hooks ?? {}),
         PreToolUse: [
@@ -679,6 +798,38 @@ export class ClaudeRuntime implements AgentRuntime {
                     if (ft.action === 'allow' && ft.requested) {
                       announceFableTier(ft.hatch ? 'hatch' : 'justified', ft, config.sessionLabel);
                       // Fall through: `Agent` is allowed by the profile anyway.
+                    }
+                  }
+                  /*
+                   * FEAT-129 — the file-busy lock. For ALL sessions, on any
+                   * file-mutating tool (Write/Edit/NotebookEdit) and the whole-file
+                   * / git-tree Bash path. Runs AFTER the git block (a git write is
+                   * refused before we bother locking) and independently of the
+                   * profile. The owner folds the per-lane `agent_id` onto the session
+                   * owner, so two lanes in one session — and two separate sessions —
+                   * each get a distinct claim. A foreign-live collision is DENIED
+                   * with the "file locked by lane X" signal; the owner's own paths and
+                   * a solo lane pay nothing. Fail-open only when the store can't be
+                   * located; a store error on a contended path fails toward deny.
+                   */
+                  if (fileLockDir) {
+                    const owner = i.agent_id ? `${fileLockSessionOwner}:${i.agent_id}` : fileLockSessionOwner;
+                    const lock = evaluateFileLock({
+                      toolName: i.tool_name,
+                      toolInput: i.tool_input,
+                      lockDir: fileLockDir,
+                      repoRoot: config.gitRepoPath ?? null,
+                      owner,
+                    });
+                    if (!lock.allow) {
+                      announceFileBusy(lock.kind, lock.holder, config.sessionLabel);
+                      return {
+                        hookSpecificOutput: {
+                          hookEventName: 'PreToolUse' as const,
+                          permissionDecision: 'deny' as const,
+                          permissionDecisionReason: lock.reason ?? 'the target file is locked by another live lane (FEAT-129)',
+                        },
+                      };
                     }
                   }
                   if (!config.orchestratorProfile) return {};
@@ -836,6 +987,9 @@ export class ClaudeRuntime implements AgentRuntime {
 
   close(): void {
     this.#closed = true; // FEAT-055: stops a pending gate from pushing into an ended queue
+    // FEAT-129 — stop the file-lock heartbeat. The session is ending; its locks
+    // must no longer be kept fresh, so they fall to the TTL backstop and release.
+    if (this.#fileLockHeartbeat) { clearInterval(this.#fileLockHeartbeat); this.#fileLockHeartbeat = null; }
     this.#input.end();
     try {
       this.#query?.close();

@@ -117,7 +117,11 @@ const health = async (port) => (await (await fetch(`http://127.0.0.1:${port}/api
 async function registerProject(port, workDir, name) {
   const reg = await (await fetch(`http://127.0.0.1:${port}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: workDir, name }),
+    // FEAT-131: this suite kills the CLI child BY PID (broker.claudePid) — a
+    // DIRECT-isolation ground truth a container session has no equivalent of.
+    // Pin isolation explicitly so the container-default for new projects cannot
+    // silently move these sessions off-host (honoured as-is, no preflight).
+    body: JSON.stringify({ hostPath: workDir, name, isolation: 'direct' }),
   })).json();
   if (!reg.project?.id) throw new Error(`register failed: ${JSON.stringify(reg)}`);
   // PROJECT-level (not per-start) so a page-driven resume inherits them too.

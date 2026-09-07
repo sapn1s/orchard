@@ -388,7 +388,9 @@ async function main() {
 
   const reg = await (await fetch(`${BASE}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: WORK, name: 'bug043-bg-detach' }),
+    // FEAT-131: direct-isolation lifecycle suite — pin isolation so the
+    // container-default for new projects cannot move the session off-host.
+    body: JSON.stringify({ hostPath: WORK, name: 'bug043-bg-detach', isolation: 'direct' }),
   })).json();
   const pid = reg.project?.id;
   if (!pid) throw new Error(`register failed: ${JSON.stringify(reg)}`);

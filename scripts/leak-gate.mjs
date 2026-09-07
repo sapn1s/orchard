@@ -48,7 +48,7 @@ import { fileURLToPath } from 'node:url';
 // detectors that disagree would be a worse bug than the leak. The literals are
 // still split ('saa'+'sis') at their new home, so nothing here or there trips
 // its own gate. See scripts/lib/leak-tokens.mjs.
-import { scanLine, scanIdentity, scanKeyShapes, allowedHitFor } from './lib/leak-tokens.mjs';
+import { scanLine, scanIdentity, scanKeyShapes, scanBinary, allowedHitFor } from './lib/leak-tokens.mjs';
 
 /** Image assets. In TREE mode these are allowlist-gated; in repo mode skipped. */
 const IMG_RE = /\.(png|jpe?g|gif|ico|webp|bmp|tiff?|svg)$/i;
@@ -134,7 +134,12 @@ if (TREE_MODE) {
       const m = rec.match(/^(\d{6}) [0-9a-f]+ \d\t(.*)$/s);
       if (m) modeOf.set(m[2], m[1]);
     }
-    files = execFileSync('git', ['diff', '--cached', '--name-only', '--diff-filter=ACMR', '-z'],
+    // --diff-filter=ACMRT: Added/Copied/Modified/Renamed AND Type-changed. The
+    // round-2 enumeration dropped T, so changing a tracked symlink/gitlink INTO a
+    // regular file whose blob carried a secret was never read — the blob is in the
+    // index, `git diff --cached` (T) reports it, but the ACMR filter excluded it
+    // (round-2 verifier CRITICAL). A Deletion (D) still carries no content to leak.
+    files = execFileSync('git', ['diff', '--cached', '--name-only', '--diff-filter=ACMRT', '-z'],
       { cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
       .split('\0').filter(Boolean)
       .filter((rel) => { const m = modeOf.get(rel); return m === '100644' || m === '100755'; });
@@ -173,12 +178,32 @@ for (const rel of files) {
 
   if (IMG_RE.test(rel)) {
     // TREE mode: a non-allowlisted image IS a leak (pixels can carry private
-    // data the text scan cannot). REPO mode: images are fine in the private
-    // working repo — skip them (no regression for the gatekeeper).
+    // data the text scan cannot). REPO mode: raster images are fine in the
+    // private working repo — skip them (no regression for the gatekeeper).
     if (TREE_MODE && !isAllowedImage(rel)) {
       hits++; imgHits++;
       perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
       emitHit(`${rel}:0: [private image — not on public allowlist] binary image would ship in the public tree`);
+    }
+    // FEAT-130 r3: an SVG is XML TEXT and can embed a credential in bytes the
+    // pixel/allowlist rule never sees (round-2 verifier HIGH: a github_pat_ inside
+    // a text .svg — and SVGs live under the very public/ + docs/assets/ dirs the
+    // TREE allowlist waives without content-scanning — shipped end to end).
+    // Content-scan SVGs for the high-signal KEY/assignment shapes in EVERY mode.
+    // Raster images are NOT text-scanned (huge false-positive risk over random
+    // pixel bytes; their pixel-leak risk is the TREE allowlist's job).
+    if (/\.svg$/i.test(rel)) {
+      let sbuf;
+      try { sbuf = readBuf(abs, rel); }
+      catch (e) {
+        console.error(`LEAK GATE: ABORT — cannot read ${STAGED ? 'staged blob' : 'file'} '${rel}': ${e.message}`);
+        process.exit(2);
+      }
+      for (const { token, match } of scanBinary(sbuf.toString('latin1'))) {
+        hits++;
+        perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
+        emitHit(`${rel}:0: [${token}] embedded in svg: ${String(match).slice(0, 80)}`);
+      }
     }
     continue;
   }
@@ -195,7 +220,11 @@ for (const rel of files) {
   // look for the high-signal KEY/PEM shapes, which have negligible false-positive
   // risk. Images are excluded — their pixels are handled by TREE-mode allowlist.
   if (BIN_SKIP_RE.test(rel) || buf.includes(0)) {
-    for (const { token, match } of scanKeyShapes(buf.toString('latin1'))) {
+    // FEAT-130 r3: scanBinary (not scanKeyShapes) so the assignment /
+    // connection-string classes are scanned too — round-2 verifier HIGH: a
+    // staged `apikey=<body>` + one trailing NUL downgraded the WHOLE blob to
+    // KEY/PEM-only and slipped. Email is still excluded (floods on binary noise).
+    for (const { token, match } of scanBinary(buf.toString('latin1'))) {
       hits++;
       perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
       emitHit(`${rel}:0: [${token}] embedded in binary/skipped file: ${String(match).slice(0, 80)}`);

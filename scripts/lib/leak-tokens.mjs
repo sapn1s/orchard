@@ -121,10 +121,53 @@ export const allowedHitFor = (rel, tokenName, line) =>
  * against the real tree (FEAT-130 worker log).
  * ──────────────────────────────────────────────────────────────────────── */
 
-/** A value that is a documented placeholder / fixture, not a live secret. */
-const PLACEHOLDER =
-  /not[-_ ]?a[-_ ]?real|not[-_ ]?real|example|placeholder|redacted|dummy|sample|changeme|foobar|\bfake\b|\byour[-_ ]|xxxx+|<[^>]*>|\.\.\.|…|test[-_ ]?(?:token|key|secret|value)|\bhere\b|\bTODO\b/i;
-const isPlaceholder = (v) => PLACEHOLDER.test(String(v ?? ''));
+/**
+ * Structural placeholder MARKERS — a value containing any of these is a template,
+ * never a live secret (`<your-key>`, `${VAR}`, `%TOKEN%`, `xxxx…`, `…`, `***`).
+ */
+const STRUCTURAL_PLACEHOLDER = /<[^>]*>|\$\{|\{\{|`|%[A-Za-z0-9_]+%|xxxx+|\.\.\.|…|\*\*\*+/;
+/**
+ * Dictionary placeholder WORDS. Only consulted for a value that has NO
+ * high-entropy chunk (see below): `your-key-here`, `not-a-real-token`, `sample`.
+ */
+const PLACEHOLDER_WORD_ANY =
+  /not[-_ ]?a[-_ ]?real|not[-_ ]?real|example|placeholder|redacted|dummy|sample|changeme|foobar|\bfake\b|\byour\b|xxx+|\bhere\b|\bTODO\b|goes[-_ ]?here|test[-_ ]?(?:token|key|secret|value)|dummy|replace[-_ ]?me/i;
+/**
+ * FEAT-130 round 4 — the placeholder decision is made PER-TOKEN, entropy FIRST.
+ *
+ * Round 3 anchored the test to the whole value but still consulted the structural
+ * marker BEFORE entropy (`if (STRUCTURAL_PLACEHOLDER.test(s)) return true;` came
+ * first). That let a benign marker override a co-located real secret: splicing a
+ * structural marker (an `xxxx` run) INTO a single high-entropy alnum run waived
+ * the whole value even though the run itself is a live credential (round-3 verifier
+ * BROKEN #1). The decision must be made per-token: if ANY `[^A-Za-z0-9]`-delimited
+ * run is itself secret-shaped, the value is a live secret — no marker elsewhere
+ * (or spliced inside a different run) can waive it. Only when NO run is
+ * secret-shaped do we consult the structural marker / placeholder word.
+ *
+ * Entropy therefore has to be a per-token property that a spliced marker cannot
+ * fake AND that a marker run cannot satisfy. So `hasEntropyChunk` now requires
+ * genuine CLASS DIVERSITY (dropping the old single-class `length >= 20` branch):
+ * a run of identical characters (`xxxx…x`, a `***` marker, an em-dash fill) is
+ * one class and is NOT entropy, so a pure placeholder still waives; but a real
+ * mixed-case+digit body — even with `xxxx` spliced in — stays mixed-class and is
+ * caught. A real credential is never a single repeated character; a value with
+ * no marker and no placeholder word is never waived regardless (see below), so
+ * this tightening removes waivers without ever hiding a live key.
+ */
+function hasEntropyChunk(v) {
+  return String(v ?? '').split(/[^A-Za-z0-9]+/).filter(Boolean).some((t) => {
+    const classes = [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(t)).length;
+    return (t.length >= 12 && classes >= 2) || (t.length >= 8 && classes >= 3);
+  });
+}
+function isPlaceholder(v) {
+  const s = String(v ?? '').trim();
+  if (!s) return true;
+  if (hasEntropyChunk(s)) return false; // a real high-entropy run → NOT a placeholder, even if a marker is spliced beside it
+  if (STRUCTURAL_PLACEHOLDER.test(s)) return true;
+  return PLACEHOLDER_WORD_ANY.test(s);
+}
 
 /** A value that is a code reference / interpolation, not a hard-coded literal. */
 const CODE_REF =
@@ -178,6 +221,22 @@ const KEY_SHAPES = [
   { name: 'slack token (xox…)',             re: /\bxox[baprs]-[A-Za-z0-9]{8,}-[A-Za-z0-9]{8,}[A-Za-z0-9-]*/ },
   { name: 'private key (PEM header)',       re: /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/ },
   { name: 'bearer token',                   re: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/, guard: (m) => !isPlaceholder(m) },
+  // FEAT-130 round 3 — major provider formats the round-2 verifier proved slip
+  // past scanLine (each is a REAL secret under the "any real-shaped secret" bar).
+  // Bodies are pinned to the provider's real length/charset so a ticket writing
+  // the shape with an ellipsis (`AIza…`) does NOT trip. Note Stripe/GitHub use an
+  // UNDERSCORE (`sk_`, `github_pat_`) that the `sk-`/`gh[pousr]_` matchers miss.
+  // The trailing terminator is a NEGATIVE LOOKAHEAD, not `\b`: an AIza body may
+  // end in `-` or `_`, and `\b` fails after a non-word char, so a key whose 35th
+  // body char is a hyphen was missed (round-3 verifier BROKEN #3). `(?![body])`
+  // pins the body to exactly 35 chars regardless of what the last one is.
+  { name: 'google api key (AIza)',          re: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/ },
+  { name: 'stripe key (sk_/rk_ live/test)', re: /\b[sr]k_(?:live|test)_[0-9A-Za-z]{20,}\b/ },
+  { name: 'github fine-grained token',      re: /\bgithub_pat_[0-9A-Za-z_]{40,}\b/ },
+  { name: 'sendgrid api key (SG.)',         re: /\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b/ },
+  { name: 'npm token (npm_)',               re: /\bnpm_[0-9A-Za-z]{36}\b/ },
+  { name: 'pypi token (pypi-AgE)',          re: /\bpypi-AgE[A-Za-z0-9_+/=-]{20,}/ },
+  { name: 'json web token (jwt)',           re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/, guard: (m) => !isPlaceholder(m) },
 ];
 
 // Secret assignments. Two accepted forms so precision stays high:
@@ -187,8 +246,14 @@ const KEY_SHAPES = [
 // *_TOKEN constants); only high-signal secret key names are matched.
 const SECRET_KEY_SRC =
   '(?:password|passwd|secret|secret[_-]?key|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|bot[_-]?token|slack[_-]?token|github[_-]?token|gh[_-]?token|npm[_-]?token)';
-const ASSIGN_DOTENV = new RegExp('(?:^|[\\s;])([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|API_?KEY|APIKEY|ACCESS_?KEY|CLIENT_?SECRET|PRIVATE_?KEY|AUTH_?TOKEN|ACCESS_?TOKEN|REFRESH_?TOKEN|BOT_?TOKEN|SLACK_?TOKEN|GITHUB_?TOKEN|GH_?TOKEN|NPM_?TOKEN)[A-Z0-9_]*)=([^\\s"\'#]{6,})');
-const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,})\\1', 'i');
+// FEAT-130 round 4 — all three assignment regexes carry the `g` flag and are
+// iterated with `matchAll` (below), never `.exec` once. `.exec` returned only the
+// FIRST assignment on a line, so a placeholder assignment written before a real
+// one masked it (`PASSWORD=your-key-here; PASSWORD=<real>` → round-3 verifier
+// BROKEN #2). Iterating every match on the line closes that: a benign first
+// assignment can no longer hide a malicious later one.
+const ASSIGN_DOTENV = new RegExp('(?:^|[\\s;])([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|API_?KEY|APIKEY|ACCESS_?KEY|CLIENT_?SECRET|PRIVATE_?KEY|AUTH_?TOKEN|ACCESS_?TOKEN|REFRESH_?TOKEN|BOT_?TOKEN|SLACK_?TOKEN|GITHUB_?TOKEN|GH_?TOKEN|NPM_?TOKEN)[A-Z0-9_]*)=([^\\s"\'#]{6,})', 'g');
+const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,})\\1', 'ig');
 // FEAT-130 round 2 — the recall gap the round-1 verify hit: a LOWERCASE,
 // UNQUOTED secret assignment (a lowercase api-key/password `=`/`:` a bare
 // high-entropy value) slipped both forms above (dotenv needs ALL-CAPS, quoted
@@ -201,7 +266,7 @@ const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,
 // Extra precision on top of isSecretValue: an unquoted bare value must ALSO look
 // secret-shaped (looksSecretish) so a plain prose word (a config key documented
 // as "required"/"optional") is not mistaken for a live credential.
-const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{6,})', 'i');
+const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{6,})', 'ig');
 // proto://user:password@host — the inline password is the leak.
 const CONN_STRING = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s:/@]+:([^\s:/@]+)@[^\s/'"]+/;
 const CONN_PLACEHOLDER = /^(?:pass|passwd|password|user|username|secret|token|xxx+|changeme)$/i;
@@ -245,12 +310,24 @@ export function scanSecrets(line) {
     const m = s.match(k.re);
     if (m && (!k.guard || k.guard(m[0]))) out.push({ token: k.name, match: m[0] });
   }
-  let a = ASSIGN_DOTENV.exec(s);
-  if (a && isSecretValue(a[2])) out.push({ token: 'secret assignment', match: `${a[1]}=…` });
-  a = ASSIGN_QUOTED.exec(s);
-  if (a && isSecretValue(a[2])) out.push({ token: 'secret assignment', match: `${a[0].split(/[:=]/)[0].trim()}=…` });
-  a = ASSIGN_BARE.exec(s);
-  if (a && isSecretValue(a[1]) && looksSecretish(a[1])) out.push({ token: 'secret assignment', match: `${a[0].split(/[:=]/)[0].trim()}=…` });
+  // Iterate EVERY assignment on the line (not just the first) so a placeholder
+  // written before a real secret cannot mask it. Dedupe by the reported key label
+  // so the same key matched by two forms (dotenv AND bare) reports once.
+  const seenAssign = new Set();
+  const pushAssign = (label) => {
+    if (seenAssign.has(label)) return;
+    seenAssign.add(label);
+    out.push({ token: 'secret assignment', match: label });
+  };
+  for (const a of s.matchAll(ASSIGN_DOTENV)) {
+    if (isSecretValue(a[2])) pushAssign(`${a[1]}=…`);
+  }
+  for (const a of s.matchAll(ASSIGN_QUOTED)) {
+    if (isSecretValue(a[2])) pushAssign(`${a[0].split(/[:=]/)[0].trim()}=…`);
+  }
+  for (const a of s.matchAll(ASSIGN_BARE)) {
+    if (isSecretValue(a[1]) && looksSecretish(a[1])) pushAssign(`${a[0].split(/[:=]/)[0].trim()}=…`);
+  }
   const c = CONN_STRING.exec(s);
   if (c && !CONN_PLACEHOLDER.test(c[1]) && !isPlaceholder(c[1]) && !isCodeRef(c[1])) {
     out.push({ token: 'connection string password', match: c[0].replace(c[1], '…') });
@@ -274,6 +351,35 @@ export function scanKeyShapes(text) {
   for (const k of KEY_SHAPES) {
     for (const m of s.matchAll(new RegExp(k.re.source, k.re.flags.includes('g') ? k.re.flags : k.re.flags + 'g'))) {
       if (!k.guard || k.guard(m[0])) { out.push({ token: k.name, match: m[0] }); break; }
+    }
+  }
+  return out;
+}
+
+/**
+ * FEAT-130 round 3 — scan binary / NUL-containing / image blob content for
+ * credential shapes. The round-2 gate downgraded any NUL-bearing or
+ * binary-extension blob (and skipped images entirely) to KEY/PEM-only scanning,
+ * so a staged `apikey=<body>` + one trailing NUL, or a `github_pat_` inside a
+ * text `.svg`, shipped. This runs the KEY/PEM/provider shapes across the whole
+ * blob AND the assignment / connection-string classes over each newline/NUL-
+ * delimited chunk. EMAIL is deliberately excluded — the generic email pattern
+ * floods on binary noise (that was the reason binary got the narrow scan). A
+ * blob's chunks are deduped so the same embedded key is reported once.
+ */
+export function scanBinary(text) {
+  const s = String(text ?? '');
+  const out = [];
+  const seen = new Set();
+  const push = (token, match) => {
+    const k = `${token} ${match}`;
+    if (!seen.has(k)) { seen.add(k); out.push({ token, match }); }
+  };
+  for (const { token, match } of scanKeyShapes(s)) push(token, match);
+  for (const chunk of s.split(/[\r\n\x00]+/)) {
+    for (const h of scanSecrets(chunk)) {
+      if (h.token === 'personal email') continue; // floods on binary noise
+      push(h.token, h.match);
     }
   }
   return out;

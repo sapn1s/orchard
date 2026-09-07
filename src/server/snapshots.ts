@@ -208,6 +208,50 @@ export function fsTypeOf(target: string): string | null {
 }
 
 /**
+ * FEAT-131 — creation-time reflink capability probe for `projectHostPath`.
+ *
+ * Answers ONE question a container-default new project needs answered before it
+ * is created: can this project's directory actually be reflink-snapshotted into
+ * the snapshot store? It runs the REAL operation that `create()` would — a
+ * `cp --reflink=always` from a throwaway file inside the project onto the store
+ * — so it catches BOTH a non-reflink filesystem AND a store that lives on a
+ * different device from the project (the two ways snapshotting is impossible
+ * here). No silent full copy: `--reflink=always` refuses rather than degrading.
+ *
+ * Non-destructive: the probe source and destination are throwaway temp entries,
+ * removed in `finally` whether the copy succeeds or fails. Used by
+ * `registry.createProject` to fall a container default safely back to `direct`;
+ * NOT used by `create()`, which stays fail-loud on the real snapshot.
+ */
+export function reflinkProbe(projectHostPath: string): { ok: boolean; message: string } {
+  const store = snapshotsRoot();
+  const tag = crypto.randomBytes(6).toString('hex');
+  const srcFile = path.join(projectHostPath, `.orchard-reflink-probe-${tag}`);
+  const destDir = path.join(store, `.probe-${tag}`);
+  try {
+    ensureDir(store);
+    fs.writeFileSync(srcFile, 'orchard reflink probe');
+    ensureDir(destDir);
+    const r = spawnSync('cp', ['--reflink=always', '-a', '--', srcFile, `${destDir}/`], {
+      encoding: 'utf8', timeout: 15_000,
+    });
+    if (r.status === 0) {
+      return {
+        ok: true,
+        message: `reflink OK (project ${fsTypeOf(projectHostPath) ?? '?'} -> store ${fsTypeOf(store) ?? '?'})`,
+      };
+    }
+    const why = (r.stderr || r.stdout || '').trim().slice(0, 300);
+    return { ok: false, message: `reflink unavailable: ${why || `cp --reflink=always exited ${r.status ?? r.signal}`}` };
+  } catch (e) {
+    return { ok: false, message: `reflink probe error: ${(e as Error).message}` };
+  } finally {
+    try { fs.rmSync(srcFile, { force: true }); } catch { /* best effort */ }
+    try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+}
+
+/**
  * Preflight the one failure mode that is certain in advance: a reflink cannot
  * cross filesystems, so if the project and the snapshot store sit on different
  * devices there is nothing to try. Everything else is left to `cp` itself.

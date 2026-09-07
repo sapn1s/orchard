@@ -304,9 +304,12 @@ const BLOCK_PRESENTATION = {
   // finding shows its own first sentence in the summary. See the header for why
   // this category gets it and narration does not.
   'orchard-finding': { key: 'finding', label: 'Finding', preview: true },
-  'orchard-outcome': { key: 'outcome', label: 'Changed' },
+  // `outcome` and `judgment` fold with a preview (round 14), same as `finding`:
+  // they are the long "what I did / why" prose, and a bare caption would force
+  // an open-to-triage. See COLLAPSED_BLOCKS in response-blocks.js.
+  'orchard-outcome': { key: 'outcome', label: 'Changed', preview: true },
   'orchard-status': { key: 'status', label: 'Where things stand' },
-  'orchard-judgment': { key: 'judgment', label: 'My call' },
+  'orchard-judgment': { key: 'judgment', label: 'My call', preview: true },
   'orchard-uncategorized': { key: 'uncat', label: 'Uncategorised' },
   'orchard-narration': { key: 'narration', label: 'Narration', hint: 'what I did this turn' },
   // LEGACY. `answer` shipped undecorated, and it stays undecorated: adding a

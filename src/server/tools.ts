@@ -22,7 +22,7 @@ import type { Project } from './registry.ts';
 import { browserSettingsOf, toolSettingsOf } from './registry.ts';
 import { mcpServerFor as browserMcpServerFor, MCP_SERVER_NAME, type McpStdioServer } from './browser.ts';
 import { containerWorkdir } from './container-manager.ts';
-import { hostSerenaBin, hostPlaywrightBin } from './provisioning.ts';
+import { hostSerenaBin, hostPlaywrightBin, hostPlaywrightBinExists } from './provisioning.ts';
 
 export const SERENA_SERVER_NAME = 'serena';
 export const PLAYWRIGHT_SERVER_NAME = 'playwright';
@@ -201,6 +201,30 @@ export interface McpPlan {
  * container the shim would point at a socket that was never bind-mounted, so
  * every call fails mid-task instead of at launch.
  */
+/**
+ * FEAT-133 — why a Playwright MCP would NOT come up for this project, or `null`
+ * when it will. Same role for Playwright that `browserUnavailableReason` plays
+ * for the stealth browser (above): decided from one fact and read by BOTH the
+ * attach gate here AND the system-prompt note (agent-bridge
+ * `playwrightAvailabilityNote`), so a session told "enabled but UNAVAILABLE" is
+ * never simultaneously handed a Playwright server that cannot start.
+ *
+ * DIRECT isolation runs the host install (`hostPlaywrightBin`); if that binary
+ * was never provisioned the server would spawn and die, so we report it instead
+ * (BUG-147 success-criterion #4: never hand a session an MCP config naming a
+ * binary that is not installed). CONTAINER isolation runs the binary BAKED into
+ * the image, which this host cannot stat and which the image build guarantees —
+ * so a container is trusted here exactly as Serena's container branch is.
+ *
+ * This is a correctness gate independent of the default: it protects a project
+ * that turned Playwright on BY HAND on a host that never provisioned it, too.
+ */
+export function playwrightUnavailableReason(project: Project): string | null {
+  if (project.isolation === 'container') return null;
+  if (hostPlaywrightBinExists()) return null;
+  return `host Playwright MCP is not provisioned (${hostPlaywrightBin()} is absent); run provisionAllHost() to install the pinned version`;
+}
+
 export function plannedMcpServers(project: Project, opts?: { browserUnavailableReason?: string }): McpPlan {
   const servers: Record<string, McpStdioServer> = {};
   const browserSettings = browserSettingsOf(project);
@@ -209,6 +233,8 @@ export function plannedMcpServers(project: Project, opts?: { browserUnavailableR
   }
   const tools = toolSettingsOf(project);
   if (tools.serena) servers[SERENA_SERVER_NAME] = serenaMcpServerFor(project);
-  if (tools.playwright) servers[PLAYWRIGHT_SERVER_NAME] = playwrightMcpServerFor(project);
+  if (tools.playwright && !playwrightUnavailableReason(project)) {
+    servers[PLAYWRIGHT_SERVER_NAME] = playwrightMcpServerFor(project);
+  }
   return { servers, strict: Object.keys(servers).length > 0 };
 }

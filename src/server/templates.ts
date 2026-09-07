@@ -529,6 +529,27 @@ export interface ComposedPrompt {
   supersededIds: string[];
   missingIds: string[];
   mode: 'none' | 'append' | 'replace';
+  /**
+   * FEAT-132 — a per-source breakdown of what actually landed, in injection
+   * order, WITH each section's body and a truncation flag. The composer is the
+   * owner of this fact (ARCH-010): it assembles the prompt, so it — not a later
+   * reader parsing the concatenated string — records which sources applied, which
+   * were missing, and which were cut to fit their cap (BUG-146 truncation, which
+   * is otherwise silent to everything but a human reading the injected text). The
+   * `systemPrompt` string is unchanged by this field's presence — it is purely
+   * additive metadata a session-configuration record persists.
+   */
+  sources: ComposedSource[];
+}
+
+/** FEAT-132 — one injected section, with its body and status. */
+export interface ComposedSource {
+  id: string;
+  label: string;
+  status: 'applied' | 'truncated' | 'missing' | 'superseded';
+  chars: number;
+  droppedChars?: number;
+  body: string;
 }
 
 /**
@@ -591,9 +612,27 @@ export function composeInstructions(
   const section = (r: { name: string; body: string }) => `# ${r.name}\n\n${r.body}`;
   const appliedIds = kept.map((r) => r.id);
 
+  // FEAT-132 — the per-source breakdown, built in injection order alongside the
+  // prompt itself so the record reflects EXACTLY what was composed. `sources` is
+  // one array reference shared into `result`; the folds below push onto it.
+  const sources: ComposedSource[] = [];
+  for (const r of kept) {
+    const body = section(r);
+    sources.push({ id: r.id, label: r.name, status: 'applied', chars: body.length, body });
+  }
+  if (lastReplace >= 0) {
+    for (const r of resolved.slice(0, lastReplace)) {
+      const body = section(r);
+      sources.push({ id: r.id, label: r.name, status: 'superseded', chars: body.length, body });
+    }
+  }
+  for (const id of missingIds) {
+    sources.push({ id, label: id, status: 'missing', chars: 0, body: '' });
+  }
+
   let result: ComposedPrompt;
   if (kept.length === 0) {
-    result = { systemPrompt: undefined, appliedIds: [], supersededIds, missingIds, mode: 'none' };
+    result = { systemPrompt: undefined, appliedIds: [], supersededIds, missingIds, mode: 'none', sources };
   } else if (lastReplace >= 0) {
     result = {
       systemPrompt: kept.map(section).join('\n\n---\n\n'),
@@ -601,6 +640,7 @@ export function composeInstructions(
       supersededIds,
       missingIds,
       mode: 'replace',
+      sources,
     };
   } else {
     result = {
@@ -609,12 +649,33 @@ export function composeInstructions(
       supersededIds,
       missingIds,
       mode: 'append',
+      sources,
     };
   }
+
+  // FEAT-132 — record one folded section as a source. Truncation is detected
+  // from the injected TEXT the section builder returned, at the one place that
+  // assembles the prompt: the local-conventions builder emits a loud
+  // `⚠ **TRUNCATED — N of M …` notice (BUG-146), and routing/response-format cap
+  // with a trailing ellipsis. This is the composer reading its own output, not a
+  // second reader re-deriving it downstream.
+  const pushSource = (id: string, label: string, text: string) => {
+    const m = /TRUNCATED — (\d+) of/.exec(text);
+    const truncated = !!m || text.endsWith('…');
+    sources.push({
+      id,
+      label,
+      status: truncated ? 'truncated' : 'applied',
+      chars: text.length,
+      ...(m ? { droppedChars: Number(m[1]) } : {}),
+      body: text,
+    });
+  };
 
   const hostPath = opts?.hostPath;
   const localSection = hostPath ? localConventionsSection(hostPath) : null;
   if (localSection) {
+    pushSource('local-conventions', 'Conventions', localSection);
     result = {
       ...result,
       systemPrompt: appendToSystemPrompt(result.systemPrompt, localSection),
@@ -634,6 +695,7 @@ export function composeInstructions(
     ? routingSection(typeof routingOpt === 'string' ? { filePath: routingOpt } : undefined)
     : null;
   if (routingSec) {
+    pushSource('provider-routing', 'Routing', routingSec);
     result = {
       ...result,
       systemPrompt: appendToSystemPrompt(result.systemPrompt, routingSec),
@@ -656,6 +718,7 @@ export function composeInstructions(
       )
     : null;
   if (rfSec) {
+    pushSource('response-format', 'Response format', rfSec);
     result = {
       ...result,
       systemPrompt: appendToSystemPrompt(result.systemPrompt, rfSec),

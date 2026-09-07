@@ -462,6 +462,10 @@ export function createDrawer(ctx) {
   /* ------------------------------------------------------- settings view */
 
   function settingsView() {
+    // FEAT-139 — the scope spine. "Machine" renders the widened global-defaults
+    // panel (Appearance, machine-wide project defaults, Templates) in this same
+    // view, so the old separate "Global defaults" view is folded in here.
+    if (d.scope === 'machine') return machineDefaultsView();
     const p = project();
     const wrap = document.createDocumentFragment();
     if (!p) {
@@ -511,7 +515,9 @@ export function createDrawer(ctx) {
       const gLink = el('button', { class: 'addrow', text: gModel
         ? `Machine-wide default: ${modelLabel(gModel)} · manage ›`
         : 'Set a machine-wide default model ›' });
-      gLink.addEventListener('click', () => open('globals', 'settings'));
+      // FEAT-139 — the machine defaults are now the "Machine" scope of THIS panel,
+      // not a separate view: switch scope rather than navigating away.
+      gLink.addEventListener('click', () => { d.scope = 'machine'; paint(); });
       model.append(gLink);
     }
 
@@ -522,7 +528,11 @@ export function createDrawer(ctx) {
     perms.append(listRow('allowedTools', 'Allowed tools', '--allowed-tools'));
     perms.append(listRow('disallowedTools', 'Disallowed tools', '--disallowed-tools'));
 
-    wrap.append(section('model', 'Model & behaviour', true, [model, perms]));
+    /* FEAT-139 — cognitive re-grouping by what the user is DOING (see the
+       ticket's justification). "Model & spend" is the everyday knob; permissions
+       moved OUT of here into "Capabilities" (permissions are what a session may
+       DO, not which brain it uses). */
+    wrap.append(section('model', 'Model & spend', true, [model]));
 
     /* ---- Isolation & environment: the isolation tier, plus the settings
        that ONLY mean something once a container exists to hold them. Mounts
@@ -587,8 +597,17 @@ export function createDrawer(ctx) {
     wrap.append(section('iso', 'Isolation & environment', true,
       [runtime, access, servicesGroup(p, sessionScope), snapshotsGroup(p, sessionScope)]));
 
-    /* ---- Instructions & tools: the working-agreement stack and the
-       attachable integrations (browser, MCPs) a session can reach for. ---- */
+    /* ---- FEAT-139 "Capabilities": everything that governs what a session can
+       REACH and DO — which engine runs it (provider), which integrations and
+       MCP tools it can use, and what it is permitted to do (permissions). These
+       three used to be split across "Instructions & tools" and "Model &
+       behaviour"; grouping them by the question ("what can it do?") is the
+       cognitive re-group the user asked for. ---- */
+    wrap.append(section('caps', 'Capabilities', true,
+      [providerGroup(sessionScope), integrationsGroup(p, sessionScope), perms]));
+
+    /* ---- Instructions: how the session is GUIDED — the working-agreement
+       stack and the response-format shaping. ---- */
     const ins = el('div', { class: 'grp', 'data-focus': 'instructions' }, groupLabel('Instructions'));
     const stack = effectiveStack();
     ins.append(stackSummaryRow('CLAUDE.md', 'file'));
@@ -599,19 +618,14 @@ export function createDrawer(ctx) {
     go.addEventListener('click', () => open('instructions', 'settings'));
     ins.append(go);
 
-    wrap.append(section('instr', 'Instructions & tools', true,
-      [ins, providerGroup(sessionScope), integrationsGroup(p, sessionScope), responseFormatGroup(p, sessionScope)]));
+    wrap.append(section('instr', 'Instructions', true,
+      [ins, responseFormatGroup(p, sessionScope)]));
 
-    /* ---- Wiring: is this project actually using our METHODOLOGY (WA, local
-       conventions, ticket board, drift-guard) — computed live from the registry
-       and files on disk, with one-click Apply for each missing layer. ---- */
-    wrap.append(section('wiring', 'Wiring', true, [wiringGroup(p, sessionScope)]));
-
-    /* ---- Advanced: project housekeeping that's rare enough to earn its
-       collapse — memories, git, and stray processes. Common settings stay
-       above, uncollapsed; this is the progressive-disclosure tier. ---- */
+    /* ---- Advanced: rare maintenance that earns its collapse — methodology
+       wiring, agent memories, git and stray processes. The four common sections
+       above stay open; this is the progressive-disclosure tier (FEAT-139). ---- */
     wrap.append(section('advanced', 'Advanced', false,
-      [memoriesGroup(p), gitGroup(p), processesGroup(p)]));
+      [wiringGroup(p, sessionScope), memoriesGroup(p), gitGroup(p), processesGroup(p)]));
 
     if (d.scope === 'session') {
       const l = live();
@@ -782,7 +796,7 @@ export function createDrawer(ctx) {
     // attachable MCP tools are baked into the mcpServers config at launch, so a
     // running session cannot attach or detach them; they are project-wide only.
     if (readOnly) grp.append(note(
-      'Browser and the attachable MCP tools (Serena, Playwright) are decided when a session launches and apply to the whole project — a running session can’t attach or detach them. Switch to “Project default” to change them.'));
+      'Browser and the attachable MCP tools (Serena, Playwright) are decided when a session launches and apply to the whole project — a running session can’t attach or detach them. Switch to “This project” to change them.'));
     return grp;
   }
 
@@ -946,7 +960,7 @@ export function createDrawer(ctx) {
 
     if (on) grp.append(guidanceRow(readOnly, cfg));
     if (readOnly) grp.append(note(
-      'The response format is project-wide — it shapes every session’s system prompt, so a running session can’t change it. Switch to “Project default” to edit.'));
+      'The response format is project-wide — it shapes every session’s system prompt, so a running session can’t change it. Switch to “This project” to edit.'));
     return grp;
   }
 
@@ -2050,7 +2064,7 @@ export function createDrawer(ctx) {
   }
 
   const projectOnlyNote = (what) =>
-    note(`${what} can only be set for the whole project — a session cannot change it without rebuilding the container for every other session. Switch to “Project default” to change it.`);
+    note(`${what} can only be set for the whole project — a session cannot change it without rebuilding the container for every other session. Switch to “This project” to change it.`);
 
   function stackSummaryRow(name, mode) {
     return el('div', { class: 'set' },
@@ -2770,18 +2784,61 @@ export function createDrawer(ctx) {
     return m ? (m.displayName || m.value) : value;
   }
 
-  function globalsView() {
+  /**
+   * FEAT-139 — a machine-scope tri-state control: "Built-in" (no machine
+   * default, `null`), plus one button per concrete value. Writing "Built-in"
+   * clears the field so the product's own default applies again. Used for the
+   * new-project isolation tier and each tool toggle. `values` is [key,label][].
+   */
+  function globalSeg(field, values, current) {
+    const seg = el('div', { class: 'seg gseg' });
+    const mk = (key, label, val) => {
+      const pressed = current === val;
+      const b = el('button', { 'aria-pressed': String(pressed), text: label });
+      b.addEventListener('click', () => { if (!pressed) saveGlobal(field, val); });
+      return b;
+    };
+    seg.append(mk('__none__', 'Built-in', null));
+    for (const [key, label] of values) seg.append(mk(key, label, key));
+    return seg;
+  }
+
+  /* FEAT-139 — appearance is a machine-wide preference, so it lives in the
+     Machine scope beside the other machine defaults. localStorage stays the fast
+     client read; this is the surface. ctx owns the <html>/localStorage write. */
+  function appearanceGroup() {
+    const grp = el('div', { class: 'grp', 'data-focus': 'appearance' }, groupLabel('Appearance'));
+    const themes = ctx.themes?.() ?? ['system', 'light', 'dark'];
+    const cur = ctx.getTheme?.() ?? 'system';
+    const LBL = { system: 'System', light: 'Light', dark: 'Dark' };
+    const seg = el('div', { class: 'seg gseg' });
+    for (const t of themes) {
+      const b = el('button', { 'aria-pressed': String(cur === t), text: LBL[t] ?? t });
+      b.addEventListener('click', () => { ctx.setTheme?.(t); paint(); });
+      seg.append(b);
+    }
+    grp.append(seg);
+    grp.append(note(cur === 'system'
+      ? 'Following the operating system’s light/dark setting. Pick Light or Dark to pin it for this browser.'
+      : `Pinned to ${LBL[cur] ?? cur} in this browser. Switch back to System to follow the OS setting.`));
+    return grp;
+  }
+
+  function machineDefaultsView() {
     const wrap = document.createDocumentFragment();
+    ensureGlobals();
     if (d.globals === undefined) {
-      ensureGlobals();
-      wrap.append(el('div', { class: 'grp' }, note('Loading global defaults…')));
+      wrap.append(appearanceGroup());
+      wrap.append(el('div', { class: 'grp' }, note('Loading machine-wide defaults…')));
       return wrap;
     }
     const g = d.globals;
     const catalog = d.modelCatalog ?? [];
 
+    wrap.append(appearanceGroup());
+
     const intro = el('div', { class: 'grp' }, groupLabel('What these are'));
-    intro.append(note('The defaults every new session starts from, on this machine. A project can override any of these, and a single session can override its project — so the order that decides what runs is: global default → project → session.'));
+    intro.append(note('The defaults every new project on this machine starts from. Model and effort are inherited LIVE — change one and every project that hasn’t set its own picks it up on its next session (order: machine → project → session). The new-project defaults below (isolation, dispatch, MCP tools) SEED a project when it is created; changing them never rewrites projects that already exist.'));
     wrap.append(intro);
 
     /* ---- default model: a real picker over the derived catalog ---- */
@@ -2864,6 +2921,48 @@ export function createDrawer(ctx) {
     eg.append(esel);
     wrap.append(eg);
 
+    /* ---- new-project defaults: isolation + the dispatch/MCP tool toggles the
+       user named. These SEED a project at creation (existing projects keep their
+       own stored value), so their copy says "new projects" — never "inherited",
+       which would be a lie for these fields (FEAT-139). ---- */
+    const np = el('div', { class: 'grp', 'data-focus': 'newProjectDefaults' }, groupLabel('New-project defaults'));
+    np.append(note('What a newly-created project is set up with, unless you choose otherwise for it at creation. “Built-in” uses Orchard’s own default. Changing these does not touch projects that already exist.'));
+
+    const isoRow = el('div', { class: 'set gset' });
+    isoRow.append(el('span', { class: 'l', text: 'Isolation' }, el('span', { class: 'f', text: 'do sessions run in a container?' })));
+    np.append(isoRow);
+    np.append(globalSeg('isolation', [['container', 'Container'], ['sandbox', 'Sandbox'], ['direct', 'Direct']], g.isolation));
+    np.append(note(g.isolation === 'container'
+      ? 'New projects try Container (isolated; falls back to Direct if this machine can’t run one). Built-in behaves the same today.'
+      : g.isolation
+        ? `New projects are created ${g.isolation}. Container isolation is the safer default where the machine supports it.`
+        : 'Built-in: new projects try Container and fall back to Direct when the machine can’t run one.'));
+
+    for (const spec of [
+      { field: 'openaiDispatch', label: 'OpenAI dispatch', flag: 'host-brokered Codex dispatch', builtin: 'on' },
+      { field: 'serena', label: 'Serena (LSP)', flag: 'symbol-level code tools', builtin: 'on' },
+      { field: 'playwright', label: 'Playwright', flag: 'headless browser for UI tests', builtin: 'on where provisioned' },
+    ]) {
+      const r = el('div', { class: 'set gset' });
+      r.append(el('span', { class: 'l', text: spec.label }, el('span', { class: 'f', text: spec.flag })));
+      np.append(r);
+      np.append(globalSeg(spec.field, [[true, 'On'], [false, 'Off']], g[spec.field]));
+    }
+    np.append(note('Playwright still only attaches on a machine where its binary is provisioned — On here means “try it”, not “force it”.'));
+    wrap.append(np);
+
+    /* ---- Templates: shared instruction library, reachable from the one panel
+       (its old sidebar door was removed in FEAT-139). ---- */
+    const tg = el('div', { class: 'grp' }, groupLabel('Templates'));
+    const tCount = d.templates.length;
+    const tLink = el('button', { class: 'addrow', text: tCount
+      ? `Instruction templates (${tCount}) ›`
+      : 'Instruction templates ›' });
+    tLink.addEventListener('click', () => open('library', 'settings'));
+    tg.append(tLink);
+    tg.append(note('Reusable instruction blocks shared across every project. Attach them to a project in its Instructions section.'));
+    wrap.append(tg);
+
     /* ---- which projects override the model default ---- */
     const overriders = (d.globalProjects ?? []).filter((p) => p?.settings && p.settings.model != null);
     const og = el('div', { class: 'grp' }, groupLabel('Projects that override the model'));
@@ -2889,7 +2988,10 @@ export function createDrawer(ctx) {
 
   const VIEWS = {
     settings: { el: 'settings', title: 'Project settings', build: settingsView, scope: true },
-    globals: { el: 'globals', title: 'Global defaults', build: globalsView, scope: false },
+    // FEAT-139 — machine defaults are now the "Machine" scope of the settings
+    // view; this stand-alone entry is retained only so a stale deep-link can't
+    // throw, and reuses the same builder.
+    globals: { el: 'globals', title: 'Settings', build: machineDefaultsView, scope: false },
     instructions: { el: 'instructions', title: 'Instructions', build: instructionsView, scope: true },
     snapshots: { el: 'snapshots', title: 'Snapshots', build: snapshotsView, scope: false },
     library: { el: 'library', title: 'Templates', build: libraryView, scope: false },
@@ -2959,13 +3061,18 @@ export function createDrawer(ctx) {
     for (const [k, n] of Object.entries(node.views)) n.classList.toggle('on', k === v.el);
     node.editor.classList.remove('on');
     node.body.hidden = false;
-    node.title.textContent = v.title;
+    // FEAT-139 — the settings view retitles by scope, since it now hosts three:
+    // machine defaults, project settings, and this-session overrides.
+    const machine = d.view === 'settings' && d.scope === 'machine';
+    node.title.textContent = machine ? 'Settings' : v.title;
     node.eyebrow.textContent = d.view === 'library' ? 'Shared across projects'
-      : d.view === 'globals' ? 'Every project on this machine'
+      : d.view === 'globals' || machine ? 'Every project on this machine'
       : (project()?.name ?? '');
     node.scope.hidden = !v.scope;
     node.back.hidden = !d.back;
-    node.hint.textContent = d.scope === 'project' ? 'Sessions inherit these' : 'Changes apply to this session only';
+    node.hint.textContent = d.scope === 'machine' ? 'Defaults for every project on this machine'
+      : d.scope === 'project' ? 'Sessions inherit these'
+      : 'Changes apply to this session only';
     for (const b of node.scope.querySelectorAll('[data-scope]')) {
       b.setAttribute('aria-pressed', b.dataset.scope === d.scope ? 'true' : 'false');
     }
@@ -2987,6 +3094,13 @@ export function createDrawer(ctx) {
     d.back = from;
     if (view !== d.view) { d.restore = null; d.confirmDelete = null; }
     d.view = view;
+    // FEAT-139 — an opener may land on a specific scope (the sidebar-foot door
+    // opens the Machine/global panel). Only settings-family views honour it.
+    // A scopeless open that lands on a project-context entry must not inherit a
+    // sticky "machine" scope from a previous visit — reset it to project so the
+    // cog always shows this project. (Project↔session stickiness is unchanged.)
+    if (opts?.scope && ['machine', 'project', 'session'].includes(opts.scope)) d.scope = opts.scope;
+    else if (d.scope === 'machine') d.scope = 'project';
     // A focus is per-open: a plain open (cog button) clears any previous one
     // and lands at the default position — no sticky deep-link.
     d.focus = opts?.focus ? { key: String(opts.focus), applied: false } : null;

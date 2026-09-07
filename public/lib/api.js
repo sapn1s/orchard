@@ -330,6 +330,15 @@ export const transcript = (encodedDir, sessionId, opts = {}) => {
 export const transcriptTail = (encodedDir, sessionId, opts = {}) =>
   transcript(encodedDir, sessionId, { tail: opts.limit ?? 200 });
 
+/**
+ * FEAT-132 — the session-configuration record (what was injected into this
+ * session's context at launch). `null` (via `optional`) means NO record: either
+ * the server predates the route, or the session predates the feature. The caller
+ * renders a clearly-labelled partial card in that case, never a full one.
+ */
+export const sessionConfig = (sessionId) =>
+  optional(`/api/session-config/${encodeURIComponent(sessionId)}`);
+
 /** Last slash-command list any session's CLI reported. null = route absent. */
 export const slashCommands = () => optional('/api/slash-commands').then((r) => r?.commands ?? null);
 

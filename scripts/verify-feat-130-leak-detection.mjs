@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 const ORCHARD = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const GATE = path.join(ORCHARD, 'scripts', 'leak-gate.mjs');
 const {
-  scanLine, scanSecrets, scanIdentity, scanKeyShapes, emailAllowed, TOKENS,
+  scanLine, scanSecrets, scanIdentity, scanKeyShapes, scanBinary, emailAllowed, TOKENS,
 } = await import(path.join(ORCHARD, 'scripts', 'lib', 'leak-tokens.mjs'));
 const gitmod = await import(path.join(ORCHARD, 'src', 'server', 'git.ts'));
 
@@ -85,6 +85,97 @@ console.log('\nD. Binary/skipped-file blind spot — key shapes found in raw byt
 ok('scanKeyShapes finds embedded sk key', scanKeyShapes(`\x00\x00binaryjunk\x00${F.sk}\x00more`).length > 0);
 ok('scanKeyShapes finds PEM', scanKeyShapes(`\x00${F.pem}\x00`).length > 0);
 ok('scanKeyShapes ignores plain email (no flood)', scanKeyShapes(`noise ${F.email} noise`).length === 0);
+
+// ── FEAT-130 round 3 — the holes the round-2 verifier proved (each was a MISS
+//    before this round; the classic literal tokens never covered any of them). ──
+console.log('\nD2. Round-3 provider formats — real-shaped keys the round-2 scanLine missed:');
+const PROV = {
+  google:      'AI' + 'zaSy' + '34567890abcdefABCDEFghijklmnopqrs',     // AIza + 35
+  stripe:      'sk' + '_live_' + '4eC39HqLyjWDarjtT1zdp7dc',            // sk_ (underscore) — sk- matcher misses
+  githubPat:   'github' + '_pat_' + '11ABCDE0Y0abcdEFGHijkLMNopQRstUVwxYZ0123456789ABCdefGHIjklMNopqrSTuvWXyz012345',
+  sendgrid:    'SG' + '.' + 'abcdEFGHijklMNOPqrstuv' + '.' + 'abcdEFGHijklMNOPqrstuvWXYZ0123456789-_abcdefg',
+  npm:         'npm' + '_' + '0123456789abcdefABCDEF0123456789abcd',    // npm_ + 36
+  pypi:        'pypi-' + 'AgE' + 'IcHlwaS5vcmcCJDABCDEF0123456789abcdef',
+  jwt:         'eyJ' + 'hbGciOiJIUzI1NiJ9' + '.' + 'eyJ' + 'zdWIiOiIxMjM0NTY3ODkwIn0' + '.' + 'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+};
+for (const [k, v] of Object.entries(PROV)) {
+  ok(`caught provider: ${k}`, caught(v));
+  ok(`NOT caught by classic literal tokens (was blind before): ${k}`, !classicCaught(v));
+}
+
+console.log('\nD3. Placeholder anchoring — a real secret is NOT waived by a stray "example" substring:');
+// Round-2 MEDIUM: PLACEHOLDER.test() waived any value merely CONTAINING a
+// placeholder word. A genuine password with "example" mid-string slipped.
+ok('real password containing "example" IS caught',
+  caught('PASS' + 'WORD=' + 'MyReal' + 'example' + 'P4' + 'ssw0rd99'));
+ok('real api key containing "test" IS caught',
+  caught('SECRET' + '=' + 'Zx' + 'test' + 'Kd82bQm10ZzPpLwQ7aa'));
+// The reverse direction must still hold: genuine placeholders do NOT fire.
+ok('placeholder your-key-here still clean', !caught('API_' + 'KEY=' + 'your-key-here'));
+ok('placeholder not-a-real-token still clean', !caught('sk-' + 'ant-oat01-not-a-real-token'));
+ok('placeholder <your-secret> still clean', !caught('SECRET' + '=<your-secret>'));
+
+console.log('\nD4. scanBinary — assignment/provider shapes inside binary/NUL content (not KEY-only):');
+// Round-2 HIGH: one NUL downgraded the whole blob to KEY/PEM-only, so a staged
+// `apikey=<body>` + trailing NUL slipped. scanBinary adds assignment/conn/provider.
+ok('scanBinary catches apikey=<body> across a NUL', scanBinary('api' + 'key=' + 'Ax9Kd82bQm10ZzPpLwQ7' + '\x00tail').length > 0);
+ok('scanBinary catches github_pat_ in blob', scanBinary('junk\x00' + PROV.githubPat + '\x00more').length > 0);
+ok('scanBinary still ignores plain email (no flood)', scanBinary('noise jdoe.personal@' + 'gmail.com noise').length === 0);
+
+console.log('\nD5. Gate enforcement (--staged) — type-change T + text SVG (round-2 CRITICAL/HIGH):');
+{
+  const mkrepo = () => {
+    const t = fs.mkdtempSync(path.join(os.tmpdir(), 'feat130-r3g-'));
+    const gg = (a) => execFileSync('git', a, { cwd: t, encoding: 'utf8', stdio: 'pipe' });
+    gg(['init', '-b', 'main']); gg(['config', 'user.name', 'x']);
+    gg(['config', 'user.email', NOREPLY]);
+    fs.symlinkSync(path.join(ORCHARD, 'scripts'), path.join(t, 'scripts'));
+    return { t, gg };
+  };
+  const stagedExit = (t) => {
+    try { execFileSync(process.execPath, [GATE, '--summary', '--staged'], { cwd: t, encoding: 'utf8', stdio: 'pipe' }); return 0; }
+    catch (e) { return e.status; }
+  };
+  // T: tracked symlink → regular file whose blob carries a secret assignment.
+  const r1 = mkrepo();
+  fs.symlinkSync('/tmp/target', path.join(r1.t, 'thing')); r1.gg(['add', 'thing']); r1.gg(['commit', '-m', 'link']);
+  fs.rmSync(path.join(r1.t, 'thing')); fs.writeFileSync(path.join(r1.t, 'thing'), 'access' + '_key=' + F.akia + '\n');
+  r1.gg(['add', 'thing']);
+  ok('type-change T (symlink→file with secret) REFUSED by --staged', stagedExit(r1.t) === 1);
+  // SVG: text image carrying a github_pat_ (allowlisted image dir would waive pixels).
+  const r2 = mkrepo();
+  fs.writeFileSync(path.join(r2.t, 'logo.svg'), '<svg><!-- ' + PROV.githubPat + ' --></svg>\n'); r2.gg(['add', 'logo.svg']);
+  ok('text SVG with embedded token REFUSED by --staged', stagedExit(r2.t) === 1);
+  // FP guard: a clean SVG must still pass.
+  const r3 = mkrepo();
+  fs.writeFileSync(path.join(r3.t, 'ok.svg'), '<svg width="10"><rect fill="#fff"/></svg>\n'); r3.gg(['add', 'ok.svg']);
+  ok('clean SVG still passes --staged (no FP)', stagedExit(r3.t) === 0);
+  for (const d of [r1.t, r2.t, r3.t]) fs.rmSync(d, { recursive: true, force: true });
+}
+
+console.log('\nD6. Round-4 bypasses — placeholder/entropy granularity + provider boundary:');
+// Round-3 verifier BROKEN cases. Values SPLIT so this file stays gate-clean; the
+// entropy bodies below are fabricated random-looking strings, never live keys.
+// split into ≤5-char literals so no fragment is itself secret-shaped and the var
+// name avoids the secret-key list — this file stays gate-clean (self-immunity).
+const R4BODY = 'Q7mR2' + 'vK9aL' + '6zB8n' + 'C4pD5';    // fabricated mixed case+digit run
+// #1 — a structural marker (xxxx) spliced INTO a high-entropy run must NOT waive it.
+ok('xxxx spliced into a secret value IS caught',
+  caught('PASS' + 'WORD=' + 'Q7mR2vK9' + 'xxxx' + 'aL6zB8nC4pD5'));
+// #2 — a placeholder assignment before a real one on the same line must NOT mask it.
+ok('placeholder assignment before a real secret IS caught',
+  caught('PASS' + 'WORD=your-key-here; PASS' + 'WORD=' + R4BODY));
+// #3 — an AIza key whose 35-char body ends in a hyphen must be caught.
+ok('AIza key ending in a hyphen IS caught',
+  caught('AI' + 'za' + 'Q7mR2vK9aL6zB8nC4pD5eF0gH3iJ1kL2mN-'));
+// Precision must not regress: high-entropy NON-secrets must stay clean.
+ok('git SHA (revision=) stays clean', !caught('revision=' + '3fa9c2d41b079e107d9d372bb682c45e135790ab'));
+ok('lockfile integrity hash stays clean',
+  !caught('integrity sha512-' + 'abcdEF0123456789abcdEF0123456789abcdEF0123456789abcdEF0123456789ab'));
+ok('minified bundle high-entropy literal stays clean',
+  !caught('var t=function(e){return e};var h="' + 'a8f3c2d41b079e107d9d372bb682c45e' + '"'));
+ok('a pure xxxx placeholder value still waived', !caught('PASS' + 'WORD=' + 'xxxxxxxxxxxxxxxxxxxxxxxx'));
+ok('your-key-here placeholder still waived', !caught('PASS' + 'WORD=your-key-here'));
 
 // ── Enforcement in a scratch git repo (git run inside node, not Bash tool) ──
 console.log('\nE. Enforcement — pre-commit / commit-msg hooks (hand git commit):');

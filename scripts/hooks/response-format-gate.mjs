@@ -142,8 +142,12 @@ function isTruthyEnv(v) {
  * missing-digest failure (and vice-versa). Each category carries its own
  * actionable instruction; only the categories that failed are mentioned.
  */
-function summarise({ formatReasons = [], readabilityReasons = [], blockReasons = [] }) {
+function summarise({ formatReasons = [], readabilityReasons = [], blockReasons = [], lengthReasons = [], askReasons = [] }) {
   const parts = ['Your reply does not meet this project\'s response guidelines.'];
+  // FEAT-137/138 come first: they are the ENFORCED checks (the reader is being
+  // asked to re-send), so their instruction should lead the correction.
+  if (lengthReasons.length) parts.push(lengthReasons.join(' '));
+  if (askReasons.length) parts.push(askReasons.join(' '));
   if (formatReasons.length) {
     parts.push(formatReasons.join(' '));
     parts.push(
@@ -428,6 +432,46 @@ function makeViolationReporter() {
 
 const reportViolation = makeViolationReporter();
 
+/* ── FEAT-137/138: the ENFORCED checks — block ONCE for an immediate revision ──
+ * The length budget and the ask-ownership rule are the two things the user has
+ * demanded twice and watched fail as advice. So, UNLIKE the format/readability/
+ * block checks above, these do NOT wait on ORCHARD_STOP_HOOK_ENFORCE (set in no
+ * launch path): they are active on every real launched session by default.
+ *
+ * WHY BLOCKING IS SAFE HERE, and why it is the LEAST-destructive option that
+ * actually changes behaviour:
+ *   - Nothing is discarded. Blocking a Stop hands `reason` back to the model as a
+ *     just-in-time correction; the model RE-SENDS the same answer, tighter / with
+ *     the ask owned. A visible advisory marker (the existing advisory mode) was
+ *     tried for exactly these and did not move output — it tells the USER, not the
+ *     model, so the model keeps doing it.
+ *   - It CANNOT strand the user. `stop_hook_active === true` is checked upstream
+ *     and always allows, so at most ONE correction happens per turn: if the
+ *     re-send is still over budget, it goes through. Worst case is one extra
+ *     generation, never a loop, never a wedged conversation.
+ *   - It is race-robust in the dangerous direction. The FEAT-085 read-during-write
+ *     race reads a PARTIAL or EARLIER message; a partial read has FEWER words, so
+ *     the length check under-counts and errs toward NOT blocking. (A false block
+ *     from reading a previous long message costs one wasted re-send, bounded as
+ *     above.)
+ *   - Kill switch already exists: ORCHARD_STOP_HOOK_DISABLED (checked upstream)
+ *     turns the whole hook inert, so a live session that misbehaves is one env var
+ *     from silence.
+ */
+function reviseTurn(cats, payload) {
+  const reason = summarise(cats)
+    + ' Re-send the SAME answer, corrected: same content, within the length budget, with every ask owned.';
+  // Record it in our own log too (best-effort), so "why did that turn get a
+  // re-prompt?" is answerable from outside the transcript.
+  appendAdvisoryLog('[enforced-revision] ' + reason, payload);
+  try {
+    process.stdout.write(JSON.stringify({ decision: 'block', reason }));
+  } catch {
+    // If we somehow cannot emit the block, fail open rather than hang.
+  }
+  return allow();
+}
+
 /* Any unhandled error anywhere -> fail open. */
 process.on('uncaughtException', () => allow());
 process.on('unhandledRejection', () => allow());
@@ -630,6 +674,10 @@ async function main() {
 
   const formatReasons = [];
   const blockReasons = [];
+  // FEAT-137/138 — the two ENFORCED categories (see reviseTurn). Filled from the
+  // parsed blocks below; empty for a compliant turn.
+  const lengthReasons = [];
+  const askReasons = [];
 
   let digest;
   try {
@@ -672,9 +720,66 @@ async function main() {
     const { parseResponseBlocks } = await importFirst(['../lib/response-blocks.js', '../../public/lib/response-blocks.js']);
     const parsed = parseResponseBlocks(text);
     try {
-      const { recordTurn } = await import('../lib/format-metrics.mjs');
-      recordTurn(parsed, { session_id: payload.session_id, cwd: payload.cwd, dataDir: dataDir() });
-    } catch { /* metrics are best-effort */ }
+      const fm = await import('../lib/format-metrics.mjs');
+      fm.recordTurn(parsed, { session_id: payload.session_id, cwd: payload.cwd, dataDir: dataDir() });
+
+      // FEAT-138 — length budget (ENFORCED). ≤120 words of prose, ≤250 on a
+      // pending-decision (ask) turn. Over → ask for a tighter re-send.
+      const len = fm.evaluateLength(parsed);
+      if (len.over) {
+        lengthReasons.push(
+          `This reply is ${len.proseWords} words of prose; the budget is ${len.ceiling}. `
+          + 'Cut it to the decision and its evidence — delete every sentence that is not new '
+          + 'evidence, a changed outcome, a material limitation, or a requested decision.',
+        );
+      }
+
+      // FEAT-137 — ask ownership (ENFORCED, coupled to the confidence protocol).
+      //
+      // Round 1 blocked only when the author ENGAGED the protocol — declared a
+      // `confidence:` level — yet named no `decider:` (the user's verbatim case:
+      // "there is a breaking bug … not sure if u want to fix it tho, so i will
+      // leave it", written as a high-confidence ask). `missing-confidence` (no
+      // confidence line at all) was recorded only, NOT blocked, because a session
+      // that had never received the confidence/decider spec declares no confidence
+      // and would have been blocked for a rule it was never told.
+      //
+      // ROUND 2 — that coupling is now satisfied: the confidence/decider spec is
+      // injected into RESPONSE_FORMAT.md's core (verified before this flip), so
+      // every launched session has been told to declare a `confidence:` on every
+      // ask. `missing-confidence` is therefore PROMOTED to a block below, closing
+      // the ownership loop: EVERY ask must now state a confidence and a decider, or
+      // be decided rather than asked. (Residual: a session that launched BEFORE the
+      // spec deployed is still running the old prompt; its asks would be blocked
+      // once — bounded by the one-correction cap upstream — until it relaunches.)
+      // See FEAT-137's Activity log (round 2).
+      for (const d of fm.askOwnershipDefects(parsed)) {
+        if (d.defect === 'high-confidence-no-decider') {
+          askReasons.push(
+            'An orchard-ask declares HIGH confidence but names no user-held decider '
+            + '(taste/priority/spend/risk/direction). If you are confident and cannot name what '
+            + 'makes this the user\'s call, it is YOUR decision — make it and move on, do not ask.',
+          );
+        } else if (d.defect === 'missing-decider') {
+          askReasons.push(
+            'An orchard-ask declares a `confidence:` level but names no `decider:` — the user-held '
+            + 'thing (taste/priority/spend/risk/direction) that makes this the user\'s call. Name it, '
+            + 'or decide it yourself.',
+          );
+        } else if (d.defect === 'missing-confidence') {
+          // FEAT-137 round 2 — PROMOTED to a block. The confidence/decider spec is
+          // now injected into RESPONSE_FORMAT.md's core, so every launched session
+          // has been told to declare a `confidence:` on every ask. An ask that
+          // declares none is no longer an un-spec'd session's legitimate silence —
+          // it is a non-compliant ask, and it is corrected in one re-send.
+          askReasons.push(
+            'An orchard-ask declares no `confidence:` line. Every ask must state your confidence in '
+            + 'the recommendation (`confidence:` high/med/low) and a `decider:` — the user-held thing '
+            + '(taste/priority/spend/risk/direction) that makes it the user\'s call. Add both, or decide it yourself.',
+          );
+        }
+      }
+    } catch { /* metrics + enforcement helpers are best-effort; never wedge */ }
     // The ONE structural thing worth telling the author: an unterminated or
     // unknown `orchard-*` fence means content they meant to collapse is now
     // showing (or vice versa). Advisory, like everything else here.
@@ -716,9 +821,22 @@ async function main() {
     noteCannotGrade('deps-readability-threw', err?.message, payload);
   }
 
-  if (formatReasons.length === 0 && readabilityReasons.length === 0 && blockReasons.length === 0) {
-    return allow(); // compliant -> silence, no advisory noise
+  // FEAT-137/138 — the ENFORCED categories decide the turn. If either fired, block
+  // ONCE for a revision (bounded by stop_hook_active upstream), folding the
+  // advisory-class reasons into the SAME correction so the model fixes everything
+  // in one re-send.
+  const enforced = lengthReasons.length > 0 || askReasons.length > 0;
+  const advisory = formatReasons.length > 0 || readabilityReasons.length > 0 || blockReasons.length > 0;
+
+  if (!enforced && !advisory) {
+    return allow(); // fully compliant -> silence, no advisory noise
   }
+  if (enforced) {
+    return reviseTurn({ formatReasons, readabilityReasons, blockReasons, lengthReasons, askReasons }, payload);
+  }
+  // Advisory-only (unchanged behaviour): report through the env-gated path — never
+  // blocks unless ORCHARD_STOP_HOOK_ENFORCE is set, preserving the FEAT-085 race
+  // decision for the digest/emoji/readability/block checks.
   return reportViolation({ formatReasons, readabilityReasons, blockReasons }, payload);
 }
 

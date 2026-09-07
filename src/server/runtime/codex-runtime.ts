@@ -52,6 +52,8 @@ import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
+import { installGitShim } from '../../../scripts/lib/git-shim.mjs';
 import type {
   AgentRuntime,
   ApprovalResult,
@@ -377,7 +379,37 @@ export class CodexRuntime implements AgentRuntime {
       args = [command, ...args];
       command = process.execPath;
     }
-    const env = { ...process.env };
+    /*
+     * FEAT-135 — extend the subprocess git-write block to the codex runtime.
+     *
+     * CodexRuntime carries NO FEAT-108 PreToolUse hook (that hook is a Claude-SDK
+     * seam), so an openai/codex session is unguarded for git writes at BOTH the
+     * shell and the subprocess layer. `installGitShim` prepends a `git` shim onto
+     * THIS app-server's PATH; the shim classifies every PATH-resolved git with the
+     * SAME read/write logic the FEAT-108 hook uses and refuses a write loudly,
+     * regardless of how it was spawned (bash, node, python, a wrapper script).
+     * The sanctioned FEAT-134 temp-index snapshot is allowed only under
+     * GIT_INDEX_FILE-in-tmpdir.
+     *
+     * PROVEN it reaches the child (not assumed): a real codex session forwards
+     * this env down to the exec subprocess in BOTH danger-full-access (bypass) and
+     * workspace-write (default sandbox) modes — the shell tool runs `bash -lc
+     * 'git …'` and the shim dir at the front of PATH survives even the login-shell
+     * PATH rebuild (FEAT-135 round-3 probe + verify-feat-135-codex-active-e2e).
+     *
+     * SCOPE: `installGitShim` is PURE — it returns a COPY of the env with the shim
+     * dir prepended; it does NOT touch the host process PATH or the user's login
+     * shell. Mirrors claude-runtime's options.env wrap. (Inside a CONTAINER the
+     * shim dir is a host temp path absent from the container FS, so container-
+     * internal git is NOT shimmed — the same pre-existing structural boundary
+     * documented for the Claude runtime. Absolute-path git and env-scrubbing
+     * subprocesses remain out of scope, as on the Claude side.)
+     *
+     * Guarded by `gitWriteBlockEnabled()`: with the ORCHARD_ALLOW_GIT_WRITE hatch
+     * open the shim is not installed, mirroring the hook's own kill-switch.
+     */
+    const baseEnv = { ...process.env };
+    const env = gitWriteBlockEnabled() ? installGitShim(baseEnv).env : baseEnv;
     let child: ChildLike;
     if (config.spawnProcess) {
       // Isolation/survival seam — same contract as ClaudeRuntime's

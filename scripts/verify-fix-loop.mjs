@@ -66,6 +66,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { snapshotWorkingTree } from './lib/tree-snapshot.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -151,26 +152,11 @@ function gitOk(...args) {
  * working-tree movement uniformly.
  */
 function snapshot() {
-  const idx = path.join(os.tmpdir(), `vfl-index-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-  const env = {
-    ...process.env, GIT_INDEX_FILE: idx,
-    // The snapshot must not depend on the user's git identity being configured
-    // (commit-tree requires one; the commit is dangling bookkeeping anyway).
-    GIT_AUTHOR_NAME: 'verify-fix-loop', GIT_AUTHOR_EMAIL: 'vfl@localhost',
-    GIT_COMMITTER_NAME: 'verify-fix-loop', GIT_COMMITTER_EMAIL: 'vfl@localhost',
-  };
-  const run = (...args) => {
-    const r = spawnSync('git', ['-C', opts.repo, ...args], { encoding: 'utf8', env, maxBuffer: 64 * 1024 * 1024 });
-    if ((r.status ?? 1) !== 0) { try { fs.rmSync(idx, { force: true }); } catch { /* ignore */ } die(`snapshot: git ${args[0]} failed: ${(r.stderr || '').trim()}`); }
-    return (r.stdout ?? '').trim();
-  };
-  const head = gitOk('rev-parse', 'HEAD').trim();
-  run('read-tree', head);
-  run('add', '-A');
-  const tree = run('write-tree');
-  const commit = run('commit-tree', tree, '-p', head, '-m', 'verify-fix-loop snapshot (dangling, advisory)');
-  try { fs.rmSync(idx, { force: true }); } catch { /* ignore */ }
-  return { head, tree, commit };
+  // Hoisted to scripts/lib/tree-snapshot.mjs (FEAT-134) so independent-verify.mjs
+  // shares the exact same mechanism (one definition, ARCH-008). The helper throws
+  // on any git failure; this wrapper preserves verify-fix-loop's fail-fast `die`.
+  try { return snapshotWorkingTree(opts.repo); }
+  catch (e) { die(e instanceof Error ? e.message : String(e)); }
 }
 
 /**

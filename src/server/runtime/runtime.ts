@@ -257,6 +257,17 @@ export interface RuntimeStartConfig {
   gitGrantKey?: string;
   gitRepoPath?: string;
   sessionLabel?: string;
+  /**
+   * FEAT-129 — the harness's own running-set, as agent_ids of the lanes that are
+   * live RIGHT NOW (the bridge's `liveAgents()` filtered to status:'running').
+   * The file-lock heartbeat consults this to decide whose held locks to keep
+   * fresh (a live lane, however long its current tool call) versus release (a
+   * lane that has dropped out of the set — finished). Ground-truth liveness, not
+   * a TTL. Optional: a runtime driven without a bridge simply keeps every lock it
+   * holds fresh for the life of the process (never clobbers; may hold a finished
+   * lane's lock until exit — see refreshOwnedLocks).
+   */
+  liveLaneIds?: () => string[];
   resume?: string;
   forkSession?: boolean;
   mcpServers?: Record<string, unknown>;

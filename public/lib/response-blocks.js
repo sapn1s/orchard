@@ -434,12 +434,26 @@ export const KNOWN_BLOCKS = Object.freeze([...CATEGORY_BLOCKS, ...LEGACY_BLOCKS,
  *     A category is collapsed if the reader does not have to read it to know
  *     WHERE THEY STAND.
  *
- * `ask`, `outcome`, `status` and `judgment` are addressed TO the reader — what
- * needs you, what changed, where it stands, what I decided and why. Skipping one
- * of those means missing something that is about them. `finding` and `narration`
- * are the SUPPORTING RECORD behind those: what is true about the subject matter,
- * and the play-by-play of establishing it. Both are worth keeping and worth
- * consulting; neither is news the reader must be handed.
+ * `digest`, `ask` and `status` are the news the reader must be handed to know
+ * where they stand: the scannable headline of the turn, what needs them, and
+ * where it stands. Skipping one of those means missing something that is about
+ * them. `finding`, `narration`, `outcome` and `judgment` are the SUPPORTING
+ * RECORD behind those: what is true about the subject matter, the play-by-play
+ * of establishing it, the full retrospective of what I did, and the reasoning
+ * behind a call I made. All are worth keeping and worth consulting; none is news
+ * the reader must be handed — the digest already carries the headline of what
+ * changed, so the long prose of `outcome` and `judgment` is detail to open on
+ * demand, not signal to hand over.
+ *
+ * ROUND 14 — the set grew by `outcome` and `judgment`. The user asked for this
+ * across seven tickets (FEAT-083/085/091/093/098/125/127): the parts of a reply
+ * addressed to them kept sitting below a wall of "here is what I did and why".
+ * A caveat the round-13 note already raised is now live: the STATED rule has
+ * been refined more than once, and a rule fitted to its members is a description,
+ * not a predictor. The honest reading is that the reader's own triage — "I do
+ * not need to read this to know where I stand" — is the ground truth, and the
+ * members follow it; the prose above is the best current articulation of that
+ * judgement, not a law it was derived from.
  *
  * WHY THIS IS THE BIG ONE, and why the fold alone would not have been enough:
  * `finding` is 34.7% of characters in the labelled sample — the single largest
@@ -448,6 +462,9 @@ export const KNOWN_BLOCKS = Object.freeze([...CATEGORY_BLOCKS, ...LEGACY_BLOCKS,
  * its first sentence rather than a bare label (public/lib/digest.js): a third of
  * every reply behind a caption that says only "Finding" makes the reader open
  * every one to learn whether it mattered, which is more work than reading it was.
+ * `outcome` and `judgment` fold with a preview for the SAME reason: they are long
+ * "here is what I did / why I did it" prose, and a bare "Changed" / "My call"
+ * caption would force the same open-to-triage that defeated the fold for findings.
  * `narration` keeps its bare label — it is small, and it is the one category the
  * reader has already been told expires.
  *
@@ -461,7 +478,9 @@ export const KNOWN_BLOCKS = Object.freeze([...CATEGORY_BLOCKS, ...LEGACY_BLOCKS,
  * unpaired, now ENDS THE FOLD at that line and reports `ambiguous-fold:` —
  * visible and flagged, the same direction narration has always degraded in.
  */
-export const COLLAPSED_BLOCKS = Object.freeze(['orchard-finding', 'orchard-narration', 'orchard-notes']);
+export const COLLAPSED_BLOCKS = Object.freeze([
+  'orchard-finding', 'orchard-outcome', 'orchard-judgment', 'orchard-narration', 'orchard-notes',
+]);
 
 /** Blocks the reader must see expanded. */
 export const EXPANDED_BLOCKS = Object.freeze(

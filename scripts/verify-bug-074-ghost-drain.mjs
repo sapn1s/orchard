@@ -246,7 +246,7 @@ async function setup() {
   const port1 = await freePort();
   server1 = spawnServer(port1);
   if (!(await waitHealth(port1))) throw new Error('server 1 never became healthy');
-  const reg = await (await fetch(`http://127.0.0.1:${port1}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: WORK, name: 'bug074' }) })).json();
+  const reg = await (await fetch(`http://127.0.0.1:${port1}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: WORK, name: 'bug074', isolation: 'direct' }) })).json(); // FEAT-131: pin direct (container-default off)
   projectId = reg.project?.id;
   if (!projectId) throw new Error(`register failed: ${JSON.stringify(reg)}`);
   await fetch(`http://127.0.0.1:${port1}/api/projects/${encodeURIComponent(projectId)}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ settings: { permissionMode: 'bypassPermissions', model: 'haiku' } }) });

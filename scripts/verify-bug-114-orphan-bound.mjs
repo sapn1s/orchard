@@ -195,7 +195,9 @@ function killServer(child) {
 async function registerProject(port, workDir) {
   const reg = await (await fetch(`http://127.0.0.1:${port}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: workDir, name: 'bug114-fixture' }),
+    // FEAT-131: direct-isolation lifecycle suite — pin isolation so the
+    // container-default for new projects cannot move the session off-host.
+    body: JSON.stringify({ hostPath: workDir, name: 'bug114-fixture', isolation: 'direct' }),
   })).json();
   if (reg.project?.id) return reg.project.id;
   const list = await (await fetch(`http://127.0.0.1:${port}/api/projects`)).json();

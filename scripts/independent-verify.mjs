@@ -38,11 +38,17 @@
  *
  * Usage:
  *   node scripts/independent-verify.mjs --requirement @docs/req.txt \
- *     [--repo <dir>] [--range <A..B|rev>] [--run "<command>"]... \
+ *     [--repo <dir>] [--range <A..B|rev> | --working-tree] [--run "<command>"]... \
  *     [--test-file <path>]... [--author-provider anthropic|openai] \
  *     [--provider anthropic|openai] [--model <m>] [--timeout-min <n>]
  *     [--keep-cleanroom] [--print-prompt] [--verdict-out <file>]
  *   node scripts/independent-verify.mjs --check-only <verdict-file>
+ *
+ * By default only COMMITTED work is visible (range → rev-parse → git archive).
+ * `--working-tree` (FEAT-134, mutually exclusive with --range) snapshots the
+ * CURRENT dirty tree — tracked edits + untracked-not-ignored files — into a
+ * dangling commit via a throwaway index and verifies that; the real repo state is
+ * never written. The durable id is the snapshot TREE sha.
  *
  * Exit codes: 0 = verdict HOLDS, 1 = verdict BROKEN, 3 = verdict INVALID
  * (contract violated — e.g. a static-only review), 2 = usage/infra error.
@@ -65,6 +71,9 @@ import {
 // room and its record dir are the artifacts a verdict cites, read after the
 // run), and `/tmp` on this machine is wiped on every boot. See scratch.mjs.
 import { mkdtempScratch, scratchRootInfo, checkSameFilesystem, SCRATCH_ENV } from './lib/scratch.mjs';
+// FEAT-134: verify the CURRENT dirty tree, not only committed objects. The
+// snapshot is a dangling commit built via a throwaway index — real repo untouched.
+import { snapshotWorkingTree } from './lib/tree-snapshot.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -74,7 +83,7 @@ const DISPATCH = path.join(ROOT, 'scripts', 'dispatch.mjs');
 const IS_ENTRY = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 const USAGE = `usage: node scripts/independent-verify.mjs --requirement <text|@file>
-         [--repo <dir>] [--range <A..B|rev>] [--run "<command>"]...
+         [--repo <dir>] [--range <A..B|rev> | --working-tree] [--run "<command>"]...
          [--test-file <path>]... [--author-provider anthropic|openai]
          [--provider anthropic|openai] [--model <m>] [--timeout-min <n>]
          [--max-diff-bytes <n>] [--keep-cleanroom] [--print-prompt]
@@ -107,6 +116,7 @@ const argv = process.argv.slice(2);
 const opts = {
   repo: process.cwd(),
   range: null,
+  workingTree: false,
   requirement: null,
   runs: [],
   testFiles: [],
@@ -129,6 +139,7 @@ for (let i = 0; i < argv.length; i++) {
   };
   if (a === '--repo') opts.repo = path.resolve(take());
   else if (a === '--range') opts.range = take();
+  else if (a === '--working-tree') opts.workingTree = true;
   else if (a === '--requirement') opts.requirement = take();
   else if (a === '--run') opts.runs.push(take());
   else if (a === '--test-file') opts.testFiles.push(take());
@@ -189,6 +200,7 @@ if (IS_ENTRY) {
   }
 
   if (!opts.requirement) die(`--requirement is required\n${USAGE}`);
+  if (opts.workingTree && opts.range) die('--working-tree and --range are mutually exclusive: one verifies the dirty tree, the other a committed range');
   if (opts.authorProvider !== 'anthropic' && opts.authorProvider !== 'openai') die('--author-provider must be anthropic|openai');
   if (opts.provider && opts.provider !== 'anthropic' && opts.provider !== 'openai') die('--provider must be anthropic|openai');
   // Cross-provider by default: decorrelated blind spots (ROUTING.md).
@@ -636,7 +648,22 @@ function resolveRange(repo, range) {
 async function main() {
   if (git(opts.repo, 'rev-parse', '--git-dir').code !== 0) die(`not a git repo: ${opts.repo}`);
   const repo = gitOk(opts.repo, 'rev-parse', '--show-toplevel').trim();
-  const { base, head } = resolveRange(repo, opts.range);
+  let base, head;
+  if (opts.workingTree) {
+    // FEAT-134: base = HEAD, head = the snapshot TREE sha (NOT the dangling commit
+    // — a commit is gc-collectable, the tree is the durable id the range line and
+    // any record then carries). git diff / git archive both accept a bare tree, so
+    // the clean-room strip and the `clean room is NOT clean` guard run over the
+    // snapshot exactly as they do over a committed rev. The real index is untouched.
+    let snap;
+    try { snap = snapshotWorkingTree(repo); }
+    catch (e) { die(e instanceof Error ? e.message : String(e)); }
+    base = snap.head;
+    head = snap.tree;
+    console.error(`  working-tree snapshot — HEAD ${snap.head.slice(0, 12)} → tree ${snap.tree.slice(0, 12)} (dangling commit ${snap.commit.slice(0, 12)}; real index untouched)`);
+  } else {
+    ({ base, head } = resolveRange(repo, opts.range));
+  }
 
   const fullDiff = gitOk(repo, 'diff', base, head);
   if (!fullDiff.trim()) die(`range ${base.slice(0, 8)}..${head.slice(0, 8)} has an empty diff — nothing to verify`);

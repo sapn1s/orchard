@@ -214,6 +214,7 @@
     "verify:bug-097-lenient-parse": "node scripts/verify-bug-097-lenient-parse.mjs",
     "verify:bug-101-contrast": "node scripts/verify-bug-101-contrast.mjs",
     "verify:bug-109": "node scripts/verify-bug-109-prose-lone-cr.mjs",
+    "verify:bug-167": "node scripts/verify-bug-167-prose-list-after-para.mjs",
     "verify:clean-room": "node scripts/independent-verify.mjs",
     "verify:scratch-root": "node scripts/verify-scratch-root.mjs",
     "orchestrator:surface": "node scripts/orchestrator-surface-report.mjs",

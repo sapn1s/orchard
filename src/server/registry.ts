@@ -12,6 +12,22 @@ import type { Isolation } from './events.ts';
 // TYPES + toolSettingsOf back from here, and both sides use their imports lazily
 // inside function bodies, so this cycle resolves cleanly at call time).
 import { coherentWaStack } from './wiring.ts';
+// FEAT-131 — creation-time preflight for the container default. Both of these
+// modules import back from registry.ts (containerSettingsOf / snapshotSettingsOf),
+// so this is a cycle; it resolves cleanly because BOTH sides use their imports
+// only inside function bodies (never at module-eval time), the same discipline
+// the wiring.ts cycle above relies on.
+import { dockerAvailable } from './container-manager.ts';
+import { reflinkProbe } from './snapshots.ts';
+// FEAT-133 — provisioning does NOT import registry, so this is a plain (acyclic)
+// dependency: the one owner of "is the host Playwright MCP present?" (ARCH-010).
+import { hostPlaywrightBinExists } from './provisioning.ts';
+import {
+  readGlobalDefaults,
+  PROJECT_SETTINGS_SEED_KEYS,
+  type GlobalDefaults,
+  type ProjectSettingsSeedKey,
+} from './global-settings.ts';
 
 export type PermissionMode = 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions';
 
@@ -148,18 +164,33 @@ export function browserSettingsOf(project: Project): BrowserSettings {
  *
  * `serena` defaults ON: it is the repo's dogfooded default (LSP-backed symbol
  * tools, see FEAT-025) and making it default-off would silently regress every
- * current session. `playwright` defaults OFF: it is a UI-testing tool most
- * projects do not need, opt-in per FEAT-034's tool-gating convention.
+ * current session.
+ *
+ * FEAT-133 split the "default" into two facts that used to be one:
+ *   - `defaultToolSettings()` below is the READ-TIME backfill for a project whose
+ *     stored `tools` object is absent or partial (rows written before a key
+ *     existed). It stays CONSERVATIVE — `playwright:false`, `openaiDispatch:false`
+ *     — precisely so an EXISTING project's effective launch config never changes
+ *     when a new-project default flips. Do NOT read this to decide what a NEW
+ *     project gets.
+ *   - `resolveNewProjectToolSettings()` is the CREATION default for a NEW project
+ *     (owner's decision, FEAT-133): OpenAI dispatch ON, and Playwright ON when a
+ *     preflight says it will actually work. It is server-only and stored
+ *     concretely, so there is no client copy of it to drift (ARCH-010).
  */
 export interface ToolSettings {
   /** Serena LSP MCP — symbol-level code tools. Repo default is ON. */
   serena: boolean;
-  /** Playwright MCP — browser automation for UI-testing projects. Default OFF. */
+  /** Playwright MCP — browser automation. New projects default ON iff its binary preflights. */
   playwright: boolean;
-  /** Host-brokered OpenAI dispatch. Credentials remain on the host. Default OFF. */
+  /** Host-brokered OpenAI dispatch. Credentials remain on the host. New projects default ON. */
   openaiDispatch: boolean;
 }
 
+/**
+ * READ-TIME backfill only (see the interface note). Conservative on purpose — the
+ * NEW-project default lives in `resolveNewProjectToolSettings`, not here.
+ */
 export function defaultToolSettings(): ToolSettings {
   return { serena: true, playwright: false, openaiDispatch: false };
 }
@@ -426,6 +457,26 @@ export interface Project {
   /** BUG-138 — see ProjectIdentity. Captured on add and on repoint only. */
   identity?: ProjectIdentity;
   isolation: Isolation;
+  /**
+   * FEAT-131 — an audit trail of the creation-time isolation preflight, present
+   * ONLY on projects created after that landed and ONLY when the container
+   * default was in play (an explicit `isolation` on the create request skips the
+   * preflight entirely, so honours the caller and leaves this absent). It records
+   * what the default WANTED and what it RESOLVED to, so a project that came out
+   * `direct` on a container-default machine explains itself instead of looking
+   * like a bug. Never read to drive behaviour — `isolation` is the ground truth.
+   */
+  isolationPreflight?: IsolationPreflight;
+  /**
+   * FEAT-133 — audit trail of the creation-time tool-default preflight, present
+   * ONLY on projects created after that landed and ONLY when the NEW-project tool
+   * defaults were in play (an explicit `settings.tools` on the create request
+   * skips it, honouring the caller). It records that Playwright was WANTED on and
+   * whether the host binary preflight let it stay on, so a project that came out
+   * with Playwright OFF on a default-ON machine explains itself. Never read to
+   * drive behaviour — `settings.tools` is the ground truth.
+   */
+  toolPreflight?: ToolPreflight;
   settings: ProjectSettings;
   createdAt: string;
   updatedAt: string;
@@ -520,6 +571,149 @@ export interface CreateProjectInput {
   settings?: Partial<ProjectSettings>;
 }
 
+/**
+ * FEAT-131 — the isolation a NEW project gets when the create request does not
+ * name one. The safe, non-breaking form: newly-created projects default to
+ * `container` (which auto-enables reflink snapshots via snapshotSettingsOf), but
+ * only after a preflight confirms the machine can actually run it — otherwise
+ * they fall back to `direct` (see resolveNewProjectIsolation). EXISTING projects
+ * are never touched by this; it is consulted only at creation.
+ */
+export const NEW_PROJECT_DEFAULT_ISOLATION: Isolation = 'container';
+
+/** FEAT-131 — creation-time record of how the container default resolved. */
+export interface IsolationPreflight {
+  /** The default we tried to apply. */
+  wanted: Isolation;
+  /** What it actually resolved to after the preflight. */
+  applied: Isolation;
+  /**
+   * Why it fell back. `null` when `applied === wanted` (the default held).
+   * A human-readable one-liner from the docker/reflink probe otherwise.
+   */
+  reason: string | null;
+  at: string;
+}
+
+/**
+ * FEAT-131 — resolve the isolation for a new project whose create request did
+ * not name one. Tries the container default and falls SAFE to `direct` when the
+ * machine can't honour it (no reachable Docker daemon, or no reflink support for
+ * snapshots). Fail-safe, never fail-blocking: a project is always created.
+ *
+ * The docker-socket opt-in is intentionally NOT touched here — a container
+ * default still ships with `dockerSocket: false` (defaultContainerSettings), so
+ * the host-root escape hatch stays an explicit, separate decision.
+ */
+export function resolveNewProjectIsolation(hostPath: string): { isolation: Isolation; preflight: IsolationPreflight } {
+  const at = new Date().toISOString();
+  // FEAT-139 — a machine-wide isolation default (set in Settings → Machine) is
+  // the "wanted" tier for a new project; absent, the built-in container default
+  // applies. Either way the container preflight below still decides whether it
+  // holds or falls safe to direct — the global default changes what we TRY, not
+  // whether the machine can honour it.
+  const wanted = readGlobalDefaults().isolation ?? NEW_PROJECT_DEFAULT_ISOLATION;
+  if (wanted !== 'container') {
+    return { isolation: wanted, preflight: { wanted, applied: wanted, reason: null, at } };
+  }
+  const docker = dockerAvailable();
+  if (!docker.ok) {
+    return { isolation: 'direct', preflight: { wanted, applied: 'direct', reason: docker.message, at } };
+  }
+  const reflink = reflinkProbe(hostPath);
+  if (!reflink.ok) {
+    return { isolation: 'direct', preflight: { wanted, applied: 'direct', reason: reflink.message, at } };
+  }
+  return { isolation: 'container', preflight: { wanted, applied: 'container', reason: null, at } };
+}
+
+/**
+ * FEAT-133 — the owner's decision: a NEW project gets OpenAI dispatch ON by
+ * default. It degrades gracefully at runtime (the host broker start is non-fatal
+ * and `dispatch-client --check` reports unavailable + reason), so there is no
+ * host-capability preflight to run — the flag is simply on.
+ */
+export const NEW_PROJECT_DEFAULT_OPENAI_DISPATCH = true;
+
+/**
+ * FEAT-133 — the owner's decision: a NEW project gets the headless Playwright MCP
+ * ON by default — but only behind the preflight below, which falls back to OFF on
+ * a machine that has no Playwright binary. (The headful stealth browser,
+ * `settings.browser.enabled`, is a separate decision and stays OFF.)
+ */
+export const NEW_PROJECT_DEFAULT_PLAYWRIGHT = true;
+
+/** FEAT-133 — creation-time record of how the Playwright default resolved. */
+export interface ToolPreflight {
+  playwright: {
+    /** The default we tried to apply (true). */
+    wanted: boolean;
+    /** What it resolved to after the host-binary preflight. */
+    applied: boolean;
+    /** Why it fell back. `null` when it held; a one-liner from the probe otherwise. */
+    reason: string | null;
+  };
+  at: string;
+}
+
+/**
+ * FEAT-133 — resolve the tool settings for a NEW project whose create request
+ * did not name `settings.tools`. OpenAI dispatch is simply ON (degrades safely at
+ * runtime). Playwright is ON only when it will actually launch:
+ *   - `container` — the binary is BAKED into the image (trusted, as Serena is);
+ *   - `direct` — ON only when the host binary is already provisioned, else OFF
+ *     with a reason, so a machine with no Playwright install gets a working
+ *     project (Serena + dispatch) rather than a dead MCP server.
+ * Fail-safe, never fail-blocking: a project is always created. Serena keeps its
+ * ON default. The record is written only when Playwright was WANTED on.
+ */
+export function resolveNewProjectToolSettings(
+  hostPath: string,
+  isolation: Isolation,
+): { tools: ToolSettings; preflight: ToolPreflight } {
+  const at = new Date().toISOString();
+  // FEAT-139 — machine-wide new-project tool defaults (Settings → Machine)
+  // override the built-in "wanted" values; absent, the FEAT-133 defaults apply.
+  // Playwright is still gated by the host-binary preflight; serena/dispatch
+  // degrade safely at runtime, so a global default for them is simply honoured.
+  const g = readGlobalDefaults();
+  const wanted = g.playwright ?? NEW_PROJECT_DEFAULT_PLAYWRIGHT;
+  // container: the image guarantees the baked binary; direct: it must be present.
+  const available = isolation === 'container' || hostPlaywrightBinExists();
+  const applied = wanted && available;
+  const reason = wanted && !available
+    ? `host Playwright MCP is not provisioned on this machine; defaulting Playwright OFF (run provisionAllHost() and enable it per-project to turn it on)`
+    : null;
+  return {
+    tools: {
+      serena: g.serena ?? true,
+      playwright: applied,
+      openaiDispatch: g.openaiDispatch ?? NEW_PROJECT_DEFAULT_OPENAI_DISPATCH,
+    },
+    preflight: { playwright: { wanted, applied, reason }, at },
+  };
+}
+
+/**
+ * FEAT-139 — copy one 'projectSettings'-channel machine default onto a new
+ * project's settings when it is set. The constraint `& keyof ProjectSettings`
+ * is the structural guard: if a future field is classified 'projectSettings' in
+ * SEED_CHANNEL but is not a ProjectSettings field, the call site in
+ * `createProject` fails to typecheck — the seed can never silently no-op. model
+ * and effort share a value type with their GlobalDefaults twin, so the write is
+ * sound; TS cannot correlate two indexed reads on a union key, so the assignment
+ * goes through the standard record cast (the KEY-level soundness is what the
+ * constraint enforces).
+ */
+function seedProjectSetting<K extends ProjectSettingsSeedKey & keyof ProjectSettings>(
+  settings: ProjectSettings,
+  globals: GlobalDefaults,
+  key: K,
+): void {
+  const gv = globals[key];
+  if (gv != null) (settings as unknown as Record<string, unknown>)[key] = gv;
+}
+
 export function createProject(input: CreateProjectInput): Project {
   const hostPath = path.resolve(expandHome(input.hostPath));
   if (!fs.existsSync(hostPath) || !fs.statSync(hostPath).isDirectory()) {
@@ -535,6 +729,39 @@ export function createProject(input: CreateProjectInput): Project {
     throw new Error(`createProject: a project already points at ${hostPath}`);
   }
   const now = new Date().toISOString();
+  // FEAT-131 — an explicit isolation on the request is honoured as-is (no
+  // preflight, no fallback: the caller has decided). Only when the request is
+  // silent does the container default + its safe-to-direct preflight apply.
+  const resolved = input.isolation
+    ? { isolation: input.isolation, preflight: undefined as IsolationPreflight | undefined }
+    : resolveNewProjectIsolation(hostPath);
+  const settings: ProjectSettings = { ...defaultSettings(), ...(input.settings ?? {}) };
+  // FEAT-139 / ARCH-010 — seed the machine defaults that ride the 'projectSettings'
+  // channel (model, effort) onto the new row, unless the create request set the
+  // field explicitly (an explicit value — including an explicit null — WINS, req 4).
+  // Driven by PROJECT_SETTINGS_SEED_KEYS (the SEED_CHANNEL declaration owned by
+  // global-settings.ts), so a machine default of this channel added later seeds
+  // here automatically rather than becoming the dead toggle model/effort were.
+  // A null machine default is left as null so the field still LIVE-inherits a
+  // later machine change (applyGlobalDefaults); a non-null one freezes onto the
+  // row so its stored config reflects the machine default (req 3). The isolation
+  // and tool channels seed via their resolvers below.
+  const globals = readGlobalDefaults();
+  for (const key of PROJECT_SETTINGS_SEED_KEYS) {
+    if (input.settings && key in input.settings) continue; // explicit request wins
+    seedProjectSetting(settings, globals, key);
+  }
+  // FEAT-133 — when the create request does NOT name `settings.tools`, apply the
+  // NEW-project tool defaults (OpenAI dispatch ON; Playwright ON iff it will
+  // launch, resolved by preflight). An EXPLICIT `settings.tools` is the escape
+  // hatch: honoured as-is with no preflight, mirroring how an explicit isolation
+  // is honoured above. Existing projects are never touched — this is creation-only.
+  let toolPreflight: ToolPreflight | undefined;
+  if (!input.settings?.tools) {
+    const t = resolveNewProjectToolSettings(hostPath, resolved.isolation);
+    settings.tools = t.tools;
+    toolPreflight = t.preflight;
+  }
   const project: Project = {
     id,
     name,
@@ -542,8 +769,10 @@ export function createProject(input: CreateProjectInput): Project {
     // BUG-138 — declare what identifies this project while the directory is
     // right here to be asked. After it is renamed away, nobody can.
     identity: captureIdentity(hostPath),
-    isolation: input.isolation ?? 'direct',
-    settings: { ...defaultSettings(), ...(input.settings ?? {}) },
+    isolation: resolved.isolation,
+    ...(resolved.preflight ? { isolationPreflight: resolved.preflight } : {}),
+    ...(toolPreflight ? { toolPreflight } : {}),
+    settings,
     createdAt: now,
     updatedAt: now,
   };

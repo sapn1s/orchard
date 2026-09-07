@@ -256,3 +256,210 @@ assignment shapes; add provider-format matchers (`AIza`, `sk_live_`,
 whole value; add a leak-gate step to the FEAT-108 classifier for compound
 `add && commit`. Repro scripts: `~/scratch/feat130-harness.mjs`,
 `~/scratch/feat130-enum.mjs`. OpenAI transcript: `…/transcripts/openai/…01a074df….jsonl`.
+
+### 2026-09-07 — worker (fixing, round 3) — round-2 verifier holes closed (detector + `--staged` enumeration)
+
+Built the round-2 verifier's follow-up list, scoped to the detector + gate (all in
+`scripts/`; NO `src/server/` edits). Left unstaged. Files changed:
+`scripts/lib/leak-tokens.mjs`, `scripts/leak-gate.mjs`,
+`scripts/verify-feat-130-leak-detection.mjs`.
+
+- **A. `--staged` enumeration now includes type-change `T`** (`leak-gate.mjs`):
+  `--diff-filter=ACMR` → `ACMRT`. The round-2 CRITICAL — a tracked symlink/gitlink
+  flipped to a regular 100644 file whose blob carried a secret was reported by
+  `git diff --cached` under `T` but the `ACMR` filter dropped it, so the blob was
+  never read and the gate PASSED with the secret in the index. `D` (deletion,
+  no content) is still excluded; the `100644/100755` mode filter is unchanged.
+- **B. Binary / NUL / image content is now credential-scanned, not KEY-only.**
+  New shared `scanBinary(text)` (`leak-tokens.mjs`): KEY/PEM/provider shapes over
+  the whole blob PLUS the assignment / connection-string classes over each
+  newline/NUL-delimited chunk (email excluded — it floods on binary noise). The
+  gate's binary/NUL branch now calls `scanBinary` (was `scanKeyShapes`), closing
+  the round-2 HIGH where one trailing NUL downgraded a staged `apikey=<body>` to
+  KEY-only and slipped. Text **SVGs** are now content-scanned in EVERY mode (they
+  are XML text and live under the very `public/`+`docs/assets/` dirs the TREE
+  allowlist waived without scanning — round-2 HIGH `github_pat_` in a `.svg`).
+  Raster images are deliberately NOT text-scanned (huge FP risk over pixel bytes;
+  their pixel-leak risk stays the TREE allowlist's job).
+- **C. Provider-format matchers added** (`KEY_SHAPES`): Google `AIza`, Stripe
+  `sk_/rk_ live|test` (underscore — the `sk-` matcher missed it), GitHub
+  fine-grained `github_pat_`, SendGrid `SG.`, npm `npm_`, PyPI `pypi-AgE`, and
+  JWT (`eyJ…`.`eyJ…`.`…`, placeholder-guarded). Each body is pinned to the
+  provider's real length/charset so a ticket writing the shape with an ellipsis
+  does not trip.
+- **D. `isPlaceholder` anchored to the WHOLE value** (`leak-tokens.mjs`): replaced
+  the substring test (which waived any value merely CONTAINING "example"/"test"/
+  "here") with an ENTROPY-anchored test — a value with any high-entropy chunk
+  (long or mixed-class run) is NOT a placeholder even if another token spells
+  "example"; only a value with no such chunk is waived, and only when it also
+  carries a structural marker (`<…>`, `${…}`, `xxxx`, `…`, `***`) or a placeholder
+  word. Closes the round-2 MEDIUM (`PASSWORD=MyReal…example…P4ss` now caught)
+  while `your-key-here` / `not-a-real-token` / `<your-secret>` stay clean.
+
+- **Verification — must-FAIL then must-PASS, real runs (not asserted):**
+  - BEFORE (current code, scratch): every class MISSED — `scanLine` returned 0 for
+    all six provider formats + JWT; `scanKeyShapes` 0 on `apikey=<body>`+NUL; the
+    real password containing "example" 0; the `--staged` gate exited **0** (pass)
+    on the symlink→file `T` bypass (secret provably in the staged blob) and on a
+    text SVG carrying `github_pat_`. Logs: `~/scratch/feat130r3/before.mjs`,
+    `before-gate.mjs`.
+  - AFTER: all six providers + JWT CAUGHT; binary `apikey=`+NUL CAUGHT; real
+    password-with-"example" CAUGHT; `--staged` gate REFUSES (exit 1) the `T`
+    bypass and the SVG, with a clean SVG still passing (no FP).
+    Logs: `~/scratch/feat130r3/after.mjs`, `after-gate.mjs`.
+  - Encoded as permanent regression tests: `verify:feat-130` now **83/83** (was
+    58; +25 for D2 providers, D3 anchoring both directions, D4 `scanBinary`, D5
+    gate-level `T`/SVG/clean-SVG). All fixtures split-literal so the tracked suite
+    is itself gate-clean.
+  - FP proof on the USER'S real tree: `npm run gate` exit **0** (read directly,
+    unpiped) — leak-gate + check-nul + typecheck all PASS, only the LICENSE waiver
+    reported. The new SVG/binary scanning did not flag any real `.svg` in the tree.
+  - Shared-detector consumer intact: `verify-leak-store-guard` 13/13.
+- **Not my regressions:** `verify-board-tool` 27/7 — the 7 are board-drift
+  UNMAPPABLE-STATUS on FEAT-129/131/132 ticket headers (other lanes' tickets),
+  identical to the round-2 note; my change touches no board tooling.
+- **Deliberately NOT done (out of this lane's scope; documented gaps remain):**
+  - The FEAT-108 classifier fix for compound `git add && git commit` lives in
+    `src/server/` and rides the session/tools path — flagged as a **collision
+    risk** with the concurrent BUG-159 lane; NOT edited. The in-repo pre-commit
+    hook remains the backstop; a bare project without hooks is still exposed to a
+    granted agent's compound stage+commit. Needs its own ticket/lane.
+  - **Generic-entropy detector deliberately omitted** — a bare 32/40-hex or
+    base64 matcher floods on the git SHAs that fill every ticket; adding it would
+    make the gate `--no-verify`-bait. Structured provider formats cover the real
+    cases; a keyword-anchored entropy check could be a future refinement.
+  - Assignment-key synonyms (`pwd`, `token=`, `auth=`, `cookie=`, `session=`)
+    still absent: `PWD=` collides with the ubiquitous working-directory env var,
+    and bare `token=`/`auth=` flood on URLs — left for a precision-tuned pass.
+  - Still open from round 2 (unchanged, lower risk): allowed-domain SUBDOMAIN
+    waiver, symlink-TARGET string never scanned, YAML block-scalar/list values.
+- **Flag (HIGH-STAKES):** security + publish-safety + this is round 3 of a change
+  the prior two rounds got wrong. An independent adversarial clean-room re-verify
+  (fresh agent attacking each new matcher + the `T`/SVG/binary paths, and probing
+  for FPs the entropy anchor might introduce) is WARRANTED before this is called
+  done. `regressed-from:` none — these are gaps the prior rounds left, not
+  breakage they introduced.
+- **Handoff:** the round-3 detector/enumeration is ready; the day's work still
+  commits THROUGH the gate via the safe (separate stage / standalone commit) form
+  the round-2 verifier documented. The worker committed nothing.
+
+### 2026-09-07 — verifier (verifying, round 1 of round-3 fix) — VERDICT: BROKEN
+
+Independent CLEAN-ROOM adversarial verify of the round-3 detector/enumeration
+change, run as a SEPARATE PROCESS (not an in-process Task subagent) via
+`scripts/independent-verify.mjs --working-tree` (the FEAT-134 dirty-tree flag).
+Cross-provider decorrelation: verifier ran on **openai**. Exit 1 (verdict BROKEN),
+contract VALID (fixer suite re-run + uncovered adversarial case + could-not-test
+list all present).
+
+- **Bootstrap sanity (FEAT-134 `--working-tree` is itself not yet independently
+  verified, so this run bootstraps on unverified tooling):** confirmed BEFORE the
+  spend via `--print-prompt` — snapshot HEAD `f42537f` → tree `c0effad5`; the diff
+  the verifier received was non-empty and contained the COMPLETE hunks for all
+  three FEAT-130 files (`scripts/leak-gate.mjs`, `scripts/lib/leak-tokens.mjs`,
+  `scripts/verify-feat-130-leak-detection.mjs`). Default `--max-diff-bytes 60000`
+  truncated the 453 KB whole-working-tree diff and cut FEAT-130's files off
+  (they sort after docs/public/src); raised the cap to 500000 so the full diff
+  (untruncated) reached the verifier. Clean room stripped `docs/prompts` +
+  `docs/bugs` (ambient surface). The run is NOT a laundered/empty diff.
+- **Fixer suite RE-RUN (real command, real output):**
+  `node scripts/verify-feat-130-leak-detection.mjs` → EXIT 0, **83/83 passed**
+  (manifest 3bf05d6fa1ef). Reproduced, not taken on faith.
+- **Adversarial cases the fixer's fixtures do NOT cover (real run, `attack-leak.mjs`,
+  EXIT 1, manifest b0d0d163e1dd) — 3 REAL RECALL BREAKS:**
+  1. **`isPlaceholder` entropy anchor waives a genuine secret.** A high-entropy
+     `PASSWORD=`-style assignment with the literal run `xxxx` spliced into the
+     MIDDLE of the value → `scanLine`/`scanBinary` return 0, `--staged` exits 0.
+     The structural `xxxx` marker overrides the high-entropy chunk — the exact
+     class of hole the round-3 D4 anchoring claim was meant to close, now
+     re-opened by the marker taking precedence over entropy.
+  2. **Placeholder-before-secret masks the real secret on the same line.**
+     `PASSWORD=<placeholder>; PASSWORD=<real high-entropy value>` on one line →
+     0 hits, `--staged` exits 0. Line-level placeholder suppression waives the
+     whole line including the trailing real assignment.
+  3. **Google `AIza` matcher boundary/charset gap.** A 39-char `AIza…` key whose
+     35-char body ends in a hyphen is missed by both detectors and allowed by
+     `--staged`.
+  (Secret VALUES not pasted here per the project's shape-not-value convention —
+  the hardened gate would flag them and this ticket would fail its own gate.)
+- **Precision controls HELD (must-NOT-fire, all SURVIVED):** a real
+  `PASSWORD=<high-entropy>` IS caught; `PASSWORD=your-key-here` stays clean; a
+  git-SHA-shaped `revision=<40-hex>` is NOT flagged.
+- **Could-not-test (stated by the verifier):** live provider-credential validity
+  (fixtures are fabricated); full binary/SVG COMMIT-path enforcement for these
+  specific new attacks (exercised through `scanBinary` directly + staged text
+  blobs, not through a binary/SVG blob end-to-end).
+- **Root of the recall breaks:** the entropy-anchored `isPlaceholder` treats a
+  structural placeholder marker (`xxxx`/`your-key-here`) as decisive even when a
+  high-entropy secret chunk co-exists on the same value/line; the fix must not let
+  a placeholder token WAIVE a co-located high-entropy secret, and the `AIza`
+  matcher's body boundary must not stop at a hyphen. This is the same "placeholder
+  substring suppresses real secrets" family the round-2 verifier flagged (D4 was
+  the attempted fix); `regressed-from:` FEAT-130 round-3 (D4).
+- **Caveat stated plainly:** `--working-tree` (FEAT-134) is new and NOT yet
+  independently verified, so this verdict bootstraps on unverified tooling; the
+  diff/clean-room sanity check above is the guard against a broken tool laundering
+  a false green, and it passed.
+- **Verified-by:** dispatch openai run 01a07918-d020-7ae2-9866-c706f5b3f131
+  (clean-room, `scripts/independent-verify.mjs --working-tree`) — VERDICT: BROKEN.
+  Kept clean room + verdict at `~/scratch/feat130-verify/verdict.txt`.
+
+### 2026-09-07 — worker (fixing, round 4) — three round-3 bypasses closed; per-token placeholder decision
+
+- **Scope:** `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`
+  only. `scripts/leak-gate.mjs` needed no change (it imports the shared matcher).
+- **must-FAIL reproduced first (real command, real output)** against the round-3
+  detector, using the round-1-of-round-3 verifier's EXACT inputs from
+  `~/scratch/feat130-verify/verdict.txt`. `scanLine`+`scanBinary` each returned 0
+  hits for all three (`EXIT=1`, 3 FAILURES); controls already green:
+  1. `PASS`+`WORD=<high-entropy run with an `xxxx` marker spliced in>` → 0
+  2. `PASS`+`WORD=your-key-here; PASS`+`WORD=<real high-entropy>` → 0
+  3. `AI`+`za<35-char body ending in a hyphen>` → 0
+- **Root cause (confirmed, matches the dispatch's direction — #1 and #2 are ONE
+  defect, granularity):**
+  - #1: `isPlaceholder` consulted `STRUCTURAL_PLACEHOLDER` (which includes `xxxx+`)
+    BEFORE the entropy check, so a marker spliced into a single high-entropy alnum
+    run waived the whole value — a per-value decision overriding a real per-token
+    secret.
+  - #2: the three assignment regexes were run with a single `.exec()`, which
+    returns only the FIRST match on a line, so a placeholder assignment written
+    before a real one masked it — a per-line decision.
+  - #3: the `AIza` matcher terminated its body with `\b`, which fails after a
+    non-word char, so a 35-char body ending in `-`/`_` did not match.
+- **Fix (granularity moved to per-token/per-match, NOT two more special cases):**
+  - `hasEntropyChunk` now requires genuine character-class diversity — dropped the
+    single-class `length >= 20` branch — so a run of identical marker chars
+    (`xxxx…`, `***`) is no longer mistaken for entropy; `isPlaceholder` checks
+    entropy FIRST and only consults structural marker / placeholder word when NO
+    token is secret-shaped. A value with no marker and no placeholder word is
+    still never waived, so recall for a marker-free real secret is unchanged.
+  - the three assignment regexes carry `g` and are iterated with `matchAll` (every
+    assignment on the line), deduped by key label. This closes #2 AND collapses the
+    pre-existing double-report (`PASSWORD=…` was emitted twice by dotenv+bare).
+  - the `AIza` body terminator is now a negative lookahead `(?![0-9A-Za-z_-])`
+    instead of `\b`, pinning the body to exactly 35 chars whatever the last one is.
+- **Each bypass proven closed** — re-ran the repro (`EXIT=0`, all pass), and drove
+  the REAL `--staged` gate end-to-end (node/execFileSync harness, git-write-clean)
+  on the exact three inputs: all three now `exit=1` (FAIL/refused); controls
+  `PASSWORD=your-key-here` and `revision=<40-hex SHA>` stay `exit=0` (PASS).
+- **Precision — must-NOT-fire (all confirmed clean), incl. high-entropy
+  NON-secrets added to the fixture set per dispatch:** real secret still caught;
+  `your-key-here` clean; git SHA clean; **lockfile `integrity sha512-<hash>` clean;
+  minified-bundle high-entropy string literal clean; pure `xxxx…` placeholder still
+  waived.** Added as verify-script section **D6** (8 new assertions).
+- **Full FEAT-130 suite:** `node scripts/verify-feat-130-leak-detection.mjs` →
+  **91/91 passed** (was 83/83; +8 D6). **`npm run gate` → EXIT 0** (PASS —
+  leak-gate + check-nul + typecheck) on the real tree. Note: the first gate run
+  correctly FAILED on this worker's own not-yet-split comment literal and fixture
+  var (`R4SECRET`); made both self-immune (reworded comment; renamed to `R4BODY`
+  split into ≤5-char fragments) — the gate catching them is evidence it works.
+- **regressed-from:** FEAT-130 round-3 (the D4 entropy anchor). #1 re-opened the
+  same "placeholder substring suppresses a real secret" family round 2 flagged.
+- **Independent verify warranted:** YES — this is a regression-prone security
+  detector on its 4th round touching a file with a history of regressions; a
+  fresh clean-room pass (`scripts/independent-verify.mjs --working-tree`) against
+  the round-4 diff, re-attacking the placeholder/entropy granularity and provider
+  boundaries, should be the last word, not this self-verified suite.
+- **Files changed (unstaged, for the user to commit):**
+  `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`,
+  and this ticket.

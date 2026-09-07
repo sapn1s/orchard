@@ -373,6 +373,18 @@ export function prose(text, cls = 'prose') {
         wrap.append(list);
         continue;
       }
+      // A bullet line interrupts a paragraph (CommonMark): emit the lead-in lines
+      // as a paragraph and re-run the remainder, which now starts at a marker.
+      // BULLET matches both `-*+` and `\d+.`, so this covers ordered lists too and
+      // the recursion's block-start path picks ol vs ul. `at > 0` only — an `at === 0`
+      // block is already claimed by the bullet branch above, so this cannot steal
+      // the wrapped-continuation fold from it.
+      const at = lines.findIndex((l) => BULLET.test(l));
+      if (at > 0) {
+        wrap.append(inlineInto(el('p'), lines.slice(0, at).join(' ')));
+        wrap.append(...prose(lines.slice(at).join('\n'), cls).childNodes);
+        continue;
+      }
       wrap.append(inlineInto(el('p'), lines.join(' ')));
     }
   }

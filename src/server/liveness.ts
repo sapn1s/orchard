@@ -514,10 +514,18 @@ export function livenessOfSurvivalHandle(input: SurvivalHandleInput): Liveness {
  *  4. probe ALIVE → LIVE regardless of silence. THE false-positive guard: a
  *     genuinely long, silent tool call with a real process behind it is never
  *     reaped by the timer.
- *  5. probe UNKNOWN → the frameless backstop is the only thing left. Past the
- *     window the claim stops standing (`live:false`) but the STATE remains
- *     `unknown`, which is what tells the caller to REFUSE rather than race a
- *     second CLI onto a transcript it cannot prove is finished (BUG-022).
+ *  5. probe UNKNOWN → the frameless backstop is the only ground-truth rung left
+ *     (a container has no host pid). Past the window the claim stops standing
+ *     (`live:false`) but the STATE remains `unknown`, which is what tells the
+ *     caller to REFUSE rather than race a second CLI onto a transcript it cannot
+ *     prove is finished (BUG-022). WITHIN the window (a frame arrived recently)
+ *     the same honest-main-turn gate as rung 4 runs (BUG-159 round 4): a NOISY
+ *     background lane keeps `lastFrameAt` fresh so this backstop never fires, and
+ *     a stuck woken `busy` shielded by that lane would otherwise read as a
+ *     running MAIN turn forever — the container face of the phantom. The recent
+ *     frame is the container-path positive liveness signal; when it is a live
+ *     lane's and the main thread is idle past the window, report not-running
+ *     (`live:true` — do not reap; the lane is real work).
  */
 /**
  * BUG-159 — is this session's `busy` a STUCK woken-turn claim that a live
@@ -668,6 +676,37 @@ export function livenessOfBridge(session: BridgeLike, now = Date.now()): Livenes
       reason:
         `no output of any kind from the agent for ${Math.round(silentMs / 1000)}s ` +
         `(limit ${Math.round(FRAMELESS_MS / 1000)}s) and ${probe.detail}`,
+      evidence: { ...base, silentMs }, since: session.turnStartedAt,
+    };
+  }
+  // BUG-159 (round 4) — the HONEST MAIN-TURN gate on the CONTAINER / no-pid
+  // path (probe==='unknown'). A container has no host pid, so the frameless
+  // backstop above is the only ground-truth rung — but a NOISY background lane
+  // refreshes `lastFrameAt` on every frame, so the window never elapses and a
+  // stuck woken-turn `busy` shielded by that lane falls through to the running
+  // claim below and reads as a running MAIN turn forever: the CONTAINER face of
+  // the phantom the `alive` branch already fixes (containers became the default
+  // runtime, so this is now the default mode's exposure). The container-path
+  // POSITIVE liveness signal is the recent frame itself — reaching here means
+  // `silentMs <= FRAMELESS_MS` (the frameless return above did not fire), so
+  // SOMETHING emitted a frame within the window and the broker/CLI is up; the
+  // gate additionally requires that frame's source be a LIVE background lane
+  // (`hasLiveBackgroundLane()`), the main thread to have NO work in flight
+  // (`hasMainThreadWork()` false — the BUG-033 + S3 provenance guard), and the
+  // MAIN clock to be past the window. That is the same POSITIVE-evidence gate
+  // the `alive` branch uses, so a genuine long-silent main turn is never
+  // downgraded, and a QUIET-lane session still self-heals via the frameless
+  // backstop above (unchanged). Report not-running but keep `live:true` (the
+  // lane is real work; the reaper must NOT drop it) — this only flips the
+  // fall-through phantom `running:true`→`false`, leaving `live` and the refuse
+  // semantics of the frameless rung untouched.
+  if (mainTurnIdleBehindLane(session, now)) {
+    const mainSilentMs = now - (mainClock(session) ?? now);
+    return {
+      state: 'unknown', running: false, live: true, kind: 'idle',
+      reason:
+        'the main thread is idle — the session is kept alive by a live background lane, ' +
+        `not by a running turn (no main-thread frame for ${Math.round(mainSilentMs / 1000)}s)`,
       evidence: { ...base, silentMs }, since: session.turnStartedAt,
     };
   }

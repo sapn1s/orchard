@@ -104,16 +104,18 @@ block; **open with 4 backticks** so ordinary ```code``` fences inside survive:
 
 Six names, three pairs. One question picks each pair, one word picks within it:
 
-- **the world** — `orchard-finding` what is TRUE (collapsed by default, with its
-  first sentence shown — so write that sentence as the one a reader would decide
-  on) · `orchard-outcome` what I CHANGED (shipped, committed, filed, deployed)
-  and what you now see.
+Only the digest, `ask` and `status` stay open — the rest FOLD, each showing its
+first sentence — lead with the line they decide on.
+
+- **the world** — `orchard-finding` what is TRUE · `orchard-outcome` what I
+  CHANGED (shipped/committed/filed) and what you now see.
 - **a decision** — `orchard-ask` it is YOURS: a choice, question, approval or an
-  action only you can take; lead with my recommendation · `orchard-judgment` it
+  action only you can take; lead with my recommendation, then `confidence:`
+  high/med/low and `decider:` (taste/priority/spend/risk/direction) · `orchard-judgment` it
   was MINE: the call and why, including where I got it wrong.
 - **the work** — `orchard-status` where it stands as this turn ENDS (running,
   next, blocked, or nothing needs you) · `orchard-narration` what I am doing
-  INSIDE this turn; collapsed by default, with no preview.
+  INSIDE this turn.
 
 - A passage that is two of these is two passages: split it.
 - **Nothing fits** → ` ````orchard-uncategorized <short label of what it is> `.
@@ -125,8 +127,8 @@ Six names, three pairs. One question picks each pair, one word picks within it:
   long as its opener.
 - **Repeat freely, in any order** (the digest is the exception: once, first).
   Blocks never nest. `orchard-*` is a reserved namespace — do not invent names.
-  An `orchard-*` fence inside a COLLAPSED block (`orchard-finding`,
-  `orchard-narration`) ends the fold there — never, even as an example.
+  An `orchard-*` fence inside a COLLAPSED block ends the fold
+  — never, even as an example.
 
 **Inside a block: lines, not paragraphs.** The category says what a passage IS;
 this is its shape. A reader takes one fact without reading a sentence to its end.
@@ -273,17 +275,20 @@ soft boundary feels like from the inside.
 
 ### Presentation follows from the category
 
-Two categories fold, and the rule that picks them is a property of the category
+Four categories fold, and the rule that picks them is a property of the category
 rather than a judgement about the passage:
 
 > **A category is collapsed if the reader does not have to read it to know where
 > they stand.**
 
-`ask`, `outcome`, `status` and `judgment` are addressed TO the reader — what needs
-you, what changed, where it stands, what I decided and why. `finding` and
+`digest`, `ask` and `status` are the news addressed TO the reader — the headline
+of the turn, what needs you, where it stands. `finding`, `outcome`, `judgment` and
 `narration` are the supporting record behind those: what is true about the subject
-matter, and the play-by-play of establishing it. The fallback is visible because
-hiding the thing we could not classify is the worst possible direction.
+matter, the full retrospective of what I changed, the reasoning behind a call I
+made, and the play-by-play of establishing it. The digest already carries the
+headline of what changed, so the long prose of `outcome` and `judgment` is detail
+to open on demand. The fallback is visible because hiding the thing we could not
+classify is the worst possible direction.
 
 **The rule used to be "a category is collapsed if its value expires when the turn
 ends", and it picked exactly `narration`.** That is a description of a set of one,

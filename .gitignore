@@ -62,6 +62,14 @@ docs/bugs/.migrated/
 
 # Ignored by exact name rather than a broad `*.py` so a future tracked Python
 # tool would still show up. See FEAT-118.
+# Scratch screenshots the user drops at the repo ROOT during verification/UI
+# review (feat*-*.png, bug*-*.png). Their PIXELS embed private data — project
+# names, a private trading brief — and the leak gate skips images by design, so
+# an accidental `git add` on this PUBLIC repo would publish them. The curated
+# README screenshots live under docs/assets/ and stay tracked; only the root is
+# an unignored escape hatch. Root-anchored so it never shadows tracked images.
+/*.png
+
 /adversarial_twosided_budget_fill.py
 /adversarial_twosided_price_drift.py
 /verify_brake_adv.py

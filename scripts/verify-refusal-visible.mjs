@@ -105,7 +105,9 @@ const health = async (port) => (await (await fetch(`http://127.0.0.1:${port}/api
 async function registerProject(port, workDir, name, settings = {}) {
   const reg = await (await fetch(`http://127.0.0.1:${port}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: workDir, name }),
+    // FEAT-131: direct-isolation suite — pin isolation so the container-default
+    // for new projects cannot move the session off-host.
+    body: JSON.stringify({ hostPath: workDir, name, isolation: 'direct' }),
   })).json();
   if (!reg.project?.id) throw new Error(`register failed: ${JSON.stringify(reg)}`);
   await fetch(`http://127.0.0.1:${port}/api/projects/${encodeURIComponent(reg.project.id)}`, {

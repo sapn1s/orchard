@@ -134,7 +134,7 @@ const waitEv = async (events, pred, ms = 60_000) => { const t0 = Date.now(); whi
 const getJson = async (url) => (await fetch(url)).json();
 
 async function register(port, cwd, name) {
-  const r = await (await fetch(`http://127.0.0.1:${port}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: cwd, name }) })).json();
+  const r = await (await fetch(`http://127.0.0.1:${port}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: cwd, name, isolation: 'direct' }) })).json(); // FEAT-131: pin direct (container-default off)
   if (!r.project?.id) throw new Error(`register failed ` + JSON.stringify(r));
   return r.project.id;
 }

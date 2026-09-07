@@ -2000,13 +2000,17 @@ export function reportedDefectCases() {
  * with — became a frozen LEGACY alias of `orchard-narration`. Both fold, so both
  * are graded as folds here. Round 13 (FEAT-093) added `orchard-finding`, at the
  * user's request: findings are now the supporting record behind a reply, folded
- * with a preview of their first sentence. This is deliberately a local set rather
- * than an import of COLLAPSED_BLOCKS: an oracle that reads the implementation's
- * own list would agree with a parser that silently stopped collapsing, which is
- * the failure this corpus exists to catch. It is pinned by a check in the suite
- * instead.
+ * with a preview of their first sentence. Round 14 added `orchard-outcome` and
+ * `orchard-judgment`, again at the user's request: the long "what I changed" and
+ * "why I called it that way" prose is the supporting record behind a reply, folded
+ * with a preview like `finding`. This is deliberately a local set rather than an
+ * import of COLLAPSED_BLOCKS: an oracle that reads the implementation's own list
+ * would agree with a parser that silently stopped collapsing, which is the failure
+ * this corpus exists to catch. It is pinned by a check in the suite instead.
  */
-export const CORPUS_FOLD_NAMES = Object.freeze(['orchard-notes', 'orchard-narration', 'orchard-finding']);
+export const CORPUS_FOLD_NAMES = Object.freeze([
+  'orchard-notes', 'orchard-narration', 'orchard-finding', 'orchard-outcome', 'orchard-judgment',
+]);
 
 /**
  * REMAP a generated case onto the round-12 semantic names, input AND expectations

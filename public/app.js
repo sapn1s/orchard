@@ -579,8 +579,6 @@ const node = {
   fine: $('#fine'),
   finder: $('#finder'),
   findInput: $('#findInput'),
-  libCount: $('#libCount'),
-  themeVal: $('#themeVal'),
   rail: $('#rail'),
   railBadge: $('#railBadge'),
   railBadgeN: $('#railBadgeN'),
@@ -854,6 +852,11 @@ const drawer = createDrawer({
   // rather than borrowing another project's attach.
   getLiveTools: () => dockLiveTools(),
   getStartSnapshot: () => state.startSnapshot,
+  // FEAT-139 — the Appearance control under Settings → Machine reads and writes
+  // the app theme through these; applyTheme owns the localStorage + <html> write.
+  themes: () => THEMES,
+  getTheme: () => theme,
+  setTheme: (t) => setThemePersist(t),
   notify: say,
   openGit: () => void gitView?.open(),
   async refreshProject() {
@@ -892,19 +895,49 @@ gitView = createGitView({
 
 /* ------------------------------------------------------------------- theme */
 
+// FEAT-139 — theme is a real, server-persisted machine setting surfaced in
+// Settings → Machine (Appearance), not a sidebar-foot cycle button. The SERVER
+// is the source of truth: it persists the value (global-settings.ts) and injects
+// it onto <html data-theme> for a flash-free first paint. localStorage stays a
+// FAST client cache (and offline fallback), NOT the only record. On load we
+// reconcile against the server; on change we write THROUGH to the server.
+const THEMES = ['system', 'light', 'dark'];
+function cachedTheme() { try { return localStorage.getItem('cs.theme'); } catch { return null; } }
+// First-paint value: prefer the server-injected <html data-theme> (authoritative,
+// present even with a cold cache), then the localStorage cache, then 'system'.
+let theme = (() => {
+  const injected = document.documentElement.dataset.theme;
+  if (injected && THEMES.includes(injected)) return injected;
+  const cached = cachedTheme();
+  return cached && THEMES.includes(cached) ? cached : 'system';
+})();
+// Apply locally + refresh the cache. Does NOT touch the server (used for first
+// paint and for reconciling a server value we just read back).
 function applyTheme(t) {
+  if (!THEMES.includes(t)) t = 'system';
+  theme = t;
   if (t === 'system') delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = t;
-  node.themeVal.textContent = t;
   try { localStorage.setItem('cs.theme', t); } catch { /* private mode */ }
 }
-const THEMES = ['system', 'light', 'dark'];
-let theme = (() => { try { return localStorage.getItem('cs.theme') || 'system'; } catch { return 'system'; } })();
-applyTheme(THEMES.includes(theme) ? theme : 'system');
-$('#themeBtn').addEventListener('click', () => {
-  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
-  applyTheme(theme);
-});
+applyTheme(theme);
+// Reconcile against the server (source of truth) once, after first paint. The
+// injected attribute already made first paint correct; this repairs a stale
+// cache and covers a static serve that did not inject. No write-back.
+(async () => {
+  try {
+    const s = await api.getSettings();
+    const t = s && typeof s.theme === 'string' ? s.theme : null;
+    if (t && THEMES.includes(t) && t !== theme) applyTheme(t);
+  } catch { /* offline — the cache/injection stand */ }
+})();
+// The Appearance control writes THROUGH: local (cache + <html>) then the server
+// record. If the PATCH fails (offline) the cache holds and the next reconcile
+// re-syncs; the server, when reachable, is the authority.
+function setThemePersist(t) {
+  applyTheme(t);
+  api.patchSettings({ theme: t }).catch(() => { /* offline; cache holds */ });
+}
 
 /* ----------------------------------------------------------------- sidebar */
 
@@ -3158,7 +3191,12 @@ function newThread(key, meta = {}) {
   node.panes.append(paneEl);
   const th = {
     key,
-    kind: key === 'main' ? 'main' : 'agent',
+    // BUG-171: the SERVER declares whether a lane is a real subagent or a single
+    // TOOL call it surfaced as its own task (a `local_bash`) — LiveAgent.kind on
+    // the wire. Read that declared fact (via agentKind at the call sites); never
+    // hardcode 'agent', which is what made a tool lane read as a phantom subagent
+    // stuck "waiting for this agent's first output…" forever (ARCH-010).
+    kind: key === 'main' ? 'main' : (meta.kind ?? 'agent'),
     agentId: key === 'main' ? null : key,
     agentType: meta.agentType ?? '',
     description: meta.description ?? '',
@@ -3178,7 +3216,7 @@ function newThread(key, meta = {}) {
     page: null, // main only: reverse-pagination cursor into the transcript
   };
   state.threads.set(key, th);
-  if (th.kind === 'agent') refreshLede(th);
+  if (th.kind !== 'main') refreshLede(th);
   return th;
 }
 
@@ -3187,7 +3225,8 @@ function newThread(key, meta = {}) {
  * once, because agent-started can arrive before we know the type/description.
  */
 function refreshLede(th) {
-  if (th.kind !== 'agent') return;
+  if (th.kind === 'main') return;
+  if (th.kind === 'tool') { refreshToolLede(th); return; }
   refreshWaiting(th);
   let lede = th.paneEl.querySelector(':scope > .lede');
   if (!lede) {
@@ -3198,6 +3237,32 @@ function refreshLede(th) {
   lede.append(el('b', { text: th.agentType || 'agent' }));
   if (th.description) lede.append(document.createTextNode(` · ${th.description}`));
   if (th.stats) lede.append(document.createTextNode(` · ${th.stats}`));
+}
+
+/**
+ * BUG-171 — the lede for a TOOL lane (BUG-030: a CLI `local_bash` the engine
+ * surfaces as its own task, e.g. the orchestrator's "Idle wait for subagents"
+ * Bash call). It is NOT a subagent: it emits no agent output, so the agent lede
+ * and the "waiting for this agent's first output…" hint are both false for it —
+ * together they read as a phantom subagent stuck forever, which is exactly how
+ * the owner reported it. Show what a bash lane actually is: its task type, the
+ * description/command the caller passed, and whether it is still running. The
+ * server DECLARES this is a tool (LiveAgent.kind); we read that, not re-derive
+ * it (ARCH-010). Deliberately no `.waiting` hint — a tool lane has no first
+ * output to wait for — so any one left over from a prior kind is removed.
+ */
+function refreshToolLede(th) {
+  th.paneEl.querySelector(':scope > .waiting')?.remove();
+  let lede = th.paneEl.querySelector(':scope > .lede');
+  if (!lede) {
+    lede = el('div', { class: 'lede' });
+    th.paneEl.prepend(lede);
+  }
+  clear(lede);
+  lede.append(el('b', { text: th.agentType || 'tool' }));
+  if (th.description) lede.append(document.createTextNode(` · ${th.description}`));
+  const stateLabel = th.status === 'running' ? 'running' : (th.stats || th.status || 'done');
+  lede.append(document.createTextNode(` · ${stateLabel}`));
 }
 
 /**
@@ -3474,8 +3539,19 @@ function finishStream(th) {
   if (!th?.stream) return;
   if (th.stream.timer) clearTimeout(th.stream.timer);
   const text = th.stream.text;
-  th.stream.wrap.replaceWith(prose(text));
+  // BUG-169: settle the live stream through the DIGEST-AWARE renderer, not raw
+  // prose(). When finishStream fires mid-stream (agent-completed / turn-end /
+  // tool-call arrives before the block's own 'text' settle event), the old
+  // prose() painted the raw orchard-digest JSON, then the trailing 'text' event
+  // — finding th.stream null — APPENDED a second, digest-aware render of the same
+  // text: the fence showed twice (raw JSON, then the rail). We now (a) render the
+  // settled node digest-aware so it already looks right, and (b) remember it as
+  // th.settledStream so the trailing 'text' re-renders THIS node in place instead
+  // of appending a duplicate (see case 'text').
+  const node = assistantProse(text);
+  th.stream.wrap.replaceWith(node);
   th.stream = null;
+  th.settledStream = { node, text };
 }
 
 /* ----------------------------------------------------------------- scroll */
@@ -3884,11 +3960,14 @@ function withScrollAnchor(mutate) {
   return out;
 }
 
-/** Put nodes at the top of a pane, after the agent lede if there is one. */
+/** Put nodes at the top of a pane, after the agent lede / session-config card. */
 function prependNodes(th, nodes, anchor = true) {
   const put = () => {
-    const lede = th.paneEl.querySelector(':scope > .lede');
-    if (lede) lede.after(...nodes);
+    // FEAT-132 — the session-config card is a persistent header pinned to the
+    // very top of the pane; older pages prepend BELOW it, never above.
+    const top = th.paneEl.querySelector(':scope > .sesscfg')
+      || th.paneEl.querySelector(':scope > .lede');
+    if (top) top.after(...nodes);
     else th.paneEl.prepend(...nodes);
   };
   if (anchor && th.paneEl.classList.contains('on')) withScrollAnchor(put);
@@ -4030,6 +4109,7 @@ async function loadNewer(th) {
     // The window can overlap what is rendered when `before` was clamped.
     const fresh = (t.messages ?? []).filter((m) => Number.isInteger(m?.index) && m.index >= th.gap.next);
     finishStream(th);
+    th.settledStream = null; // gap-fetched history supersedes the live node; no trailing 'text' re-renders it (BUG-169)
     th.claudeBody = null;
     renderMessages(th, fresh);
     const last = fresh[fresh.length - 1];
@@ -4088,7 +4168,9 @@ function showThread(key) {
   state.viewing = key;
   for (const th of state.threads.values()) th.paneEl.classList.toggle('on', th.key === key);
   const th = state.threads.get(key);
-  node.main.dataset.viewing = th.kind === 'agent' ? 'agent' : 'main';
+  // BUG-171: a tool lane is a read-only sub-thread like an agent, not the main
+  // composer — anything but `main` renders in the sub-thread ('agent') layout.
+  node.main.dataset.viewing = th.kind === 'main' ? 'main' : 'agent';
   paintCrumbs();
   paintComposerFor(th);
   renderStrip();
@@ -4115,7 +4197,7 @@ function restoreScroll(th) {
 /** Enter a subagent thread, fetching its recorded transcript if we have none. */
 async function viewAgent(agentId) {
   let th = state.threads.get(agentId);
-  if (!th) th = newThread(agentId, {});
+  if (!th) th = newThread(agentId, { kind: threadKindFor(agentId) });
   showThread(agentId);
   if (th.loaded || th.loading) return;
   // A live agent's messages arrive over the socket; only recorded ones fetch.
@@ -4163,7 +4245,7 @@ function backToMain() {
 function paintCrumbs() {
   const th = viewedThread();
   clear(node.title);
-  if (th.kind !== 'agent') {
+  if (th.kind === 'main') {
     node.title.append(document.createTextNode(state.current.title ?? (currentProject() ? 'New session' : 'Claude Station')));
     return;
   }
@@ -4193,7 +4275,7 @@ function paintComposerFor(th) {
    * unconditionally) so no early return below can leave it stale on screen.
    */
   node.liveElsewhereText.textContent = '';
-  if (state.liveElsewhere && th.kind !== 'agent') {
+  if (state.liveElsewhere && th.kind === 'main') {
     // The server's messages are lowercase (they are written for the status
     // strip). Here the same words are a sentence following a bold lead, and
     // "Open in another tab. this session is…" reads as a typo — a screenshot
@@ -4220,7 +4302,7 @@ function paintComposerFor(th) {
   // thread — the session is still readable, but MUST NOT look sendable, and
   // must not silently un-lock just because the user switched threads or the
   // view re-painted. Only closeSocket()/a fresh connect() clears this.
-  if (state.budgetLocked && th.kind !== 'agent') {
+  if (state.budgetLocked && th.kind === 'main') {
     node.agentDone.hidden = true;
     node.box.hidden = true;
     node.frozen.hidden = true;
@@ -4239,7 +4321,7 @@ function paintComposerFor(th) {
   const frozenFork = !!state.pendingFork && !state.forkFrom;
   const frozenWin = state.current.os === 'windows' && !state.forkFrom;
   const frozen = frozenWin || frozenFork;
-  if (th.kind !== 'agent') {
+  if (th.kind === 'main') {
     node.agentDone.hidden = true;
     // Parked in history (restored at a deep index, newer messages unfetched):
     // the composer would visually attach a reply to the wrong place, so the
@@ -4445,12 +4527,78 @@ const HARNESS_SENTINELS = [
   '[station]',
 ];
 
-/** Detect a harness notice; returns { one, full } or null for a real message. */
+/*
+ * BUG-168 — the server (#withBriefing, src/server/agent-bridge.ts) PREPENDS a
+ * "[station] While you were away…" briefing (and, on the first turn, the board
+ * snapshot) to the user's typed prompt and the CLI writes ONE role:user entry:
+ * injected text first, human's words last. Without a boundary the whole entry was
+ * swallowed into the collapsed notice chip and the human's own sentence vanished
+ * on any re-read. The server now terminates the injected prefix with this exact
+ * sentinel; we split on it, collapse the prefix into the chip, and render the
+ * REMAINDER as the normal user bubble (the FEAT-072 queuedCaption peel pattern).
+ * Keep this literal byte-identical with the server's BRIEFING_TERMINATOR (the two
+ * cannot share a module — the client is a browser file).
+ */
+const BRIEFING_TERMINATOR = '⟦STATION-BRIEFING-END⟧';
+/* The known tail line of BOTH briefing kinds (takeBriefing + boardAnswerBriefing),
+ * used only to split LEGACY entries written before the terminator existed. */
+const LEGACY_BRIEF_TAIL = '[station] This is a server-recorded fact';
+/* The first-turn board snapshot (FEAT-113) head + the `---` rule the server joins
+ * it to the user's prompt with — the legacy first-turn boundary. */
+const BOARD_SNAPSHOT_HEAD = '# Project state (live board snapshot)';
+const BOARD_SNAPSHOT_SEP = '\n\n---\n\n';
+
+/**
+ * LEGACY split: entries written before BRIEFING_TERMINATOR existed carry no
+ * boundary marker, so recover the user's words heuristically from the KNOWN
+ * briefing shape. Returns { prefix, body } when the boundary is found CONFIDENTLY,
+ * or null to fall back to collapsing the whole entry (never guess a boundary and
+ * risk rendering briefing text as the user's words). `t` is left-trimmed.
+ */
+function legacyBriefingSplit(t) {
+  const tailStart = t.lastIndexOf(LEGACY_BRIEF_TAIL);
+  if (tailStart < 0) return null; // not a [station] briefing (e.g. a bare notification) → collapse whole
+  const nl = t.indexOf('\n', tailStart);
+  const afterTail = nl < 0 ? t.length : nl; // through the end of the tail line
+  const rest = t.slice(afterTail).replace(/^\s+/, '');
+  if (!rest) return { prefix: t.slice(0, afterTail), body: '' }; // pure briefing, no user words
+  if (rest.startsWith(BOARD_SNAPSHOT_HEAD)) {
+    // First-turn: a board snapshot sits between the briefing and the user's words,
+    // joined by the `---` rule. The board snapshot itself contains no `---`, so the
+    // FIRST separator after the snapshot head is the true boundary.
+    const sepInRest = rest.indexOf(BOARD_SNAPSHOT_SEP);
+    if (sepInRest < 0) return null; // board snapshot but no separator → can't split confidently
+    const body = rest.slice(sepInRest + BOARD_SNAPSHOT_SEP.length).replace(/^\s+/, '');
+    if (!body) return null; // separator but nothing after it → don't guess
+    // Prefix = everything before the user's words (briefing tail + board snapshot).
+    const boundary = t.length - (rest.length - sepInRest);
+    return { prefix: t.slice(0, boundary).replace(/\s+$/, ''), body };
+  }
+  // Follow-up turn: the user's words follow the briefing tail directly.
+  return { prefix: t.slice(0, afterTail), body: rest };
+}
+
+/**
+ * Detect a harness notice. Returns { one, full, body } or null for a real message.
+ * `body` (BUG-168) is the user's own words peeled off the injected prefix — empty
+ * when the entry is a pure briefing with no user prompt.
+ */
 function harnessNotice(text) {
   if (typeof text !== 'string') return null;
   const t = text.replace(/^\s+/, '');
   if (!HARNESS_SENTINELS.some((s) => t.startsWith(s))) return null;
-  return { one: harnessOneLiner(t), full: text };
+  // New format: the injected prefix is terminated by an explicit sentinel; peel it.
+  const term = t.indexOf(BRIEFING_TERMINATOR);
+  if (term >= 0) {
+    const prefix = t.slice(0, term).replace(/\s+$/, '');
+    const body = t.slice(term + BRIEFING_TERMINATOR.length).replace(/^\s+/, '');
+    return { one: harnessOneLiner(prefix), full: prefix, body };
+  }
+  // Legacy entry (pre-terminator): recover the user's words heuristically, or
+  // collapse the whole entry when the boundary is not confidently found.
+  const split = legacyBriefingSplit(t);
+  if (split) return { one: harnessOneLiner(split.prefix), full: split.prefix, body: split.body };
+  return { one: harnessOneLiner(t), full: text, body: '' };
 }
 
 /** Best-effort one-liner for the collapsed notice; parses task-notification. */
@@ -4491,6 +4639,120 @@ function noticeChip(th, notice) {
   th.claudeBody = null;
   th.stream = null;
   return det;
+}
+
+/*
+ * FEAT-132 — the "Session configuration" card, pinned above the first turn of a
+ * transcript. It shows what was actually injected into this session's context at
+ * launch (the four composed docs, the board snapshot, MCP servers, model, tools)
+ * — facts the JSONL never carries, so a reader otherwise cannot see them. The
+ * server owns and persists the record (session-config.ts); this only renders it.
+ *
+ * Collapsed by default. Each source is a chip; clicking one expands its injected
+ * body inline. A TRUNCATED (BUG-146) or MISSING doc is marked visibly — exposing
+ * silent truncation is the whole reason the card exists. A session with no record
+ * (it predates the feature) gets a clearly-labelled partial card, never one that
+ * implies full knowledge.
+ */
+const SC_STATUS_LABEL = { truncated: 'truncated', missing: 'missing', superseded: 'superseded', 'best-effort': '?' };
+
+async function mountSessionConfigCard(th, sess, scope) {
+  let rec = null;
+  try { rec = await api.sessionConfig(sess.sessionId); } catch { rec = null; }
+  // Dropped if the user navigated away while the fetch was in flight (same guard
+  // the transcript paint uses), or if the pane already carries a card.
+  if (scope != null && scope !== state.txScope) return;
+  if (th.paneEl.querySelector(':scope > .sesscfg')) return;
+
+  const card = el('section', { class: 'sesscfg', 'data-open': 'false' });
+  const tw = el('span', { class: 'tw', text: '▶' });
+  const title = el('span', { class: 'sc-title', text: 'Session configuration' });
+
+  if (!rec) {
+    // Partial card — no record. Honest about WHY, never implies full knowledge.
+    const head = el('button', { class: 'sc-head', 'aria-expanded': 'false', type: 'button' },
+      tw, title,
+      el('span', { class: 'sc-sub', text: 'not recorded' }));
+    const body = el('div', { class: 'sc-body', hidden: true },
+      el('p', { class: 'sc-note', text:
+        'Orchard has no configuration record for this session. It was launched before this feature existed (or by a server that does not record it), so what was injected into its context cannot be shown here.' }));
+    head.addEventListener('click', () => toggleSessCfg(card, head, body));
+    card.append(head, body);
+    th.paneEl.prepend(card);
+    return;
+  }
+
+  const warned = rec.sources.filter((s) => s.status === 'truncated' || s.status === 'missing').length;
+  const sub = [rec.model || null, `${rec.sources.length} source${rec.sources.length === 1 ? '' : 's'}`]
+    .filter(Boolean).join(' · ');
+  const head = el('button', { class: 'sc-head', 'aria-expanded': 'false', type: 'button' },
+    tw, title,
+    el('span', { class: 'sc-sub', text: sub }),
+    warned ? el('span', { class: 'sc-warn', title: `${warned} source(s) truncated or missing`, text: `⚠ ${warned}` }) : null);
+
+  const body = el('div', { class: 'sc-body', hidden: true });
+  // Meta line: the facts that are single values, not sources.
+  const metaBits = [
+    rec.model ? `model ${rec.model}` : null,
+    rec.provider ? `provider ${rec.provider}` : null,
+    rec.isolation ? `isolation ${rec.isolation}` : null,
+    `prompt ${rec.mode}`,
+  ].filter(Boolean);
+  body.append(el('div', { class: 'sc-meta', text: metaBits.join('  ·  ') }));
+
+  const chips = el('div', { class: 'sc-chips' });
+  const detail = el('pre', { class: 'sc-src', hidden: true });
+  let openChip = null;
+
+  const show = (chip, src) => {
+    if (openChip === chip) { // toggle off
+      detail.hidden = true; chip.setAttribute('aria-expanded', 'false'); openChip = null; return;
+    }
+    if (openChip) openChip.setAttribute('aria-expanded', 'false');
+    openChip = chip; chip.setAttribute('aria-expanded', 'true');
+    if (src.body && src.body.trim()) {
+      detail.textContent = src.body;
+    } else if (src.note) {
+      detail.textContent = src.note;
+    } else if (src.status === 'missing') {
+      detail.textContent = `${src.label}: referenced but could not be read at launch — nothing was injected for it.`;
+    } else {
+      detail.textContent = `${src.label}: no recorded body.`;
+    }
+    detail.hidden = false;
+  };
+
+  // The composed/persisted sources, plus a synthetic "Tools" chip from the real
+  // attached tool list the CLI reported.
+  const allSources = [...rec.sources];
+  if (Array.isArray(rec.tools) && rec.tools.length) {
+    allSources.push({ id: 'tools', label: 'Tools', status: 'applied', chars: rec.tools.length,
+      body: rec.tools.join('\n'), note: `${rec.tools.length} tools` });
+  }
+
+  for (const src of allSources) {
+    const badge = SC_STATUS_LABEL[src.status];
+    const chip = el('button', { class: 'sc-chip', type: 'button', 'data-status': src.status, 'aria-expanded': 'false' },
+      el('span', { class: 'sc-lbl', text: src.label }),
+      src.status === 'truncated' && src.droppedChars != null
+        ? el('span', { class: 'sc-bad', text: `truncated −${kilo(src.droppedChars)}` })
+        : badge ? el('span', { class: 'sc-bad', text: badge }) : null);
+    chip.addEventListener('click', () => show(chip, src));
+    chips.append(chip);
+  }
+  body.append(chips, detail);
+  head.addEventListener('click', () => toggleSessCfg(card, head, body));
+  card.append(head, body);
+  th.paneEl.prepend(card);
+}
+
+function toggleSessCfg(card, head, body) {
+  const open = card.getAttribute('data-open') === 'true';
+  card.setAttribute('data-open', open ? 'false' : 'true');
+  head.setAttribute('aria-expanded', open ? 'false' : 'true');
+  body.hidden = open;
+  const tw = head.querySelector('.tw');
+  if (tw) tw.textContent = open ? '▶' : '▼';
 }
 
 /*
@@ -4650,8 +4912,15 @@ function renderMessages(th, messages) {
           // BUG-067: harness-injected notices (task-notification / [station] /
           // <system-reminder> / SYSTEM NOTIFICATION) are not the user's words —
           // render a collapsed system notice, not a user bubble.
+          // BUG-168: when the notice PREFIXES a real user message (a "[station]"
+          // briefing prepended to the human's typed prompt), peel the prefix into
+          // the chip and render the user's own words (notice.body) as their bubble.
+          // An empty body (pure briefing, no user prompt) stays chip-only.
           const notice = harnessNotice(b.text);
-          if (notice) mark(noticeChip(th, notice));
+          if (notice) {
+            mark(noticeChip(th, notice));
+            if (notice.body) stampTime(mark(youBubble(th, notice.body)), m.timestamp);
+          }
           else {
             // FEAT-072: a real user message wearing a queued-metadata prefix —
             // peel the prefix into a dim caption, keep the words in the bubble.
@@ -4755,6 +5024,9 @@ async function loadRecordedAgents(th, sessionId) {
     for (const a of next) {
       const agentId = a.agentId;
       const meta = {
+        // BUG-171: carry the declared kind so a historical tool lane (local_bash)
+        // opens with the tool lede, not the agent lede + never-clearing wait hint.
+        kind: agentKind(a),
         agentType: a.subagentType ?? a.agentType ?? 'agent',
         description: a.description ?? '',
         status: a.status ?? 'completed',
@@ -4861,6 +5133,11 @@ async function openSession(p, sess, opts = {}) {
     // under the current header. `wait` was detached by that reset, so leave it.
     if (scope !== state.txScope) return;
     wait.remove();
+    // FEAT-132 — the session-configuration card pinned above the first turn.
+    // Fire-and-forget: it fetches its own record and prepends when ready, so it
+    // never delays the transcript paint, and it stays the pane's top child
+    // regardless of when it lands (prependNodes anchors older pages below it).
+    mountSessionConfigCard(th, sess, scope);
     const tailStart = Number.isInteger(t.messages?.[0]?.index) ? t.messages[0].index : (t.offset ?? 0);
     if (at != null && at < tailStart) {
       // The remembered message is OLDER than the newest page: render a window
@@ -6658,6 +6935,21 @@ function agentKind(a) {
   return a.kind ?? ((a.agentType || '').startsWith('local_') && a.agentType !== 'local_agent' ? 'tool' : 'agent');
 }
 
+/**
+ * BUG-171 — the DECLARED kind for a live agent id, for the rare path that has to
+ * create a thread before an `agent-started` frame stamped it (viewAgent from a
+ * strip-row click). Read, never re-derive: the live agent record carries `kind`;
+ * the running snapshot row carries the same fact as `row` ('tool'|'agent'). Falls
+ * back to 'agent' when neither authority has spoken yet.
+ */
+function threadKindFor(agentId) {
+  const a = state.agents.get(agentId)?.agent;
+  if (a) return agentKind(a);
+  const r = state.snap?.running?.find((x) => x.id === agentId);
+  if (r) return r.row === 'tool' ? 'tool' : 'agent';
+  return 'agent';
+}
+
 /*
  * BUG-030 — the in-flight invariant: a card may show ◐ only while a live
  * process/turn can actually be behind it. Two ground truths enforce it:
@@ -7251,6 +7543,7 @@ function applyAppend(e) {
   // A persisted message is a complete unit; end any half-open stream first so
   // it does not get appended into the previous turn's body.
   finishStream(th);
+  th.settledStream = null; // persisted units replace the live body; no trailing 'text' will re-render (BUG-169)
   th.claudeBody = null;
   const shown = renderMessages(th, fresh);
   if (!shown) return;
@@ -8496,10 +8789,28 @@ function onEvent(e) {
       // stream_event.parent_tool_use_id is always null — deltas are main-thread.
       const th = mainThread();
       if (!th.stream) {
-        const body = claudeBody(th);
-        const wrap = el('div', { class: 'prose' });
-        body.append(wrap);
-        th.stream = { wrap, text: '', caret: el('span', { class: 'caret' }), timer: 0, lastRender: 0 };
+        if (th.settledStream) {
+          // BUG-170 (Case A): th.settledStream is set ONLY by finishStream, and
+          // every real block boundary (this block's own 'text', a tool-call,
+          // question, plan, turn-end, a gap-fetch) CLEARS it. So if it is still
+          // live when a fresh text-delta arrives, finishStream fired MID-block (a
+          // background lane's agent-completed between two of this block's deltas)
+          // and this delta CONTINUES that same block. Resume it in place — reuse
+          // the settled node as the new stream wrap and seed the buffer with the
+          // already-settled text — instead of starting a fresh block, which
+          // orphaned the partial node (a stray raw-JSON <pre>) beside the final
+          // rail. Resuming preserves the streamed text: nothing is discarded.
+          const wrap = el('div', { class: 'prose' });
+          th.settledStream.node.replaceWith(wrap);
+          th.stream = { wrap, text: th.settledStream.text, caret: el('span', { class: 'caret' }), timer: 0, lastRender: 0 };
+          th.settledStream = null;
+        } else {
+          // A NEW live stream starts a new block.
+          const body = claudeBody(th);
+          const wrap = el('div', { class: 'prose' });
+          body.append(wrap);
+          th.stream = { wrap, text: '', caret: el('span', { class: 'caret' }), timer: 0, lastRender: 0 };
+        }
       }
       th.stream.text += e.text;
       // Leading-edge throttle: render the first token immediately (caret shows
@@ -8528,9 +8839,32 @@ function onEvent(e) {
         // becomes the structured list (and the raw JSON is hidden).
         th.stream.wrap.replaceWith(assistantProse(e.text || th.stream.text));
         th.stream = null;
+      } else if (th.settledStream
+          && (e.text || '').replace(/\r\n?/g, '\n').startsWith(th.settledStream.text.replace(/\r\n?/g, '\n'))) {
+        // BUG-169: finishStream already settled THIS block (a mid-stream
+        // agent-completed / tool-call / turn-end fired before this trailing 'text'
+        // arrived). Re-render that same node digest-aware in place — do NOT append,
+        // which is what painted the fence a second time. The startsWith guard makes
+        // sure this is a continuation of the settled buffer, not a later unrelated
+        // block (e.g. a post-tool paragraph or a gap-fetch rewrite).
+        //
+        // BUG-169 round 2: compare in the renderer's NORMALISED line-ending space
+        // (the same `\r\n?`->`\n` boundary renderAssistantText applies). The
+        // settled buffer is the raw concatenation of `text-delta` frames; the
+        // trailing `text` carries the CLI's canonical `block.text`. When those two
+        // disagree on line endings only (LF deltas, CRLF block text is a real
+        // divergence), the byte-exact startsWith MISSED, took the else branch, and
+        // APPENDED a second, digest-aware render — leaving the mid-stream settle
+        // (a RAW-JSON <pre> of the still-unclosed digest fence) orphaned above the
+        // rail. That is the reported "raw JSON at top, correct rail below"
+        // duplicate. Normalising both sides makes the continuation-of-same-block
+        // test robust to line-ending skew without weakening it for a genuinely
+        // different later block (which the boundary handlers null settledStream for).
+        th.settledStream.node.replaceWith(assistantProse(e.text));
       } else {
         claudeBody(th).append(assistantProse(e.text));
       }
+      th.settledStream = null;
       if (state.viewing === 'main') scrollDown();
       return;
     }
@@ -8544,6 +8878,7 @@ function onEvent(e) {
       const th = threadFor(e.agentId);
       if (e.agentId && e.agentType && !th.agentType) { th.agentType = e.agentType; refreshLede(th); }
       finishStream(th);
+      th.settledStream = null; // a tool call / decision is a hard block boundary (BUG-169)
       // A question or a plan is a decision, not a tool call. Rendering it as a
       // chip is the bug: it looks like something that already happened.
       if (renderDecisionCall(th, e)) return;
@@ -8578,6 +8913,7 @@ function onEvent(e) {
     case 'ask-user-question': {
       const th = threadFor(e.agentId);
       finishStream(th);
+      th.settledStream = null; // a question is a hard block boundary (BUG-169)
       renderQuestion(th, {
         toolUseId: e.toolUseId ?? null,
         requestId: e.requestId ?? null,
@@ -8589,6 +8925,7 @@ function onEvent(e) {
     case 'exit-plan-mode': {
       const th = threadFor(e.agentId);
       finishStream(th);
+      th.settledStream = null; // a plan is a hard block boundary (BUG-169)
       renderPlan(th, {
         toolUseId: e.toolUseId ?? null,
         requestId: e.requestId ?? null,
@@ -8617,7 +8954,12 @@ function onEvent(e) {
     case 'agent-started': {
       state.agents.set(e.agent.agentId, { agent: e.agent, t0: Date.now() - (e.agent.elapsedMs || 0), settled: false, seenAt: Date.now() });
       // Give it a thread immediately so the row is clickable the moment it appears.
-      const th = state.threads.get(e.agent.agentId) ?? newThread(e.agent.agentId, {});
+      const th = state.threads.get(e.agent.agentId) ?? newThread(e.agent.agentId, { kind: agentKind(e.agent) });
+      // BUG-171: stamp the server's DECLARED kind (via agentKind, the one reader)
+      // onto the thread so a tool lane is not rendered as an agent. Covers a
+      // thread that pre-existed as the default 'agent' (e.g. a stream frame that
+      // raced ahead of this start).
+      th.kind = agentKind(e.agent);
       th.agentType = e.agent.agentType;
       th.description = e.agent.description;
       th.status = 'running';
@@ -8631,7 +8973,7 @@ function onEvent(e) {
       if (cur) { cur.agent = e.agent; cur.t0 = Date.now() - (e.agent.elapsedMs || 0); cur.seenAt = Date.now(); }
       else state.agents.set(e.agent.agentId, { agent: e.agent, t0: Date.now() - (e.agent.elapsedMs || 0), settled: false, seenAt: Date.now() });
       const t = state.threads.get(e.agent.agentId);
-      if (t) { t.agentType = e.agent.agentType; t.description = e.agent.description; t.status = e.agent.status; refreshLede(t); }
+      if (t) { t.kind = agentKind(e.agent); t.agentType = e.agent.agentType; t.description = e.agent.description; t.status = e.agent.status; refreshLede(t); }
       renderStrip();
       return;
     }
@@ -8825,7 +9167,7 @@ function onEvent(e) {
        * Nothing is settled here.
        */
       nominateCutAgents();
-      finishStream(mainThread());
+      { const mt = mainThread(); finishStream(mt); mt.settledStream = null; } // turn is over; settled node is final (BUG-169)
       setBusy(false);
       state.turnStartedAt = 0;
       // The turn that just ended is exactly the one submit() painted the
@@ -9702,8 +10044,9 @@ async function submit() {
   // reject.
   if (state.budgetLocked) return say(state.budgetLockReason || 'this session hit its budget limit and will not send further turns', true);
   const th = viewedThread();
-  if (th.kind === 'agent') {
+  if (th.kind !== 'main') {
     // Structurally impossible — see paintComposerFor. Never even attempt it.
+    // BUG-171: a tool lane is read-only too, so anything but main is blocked.
     return say('a subagent takes no messages — return to main to steer the run', true);
   }
 
@@ -10826,7 +11169,10 @@ node.pop.addEventListener('click', async (e) => {
 // FEAT-054: the isolation popover's settings footer names isolation — land there.
 $('#popSettings').addEventListener('click', () => { closePops(); void drawer.open('settings', { focus: 'iso' }); });
 node.insBtn.addEventListener('click', () => void drawer.open('instructions', 'settings'));
-$('#libBtn').addEventListener('click', () => void drawer.open('library', 'instructions'));
+// FEAT-139 — the sidebar-foot Settings door opens the one panel at Machine scope
+// ("global settings"): Appearance, Templates and the machine-wide project
+// defaults all live there. The navbar cog opens the same panel at project scope.
+$('#settingsFootBtn').addEventListener('click', () => void drawer.open('settings', { scope: 'machine' }));
 
 /* ------------------------------------------------------------ add project */
 
@@ -13623,8 +13969,7 @@ async function boot() {
     return say(err.message, true);
   }
   renderRail(); // paint the quiet empty rail immediately; refreshRail fills it per project
-  await drawer.ensureTemplates();
-  node.libCount.textContent = String(drawer.templates().length);
+  await drawer.ensureTemplates(); // FEAT-139: prewarm the template list (its count now shows inside Settings → Machine, not the removed sidebar door)
   loadExpanded(); // the user's working set of open projects survives reloads
   loadSeen();
   loadMarks(); // FEAT-118 — read-marks and bookmarks survive a reload
@@ -13715,6 +14060,10 @@ async function boot() {
     // verify script can render a fixture transcript and assert on which entries
     // become user bubbles vs collapsed system notices.
     renderMessages, mainThread, harnessNotice, stampTime,
+    // BUG-168: the briefing-prefix peel — the terminator literal + the legacy
+    // heuristic split, exposed so a verify script can assert the new/legacy/
+    // board-snapshot/empty-body splits directly and the mid-prose "[station]" case.
+    BRIEFING_TERMINATOR, legacyBriefingSplit,
     // FEAT-083: the structured response-digest renderer + its enable check, so a
     // verify script can render the four fixtures (well-formed / none / malformed
     // / disabled) through the real render path and assert on the resulting DOM.

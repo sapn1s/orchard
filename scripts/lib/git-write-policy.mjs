@@ -68,6 +68,19 @@ export const GIT_READONLY = new Set([
   'check-ref-format', 'verify-commit', 'verify-tag', 'verify-pack',
   'get-tar-commit-id', 'annotate', 'range-diff', 'show-branch', 'show-index',
   'patch-id', 'interpret-trailers', 'stripspace', 'url-parse', 'fmt-merge-msg',
+  // `git archive` reads a tree and emits a tarball; it mutates no ref, object,
+  // index, working tree, config or history in ANY form. It is a pure read and
+  // was missing here (BUG-165), which deny-by-default then mis-classified as a
+  // write — silently disabling the entire clean-room export
+  // (scripts/independent-verify.mjs pipes `git archive <rev> | tar -x`), so no
+  // dispatch could verify itself (WA §I). ALL forms are allowed deliberately,
+  // including `git archive --output=<path>`: `--output` writes a tarball to a
+  // FILESYSTEM path, which is an ordinary file write the agent already has via
+  // every other channel — it is not a repo mutation and cannot carry anything
+  // into git history, which is the only leak vector this backstop guards. A
+  // stdout-only predicate would add a special-case dual-read for zero safety
+  // gain, so `archive` is an unconditional read.
+  'archive',
 ]);
 
 /* ── Dual-mode subcommands: read in some forms, write in others ───────────────
@@ -156,8 +169,13 @@ function gitSubcommand(tokens) {
   return null;
 }
 
-/** Decide one already-isolated `git …` token array. Returns an offender or null. */
-function offenderForGit(tokens) {
+/**
+ * Decide one already-isolated `git …` token array. Returns an offender or null.
+ * Exported (FEAT-135) so the invocation-layer git shim reuses this EXACT read /
+ * write classification — one definition of "what is a git write" (ARCH-008),
+ * shared by the command-string hook and the PATH shim.
+ */
+export function offenderForGit(tokens) {
   const parsed = gitSubcommand(tokens);
   if (!parsed) return null; // bare git / --version / --help
   const { sub, args } = parsed;

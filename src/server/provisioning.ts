@@ -147,6 +147,24 @@ export function hostPlaywrightBin(): string {
   return hostBinFor('playwright');
 }
 
+/**
+ * FEAT-133 — the single owner of the fact "is the host Playwright MCP binary
+ * actually present?" (ARCH-010). Read by two callers that must not re-derive it:
+ * the creation-time tool preflight (registry.ts `resolveNewProjectToolSettings`,
+ * which will not default Playwright ON when it would launch a dead server) and
+ * the attach gate (tools.ts `playwrightUnavailableReason`, which keeps a session
+ * whose binary is missing from being handed a Playwright server that cannot
+ * start). Host-only: a `container` session runs the baked image binary, which
+ * this host cannot stat, so callers treat the container case separately.
+ */
+export function hostPlaywrightBinExists(): boolean {
+  try {
+    return fs.existsSync(hostPlaywrightBin());
+  } catch {
+    return false;
+  }
+}
+
 function installedRecordFile(): string {
   return path.join(hostProvisionDir(), 'installed.json');
 }

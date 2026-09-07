@@ -14,6 +14,7 @@ import * as hist from '../lib/session-history.ts';
 import { loadProvenanceMap, resolveStartedBy } from '../lib/session-provenance.mjs';
 import * as reg from './registry.ts';
 import * as tpl from './templates.ts';
+import { readSessionConfig } from './session-config.ts';
 import { wiringStatus, coherentWaStack, hasEnabledWaRef } from './wiring.ts';
 import * as cm from './container-manager.ts';
 import * as svc from './service-manager.ts';
@@ -202,6 +203,27 @@ function serveStatic(res: http.ServerResponse, urlPath: string): boolean {
     return false;
   }
   if (!st.isFile()) return false;
+  // FEAT-139 — inject the persisted machine theme onto <html> for index.html, so
+  // the FIRST paint matches the server (the source of truth for appearance) even
+  // when the client's localStorage cache is cold or was just cleared: no flash of
+  // the wrong theme. 'system' injects nothing (the CSS default), matching the
+  // client's applyTheme. The client still reads/writes localStorage as a fast
+  // cache and reconciles against GET /api/settings.
+  if (rel === 'index.html') {
+    let html = fs.readFileSync(file, 'utf8');
+    const theme = readGlobalDefaults().theme;
+    if (theme === 'light' || theme === 'dark') {
+      html = html.replace(/<html((?:\s[^>]*)?)>/i, (_m, attrs) => `<html${attrs} data-theme="${theme}">`);
+    }
+    const buf = Buffer.from(html, 'utf8');
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': buf.length,
+      'cache-control': 'no-store',
+    });
+    res.end(buf);
+    return true;
+  }
   res.writeHead(200, {
     'content-type': MIME[path.extname(file)] ?? 'application/octet-stream',
     'content-length': st.size,
@@ -1712,6 +1734,25 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   /* transcripts */
+  /*
+   * FEAT-132 — GET /api/session-config/<sessionId>
+   *
+   * The session-configuration record persisted at launch (session-config.ts):
+   * which docs were injected, which were TRUNCATED (BUG-146) or missing, the
+   * composition mode, model, tools and MCP set. Keyed by the engine's session id
+   * (the same id the transcript route uses), so the transcript view reads it for
+   * ANY session — live or long finished — not just one this server still holds
+   * in memory (the live effective-config route below is memory-only). A 404 is a
+   * KNOWN state: the session predates this feature, and the UI shows a
+   * clearly-labelled partial card rather than one implying full knowledge.
+   */
+  if (rest[0] === 'session-config' && rest.length === 2 && m === 'GET') {
+    const rec = readSessionConfig(rest[1]!);
+    if (!rec) return notFound(res, `no configuration record for session ${JSON.stringify(rest[1])}`);
+    sendJson(res, 200, rec);
+    return true;
+  }
+
   if (rest[0] === 'transcript' && rest.length === 3 && m === 'GET') {
     const [, encodedDir, sessionId] = rest as [string, string, string];
     try {

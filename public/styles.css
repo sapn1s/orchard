@@ -557,6 +557,65 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* FEAT-132 — the "Session configuration" card, pinned above the first turn.
+   Shares the transcript's quiet greyscale idiom: a rail-toned panel, mono
+   metadata, chips built on the existing .pill language. Truncated/missing
+   sources borrow the board's status tints (--st-needs amber, --st-high brick)
+   so the one thing that must not stay silent reads at a glance. */
+.sesscfg {
+  margin: 2px 0 24px; padding: 8px 12px;
+  border: 1px solid var(--hair-2); border-radius: 8px;
+  background: var(--rail);
+}
+.sc-head {
+  width: 100%; background: none; border: 0; cursor: pointer;
+  display: flex; align-items: baseline; gap: 9px; padding: 2px 0;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); text-align: left;
+}
+.sc-head .tw { font-size: 7px; color: var(--ink-4); flex: none; }
+.sc-title { font-weight: 500; color: var(--ink); }
+.sc-sub { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sc-warn { margin-left: auto; flex: none; color: var(--st-needs); font-size: 11px; }
+/* Missing outranks truncated: brick tint (the board's --st-high) when any source
+   is wholly absent, so it doesn't read like a merely-truncated one at a glance. */
+.sc-warn[data-sev="missing"] { color: var(--st-high); }
+.sc-head:hover .sc-title { color: var(--ink); }
+.sc-head:focus-visible { outline: 2px solid var(--accent, var(--ink-4)); outline-offset: 2px; border-radius: 4px; }
+.sc-body { margin-top: 10px; }
+.sc-meta {
+  font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+  margin-bottom: 10px; overflow-wrap: anywhere;
+}
+.sc-note { font-size: 12px; line-height: 1.55; color: var(--ink-2); margin: 2px 0; }
+.sc-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.sc-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--ink-2);
+  border: 1px solid var(--hair); border-radius: 6px;
+  padding: 3px 8px; background: var(--window); cursor: pointer;
+  transition: border-color .12s, color .12s, background .12s;
+}
+.sc-chip:hover { border-color: var(--ink-4); color: var(--ink); }
+.sc-chip[aria-expanded="true"] { border-color: var(--ink-3); color: var(--ink); background: var(--sunken); }
+.sc-chip .sc-bad {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .02em;
+  padding: 1px 5px; border-radius: 999px;
+  background: var(--sunken); color: var(--ink-4);
+}
+.sc-chip[data-status="truncated"] { border-color: color-mix(in srgb, var(--st-needs) 45%, var(--hair)); }
+.sc-chip[data-status="truncated"] .sc-bad { color: var(--st-needs); background: color-mix(in srgb, var(--st-needs) 14%, transparent); }
+.sc-chip[data-status="missing"] { border-color: color-mix(in srgb, var(--st-high) 45%, var(--hair)); }
+.sc-chip[data-status="missing"] .sc-bad,
+.sc-chip[data-status="missing"] .sc-lbl { color: var(--st-high); }
+.sc-chip[data-status="superseded"] .sc-lbl { color: var(--ink-4); text-decoration: line-through; }
+.sc-chip[data-status="best-effort"] { border-style: dashed; }
+.sc-src {
+  margin: 10px 0 2px; padding: 9px 11px; max-height: 320px; overflow: auto;
+  font-family: var(--mono); font-size: 11px; line-height: 1.55; color: var(--ink-3);
+  background: var(--sunken); border-radius: 6px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
 /* FEAT-072 — queued-message metadata caption. A queued/batch-delivered user
    message carries a fixed bracketed metadata prefix ("[msg N/M · queued …]");
    we lift it out of the bubble into this quiet line so the eye skips it and
@@ -1347,20 +1406,37 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 }
 .d-head .ic { margin-left: auto; }
 
-.d-scope { display: flex; gap: 2px; margin-top: 11px; }
+/* FEAT-139 — the scope spine: Machine · This project · This session. A
+   segmented control that is the panel's primary navigation, so it reads as one
+   unit (shared track) rather than three loose buttons. Wraps the hint to its
+   own line when the three tabs fill the width. */
+.d-scope {
+  display: flex; flex-wrap: wrap; gap: 2px; margin-top: 11px;
+  background: var(--sunken); border: 1px solid var(--hair-2);
+  border-radius: 8px; padding: 2px;
+}
 .d-scope button {
-  font-size: 11.5px; color: var(--ink-3);
-  padding: 3px 9px; border-radius: 6px;
-  border: 1px solid transparent;
+  font-size: 11.5px; color: var(--ink-3); flex: 1 1 auto;
+  padding: 4px 9px; border-radius: 6px;
+  border: 1px solid transparent; white-space: nowrap;
+  transition: color .12s ease, background .12s ease;
 }
 .d-scope button:hover { color: var(--ink-2); }
 .d-scope button[aria-pressed="true"] {
-  border-color: var(--hair); background: var(--sunken); color: var(--ink);
+  border-color: var(--hair); background: var(--window); color: var(--ink);
+  box-shadow: 0 1px 2px rgba(0,0,0,.06);
 }
 .d-scope .hint {
-  margin-left: auto; align-self: center;
+  flex-basis: 100%; margin: 2px 2px 1px; align-self: center;
   font-size: 10.5px; color: var(--ink-4);
 }
+
+/* FEAT-139 — Machine-scope segmented rows (appearance, new-project defaults).
+   Reuse the .seg idiom; a label above, the seg below. */
+.gseg { flex-wrap: wrap; }
+.gseg button { flex: 1 1 auto; }
+.set.gset { align-items: baseline; margin-top: 10px; }
+.set.gset + .seg { margin-top: 4px; }
 
 .d-body { flex: 1; overflow-y: auto; scrollbar-width: thin; padding: 0 0 22px; }
 .d-body::-webkit-scrollbar { width: 9px; }
@@ -1528,7 +1604,18 @@ button.set:hover { background: var(--window); }
 }
 .seg button .g { font-size: 11px; }
 .seg button:hover { color: var(--ink-2); border-color: var(--ink-4); }
-.seg button[aria-pressed="true"] { background: var(--sunken); border-color: var(--ink-4); color: var(--ink); }
+/* FEAT-139 — the selected option must be UNMISTAKABLE. The old treatment filled
+   the pressed button with --sunken, which is EXACTLY the card background these
+   segs sit on, so "selected" carried no fill at all — only a faint border/text
+   shade shift the user could not see (serena on vs off looked identical). Adopt
+   the panel's own on/off idiom instead: the solid fill already used by .sw and
+   .cb in this same drawer. --solid inverts per theme (dark chip on light, light
+   chip on dark) so selection reads at a glance in BOTH themes, and it is a
+   luminance inversion (not a hue), so the state is not carried by colour alone —
+   backed by the aria-pressed the buttons already set. */
+.seg button[aria-pressed="true"] { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
+.seg button[aria-pressed="true"] .g { color: var(--on-solid); }
+.seg button[aria-pressed="true"]:hover { color: var(--on-solid); border-color: var(--solid); opacity: .9; }
 
 .state-row {
   display: flex; align-items: center; gap: 8px;

@@ -169,7 +169,7 @@ async function main() {
   const flag = path.join(WORK, 'terminal.flag');
   const srvBg = spawnServer(portBg, { SCENARIO: 'bg', LEVEL_DELAY_MS: '4000', TERMINAL_FLAG: flag });
   if (!(await waitHealth(portBg))) throw new Error('bg server never healthy');
-  const regBg = await (await fetch(`http://127.0.0.1:${portBg}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: WORK, name: 'bg068-bg' }) })).json();
+  const regBg = await (await fetch(`http://127.0.0.1:${portBg}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: WORK, name: 'bg068-bg', isolation: 'direct' }) })).json(); // FEAT-131: pin direct (container-default off)
   const pidBg = regBg.project?.id; if (!pidBg) throw new Error('register(bg) failed ' + JSON.stringify(regBg));
 
   const { c, stationId } = await startSession(portBg, 'background', { projectId: pidBg });
@@ -210,7 +210,7 @@ async function main() {
   const portFg = await freePort();
   const srvFg = spawnServer(portFg, { SCENARIO: 'fg' });
   if (!(await waitHealth(portFg))) throw new Error('fg server never healthy');
-  const regFg = await (await fetch(`http://127.0.0.1:${portFg}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: WORK_FG, name: 'bg068-fg' }) })).json();
+  const regFg = await (await fetch(`http://127.0.0.1:${portFg}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: WORK_FG, name: 'bg068-fg', isolation: 'direct' }) })).json(); // FEAT-131: pin direct (container-default off)
   const pidFg = regFg.project?.id; if (!pidFg) throw new Error('register(fg) failed ' + JSON.stringify(regFg));
 
   const fg = await startSession(portFg, 'foreground', { projectId: pidFg });

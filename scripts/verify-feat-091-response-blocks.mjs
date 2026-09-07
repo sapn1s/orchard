@@ -107,21 +107,24 @@ async function main() {
   // THE HIDING SURFACE IS BOUNDED BY A PROPERTY, NOT BY A LIST. This used to pin
   // the literal set, and round 13 (FEAT-093) added `finding` to it at the user's
   // request — at which point a literal pin only records that a change happened.
-  // What must stay true is the DIRECTION: a category ADDRESSED TO THE READER can
-  // never be made invisible. The ask, the outcome, the status, the call I made,
-  // the declared fallback and the legacy visible name are all addressed; only the
-  // supporting record (what is true, and the play-by-play of establishing it) may
-  // fold. This check fails LOUDLY if a future round folds one of them.
+  // What must stay true is the DIRECTION: a category the reader MUST SEE to know
+  // where they stand can never be made invisible. Round 14 (this ticket) narrowed
+  // that non-negotiable set to the digest, the ask and the status — the headline,
+  // what needs you, where it stands. The supporting record — what is true, the
+  // full retrospective of what I changed, the reasoning behind a call I made, and
+  // the play-by-play of establishing it — may fold. The declared fallback and the
+  // legacy visible name also stay expanded. This check fails LOUDLY if a future
+  // round folds one of the must-see names.
   const ADDRESSED_TO_READER = [
-    'orchard-ask', 'orchard-outcome', 'orchard-status', 'orchard-judgment',
-    'orchard-uncategorized', 'orchard-answer', 'orchard-digest',
+    'orchard-ask', 'orchard-status', 'orchard-digest',
+    'orchard-uncategorized', 'orchard-answer',
   ];
-  check('nothing addressed to the reader can ever be folded',
+  check('nothing the reader must see can ever be folded',
     ADDRESSED_TO_READER.every((n) => !COLLAPSED_BLOCKS.includes(n)),
     { collapsed: COLLAPSED_BLOCKS, addressed: ADDRESSED_TO_READER });
-  check('the fold holds the supporting record only: finding + narration (+ legacy alias)',
+  check('the fold holds the supporting record only: finding + outcome + judgment + narration (+ legacy alias)',
     JSON.stringify([...COLLAPSED_BLOCKS].sort())
-      === JSON.stringify(['orchard-finding', 'orchard-narration', 'orchard-notes']),
+      === JSON.stringify(['orchard-finding', 'orchard-judgment', 'orchard-narration', 'orchard-notes', 'orchard-outcome'].sort()),
     COLLAPSED_BLOCKS);
   check('every other known name is expanded, derived not listed',
     EXPANDED_BLOCKS.length === KNOWN_BLOCKS.length - COLLAPSED_BLOCKS.length

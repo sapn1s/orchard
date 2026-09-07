@@ -226,7 +226,11 @@ const waitEv = async (events, pred, ms = 60_000) => { const t0 = Date.now(); whi
 const waitCount = async (events, pred, n, ms = 60_000) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (events.filter(pred).length >= n) return true; await sleep(120); } return false; };
 
 async function register(port, cwd, name) {
-  const r = await (await fetch(`http://127.0.0.1:${port}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: cwd, name }) })).json();
+  // FEAT-131: this suite proves the DIRECT survival broker + scripted fake
+  // `claude` (CLAUDE_STATION_CLAUDE_BIN) path; a container session ignores the
+  // fake bin and has no broker pid, so pin isolation explicitly (honoured
+  // as-is, no preflight) against the container-default for new projects.
+  const r = await (await fetch(`http://127.0.0.1:${port}/api/projects`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hostPath: cwd, name, isolation: 'direct' }) })).json();
   if (!r.project?.id) throw new Error(`register(${name}) failed ` + JSON.stringify(r));
   return r.project.id;
 }

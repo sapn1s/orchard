@@ -187,7 +187,9 @@ async function healthGone(port, ms = 15000) {
 async function registerProject(port) {
   const reg = await (await fetch(`http://127.0.0.1:${port}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: WORK, name: 'survive-fixture' }),
+    // FEAT-131: direct-isolation survival suite — pin isolation so the
+    // container-default for new projects cannot move the session off-host.
+    body: JSON.stringify({ hostPath: WORK, name: 'survive-fixture', isolation: 'direct' }),
   })).json();
   if (reg.project?.id) return reg.project.id;
   // Shared DATA across phases: the project may already exist — reuse it.

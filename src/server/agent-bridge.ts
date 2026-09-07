@@ -34,6 +34,7 @@ import type {
 } from './events.ts';
 import type { Project } from './registry.ts';
 import { composeInstructions, appendToSystemPrompt, type ComposedPrompt } from './templates.ts';
+import { recordSessionConfig, type SessionConfigSource } from './session-config.ts';
 import { boardStateSection, boardAnswerBriefing, answeredAwaitingKeys } from './board.ts';
 import { OpenToolCalls } from './open-tool-calls.ts';
 import type { InstructionRef, ProjectSettings } from './registry.ts';
@@ -41,7 +42,7 @@ import { browserSettingsOf, orchestratorProfileOf, responseDigestOf, toolSetting
 import * as browser from './browser.ts';
 import { MCP_SERVER_NAME } from './browser.ts';
 import * as dispatchBroker from './dispatch-broker.ts';
-import { plannedMcpServers } from './tools.ts';
+import { plannedMcpServers, playwrightUnavailableReason } from './tools.ts';
 import { SESSION_OVERRIDE_FIELDS, type SessionOverrides } from './validate.ts';
 import { discardStaged, explainUnresumable, planFork, type ForkPlan } from './fork.ts';
 import * as snapshots from './snapshots.ts';
@@ -435,6 +436,27 @@ export type AutonomousStopReason =
 const AUTONOMOUS_MAX_TURNS_CEILING = 50;
 
 /*
+ * BUG-168 — the self-delimiting terminator that closes an injected "[station]"
+ * briefing prefix, so a re-read of the transcript can PEEL the prefix off and
+ * still show the user's own words. `#withBriefing` PREPENDS the briefing (and, on
+ * the first turn, the board snapshot) to the user's typed prompt and the CLI
+ * writes ONE role:user JSONL entry: injected text first, human's words last. With
+ * no boundary marker the client swallowed the WHOLE entry into a collapsed notice
+ * chip (it matched the '[station]' sentinel at position 0), so the human's own
+ * sentence vanished on any re-read (BUG-168). This token marks exactly where the
+ * injected prefix ends and the user's message begins.
+ *
+ * Chosen to be impossible in ordinary prose — the mathematical white square
+ * brackets U+27E6/U+27E7 are not on any keyboard and appear in no natural text —
+ * and to survive JSONL round-tripping (plain BMP text, no JSON-escaping surprises,
+ * no regex-metacharacter hazards on a literal indexOf). The SAME literal is
+ * duplicated in public/app.js as BRIEFING_TERMINATOR (the client cannot import a
+ * server module — the existing '[station]'/'<system-reminder>' sentinels are
+ * duplicated the same way); keep the two byte-identical.
+ */
+export const BRIEFING_TERMINATOR = '⟦STATION-BRIEFING-END⟧';
+
+/*
  * BUG-157 — a container close requires a POSITIVE quiet signal: NO frame for at
  * least this long. It complements (does NOT replace) the container process probe
  * (`#probeContainerLiveness`) — a session actively STREAMING frames (a woken
@@ -482,6 +504,15 @@ export class AgentSession {
   readonly id: string;
   readonly project: Project;
   readonly composed: ComposedPrompt;
+  /**
+   * FEAT-132 — the two launch-time facts a session-configuration record needs
+   * that live OUTSIDE `composed`: the live board snapshot (injected into the
+   * first user turn, not the system prompt) and the MCP server names Orchard
+   * attached. Captured in start() where they are computed, read at system:init
+   * where the engine's session id finally exists to key the record by.
+   */
+  #configBoardSnapshot: string | null = null;
+  #configMcpServers: string[] = [];
   /** Resolved settings this session actually runs with (project ∘ overrides). */
   /**
    * NOT readonly for `permissionMode`: `setPermissionMode()` changes it on a
@@ -997,6 +1028,11 @@ export class AgentSession {
      * together are what tell a session WHICH browser to use, and that choice was
      * the whole defect.
      */
+    // FEAT-133 — the SAME fact plannedMcpServers() gates the Playwright attach on
+    // (a missing host binary), read from the one helper so the note and the tool
+    // list can never disagree: a session told "enabled but UNAVAILABLE" has no
+    // `mcp__playwright__*` in its tool list either.
+    const pwUnavailable = playwrightUnavailableReason(opts.project) ?? undefined;
     const pwNote = playwrightAvailabilityNote(toolSettingsOf(opts.project).playwright, {
       // Enabled-but-unavailable is NOT an alternative to offer. Telling a session
       // "use the stealth browser instead" when its tools were not attached sends
@@ -1004,6 +1040,7 @@ export class AgentSession {
       // the availability notes exist to prevent.
       stealthEnabled: stealthOn && !opts.browserUnavailableReason,
       inContainer: opts.project.isolation === 'container',
+      unavailableReason: pwUnavailable,
     });
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, pwNote) };
     for (const missing of this.composed.missingIds) {
@@ -1321,6 +1358,9 @@ export class AgentSession {
       strictMcpConfig = false;
     }
     if (mcpServers && plan.servers[MCP_SERVER_NAME]) this.browserAttached = true;
+    // FEAT-132 — the MCP set this session was actually handed (after the
+    // capabilities gate above may have dropped it), for the config record.
+    this.#configMcpServers = mcpServers ? Object.keys(mcpServers) : [];
 
     /*
      * BOOT AWARE (FEAT-021). For a board-having project, a compact, capped live
@@ -1349,6 +1389,7 @@ export class AgentSession {
     let sp = this.composed.systemPrompt;
     sp = appendToSystemPrompt(sp, opts.extraAppend);
     const boardSnapshot = boardStateSection(opts.project.hostPath);
+    this.#configBoardSnapshot = boardSnapshot; // FEAT-132 — for the config record
 
     // FEAT-090: the snapshot above ALREADY carries the answered-awaiting lane, so
     // seed the seen-set with what it just stated — the open-session briefing
@@ -1370,10 +1411,11 @@ export class AgentSession {
     // user's prompt and any "while you were away" briefing. Injected once per
     // launch/resume, exactly as before — only its LOCATION moved (system → first
     // user turn), so the cached system prefix stays byte-stable across resumes.
-    const orientedFirst = [boardSnapshot, opts.firstPrompt]
-      .filter((s): s is string => !!s && !!s.trim())
-      .join('\n\n---\n\n');
-    const firstPrompt = this.#withBriefing(orientedFirst, opts.resumeSessionId ?? null);
+    // BUG-168 — the board snapshot is injected context, so it is passed as
+    // `extraPrefix` (part of the peelable prefix) and the user's own words stay
+    // as the terminated remainder, rather than pre-merging the two into one blob
+    // that a transcript re-read could not tell apart.
+    const firstPrompt = this.#withBriefing(opts.firstPrompt ?? '', opts.resumeSessionId ?? null, boardSnapshot);
 
     /*
      * FEAT-037 P2b — arm Orchard-owned transcript capture for engines with no
@@ -1448,6 +1490,12 @@ export class AgentSession {
         gitGrantKey: opts.project.id,
         gitRepoPath: opts.project.hostPath,
         sessionLabel: this.id,
+        // FEAT-129 — the file-lock heartbeat's liveness ground truth: the agent_ids
+        // of the lanes this session has running RIGHT NOW (the same running-set
+        // authority running-set.ts reads). A lane in a long tool call stays in this
+        // set, so its held locks are kept fresh and never falsely reclaimed; a
+        // finished lane drops out, so its lock is released, not wedged.
+        liveLaneIds: () => this.liveAgents().filter((a) => a.status === 'running').map((a) => a.agentId),
         resume: opts.resumeSessionId ? (this.#forkPlan?.resumeSessionId ?? opts.resumeSessionId) : undefined,
         forkSession: opts.resumeSessionId && opts.fork ? true : undefined,
         mcpServers,
@@ -1481,7 +1529,7 @@ export class AgentSession {
    * resumed match records written under its SDK id before this bridge existed
    * (the exact case where the orchestrator was not awake to see the death).
    */
-  #withBriefing(prompt: string, extraId: string | null = null): string {
+  #withBriefing(prompt: string, extraId: string | null = null, extraPrefix: string | null = null): string {
     let brief: string | null = null;
     try { brief = outcomes.takeBriefing([this.id, this.sdkSessionId, extraId]); } catch { brief = null; }
     // FEAT-090 — a SIBLING briefing: board tickets answered while this session was
@@ -1489,7 +1537,27 @@ export class AgentSession {
     // starts one — send() is what invokes it, and only when the user is sending).
     let answer: string | null = null;
     try { answer = boardAnswerBriefing(this.project.hostPath, this.#answerBriefSeen); } catch { answer = null; }
-    return [answer, brief, prompt].filter((s): s is string => !!s).join('\n\n');
+    // The `[station]` briefings (both start with that sentinel — the ONLY prefix
+    // the client's harnessNotice recognises). `extraPrefix` is the first-turn board
+    // snapshot (FEAT-113) — injected context, but it leads with `# Project state`,
+    // not a sentinel.
+    const briefings = [answer, brief].filter((s): s is string => !!s && !!s.trim());
+    const prefixParts = [...briefings, extraPrefix].filter((s): s is string => !!s && !!s.trim());
+    if (!prefixParts.length) return prompt;
+    // BUG-168 — when a `[station]` briefing leads the prefix, terminate the whole
+    // injected prefix (briefing + any board snapshot) with a self-delimiting
+    // sentinel so a transcript re-read peels the prefix into the notice chip and
+    // still renders the user's own words as their bubble. A pure-briefing turn
+    // (empty prompt) still emits the terminator; the client renders the empty
+    // remainder as no bubble (just the chip).
+    if (briefings.length) {
+      return `${prefixParts.join('\n\n')}\n\n${BRIEFING_TERMINATOR}\n\n${prompt}`;
+    }
+    // Board-snapshot-only first turn (no briefing) — unchanged from FEAT-113: the
+    // snapshot leads the user's prompt joined by a `---` rule. This path is NOT the
+    // BUG-168 symptom (it carries no `[station]` sentinel the client collapses), so
+    // its rendering is left exactly as it was rather than widened here.
+    return [extraPrefix, prompt].filter((s): s is string => !!s && !!s.trim()).join('\n\n---\n\n');
   }
 
   /**
@@ -3156,6 +3224,72 @@ export class AgentSession {
   }
 
   /**
+   * FEAT-132 — assemble and persist the session-configuration record at
+   * system:init. Everything here is a fact its owner already computed at launch:
+   * `this.composed.sources` (the injected docs + truncation flags), the captured
+   * board snapshot and MCP set, and the CLI's own init frame (`m.model`,
+   * `m.tools`). Nothing is re-derived. Best-effort — recordSessionConfig swallows
+   * every error, so a config-record failure can never break a session start.
+   */
+  #recordConfig(init: Record<string, unknown>): void {
+    if (!this.sdkSessionId) return;
+    const sources: SessionConfigSource[] = this.composed.sources.map((s) => ({
+      id: s.id,
+      label: s.label,
+      status: s.status,
+      chars: s.chars,
+      ...(s.droppedChars != null ? { droppedChars: s.droppedChars } : {}),
+      body: s.body,
+    }));
+    // The live board snapshot rides the first user turn, not the system prompt,
+    // so it is not in `composed.sources` — add it as its own source. A board-less
+    // project injected none, so nothing is added (opt-in, no misleading chip).
+    if (this.#configBoardSnapshot && this.#configBoardSnapshot.trim()) {
+      sources.push({
+        id: 'board-snapshot',
+        label: 'Board snapshot',
+        status: 'applied',
+        chars: this.#configBoardSnapshot.length,
+        body: this.#configBoardSnapshot,
+      });
+    }
+    // MCP servers Orchard attached — chip lists the names; body is the same list
+    // (their per-server instructions are the CLI's, not Orchard's to record).
+    if (this.#configMcpServers.length) {
+      sources.push({
+        id: 'mcp-servers',
+        label: 'MCP servers',
+        status: 'applied',
+        chars: this.#configMcpServers.join(', ').length,
+        body: this.#configMcpServers.join('\n'),
+        note: `${this.#configMcpServers.length} attached`,
+      });
+    }
+    // CLAUDE.md and skills are CLI-native: injected by the harness as
+    // system-reminders in SOME sessions, and Orchard neither composes nor owns
+    // their content. Record them as best-effort so the card can say "the CLI may
+    // have injected this" without implying Orchard knows what it contained.
+    sources.push({
+      id: 'claude-md',
+      label: 'CLAUDE.md',
+      status: 'best-effort',
+      chars: 0,
+      body: '',
+      note: 'injected by the CLI (not composed by Orchard) — look for a system-reminder in the transcript',
+    });
+    recordSessionConfig(this.sdkSessionId, {
+      projectId: this.project.id,
+      mode: this.composed.mode,
+      model: typeof init.model === 'string' ? init.model : (this.effective.model || null),
+      provider: this.effective.provider ?? 'anthropic',
+      isolation: this.project.isolation,
+      sources,
+      tools: Array.isArray(init.tools) ? init.tools.map(String) : [],
+      mcpServers: [...this.#configMcpServers],
+    });
+  }
+
+  /**
    * Fork bookkeeping, for the API and the verification harness. `forked`/
    * `from` are what the UI renders as the "forked from <id>" suffix — this
    * used to return neither field, so that suffix was dead code that never
@@ -3987,6 +4121,12 @@ export class AgentSession {
         // session id exists (session-provenance.mjs). Default 'user' keeps a row
         // visible; the picker folds only rows explicitly recorded 'agent'.
         recordSessionProvenance(this.sdkSessionId, this.#startedBy, { source: 'agent-bridge' });
+        // FEAT-132 — write the SESSION CONFIGURATION record, write-once, keyed by
+        // the engine's session id (same moment provenance is declared). This is
+        // the only place the composed docs, the live board snapshot, the CLI's
+        // real tool list and the attached MCP set are all known AND the id to key
+        // them by exists. Best-effort: recordSessionConfig never throws.
+        this.#recordConfig(m);
         // FEAT-037 P2b: the engine's session/thread id names the Orchard
         // transcript file (it IS the resume handle). Buffered entries (the
         // first prompt) flush here; a resume already adopted the same id.

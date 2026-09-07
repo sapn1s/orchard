@@ -117,6 +117,74 @@ export function proseVolume(parsed) {
   return { proseWords: words, askBlocks };
 }
 
+/**
+ * Which length budget applies this turn, and whether the reply is over it
+ * (FEAT-138 — the ENFORCED form of the FEAT-125 length budget).
+ *   - default : ≤120 words of prose.
+ *   - handoff : ≤250 words when the turn carries a PENDING DECISION — i.e. an
+ *               `orchard-ask`. This is the only "handoff" the Stop hook can grade:
+ *               a lane→orchestrator handoff is a sidechain the hook never sees, so
+ *               on the main thread the ask turn IS the pending-decision turn.
+ * Pure; derived from the same parseResponseBlocks() result as proseVolume().
+ */
+export function evaluateLength(parsed) {
+  const { proseWords, askBlocks } = proseVolume(parsed);
+  const ceiling = askBlocks > 0 ? HANDOFF_WORD_CEILING : DEFAULT_WORD_CEILING;
+  return { proseWords, askBlocks, ceiling, over: proseWords > ceiling };
+}
+
+/* ── ask-ownership gate (FEAT-137) ────────────────────────────────────────────
+ * The MECHANICAL form of WA §A's ownership test. Every `orchard-ask` must declare,
+ * in its own body, a CONFIDENCE and a DECIDER — the user-held thing that makes the
+ * call theirs (taste, priority, spend, risk appetite, project direction). The
+ * defect this catches is the one the user hit verbatim ("there is a breaking bug
+ * which will corrupt data … not sure if u want to fix it tho, so i will leave it"):
+ * a HIGH-confidence ask that names no user-held decider is not the user's decision
+ * at all — it is the author's, and should have been decided, not handed over.
+ *
+ * HONEST LIMITATION, stated where the code is: this is a PRESENCE/well-formedness
+ * check, not a truth check. It verifies the ask carries a recognised `confidence:`
+ * level and a non-empty `decider:` line; it CANNOT verify the named decider is
+ * genuinely user-held (a model can type `decider: taste` over a pure sequencing
+ * choice). It catches the missing or unnameable declaration — the shape the user
+ * actually hit — and the report surfaces the rest for a human to read. */
+const CONFIDENCE_RE = /^[ \t>*+-]*confidence[ \t]*:[ \t]*(high|hi|med(?:ium)?|low|lo)\b/im;
+const DECIDER_RE = /^[ \t>*+-]*decider[ \t]*:[ \t]*(\S.*)$/im;
+
+/** Normalise a declared confidence token to high|med|low, or '' when absent. */
+function confidenceLevel(content) {
+  const m = CONFIDENCE_RE.exec(String(content ?? ''));
+  if (!m) return '';
+  const t = m[1].toLowerCase();
+  if (t === 'high' || t === 'hi') return 'high';
+  if (t === 'low' || t === 'lo') return 'low';
+  return 'med';
+}
+
+/**
+ * Ownership defects across every `orchard-ask` block in a parsed reply. Pure.
+ * One entry per offending ask: `{ confidence, hasDecider, defect }`, where defect is
+ *   'missing-confidence'          — no recognised `confidence:` line at all.
+ *   'high-confidence-no-decider'  — the CORE defect: confident AND no user-held decider.
+ *   'missing-decider'             — a `decider:` line is absent (med/low confidence).
+ * A well-formed ask (a confidence AND a decider) contributes nothing.
+ */
+export function askOwnershipDefects(parsed) {
+  const blocks = Array.isArray(parsed?.blocks) ? parsed.blocks : [];
+  const out = [];
+  for (const b of blocks) {
+    if (!b || b.name !== 'orchard-ask') continue;
+    const content = String(b.content ?? '');
+    const confidence = confidenceLevel(content);
+    const hasDecider = DECIDER_RE.test(content);
+    if (!confidence) { out.push({ confidence: '', hasDecider, defect: 'missing-confidence' }); continue; }
+    if (!hasDecider) {
+      out.push({ confidence, hasDecider, defect: confidence === 'high' ? 'high-confidence-no-decider' : 'missing-decider' });
+    }
+  }
+  return out;
+}
+
 /* ── record ─────────────────────────────────────────────────────────────────── */
 
 /**
@@ -150,11 +218,21 @@ export function buildRecord(parsed, meta = {}) {
       excerpt: d.excerpt,
     }));
   const volume = proseVolume(parsed);
+  const len = evaluateLength(parsed);
+  const ownership = askOwnershipDefects(parsed);
   return {
     v: 2,
     ts: new Date().toISOString(),
     proseWords: volume.proseWords,
     askBlocks: volume.askBlocks,
+    // FEAT-137/138 enforcement telemetry: was this turn over its length budget,
+    // and how many asks were unowned (so the report shows whether enforcement is
+    // biting and how often, not just whether the checks exist).
+    lengthCeiling: len.ceiling,
+    overLengthBudget: len.over,
+    asksMissingConfidence: ownership.filter((d) => d.defect === 'missing-confidence').length,
+    asksHighNoDecider: ownership.filter((d) => d.defect === 'high-confidence-no-decider').length,
+    asksMissingDecider: ownership.filter((d) => d.defect === 'missing-decider').length,
     session_id: typeof meta.session_id === 'string' ? meta.session_id : null,
     cwd: typeof meta.cwd === 'string' ? meta.cwd : null,
     shape: parsed?.shape ?? 'unstructured',
@@ -263,6 +341,14 @@ export function summariseMetrics(file = metricsPath()) {
     turnsWithAsk: 0,         // >= 1 orchard-ask
     turnsWithMultipleAsks: 0, // >= 2 orchard-ask in one turn
     biggestProseTurns: [],   // {ts, proseWords, askBlocks}
+    /* ── ENFORCEMENT (FEAT-137/138) — how often the two gates would/did bite.
+     * These count turns whose LAST-message record carries the enforcement fields
+     * (older records simply do not contribute). */
+    enforcedTurns: 0,        // turns recorded since the enforcement fields existed
+    overLengthTurns: 0,      // turns over their applicable length ceiling
+    asksMissingConfidence: 0,
+    asksHighNoDecider: 0,    // the core ownership defect
+    asksMissingDecider: 0,
   };
   let raw;
   try { raw = fs.readFileSync(file, 'utf8'); } catch { return out; }
@@ -288,6 +374,16 @@ export function summariseMetrics(file = metricsPath()) {
     out.asksTotal += asks;
     if (asks >= 1) out.turnsWithAsk++;
     if (asks >= 2) out.turnsWithMultipleAsks++;
+
+    // ENFORCEMENT telemetry (FEAT-137/138). `overLengthBudget` is the marker that
+    // a record predates or postdates the enforcement fields.
+    if (typeof rec.overLengthBudget === 'boolean') {
+      out.enforcedTurns++;
+      if (rec.overLengthBudget) out.overLengthTurns++;
+    }
+    out.asksMissingConfidence += Number(rec.asksMissingConfidence || 0);
+    out.asksHighNoDecider += Number(rec.asksHighNoDecider || 0);
+    out.asksMissingDecider += Number(rec.asksMissingDecider || 0);
     out.fallbackCharsTotal += rec.fallbackChars || 0;
     out.blockCharsTotal += rec.blockChars || 0;
     if (rec.shape === 'structured') {
@@ -360,9 +456,10 @@ export function formatReport(s) {
     '  blocks used (by category):',
     top(s.blockCounts, 12),
     '',
-    '  PROSE VOLUME & ASKS (FEAT-127) — the two failure modes, MEASURED not enforced.',
-    '  Advisory: these numbers do not block or truncate a turn; they say whether the',
-    '  FEAT-125 length budget and the ask-ownership rule (WA §A) are actually holding.',
+    '  PROSE VOLUME & ASKS (FEAT-127 measured; FEAT-137/138 ENFORCED) — the two failure modes.',
+    '  The measurements below are the lens FEAT-127 added; the ENFORCEMENT block after them',
+    '  says how often the Stop hook is now asking for a revision (FEAT-125 length budget and',
+    '  the WA §A ask-ownership rule are no longer advice-only on the main thread).',
     `    prose words/turn       : mean ${s.proseWordsMean.toFixed(0)}, median ${s.proseWordsMedian}, max ${s.proseWordsMax}  (over ${s.proseWordsTurns} turns with the field)`,
     `    over ${DEFAULT_WORD_CEILING}-word budget    : ${s.overDefaultCeiling} turns${s.proseWordsTurns ? ` (${pct(s.overDefaultCeiling / s.proseWordsTurns)})` : ''}`,
     `    over ${HANDOFF_WORD_CEILING}-word handoff cap: ${s.overHandoffCeiling} turns${s.proseWordsTurns ? ` (${pct(s.overHandoffCeiling / s.proseWordsTurns)})` : ''}`,
@@ -371,6 +468,11 @@ export function formatReport(s) {
     (s.biggestProseTurns.length
       ? s.biggestProseTurns.map((t) => `      ${String(t.proseWords).padStart(5)}w  ${t.askBlocks} ask  ${t.ts}`).join('\n')
       : '      (none)'),
+    '',
+    '  ENFORCEMENT (FEAT-137/138) — turns the Stop hook would ask to revise, over the',
+    `  ${s.enforcedTurns} turns recorded since enforcement shipped:`,
+    `    over the length budget : ${s.overLengthTurns} turns${s.enforcedTurns ? ` (${pct(s.overLengthTurns / s.enforcedTurns)})` : ''}  (blocked once for a tighter re-send)`,
+    `    unowned asks           : ${s.asksHighNoDecider} high-confidence with NO decider (the core defect), ${s.asksMissingDecider} other missing-decider, ${s.asksMissingConfidence} missing-confidence`,
     '',
     '  DECLARED UNCATEGORIZED — the author reached for the vocabulary and nothing fit.',
     '  This is the signal the design exists to produce: a repeated label here NAMES',

@@ -344,7 +344,9 @@ async function setup() {
   if (!(await waitHealth(port1))) throw new Error('server 1 never became healthy');
   const reg = await (await fetch(`http://127.0.0.1:${port1}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: WORK, name: 'feat065-delivery' }),
+    // FEAT-131: direct-isolation lifecycle suite — pin isolation so the
+    // container-default for new projects cannot move the session off-host.
+    body: JSON.stringify({ hostPath: WORK, name: 'feat065-delivery', isolation: 'direct' }),
   })).json();
   projectId = reg.project?.id;
   if (!projectId) throw new Error(`register failed: ${JSON.stringify(reg)}`);

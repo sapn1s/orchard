@@ -285,7 +285,9 @@ async function restartSection() {
 
   const reg = await (await fetch(`http://127.0.0.1:${port1}/api/projects`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ hostPath: WORK, name: 'bug044-restart-bg' }),
+    // FEAT-131: direct-isolation lifecycle suite — pin isolation so the
+    // container-default for new projects cannot move the session off-host.
+    body: JSON.stringify({ hostPath: WORK, name: 'bug044-restart-bg', isolation: 'direct' }),
   })).json();
   const pid = reg.project?.id;
   if (!pid) throw new Error(`register failed: ${JSON.stringify(reg)}`);

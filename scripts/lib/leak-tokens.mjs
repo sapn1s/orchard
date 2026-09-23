@@ -285,6 +285,16 @@ const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,
 // secret-shaped (looksSecretish) so a plain prose word (a config key documented
 // as "required"/"optional") is not mistaken for a live credential.
 const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{6,})', 'ig');
+// FEAT-130 round 6 — GENERIC (high-frequency, low-signal) secret key synonyms.
+// Kept in a SEPARATE list from SECRET_KEY_SRC because these fire only behind the
+// strict `looksHighEntropySecret` floor (above); the high-signal keys keep their
+// looser floor. A leading negative-lookbehind `(?<![A-Za-z0-9_])` anchors the key
+// to a word boundary so `oauth=`/`mysession=`/`author:` do NOT match `auth`/
+// `session`/`auth`. The key is captured (group 1) for the reported label.
+const GENERIC_SECRET_KEY_SRC =
+  '(?<![A-Za-z0-9_])(token|auth|pwd|passphrase|credentials?|cred|cookie|session|api[_-]?secret|secret[_-]?token|private[_-]?token|session[_-]?(?:token|key|secret)|client[_-]?key|access[_-]?secret)';
+const ASSIGN_GENERIC_BARE = new RegExp(GENERIC_SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{18,})', 'ig');
+const ASSIGN_GENERIC_QUOTED = new RegExp(GENERIC_SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{18,})\\2', 'ig');
 // proto://user:password@host — the inline password is the leak. FEAT-130 round 5:
 // the userinfo user part is `*` not `+`, so a PASSWORD-ONLY URL (`redis://:pass@host`,
 // the common redis/amqp shape where the username is empty) is matched too — the
@@ -321,6 +331,62 @@ function looksSecretish(v) {
   return classes >= 2 || s.length >= 24;
 }
 
+/* ────────────────────────────────────────────────────────────────────────
+ * FEAT-130 round 6 — GENERIC assignment-key detection, behind a VALUE-SHAPE FLOOR.
+ *
+ * The high-signal `SECRET_KEY_SRC` keys above (password, api_key, client_secret,
+ * …) are safe to match on their key name alone because those words rarely appear
+ * as an ordinary variable. The GENERIC synonyms the user asked for in round 6 —
+ * bare `token`, `auth`, `pwd`, `cred`, `cookie`, `session`, `passphrase` — are the
+ * OPPOSITE: this repo is full of code that legitimately writes them (`token`,
+ * `session`, `auth`, `cookie` fill src/server and public/app.js). Matching them on
+ * the key name alone would flood the gate, and a noisy gate gets `--no-verify`'d —
+ * a worse outcome than the recall we gain. So the whole point of this class is the
+ * FLOOR: the VALUE must look like an actual random secret, never an identifier,
+ * word, path, expression, or short literal.
+ *
+ * THE FLOOR (both a length minimum AND an entropy/charset test, deliberately
+ * strict — see the round-6 whole-tree false-positive measurement in the ticket):
+ *   - length ≥ 18 (real API tokens/keys are long; kills `token=abc`, `auth=basic`,
+ *     `pwd=x`, and every short identifier reference),
+ *   - passes `isSecretValue` (so a placeholder `<redacted>`, a code-ref/template
+ *     `$PASSWORD` / `${env.AUTH}` / `process.env.X`, prose with a space, or a bare
+ *     number is already excluded),
+ *   - character-CLASS diversity = 3 (lowercase AND uppercase AND digit all
+ *     present) — a random credential mixes all three; identifiers, dictionary
+ *     words, filesystem paths, lowercase-hex digests (git SHAs, md5/sha) and
+ *     base64-of-lowercase do NOT, so they never trip this class,
+ *   - Shannon entropy ≥ 3.2 bits/char (guards a long, 3-class-but-repetitive value
+ *     like a templated `Aaaa1Bbbb2Cccc3…` from passing on charset alone).
+ * A value that already matches a known KEY_SHAPE (an `sk-`/`ghp_`/`AIza…` key
+ * assigned to a generic `token=`) is NOT re-reported here — that secret is already
+ * caught by its provider matcher; double-reporting it would just be noise.
+ * ──────────────────────────────────────────────────────────────────────── */
+function shannonBits(s) {
+  const str = String(s ?? '');
+  const n = str.length;
+  if (!n) return 0;
+  const freq = new Map();
+  for (const c of str) freq.set(c, (freq.get(c) ?? 0) + 1);
+  let e = 0;
+  for (const c of freq.values()) { const p = c / n; e -= p * Math.log2(p); }
+  return e;
+}
+function looksHighEntropySecret(v) {
+  const s = String(v ?? '');
+  if (s.length < 18) return false;                 // real tokens are long
+  if (!isSecretValue(s)) return false;             // placeholder / code-ref / prose / numeric
+  const classes = [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(s)).length;
+  if (classes < 3) return false;                   // random secrets mix all three; identifiers/words/paths/hex do not
+  if (shannonBits(s) < 3.2) return false;          // a long-but-repetitive 3-class value is not a secret
+  return true;
+}
+/** True when a value is ALREADY a known provider KEY_SHAPE (so don't double-report). */
+function valueMatchesKnownShape(v) {
+  const s = String(v ?? '');
+  return KEY_SHAPES.some((k) => { const m = s.match(k.re); return m && (!k.guard || k.guard(m[0])); });
+}
+
 /**
  * Scan ONE line for credential/secret/email shapes. Returns `[{ token, match }]`.
  * Shared by the commit-time gate and the ticket-write guard so the two can never
@@ -350,6 +416,15 @@ export function scanSecrets(line) {
   }
   for (const a of s.matchAll(ASSIGN_BARE)) {
     if (isSecretValue(a[1]) && looksSecretish(a[1])) pushAssign(`${a[0].split(/[:=]/)[0].trim()}=…`);
+  }
+  // FEAT-130 round 6 — GENERIC key synonyms, gated by the strict value-shape floor
+  // (length ≥ 18, all three char classes, entropy ≥ 3.2), and NOT re-reporting a
+  // value already caught as a known provider KEY_SHAPE.
+  for (const a of s.matchAll(ASSIGN_GENERIC_BARE)) {
+    if (looksHighEntropySecret(a[2]) && !valueMatchesKnownShape(a[2])) pushAssign(`${a[1]}=…`);
+  }
+  for (const a of s.matchAll(ASSIGN_GENERIC_QUOTED)) {
+    if (looksHighEntropySecret(a[3]) && !valueMatchesKnownShape(a[3])) pushAssign(`${a[1]}=…`);
   }
   const c = CONN_STRING.exec(s);
   if (c && !CONN_PLACEHOLDER.test(c[1]) && !isPlaceholder(c[1]) && !isCodeRef(c[1])) {

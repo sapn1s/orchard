@@ -198,6 +198,44 @@ ok('password-only amqp URL IS caught', caught('amqp://:' + D7BODY + '@rabbit:567
 ok('user:pass connection URL still caught', caught('postgres://admin:' + D7BODY + '@h/db'));
 ok('placeholder-password URL stays clean', !caught('redis://:changeme@host:6379'));
 
+console.log('\nD8. Round-6 generic assignment-key synonyms behind a value-shape floor:');
+// The round-5 DECISION fork: bare `token=`/`auth=`/`pwd=`/`cookie=`/`session=` and
+// siblings are now caught, but ONLY when the value clears the strict floor (len ≥ 18,
+// all three char classes, entropy ≥ 3.2). The floor is the point — this repo is full
+// of code that writes these words, so a noisy match would get the gate --no-verify'd.
+// Bodies SPLIT into ≤5-char fragments (self-immunity) and the var avoids the
+// secret-key list; the run is a fabricated mixed case+digit string, never a live key.
+const R6BODY = 'Q7mR2' + 'vK9aL' + '6zB8n' + 'C4pD5' + 'xW1yE';   // 25-char fabricated 3-class run
+// MUST FIRE — each new generic key on a real-shaped value, and NOT caught before r6.
+for (const key of ['token', 'auth', 'pwd', 'cookie', 'session', 'passphrase', 'cred', 'client_key', 'private_token']) {
+  ok(`generic key caught: ${key}=<secret>`, caught(`${key}=${R6BODY}`));
+}
+ok('generic quoted value caught', caught('credential: "' + R6BODY + '"'));
+ok('generic key NOT caught by classic literal tokens (blind before r6)', !classicCaught(`token=${R6BODY}`));
+// MUST NOT FIRE — the user's explicit non-secret list + identifier/template/placeholder refs.
+ok('floor: short value token=abc clean', !caught('token=abc'));
+ok('floor: env-var ref pwd=$PASSWORD clean', !caught('pwd=$PASSWORD'));
+ok('floor: template auth=${env.AUTH} clean', !caught('auth=' + '${env.AUTH}'));
+ok('floor: placeholder secret=<redacted> clean', !caught('secret=<redacted>'));
+ok('floor: token=your-key-here clean', !caught('token=your-key-here'));
+ok('floor: bare token= clean', !caught('token='));
+ok('floor: identifier ref auth=authHeaderValue clean', !caught('auth=authHeaderValue'));
+ok('floor: code ref session=req.session.token clean', !caught('session=req.session.token'));
+ok('floor: template token=${TOKEN} clean', !caught('token=' + '${TOKEN}'));
+ok('floor: cookie=document.cookie clean', !caught('cookie=document.cookie'));
+ok('floor: 40-hex sha revision (2-class) clean', !caught('token=3fa9c2d41b079e107d9d372bb682c45e135790ab'));
+ok('floor: long-but-low-entropy 3-class value clean', !caught('token=' + 'aaaaaaaaaaaaaaaaaaBBBBBBBB1'));
+// Word-boundary: a longer identifier that merely CONTAINS a generic key must not match.
+ok('boundary: mysession=<secret> not matched (session inside a word)', !caught('mysession=' + R6BODY));
+ok('boundary: author=<secret> not matched (auth inside a word)', !caught('author=' + R6BODY));
+// No double-report: a known provider key assigned to a generic `token=` is reported
+// once (by its provider matcher), not also as a generic assignment.
+{
+  const hits = scanSecrets('token=' + F.ghp);
+  ok('no double-report: token=<ghp_ key> reported once as the provider shape',
+    hits.length === 1 && /github token/.test(hits[0].token));
+}
+
 // ── Enforcement in a scratch git repo (git run inside node, not Bash tool) ──
 console.log('\nE. Enforcement — pre-commit / commit-msg hooks (hand git commit):');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'feat130-repo-'));

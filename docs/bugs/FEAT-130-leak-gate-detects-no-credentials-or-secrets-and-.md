@@ -590,3 +590,118 @@ it imports the shared matcher). No `src/server/` / `public/` / `git-grant*` /
   and this ticket. (Other dirty files in the tree — `public/app.js`, `src/server/*`,
   `scripts/git-grant*`, `scripts/lib/git-shim.mjs`, other tickets — belong to
   concurrent lanes; untouched by this lane.)
+
+### 2026-09-23 — worker (fixing, round 6, class=fix) — round-5 DECISION fork resolved: generic assignment keys behind a value-shape floor
+
+The user DECIDED the round-5 open fork: add generic assignment-key detection
+(`token=`, `auth=`, `pwd=`, and siblings — `secret=`/`api_key=`/`password=` were
+already in the high-signal list) **gated behind a strict value-shape FLOOR** so it
+only fires on things that actually look like secrets. The floor is the point, not a
+refinement: this repo is full of code that writes these words, and a noisy gate gets
+`--no-verify`'d. Scope: `scripts/lib/leak-tokens.mjs` +
+`scripts/verify-feat-130-leak-detection.mjs` only (`leak-gate.mjs` needed no change —
+it imports the shared matcher). Left unstaged.
+
+- **Design — a SEPARATE generic-key list with its own strict floor** (not merged into
+  `SECRET_KEY_SRC`, whose high-signal keys keep their looser floor). New
+  `GENERIC_SECRET_KEY_SRC` = `token|auth|pwd|passphrase|credentials?|cred|cookie|
+  session|api_secret|secret_token|private_token|session_(token|key|secret)|client_key|
+  access_secret`, each anchored by a leading negative-lookbehind `(?<![A-Za-z0-9_])`
+  so `oauth=`/`mysession=`/`author:` do NOT match `auth`/`session`. Bare (`=`/`:`) and
+  quoted forms.
+- **The FLOOR (`looksHighEntropySecret`, both a length min AND an entropy/charset
+  test):** value length ≥ 18; passes `isSecretValue` (so placeholders `<redacted>`,
+  code-refs/templates `$PASSWORD`/`${env.AUTH}`/`process.env.X`, prose-with-space and
+  bare numbers are already out); character-CLASS diversity = 3 (lowercase AND uppercase
+  AND digit all present — a random credential mixes all three; identifiers, dictionary
+  words, filesystem paths, lowercase-hex digests like git SHAs, and base64-of-lowercase
+  do NOT); Shannon entropy ≥ 3.2 bits/char (guards a long-but-repetitive 3-class value).
+  A value that already matches a known provider `KEY_SHAPE` (an `sk-`/`ghp_`/`AIza…`
+  assigned to a generic `token=`) is NOT re-reported — no double-report.
+- **WHOLE-TREE false-positive MEASUREMENT (the requirement, real run):** scanned every
+  one of the 1102 tracked files for the new generic class →
+  **0 generic-assignment hits.** `node scripts/leak-gate.mjs` (whole-tree, read-only)
+  output is BYTE-IDENTICAL to the pre-change baseline — still `PASS — 0 hits across 1102
+  files`, only the LICENSE waiver. `npm run gate` → **EXIT 0** (leak-gate + check-nul +
+  typecheck all PASS), read directly unpiped. The strict floor produces zero new FPs;
+  no waiver needed.
+- **Both directions, real gate end-to-end (no git writes — reads only):**
+  - must-FAIL BEFORE: the committed HEAD (round-5) `scanSecrets` returns **0** for
+    `token=`/`auth=`/`pwd=`/`cookie=`/`session=`+`<high-entropy body>`; round-6 returns
+    **1** for each.
+  - end-to-end: seeded an untracked file `token=<25-char 3-class body>` into the real
+    tree → `node scripts/leak-gate.mjs` **exit 1** (hit reported: `[secret assignment]
+    token=…`); removed the seed → **exit 0**. This exercises the real gate (working-tree
+    REPO mode reads only, no blocked git write).
+  - precision controls all clean: `token=abc`, `pwd=$PASSWORD`, `auth=${env.AUTH}`,
+    `secret=<redacted>`, `token=your-key-here`, bare `token=`, `auth=authHeaderValue`
+    (identifier), `session=req.session.token` (code-ref), `token=${TOKEN}` (template),
+    `cookie=document.cookie`, a 40-hex git-SHA value (2-class), a long low-entropy
+    3-class value, `mysession=`/`author=` (boundary), and `token=<ghp_ key>`
+    (reported once as the provider shape, not doubly).
+- **Permanent regression tests — new `D8` section (+26 assertions).** The suite now
+  totals **128** assertions (was 102). Fixtures are SPLIT into ≤5-char fragments (var
+  `R6BODY`, not on the secret-key list) so the tracked file stays gate-clean (verified:
+  whole-tree gate is clean with the edited suite present).
+- **Verification honesty — git-driving suite sections could NOT run in this lane.**
+  Sections `D5/E/F/G` (scratch-repo `git init/add/commit` + `--staged`) require real git
+  writes; git writes are BLOCKED for agent sessions (FEAT-108 hook + FEAT-135 shim) and
+  this lane has no user grant, so an in-process full run throws at D5. What I ran:
+  the pure-detector sections **A–D4 = 69/69, 0 failed**; the new **D8 = 26/26** via a
+  standalone replay of its exact assertions against the real imported functions; plus the
+  whole-tree gate and the seeded end-to-end proof above. The enforcement plumbing is
+  UNCHANGED by this patch (I touched only the shared matcher's assignment classes, which
+  the gate imports) and the seeded-file run proves the gate inherits the new class. Under
+  a user git grant the full suite should report **128/128**; the orchestrator/user should
+  run it once with the grant to confirm D5/E/F/G stay green.
+- **regressed-from:** none — this is the additive recall the round-3/5 fixers
+  deliberately deferred pending the user's precision-vs-recall decision, now made.
+- **Independent verify — WARRANTED (HIGH-STAKES):** security detector, 6th round on a
+  file with a documented regression history; this lane is self-verified only. A fresh
+  clean-room pass (`scripts/independent-verify.mjs --working-tree`) should re-attack the
+  floor — probe for a real secret the class MISSES (a 2-class hex/base64-lower token with
+  a generic key; a value 16–17 chars long) and for a FP the floor lets through (a
+  high-entropy-looking non-secret assigned to `token=`/`session=` in real code) — and
+  should run the full suite WITH a git grant to confirm the enforcement sections.
+- **Files changed (unstaged, for the user to commit):**
+  `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`, and this
+  ticket.
+
+### 2026-09-23 — independent verifier (verifying, round 7)
+**VERDICT: PASS** (not cosmetic-only). Read diff + test + problem statement only, not the
+fixer's rationale. All commands executed with real output.
+- **Suite + gate (once each):** `verify:feat-130` → 128 passed / 0 failed. Whole-tree
+  `npm run gate` → PASS (leak-gate + check-nul + typecheck, exit 0), no clean-tree false
+  positive. Detector run over a realistic external corpus (real `package-lock.json` +
+  3 minified bundles, 2102 lines) → **0 hits**. So the FAIL criterion (any clean-tree /
+  realistic false positive) is NOT met — precision holds.
+- **Empirical floor (measured, not argued):** length flips exactly at 18 (16/17-char
+  random 3-class body MISS, 18 CATCH); entropy floor genuinely bites — a len-18 *repetitive*
+  3-class value `aAbB1234aAbB1234aA` (entropy 2.97) MISSES, a high-variety one (4.17) CATCHES.
+  Word-boundary (`mysession=`,`author=`), placeholder/code-ref, and known-provider-shape
+  no-double-report all behave as claimed.
+- **False-NEGATIVE findings (recall gaps, not regressions):**
+  (1) *JSON / quoted-KEY form* `"token": "<secret>"` is **MISSED** — and so is every
+  high-signal key (`"password":`,`"secret":`,`"api_key":`). `ASSIGN_QUOTED`/generic regexes
+  require an *unquoted* key, so the canonical config-file secret shape is uncaught. This is
+  a PRE-EXISTING detector boundary, NOT introduced by round 6, but the round-6 suite only
+  exercises the unquoted key (`credential: "…"`), so JSON-config recall is untested + absent.
+  Highest-value follow-up.
+  (2) By-design floor misses (precision/recall tradeoff, acknowledged): sub-18-char keys,
+  single/two-class bodies (lowercase-hex/git-SHA, base64-of-one-class, numeric PIN), and
+  **dictionary-word passphrases** (`passphrase=correct-horse-battery-staple`, entropy<3.2).
+  The ticket lists `passphrase` as a synonym, but a real word-passphrase structurally cannot
+  clear the entropy floor — the gate cannot catch it. Worth stating in the ticket as a known
+  limitation rather than a covered case.
+- **False-POSITIVE (latent, NOT clean-tree → not a FAIL):** a glued bare `key=<18+char,
+  3-class, high-entropy value>` fires on non-secret shapes — an 18+char camelCase
+  identifier-with-digit, a base64 test fixture assigned to `cookie=`, a CSS-in-JS class name.
+  NONE occur in the tracked tree or the 2102-line external corpus, so there is no current
+  false positive; but if such a glued assignment enters the tree (URL query params, generated
+  code) it would trip. Latent precision risk to watch.
+- **Could not test:** did NOT delegate a clean-room cross-provider dispatch pass — `node
+  src/server/dispatch-client.mjs --check` reported openai AVAILABLE, but I ran the adversarial
+  pass directly for empirical depth instead of delegating; noting this as the one deviation
+  from the preferred method. Also untested: binary/non-UTF8 blobs and pathological
+  single-line lengths beyond the sampled minified bundles.
+- **Verified-by:** independent verifier (fresh context, Opus 4.8), 2026-09-23.

@@ -65,15 +65,22 @@ export function evaluateGitWrite({
   if (PUBLISHING_SUBCOMMANDS.has(sub)) {
     const gate = runLeakGate ? safeGate(runLeakGate) : { ok: false, detail: 'no leak-gate runner available — failing closed' };
     if (!gate.ok) {
-      const rec = recordGitWrite({ projectKey, offender, command, sessionLabel, grantScope: grant.scope, gatePassed: false, now });
+      // Refused at decide — this write never runs. Record it as blocked, not as a
+      // permit a later reader could mistake for a landed commit (BUG-184).
+      const rec = recordGitWrite({ projectKey, offender, command, sessionLabel, grantScope: grant.scope, gatePassed: false, outcome: 'blocked-gate', now });
       return { allow: false, offender, gateFailed: true, reason: gitWriteGateFailedRefusal(offender, gate.detail), record: rec };
     }
   }
 
   consumeGrant(projectKey, now);
+  // BUG-184 — record the DECISION as 'permitted', NOT as executed. The host cannot
+  // observe whether the caller then runs git (over the shim path the exec lives in
+  // another process that may abort or fail). The executor confirms the real outcome
+  // via `confirmGitWrite`; until then the record honestly reads "authorised, not
+  // yet observed to have run", so the audit can never claim a commit HEAD lacks.
   const rec = recordGitWrite({
     projectKey, offender, command, sessionLabel, grantScope: grant.scope,
-    gatePassed: PUBLISHING_SUBCOMMANDS.has(sub) ? true : null, now,
+    gatePassed: PUBLISHING_SUBCOMMANDS.has(sub) ? true : null, outcome: 'permitted', now,
   });
   return { allow: true, granted: true, offender, grant, record: rec };
 }

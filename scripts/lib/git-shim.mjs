@@ -177,10 +177,49 @@ export async function askHostGrant(argv, env = process.env, { fetchImpl = global
     });
     if (!res || res.status !== 200) return { allow: false };
     const body = await res.json();
-    if (body && body.allow === true) return { allow: true, granted: true };
+    // BUG-184 — carry the ledger record id AND its single-use capability token back
+    // so the shim can CONFIRM the real git exit after it execs. The token is minted
+    // per-record by the host and returned ONLY here, to this executor: it is the
+    // unforgeable proof a same-uid peer cannot fabricate (round 3, attack A1). The
+    // host recorded 'permitted' at decide; only this executor observes the real run.
+    if (body && body.allow === true) {
+      return {
+        allow: true, granted: true,
+        recordId: typeof body.recordId === 'string' ? body.recordId : null,
+        confirmToken: typeof body.confirmToken === 'string' ? body.confirmToken : null,
+      };
+    }
     return { allow: false, reason: typeof body?.reason === 'string' ? body.reason : undefined };
   } catch {
     return { allow: false }; // fail closed on abort/network/parse
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * BUG-184 — report the OBSERVED git exit status back to the host so the ledger
+ * records what HAPPENED, not just what was decided (ARCH-010: the shim owns the
+ * fact "did the write run"). Best-effort and non-blocking to the git result: a
+ * failed/timed-out confirmation simply leaves the record 'permitted' (honest:
+ * unknown), it never changes the exit status the user sees. Fails silently on any
+ * error — a broken audit callback must never break the git call itself.
+ */
+export async function confirmHostExec(recordId, status, { fetchImpl = globalThis.fetch, timeoutMs = 5000, hostUrl, shimAuth, confirmToken, projectKey } = {}) {
+  // The single-use capability token is REQUIRED — without it the host rejects the
+  // confirm (round 3). `projectKey` binds the confirm to the record's owner.
+  if (!recordId || !hostUrl || !shimAuth || !confirmToken || typeof fetchImpl !== 'function') return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    await fetchImpl(`${hostUrl.replace(/\/+$/, '')}/api/git-shim/confirm`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ recordId, status: status == null ? null : Number(status), shimAuth, token: confirmToken, projectKey: projectKey ?? null }),
+      signal: controller.signal,
+    });
+  } catch {
+    /* best-effort — never break the git call over a failed confirmation */
   } finally {
     clearTimeout(timer);
   }
@@ -198,7 +237,7 @@ export async function resolveGitShim(argv, env = process.env, opts = {}) {
   const local = decideGitShim(argv, env, { ignoreEnvHatch: opts.ignoreEnvHatch !== false });
   if (local.allow || !local.consultHost) return local;
   const host = await askHostGrant(argv, env, opts);
-  if (host.allow) return { allow: true, granted: true };
+  if (host.allow) return { allow: true, granted: true, recordId: host.recordId ?? null, confirmToken: host.confirmToken ?? null };
   return { allow: false, reason: host.reason ?? local.reason };
 }
 
@@ -273,8 +312,15 @@ export async function runGitShim(argv, { realGit, hostUrl, grantKey, shimAuth } 
   }
   const bin = realGit || 'git';
   const r = spawnSync(bin, argv, { stdio: 'inherit', env: process.env });
+  // BUG-184 — report the REAL git outcome back to the host ledger. `d.recordId` is
+  // present only when the host recorded a decide-time permit (a granted write); a
+  // read / sanctioned-plumbing allow has none, so no confirmation is sent. An exec
+  // failure is a non-success outcome too (status 127). Best-effort: the git exit
+  // status the user sees is unchanged regardless of whether the confirm lands.
+  const exit = r.error ? 127 : (r.status == null ? 1 : r.status);
+  if (d.recordId && d.confirmToken) await confirmHostExec(d.recordId, exit, { hostUrl, shimAuth, confirmToken: d.confirmToken, projectKey: grantKey });
   if (r.error) { process.stderr.write(`orchard git-shim: exec failed: ${r.error.message}\n`); process.exit(127); }
-  process.exit(r.status == null ? 1 : r.status);
+  process.exit(exit);
 }
 
 /**

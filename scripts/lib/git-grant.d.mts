@@ -2,7 +2,7 @@
  * Types for git-grant.mjs (FEAT-108 round 2). The grant-aware git-write decision
  * the runtime PreToolUse hook runs. Same sidecar-.d.mts convention.
  */
-import type { GitWriteGrantView, GitWriteRecord } from './git-grant-store.d.mts';
+import type { GitWriteGrantView, RecordedGitWrite } from './git-grant-store.d.mts';
 
 export declare const PUBLISHING_SUBCOMMANDS: Set<string>;
 
@@ -13,7 +13,8 @@ export interface GitWriteEvaluation {
   granted?: boolean;
   gateFailed?: boolean;
   grant?: GitWriteGrantView;
-  record?: GitWriteRecord;
+  /** Carries the single-use confirm token (BUG-184 r3) for the decide response. */
+  record?: RecordedGitWrite;
 }
 
 /**

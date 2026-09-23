@@ -48,6 +48,30 @@ async function resolveProject(needle) {
   throw new Error(`no project matches "${needle}" (id or name); run --list`);
 }
 
+/**
+ * BUG-184 — the write's REAL outcome leads the line, so a reader can never mistake
+ * a permit (host authorised, execution not observed) for a landed commit. Only
+ * 'executed' means the write ran; 'permitted' means decided-but-unconfirmed (an
+ * aborted shim or a hook-path write the host never sees execute), which must NOT
+ * read as success. Older records with no `outcome` field predate the fix and are
+ * flagged as such (their gate=pass cannot be trusted to mean "landed").
+ */
+function fmtOutcome(w) {
+  const map = {
+    executed: 'EXECUTED',
+    failed: 'FAILED',
+    permitted: 'permitted(not confirmed run)',
+    'blocked-gate': 'BLOCKED(gate)',
+  };
+  if (!('outcome' in w) || w.outcome == null) return 'outcome=unknown(pre-BUG-184)';
+  const label = map[w.outcome] ?? String(w.outcome);
+  const st = w.exitStatus === null || w.exitStatus === undefined ? '' : ` exit=${w.exitStatus}`;
+  // BUG-184 r3 — rejected confirm attempts (wrong token / foreign owner / replay)
+  // are a tampering signal; make them LOUD so a reader never trusts the row blindly.
+  const anom = w.confirmAnomalies ? ` !TAMPER-ATTEMPTS=${w.confirmAnomalies}` : '';
+  return `[${label}${st}]${anom}`;
+}
+
 function fmtGrant(g) {
   if (!g) return 'none';
   const mins = Math.round((g.expiresInMs ?? 0) / 60000);
@@ -78,7 +102,7 @@ async function main() {
     console.log(`project ${p.id} (${p.name})\n  grant: ${fmtGrant(s.grant)}`);
     console.log(`  recent agent git writes: ${s.recentWrites.length}`);
     for (const w of s.recentWrites.slice(0, 10)) {
-      console.log(`    ${w.at}  ${w.offender}  gate=${w.gatePassed === null ? 'n/a' : w.gatePassed ? 'pass' : 'FAIL'}  ${w.command ?? ''}`);
+      console.log(`    ${w.at}  ${w.offender}  ${fmtOutcome(w)}  gate=${w.gatePassed === null ? 'n/a' : w.gatePassed ? 'pass' : 'FAIL'}  ${w.command ?? ''}`);
     }
     return;
   }

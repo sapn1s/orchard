@@ -32,7 +32,7 @@ import * as gitcli from './git.ts';
 // FEAT-108 round 2 — the runtime, per-project git-write grant store. Host-memory
 // only (see git-grant-store.mjs): the ONLY mutator is these user-driven routes,
 // so an agent cannot plant a grant by writing config or exporting an env var.
-import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink } from '../../scripts/lib/git-grant-store.mjs';
+import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink, confirmGitWrite } from '../../scripts/lib/git-grant-store.mjs';
 // BUG-173 — the invocation-layer shim consults the SAME grant authority as the
 // FEAT-108 hook, over loopback, at call time. `evaluateGitWrite` is that one
 // authority; `runLeakGateForRepo` is the one leak gate a granted publish must pass.
@@ -2446,9 +2446,69 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       runLeakGate: () => runLeakGateForRepo(repoPath),
     });
     if (decision.allow && decision.granted) {
-      console.warn(`[orchard] git-write PERMITTED via invocation shim (subprocess) for project ${grantKey}: \`${decision.offender}\` — grant honoured (BUG-173, recorded).`);
+      console.warn(`[orchard] git-write PERMITTED via invocation shim (subprocess) for project ${grantKey}: \`${decision.offender}\` — grant honoured (BUG-173, recorded PENDING; the shim confirms the real git outcome, BUG-184).`);
     }
-    sendJson(res, 200, { allow: !!decision.allow, reason: decision.reason ?? null, offender: decision.offender ?? null });
+    // BUG-184 — hand the ledger record id AND its single-use capability token back
+    // so the shim can CONFIRM the real git exit after it execs. The token is minted
+    // per-record and returned ONLY here to this executor (round 3): a same-uid peer
+    // cannot guess it, so it cannot forge another write's outcome. The record is
+    // 'permitted' (pending) until confirmed, never a false 'executed'.
+    sendJson(res, 200, {
+      allow: !!decision.allow, reason: decision.reason ?? null, offender: decision.offender ?? null,
+      recordId: decision.record?.id ?? null,
+      confirmToken: decision.allow && decision.granted ? (decision.record?.confirmToken ?? null) : null,
+    });
+    return true;
+  }
+
+  /*
+   * BUG-184 — the shim reports the OBSERVED git exit after it execs, so the ledger
+   * records what HAPPENED, not just what the host DECIDED.
+   *
+   *   POST /api/git-shim/confirm  { recordId, status, token, projectKey, shimAuth }
+   *     → { ok, outcome, reason }
+   *
+   * The host recorded a decide-time PERMIT ('permitted') on /decide; only the shim
+   * (running in the session subprocess) observes whether git actually ran and with
+   * what status (ARCH-010: the executor owns the fact). `status === 0` → 'executed'
+   * (the write landed); anything else → 'failed'. A permit whose shim aborts (the
+   * BUG-173 timeout residual) or is never confirmed stays 'permitted' — honest, and
+   * never mistakable for a landed commit.
+   *
+   * ROUND 3 — a same-uid peer must not be able to forge another write's outcome
+   * (attacks A1/A2). The shim-secret gate keeps NON-session localhost callers off
+   * the route, but the shim secret is extractable host-wide, so it is NOT the
+   * binding. The binding is the per-record single-use capability `token` (minted at
+   * decide, returned only to that write's executor) plus the owner `projectKey`;
+   * `confirmGitWrite` verifies both and records any mismatch as an anomaly. So even
+   * a caller holding the shim secret cannot confirm a record it does not own.
+   */
+  if (rest[0] === 'git-shim' && rest[1] === 'confirm' && rest.length === 2 && m === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+    } catch {
+      sendJson(res, 200, { ok: false, reason: 'git-shim confirm: unreadable body' });
+      return true;
+    }
+    const recordId = typeof body.recordId === 'string' && body.recordId ? body.recordId : null;
+    const status = typeof body.status === 'number' ? body.status : (body.status === null ? null : Number.NaN);
+    const token = typeof body.token === 'string' ? body.token : null;
+    const projectKey = typeof body.projectKey === 'string' ? body.projectKey : null;
+    const shimAuth = typeof body.shimAuth === 'string' ? body.shimAuth : null;
+    if (!isShimSecretValid(shimAuth)) {
+      sendJson(res, 200, { ok: false, reason: 'git-shim confirm: missing or invalid shim secret' });
+      return true;
+    }
+    if (!recordId || Number.isNaN(status)) {
+      sendJson(res, 200, { ok: false, reason: 'git-shim confirm: recordId and numeric status required' });
+      return true;
+    }
+    const result = confirmGitWrite(recordId, { token, projectKey, exitStatus: status });
+    if (!result.ok && result.reason === 'unauthorized-confirm') {
+      console.warn(`[orchard] git-write confirm REJECTED (unauthorized) for record ${recordId} project ${projectKey ?? '?'} — recorded as an anomaly (BUG-184 r3).`);
+    }
+    sendJson(res, 200, { ok: result.ok, outcome: result.record?.outcome ?? null, reason: result.reason });
     return true;
   }
 

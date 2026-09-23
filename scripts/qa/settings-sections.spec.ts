@@ -1,32 +1,38 @@
 /**
  * FEAT-034 — settings drawer: grouped sections + conditional disclosure.
  *
- * Before this ticket, `public/lib/drawer.js`'s settingsView() was one flat
- * run of `.grp` cards (Runtime, Snapshots, Memories, Git, Processes, Access,
- * Integrations, Model, Permissions, Instructions) appended straight to the
- * body — and the "Access" card (mounts + docker-socket) rendered
- * UNCONDITIONALLY, even though both settings are rejected server-side unless
- * isolation === 'container' (see `PROJECT_ONLY` / validate.ts's mount
- * rejection). A direct-isolation project showed two dead controls with
- * nothing behind them.
+ * Original (FEAT-034) shape: the settings view was four named
+ * `<details class="sect">` sections, "Advanced" collapsed by default, and the
+ * "Access" card (mounts + docker socket) rendered UNCONDITIONALLY, even though
+ * both settings are rejected server-side unless isolation === 'container'.
  *
- * This spec is the PERMANENT regression guard for both halves of the fix:
- *   (a) grouping — the settings view is now four named <details class="sect">
- *       sections (Model & behaviour / Isolation & environment / Instructions
- *       & tools / Advanced), each collapsible, "Advanced" collapsed by
- *       default;
- *   (b) conditional disclosure — the "Access" card (mounts, docker socket)
- *       is ABSENT from the DOM when isolation = direct, and appears the
- *       moment isolation flips to container, gone again the moment it flips
- *       back.
- * It also proves persistence survived the refactor in both scopes: a
+ * FEAT-146 replaced the whole drawer with a modal (`.smodal`) whose CONTENT is
+ * the navigation: an 11-item rail in two groups ("This project" / "This
+ * machine") stands in for the old four sections — see
+ * `docs/bugs/FEAT-146-settings-is-two-navigation-axes-fighting-each-other.md`.
+ * Only two `<details class="sect">` survive at all (`advanced`, `patterns`),
+ * because those two lists are genuinely long; everything else that used to be
+ * a collapsible section is now a rail category, always fully shown once
+ * selected. This spec is the regression guard for the SAME two invariants,
+ * translated onto the new shape:
+ *
+ *   (a) grouping — the rail carries all 11 categories, in order, split into
+ *       "This project" (7) and "This machine" (4); the one category that kept
+ *       a real `<details>` (Advanced ▸ Agent memories) is still collapsed by
+ *       default and still expands/collapses on click;
+ *   (b) conditional disclosure — the "Access" card (mounts, docker socket) is
+ *       ABSENT from the DOM under the Isolation & environment category when
+ *       isolation = direct, and appears the moment isolation flips to
+ *       container, gone again the moment it flips back.
+ *
+ * It also proves persistence survived the redesign in both scopes: a
  * project-default edit survives a reload, and a this-session override
- * survives switching the scope toggle away and back (the in-memory
+ * survives switching the scope lens away and back (the in-memory
  * `ctx.overrides` path).
  *
- * MUST FAIL on the pre-FEAT-034 code: the old flat view has no `.sect`
- * elements at all, and always renders the Access group regardless of
- * isolation.
+ * MUST FAIL on the pre-FEAT-146 code: `#sRail` does not exist there (the old
+ * markup has `#dScope` tabs and `<details class="sect">` sections only), so
+ * every rail-based locator in this spec would find nothing.
  *
  * Assertions are on the USER-OBSERVABLE surface (role/name, DOM structure,
  * visibility), per WORKING_AGREEMENT §C — never on server/registry internals.
@@ -112,13 +118,18 @@ async function bootToProject(page: Page, projectId: string): Promise<void> {
 
 async function openSettings(page: Page): Promise<void> {
   await page.getByRole('button', { name: 'Project settings' }).click();
-  // The four themed sections are the shape under test — wait for all of them
+  // FEAT-146: the rail is the shape under test now — wait for all 11 items
   // rather than an arbitrary sleep.
-  await expect(page.locator('#vSettings .sect-l')).toHaveCount(4);
+  await expect(page.locator('#sRail .srail-item')).toHaveCount(11);
 }
 
-test('settings drawer: grouped sections + container-only settings gated on isolation', async ({ page }) => {
-  // ---- register a scratch project, isolation left at its default (direct) ----
+test('settings modal: 11-category rail (2 groups) + container-only settings gated on isolation', async ({ page }) => {
+  // ---- register a scratch project, then FORCE isolation to direct: the
+  //      server's own NEW_PROJECT_DEFAULT_ISOLATION is 'container'
+  //      (registry.ts), so relying on the registration default to be
+  //      'direct' is a race against a value this spec does not own. Setting
+  //      it explicitly makes the direct-vs-container transition below a
+  //      controlled fixture rather than an assumption. ----
   const reg = await (await fetch(`${BASE}/api/projects`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -126,55 +137,64 @@ test('settings drawer: grouped sections + container-only settings gated on isola
   })).json() as { project?: { id: string; isolation?: string } };
   const projectId = reg.project?.id;
   expect(projectId, `project registration failed: ${JSON.stringify(reg)}`).toBeTruthy();
-  expect(reg.project?.isolation ?? 'direct', 'fixture must start in direct isolation').toBe('direct');
+  const toDirect = await fetch(`${BASE}/api/projects/${projectId}`, {
+    method: 'PATCH', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ isolation: 'direct' }),
+  });
+  expect(toDirect.ok, `force isolation=direct: ${await toDirect.text()}`).toBe(true);
 
   await bootToProject(page, projectId!);
   await openSettings(page);
 
-  // ---- (a) grouping: four named sections, in order, "Advanced" collapsed ----
-  const sectionLabels = await page.locator('#vSettings .sect-l').allTextContents();
-  expect(sectionLabels).toEqual([
-    'Model & behaviour',
-    'Isolation & environment',
-    'Instructions & tools',
-    'Advanced',
+  // ---- (a) grouping: 11 categories, in order, "This project" then "This
+  //      machine" (the boundary is index 7 — this IS the grouping test, since
+  //      the rail renders the two groups as one ordered list of buttons) ----
+  const catLabels = await page.locator('#sRail .srail-item .n').allTextContents();
+  expect(catLabels).toEqual([
+    'Model & spend', 'Permissions & tools', 'Instructions', 'Isolation & environment',
+    'Snapshots', 'Workspace', 'Advanced',
+    'Accounts', 'Appearance', 'New-project defaults', 'Templates',
   ]);
-  const modelSect = page.locator('#vSettings .sect').filter({ has: page.locator('.sect-l', { hasText: 'Model & behaviour' }) });
-  const isoSect = page.locator('#vSettings .sect').filter({ has: page.locator('.sect-l', { hasText: 'Isolation & environment' }) });
-  const advSect = page.locator('#vSettings .sect').filter({ has: page.locator('.sect-l', { hasText: 'Advanced' }) });
-  await expect(modelSect).toHaveJSProperty('open', true);
-  await expect(isoSect).toHaveJSProperty('open', true);
-  await expect(advSect).toHaveJSProperty('open', false);
-  // Content of a closed <details> is present but not visible.
-  await expect(advSect.locator('.grp-l', { hasText: 'Running here' })).toHaveCount(1);
-  await expect(advSect.locator('.grp-l', { hasText: 'Running here' })).toBeHidden();
+  const groupHeadings = await page.locator('#sRail h3').allTextContents();
+  expect(groupHeadings).toEqual(['This project', 'This machine']);
 
-  // ---- (a) collapse/expand: click the Advanced summary, content shows ----
-  await advSect.locator('.sect-l').click();
-  await expect(advSect).toHaveJSProperty('open', true);
-  await expect(advSect.locator('.grp-l', { hasText: 'Running here' })).toBeVisible();
-  await advSect.locator('.sect-l').click();
-  await expect(advSect).toHaveJSProperty('open', false);
+  // ---- (a) the one surviving <details class="sect">: Advanced ▸ Agent
+  //      memories, collapsed by default, expands/collapses on click ----
+  await page.locator('#sRail-advanced').click();
+  const advDetails = page.locator('#vSettings details[data-sect="advanced"]');
+  await expect(advDetails).toHaveJSProperty('open', false);
+  await expect(advDetails.locator('.grp-l', { hasText: 'Agent memories' })).toHaveCount(1);
+  await expect(advDetails.locator('.grp-l', { hasText: 'Agent memories' })).toBeHidden();
+  await advDetails.locator('.sect-l').click();
+  await expect(advDetails).toHaveJSProperty('open', true);
+  await expect(advDetails.locator('.grp-l', { hasText: 'Agent memories' })).toBeVisible();
+  await advDetails.locator('.sect-l').click();
+  await expect(advDetails).toHaveJSProperty('open', false);
 
   // ---- (b) conditional disclosure: Access (mounts, docker socket) is ABSENT
-  //          in direct isolation, not merely disabled or hidden-by-CSS ----
+  //          under Isolation & environment in direct isolation, not merely
+  //          disabled or hidden-by-CSS ----
+  await page.locator('#sRail-isolation').click();
   await expect(page.locator('#vSettings .grp-l', { hasText: 'Access' })).toHaveCount(0);
   await expect(page.locator('#vSettings').getByRole('button', { name: '+ Add mount' })).toHaveCount(0);
   await expect(page.locator('#vSettings').getByLabel('Toggle docker socket access')).toHaveCount(0);
 
   // ---- switch isolation to Container, Access appears ----
-  await isoSect.getByRole('button', { name: 'Container' }).click();
+  const isoSeg = page.locator('#vSettings .grp[data-focus="iso"] .seg');
+  await isoSeg.getByRole('button', { name: 'Container' }).click();
   await expect.poll(() => page.evaluate(() => (window as any).__station.state.current.projectId)).toBe(projectId);
   await expect(page.locator('#vSettings .grp-l', { hasText: 'Access' })).toHaveCount(1);
   await expect(page.locator('#vSettings').getByRole('button', { name: '+ Add mount' })).toBeVisible();
   await expect(page.locator('#vSettings').getByLabel('Toggle docker socket access')).toBeVisible();
 
   // ---- switch back to Direct, Access disappears again ----
-  await isoSect.getByRole('button', { name: 'Direct' }).click();
+  await isoSeg.getByRole('button', { name: 'Direct' }).click();
   await expect(page.locator('#vSettings .grp-l', { hasText: 'Access' })).toHaveCount(0);
 
   // ---- persistence, project-default scope: change Model, survive a reload ----
-  const modelRow = modelSect.locator('.grp').first().locator('.set').first();
+  await page.locator('#sRail-model').click();
+  const modelGrp = page.locator('#vSettings .grp[data-focus="projectModel"]');
+  const modelRow = modelGrp.locator('.set').first();
   const before = await modelRow.locator('.v').textContent();
   await modelRow.click();
   await expect.poll(async () => modelRow.locator('.v').textContent()).not.toBe(before);
@@ -184,19 +204,27 @@ test('settings drawer: grouped sections + container-only settings gated on isola
   await page.waitForFunction(() => (window as any).__station !== undefined);
   await bootToProject(page, projectId!);
   await openSettings(page);
-  const modelSect2 = page.locator('#vSettings .sect').filter({ has: page.locator('.sect-l', { hasText: 'Model & behaviour' }) });
-  const modelRow2 = modelSect2.locator('.grp').first().locator('.set').first();
+  await page.locator('#sRail-model').click();
+  const modelGrp2 = page.locator('#vSettings .grp[data-focus="projectModel"]');
+  const modelRow2 = modelGrp2.locator('.set').first();
   await expect(modelRow2.locator('.v')).toHaveText(afterFirstClick ?? '');
 
   // ---- persistence, this-session scope: an override survives a scope
   //      round-trip without a reload (the in-memory ctx.overrides path) ----
+  // FEAT-146 phase 2b (landed mid-fix, while this spec was being repaired —
+  // see this ticket's Activity log): `.ovr` ("overridden") text is retired,
+  // replaced by a provenance CHIP — `.prov[data-level="session"]`, filled
+  // when the current write target itself holds the override. Same
+  // invariant (a session override is visibly marked and survives the scope
+  // round-trip), new marker.
   await page.locator('#dScope button[data-scope="session"]').click();
-  const effortRow = modelSect2.locator('.grp').first().locator('.set').nth(1); // Effort
+  const effortRow = modelGrp2.locator('.set').nth(1); // Effort
   await effortRow.click();
-  await expect(effortRow.locator('.ovr')).toHaveText('overridden');
+  const effortChip = effortRow.locator('.prov[data-level="session"]');
+  await expect(effortChip).toHaveAttribute('data-fill', 'true');
   await page.locator('#dScope button[data-scope="project"]').click();
   await page.locator('#dScope button[data-scope="session"]').click();
-  await expect(effortRow.locator('.ovr')).toHaveText('overridden');
+  await expect(effortChip).toHaveAttribute('data-fill', 'true');
 
   await page.screenshot({ path: path.join(ROOT, 'docs', 'bugs', 'assets', 'FEAT-034-after.png') }).catch(() => {});
 });

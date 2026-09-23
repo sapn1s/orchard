@@ -1,28 +1,40 @@
 /**
- * The right slide-in drawer: Runtime / Access / Model / Permissions /
- * Instructions, plus the template library and its editor.
+ * The settings modal (FEAT-146) — `.smodal`.
  *
- * Non-modal by design — it overlaps the transcript rather than squeezing it,
- * and the transcript stays live behind it.
+ * It used to be a 388px right-hand drawer carrying TWO orthogonal navigation
+ * axes at once: a scope tab strip (machine / project / session) and a content
+ * axis of six views. Scope was never a real axis in this data model — machine
+ * scope has unique content that does not exist at project level, and session
+ * scope is a strict lossy subset that rendered as a screen of dead controls.
  *
- * Scope: "Project default" writes straight through to the registry.
- * "This session" holds an override locally. Instruction overrides are real —
- * they ride the `start` command's templateIds. The other session-scope
- * overrides have nowhere to go on the wire yet (see README of the report);
- * the drawer says so rather than pretending.
+ * So: CONTENT is the rail (11 categories in two groups), and SCOPE is a header
+ * LENS that changes only the write target — never what is on screen. Flipping
+ * the lens does not rebuild the rail, does not scroll the pane, and does not
+ * make a row vanish or grey out.
+ *
+ * The lens still writes through `d.scope`: "This project" writes straight to
+ * the registry, "This session" holds an override locally. `'machine'` stopped
+ * being a lens value and became a rail GROUP.
+ *
+ * `createSlidePanel` is deliberately NOT used here any more (git-view.js still
+ * needs it): a modal opens in place, it does not slide in from the right.
  */
 import { $, el, clear, shortPath, bytes, stamp, when } from './dom.js';
 import * as api from './api.js';
-import { createSlidePanel } from './slide-panel.js';
 
 const MODEL_CYCLE = [null, 'opus', 'sonnet', 'haiku'];
 const EFFORT_CYCLE = [null, 'low', 'medium', 'high', 'xhigh', 'max'];
 const BUDGET_CYCLE = [null, 10, 25, 40];
 const PERM_CYCLE = ['default', 'plan', 'acceptEdits', 'bypassPermissions'];
+/* FEAT-146 round 4 — no glyphs. `▣ ◑ ○` were unreadable at 11px, arbitrary
+   (nothing about a half-filled circle says "sandbox"), inconsistent with the
+   provider set's `✳ ⌬`, and the stacked glyph line is what forced the segments
+   to 53/54px while Appearance's glyph-less set sat at 35. The fill carries
+   selection; the word carries the meaning. */
 const ISO = {
-  container: { g: '▣', n: 'Container' },
-  sandbox: { g: '◑', n: 'Sandbox' },
-  direct: { g: '○', n: 'Direct' },
+  container: { n: 'Container' },
+  sandbox: { n: 'Sandbox' },
+  direct: { n: 'Direct' },
 };
 const DOCKER_SOCK = '/var/run/docker.sock';
 
@@ -97,19 +109,53 @@ export function createDrawer(ctx) {
      * and the user's own collapse choices (`sectClosed`) are never rewritten.
      */
     focus: null,
+    /* FEAT-145 step 3 — the "Add account" flow, all three of its states:
+       `acctAdd`   the inline label form ({label, busy})
+       `acctLogin` the live login panel ({accountId, label, url, done, ws, …});
+                   it holds its OWN output <pre> and code <input> nodes so a
+                   repaint never wipes streamed output or what the user typed
+       `acctConfirm` the account id with an armed delete (credentials go too) */
+    acctAdd: null,
+    acctLogin: null,
+    acctConfirm: null,
+    /** FEAT-146 — the selected rail category id. The rail is the content axis. */
+    cat: 'model',
+    /** Pane scroll offset per category, for the life of ONE open modal. */
+    paneScroll: new Map(),
+    /**
+     * FEAT-146 phase 2b — the inline `ⓘ` disclosure.
+     *
+     * `whyAll` is the footer's "Show all descriptions", persisted in
+     * localStorage; `whyOpen` / `whyClosed` are the per-row overrides ON TOP of
+     * it, so a user who expands one row while "show all" is off — or collapses
+     * one while it is on — keeps that choice across the repaints every commit
+     * in this panel triggers. `whyFade` is the ONE key whose block may play its
+     * .12s fade on the next paint: a repaint while a block is open must not
+     * replay the animation.
+     */
+    whyAll: (() => { try { return localStorage.getItem('orchard.settings.descriptions') === 'all'; } catch { return false; } })(),
+    whyOpen: new Set(),
+    whyClosed: new Set(),
+    whyFade: null,
+    /** The element focus returns to on close (see closeModal). */
+    returnFocus: null,
   };
 
   const node = {
-    drawer: $('#drawer'),
+    modal: $('#smodal'),
+    back0: $('#smodalBack'),
     body: $('#dBody'),
+    rail: $('#sRail'),
     scope: $('#dScope'),
     hint: $('#dHint'),
+    whyAll: $('#dWhyAll'),
+    liveLine: $('#dLive'),
     title: $('#dTitle'),
     eyebrow: $('#dEyebrow'),
     back: $('#dBack'),
+    close: $('#dClose'),
     views: {
       settings: $('#vSettings'),
-      globals: $('#vGlobals'),
       instructions: $('#vInstructions'),
       library: $('#vLibrary'),
       snapshots: $('#vSnapshots'),
@@ -122,7 +168,88 @@ export function createDrawer(ctx) {
     edSave: $('#edSave'),
     edUse: $('#edUse'),
   };
-  const slide = createSlidePanel(node.drawer, { useHidden: false });
+  /* The app root the focus trap makes `inert`. The modal is a SIBLING of it in
+     index.html precisely so this works. */
+  const appRoot = $('#win');
+
+  /* ────────────────────────── FEAT-146: the rail ──────────────────────────
+     Eleven categories in two groups, ordered by reach frequency rather than by
+     how the code happens to be organised. `view` names the existing builder
+     each category renders in THIS phase — several categories still render more
+     than they eventually will; re-homing the content is a separate step, and
+     doing it here would have meant rebuilding navigation and content in one
+     unreviewable change. */
+  const RAIL = [
+    { group: 'project', id: 'model', label: 'Model & spend', view: 'settings' },
+    { group: 'project', id: 'permissions', label: 'Permissions & tools', view: 'settings' },
+    { group: 'project', id: 'instructions', label: 'Instructions', view: 'settings' },
+    { group: 'project', id: 'isolation', label: 'Isolation & environment', view: 'settings' },
+    { group: 'project', id: 'snapshots', label: 'Snapshots', view: 'snapshots' },
+    { group: 'project', id: 'workspace', label: 'Workspace', view: 'settings' },
+    { group: 'project', id: 'advanced', label: 'Advanced', view: 'settings' },
+    { group: 'machine', id: 'accounts', label: 'Accounts', view: 'machine' },
+    { group: 'machine', id: 'appearance', label: 'Appearance', view: 'machine' },
+    { group: 'machine', id: 'defaults', label: 'New-project defaults', view: 'machine' },
+    { group: 'machine', id: 'templates', label: 'Templates', view: 'library' },
+  ];
+  const GROUP_LABEL = { project: 'This project', machine: 'This machine' };
+  const catOf = (id) => RAIL.find((c) => c.id === id) ?? RAIL[0];
+
+  /**
+   * Every `data-focus` / `data-sect` anchor key → the rail category that now
+   * CONTAINS it. `open(view, {focus})` selects the category first, paints, and
+   * only then hands the key to the untouched applyFocus(). Without this map a
+   * deep link would land on whatever category happened to be selected and
+   * silently no-op — which is the one regression this redesign could not
+   * afford, since 18 call sites in app.js point here.
+   */
+  const FOCUS_CATEGORY = {
+    /* the 14 data-focus keys */
+    permissionMode: 'permissions',
+    integrations: 'permissions',
+    iso: 'isolation',
+    mounts: 'isolation',
+    services: 'isolation',
+    git: 'workspace',
+    processes: 'workspace',
+    instructions: 'instructions',
+    responseDigest: 'instructions',
+    wiring: 'advanced',
+    globalModel: 'defaults',
+    newProjectDefaults: 'defaults',
+    globalAccount: 'accounts',
+    appearance: 'appearance',
+    /* The 6 data-sect (whole-section) keys. Phase 2 retired four of the
+       `<details class="sect">` sections they named — the rail replaces them —
+       so `model`, `caps`, `instr` and `isoSection` are carried by the CATEGORY
+       WRAPPER's own `data-focus` instead (see `catWrap` below). applyFocus
+       resolves `[data-focus]` first, so every one of them still lands; its
+       internals were not touched. `advanced` and `patterns` are still real
+       <details>, because those two lists are genuinely long. */
+    model: 'model',
+    caps: 'permissions',
+    instr: 'instructions',
+    advanced: 'advanced',
+    patterns: 'templates',
+    isoSection: 'isolation',
+    /* anchors this ticket ADDS — eight groups had none at all, so any future
+       deep link at them would have silently no-op'd */
+    projectModel: 'model',
+    /* Phase 2 re-homings. `provider` moved to Model & spend (which engine runs
+       this project is the same decision as which model and what it costs), and
+       the snapshot settings card moved out of Isolation into Snapshots, where
+       the list it configures already lives. `globalTemplates` now lands on the
+       Templates category itself rather than on a link to it. */
+    provider: 'model',
+    projectAccount: 'model',
+    snapshots: 'snapshots',
+    snapshotsGroup: 'snapshots',
+    memories: 'advanced',
+    globalEffort: 'defaults',
+    globalTemplates: 'templates',
+    modelOverrides: 'defaults',
+    accounts: 'accounts',
+  };
 
   /* ---------------------------------------------------------- value model */
 
@@ -194,45 +321,249 @@ export function createDrawer(ctx) {
   const show = (v) =>
     v === null || v === undefined || v === '' ? 'inherit' : Array.isArray(v) ? (v.length ? v.join(', ') : 'none') : String(v);
 
+  /* ───────── FEAT-146 phase 2b — provenance, the gutter, the disclosure ─────
+   *
+   * Before this phase a row said where its value came from in FOUR different
+   * idioms: a "Built-in" button in machine scope, a ''-valued "No global
+   * default" select option, the bare word `inherit` printed in a cycle row's
+   * value, and a `.inh` tag that only existed on mouse hover. One chip, in its
+   * own column, replaces the three DISPLAY idioms (the other two are controls,
+   * and stay).
+   *
+   * The chip is a display of the DATA LAYER, never a second copy of it: it is
+   * derived on every paint from the same `base()` / `overriddenNow()` /
+   * `d.globals` this panel already reads, so there is nothing here that can
+   * hold a different answer than the value beside it.
+   */
+  const isSet = (v) => !(v === null || v === undefined || v === ''
+    || (Array.isArray(v) && v.length === 0));
+  /** The only two fields that genuinely have a machine-wide default to inherit. */
+  const MACHINE_DEFAULTED = new Set(['model', 'effort']);
+  const machineValue = (field) => (MACHINE_DEFAULTED.has(field) ? (d.globals?.[field] ?? null) : null);
+  /**
+   * What a reset WRITES. Most fields unset with null; `permissionMode` has no
+   * null (the server rejects it — 'default' IS its built-in), and the two list
+   * fields must stay arrays.
+   */
+  const RESET_VALUE = { permissionMode: 'default', allowedTools: [], disallowedTools: [] };
+  const resetValueOf = (field) => (field in RESET_VALUE ? RESET_VALUE[field] : null);
+
+  /**
+   * Which LEVEL the value on screen comes from, and whether that level is the
+   * lens's current write target. `null` means built-in — no chip at all.
+   *
+   * hollow (filled:false) = inherited from a level above the current lens;
+   * filled (filled:true)  = set HERE, at the current write target.
+   */
+  function provOf(spec) {
+    const target = spec.target ?? (d.scope === 'session' ? 'session' : 'project');
+    // A field a session may not override at all is a different fact from
+    // "inherited", and saying so is what stops the user hunting for a control
+    // that cannot exist here.
+    if (spec.projectOnly && d.scope === 'session') return { level: 'project-only', filled: false };
+    const level = spec.session ? 'session' : spec.project ? 'project' : spec.machine ? 'machine' : null;
+    if (!level) return null;
+    return { level, filled: level === target };
+  }
+  const fieldProv = (field) => provOf({
+    session: overriddenNow(field),
+    project: isSet(base(field)),
+    machine: isSet(machineValue(field)),
+    projectOnly: PROJECT_ONLY.has(field),
+  });
+  const provChip = (p) => (p ? el('span', {
+    class: 'prov', 'data-level': p.level, 'data-fill': p.filled ? 'true' : 'false', text: p.level,
+  }) : null);
+
+  /** The level a reset falls back TO, and the value that would then apply. */
+  function resetTarget(field) {
+    if (overriddenNow(field) && isSet(base(field))) return { level: 'project', text: show(base(field)) };
+    if (isSet(machineValue(field))) return { level: 'machine', text: show(machineValue(field)) };
+    const t = show(resetValueOf(field));
+    return { level: 'built-in', text: t === 'inherit' ? 'built-in default' : t };
+  }
+
+  /** Undo whatever the filled chip reports: the override, or the project value. */
+  function resetField(field) {
+    if (d.scope === 'session' && overriddenNow(field)) {
+      delete ctx.overrides[field];
+      ctx.onStackChanged?.();
+      paint();
+      return;
+    }
+    void put(field, resetValueOf(field));
+  }
+
+  /* ── the descriptions that may live behind an `ⓘ` ─────────────────────────
+   *
+   * THE HAZARD RULE, which is the safety-critical part of this ticket:
+   * *if removing the sentence could cause the user to take an irreversible,
+   * costly, or security-widening action they would otherwise not take, it
+   * stays inline.*
+   *
+   * So only definitional / how-it-works prose about a REVERSIBLE choice
+   * between SAFE options is allowed in this map. Everything on the other side
+   * of that line renders in flow with NO `ⓘ` at all — the icon's absence is
+   * itself the signal — and there is deliberately no entry here for
+   * `permissionMode` (security posture), `maxBudgetUsd` (cost), the two tool
+   * lists (what a session may reach), `isolation`, the docker socket, the
+   * account pickers (which subscription is billed), snapshot retention or any
+   * destructive ceremony. Adding one for any of those is the regression
+   * `scripts/verify-feat-146-settings-rows.mjs` exists to catch.
+   */
+  const WHY = {
+    model: 'Which Claude model a new session in this project starts with. '
+      + 'Sessions already running keep the model they started with. Left unset, the machine-wide '
+      + 'default applies; unset that too and Orchard uses the CLI’s own default.',
+    effort: 'How much reasoning the model is asked to spend before it answers. Higher settings think '
+      + 'longer and cost more per turn; they do not change what a session is allowed to do, and the '
+      + 'setting can be changed again at any time.',
+    'container.image': 'The Docker image sessions in this project run inside. Left empty, Orchard uses its own '
+      + 'image. A changed image takes effect the next time the container is built, not on a session '
+      + 'already running.',
+    serena: 'Serena attaches a language server, so a session can look code up by symbol — find a definition, '
+      + 'list references — instead of reading whole files. Off means sessions read files the ordinary way.',
+    playwright: 'Playwright gives a session a headless browser it can drive, which is how it tests a UI it just '
+      + 'changed. It only attaches on a machine where the binary is provisioned, so On here means “try it”, '
+      + 'not “force it”.',
+  };
+
+  const whyIsOpen = (key) => (d.whyClosed.has(key) ? false : (d.whyAll || d.whyOpen.has(key)));
+  function toggleWhy(key) {
+    if (whyIsOpen(key)) { d.whyOpen.delete(key); d.whyClosed.add(key); }
+    else { d.whyClosed.delete(key); d.whyOpen.add(key); }
+    d.whyFade = key;
+    paint();
+    // paint() rebuilt the row, so the button the user just pressed is a new
+    // node: put focus back on its replacement, or a keyboard user is dropped
+    // at the top of the pane every time they open a description.
+    document.getElementById(`whyb-${cssId(key)}`)?.focus();
+  }
+  function setWhyAll(on) {
+    d.whyAll = on;
+    // The footer toggle is the master switch: it clears the per-row overrides
+    // rather than fighting them.
+    d.whyOpen.clear();
+    d.whyClosed.clear();
+    try { localStorage.setItem('orchard.settings.descriptions', on ? 'all' : 'auto'); } catch { /* private mode */ }
+    paint();
+  }
+  /** A field name like `container.image` is not a valid bare id fragment. */
+  const cssId = (key) => String(key).replace(/[^A-Za-z0-9_-]/g, '-');
+
+  /**
+   * Column 4 — ALWAYS rendered, always 46px, whatever the row's state, so a
+   * row's geometry is byte-identical with and without a reset button.
+   *
+   * Right to left: the reset `.rev`, rendered only when the chip is FILLED
+   * (there is nothing to undo at this level otherwise), and the info `.why`,
+   * rendered whenever the row has a description. Both are real <button>s in
+   * tab order after the row's own control, both render persistently at
+   * --ink-4 — the deleted `.inh` hover-reveal was information a touch or
+   * keyboard user could never get at.
+   */
+  function gutter(row, opts) {
+    const g = el('span', { class: 'sgut' });
+    const key = opts.key ? cssId(opts.key) : null;
+    if (opts.why && key) {
+      const open = whyIsOpen(opts.key);
+      const b = el('button', {
+        type: 'button', class: 'why', id: `whyb-${key}`, 'data-why': opts.key,
+        'aria-expanded': String(open), 'aria-controls': `why-${key}`,
+        'aria-label': `${open ? 'Hide' : 'Show'} what “${opts.label}” does`,
+        title: `What “${opts.label}” does`,
+        text: 'i',
+      });
+      b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); toggleWhy(opts.key); });
+      g.append(b);
+      // `.set-why` is the SURFACE (round 4 made it the only explanatory block in
+      // the modal); `.disclosure` marks the subset that is toggled by an ⓘ, which
+      // is the set the hazard rule governs — a load-bearing sentence may sit in a
+      // `.set-why`, it may never sit in a `.set-why.disclosure`.
+      const block = el('div', { class: 'set-why disclosure', id: `why-${key}`, text: opts.why });
+      // Selecting the prose must never be read as a click on the row.
+      block.addEventListener('click', (e) => e.stopPropagation());
+      if (!open) block.hidden = true;
+      else if (d.whyFade === opts.key) { block.classList.add('in'); d.whyFade = null; }
+      row.append(block);
+      // A screen-reader user landing on the CONTROL hears the explanation —
+      // but only while it is actually on screen.
+      if (open && opts.control) opts.control.setAttribute('aria-describedby', `why-${key}`);
+    }
+    if (opts.prov?.filled && opts.onReset) {
+      const t = opts.resetTo ?? { level: 'built-in', text: 'built-in default' };
+      const r = el('button', {
+        type: 'button', class: 'rev',
+        'aria-label': `Reset ${opts.label} to the ${t.level} value (${t.text})`,
+        title: `Reset to the ${t.level} value (${t.text})`,
+        text: '↩',
+      });
+      const go = (e) => { e.preventDefault(); e.stopPropagation(); opts.onReset(); };
+      r.addEventListener('click', go);
+      // A real <button> activates on Enter/Space natively. The explicit keydown
+      // is for SYNTHETIC KeyboardEvents, which never fire a default action —
+      // and it stands down for a trusted event so a real key press can never
+      // fire the reset twice.
+      r.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ' && e.key !== 'Spacebar') return;
+        if (e.isTrusted) return;
+        go(e);
+      });
+      g.append(r);
+    }
+    return g;
+  }
+
   /* ------------------------------------------------------------- rows */
 
   function row(field, label, flag, opts = {}) {
     const cycleList = opts.cycle;
-    const tag = cycleList ? 'button' : 'div';
-    const n = el(tag, { class: 'set' });
+    const p = fieldProv(field);
+    // The bare word "inherit" was the third of the four "where did this come
+    // from" idioms, and it was the least informative: it named the mechanism
+    // and hid the answer. The chip names the LEVEL now, so the value column is
+    // free to say what actually applies — the machine default when that is what
+    // is in force, and "built-in" when nothing is set anywhere.
+    const valueText = opts.text
+      ?? (p === null ? 'built-in'
+        : p.level === 'machine' ? show(machineValue(field))
+        : show(val(field)));
+    const n = el('div', { class: 'set' });
+    const lab = el('span', { class: 'l', text: label }, flag ? el('span', { class: 'f', text: flag }) : null);
+    const chip = provChip(p);
+    const v = el('span', { class: `v${opts.dim || !p ? ' dim' : ''}` });
+    v.append(document.createTextNode(valueText));
+
+    let control = null;
     if (cycleList) {
+      n.dataset.cycle = 'true';
       n.title = 'Click to change';
+      // The mono flag text pollutes the computed name ("Effort --effort low"),
+      // so the row says what it is and what activating it does.
+      control = el('button', {
+        type: 'button', class: 'set-main',
+        'aria-label': `${label}: ${valueText}. Activate to change.`,
+      }, lab, chip, v);
+      n.append(control);
       n.addEventListener('click', () => cycle(field, cycleList));
+    } else {
+      n.append(lab);
+      if (chip) n.append(chip);
+      n.append(v);
     }
-    n.append(el('span', { class: 'l', text: label }, flag ? el('span', { class: 'f', text: flag }) : null));
-    const v = el('span', { class: `v${opts.dim ? ' dim' : ''}` });
-    if (isOvr(field)) v.append(el('span', { class: 'ovr', text: 'overridden' }));
-    else if (d.scope === 'session' && cycleList) v.append(el('span', { class: 'inh', text: 'inherited' }));
-    v.append(document.createTextNode(opts.text ?? show(val(field))));
-    if (isOvr(field)) {
-      const rev = el('span', {
-        class: 'rev',
-        role: 'button',
-        tabindex: '0',
-        'aria-label': 'Revert to project default',
-        title: `Revert to the project default (${show(base(field))})`,
-        text: '↩',
-      });
-      rev.addEventListener('click', (e) => {
-        e.stopPropagation();
-        delete ctx.overrides[field];
-        ctx.onStackChanged?.();
-        paint();
-      });
-      v.append(rev);
-    }
-    n.append(v);
+    n.append(gutter(n, {
+      key: field, label, prov: p, why: WHY[field], control,
+      resetTo: resetTarget(field), onReset: () => resetField(field),
+    }));
     return n;
   }
 
   function listRow(field, label, flag) {
     const n = el('div', { class: 'set' });
     n.append(el('span', { class: 'l', text: label }, el('span', { class: 'f', text: flag })));
+    const p = fieldProv(field);
+    const chip = provChip(p);
+    if (chip) n.append(chip);
     const cur = val(field) ?? [];
     const input = el('input', {
       class: 'vin',
@@ -255,11 +586,65 @@ export function createDrawer(ctx) {
       }
     });
     n.append(input);
+    // No `why`: what a session may or may not reach is security posture, and
+    // the hazard rule keeps that kind of prose in flow, never behind an icon.
+    n.append(gutter(n, {
+      key: field, label, prov: p, control: input,
+      resetTo: resetTarget(field), onReset: () => resetField(field),
+    }));
     return n;
   }
 
   const groupLabel = (t) => el('div', { class: 'grp-l', text: t });
   const note = (t) => el('div', { class: 'grp-note', text: t });
+
+  /**
+   * FEAT-146 phase 2 — one category's cards, in one wrapper.
+   *
+   * `anchor` is the key the `<details class="sect">` section this category
+   * REPLACED used to answer (`model`, `caps`, `instr`, `isoSection`). Carrying
+   * it here is what keeps those four deep links landing on a real node now that
+   * the sections are gone: applyFocus tries `[data-focus=key]` before
+   * `details[data-sect=key]`, so nothing about applyFocus had to change.
+   */
+  function catWrap(anchor, ...kids) {
+    const w = el('div', { class: 'scat', 'data-focus': anchor ?? null });
+    for (const k of kids.flat()) if (k) w.append(k);
+    return w;
+  }
+
+  /* ───────────── FEAT-146 — the Claude account list has ONE owner ─────────────
+   *
+   * ARCH-010: app.js owns it. It holds `ACCOUNTS`, `refreshAccounts`,
+   * `acctPlanDesc`, `acctUsageDesc` and `accountLockedReason`, and paints the
+   * launch-surface control from them. This module used to keep a SECOND list
+   * (`d.claudeAccounts`, filled by its own `api.getClaudeAccounts()` call) and a
+   * SECOND plan describer (`acctDesc`) — two places able to hold a different
+   * answer about which subscription a session will spend, which is exactly what
+   * that rule forbids. It reads the owner's copy through `ctx` now and stores
+   * none of its own; the only thing it still owns is the LOGIN flow (d.acctLogin),
+   * which is a drawer surface, not a fact about the account list.
+   */
+  /** undefined = never fetched, null = no route / unreadable, [] = only the default. */
+  const accountsState = () => ctx.accounts?.();
+  const accountList = () => (Array.isArray(accountsState()) ? accountsState() : []);
+  /** " — max, logged in" (the owner's wording), or '' when nothing is known. */
+  const acctDesc = (a) => { const s = ctx.acctPlanDesc?.(a) ?? ''; return s ? ` — ${s}` : ''; };
+  /** This account's OWN remaining 5-hour window — FEAT-145's whole point. */
+  const acctWindow = (id) => ctx.acctUsageDesc?.(id) ?? '';
+  const acctLabel = (id) => {
+    const rows = accountList();
+    if (!id || id === 'default') return rows.find((a) => a && a.id === 'default')?.label ?? 'Default (~/.claude)';
+    return rows.find((a) => a && a.id === id)?.label ?? id;
+  };
+
+  let acctTried = false;
+  /** Ask the OWNER for the list once; it caches, so this cannot loop on paint. */
+  function ensureAccounts() {
+    if (accountsState() !== undefined || acctTried) return;
+    acctTried = true;
+    Promise.resolve(ctx.refreshAccounts?.({})).then(() => { if (isOpenNow) paint(); });
+  }
 
   /**
    * A themed section of the settings view: a native <details> so expand/
@@ -316,18 +701,29 @@ export function createDrawer(ctx) {
    */
   function directoryBlock(p) {
     const missing = p.pathMissing === true;
-    const box = el('div', { class: 'proj-dir-box', 'data-missing': missing ? 'true' : 'false' });
+    /* FEAT-146 round 4 — a CARD with a normal row in it. This was the only pane
+       content outside the card system: a bare label, a path that wrapped
+       mid-token with its continuation aligned to nothing, and a `Change…` with
+       no button affordance, all floating above the first real card. The path is
+       the row's VALUE now (left-aligned and breaking anywhere, because it is a
+       path, not a scalar) and the action is a `.mini` like every other action
+       in this category. */
+    const box = el('div', { class: 'grp proj-dir-box', 'data-missing': missing ? 'true' : 'false' },
+      groupLabel('Workspace'));
 
-    const dir = el('div', { class: 'proj-dir', title: p.hostPath });
-    dir.append(el('span', { class: 'k', text: 'Directory' }));
-    dir.append(el('code', { class: 'v', text: shortPath(p.hostPath) }));
+    /* `.set.stack`, the same full-width shape the exclusion list uses: a host
+       path is 60+ characters of unbreakable token, so squeezing it into the
+       200px value rail would collapse the label column instead. */
+    const dir = el('div', { class: 'set stack proj-dir', title: p.hostPath });
+    dir.append(el('span', { class: 'l' }, el('span', { class: 'k', text: 'Directory' })));
+    dir.append(el('code', { class: 'v path', text: shortPath(p.hostPath) }));
     if (d.scope !== 'session') {
-      const change = el('button', { class: 'addrow dir-change', text: d.repoint ? 'Close' : (missing ? 'Fix…' : 'Change…') });
+      const change = el('button', { class: 'mini dir-change', text: d.repoint ? 'Close' : (missing ? 'Fix…' : 'Change…') });
       change.addEventListener('click', () => {
         if (d.repoint) { d.repoint = null; paint(); return; }
         openRepoint(p);
       });
-      dir.append(change);
+      dir.append(el('div', { class: 'cacts dir-acts' }, change));
     }
     box.append(dir);
 
@@ -389,13 +785,13 @@ export function createDrawer(ctx) {
         el('code', { class: 'p', text: shortPath(c.hostPath), title: c.hostPath }));
       if (c.confidence === 'match') top.append(el('span', { class: 'badge', text: 'matches this project' }));
       if (!armed) {
-        const pick = el('button', { class: 'addrow', text: 'Point here…' });
+        const pick = el('button', { class: 'mini', text: 'Point here…' });
         pick.addEventListener('click', () => { d.repoint.arm = c.hostPath; paint(); });
         top.append(pick);
       }
       row.append(top);
-      if (c.remoteUrl) row.append(el('div', { class: 'why', text: `git origin ${c.remoteUrl}` }));
-      else row.append(el('div', { class: 'why', text: 'not a git repository — nothing to match on' }));
+      if (c.remoteUrl) row.append(el('div', { class: 'cwhy', text: `git origin ${c.remoteUrl}` }));
+      else row.append(el('div', { class: 'cwhy', text: 'not a git repository — nothing to match on' }));
       if (armed) row.append(confirmRepoint(p, c.hostPath));
       panel.append(row);
     }
@@ -408,7 +804,7 @@ export function createDrawer(ctx) {
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && input.value.trim()) { d.repoint.manual = input.value; d.repoint.arm = input.value.trim(); paint(); }
     });
-    const go = el('button', { class: 'addrow', text: 'Point here…' });
+    const go = el('button', { class: 'mini', text: 'Point here…' });
     go.addEventListener('click', () => {
       const v = (d.repoint.manual || '').trim();
       if (v) { d.repoint.arm = v; paint(); }
@@ -422,17 +818,17 @@ export function createDrawer(ctx) {
 
   /** The armed confirm. This is the only thing here that writes anything. */
   function confirmRepoint(p, hostPath) {
-    const wrap = el('div', { class: 'wiring-confirm' });
+    const wrap = el('div', { class: 'wiring-confirm', 'data-armed': 'true' });
     wrap.append(note(
       `Point “${p.name}” at ${hostPath}. Nothing inside either directory is touched, and the sessions recorded under `
       + `${shortPath(p.hostPath)} stay listed under this project — Orchard remembers the old path instead of moving any files. `
       + 'Reversible: repoint again, or rename the directory back, and nothing is stranded.'));
-    const no = el('button', { class: 'addrow', text: 'Cancel' });
+    const no = el('button', { class: 'mini', text: 'Cancel' });
     no.addEventListener('click', () => { d.repoint.arm = null; paint(); });
-    const yes = el('button', { class: 'addrow wiring-go', text: d.repoint.busy ? 'Working…' : 'Point it here' });
+    const yes = el('button', { class: 'mini wiring-go', text: d.repoint.busy ? 'Working…' : 'Point it here' });
     if (d.repoint.busy) yes.disabled = true;
     yes.addEventListener('click', () => void applyRepoint(p, hostPath));
-    wrap.append(no, yes);
+    wrap.append(el('div', { class: 'cacts' }, no, yes));
     return wrap;
   }
 
@@ -461,34 +857,45 @@ export function createDrawer(ctx) {
 
   /* ------------------------------------------------------- settings view */
 
+  /**
+   * FEAT-146 phase 2 — the rail selects AND the pane filters.
+   *
+   * Phase 1 shipped the rail with a deliberate seam: every project category
+   * rendered the whole of this function, so selecting one moved nothing. Each
+   * category now builds only the cards it owns, and no card is built by two of
+   * them — that two-directional property is what the verify suite asserts.
+   *
+   * Nothing below CHANGES a control: every group builder is the one that was
+   * here before, called from one place instead of from a single monolith.
+   */
   function settingsView() {
-    // FEAT-139 — the scope spine. "Machine" renders the widened global-defaults
-    // panel (Appearance, machine-wide project defaults, Templates) in this same
-    // view, so the old separate "Global defaults" view is folded in here.
-    if (d.scope === 'machine') return machineDefaultsView();
     const p = project();
     const wrap = document.createDocumentFragment();
     if (!p) {
       wrap.append(el('div', { class: 'grp' }, note('No project selected.')));
       return wrap;
     }
-    const iso = project()?.isolation ?? 'direct';
     const sessionScope = d.scope === 'session';
-    const isContainer = iso === 'container';
+    const isContainer = (p.isolation ?? 'direct') === 'container';
+    switch (d.cat) {
+      case 'permissions': wrap.append(permissionsPane(p, sessionScope)); break;
+      case 'instructions': wrap.append(instructionsPane(p, sessionScope)); break;
+      case 'isolation': wrap.append(isolationPane(p, sessionScope, isContainer)); break;
+      case 'workspace': wrap.append(workspacePane(p)); break;
+      case 'advanced': wrap.append(advancedPane(p, sessionScope)); break;
+      default: wrap.append(modelPane(p, sessionScope)); break;
+    }
+    return wrap;
+  }
 
-    /* FEAT-071 — which host directory this project maps to. After a rename or a
-       relocation the display name and the path can diverge (name "orchard", path
-       elsewhere), so a quiet reference line at the top of the settings drawer
-       says which directory is actually in play. shortPath for display, full path
-       on hover (title) — leak-hygiene and discoverability in one line. */
-    if (p.hostPath) wrap.append(directoryBlock(p));
-
-    /* ---- Model & behaviour: the settings almost every session touches ---- */
+  /* ---- Model & spend: which brain, which engine, which subscription, and what
+     it is allowed to cost. The settings almost every session touches. ---- */
+  function modelPane(p, sessionScope) {
     // FEAT-118: pull the machine-wide defaults so the Model row can say what an
     // unset value actually inherits, instead of the bare word "inherit".
     ensureGlobals();
     const gModel = d.globals?.model ?? null;
-    const model = el('div', { class: 'grp' }, groupLabel('Model'));
+    const model = el('div', { class: 'grp', 'data-focus': 'projectModel' }, groupLabel('Model'));
     const modelInheritsGlobal = !sessionScope && val('model') == null && gModel;
     // FEAT-118: cycle over the SAME derived catalog the header popover and the
     // global-defaults picker use (d.modelCatalog, filled by ensureGlobals from
@@ -517,33 +924,56 @@ export function createDrawer(ctx) {
         : 'Set a machine-wide default model ›' });
       // FEAT-139 — the machine defaults are now the "Machine" scope of THIS panel,
       // not a separate view: switch scope rather than navigating away.
-      gLink.addEventListener('click', () => { d.scope = 'machine'; paint(); });
+      // FEAT-146 — the machine defaults are a rail CATEGORY now, not a scope.
+      gLink.addEventListener('click', () => selectCat('defaults', { focus: 'globalModel' }));
       model.append(gLink);
     }
 
+    /* `model` carries the anchor the retired `<details data-sect="model">`
+       section answered — see catWrap. */
+    return catWrap('model', model, providerGroup(sessionScope), projectAccountGroup(p, sessionScope));
+  }
+
+  /* ---- Permissions & tools: what a session may DO and what it can REACH.
+     (FEAT-139's "Capabilities", minus the provider — which engine runs the
+     project is a spend decision and moved to Model & spend.) ---- */
+  function permissionsPane(p, sessionScope) {
     const perms = el('div', { class: 'grp', 'data-focus': 'permissionMode' }, groupLabel('Permissions'));
     perms.append(row('permissionMode', 'Permission mode', '--permission-mode', { cycle: PERM_CYCLE }));
     const pn = permModeNote();
     if (pn) perms.append(pn);
     perms.append(listRow('allowedTools', 'Allowed tools', '--allowed-tools'));
     perms.append(listRow('disallowedTools', 'Disallowed tools', '--disallowed-tools'));
+    return catWrap('caps', perms, integrationsGroup(p, sessionScope));
+  }
 
-    /* FEAT-139 — cognitive re-grouping by what the user is DOING (see the
-       ticket's justification). "Model & spend" is the everyday knob; permissions
-       moved OUT of here into "Capabilities" (permissions are what a session may
-       DO, not which brain it uses). */
-    wrap.append(section('model', 'Model & spend', true, [model]));
+  /* ---- Instructions: how the session is GUIDED — the working-agreement stack
+     (edited in a pane-level takeover) and the response-format shaping. ---- */
+  function instructionsPane(p, sessionScope) {
+    const ins = el('div', { class: 'grp', 'data-focus': 'instructions' }, groupLabel('Instruction stack'));
+    const stack = effectiveStack();
+    ins.append(stackSummaryRow('CLAUDE.md', 'file'));
+    for (const s of stack.filter((x) => x.enabled)) {
+      ins.append(stackSummaryRow(nameOf(s.templateId), s.mode ?? modeOf(s.templateId)));
+    }
+    const go = el('button', { class: 'addrow', text: 'Edit the instruction stack ›' });
+    go.addEventListener('click', () => open('instructions', 'settings'));
+    ins.append(go);
+    return catWrap('instr', ins, responseFormatGroup(p, sessionScope));
+  }
 
-    /* ---- Isolation & environment: the isolation tier, plus the settings
-       that ONLY mean something once a container exists to hold them. Mounts
-       and the docker-socket flag are rejected server-side outside a
-       container, so showing them there would be a dead option — they render
-       here, gated on `isContainer`, instead of always. ---- */
+  /* ---- Isolation & environment: the isolation tier, plus the settings that
+     ONLY mean something once a container exists to hold them. Mounts and the
+     docker-socket flag are rejected server-side outside a container, so showing
+     them there would be a dead option — they render gated on `isContainer`.
+     Snapshots used to sit here; they are their own category now, beside the
+     list they configure. ---- */
+  function isolationPane(p, sessionScope, isContainer) {
+    const iso = p.isolation ?? 'direct';
     const runtime = el('div', { class: 'grp', 'data-focus': 'iso' }, groupLabel('Isolation'));
     const seg = el('div', { class: 'seg' });
     for (const [key, meta] of Object.entries(ISO)) {
-      const b = el('button', { 'aria-pressed': iso === key ? 'true' : 'false' },
-        el('span', { class: 'g', text: meta.g }), document.createTextNode(meta.n));
+      const b = el('button', { 'aria-pressed': iso === key ? 'true' : 'false', text: meta.n });
       if (sessionScope) b.disabled = true;
       else b.addEventListener('click', () => put('isolation', key));
       seg.append(b);
@@ -591,58 +1021,167 @@ export function createDrawer(ctx) {
       if (sessionScope) access.append(projectOnlyNote('Mounts and the socket flag'));
     }
 
-    /* Snapshots sits in this section deliberately: isolation is the layer
-       that PREVENTS damage, snapshots are the layer that UNDOES it, and a
-       container does not undo anything because it bind-mounts the real dir. */
-    wrap.append(section('iso', 'Isolation & environment', true,
-      [runtime, access, servicesGroup(p, sessionScope), snapshotsGroup(p, sessionScope)]));
+    return catWrap('isoSection', runtime, access, servicesGroup(p, sessionScope));
+  }
 
-    /* ---- FEAT-139 "Capabilities": everything that governs what a session can
-       REACH and DO — which engine runs it (provider), which integrations and
-       MCP tools it can use, and what it is permitted to do (permissions). These
-       three used to be split across "Instructions & tools" and "Model &
-       behaviour"; grouping them by the question ("what can it do?") is the
-       cognitive re-group the user asked for. ---- */
-    wrap.append(section('caps', 'Capabilities', true,
-      [providerGroup(sessionScope), integrationsGroup(p, sessionScope), perms]));
+  /* ---- Workspace: the directory this project maps to, its git state, and what
+     is running out of it. Everything here is about the real files on disk. ---- */
+  function workspacePane(p) {
+    /* FEAT-071 — which host directory this project maps to. After a rename or a
+       relocation the display name and the path can diverge (name "orchard", path
+       elsewhere), so a quiet reference line says which directory is actually in
+       play. shortPath for display, full path on hover (title) — leak-hygiene and
+       discoverability in one line. */
+    return catWrap(null, p.hostPath ? directoryBlock(p) : null, gitGroup(p), processesGroup(p));
+  }
 
-    /* ---- Instructions: how the session is GUIDED — the working-agreement
-       stack and the response-format shaping. ---- */
-    const ins = el('div', { class: 'grp', 'data-focus': 'instructions' }, groupLabel('Instructions'));
-    const stack = effectiveStack();
-    ins.append(stackSummaryRow('CLAUDE.md', 'file'));
-    for (const s of stack.filter((x) => x.enabled)) {
-      ins.append(stackSummaryRow(nameOf(s.templateId), s.mode ?? modeOf(s.templateId)));
+  /* ---- Advanced: rare maintenance that earns its collapse — methodology
+     wiring and the agent memories. The memory list is the one thing left in the
+     whole panel that is genuinely long enough to keep its `<details>`. ---- */
+  function advancedPane(p, sessionScope) {
+    return catWrap(null,
+      wiringGroup(p, sessionScope),
+      section('advanced', 'Agent memories', false, [memoriesGroup(p)]));
+  }
+
+  /**
+   * FEAT-146 — the project-scope Claude account control, which did not exist.
+   *
+   * FEAT-145 shipped the machine default and the per-launch session override,
+   * and the launch popover's locked message says, literally, "Change it in this
+   * project's settings" — pointing at a control nobody had built. The server has
+   * accepted `settings.claudeAccount` at project scope since FEAT-145 step 4
+   * (global-settings.ts writeTarget, validate.ts, containerManager desiredBinds),
+   * and a CONTAINER project is project-scope-only BY DESIGN, so a container
+   * project had no reachable way to set its account at all.
+   *
+   * It lives in Model & spend because it is a billing decision: which
+   * subscription this project's sessions spend. Each row carries the plan, the
+   * login state and that account's OWN remaining 5-hour window, because "which
+   * plan has headroom right now" is the question the control is answering.
+   *
+   * Under the SESSION lens on a container project it is visibly LOCKED with the
+   * reason on screen — never silently absent, never offered-then-rejected — and
+   * the reason is app.js's `accountLockedReason()` verbatim rather than a second
+   * phrasing of the same refusal.
+   */
+  function projectAccountGroup(p, sessionScope) {
+    const grp = el('div', { class: 'grp', 'data-focus': 'projectAccount' }, groupLabel('Claude account'));
+    ensureAccounts();
+    const st = accountsState();
+    if (st === undefined) { grp.append(note('Checking Claude accounts…')); return grp; }
+    if (st === null) {
+      grp.append(note('This server does not report Claude accounts, so the subscription cannot be pinned from here.'));
+      return grp;
     }
-    const go = el('button', { class: 'addrow', text: 'Edit the instruction stack ›' });
-    go.addEventListener('click', () => open('instructions', 'settings'));
-    ins.append(go);
+    const rows = accountList();
+    const extra = rows.filter((a) => a && a.id !== 'default');
+    /* The container refusal, in the owner's words. Only the SESSION lens is
+       refused — pinning at PROJECT scope is exactly what a container project
+       must do, and is what this control adds. */
+    const locked = sessionScope ? (ctx.accountLockedReason?.() ?? '') : '';
+    const armed = sessionScope && ('claudeAccount' in ctx.overrides);
+    const cur = val('claudeAccount') ?? null;
+    const detail = (a, id) => {
+      const plan = acctDesc(a);            // " — max, logged in"
+      const win = acctWindow(id);          // "38% of 5-hour · resets 14:20"
+      return `${plan}${win ? `${plan ? ' · ' : ' — '}${win}` : ''}`;
+    };
 
-    wrap.append(section('instr', 'Instructions', true,
-      [ins, responseFormatGroup(p, sessionScope)]));
+    if (!extra.length) {
+      const only = el('div', { class: 'set' },
+        el('span', { class: 'l' }, document.createTextNode('Account'),
+          el('span', { class: 'f', text: '--settings › claudeAccount' })),
+        el('span', { class: 'v dim', text: `${acctLabel(null)}${acctWindow('default') ? ` · ${acctWindow('default')}` : ''}` }));
+      grp.append(only);
+      grp.append(note('Only the default account (~/.claude) is set up, so every session here uses it. Add a second Claude subscription and this project can be pinned to it.'));
+      const go = el('button', { class: 'addrow', text: 'Accounts on this machine ›' });
+      go.addEventListener('click', () => selectCat('accounts', { focus: 'accounts' }));
+      grp.append(go);
+      return grp;
+    }
 
-    /* ---- Advanced: rare maintenance that earns its collapse — methodology
-       wiring, agent memories, git and stray processes. The four common sections
-       above stay open; this is the progressive-disclosure tier (FEAT-139). ---- */
-    wrap.append(section('advanced', 'Advanced', false,
-      [wiringGroup(p, sessionScope), memoriesGroup(p), gitGroup(p), processesGroup(p)]));
+    const sel = el('select', {
+      class: 'gsel', id: 'pAccountSel',
+      'aria-label': sessionScope ? 'Claude account for this session' : 'Claude account for this project',
+      'data-locked': locked ? 'true' : null,
+    });
+    const opt = (value, text, on) => { const o = el('option', { value, text }); if (on) o.selected = true; sel.append(o); };
+    const dflt = rows.find((a) => a && a.id === 'default');
+    if (sessionScope) {
+      /* Session scope mirrors the launch popover exactly: inherit, the implicit
+         default, or a named account. The write goes through app.js's own
+         pickAccount (below), so there is one writer for a session override. */
+      opt('__inherit__', `Project default — currently ${acctLabel(cur)}`, !armed);
+      opt('__default__', `${dflt?.label ?? 'Default (~/.claude)'}${detail(dflt, 'default')}`,
+        armed && (ctx.overrides.claudeAccount ?? null) === null);
+      for (const a of extra) opt(a.id, `${a.label}${detail(a, a.id)}`, armed && ctx.overrides.claudeAccount === a.id);
+    } else {
+      opt('__inherit__', `Machine default — currently ${acctLabel(d.globals?.claudeAccount ?? null)}`, cur == null);
+      for (const a of extra) opt(a.id, `${a.label}${detail(a, a.id)}`, cur === a.id);
+    }
+    if (locked) sel.disabled = true;
+    else {
+      sel.addEventListener('change', () => {
+        const v = sel.value;
+        if (sessionScope) {
+          // app.js owns the per-launch override (it persists it, tells the user,
+          // and repaints the launch pill + usage badge). Never a second writer.
+          ctx.pickSessionAccount?.(v === '__inherit__' ? undefined : v === '__default__' ? null : v);
+          paint();
+        } else {
+          // Project scope: null means "inherit the machine default" — the server
+          // maps the 'default' sentinel to null too, so never send it.
+          void put('claudeAccount', v === '__inherit__' ? null : v);
+        }
+      });
+    }
+    grp.append(sel);
 
-    if (d.scope === 'session') {
-      const l = live();
-      if (l?.ignoredOverrides?.length) {
-        wrap.append(el('div', { class: 'grp' }, note(
-          `The server accepted but could not honour: ${l.ignoredOverrides.map((i) => `${i.field} (${i.reason})`).join('; ')}.`)));
-      } else if (l) {
-        wrap.append(el('div', { class: 'grp' }, note(
-          l.overridden?.length
-            ? `Live session is running with ${l.overridden.join(', ')} overridden. These values are read back from the session, not from what was requested.`
-            : 'Live session is running on the project defaults — no override changed a value.')));
-      } else {
-        wrap.append(el('div', { class: 'grp' }, note(
-          'These apply to the next session you start from this project. They are never written to the registry.')));
+    if (locked) {
+      const warn = note(locked);
+      warn.dataset.warn = 'true';
+      grp.append(warn);
+      grp.append(note('Switch to “This project” to change it — that write is allowed, and is the only way a container project’s account can be set.'));
+    } else if (sessionScope) {
+      grp.append(note('Applies to the NEXT session launched from here — the project and machine defaults are untouched.'));
+    } else {
+      grp.append(note('Which Claude subscription this project’s sessions bill to (machine → project → session). “Machine default” follows Accounts on this machine; pinning a named account here overrides it for every session in this project. Each account is a thin overlay over ~/.claude, so the transcript history is shared — only the credential differs.'));
+      if ((p.isolation ?? 'direct') === 'container') {
+        grp.append(note('This project runs in a container, so the account is bound when the container is created: it can only be chosen here, never per session.'));
       }
     }
-    return wrap;
+    return grp;
+  }
+
+  /**
+   * FEAT-146 — the contextual live-state line. It used to be the last card at
+   * the bottom of a ~2,000-word scroll, which is the one place a statement about
+   * what the live session is actually running cannot do its job.
+   *
+   * Round 4 moved it out of the FOOTER and to the top of the pane, and deleted
+   * one of its branches. In a 44px bar beside the write-target hint the two
+   * strings clipped each other — the hint needed 299px and got 201, this line
+   * needed 476px and got 320, two adjacent ellipses in the one place that tells
+   * you where your writes are going. And the branch that was deleted ("These
+   * apply to the next session you start from this project…") said the same
+   * thing the hint beside it already said, so half the crowding bought nothing.
+   * What is left is only what the hint cannot say: what the LIVE session is
+   * really running with.
+   */
+  function liveStateText() {
+    if (d.scope !== 'session') return '';
+    if (catOf(d.cat).group !== 'project') return '';
+    const l = live();
+    if (l?.ignoredOverrides?.length) {
+      return `The server accepted but could not honour: ${l.ignoredOverrides.map((i) => `${i.field} (${i.reason})`).join('; ')}.`;
+    }
+    if (l) {
+      return l.overridden?.length
+        ? `Live session is running with ${l.overridden.join(', ')} overridden. These values are read back from the session, not from what was requested.`
+        : 'Live session is running on the project defaults — no override changed a value.';
+    }
+    return '';
   }
 
   /**
@@ -655,15 +1194,14 @@ export function createDrawer(ctx) {
    * launch then fails honestly with the same hint).
    */
   function providerGroup(sessionScope) {
-    const grp = el('div', { class: 'grp' }, groupLabel('Provider'));
+    const grp = el('div', { class: 'grp', 'data-focus': 'provider' }, groupLabel('Provider'));
     const cur = val('provider') ?? 'anthropic';
     const seg = el('div', { class: 'seg prov-seg' });
     for (const o of [
-      { key: 'anthropic', g: '✳', n: 'Claude' },
-      { key: 'openai', g: '⌬', n: 'OpenAI Codex' },
+      { key: 'anthropic', n: 'Claude' },
+      { key: 'openai', n: 'OpenAI Codex' },
     ]) {
-      const b = el('button', { 'data-prov': o.key, 'aria-pressed': String(cur === o.key) },
-        el('span', { class: 'g', text: o.g }), document.createTextNode(o.n));
+      const b = el('button', { 'data-prov': o.key, 'aria-pressed': String(cur === o.key), text: o.n });
       b.addEventListener('click', () => {
         if (cur === o.key) return;
         // Session scope: picking the project's own default is "no override" —
@@ -734,13 +1272,15 @@ export function createDrawer(ctx) {
     // FEAT-051 — the terse when-to-use line, same wording as the crown chip's hover.
     row.append(el('div', { class: 'use1', text: 'real profile, stays logged in, survives bot checks' }));
 
-    const why = el('div', { class: 'why' });
+    // FEAT-146 round 4 — no inline `browser.enabled` copy: the key is already
+    // on its own line in the row's `.f` sub-label directly above, and dumping it
+    // a second time mid-paragraph broke the sentence in half.
+    const why = el('div', { class: 'set-why' });
     why.append(document.createTextNode(on
       ? 'On. Sessions in this project can navigate, read rendered pages, screenshot, click and type — which is how they reach pages that refuse a plain fetch. '
       : 'Off. Turning it on gives this project’s sessions a real browser, for pages that refuse a plain fetch. '));
-    why.append(el('code', { text: 'browser.enabled' }));
     // The two things a user will otherwise learn the hard way.
-    why.append(el('br'), document.createTextNode(
+    why.append(document.createTextNode(
       'The browser profile persists per project, so logins and cookies carry between sessions; sites behind hard Cloudflare are not reliably reachable, and a cold profile is challenged more than a warmed one.'));
     row.append(why);
     grp.append(row);
@@ -863,10 +1403,9 @@ export function createDrawer(ctx) {
       sw));
     // FEAT-051 — terse when-to-use, mirrored on the crown chip's hover.
     if (spec.use) row.append(el('div', { class: 'use1', text: spec.use }));
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     why.append(document.createTextNode(on ? spec.onText : spec.offText));
-    why.append(el('code', { text: spec.code }));
-    why.append(el('br'), document.createTextNode(spec.tail));
+    why.append(document.createTextNode(spec.tail));
     row.append(why);
     return row;
   }
@@ -950,11 +1489,10 @@ export function createDrawer(ctx) {
         el('span', { class: 'f', text: '--settings › responseDigest.enabled' })),
       sw));
     row.append(el('div', { class: 'use1', text: 'scannable orchard-digest summary atop substantive replies' }));
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     why.append(document.createTextNode(on
       ? 'On. Sessions here are instructed to lead substantive replies with the orchard-digest envelope, and the transcript lifts it into a scannable summary. '
       : 'Off. Neither injected nor parsed — plain prose only, and no tokens spent on the instruction. '));
-    why.append(el('code', { text: 'responseDigest.enabled' }));
     row.append(why);
     grp.append(row);
 
@@ -970,9 +1508,13 @@ export function createDrawer(ctx) {
   function guidanceRow(readOnly, cfg) {
     const wrap = el('div', { class: 'digest-guidance' });
     const cur = typeof cfg.guidance === 'string' ? cfg.guidance : '';
+    // FEAT-146 round 4 — `.vin` and `rows` are gone: `.vin` is the right-aligned
+    // inline value input (wrong shape entirely for a paragraph), and `rows`
+    // fought the CSS min-height. The field is styled in styles.css `.guidance-in`
+    // — full width, 96px, vertical-only resize, real theme tokens and the app's
+    // own mono stack. It rendered as a raw light-grey UA widget in dark theme.
     const ta = el('textarea', {
-      class: 'vin guidance-in',
-      rows: '3',
+      class: 'guidance-in',
       maxlength: String(GUIDANCE_MAX),
       spellcheck: 'true',
       placeholder: 'Optional per-project nudge — verbosity, detail, style, when to emit. Steers tone only; the JSON format stays fixed.',
@@ -1024,7 +1566,23 @@ export function createDrawer(ctx) {
    * a registry-only change (reversible in the instruction stack above) and needs
    * no arm. After any Apply the panel re-fetches so the row flips live.
    */
-  const WIRING_ICON = { ok: '✅', warn: '⚠️', missing: '❌', info: 'ℹ️' };
+/* FEAT-146 round 4 — GREYSCALE, and a word rather than a glyph.
+ *
+ * These six rows used to be led by `✅ ⚠️ ❌ ℹ️` in a 13px `.ic` span, which
+ * fell through to Noto Color Emoji and painted Material red 500 and a Material
+ * blue — the only two hues anywhere in the product, on the least important
+ * screen in the modal, shouting louder than the provenance chip that is
+ * supposed to be the one loud element. The state is reported in the panel's own
+ * existing greyscale idiom instead: `.prov-state`, a dot plus a word, the same
+ * component the provider verdict below uses. `--live` for present, `--warn` for
+ * partial, a hollow ring for missing — luminance and shape, never hue.
+ */
+const WIRING_STATE = {
+  ok: { status: 'connected', text: 'present' },
+  warn: { status: 'installed-not-signed-in', text: 'partial' },
+  missing: { status: 'not-installed', text: 'missing' },
+  info: { status: 'unknown', text: 'not applicable' },
+};
 
   function wiringGroup(p, readOnly) {
     const grp = el('div', { class: 'grp wiring', 'data-focus': 'wiring' }, groupLabel('Wiring'));
@@ -1034,9 +1592,9 @@ export function createDrawer(ctx) {
       return grp;
     }
     if (d.wiring === null) {
-      const retry = el('button', { class: 'addrow', text: 'Check again' });
+      const retry = el('button', { class: 'mini', text: 'Check again' });
       retry.addEventListener('click', () => { d.wiring = undefined; paint(); });
-      grp.append(note('This server has no wiring route yet (predates FEAT-076); wiring status is unavailable.'), retry);
+      grp.append(note('This server has no wiring route yet (predates FEAT-076); wiring status is unavailable.'), el('div', { class: 'cacts' }, retry));
       return grp;
     }
     grp.append(note('Which of our methodology layers this project actually has — computed live from the registry and the files on disk, so it can’t drift. Apply sets up a missing layer from here.'));
@@ -1051,13 +1609,15 @@ export function createDrawer(ctx) {
 
   function wiringRow(p, c, readOnly) {
     const row = el('div', { class: 'wiring-row', 'data-state': c.state });
+    const st = WIRING_STATE[c.state] ?? WIRING_STATE.info;
     const top = el('div', { class: 'top' },
-      el('span', { class: 'ic', 'aria-hidden': 'true', text: WIRING_ICON[c.state] ?? 'ℹ️' }),
-      el('span', { class: 'l', text: c.label }));
+      el('span', { class: 'l', text: c.label }),
+      el('span', { class: 'prov-state', 'data-status': st.status },
+        el('span', { class: 'dot', 'aria-hidden': 'true' }), document.createTextNode(st.text)));
     const busy = d.wiringBusy === c.key;
     if (c.apply && !readOnly && d.wiringArm !== c.key) {
       const label = c.apply === 'attach-wa' ? 'Attach' : 'Scaffold…';
-      const btn = el('button', { class: 'addrow wiring-apply', text: busy ? 'Working…' : label });
+      const btn = el('button', { class: 'mini wiring-apply', text: busy ? 'Working…' : label });
       if (busy || d.wiringBusy) btn.disabled = true;
       btn.addEventListener('click', () => {
         if (c.apply === 'attach-wa') void applyWiring(p, c);   // registry-only, no arm
@@ -1066,18 +1626,18 @@ export function createDrawer(ctx) {
       top.append(btn);
     }
     row.append(top);
-    row.append(el('div', { class: 'why', text: c.detail }));
+    row.append(el('div', { class: 'set-why', text: c.detail }));
 
     /* Armed scaffold confirm — names the exact repo the write lands in. */
     if (c.apply === 'onboard' && d.wiringArm === c.key && !readOnly) {
-      const confirm = el('div', { class: 'wiring-confirm' });
+      const confirm = el('div', { class: 'wiring-confirm', 'data-armed': 'true' });
       confirm.append(note(`Scaffold the ticket board, drift-guard and conventions stub into “${p.name}” (${shortPath(p.hostPath)}). Idempotent — existing files are left untouched.`));
-      const no = el('button', { class: 'addrow', text: 'Cancel' });
+      const no = el('button', { class: 'mini', text: 'Cancel' });
       no.addEventListener('click', () => { d.wiringArm = null; paint(); });
-      const yes = el('button', { class: 'addrow wiring-go', text: busy ? 'Working…' : `Scaffold into ${p.name}` });
+      const yes = el('button', { class: 'mini wiring-go', text: busy ? 'Working…' : `Scaffold into ${p.name}` });
       if (busy) yes.disabled = true;
       yes.addEventListener('click', () => void applyWiring(p, c));
-      confirm.append(no, yes);
+      confirm.append(el('div', { class: 'cacts' }, no, yes));
       row.append(confirm);
     }
     return row;
@@ -1189,7 +1749,10 @@ export function createDrawer(ctx) {
 
   async function refreshBrowser(id) {
     d.browser = await api.browserStatus(id);
-    if (d.view === 'settings') paint();
+    // FEAT-146 phase 2 — repaint whenever the modal is open, not only when the
+    // settings pane is showing: these reads now feed the rail DOTS too, and a dot
+    // on an unvisited category must land even while another one is on screen.
+    if (isOpenNow) paint();
   }
 
   async function putBrowser(patch) {
@@ -1248,7 +1811,7 @@ export function createDrawer(ctx) {
   }
 
   function snapshotsGroup(p, readOnly) {
-    const grp = el('div', { class: 'grp' }, groupLabel('Snapshots'));
+    const grp = el('div', { class: 'grp', 'data-focus': 'snapshotsGroup' }, groupLabel('Snapshots'));
     /* Fetch BEFORE deciding what to draw, and regardless of the stored flag:
        the stored flag can be null ("auto") and only the server knows how that
        resolves. Drawing "Off" first and correcting later would be a lie for as
@@ -1280,7 +1843,7 @@ export function createDrawer(ctx) {
         el('span', { class: 'f', text: '--settings › snapshots.enabled' })),
       sw));
 
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     if (unknown) {
       why.append(document.createTextNode(
         'Checking whether this project is being snapshotted. It is set to follow the runtime, and only the server can say how that resolves.'));
@@ -1357,10 +1920,8 @@ export function createDrawer(ctx) {
     const fails = d.snaps.failures ?? [];
     if (fails.length) grp.append(failureNote(fails));
 
-    const list = d.snaps.snapshots ?? [];
-    const go = el('button', { class: 'addrow', text: `${list.length} snapshot${list.length === 1 ? '' : 's'} · open the list ›` });
-    go.addEventListener('click', () => open('snapshots', 'settings'));
-    grp.append(go);
+    /* FEAT-146 phase 2 — no "open the list ›" any more: the list is the rest of
+       THIS category, directly below. */
     return grp;
   }
 
@@ -1376,7 +1937,7 @@ export function createDrawer(ctx) {
    */
   function liveFailureNote(error) {
     const n = el('div', { class: 'risk', 'data-on': 'true' });
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     why.append(el('b', { text: 'This session has no restore point. ' }));
     why.append(document.createTextNode(
       'Its start snapshot did not complete, so nothing here can put the directory back to how it was when the session began. Taking one now protects everything from this moment on, but not what has already changed.'));
@@ -1387,7 +1948,7 @@ export function createDrawer(ctx) {
 
   function failureNote(fails) {
     const n = el('div', { class: 'risk', 'data-on': 'true' });
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     const f = fails[0];
     why.append(el('b', { text: fails.length === 1 ? 'The last snapshot failed. ' : `${fails.length} snapshots failed. ` }));
     why.append(document.createTextNode(
@@ -1427,7 +1988,7 @@ export function createDrawer(ctx) {
 
   async function refreshSnaps(id) {
     d.snaps = await api.listSnapshots(id);
-    if (d.view === 'settings' || d.view === 'snapshots') paint();
+    if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
   }
 
   /* --------------------------------------------------------- git group */
@@ -1440,7 +2001,7 @@ export function createDrawer(ctx) {
 
   async function refreshGit(id) {
     d.git = await api.gitStatus(id);
-    if (d.view === 'settings') paint();
+    if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
   }
 
   async function gitDo(action, body, okText) {
@@ -1474,19 +2035,19 @@ export function createDrawer(ctx) {
     if (!s.repo) {
       grp.append(note('Not a git repository — this project’s only history is snapshots.'));
       if (d.gitArm === 'init') {
-        const acts = el('div', { class: 'cacts' });
+        const acts = el('div', { class: 'cacts', 'data-armed': 'true' });
         const no = el('button', { class: 'mini', text: 'Not now' });
         no.addEventListener('click', () => { d.gitArm = null; paint(); });
         const yes = el('button', { class: 'mini', text: 'Init repository' });
         yes.addEventListener('click', () => void gitDo('init', {}, () => 'initialised an empty repository on branch main'));
         acts.append(el('span', { class: 'grp-note inline', text: 'Local only — nothing leaves this machine.' }), no, yes);
         grp.append(acts);
+        grp.append(el('div', { class: 'cacts' }, terminalRow(p)));
       } else {
-        const init = el('button', { class: 'addrow', text: 'git init — start tracking this project ›' });
+        const init = el('button', { class: 'mini', text: 'git init' });
         init.addEventListener('click', () => { d.gitArm = 'init'; paint(); });
-        grp.append(init);
+        grp.append(el('div', { class: 'cacts' }, init, terminalRow(p)));
       }
-      grp.append(terminalRow(p));
       return grp;
     }
 
@@ -1499,12 +2060,18 @@ export function createDrawer(ctx) {
     if (s.lastCommit) line.append(el('span', { class: 'u', text: `last: ${s.lastCommit}` }));
     grp.append(line);
 
-    const workbench = el('button', { class: 'addrow', text: s.dirty ? `Review and stage ${s.dirty} changed file${s.dirty === 1 ? '' : 's'} ›` : 'Open Git workbench ›' });
+    /* FEAT-146 round 4 — ONE action idiom. This card used to stack three: a
+       bare text link with a `›`, a bordered `.mini`, and a bare `↻`. Because
+       only the middle one had a border, its label was optically indented 19px
+       from the links above and below it. Every action in this card is a `.mini`
+       in one row now. */
+    const workbench = el('button', { class: 'mini', text: s.dirty ? `Review and stage ${s.dirty} changed file${s.dirty === 1 ? '' : 's'}` : 'Open Git workbench' });
     workbench.addEventListener('click', () => ctx.openGit?.());
-    grp.append(workbench);
 
     const acts = el('div', { class: 'cacts' });
+    if (d.gitArm !== 'push' && d.gitArm !== 'create') acts.append(workbench);
     if (d.gitArm === 'push') {
+      acts.dataset.armed = 'true';
       const no = el('button', { class: 'mini', text: 'Not now' });
       no.addEventListener('click', () => { d.gitArm = null; paint(); });
       const yes = el('button', { class: 'mini', text: s.upstream ? 'Push' : `Push -u origin ${s.branch}` });
@@ -1512,7 +2079,8 @@ export function createDrawer(ctx) {
       yes.addEventListener('click', () => void gitDo('push', {}, (r) => `pushed · ${r.detail || 'ok'}`));
       acts.append(el('span', { class: 'grp-note inline', text: `This publishes commits to ${s.remoteUrl ?? 'the remote'}.` }), no, yes);
     } else if (d.gitArm === 'create') {
-      const nameIn = el('input', { class: 'vin narrow', type: 'text', spellcheck: 'false', 'aria-label': 'Repository name' });
+      acts.dataset.armed = 'true';
+      const nameIn = el('input', { class: 'gtext narrow', type: 'text', spellcheck: 'false', 'aria-label': 'Repository name' });
       nameIn.value = (p.hostPath.split('/').pop() ?? 'repo');
       const no = el('button', { class: 'mini', text: 'Not now' });
       no.addEventListener('click', () => { d.gitArm = null; paint(); });
@@ -1538,17 +2106,16 @@ export function createDrawer(ctx) {
         create.addEventListener('click', () => { d.gitArm = 'create'; paint(); });
         acts.append(create);
       }
-      const rf = el('button', { class: 'mini', text: '↻' , title: 'Refresh status' });
+      const rf = el('button', { class: 'mini', text: 'Refresh', title: 'Re-read git status' });
       rf.addEventListener('click', () => { d.git = undefined; paint(); });
-      acts.append(rf);
+      acts.append(rf, terminalRow(p));
     }
     grp.append(acts);
-    grp.append(terminalRow(p));
     return grp;
   }
 
   function terminalRow(p) {
-    const t = el('button', { class: 'addrow', text: 'Open a terminal here (kitty) ›', title: p.hostPath });
+    const t = el('button', { class: 'mini', text: 'Open a terminal (kitty)', title: p.hostPath });
     t.addEventListener('click', async () => {
       try {
         const r = await api.openTerminal(p.id);
@@ -1564,7 +2131,7 @@ export function createDrawer(ctx) {
 
   async function refreshProcs(id) {
     d.procs = await api.projectProcesses(id);
-    if (d.view === 'settings') paint();
+    if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
   }
 
   function processesGroup(p) {
@@ -1584,9 +2151,9 @@ export function createDrawer(ctx) {
       + ` — ${listening || 'none'} listening on a port; the rest are things like Claude sessions and their tool shims.`
       + ' Stopping sends SIGTERM to that pid only.'));
     for (const pr of d.procs) grp.append(procRow(p, pr));
-    const rf = el('button', { class: 'addrow', text: '↻ refresh' });
+    const rf = el('button', { class: 'mini', text: 'Refresh' });
     rf.addEventListener('click', () => { d.procs = undefined; paint(); });
-    grp.append(rf);
+    grp.append(el('div', { class: 'cacts' }, rf));
     return grp;
   }
 
@@ -1601,6 +2168,7 @@ export function createDrawer(ctx) {
     if (pr.self) {
       acts.append(el('span', { class: 'grp-note inline', text: 'won’t stop itself' }));
     } else if (d.procConfirm === pr.pid) {
+      acts.dataset.armed = 'true';
       const no = el('button', { class: 'mini', text: 'Keep' });
       no.addEventListener('click', () => { d.procConfirm = null; paint(); });
       const yes = el('button', { class: 'mini', text: 'Stop it' });
@@ -1637,31 +2205,17 @@ export function createDrawer(ctx) {
   async function refreshMemories(id) {
     d.memories = await api.listMemories(id);
     d.memBody.clear();
-    if (d.view === 'settings' || d.view === 'memories') paint();
+    if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
   }
 
+  /**
+   * FEAT-146 phase 2 — the memory LIST renders here, inline in Advanced, instead
+   * of behind a "open the list ›" navigation into a separate view. One surface,
+   * one builder: `memoriesView()` below is the same card, kept so the old
+   * `open('memories')` door still resolves.
+   */
   function memoriesGroup(p) {
-    const grp = el('div', { class: 'grp' }, groupLabel('Agent memories'));
-    if (d.memories === undefined) {
-      void refreshMemories(p.id);
-      grp.append(note('Checking for memory files…'));
-      return grp;
-    }
-    if (d.memories === null) return grp.append(note('This server does not list memories yet.')), grp;
-    const files = (d.memories.memories ?? []).filter((f) => !f.isIndex);
-    const go = el('button', { class: 'addrow', text: files.length
-      ? `${files.length} memor${files.length === 1 ? 'y' : 'ies'} shaping every session here · open the list ›`
-      : 'no memories recorded for this project · open ›' });
-    go.addEventListener('click', () => open('memories', 'settings'));
-    grp.append(go);
-    return grp;
-  }
-
-  function memoriesView() {
-    const p = project();
-    const wrap = document.createDocumentFragment();
-    if (!p) return wrap;
-    const grp = el('div', { class: 'grp' }, groupLabel('Agent memories'));
+    const grp = el('div', { class: 'grp', 'data-focus': 'memories' }, groupLabel('Agent memories'));
     const intro = el('div', { class: 'grp-note' });
     intro.append(document.createTextNode('What Claude concluded and saved about this project — auto-loaded into every session. '),
       el('code', { text: 'CLAUDE.md' }),
@@ -1669,23 +2223,16 @@ export function createDrawer(ctx) {
     grp.append(intro);
 
     if (d.memories === undefined) {
-      grp.append(note('Loading…'));
       void refreshMemories(p.id);
-      wrap.append(grp);
-      return wrap;
+      grp.append(note('Checking for memory files…'));
+      return grp;
     }
-    if (d.memories === null) {
-      grp.append(note('This server does not list memories yet.'));
-      wrap.append(grp);
-      return wrap;
-    }
+    if (d.memories === null) return grp.append(note('This server does not list memories yet.')), grp;
     const files = d.memories.memories ?? [];
     if (!files.length) {
       grp.append(note('No memory files exist for this project — nothing is being silently loaded into its sessions.'));
-      wrap.append(grp);
-      return wrap;
+      return grp;
     }
-
     const multiDir = new Set(files.map((f) => f.dir)).size > 1;
     let lastDir = null;
     for (const f of files) {
@@ -1695,7 +2242,14 @@ export function createDrawer(ctx) {
       }
       grp.append(memoryFileRow(p, f));
     }
-    wrap.append(grp);
+    return grp;
+  }
+
+  function memoriesView() {
+    const wrap = document.createDocumentFragment();
+    const p = project();
+    if (!p) return wrap;
+    wrap.append(memoriesGroup(p));
     return wrap;
   }
 
@@ -1727,6 +2281,7 @@ export function createDrawer(ctx) {
         const acts = el('div', { class: 'cacts' });
         if (!f.isIndex) {
           if (d.memConfirm === key) {
+            acts.dataset.armed = 'true';
             const no = el('button', { class: 'mini', text: 'Keep' });
             no.addEventListener('click', () => { d.memConfirm = null; paint(); });
             const yes = el('button', { class: 'mini', text: 'Delete it' });
@@ -1763,8 +2318,15 @@ export function createDrawer(ctx) {
     const p = project();
     const wrap = document.createDocumentFragment();
     if (!p) return wrap;
+    /* FEAT-146 phase 2 — the settings card that decides whether snapshots happen
+       at all now sits directly above the list it governs, instead of in
+       Isolation two categories away. */
+    wrap.append(snapshotsGroup(p, d.scope === 'session'));
 
-    const grp = el('div', { class: 'grp' }, groupLabel('Snapshots'));
+    /* "Taken so far", not a second card headed "Snapshots": the settings card
+       directly above already carries that name, and two identical headings in
+       one pane is the kind of thing the old scroll got away with. */
+    const grp = el('div', { class: 'grp', 'data-focus': 'snapshots' }, groupLabel('Taken so far'));
     const intro = el('div', { class: 'grp-note' });
     intro.append(document.createTextNode('Reflink copies of '));
     intro.append(el('code', { text: shortPath(p.hostPath) }));
@@ -1810,7 +2372,8 @@ export function createDrawer(ctx) {
     if (!list.length) grp.append(note('No snapshots yet. One is taken automatically each time a session starts on this project.'));
     for (const s of list) grp.append(snapRow(p, s));
 
-    grp.append(exclusionTruth());
+    /* exclusionTruth() is NOT repeated here any more: the card above states it
+       once, next to the exclude list it is about. */
     wrap.append(grp);
     return wrap;
   }
@@ -1854,6 +2417,7 @@ export function createDrawer(ctx) {
       acts.append(rest);
 
       if (d.confirmDelete === s.id) {
+        acts.dataset.armed = 'true';
         const no = el('button', { class: 'mini', text: 'Keep' });
         no.addEventListener('click', () => { d.confirmDelete = null; paint(); });
         const yes = el('button', { class: 'mini', text: 'Delete it' });
@@ -1898,7 +2462,10 @@ export function createDrawer(ctx) {
    */
   function restoreCeremony(p, s) {
     const st = d.restore;
-    const box = el('div', { class: 'ceremony' });
+    // data-armed is read by the modal's close guard (FEAT-146): a backdrop click
+    // or Esc must not discard a half-finished ceremony. Marker only — nothing
+    // about this ceremony's wording, styling or placement changes.
+    const box = el('div', { class: 'ceremony', 'data-armed': 'true' });
 
     const h = el('div', { class: 'ch' });
     h.append(document.createTextNode('Overwrite '));
@@ -1986,7 +2553,11 @@ export function createDrawer(ctx) {
     const acts = el('div', { class: 'cacts' });
     const cancel = el('button', { class: 'mini', text: 'Cancel' });
     cancel.addEventListener('click', () => { d.restore = null; paint(); });
-    const go = el('button', { class: 'mini danger', text: `Restore ${p.name}` });
+    // FEAT-146 round 4 — NOT `Restore ${p.name}`. A 62-character project name
+    // made an 830px button, and a longer one would wrap or overflow. Which
+    // project is being overwritten is stated three times above this button, in
+    // the heading, the path line and the field label you just typed it into.
+    const go = el('button', { class: 'mini danger', text: 'Restore this project' });
     const ok = () => input.value.trim() === p.name;
     go.disabled = !ok();
     input.addEventListener('input', () => { st.typed = input.value; go.disabled = !ok(); });
@@ -2212,7 +2783,7 @@ export function createDrawer(ctx) {
     const sw = el('button', { class: 'sw', 'data-risk': '', 'aria-pressed': String(on), 'aria-label': 'Toggle docker socket access' }, el('i'));
     risk.append(el('div', { class: 'top' }, el('span', { class: 'l', text: 'Docker socket' }), sw));
 
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     if (on) {
       why.append(
         document.createTextNode('On. This session can start containers of its own, outside this one — the isolation you set above stops at the socket. '
@@ -2272,6 +2843,12 @@ export function createDrawer(ctx) {
     const effective = d.container && !d.container.problem ? d.container.image : null;
     const n = el('div', { class: 'set' });
     n.append(el('span', { class: 'l' }, document.createTextNode('Base image'), el('span', { class: 'f', text: '--settings › container.image' })));
+    // container.* is project-only by design (a per-session image would rebuild
+    // the container under every other session), so under the session lens the
+    // chip says exactly that rather than "inherited".
+    const p = provOf({ project: isSet(cur), projectOnly: true });
+    const chip = provChip(p);
+    if (chip) n.append(chip);
     const input = el('input', { class: 'vin', type: 'text', spellcheck: 'false', 'aria-label': 'Base image', placeholder: effective ?? 'default' });
     input.value = cur ?? '';
     if (readOnly) input.disabled = true;
@@ -2283,6 +2860,11 @@ export function createDrawer(ctx) {
     input.addEventListener('blur', commit);
     input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
     n.append(input);
+    n.append(gutter(n, {
+      key: 'container.image', label: 'Base image', prov: p, why: WHY['container.image'], control: input,
+      resetTo: { level: 'built-in', text: 'Orchard’s own image' },
+      onReset: readOnly ? null : () => void putContainer({ image: null }),
+    }));
     return n;
   }
 
@@ -2290,14 +2872,33 @@ export function createDrawer(ctx) {
 
   function memoryRow(readOnly = false) {
     const cur = settings().container?.memoryMb ?? null;
-    const n = el(readOnly ? 'div' : 'button', { class: 'set', title: readOnly ? '' : 'Click to change' });
-    n.append(el('span', { class: 'l' }, document.createTextNode('Memory cap'), el('span', { class: 'f', text: '--settings › container.memoryMb' })));
-    n.append(el('span', { class: 'v', text: cur ? `${(cur / 1024).toFixed(0)} GB` : 'default' }));
-    if (readOnly) return n;
-    n.addEventListener('click', () => {
-      const i = MEM_CYCLE.indexOf(cur);
-      void putContainer({ memoryMb: MEM_CYCLE[(i + 1) % MEM_CYCLE.length] });
-    });
+    const n = el('div', { class: 'set' });
+    const p = provOf({ project: isSet(cur), projectOnly: true });
+    const lab = el('span', { class: 'l' }, document.createTextNode('Memory cap'), el('span', { class: 'f', text: '--settings › container.memoryMb' }));
+    const valueText = cur ? `${(cur / 1024).toFixed(0)} GB` : 'default';
+    const v = el('span', { class: `v${p ? '' : ' dim'}`, text: valueText });
+    const chip = provChip(p);
+    if (readOnly) {
+      n.append(lab);
+      if (chip) n.append(chip);
+      n.append(v);
+    } else {
+      n.dataset.cycle = 'true';
+      n.title = 'Click to change';
+      n.append(el('button', { type: 'button', class: 'set-main', 'aria-label': `Memory cap: ${valueText}. Activate to change.` },
+        lab, chip, v));
+      n.addEventListener('click', () => {
+        const i = MEM_CYCLE.indexOf(cur);
+        void putContainer({ memoryMb: MEM_CYCLE[(i + 1) % MEM_CYCLE.length] });
+      });
+    }
+    n.append(gutter(n, {
+      // No reset: the server has no "unset" for this field (validate.ts requires
+      // an integer >= 512), and inventing one would mean a second write path
+      // into container settings. The gutter is still reserved, so the row's
+      // geometry matches every other row exactly.
+      key: 'container.memoryMb', label: 'Memory cap', prov: p, onReset: null,
+    }));
     return n;
   }
 
@@ -2373,7 +2974,7 @@ export function createDrawer(ctx) {
       d.container = null;
       ctx.notify(`container status: ${err.message}`, true);
     }
-    if (d.view === 'settings') paint();
+    if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
   }
 
   /* --------------------------------------------------- instructions view */
@@ -2394,7 +2995,7 @@ export function createDrawer(ctx) {
     const iso = l?.isolation ?? project()?.isolation ?? 'direct';
     const calm = iso === 'container';
     const n = el('div', { class: 'risk', 'data-on': String(!calm) });
-    const why = el('div', { class: 'why' });
+    const why = el('div', { class: 'set-why' });
     if (calm) {
       why.append(document.createTextNode(l?.permissionModeSource === 'container-default'
         ? 'Approvals are skipped by default here — the container is the safety boundary, so tools run without asking.'
@@ -2458,7 +3059,11 @@ export function createDrawer(ctx) {
       }
       const gone = repl > -1 && i < repl;
       const t = el('div', { class: `trow${r.enabled ? '' : ' off'}${gone ? ' gone' : ''}` });
-      t.append(el('span', { class: 'grip', title: 'Use the arrows to reorder', text: '⠿' }));
+      // FEAT-146 — the `⠿` drag handle is GONE. It was never draggable: it had
+      // no drag listeners and its own title said "Use the arrows to reorder",
+      // so it advertised an interaction the row does not support. An affordance
+      // that lies is worse than no affordance; the ▲/▼ arrows are the real (and
+      // keyboard-reachable) reorder control.
 
       const cb = el('button', { class: 'cb', 'aria-pressed': String(r.enabled), 'aria-label': `Toggle ${r.name}`, text: '✓' });
       if (r.pin) cb.disabled = true;
@@ -2569,7 +3174,9 @@ export function createDrawer(ctx) {
   function templateRow(t) {
     const b = el('button', { class: 'lrow' });
     const nm = el('span', { class: 'nm' });
-    if (t.living) nm.append(el('span', { class: 'spark' }));
+    // FEAT-146 round 4 — the marker column is RESERVED on every row. Rendering
+    // it only on `living` rows put sibling titles on two left rails 25px apart.
+    nm.append(el('span', { class: `spark${t.living ? '' : ' off'}`, 'aria-hidden': 'true' }));
     nm.append(document.createTextNode(t.name));
     const mid = el('span', { class: 'mid' }, nm, el('span', { class: 'desc', text: t.description || '—' }));
     // Provenance: only surface a real `source:` (the read-through repo file).
@@ -2595,7 +3202,9 @@ export function createDrawer(ctx) {
    *   • Other templates — anything the user created themselves.
    */
   function libraryView() {
-    const wrap = document.createDocumentFragment();
+    /* FEAT-146 phase 2 — carries the `globalTemplates` anchor: a deep link at
+       the templates library lands on the library, not on a link to it. */
+    const wrap = catWrap('globalTemplates');
 
     if (!d.templates.length) {
       const empty = el('div', { class: 'grp' }, groupLabel('Templates'));
@@ -2630,12 +3239,14 @@ export function createDrawer(ctx) {
       // section content gets the same horizontal inset instead of sitting
       // flush against the drawer edge. `.sect .grp:first-of-type` zeroes its
       // top margin, so it tucks directly under the summary.
-      const grp = el('div', { class: 'grp' });
-      grp.append(note('Reusable dispatch SHAPES from real projects. Nothing auto-injects these — a project only gets one if it explicitly opts in. Niche but proven; expand to browse.'));
-      grp.append(el('div', { style: 'height:6px' }));
-      for (const t of patterns) grp.append(templateRow(t));
-      const sect = section('patterns', `Patterns (opt-in) · ${patterns.length}`, false, [grp]);
-      if (sect) wrap.append(sect);
+      // FEAT-146 round 4 — the <details> goes INSIDE the card, not around it.
+      // `PATTERNS (OPT-IN) · 4` was a card header with no card under it: the
+      // summary sat on the pane background while every other heading in the
+      // modal sits on a `.grp`.
+      const kids = [note('Reusable dispatch SHAPES from real projects. Nothing auto-injects these — a project only gets one if it explicitly opts in. Niche but proven; expand to browse.')];
+      for (const t of patterns) kids.push(templateRow(t));
+      const sect = section('patterns', `Patterns (opt-in) · ${patterns.length}`, false, kids);
+      if (sect) wrap.append(el('div', { class: 'grp' }, sect));
     }
 
     // ---- Other (user-created) templates ----
@@ -2668,18 +3279,22 @@ export function createDrawer(ctx) {
     d.editing = t;
     d.back = 'library';
     d.view = 'editor';
-    node.body.hidden = true;
+    // FEAT-146 — the editor is a pane-level takeover INSIDE the content column
+    // (it keeps the ← button), never a nested modal. So the other views simply
+    // switch off; the pane host itself stays put.
+    for (const n of Object.values(node.views)) n.classList.remove('on');
     node.editor.classList.add('on');
-    node.title.textContent = t.name;
-    node.eyebrow.textContent = 'Template';
-    node.scope.hidden = true;
-    node.back.hidden = false;
     clear(node.edMeta);
     node.edMeta.append(document.createTextNode(t.description || 'No description.'));
     node.edMeta.append(el('span', { class: 'u', text: `${t.id || 'new'} · default mode ${t.defaultMode}${t.living ? ' · living' : ''}` }));
     node.edText.value = t.body ?? '';
+    // paint() returns early for the editor, so the close guard's dirty-field
+    // baseline is stamped here instead — unsaved template text is exactly what
+    // a stray backdrop click must not be allowed to throw away.
+    node.edText.dataset.base146 = node.edText.value;
     updateEdFoot();
-    slide.open();
+    openModal();
+    paintChrome();
   }
 
   function updateEdFoot() {
@@ -2719,9 +3334,8 @@ export function createDrawer(ctx) {
     if (!stack.some((s) => s.templateId === d.editing.id)) {
       void setStack([...stack, { templateId: d.editing.id, enabled: true }]);
     }
-    d.back = 'settings';
+    d.back = catOf(d.cat).view;
     d.view = 'instructions';
-    node.body.hidden = false;
     node.editor.classList.remove('on');
     paint();
   });
@@ -2743,6 +3357,9 @@ export function createDrawer(ctx) {
   function ensureGlobals() {
     if (d.globals !== undefined || d.globalsInflight) return;
     d.globalsInflight = true;
+    /* FEAT-146 — the account list is NOT fetched here any more. app.js owns it
+       (ARCH-010); `ensureAccounts()` asks the owner and this module keeps no
+       copy of its own. */
     Promise.all([
       api.getSettings(),
       api.models('anthropic'),
@@ -2757,7 +3374,13 @@ export function createDrawer(ctx) {
       d.globalProjects = [];
     }).finally(() => {
       d.globalsInflight = false;
-      if (d.view === 'globals' || d.view === 'settings') paint();
+      // FEAT-146 round 4 — `'machine'` was missing. FEAT-146 introduced it as
+      // the view every machine-scope category renders through, and this guard
+      // was never updated, so the FIRST-ever visit to Accounts / New-project
+      // defaults painted "Loading machine-wide defaults…" and the resolution
+      // repainted nothing: the user sat on a loading string until their next
+      // click. Reported by the round-3 suite sweep, fixed here.
+      if (d.view === 'globals' || d.view === 'settings' || d.view === 'machine') paint();
     });
   }
 
@@ -2803,6 +3426,336 @@ export function createDrawer(ctx) {
     return seg;
   }
 
+  /* ------------------------------- FEAT-145 step 3: Claude accounts + login */
+
+  /**
+   * Re-read the account list and repaint. FEAT-146: the READ belongs to app.js
+   * (see the ARCH-010 note at the top of this file) — this asks the owner to
+   * refresh and then repaints, rather than keeping a second list. `acctDesc`
+   * (plan + login state) is the owner's `acctPlanDesc`, for the same reason.
+   */
+  function refreshAccounts() {
+    return Promise.resolve(ctx.refreshAccounts?.({ force: true }))
+      .then(() => { if (isOpenNow) paint(); });
+  }
+
+  function closeLoginSocket(L) {
+    if (!L?.ws) return;
+    try { L.ws.close(); } catch { /* already gone */ }
+    L.ws = null;
+  }
+
+  /**
+   * Drive one "Add account" login over the SAME WebSocket endpoint the rest of
+   * the app uses (api.wsUrl) — a login is not a session, so it gets its own
+   * connection rather than sharing the session-driving socket, exactly like
+   * app.js's passive watch socket.
+   *
+   * The server owns the CLI: it streams output, scrapes the authorize URL,
+   * takes the pasted code on stdin, and kills the whole process group on
+   * cancel/close. This side only renders and relays.
+   */
+  function startLogin(account) {
+    const L = {
+      accountId: account.id,
+      label: account.label,
+      url: null,
+      status: null,       // { message, urlFound, raw } — the degradation report
+      done: null,         // the single verdict event
+      sent: false,        // a code has been handed over
+      ws: null,
+      // Owned DOM: a repaint re-appends these nodes instead of rebuilding them,
+      // so streamed output is never lost and a half-typed code survives.
+      out: el('pre', { class: 'loginout', 'aria-label': 'Claude CLI output' }),
+      codeInput: el('input', {
+        type: 'text', class: 'gtext', id: 'gAcctCode', autocomplete: 'off', spellcheck: 'false',
+        // Short on purpose: the drawer column is ~200px, and a longer
+        // placeholder is truncated mid-word (measured in the real drawer).
+        placeholder: 'paste the code',
+        'aria-label': 'Authorization code from the Claude sign-in page',
+      }),
+    };
+    d.acctLogin = L;
+    let ws;
+    try {
+      ws = new WebSocket(api.wsUrl());
+    } catch (err) {
+      L.done = { ok: false, reason: `could not open a connection to the server: ${err.message}` };
+      paint();
+      return;
+    }
+    L.ws = ws;
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ type: 'claude-login-start', accountId: account.id }));
+    });
+    ws.addEventListener('message', (ev) => {
+      let e;
+      try { e = JSON.parse(ev.data); } catch { return; }
+      if (d.acctLogin !== L) return; // a newer attempt owns the panel
+      if (e.t === 'claude-login-output') {
+        // Append in place — no repaint, so the user's cursor and scroll stay put.
+        L.out.append(document.createTextNode(e.text));
+        L.out.scrollTop = L.out.scrollHeight;
+        return;
+      }
+      if (e.t === 'claude-login-url') { L.url = e.url; paint(); return; }
+      if (e.t === 'claude-login-status') { L.status = e; paint(); return; }
+      if (e.t === 'claude-login-done') {
+        L.done = e;
+        closeLoginSocket(L);
+        if (e.ok) {
+          ctx.notify(`Claude account “${L.label}” is signed in${e.subscriptionType ? ` (${e.subscriptionType})` : ''}`);
+          void refreshAccounts();
+        } else if (e.accountRemoved) {
+          void refreshAccounts();
+        }
+        paint();
+        return;
+      }
+      if (e.t === 'error') {
+        L.done = { ok: false, reason: e.message };
+        closeLoginSocket(L);
+        void refreshAccounts();
+        paint();
+      }
+    });
+    ws.addEventListener('close', () => {
+      if (d.acctLogin !== L || L.done) return;
+      // The server cancels the CLI when this socket drops, so saying the
+      // sign-in stopped is the truth, not a guess.
+      L.done = { ok: false, reason: 'the connection to the server dropped — the sign-in was stopped' };
+      void refreshAccounts();
+      paint();
+    });
+  }
+
+  /** The label form. A label is user-supplied because it names the user's own
+   *  subscription (e.g. "work" vs "personal"); the CLI's `email` field is not
+   *  reliable enough to build this on — it has been observed both null and
+   *  populated for real subscription logins, so nothing branches on it. */
+  function addAccountForm() {
+    const box = el('div', { class: 'gcustom' });
+    const input = el('input', {
+      type: 'text', class: 'gtext', id: 'gAcctLabel',
+      placeholder: 'e.g. Work Max plan',
+      'aria-label': 'Name for the new Claude account',
+      value: d.acctAdd?.label ?? '',
+    });
+    const go = el('button', { type: 'button', class: 'gbtn', id: 'gAcctCreate', text: 'Add' });
+    const cancel = el('button', { type: 'button', class: 'mini', text: 'Cancel' });
+    cancel.addEventListener('click', () => { d.acctAdd = null; paint(); });
+    const submit = async () => {
+      const label = input.value.trim();
+      if (!label) { ctx.notify('give the account a name so you can tell the two subscriptions apart', true); return; }
+      go.disabled = true;
+      d.acctAdd = { label, busy: true };
+      try {
+        const account = await api.createClaudeAccount(label);
+        d.acctAdd = null;
+        await refreshAccounts();
+        startLogin(account);
+        paint();
+      } catch (err) {
+        d.acctAdd = { label, busy: false };
+        ctx.notify(`could not add the account: ${err.message}`, true);
+        paint();
+      }
+    };
+    go.addEventListener('click', submit);
+    input.addEventListener('input', () => { if (d.acctAdd) d.acctAdd.label = input.value; });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); } });
+    if (d.acctAdd?.busy) { go.disabled = true; go.textContent = 'Adding…'; }
+    box.append(input, go, cancel);
+    return box;
+  }
+
+  /** The live sign-in panel: the URL (clickable AND selectable), the code
+   *  field, the CLI's own output, and a cancel that really stops the CLI. */
+  function loginPanel() {
+    const L = d.acctLogin;
+    // FEAT-146 round 4 — the heading was `SIGNING IN — <label>`, uppercase and
+    // tracked at full card width, so a 76-character account label wrapped at
+    // 800px. A fixed heading, with the user's own string in sentence case below
+    // it where wrapping is ordinary.
+    const box = el('div', { class: 'acctlogin' }, groupLabel('Signing in'));
+    box.append(note(L.label));
+
+    if (L.done) {
+      box.append(note(L.done.ok
+        ? `Signed in. “${L.label}” is ready to use${L.done.subscriptionType ? ` on the ${L.done.subscriptionType} plan` : ''}.`
+        : `Not signed in. ${L.done.reason}`));
+      if (!L.done.ok && !L.done.accountRemoved) {
+        box.append(note('The account was kept as “not logged in yet” so you can try again; delete it below if you would rather start over.'));
+      }
+      const acts = el('div', { class: 'cacts' });
+      const close = el('button', { class: 'mini', text: 'Close' });
+      close.addEventListener('click', () => { d.acctLogin = null; void refreshAccounts(); paint(); });
+      acts.append(close);
+      box.append(L.out, acts);
+      return box;
+    }
+
+    if (L.url) {
+      box.append(note('Open this page, approve the sign-in, then paste the code it gives you below. It opens on THIS device only if you click it — the address is shown in full so you can open it on the machine where you are signed in to Claude.'));
+      const link = el('a', { class: 'acctlink', href: L.url, target: '_blank', rel: 'noopener noreferrer', text: 'Open the Claude sign-in page ↗' });
+      box.append(link);
+      // FEAT-146 round 4 — `joined`: a field and the button that acts on that
+      // field are one control, not two bordered boxes 15px apart.
+      const urlRow = el('div', { class: 'gcustom joined' });
+      const urlField = el('input', { type: 'text', class: 'gtext mono', readonly: true, value: L.url, 'aria-label': 'Claude sign-in URL' });
+      urlField.addEventListener('focus', () => urlField.select());
+      const copy = el('button', { type: 'button', class: 'gbtn', text: 'Copy' });
+      copy.addEventListener('click', async () => {
+        try { await navigator.clipboard.writeText(L.url); ctx.notify('sign-in link copied'); }
+        catch { urlField.select(); ctx.notify('press ⌘/Ctrl-C to copy the selected link', true); }
+      });
+      urlRow.append(urlField, copy);
+      box.append(urlRow);
+    } else if (L.status && L.status.urlFound === false) {
+      box.append(note(L.status.message));
+      box.append(note('Raw output from the CLI (no sign-in link was recognised in it):'));
+      box.append(el('pre', { class: 'loginout', text: L.status.raw ?? '' }));
+    } else {
+      box.append(note('Starting the Claude CLI and waiting for its sign-in link…'));
+      if (L.status) box.append(note(L.status.message));
+    }
+
+    const codeRow = el('div', { class: 'gcustom joined' });
+    const sendCode = el('button', { type: 'button', class: 'gbtn', id: 'gAcctCodeSend', text: L.sent ? 'Resend' : 'Send code' });
+    const submitCode = () => {
+      const code = L.codeInput.value.trim();
+      if (!code) { ctx.notify('paste the code from the sign-in page first', true); return; }
+      if (!L.ws || L.ws.readyState !== WebSocket.OPEN) { ctx.notify('the sign-in connection is closed — cancel and try again', true); return; }
+      L.ws.send(JSON.stringify({ type: 'claude-login-code', code }));
+      // Clear it immediately: the code is a credential, and it is never needed
+      // again on this side (the server holds it only to redact it from output).
+      L.codeInput.value = '';
+      L.sent = true;
+      paint();
+    };
+    sendCode.addEventListener('click', submitCode);
+    L.codeInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submitCode(); } });
+    codeRow.append(L.codeInput, sendCode);
+    box.append(codeRow);
+
+    box.append(L.out);
+
+    const acts = el('div', { class: 'cacts' });
+    const cancel = el('button', { class: 'mini danger', id: 'gAcctCancel', text: 'Cancel sign-in' });
+    cancel.addEventListener('click', () => {
+      if (L.ws && L.ws.readyState === WebSocket.OPEN) L.ws.send(JSON.stringify({ type: 'claude-login-cancel' }));
+      else { closeLoginSocket(L); d.acctLogin = null; void refreshAccounts(); paint(); }
+    });
+    acts.append(el('span', { class: 'grp-note inline', text: 'Stops the CLI and removes the half-made account.' }), cancel);
+    box.append(acts);
+    return box;
+  }
+
+  /** The account list + its delete ceremony + the add/login surface. */
+  function accountsPanel(accounts) {
+    const box = el('div', { class: 'grp acctlist', 'data-focus': 'accounts' }, el('div', { class: 'grp-l sub', text: 'Accounts on this machine' }));
+    for (const a of accounts) {
+      const row = el('div', { class: 'set' });
+      row.append(el('span', { class: 'l' },
+        document.createTextNode(a.id === 'default' ? 'Default (~/.claude)' : a.label),
+        el('span', { class: 'f', text: a.id === 'default'
+          ? 'the credential this machine already had'
+          : `${a.state === 'ready' ? 'signed in' : 'not signed in yet'}${a.lastStatus?.subscriptionType ? ` · ${a.lastStatus.subscriptionType} plan` : ''}` })));
+      if (a.id !== 'default') {
+        if (d.acctConfirm === a.id) {
+          row.dataset.armed = 'true';
+          const no = el('button', { class: 'mini', text: 'Keep' });
+          no.addEventListener('click', () => { d.acctConfirm = null; paint(); });
+          const yes = el('button', { class: 'mini danger', text: `Delete “${a.label}”` });
+          yes.addEventListener('click', async () => {
+            yes.disabled = true;
+            try {
+              await api.deleteClaudeAccount(a.id);
+              ctx.notify(`Claude account “${a.label}” deleted — its credential is gone`);
+            } catch (err) {
+              ctx.notify(`could not delete “${a.label}”: ${err.message}`, true);
+            }
+            d.acctConfirm = null;
+            await refreshAccounts();
+          });
+          row.append(el('span', { class: 'v' }, no, yes));
+        } else {
+          const del = el('button', { class: 'mini x', text: 'Delete…' });
+          del.addEventListener('click', () => { d.acctConfirm = a.id; paint(); });
+          row.append(el('span', { class: 'v' }, del));
+        }
+      }
+      /* The default row gets NO `.v` value: that column is a narrow mono slot
+         (it wraps a two-word phrase one letter per line), and the only thing
+         there is to say about the default is already its sub-label. It is also
+         the honest choice — nothing probes ~/.claude's plan, so a "max" there
+         would be invented. */
+      box.append(row);
+      // The confirm names the account AND what deleting it costs — this removes
+      // a credential, which no other row in this drawer does.
+      if (d.acctConfirm === a.id) {
+        box.append(note(`Deleting “${a.label}” signs that subscription out of Orchard: its ~/.claude overlay and the credential inside it are removed (the shared transcript history is untouched). You would add it again with a fresh sign-in.`));
+      }
+    }
+
+    if (d.acctLogin) {
+      box.append(loginPanel());
+    } else if (d.acctAdd) {
+      box.append(addAccountForm());
+      box.append(note('Name it however you think of it — “Work Max”, “Personal”. The Claude CLI reports no name for a subscription login, so this label is the only way to tell two plans apart.'));
+    } else {
+      const add = el('button', { class: 'addrow', id: 'gAcctAdd', text: '+ Add account' });
+      add.addEventListener('click', () => { d.acctAdd = { label: '', busy: false }; paint(); });
+      box.append(add);
+      box.append(note('Signs a second Claude subscription in through the Claude CLI: Orchard shows you the sign-in link, you paste back the code, and the credential is stored in that account’s own overlay of ~/.claude. Nothing is swapped by hand and the transcript history stays shared.'));
+    }
+    return box;
+  }
+
+  /**
+   * The Accounts CATEGORY (FEAT-146 phase 2): which subscription new sessions
+   * bill to by default, then the accounts themselves — list, add, sign-in,
+   * delete. It used to be one card buried three quarters of the way down the
+   * machine-defaults scroll.
+   *
+   * ---- FEAT-145 step 4 ----
+   * Inherited LIVE like model/effort (machine → project → session). Each account
+   * is a thin overlay over ~/.claude that differs only in the credential, so the
+   * transcript history is shared.
+   */
+  function accountsPane() {
+    ensureAccounts();
+    const ag = el('div', { class: 'grp', 'data-focus': 'globalAccount' }, groupLabel('Default Claude account'));
+    const st = accountsState();
+    if (st === undefined) {
+      ag.append(note('Checking accounts…'));
+      return catWrap(null, ag);
+    }
+    const rows = accountList();
+    const extra = rows.filter((a) => a && a.id !== 'default');
+    if (!extra.length) {
+      ag.append(note('Only the default account (~/.claude) is set up, so every session uses it. Add a second Claude subscription below to switch plans without swapping credentials by hand — sessions still share one transcript history.'));
+    } else {
+      const g = d.globals ?? {};
+      const asel = el('select', { class: 'gsel', id: 'gAccountSel', 'aria-label': 'Global default Claude account' });
+      const curAccount = g.claudeAccount ?? null;
+      const dfltRow = rows.find((a) => a && a.id === 'default');
+      const win = (id) => { const w = acctWindow(id); return w ? ` · ${w}` : ''; };
+      const o0 = el('option', { value: '', text: `Default (~/.claude)${acctDesc(dfltRow)}${win('default')}` });
+      if (!curAccount) o0.selected = true;
+      asel.append(o0);
+      for (const a of extra) {
+        const o = el('option', { value: a.id, text: `${a.label}${acctDesc(a)}${win(a.id)}` });
+        if (curAccount === a.id) o.selected = true;
+        asel.append(o);
+      }
+      asel.addEventListener('change', () => saveGlobal('claudeAccount', asel.value || null));
+      ag.append(asel);
+      ag.append(note('Which Claude subscription new sessions bill to (machine → project → session). Each account is a thin overlay over ~/.claude — the transcript history is shared, only the credential differs. A project can pin its own account under Model & spend.'));
+    }
+    return catWrap(null, ag, accountsPanel(rows));
+  }
+
   /* FEAT-139 — appearance is a machine-wide preference, so it lives in the
      Machine scope beside the other machine defaults. localStorage stays the fast
      client read; this is the surface. ctx owns the <html>/localStorage write. */
@@ -2824,18 +3777,55 @@ export function createDrawer(ctx) {
     return grp;
   }
 
+  /**
+   * FEAT-146 round 4 — the second thing Appearance owns.
+   *
+   * "Show all descriptions" is a MACHINE-level visual preference (it is stored
+   * in localStorage, it applies to every project, and it changes nothing but
+   * what is on screen), and until now the only way to reach it was a toggle in
+   * the footer — which says what it does but not that the choice persists. It
+   * belongs here, stated as a default, with the footer toggle left in place as
+   * the in-context switch. One preference, one store: both read and write
+   * `d.whyAll` through setWhyAll, so there is no second place holding an answer.
+   */
+  function descriptionsGroup() {
+    const grp = el('div', { class: 'grp', 'data-focus': 'descriptions' }, groupLabel('Descriptions'));
+    const seg = el('div', { class: 'seg gseg' });
+    seg.setAttribute('role', 'group');
+    seg.setAttribute('aria-label', 'When to show setting descriptions');
+    for (const [on, label] of [[false, 'Only when asked'], [true, 'Always show']]) {
+      const b = el('button', { 'aria-pressed': String(d.whyAll === on), text: label });
+      b.addEventListener('click', () => { if (d.whyAll !== on) setWhyAll(on); });
+      seg.append(b);
+    }
+    grp.append(seg);
+    grp.append(note(d.whyAll
+      ? 'Every ⓘ description is expanded as soon as a category opens. The same switch is in the footer of every category.'
+      : 'A setting’s description stays collapsed until you press its ⓘ. Sentences about data loss, security or cost are never behind an icon — they always render in full, and the absence of an ⓘ is itself the signal.'));
+    return grp;
+  }
+
+  /**
+   * FEAT-146 phase 2 — the machine group filters too: Appearance, Accounts and
+   * New-project defaults are three categories, not one long scroll.
+   */
   function machineDefaultsView() {
     const wrap = document.createDocumentFragment();
+    if (d.cat === 'appearance') {
+      wrap.append(catWrap(null, appearanceGroup(), descriptionsGroup()));
+      return wrap;
+    }
     ensureGlobals();
+    if (d.cat === 'accounts') {
+      wrap.append(accountsPane());
+      return wrap;
+    }
     if (d.globals === undefined) {
-      wrap.append(appearanceGroup());
       wrap.append(el('div', { class: 'grp' }, note('Loading machine-wide defaults…')));
       return wrap;
     }
     const g = d.globals;
     const catalog = d.modelCatalog ?? [];
-
-    wrap.append(appearanceGroup());
 
     const intro = el('div', { class: 'grp' }, groupLabel('What these are'));
     intro.append(note('The defaults every new project on this machine starts from. Model and effort are inherited LIVE — change one and every project that hasn’t set its own picks it up on its next session (order: machine → project → session). The new-project defaults below (isolation, dispatch, MCP tools) SEED a project when it is created; changing them never rewrites projects that already exist.'));
@@ -2909,7 +3899,7 @@ export function createDrawer(ctx) {
     wrap.append(mg);
 
     /* ---- default effort ---- */
-    const eg = el('div', { class: 'grp' }, groupLabel('Default effort'));
+    const eg = el('div', { class: 'grp', 'data-focus': 'globalEffort' }, groupLabel('Default effort'));
     const esel = el('select', { class: 'gsel', id: 'gEffortSel', 'aria-label': 'Global default effort' });
     esel.append(el('option', { value: '', text: 'No global default' }));
     for (const ev of ['low', 'medium', 'high', 'xhigh', 'max']) {
@@ -2928,8 +3918,16 @@ export function createDrawer(ctx) {
     const np = el('div', { class: 'grp', 'data-focus': 'newProjectDefaults' }, groupLabel('New-project defaults'));
     np.append(note('What a newly-created project is set up with, unless you choose otherwise for it at creation. “Built-in” uses Orchard’s own default. Changing these does not touch projects that already exist.'));
 
+    /* These rows are LABEL + a full-width `.seg` beneath — a scalar row and a
+       block never share one row. The chip still belongs on the label row: here
+       the write target IS the machine, so a stored seed reads as filled
+       `machine` and an unset one carries no chip at all. */
     const isoRow = el('div', { class: 'set gset' });
     isoRow.append(el('span', { class: 'l', text: 'Isolation' }, el('span', { class: 'f', text: 'do sessions run in a container?' })));
+    const isoProv = provOf({ machine: isSet(g.isolation), target: 'machine' });
+    const isoChip = provChip(isoProv);
+    if (isoChip) isoRow.append(isoChip);
+    isoRow.append(gutter(isoRow, { key: 'global.isolation', label: 'Isolation', prov: isoProv, onReset: null }));
     np.append(isoRow);
     np.append(globalSeg('isolation', [['container', 'Container'], ['sandbox', 'Sandbox'], ['direct', 'Direct']], g.isolation));
     np.append(note(g.isolation === 'container'
@@ -2945,27 +3943,31 @@ export function createDrawer(ctx) {
     ]) {
       const r = el('div', { class: 'set gset' });
       r.append(el('span', { class: 'l', text: spec.label }, el('span', { class: 'f', text: spec.flag })));
+      const prov = provOf({ machine: isSet(g[spec.field]), target: 'machine' });
+      const chip = provChip(prov);
+      if (chip) r.append(chip);
+      const seg = globalSeg(spec.field, [[true, 'On'], [false, 'Off']], g[spec.field]);
+      // The seg IS this row's control, so it is what carries aria-describedby
+      // while the description is open; role="group" makes it a legal target.
+      seg.setAttribute('role', 'group');
+      seg.setAttribute('aria-label', spec.label);
+      r.append(gutter(r, {
+        key: `global.${spec.field}`, label: spec.label, prov, why: WHY[spec.field], control: seg, onReset: null,
+      }));
       np.append(r);
-      np.append(globalSeg(spec.field, [[true, 'On'], [false, 'Off']], g[spec.field]));
+      np.append(seg);
     }
     np.append(note('Playwright still only attaches on a machine where its binary is provisioned — On here means “try it”, not “force it”.'));
     wrap.append(np);
 
-    /* ---- Templates: shared instruction library, reachable from the one panel
-       (its old sidebar door was removed in FEAT-139). ---- */
-    const tg = el('div', { class: 'grp' }, groupLabel('Templates'));
-    const tCount = d.templates.length;
-    const tLink = el('button', { class: 'addrow', text: tCount
-      ? `Instruction templates (${tCount}) ›`
-      : 'Instruction templates ›' });
-    tLink.addEventListener('click', () => open('library', 'settings'));
-    tg.append(tLink);
-    tg.append(note('Reusable instruction blocks shared across every project. Attach them to a project in its Instructions section.'));
-    wrap.append(tg);
+    /* FEAT-146 phase 2 — the "Instruction templates ›" link card is gone: the
+       library is a rail category one click away, so a link to it from here was a
+       second door to the same room. Its `globalTemplates` anchor now lands on
+       the Templates category itself. */
 
     /* ---- which projects override the model default ---- */
     const overriders = (d.globalProjects ?? []).filter((p) => p?.settings && p.settings.model != null);
-    const og = el('div', { class: 'grp' }, groupLabel('Projects that override the model'));
+    const og = el('div', { class: 'grp', 'data-focus': 'modelOverrides' }, groupLabel('Projects that override the model'));
     if (d.globalProjects === undefined) {
       og.append(note('Checking projects…'));
     } else if (!overriders.length) {
@@ -2987,15 +3989,15 @@ export function createDrawer(ctx) {
   /* -------------------------------------------------------------- paint */
 
   const VIEWS = {
-    settings: { el: 'settings', title: 'Project settings', build: settingsView, scope: true },
-    // FEAT-139 — machine defaults are now the "Machine" scope of the settings
-    // view; this stand-alone entry is retained only so a stale deep-link can't
-    // throw, and reuses the same builder.
-    globals: { el: 'globals', title: 'Settings', build: machineDefaultsView, scope: false },
-    instructions: { el: 'instructions', title: 'Instructions', build: instructionsView, scope: true },
-    snapshots: { el: 'snapshots', title: 'Snapshots', build: snapshotsView, scope: false },
-    library: { el: 'library', title: 'Templates', build: libraryView, scope: false },
-    memories: { el: 'memories', title: 'Agent memories', build: memoriesView, scope: false },
+    settings: { el: 'settings', build: settingsView },
+    // FEAT-146 — machine defaults are a rail GROUP now, not a scope and not a
+    // separate door. They render into the same pane host; there is no state to
+    // preserve between the two, so no second host earns its keep.
+    machine: { el: 'settings', build: machineDefaultsView },
+    instructions: { el: 'instructions', title: 'Instructions', build: instructionsView },
+    snapshots: { el: 'snapshots', build: snapshotsView },
+    library: { el: 'library', build: libraryView },
+    memories: { el: 'memories', title: 'Agent memories', build: memoriesView },
   };
 
   /**
@@ -3052,30 +4054,269 @@ export function createDrawer(ctx) {
     });
   }
 
+  /* ─────────────────────────── FEAT-146: the rail ─────────────────────── */
+
+  /** Build the rail ONCE per open. Never rebuilt on a lens flip or a repaint —
+   *  rebuilding it would move focus out from under the keyboard user mid-browse
+   *  and is exactly the page instability the lens is designed not to cause. */
+  function buildRail() {
+    clear(node.rail);
+    let group = null;
+    let list = null;
+    for (const c of RAIL) {
+      if (c.group !== group) {
+        group = c.group;
+        const h = el('h3', { id: `sRailH-${group}`, text: GROUP_LABEL[group] });
+        node.rail.append(h);
+        list = el('ul', { role: 'list', 'aria-labelledby': h.id });
+        node.rail.append(list);
+      }
+      const b = el('button', {
+        type: 'button',
+        class: 'srail-item',
+        id: `sRail-${c.id}`,
+        'data-cat': c.id,
+        tabindex: '-1',
+      }, el('span', { class: 'n', text: c.label }), el('span', { class: 'd', 'aria-hidden': 'true' }));
+      b.addEventListener('click', () => selectCat(c.id));
+      list.append(el('li', {}, b));
+    }
+    node.rail.addEventListener('keydown', onRailKey);
+    markRail();
+  }
+
+  const railItems = () => [...node.rail.querySelectorAll('.srail-item')];
+
+  /** Is the rail the horizontal strip? (the <860px layout — see styles.css) */
+  const railIsStrip = () => window.matchMedia?.('(max-width: 860px)')?.matches === true;
+
+  /**
+   * FEAT-146 round 4 — bring the SELECTED category into view.
+   *
+   * Below 860px the rail is a horizontal scroller measuring scrollWidth 1499
+   * against clientWidth 500: five items off screen at 800px and seven at 500px,
+   * and nothing ever scrolled the selected one back. Selecting a category by
+   * deep link, by keyboard, or by `selectCat` from another card could leave the
+   * one thing that says where you are entirely off the left edge — and at 500px
+   * the pill that WAS partly visible was sliced mid-word.
+   *
+   * `inline: 'center'` so a selection never lands flush against the fade, and
+   * `block: 'nearest'` so this can never scroll the pane or the page. Guarded on
+   * the strip layout: the desktop rail is `overflow: hidden` and has nothing to
+   * scroll, so calling this there could only move an ancestor.
+   */
+  function revealSelectedCat() {
+    if (!railIsStrip()) return;
+    node.rail.querySelector(`.srail-item[data-cat="${d.cat}"]`)
+      ?.scrollIntoView({ inline: 'center', block: 'nearest' });
+    updateRailEdges();
+  }
+
+  /**
+   * FEAT-146 round 5 — the edge fades say where the strip ACTUALLY continues.
+   *
+   * Round 4 added a 24px mask fade at both ends of the narrow rail so "there is
+   * more" is visible without a scrollbar. It was static: both ends faded even at
+   * `scrollLeft: 0`, so the left edge suggested content behind it when the strip
+   * was already at its start — a fade that means "more this way" is a lie in the
+   * one position where there is nothing that way, and it dims the FIRST category
+   * for no reason.
+   *
+   * The scroll position is the fact; nothing else can derive it. It is written
+   * ONCE here onto `data-edge` (a token list: `start`, `end`, both, or `none`)
+   * and the stylesheet reads it — no second copy, no per-rule recomputation
+   * (docs/CONVENTIONS.md, ARCH-010). Cheap enough for a scroll handler: two
+   * layout reads and a string compare, and the attribute is only written when
+   * the token set actually changes.
+   *
+   * The 1px slack absorbs fractional scroll offsets (a zoomed or
+   * device-pixel-ratio'd layout makes `scrollLeft` fractional, and an exact
+   * `=== max` test would flicker the end fade on and off at rest).
+   */
+  function updateRailEdges() {
+    const r = node.rail;
+    if (!r) return;
+    const max = r.scrollWidth - r.clientWidth;
+    const atStart = r.scrollLeft <= 1;
+    const atEnd = max <= 1 || r.scrollLeft >= max - 1;
+    const v = [atStart ? null : 'start', atEnd ? null : 'end'].filter(Boolean).join(' ') || 'none';
+    if (r.dataset.edge !== v) r.dataset.edge = v;
+  }
+
+  /** Selection state only — no DOM rebuild, so focus and scroll survive. */
+  function markRail() {
+    for (const b of railItems()) {
+      const on = b.dataset.cat === d.cat;
+      if (on) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
+      b.tabIndex = on ? 0 : -1;               // roving tabindex
+    }
+    // The pane is labelled by whichever rail button is selected.
+    node.body.setAttribute('aria-labelledby', `sRail-${d.cat}`);
+    revealSelectedCat();
+    // Unconditionally, not only via revealSelectedCat: at desktop width that
+    // returns early, and a stale `start end` left over from a narrow layout
+    // would outlive the layout it described.
+    updateRailEdges();
+  }
+
+  /**
+   * Live/needs-you dots, updated IN PLACE on every paint. Silence is the
+   * default: a category whose state is still unfetched gets no dot rather than
+   * a reassuring blank one. No counts, no badges.
+   */
+  function paintRailDots() {
+    const dot = (id, v) => {
+      const b = node.rail.querySelector(`.srail-item[data-cat="${id}"]`);
+      if (!b) return;
+      if (v) b.dataset.dot = v; else delete b.dataset.dot;
+    };
+    const p = project();
+    /* FEAT-146 phase 2 — the real conditions, all read from state the panel
+       already holds (prefetchForDots asks for the three that need a route, on
+       open, exactly as the old all-in-one pane did). A category whose state is
+       still unfetched gets NO dot: silence, never a reassuring blank one.
+
+       --warn = something needs YOU. --live = something is running. */
+    const ss = ctx.getStartSnapshot?.();
+    const snapFailed = ss?.status === 'failed'
+      || (!!d.snaps && !d.snaps.problem && (d.snaps.failures ?? []).length > 0);
+    // A named account that was added but never signed in is dead weight the user
+    // has to finish; a login IN FLIGHT is waiting on a pasted code.
+    const pendingAcct = accountList().some((a) => a && a.id !== 'default' && a.state !== 'ready');
+    dot('model', d.scope === 'session' && !!live() ? 'live' : null);
+    dot('workspace', p?.pathMissing === true ? 'warn'
+      : Array.isArray(d.procs) && d.procs.length ? 'live'
+      : (d.git && d.git.repo && d.git.dirty > 0) ? 'warn' : null);
+    dot('isolation', d.container && !d.container.problem && d.container.running ? 'live' : null);
+    dot('snapshots', snapFailed ? 'warn' : null);
+    dot('accounts', (d.acctLogin && !d.acctLogin.done) || pendingAcct ? 'warn' : null);
+  }
+
+  /**
+   * FEAT-146 phase 2 — the pane renders ONE category now, so the reads that used
+   * to happen merely because everything was on screen have to be asked for. Same
+   * routes, same moment (modal open) as before the split; the rail DOTS are what
+   * consume them, so a category the user has not visited can still say "there is
+   * something running here" or "this needs you".
+   */
+  function prefetchForDots() {
+    const p = project();
+    ensureAccounts();
+    if (!p) return;
+    if (d.git === undefined) void refreshGit(p.id);
+    if (d.procs === undefined) void refreshProcs(p.id);
+    if (d.snaps === undefined) void refreshSnaps(p.id);
+    if ((p.isolation ?? 'direct') === 'container' && d.container === undefined) void refreshContainer(p.id);
+  }
+
+  /**
+   * Select a rail category. Deliberately does NOT rebuild the rail, so a
+   * keyboard user can arrow through categories without losing focus.
+   */
+  function selectCat(id, opts = null) {
+    const c = catOf(id);
+    if (d.cat !== c.id) d.paneScroll.set(d.cat, node.body.scrollTop);
+    d.cat = c.id;
+    d.view = c.view;
+    d.back = null;
+    d.focus = opts?.focus ? { key: String(opts.focus), applied: false } : null;
+    markRail();
+    paint();
+    if (!d.focus) node.body.scrollTop = d.paneScroll.get(c.id) ?? 0;
+  }
+
+  function onRailKey(e) {
+    const items = railItems();
+    const i = items.indexOf(e.target.closest('.srail-item'));
+    if (i < 0) return;
+    // Below 860px the rail is a horizontal strip, so the axis flips with it.
+    const horizontal = window.matchMedia?.('(max-width: 860px)')?.matches === true;
+    const prev = horizontal ? 'ArrowLeft' : 'ArrowUp';
+    const next = horizontal ? 'ArrowRight' : 'ArrowDown';
+    let j = -1;
+    if (e.key === next) j = Math.min(items.length - 1, i + 1);       // crosses the group boundary
+    else if (e.key === prev) j = Math.max(0, i - 1);
+    else if (e.key === 'Home') j = 0;
+    else if (e.key === 'End') j = items.length - 1;
+    else if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      // Only Enter/Space moves focus INTO the pane. Arrows browse.
+      e.preventDefault();
+      selectCat(items[i].dataset.cat);
+      node.body.focus();
+      return;
+    } else return;
+    e.preventDefault();
+    selectCat(items[j].dataset.cat);
+    items[j].focus();   // arrow navigation keeps focus in the rail
+  }
+
+  /* ─────────────────────── FEAT-146: paint ─────────────────────── */
+
+  /** Baseline for "is this free-text field dirty?" — see closeGuard. Stamped
+   *  after every paint, because every commit in this panel triggers one. */
+  function stampBaselines() {
+    for (const n of node.body.querySelectorAll('input[type="text"], input[type="search"], input:not([type]), textarea')) {
+      if (n.readOnly || n.disabled) { delete n.dataset.base146; continue; }
+      n.dataset.base146 = n.value;
+    }
+  }
+
   function paint() {
-    if (d.view === 'editor') return;
-    const v = VIEWS[d.view];
+    if (d.view === 'editor') { paintChrome(); return; }
+    const v = VIEWS[d.view] ?? VIEWS.settings;
     const host = node.views[v.el];
+    // Hold the pane still across a rebuild. Async fetches (git, processes,
+    // wiring…) repaint constantly, and a lens flip repaints too — none of them
+    // is a navigation, so none of them may move the page under the reader.
+    const keep = node.body.scrollTop;
     clear(host).append(v.build());
-    applyFocus(host);
     for (const [k, n] of Object.entries(node.views)) n.classList.toggle('on', k === v.el);
     node.editor.classList.remove('on');
-    node.body.hidden = false;
-    // FEAT-139 — the settings view retitles by scope, since it now hosts three:
-    // machine defaults, project settings, and this-session overrides.
-    const machine = d.view === 'settings' && d.scope === 'machine';
-    node.title.textContent = machine ? 'Settings' : v.title;
-    node.eyebrow.textContent = d.view === 'library' ? 'Shared across projects'
-      : d.view === 'globals' || machine ? 'Every project on this machine'
-      : (project()?.name ?? '');
-    node.scope.hidden = !v.scope;
-    node.back.hidden = !d.back;
-    node.hint.textContent = d.scope === 'machine' ? 'Defaults for every project on this machine'
-      : d.scope === 'project' ? 'Sessions inherit these'
-      : 'Changes apply to this session only';
+    node.body.scrollTop = keep;
+    applyFocus(host);
+    stampBaselines();
+    paintChrome();
+  }
+
+  /** Header, lens, footer, rail dots — everything outside the pane body. */
+  function paintChrome() {
+    const c = catOf(d.cat);
+    const machine = c.group === 'machine';
+    const takeover = d.view === 'editor' ? (d.editing?.name ?? 'Template')
+      : d.back ? (VIEWS[d.view]?.title ?? null) : null;
+    node.title.textContent = takeover ?? c.label;
+    node.eyebrow.textContent = d.view === 'editor' ? 'Template'
+      : d.view === 'library' ? 'Shared across projects'
+      : machine ? 'Every project on this machine'
+      : (project()?.name ?? 'No project selected');
+    node.back.hidden = !d.back && d.view !== 'editor';
+    node.body.classList.toggle('editing', d.view === 'editor');
+
+    /* The lens is a WRITE TARGET, not navigation: absent where there is
+       nothing to write to. */
+    node.scope.hidden = machine || d.view === 'editor';
+    const sessionOk = !!project();
     for (const b of node.scope.querySelectorAll('[data-scope]')) {
       b.setAttribute('aria-pressed', b.dataset.scope === d.scope ? 'true' : 'false');
+      if (b.dataset.scope === 'session') {
+        b.disabled = !sessionOk;
+        b.title = sessionOk ? '' : 'No project selected, so there is no session to override.';
+      }
     }
+    node.hint.textContent = machine ? 'Applies to every project on this machine'
+      : !sessionOk ? 'No project selected — nothing to write to'
+      : d.scope === 'project' ? 'Writing to this project · sessions inherit these'
+      : 'Writing to this session only · the project default is untouched';
+    // Round 4 — the live-state line is a note at the TOP OF THE PANE, not a
+    // second footer string. It is a static child of the scroll host, so paint()
+    // (which only clears the `.view` hosts) never rebuilds it.
+    const liveText = liveStateText();
+    node.liveLine.textContent = liveText;
+    node.liveLine.hidden = !liveText || d.view === 'editor';
+    node.hint.title = node.hint.textContent;
+    node.whyAll?.setAttribute('aria-pressed', String(d.whyAll));
+    paintRailDots();
   }
 
   async function ensureTemplates() {
@@ -3087,60 +4328,240 @@ export function createDrawer(ctx) {
     }
   }
 
+  /* ─────────── FEAT-146: the modal shell, focus trap and close guard ─────── */
+
+  let isOpenNow = false;
+  const isOpen = () => isOpenNow;
+
+  const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]),'
+    + ' textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+  /** Recomputed on EVERY keypress: paint() rebuilds the pane underneath, so a
+   *  list captured at open time is stale by the second Tab. Visibility is
+   *  checked properly (a collapsed <details>, a `hidden` header control, a
+   *  `visibility:hidden` row) — an unfocusable member of this list is a hole in
+   *  the trap, because Tab would skip it natively and land outside. */
+  const canFocus = (n) => {
+    if (n === document.activeElement) return true;
+    if (typeof n.checkVisibility === 'function') return n.checkVisibility({ checkVisibilityCSS: true });
+    return n.offsetParent !== null;
+  };
+  const focusables = () => [...node.modal.querySelectorAll(FOCUSABLE)].filter(canFocus);
+
+  function onModalKey(e) {
+    if (e.key === 'Tab') {
+      const list = focusables();
+      if (!list.length) return;
+      const first = list[0];
+      const last = list[list.length - 1];
+      const here = document.activeElement;
+      if (e.shiftKey && (here === first || !node.modal.contains(here))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (here === last || !node.modal.contains(here))) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  }
+
+  function openModal() {
+    if (isOpenNow) return;
+    isOpenNow = true;
+    d.returnFocus = document.activeElement;
+    d.paneScroll.clear();
+    node.modal.hidden = false;
+    appRoot?.setAttribute('inert', '');
+    node.modal.addEventListener('keydown', onModalKey);
+    buildRail();
+  }
+
+  function closeModal() {
+    if (!isOpenNow) return;
+    isOpenNow = false;
+    d.focus = null;
+    node.modal.hidden = true;
+    node.modal.removeEventListener('keydown', onModalKey);
+    appRoot?.removeAttribute('inert');
+    // Restore focus to whatever opened us; fall back to the cog when that node
+    // was repainted away (rail rows and chips are rebuilt constantly).
+    const back = d.returnFocus;
+    d.returnFocus = null;
+    const ok = back && back.isConnected && typeof back.focus === 'function';
+    (ok ? back : $('#cogBtn'))?.focus?.();
+  }
+
+  /** The element whose loss a stray click/Esc would be unacceptable, or null. */
+  function armedNode() {
+    if (d.acctLogin && !d.acctLogin.done) return node.body.querySelector('#gAcctCancel') ?? node.body.querySelector('.acctlogin');
+    const armed = node.body.querySelector('[data-armed="true"]');
+    if (armed) return armed;
+    for (const n of node.body.querySelectorAll('input, textarea')) {
+      if (n.dataset.base146 !== undefined && n.value !== n.dataset.base146) return n;
+    }
+    return null;
+  }
+
+  function flashArmed(n) {
+    n.scrollIntoView({ behavior: 'auto', block: 'center' });
+    n.classList.add('focus-flash');
+    setTimeout(() => n.classList.remove('focus-flash'), 1400);
+  }
+
+  /**
+   * FEAT-146 phase 2b — Esc inside an expanded description collapses it and
+   * puts focus back on its `ⓘ`. Returns true when it handled the key, so the
+   * caller stops before the close ladder.
+   */
+  function collapseWhyAtFocus() {
+    const here = document.activeElement;
+    if (!here || !node.body.contains(here)) return false;
+    const row = here.closest('.set');
+    if (!row) return false;
+    const btn = row.querySelector('button.why[data-why][aria-expanded="true"]');
+    if (!btn) return false;
+    toggleWhy(btn.dataset.why);
+    return true;
+  }
+
+  /** Disarm the innermost armed ceremony. Returns true if one was disarmed. */
+  function disarmOne() {
+    if (d.acctConfirm) { d.acctConfirm = null; paint(); return true; }
+    if (d.restore) { d.restore = null; paint(); return true; }
+    if (d.confirmDelete) { d.confirmDelete = null; paint(); return true; }
+    if (d.memConfirm) { d.memConfirm = null; paint(); return true; }
+    if (d.procConfirm) { d.procConfirm = null; paint(); return true; }
+    if (d.gitArm) { d.gitArm = null; paint(); return true; }
+    if (d.wiringArm) { d.wiringArm = null; paint(); return true; }
+    if (d.repoint?.arm) { d.repoint.arm = null; paint(); return true; }
+    return false;
+  }
+
+  /**
+   * Esc: innermost first — an armed ceremony DISARMS and the modal stays open;
+   * a second Esc closes. Never closes during a live sign-in, and never while a
+   * free-text field holds an uncommitted edit: losing a half-finished login to
+   * a stray keypress is not an acceptable cost for a convenience shortcut.
+   */
+  function escape() {
+    if (d.acctLogin && !d.acctLogin.done) {
+      const n = armedNode();
+      if (n) flashArmed(n);
+      return;
+    }
+    // FEAT-146 phase 2b — an open `.set-why` is the innermost thing Esc can
+    // close, but ONLY when the focus is actually inside its row: Esc anywhere
+    // else in the modal must still reach the ceremony ladder below. Collapsing
+    // returns focus to the `ⓘ` that opened it and never closes the modal.
+    if (collapseWhyAtFocus()) return;
+    if (disarmOne()) return;
+    const n = armedNode();          // a dirty free-text field
+    if (n) { flashArmed(n); return; }
+    closeModal();
+  }
+
+  /** Backdrop click: same refusals, but it does NOT disarm — a click that lands
+   *  outside is far likelier to be a slip than an intent to abandon. */
+  function backdropClose() {
+    const n = armedNode();
+    if (n) { flashArmed(n); return; }
+    closeModal();
+  }
+
   async function open(view, from = null, opts = null) {
     // FEAT-054: `open('settings', {focus:'git'})` — the second arg may be the
     // options object (the ticket's own signature); a string stays `from`.
     if (from && typeof from === 'object') { opts = from; from = opts.from ?? null; }
-    d.back = from;
     if (view !== d.view) { d.restore = null; d.confirmDelete = null; }
-    d.view = view;
-    // FEAT-139 — an opener may land on a specific scope (the sidebar-foot door
-    // opens the Machine/global panel). Only settings-family views honour it.
-    // A scopeless open that lands on a project-context entry must not inherit a
-    // sticky "machine" scope from a previous visit — reset it to project so the
-    // cog always shows this project. (Project↔session stickiness is unchanged.)
-    if (opts?.scope && ['machine', 'project', 'session'].includes(opts.scope)) d.scope = opts.scope;
-    else if (d.scope === 'machine') d.scope = 'project';
-    // A focus is per-open: a plain open (cog button) clears any previous one
-    // and lands at the default position — no sticky deep-link.
-    d.focus = opts?.focus ? { key: String(opts.focus), applied: false } : null;
     /* Always refetch on open. A cached list is fine for a container's state,
        but not here: the signal that matters most is a session-start snapshot
        that FAILED, and showing a stale list would report protection the
        project no longer has. */
     d.snaps = undefined;
-    d.container = view === 'settings' ? d.container : d.container;
     /* Wiring is a live true-source read (registry + files on disk); re-read on
-       every drawer open so a change made outside the UI is reflected. */
+       every open so a change made outside the UI is reflected. */
     d.wiring = undefined;
     d.wiringArm = null;
     d.wiringReport = null;
     d.repoint = null; // BUG-138: a repoint panel is per-visit; never reopen armed
-    slide.open();
+
+    /* FEAT-146 — resolve the CATEGORY first, then the view.
+       `{scope:'machine'}` was the sidebar-foot door into the machine panel;
+       machine is a rail group now, so it maps to the Accounts category. */
+    const machineAsked = opts?.scope === 'machine' || view === 'globals';
+    if (opts?.scope === 'project' || opts?.scope === 'session') d.scope = opts.scope;
+    const focusKey = opts?.focus ? String(opts.focus) : null;
+    let cat = machineAsked ? 'accounts'
+      : focusKey ? (FOCUS_CATEGORY[focusKey] ?? null)
+      : null;
+
+    openModal();
     await ensureTemplates();
+
+    if (view === 'settings' || view === 'globals' || !VIEWS[view]) {
+      d.cat = cat ?? (catOf(d.cat).group === 'machine' && !machineAsked ? 'model' : d.cat);
+      if (machineAsked) d.cat = 'accounts';
+      d.view = catOf(d.cat).view;
+      d.back = null;
+    } else {
+      // A named sub-application (instructions / library / snapshots / memories).
+      // Keep it a takeover when an opener said where it came FROM; otherwise
+      // land on its own rail category if it has one.
+      const own = RAIL.find((c) => c.view === view);
+      if (from) { d.view = view; d.back = from; }
+      else if (own) { d.cat = own.id; d.view = view; d.back = null; }
+      else { d.view = view; d.back = 'settings'; }
+      if (cat) d.cat = cat;
+    }
+    // A focus is per-open: a plain open (cog button) clears any previous one
+    // and lands at the default position — no sticky deep-link.
+    d.focus = focusKey ? { key: focusKey, applied: false } : null;
+    markRail();
+    prefetchForDots();
     paint();
+    if (!d.focus) node.body.scrollTop = 0;
+    // Focus lands on the selected rail item, never on the first control in the
+    // pane — a settings modal that opens with a cycle button focused invites an
+    // accidental Space. preventScroll, then an explicit `nearest`: a plain
+    // focus() in the narrow HORIZONTAL rail scrolls the item flush to the left
+    // edge and takes its group heading off screen with it, which is the one
+    // piece of structure that strip has.
+    const seat = node.rail.querySelector(`.srail-item[data-cat="${d.cat}"]`);
+    if (seat) {
+      seat.focus({ preventScroll: true });
+      // preventScroll, then an explicit reveal: a plain focus() in the narrow
+      // horizontal rail scrolls the item flush to the scrollport start.
+      revealSelectedCat();
+    } else node.body.focus();
   }
 
   node.back.addEventListener('click', () => {
-    const to = d.back || 'settings';
+    const to = d.back || catOf(d.cat).view;
     d.back = to === 'library' ? 'instructions' : null;
     d.view = to;
-    node.body.hidden = false;
     node.editor.classList.remove('on');
     paint();
   });
-  $('#dClose').addEventListener('click', () => { d.focus = null; slide.close(); });
+  /* The two events that can change which ends of the strip have more behind
+     them. Registered ONCE on the persistent nodes (never inside buildRail,
+     which runs on every open), and passive — this handler only reads. */
+  node.rail.addEventListener('scroll', () => updateRailEdges(), { passive: true });
+  window.addEventListener('resize', () => { if (isOpenNow) updateRailEdges(); }, { passive: true });
+  node.close.addEventListener('click', () => closeModal());
+  node.whyAll?.addEventListener('click', () => setWhyAll(!d.whyAll));
+  node.back0.addEventListener('click', () => backdropClose());
   node.scope.addEventListener('click', (e) => {
     const b = e.target.closest('[data-scope]');
-    if (!b) return;
+    if (!b || b.disabled) return;
     d.scope = b.dataset.scope;
+    // Lens only: the rail is NOT rebuilt and the pane is NOT scrolled. paint()
+    // restores scrollTop byte-for-byte across the rebuild.
     paint();
   });
 
   return {
     open,
-    close: () => { d.focus = null; slide.close(); },
-    isOpen: slide.isOpen,
+    close: () => escape(),
+    isOpen,
     /* Note the restore reset: an armed confirm names one project and one
        snapshot. Letting it survive a project switch would leave a primed
        "Restore <old name>" button sitting under a different project. */
@@ -3164,10 +4585,10 @@ export function createDrawer(ctx) {
       d.wiringBusy = null;
       d.wiringReport = null;
       d.repoint = null; // BUG-138: candidates + any armed confirm belong to the project we left
-      if (node.drawer.classList.contains('open')) paint();
+      if (isOpenNow) paint();
     },
     /** The live session reported what it is actually running with — redraw. */
-    repaintLive: () => { if (node.drawer.classList.contains('open') && d.view === 'settings') paint(); },
+    repaintLive: () => { if (isOpenNow && d.view === 'settings') paint(); },
     templates: () => d.templates,
     ensureTemplates,
     effectiveStack,

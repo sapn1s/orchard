@@ -33,6 +33,12 @@ import type { Readable, Writable } from 'node:stream';
 import { projectRoot, ensureDir } from '../lib/paths.ts';
 import type { Project, Mount, ContainerSettings } from './registry.ts';
 import { containerSettingsOf, browserSettingsOf, toolSettingsOf } from './registry.ts';
+// FEAT-145 step 6 — the account layer. `applyGlobalDefaults` is the shared
+// machine→project merge (agent-bridge's `pickOverridable` is the other caller);
+// `resolveAccountDir` is the sole id→dir authority (ARCH-010) and
+// `resolveLaunchAccountDir` the sole "may a launch use this account" gate.
+import { applyGlobalDefaults } from './global-settings.ts';
+import { AccountError, DEFAULT_ACCOUNT_ID, resolveAccountDir, resolveLaunchAccountDir } from './claude-accounts.ts';
 import { provisionHash, serenaPin, type ProvisionState } from './provisioning.ts';
 import { available as browserAvailable, browserBinds, containerEnv as browserContainerEnv, socketPath as browserSocketPath, stateHome as browserStateHome, CONTAINER_MCP_DIR } from './browser.ts';
 import { dispatchBinds, dispatchSocketPath, dispatchStateHome, CONTAINER_DISPATCH_DIR, CONTAINER_DISPATCH_SOCKET_DIR } from './dispatch-broker.ts';
@@ -233,8 +239,110 @@ function hostUidGid(): { uid: number; gid: number } {
   return { uid: u.uid, gid: u.gid };
 }
 
-function credentialsFile(): string {
-  return path.join(os.homedir(), '.claude', '.credentials.json');
+/* ------------------------------------------------- FEAT-145: which account */
+
+/**
+ * FEAT-145 step 6 — the Claude account a project's CONTAINER runs as.
+ *
+ * PROJECT SCOPE ONLY, NEVER PER SESSION. `desiredBinds()` below is the drift
+ * oracle: `ensureContainer` recreates the container on ANY bind difference. So
+ * a per-session account would recreate the container out from under every OTHER
+ * session already running in it, and the change would outlive the session that
+ * asked for it. That is exactly why `mounts` is project-scope-only too (see the
+ * rationale at `validate.ts` `SESSION_OVERRIDE_FIELDS`). Step 5 owns rejecting
+ * a per-session override for a container-backed project; this file owns the
+ * bind. Changing the PROJECT's account SHOULD recreate the container — that is
+ * the established, correct behaviour for every other bind change.
+ *
+ * The value is the machine→project merge (`applyGlobalDefaults`), the SAME
+ * merge `pickOverridable()` feeds a session's `CLAUDE_CONFIG_DIR` with, so a
+ * container project and a direct project on the same settings resolve to the
+ * same account. Reading only `project.settings.claudeAccount` here would strand
+ * every inheriting container project on the old account the moment the machine
+ * default moved — quota spent on the wrong plan, with no signal.
+ *
+ * `null` means the implicit default account (`~/.claude`).
+ */
+export function containerAccountId(project: Project): string | null {
+  const s = (project.settings ?? {}) as Partial<Project['settings']>;
+  return applyGlobalDefaults({
+    model: s.model ?? null,
+    effort: s.effort ?? null,
+    claudeAccount: s.claudeAccount ?? null,
+  }).claudeAccount;
+}
+
+/**
+ * The account dir whose `.credentials.json` this project's container binds.
+ *
+ * FAILS LOUDLY for a named account that is missing, not logged in, or has lost
+ * its credential — it never falls back to `~/.claude`, because a silent
+ * fallback spends the OTHER subscription's quota with nothing to show for it.
+ * `resolveLaunchAccountDir` is the one gate for "may a launch use this account"
+ * (shared with the direct/non-container path in agent-bridge, so both refuse on
+ * the same grounds); `resolveAccountDir` is the one id→dir authority (ARCH-010)
+ * — the dir is never re-derived here.
+ */
+function accountDirForContainer(project: Project): string {
+  const id = containerAccountId(project) ?? DEFAULT_ACCOUNT_ID;
+  try {
+    // Returns null for the implicit default (nothing to gate); for a named
+    // account it throws unless the account exists, is ready, and has a
+    // credential file. Also repairs the overlay symlinks (idempotent).
+    resolveLaunchAccountDir(id);
+    return resolveAccountDir(id);
+  } catch (err) {
+    if (err instanceof AccountError) {
+      throw new ContainerError(
+        'account-unavailable',
+        `project ${project.id} is pinned to Claude account "${id}", which cannot be used`,
+        `${err.message}\nFix or re-add the account in Machine settings, or clear this project's Claude account. ` +
+          'The container is deliberately NOT started on the default account instead: that would silently ' +
+          "spend the wrong subscription's quota.",
+      );
+    }
+    throw err;
+  }
+}
+
+/**
+ * The host file bound at `$HOME/.claude/.credentials.json` inside the container.
+ *
+ * WHY ONLY THIS ONE FILE, and not the account dir wholesale: an account overlay
+ * dir's `projects` and `settings.json` are SYMLINKS to host paths (`~/.claude/…`)
+ * that do not exist at those paths inside the container, so bind-mounting the
+ * dir would hand the CLI two broken links — a dangling `projects` is where the
+ * transcripts would silently stop landing. The container keeps its own
+ * `$HOME/.claude` (image-local) as its config dir, the session-history bind
+ * below puts this project's transcript dir exactly where Orchard's readers
+ * expect it, and the ONLY thing that varies per account is this file. That also
+ * means `CLAUDE_CONFIG_DIR` must NOT cross into the container (it names a HOST
+ * path) — see the note on `ENV_PASSTHROUGH`.
+ */
+function credentialsBind(project: Project): BindSpec {
+  const id = containerAccountId(project);
+  const dir = accountDirForContainer(project);
+  return {
+    hostPath: path.join(dir, '.credentials.json'),
+    containerPath: `${CONTAINER_HOME}/.claude/.credentials.json`,
+    // rw, NOT :ro — the CLI refreshes the OAuth token in place, and a read-only
+    // mount silently blocks that refresh from reaching the host, which breaks
+    // long-running containers hours later.
+    // BUG-136: "in place" is only true of the CLI INSIDE the container. The HOST
+    // copy of Claude Code replaces this file wholesale, which orphans this bind —
+    // see `staleFileBinds`, which turns that into drift so the next ensure
+    // re-binds the current file.
+    readOnly: false,
+    // Unchanged string for the default account (drift/log text stays as it was);
+    // a named account says so, because "which plan is this burning" is the
+    // question the whole feature exists to answer.
+    why: id == null || id === DEFAULT_ACCOUNT_ID ? 'Claude credentials' : `Claude credentials (account ${id})`,
+  };
+}
+
+/** The credentials path for the project's effective account. */
+function credentialsFile(project: Project): string {
+  return credentialsBind(project).hostPath;
 }
 
 /* ----------------------------------------------------------------- binds */
@@ -257,19 +365,12 @@ export function desiredBinds(project: Project): BindSpec[] {
   const workdir = containerWorkdir(project.id);
   const binds: BindSpec[] = [
     { hostPath: project.hostPath, containerPath: workdir, readOnly: false, why: 'project directory' },
-    // rw, NOT :ro — the CLI refreshes the OAuth token in place, and a read-only
-    // mount silently blocks that refresh from reaching the host, which breaks
-    // long-running containers hours later.
-    // BUG-136: "in place" is only true of the CLI INSIDE the container. The HOST
-    // copy of Claude Code replaces this file wholesale, which orphans this bind —
-    // see `staleFileBinds`, which turns that into drift so the next ensure
-    // re-binds the current file.
-    {
-      hostPath: credentialsFile(),
-      containerPath: `${CONTAINER_HOME}/.claude/.credentials.json`,
-      readOnly: false,
-      why: 'Claude credentials',
-    },
+    // FEAT-145 — the project's EFFECTIVE Claude account's credential file (see
+    // `credentialsBind`). Same container path and same rw-ness as before; only
+    // the host side moves, and only for a project on a named account. Because
+    // this list is the drift oracle, changing the project's account is drift and
+    // recreates the container exactly once, like any other bind change.
+    credentialsBind(project),
     // This project's own session history only. Note you cannot nest a file
     // mount inside a :ro directory mount in Docker, which is one more reason
     // ~/.claude is never mounted wholesale.
@@ -969,7 +1070,14 @@ async function doEnsure(project: Project, opts: { onLog?: (s: string) => void })
   if (!fs.existsSync(project.hostPath) || !fs.statSync(project.hostPath).isDirectory()) {
     throw new ContainerError('hostpath-missing', `project directory does not exist: ${project.hostPath}`);
   }
-  const cred = credentialsFile();
+  /*
+   * FEAT-145 — this resolves the project's EFFECTIVE account and throws
+   * `account-unavailable` (never falls back to ~/.claude) when a named account
+   * is missing / not logged in / has no credential. For a NAMED account
+   * `resolveLaunchAccountDir` has already proven the credential file exists, so
+   * the check below is the default account's own guard — kept exactly as it was.
+   */
+  const cred = credentialsFile(project);
   if (!fs.existsSync(cred)) {
     // Without this the container reaches the API and gets
     // "Not logged in · Please run /login" — a confusing failure two layers down.
@@ -1205,7 +1313,18 @@ export function oomExplanation(project: Project, baselineOomKills: number | null
 
 /* ------------------------------------------------------------------- exec */
 
-/** Env vars worth carrying from the SDK's spawn env into the container. */
+/**
+ * Env vars worth carrying from the SDK's spawn env into the container.
+ *
+ * FEAT-145 — `CLAUDE_CONFIG_DIR` is deliberately NOT on this list and must
+ * never be added. agent-bridge sets it to the account's overlay dir on the
+ * HOST (`<data>/claude-accounts/<id>`), a path that does not exist inside the
+ * container; forwarding it would point the CLI at an empty config dir it would
+ * then create fresh — no credential, no settings.json (so `cleanupPeriodDays`
+ * back to 30), and transcripts written somewhere no Orchard reader looks. The
+ * container's account identity travels as a BIND instead (`credentialsBind`),
+ * which is also what makes it drift-detectable.
+ */
 const ENV_PASSTHROUGH = [
   // BUG-118: the launch-provenance marker — the session id this launch declared
   // (round 2; a bare flag was inherited by nested hand-started sessions). A

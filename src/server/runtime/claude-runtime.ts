@@ -26,6 +26,7 @@ import { decide } from '../../../scripts/lib/orchestrator-profile.mjs';
 // PreToolUse callback, runs first, gated only by its own escape hatch.
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
 import { installGitShim } from '../../../scripts/lib/git-shim.mjs';
+import { getShimSecret } from '../../../scripts/lib/git-shim-secret.mjs';
 // FEAT-108 round 2 — the git-write decision is now grant-aware: a runtime,
 // per-project, revocable grant (git-grant-store.mjs, host-memory only) can lift
 // the block WITHOUT relaunching, and a granted commit/push still runs the
@@ -328,7 +329,7 @@ function announceFableTier(
  * granted write is permitted only when the gate can be run AND passes. Returns
  * `{ ok, detail }`; `detail` carries the gate's own capped output on failure.
  */
-function runLeakGateForRepo(repoPath: string | undefined | null): { ok: boolean; detail: string } {
+export function runLeakGateForRepo(repoPath: string | undefined | null): { ok: boolean; detail: string } {
   if (!repoPath) return { ok: false, detail: 'no repo path known for this session — cannot verify the leak gate; failing closed' };
   const gate = path.join(REPO_ROOT, 'scripts', 'leak-gate.mjs');
   // FEAT-130 round 2 — this gate runs as a PRE-EXECUTION guard on an arbitrary
@@ -570,7 +571,18 @@ export class ClaudeRuntime implements AgentRuntime {
      * open the shim is not installed, mirroring the hook's own kill-switch.
      */
     const baseSessionEnv = { ...process.env, ...(config.env ?? {}), [ORCHARD_SESSION_ENV]: declaredSessionId };
-    const sessionEnv = gitWriteBlockEnabled() ? installGitShim(baseSessionEnv).env : baseSessionEnv;
+    // BUG-173 — bake the grant authority coordinates so the shim consults the SAME
+    // host grant the FEAT-108 hook reads (per call, over loopback). The port is the
+    // one THIS host process listens on (index.ts: PORT ?? 4317); we are in-process.
+    const sessionEnv = gitWriteBlockEnabled()
+      ? installGitShim(baseSessionEnv, {
+          grantKey: config.gitGrantKey ?? undefined,
+          hostUrl: `http://127.0.0.1:${process.env.PORT ?? 4317}`,
+          // BUG-173 round 3 — baked into the shim source (not env) and required by
+          // /api/git-shim/decide, so the consult cannot be redirected to a forged host.
+          shimAuth: getShimSecret(),
+        }).env
+      : baseSessionEnv;
     const options: Options = {
       cwd: config.cwd,
       includePartialMessages: true,
@@ -721,12 +733,24 @@ export class ClaudeRuntime implements AgentRuntime {
     if (fileLockDir) {
       const liveLaneIds = config.liveLaneIds;
       const ownerPrefix = fileLockSessionOwner ? `${fileLockSessionOwner}:` : null;
-      const isOwnerLive = (owner: string): boolean => {
+      /*
+       * Returns TRUE (live), FALSE (provably gone) or NULL (not ours to judge).
+       * The `null` rung is load-bearing and was the FEAT-129 defect: this used
+       * to answer `true` for a foreign session's owner, on the assumption that
+       * `refreshOwnedLocks`'s `ownerPid` filter had already excluded foreign
+       * sessions. It had not — every session on this host shares ONE server
+       * pid, so that `true` made THIS session's heartbeat re-stamp DEAD
+       * sessions' locks forever, and nothing could ever age them out. Saying
+       * `null` instead lets the refresher leave them strictly alone: not
+       * refreshed (so the TTL backstop can free them), not released (so a live
+       * foreign lane is never clobbered — its own heartbeat keeps it fresh).
+       */
+      const isOwnerLive = (owner: string): boolean | null => {
         if (this.#closed) return false;                         // the whole session is gone
         if (!ownerPrefix || owner === fileLockSessionOwner) return !this.#closed; // the main owner
-        if (!owner.startsWith(ownerPrefix)) return true;        // a foreign session's owner — not ours to judge
+        if (!owner.startsWith(ownerPrefix)) return null;        // a foreign session's owner — not ours to judge
         const agentId = owner.slice(ownerPrefix.length);
-        if (typeof liveLaneIds !== 'function') return true;     // no running-set wired → keep it (never clobber)
+        if (typeof liveLaneIds !== 'function') return true;     // OUR lane, no running-set wired → keep it (never clobber)
         try { return liveLaneIds().includes(agentId); } catch { return true; }
       };
       const tick = () => {

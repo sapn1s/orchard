@@ -271,9 +271,10 @@ for (const c of AMBIGUITY_CASES) {
   }
 }
 restoreVictim();
-// Non-vacuity: on the RESTORED real corpus none of the new reports fires. (Two
-// long-standing AMBIGUOUS STATUS advisories — FEAT-020, FEAT-043 — do fire, and
-// did before this change; they are the incidental-DONE case b88ad5e named.)
+// Non-vacuity: on the RESTORED real corpus none of the new reports fires.
+// (ARCH-004/ARCH-017: AMBIGUOUS STATUS is no longer emitted at all — the
+// incidental-DONE sweep it advised on has been removed; only the declared
+// leading word classifies a legacy ticket.)
 {
   const clean = boardTool.readTickets(BUGS);
   check('a restored board raises NO new-class status report (the alarm is not always on)',
@@ -804,8 +805,12 @@ const CASES = [
   ['OPEN — needs a decision', { matched: true, done: false }],
   ['VERIFIED 2026-08-19 — shipped', { matched: true, done: true }],
   ['FIXED', { matched: true, done: true }],
-  ['RE-DONE by hand', { matched: true, done: true }],           // \bDONE\b: a separate token
-  ['IN PROGRESS — Phase R DONE', { matched: true, done: true }], // ambiguous, but classified
+  // ARCH-004/ARCH-017: an incidental `DONE` token no longer decides state. No
+  // recognised LEADING word ⇒ UNMAPPABLE (not swept to Done by the token).
+  ['RE-DONE by hand', { matched: false, done: false }],
+  // Leading `IN PROGRESS` wins; the incidental `DONE` later in the line does NOT
+  // override it — this ticket stays Open. (This is the ARCH-017 shape.)
+  ['IN PROGRESS — Phase R DONE', { matched: true, done: false }],
 ];
 
 for (const [raw, want] of CASES) {

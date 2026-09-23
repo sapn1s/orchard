@@ -119,8 +119,11 @@ export const SHOTS = [
     label: 'The live model chip — flags a silent provider fallback until you acknowledge it',
   },
   {
-    name: 'isolation-chip', outFile: 'isolation-chip.png', target: '#isoBtn',
-    label: 'Isolation tier (Direct / Sandbox / Container) with the permission mode and instruction stack beside it',
+    // FEAT-146 round 4 — the isolation chip and its popover were deleted (dead
+    // since FEAT-139 hid the button unconditionally). Isolation is set in the
+    // settings modal, so the shot names the door that actually reaches it.
+    name: 'isolation-chip', outFile: 'isolation-chip.png', target: '#settingsBtn',
+    label: 'Settings — isolation tier (Direct / Sandbox / Container), permissions and the instruction stack all live behind this one door',
   },
   {
     name: 'guide-pill', outFile: 'guide-pill.png', target: '#guideBtn',

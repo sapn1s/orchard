@@ -12,6 +12,10 @@ import type { InstructionRef } from './registry.ts';
 // FEAT-106 — resolve the local-conventions doc wherever the project keeps it
 // (legacy `docs/CONVENTIONS.md` or consolidated `.orchard/CONVENTIONS.md`).
 import { resolveConventionsFile } from '../../scripts/lib/board-path.mjs';
+// BUG-182 — the doc paths seedTemplates() needs at boot are declared ONCE, in
+// seed-sources.mjs, and read from there by both this file and the clean room
+// (scripts/independent-verify.mjs). Never write such a path literal here.
+import { READ_THROUGH_SEED_IDS, seedSourceRelPath } from './seed-sources.mjs';
 
 export type TemplateMode = 'append' | 'replace';
 
@@ -81,12 +85,19 @@ function serialize(t: Pick<Template, 'name' | 'defaultMode' | 'living' | 'descri
  * seed id that lacks `source` adopts this default at READ time. The stored
  * file on disk is never rewritten by this fallback.
  */
-const DEFAULT_SEED_SOURCES: Record<string, string> = {
-  'working-agreement': path.join('docs', 'prompts', 'WORKING_AGREEMENT.md'),
-  'working-agreement-v2': path.join('docs', 'prompts', 'WORKING_AGREEMENT.v2.md'),
-  'working-agreement-v3': path.join('docs', 'prompts', 'WORKING_AGREEMENT.v3.md'),
-  'working-agreement-v4': path.join('docs', 'prompts', 'WORKING_AGREEMENT.v4.md'),
-};
+const DEFAULT_SEED_SOURCES: Record<string, string> = Object.fromEntries(
+  READ_THROUGH_SEED_IDS.map((id) => [id, seedSourceRel(id)]),
+);
+
+/** A declared seed path in this platform's separators (the stored `source:` form). */
+function seedSourceRel(id: string): string {
+  return path.join(...seedSourceRelPath(id).split('/'));
+}
+
+/** The absolute file a seed id is read from — declared in seed-sources.mjs (BUG-182). */
+function seedSourceAbs(id: string): string {
+  return path.join(projectRoot(), seedSourceRel(id));
+}
 
 /**
  * Resolve a stored `source` value to an absolute path, refusing to escape
@@ -484,9 +495,11 @@ export function responseFormatSection(opts?: {
   // in a rules document is worse than the tokens it saves, and a truncated
   // "close the fence" rule would teach exactly the failure it warns about. The
   // doc's own comment holds the core under ~4.6 KB (round 14 added the in-block
-  // prose shape); verify:feat-084 pins the composed section at <= 5500, so this
-  // leaves real headroom and the core is never truncated mid-rule.
-  const maxChars = Math.max(200, opts?.maxChars ?? 6000);
+  // prose shape); verify:feat-084 pins the composed section at <= 6200, so this
+  // leaves real headroom and the core is never truncated mid-rule. Raised from
+  // 6000 by FEAT-149 (the re-state-the-handoff-after-cleanup clause, +~197 bytes)
+  // so the whole core is still delivered rather than truncated mid-rule.
+  const maxChars = Math.max(200, opts?.maxChars ?? 6400);
   const parts = [
     // The literal `Response Format (orchard-digest)` is load-bearing: the FEAT-084
     // suite asserts on it to prove the fold landed and landed LAST. Layer 2 is
@@ -782,7 +795,11 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
   const seeded: string[] = [];
   const skipped: string[] = [];
   const refreshed: string[] = [];
-  const seeds: (SaveTemplateInput & { sourceAbs: string })[] = [
+  // BUG-182: no seed carries its own path. The doc each id is read from is
+  // declared once in seed-sources.mjs and resolved below via seedSourceAbs(),
+  // which throws BY NAME for an id nobody declared — so a new seed cannot
+  // quietly introduce a boot-required file the clean room has never heard of.
+  const seeds: (SaveTemplateInput & { id: string })[] = [
     {
       id: 'working-agreement',
       name: 'Working Agreement',
@@ -790,7 +807,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
       living: false,
       description: 'Stable base: build to production confidence; verification is the deliverable.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.md'),
     },
     {
       id: 'working-agreement-v2',
@@ -799,7 +815,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
       living: true,
       description: 'Living copy — appended to whenever a preference or failure mode shows up in practice.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.v2.md'),
     },
     {
       id: 'working-agreement-v3',
@@ -808,7 +823,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
       living: true,
       description: 'Standalone condensed default; preserves the universal working contract at lower context cost.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.v3.md'),
     },
     {
       id: 'working-agreement-v4',
@@ -817,7 +831,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
       living: true,
       description: 'Standalone default; supersedes v1/v2/v3 — the full universal working contract, deduplicated, with stable section anchors.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'WORKING_AGREEMENT.v4.md'),
     },
     {
       id: 'pattern-manager-subagent-tree',
@@ -829,7 +842,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
         'manager agent over each area, let it run its own helpers, and the top orchestrator reads only ' +
         "each manager's summary. Use when the work has several domains too complex to fan out flat.",
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'patterns', 'MANAGER_SUBAGENT_TREE.md'),
     },
     {
       id: 'pattern-index-table-router',
@@ -841,7 +853,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
         'files, so it never bloats and readers load only the topic they need. Use when notes/playbooks ' +
         'keep piling up and one flat doc would get too big to read.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'patterns', 'INDEX_TABLE_ROUTER.md'),
     },
     {
       id: 'pattern-raw-curated-memory-split',
@@ -853,7 +864,6 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
         'summary you rewrite as understanding changes. Readers use the summary; the raw log is insurance ' +
         'if the summary is ever wrong. Use when observations pile up faster than you can digest them.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'patterns', 'RAW_CURATED_MEMORY_SPLIT.md'),
     },
     {
       id: 'pattern-go-no-go-preflight',
@@ -865,11 +875,14 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
         'cold. Use when starting in the wrong state (wrong branch, a job already done, a resource still ' +
         'in use) is costly to unwind and the things to check are a clear finite list.',
       body: '',
-      sourceAbs: path.join(projectRoot(), 'docs', 'prompts', 'patterns', 'GO_NO_GO_PREFLIGHT.md'),
     },
   ];
   for (const s of seeds) {
     const id = safeId(s.id!);
+    // Resolved OUTSIDE the refresh branch's catch-all below: an undeclared seed
+    // path is a programming error that must surface by name, never be swallowed
+    // by the fail-open refresh path.
+    const sourceAbs = seedSourceAbs(s.id);
     const file = fileFor(id);
     if (fs.existsSync(file)) {
       // FEAT-096: an already-seeded, source-backed template is no longer frozen
@@ -895,7 +908,7 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
           continue;
         }
         const resolved = resolveSourcePath(existing.source);
-        if (!resolved || resolved !== s.sourceAbs) {
+        if (!resolved || resolved !== sourceAbs) {
           skipped.push(id); // re-pointed at a different source — leave it alone
           continue;
         }
@@ -935,12 +948,11 @@ export function seedTemplates(): { seeded: string[]; skipped: string[]; refreshe
     }
     let body: string;
     try {
-      body = fs.readFileSync(s.sourceAbs, 'utf8');
+      body = fs.readFileSync(sourceAbs, 'utf8');
     } catch (err) {
-      throw new Error(`seedTemplates: cannot read seed source ${s.sourceAbs}: ${(err as Error).message}`);
+      throw new Error(`seedTemplates: cannot read seed source ${sourceAbs}: ${(err as Error).message}`);
     }
-    const { sourceAbs, ...rest } = s;
-    saveTemplate({ ...rest, body, source: path.relative(projectRoot(), sourceAbs) });
+    saveTemplate({ ...s, body, source: path.relative(projectRoot(), sourceAbs) });
     seeded.push(id);
   }
   return { seeded, skipped, refreshed };

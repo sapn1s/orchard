@@ -357,6 +357,22 @@ export const patchSettings = (patch) =>
   api('/api/settings', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
     .then((r) => r.settings);
 
+/** FEAT-145: Claude account registry. The implicit default is first. null = route absent. */
+export const getClaudeAccounts = () => optional('/api/claude-accounts').then((r) => r?.accounts ?? null);
+export const createClaudeAccount = (label) =>
+  api('/api/claude-accounts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ label }) })
+    .then((r) => r.account);
+export const deleteClaudeAccount = (id) =>
+  api(`/api/claude-accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+/**
+ * FEAT-145 step 3 — the URL of the ONE WebSocket endpoint this app already
+ * uses. The "Add account" login relay opens its own connection to it (the same
+ * shape as app.js's passive `watch()` socket): same transport, same endpoint,
+ * no second channel — a login just isn't a session, so it never shares the
+ * session-driving socket.
+ */
+export const wsUrl = () => `ws://${location.host}/ws`;
+
 /** FEAT-116: per-provider rate-limit window usage snapshots. null = route absent. */
 export const usage = () => optional('/api/usage').then((r) => r?.providers ?? null);
 
@@ -739,6 +755,53 @@ export const dismissOutcomes = (ids) =>
   optional('/api/agent-outcomes/dismiss', {
     method: 'POST',
     body: JSON.stringify(ids === '*' ? { all: true } : { ids }),
+  });
+
+/* ------------------------------------------- pending lane results (ARCH-017) */
+/*
+ * The group-settle drain's client half. Same graceful-degradation contract as
+ * `agentOutcomes` above and for the same reason: an older server has no
+ * `/api/lanes/*`, and the honest answer is `null` ("this server cannot tell
+ * you") so the rail section stays HIDDEN — never an empty list, which on a
+ * surface whose whole job is "Orchard is holding results for you" reads as the
+ * false and expensive claim that nothing is waiting.
+ *
+ * `{problem}` is the third outcome and is distinct from both: the route EXISTS
+ * and refused (503 — the ledger is corrupt and is refused whole). That must be
+ * shown in the store's own words, because the recovery path is in them.
+ */
+export async function pendingLanes({ projectId } = {}) {
+  const q = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+  let r;
+  try { r = await optional(`/api/lanes/pending${q}`); }
+  catch (err) { return { problem: err.message }; }
+  if (r === null) return null;
+  if (r && r.pending === null) return { problem: r.error || 'the lane ledger is unreadable' };
+  return { items: Array.isArray(r.pending) ? r.pending : [], capacity: r.capacity ?? null };
+}
+
+/** Collect: stamps Orchard's handoff and returns the bundle + the receipt. */
+export const processLanes = (ids, projectId) =>
+  optional('/api/lanes/process', {
+    method: 'POST',
+    body: JSON.stringify(ids === '*' ? { all: true, projectId } : { ids, projectId }),
+  });
+
+/**
+ * The consumer's half — without this the lanes stay held and come back.
+ *
+ * `receipt` must carry `{bytes, digest, nonce, channel}`: the digest is
+ * `sha256(nonce ‖ channel ‖ bytes)` (the store's own rule), the nonce proves
+ * the receipt is for THIS send rather than a replay of an earlier identical
+ * one, and the channel states where the bytes were actually put.
+ */
+export const ackLanes = (laneIds, receipt) =>
+  optional('/api/lanes/ack', { method: 'POST', body: JSON.stringify({ laneIds, receipt }) });
+
+export const dismissPendingLanes = (ids, projectId) =>
+  optional('/api/lanes/dismiss', {
+    method: 'POST',
+    body: JSON.stringify(ids === '*' ? { all: true, projectId } : { ids, projectId }),
   });
 
 /* ---------------------------------------------------------------- browser */

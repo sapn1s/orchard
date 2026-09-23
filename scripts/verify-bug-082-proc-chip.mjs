@@ -129,27 +129,23 @@ async function main() {
       return (head.match(/:\d+/g) ?? []);
     };
 
-    const CAP = 3;
-    check(`inline preview caps at ${CAP} ports (must FAIL pre-fix: all 9 inline)`,
-      inlinePorts().length === CAP, `inline=${JSON.stringify(inlinePorts())} | text=${JSON.stringify(chipText())}`);
-    check('overflow shown as "+N" (N = 9 - cap = 6) (must FAIL pre-fix: no +N)',
-      /\+6\b/.test(chipText()), `text=${JSON.stringify(chipText())}`);
-    check(':4317 is ALWAYS the first inline port (must FAIL pre-fix: raw-order head)',
-      inlinePorts()[0] === ':4317', `inline[0]=${JSON.stringify(inlinePorts()[0])}`);
-    check('remaining inline ports ascending after :4317 (stable, no jitter)',
-      JSON.stringify(inlinePorts()) === JSON.stringify([':4317', ':33001', ':35873']),
-      `inline=${JSON.stringify(inlinePorts())}`);
-    check('the "· N procs" summary is kept (anti-regression)',
-      /·\s*11 procs\b/.test(chipText()), `text=${JSON.stringify(chipText())}`);
+    // FEAT-139 took BUG-082's invariant to its end: the strip FACE is a live
+    // readout, so it no longer previews ANY ports inline — it shows only a
+    // compact "N ports" count and the full list lives ONLY in the popover below.
+    // So the face carries zero ":NNNN" tokens and no "+N" overflow at all.
+    check('face shows NO inline port tokens (must FAIL pre-FEAT-139: ports dumped inline)',
+      inlinePorts().length === 0, `inline=${JSON.stringify(inlinePorts())} | text=${JSON.stringify(chipText())}`);
+    check('face is a compact port count "9 ports" (must FAIL pre-FEAT-139: port list + proc count)',
+      chipText() === '9 ports', `text=${JSON.stringify(chipText())}`);
 
-    // ---- Chip width bounded: never more than CAP ":port" tokens inline, no
-    // matter how many ports the poll reports (the whole point of the fix). ----
+    // ---- Chip width bounded: the face is a single count no matter how many
+    // ports the poll reports (the whole point, strengthened by FEAT-139). ----
     st.procSummary = { p1: { count: 40, ports: Array.from({ length: 30 }, (_, i) => 40000 + i).concat(4317), hasSelf: true } };
     paintChip();
-    check('width bounded: 31 ports still previews only CAP inline (+overflow)',
-      inlinePorts().length === CAP && /\+28\b/.test(chipText()), `inline=${inlinePorts().length} text=${JSON.stringify(chipText())}`);
+    check('width bounded: 31 ports still renders a single "31 ports" count, never a list',
+      inlinePorts().length === 0 && chipText() === '31 ports', `inline=${inlinePorts().length} text=${JSON.stringify(chipText())}`);
 
-    // ---- Stable order across re-renders: same set, shuffled input, same text. ----
+    // ---- Stable across re-renders: same set, shuffled input, same face text. ----
     const SET = [44913, 4317, 37825, 35873]; // 4 ports
     st.procSummary = { p1: { count: 6, ports: SET, hasSelf: true } };
     paintChip();
@@ -157,8 +153,8 @@ async function main() {
     st.procSummary = { p1: { count: 6, ports: [...SET].reverse(), hasSelf: true } };
     paintChip();
     const t2 = chipText();
-    check('stable ordering: same port set in a different input order → identical chip text',
-      t1 === t2 && t1.startsWith(':4317'), `t1=${JSON.stringify(t1)} t2=${JSON.stringify(t2)}`);
+    check('stable face: same port set in a different input order → identical "4 ports" text',
+      t1 === t2 && t1 === '4 ports', `t1=${JSON.stringify(t1)} t2=${JSON.stringify(t2)}`);
 
     // ---- Clicking #procBtn opens #procPop listing ALL ports (the full view). ----
     st.procSummary = { p1: { count: 11, ports: RAW, hasSelf: true } };
@@ -186,8 +182,8 @@ async function main() {
     // crown assertion — one scratch port must still read ":NNNN · 1 proc"). ----
     st.procSummary = { p1: { count: 1, ports: [51515], hasSelf: false } };
     paintChip();
-    check('single port: fully inline, no "+N", singular "1 proc" grammar (verify:processes parity)',
-      chipText() === ':51515 · 1 proc', `text=${JSON.stringify(chipText())}`);
+    check('single port: compact "1 port" face, singular grammar (FEAT-139 face)',
+      chipText() === '1 port', `text=${JSON.stringify(chipText())}`);
 
     // ---- Anti-regression: no ports → just the proc count, chip still shown. ----
     st.procSummary = { p1: { count: 3, ports: [], hasSelf: false } };

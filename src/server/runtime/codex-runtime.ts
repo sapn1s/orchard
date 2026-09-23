@@ -54,6 +54,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
 import { installGitShim } from '../../../scripts/lib/git-shim.mjs';
+import { getShimSecret } from '../../../scripts/lib/git-shim-secret.mjs';
 import type {
   AgentRuntime,
   ApprovalResult,
@@ -409,7 +410,18 @@ export class CodexRuntime implements AgentRuntime {
      * open the shim is not installed, mirroring the hook's own kill-switch.
      */
     const baseEnv = { ...process.env };
-    const env = gitWriteBlockEnabled() ? installGitShim(baseEnv).env : baseEnv;
+    // BUG-173 — same call-time host-grant consult as the Claude runtime: bake the
+    // grant key + loopback host URL so a grant minted after launch reaches the shim.
+    const env = gitWriteBlockEnabled()
+      ? installGitShim(baseEnv, {
+          grantKey: config.gitGrantKey ?? undefined,
+          hostUrl: `http://127.0.0.1:${process.env.PORT ?? 4317}`,
+          sessionLabel: config.sessionLabel ?? undefined,
+          // BUG-173 round 3 — baked into the shim source (not env) and required by
+          // /api/git-shim/decide, so the consult cannot be redirected to a forged host.
+          shimAuth: getShimSecret(),
+        }).env
+      : baseEnv;
     let child: ChildLike;
     if (config.spawnProcess) {
       // Isolation/survival seam — same contract as ClaudeRuntime's

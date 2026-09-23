@@ -147,7 +147,7 @@ const READ = `(() => {
   const grp = risk ? risk.closest('.grp') : null;
   const iso = [...document.querySelectorAll('.grp')].find((g) => g.dataset.focus === 'iso');
   const r = risk ? risk.getBoundingClientRect() : null;
-  const drawerEl = document.querySelector('#drawer') || document.querySelector('.drawer');
+  const drawerEl = document.querySelector('#smodal') || document.querySelector('.smodal-box'); // FEAT-146
   const dr = drawerEl ? drawerEl.getBoundingClientRect() : null;
   const txt = risk ? risk.querySelector('.state-row .txt') : null;
   return {

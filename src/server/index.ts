@@ -33,6 +33,14 @@ import * as gitcli from './git.ts';
 // only (see git-grant-store.mjs): the ONLY mutator is these user-driven routes,
 // so an agent cannot plant a grant by writing config or exporting an env var.
 import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink } from '../../scripts/lib/git-grant-store.mjs';
+// BUG-173 — the invocation-layer shim consults the SAME grant authority as the
+// FEAT-108 hook, over loopback, at call time. `evaluateGitWrite` is that one
+// authority; `runLeakGateForRepo` is the one leak gate a granted publish must pass.
+import { evaluateGitWrite } from '../../scripts/lib/git-grant.mjs';
+// BUG-173 round 3 — the decide route authenticates the shim caller with a
+// host-minted per-process secret, so it is not an open localhost endpoint.
+import { isShimSecretValid } from '../../scripts/lib/git-shim-secret.mjs';
+import { runLeakGateForRepo } from './runtime/claude-runtime.ts';
 import * as procs from './processes.ts';
 import * as board from './board.ts';
 // FEAT-058 — the ticket dashboard's read/write layer over the SAME docs/bugs/
@@ -47,11 +55,17 @@ import * as decisions from './decisions.ts';
  * renders is authored HERE, not assembled from whatever events it caught.
  */
 import * as outcomes from './outcomes.ts';
+import * as laneDrain from './lane-drain.ts';
+import * as lanes from './lanes.ts';
 import * as requests from './requests.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
 import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
 import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, knownSlashCommands, knownModels, startZombieReaper, type AgentSession } from './agent-bridge.ts';
 import { readGlobalDefaults, patchGlobalDefaults } from './global-settings.ts';
+import { listAccounts, createAccount, deleteAccount, AccountError } from './claude-accounts.ts';
+// FEAT-145 step 3 — the "Add account" login relay (one attempt at a time, over
+// the WebSocket below). It owns the CLI child and its process group.
+import { startClaudeLogin, submitClaudeLoginCode, cancelClaudeLogin, type LoginEvent } from './claude-login.ts';
 import { adoptSurvivingHosts, survivingHostForSdkSession, survivingHostForSession, scanSurvivingHosts, dropDeadSurvivorHost, type HostStatus } from './survival.ts';
 import { activeDeliveryFor, deliverIntoSurvivor, deliveryEvidenceFor, survivorDeliveryEnabled, type SurvivorDelivery } from './survivor-delivery.ts';
 /*
@@ -65,7 +79,7 @@ import { detectCodex } from './runtime/codex-runtime.ts';
 // FEAT-116 — provider rate-limit window usage (dispatch-now-vs-park); a cached,
 // bounded, fail-quiet reader that never blocks the request path.
 import * as providerUsage from './provider-usage.ts';
-import type { ClientCommand, StationEvent } from './events.ts';
+import type { ClaudeLoginCommand, ClientCommand, StationEvent } from './events.ts';
 // FEAT-038 UI action: the server route reuses the SAME onboarding core the CLI
 // runs (`node scripts/onboard.mjs`) — imported, not reimplemented, so the button
 // and the command can never diverge. The CLI entry (main()) only runs when the
@@ -1590,6 +1604,42 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     return true;
   }
 
+  /*
+   * FEAT-145 step 2 — the Claude account registry. The GET lists accounts with
+   * the implicit default FIRST (synthesised, never a row on disk); the POST
+   * takes a free-text `label`, mints an opaque id, materialises the overlay dir
+   * (symlinks `projects`/`settings.json` into ~/.claude) and returns the new
+   * row as `state:'pending'` (login is a later step); the DELETE removes a row
+   * and moves its dir aside, refusing the default. `resolveAccountDir` is the
+   * one id→dir authority (ARCH-010); this route never derives a dir itself.
+   */
+  if (rest[0] === 'claude-accounts' && rest.length === 1 && m === 'GET') {
+    sendJson(res, 200, { accounts: listAccounts() });
+    return true;
+  }
+  if (rest[0] === 'claude-accounts' && rest.length === 1 && m === 'POST') {
+    const body = await readBody(req);
+    const label = body && typeof body === 'object' ? (body as Record<string, unknown>).label : undefined;
+    try {
+      const row = createAccount(label);
+      sendJson(res, 201, { account: row });
+    } catch (err) {
+      const status = err instanceof AccountError ? err.status : 500;
+      sendJson(res, status, { error: (err as Error).message });
+    }
+    return true;
+  }
+  if (rest[0] === 'claude-accounts' && rest.length === 2 && m === 'DELETE') {
+    try {
+      const result = deleteAccount(rest[1]);
+      sendJson(res, 200, result);
+    } catch (err) {
+      const status = err instanceof AccountError ? err.status : 500;
+      sendJson(res, status, { error: (err as Error).message });
+    }
+    return true;
+  }
+
   /* filesystem: directory listing for the add-project browser */
   if (rest[0] === 'fs' && rest[1] === 'dirs' && rest.length === 2 && m === 'GET') {
     let p = url.searchParams.get('path')?.trim() || os.homedir();
@@ -1759,7 +1809,19 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // Claude store first, then the Orchard-owned transcript store (FEAT-037
       // P2b — engines with persistedTranscript:false). Same entry shapes, so
       // tail/forward/count below serve both identically.
-      let file = hist.resolveSessionFile(encodedDir, sessionId) ?? ot.resolveOrchardSessionFile(encodedDir, sessionId)?.filePath;
+      const claudeFile = hist.resolveSessionFile(encodedDir, sessionId);
+      /*
+       * FEAT-144 — opportunistically mirror the live Claude store into Orchard's
+       * durable copy on read, so a session viewed after a server restart (whose
+       * final turn the turn-end hook missed) or one predating this feature is
+       * captured before the CLI prunes it. Idempotent + stat-gated inside
+       * mirrorClaudeStore, and only while the authoritative CLI file still exists;
+       * a read must never fail because the mirror did.
+       */
+      if (claudeFile) {
+        try { ot.mirrorClaudeStore(encodedDir, sessionId); } catch { /* mirror is best-effort */ }
+      }
+      let file = claudeFile ?? ot.resolveOrchardSessionFile(encodedDir, sessionId)?.filePath;
       /*
        * FEAT-078 — a NATIVE codex session has no file in either store until it
        * is opened. Backfill it into the Orchard transcript store now (bounded to
@@ -1833,6 +1895,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           fileBytes: r.fileBytes,
           budgetExhausted: r.budgetExhausted,
           malformedLines: r.malformedLines,
+          // Failed quality gates (hook_non_blocking_error) rolled up over the
+          // WHOLE session by the same count scan — a gate that never ran is
+          // otherwise invisible on every turn (BUG-177).
+          hookErrors: counted.hookErrors,
           warnings: r.budgetExhausted ? [`tail scan stopped at its byte ceiling before collecting ${n} messages`] : [],
           tookMs: Date.now() - t0,
         });
@@ -1869,6 +1935,8 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         warnings: t.budgetExhausted ? [`forward scan stopped at its 128 MiB budget; the newest ${Math.max(0, counted.total - reachable)} messages are reachable only via ?tail`] : [],
         forwardReachableMessages: reachable,
         unreachableForward: t.budgetExhausted ? Math.max(0, counted.total - reachable) : 0,
+        // Session-wide failed-gate roll-up (BUG-177), same as the tail branch.
+        hookErrors: counted.hookErrors,
       });
     } catch (err) {
       const msg = (err as Error).message;
@@ -2035,6 +2103,115 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
    * Dismissal is PERSISTED, not client-side: a banner the user cleared must not
    * come back on the next reload, and one they did not clear must.
    */
+  /*
+   * ARCH-017 step 2 — the `#railPending` surface.
+   *
+   *   GET  /api/lanes/pending[?projectId=]      what is waiting, drain-shaped
+   *   POST /api/lanes/process  {ids:[…]|all}    collect — stamps the handoff,
+   *                                             returns the bundle + a receipt
+   *   POST /api/lanes/ack      {laneIds,receipt} the consumer's half
+   *   POST /api/lanes/dismiss  {ids:[…]|all}    discard without collecting
+   *
+   * WHY A NEW RAIL SECTION AND NOT AN EXISTING SURFACE. The Needs-You rail is
+   * hardwired to board tickets — a held lane result is not a ticket and cannot
+   * be rendered there without lying about what it is. Agent cards are
+   * ephemeral: they vanish with the session, and the entire point here is a
+   * durable actionable item that survives a restart and a fresh page load with
+   * no model in the loop. Modelled on FEAT-057's outcomes rail because that is
+   * the one surface already built for exactly that property.
+   *
+   * 503, NOT 500, when the ledger is unreadable: a corrupt ledger is refused
+   * whole (round 7's deliberate choice — a partial read would let the next
+   * write delete the records it could not parse), and the rail must say so in
+   * the store's own words rather than render an empty list that reads as
+   * "nothing is waiting for you".
+   */
+  if (rest[0] === 'lanes' && rest[1] === 'pending' && rest.length === 2 && m === 'GET') {
+    try {
+      const items = laneDrain.pending({ projectId: url.searchParams.get('projectId') });
+      sendJson(res, 200, { pending: items, capacity: lanes.capacity() });
+    } catch (err) {
+      sendJson(res, 503, { error: (err as Error).message, pending: null });
+    }
+    return true;
+  }
+  if (rest[0] === 'lanes' && (rest[1] === 'process' || rest[1] === 'dismiss' || rest[1] === 'ack') && rest.length === 2 && m === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+    } catch (err) {
+      sendJson(res, err instanceof HttpError ? err.status : 400, { error: (err as Error).message });
+      return true;
+    }
+    const projectId = body.projectId == null ? null : String(body.projectId);
+    try {
+      if (rest[1] === 'ack') {
+        const laneIds = Array.isArray(body.laneIds) ? body.laneIds.map(String) : [];
+        // `{bytes, digest, nonce, channel}` — the drain enforces all four.
+        const receipt = (body.receipt ?? {}) as { bytes: number; digest: string; nonce?: string; channel?: string };
+        if (!laneIds.length) { sendJson(res, 400, { error: 'ack: pass {laneIds:[…], receipt:{bytes,digest}}' }); return true; }
+        sendJson(res, 200, laneDrain.acknowledge(laneIds, receipt, 'user'));
+        return true;
+      }
+      // `all:true` means every item the rail would currently SHOW — which for
+      // `process` is deliberately only the READY ones. "Process all" must never
+      // silently pull a result out of a group that is still filling; the early
+      // pull is a per-item choice the user makes explicitly.
+      const items = laneDrain.pending({ projectId });
+      const ids = body.all === true
+        ? items.filter((i) => rest[1] === 'dismiss' || i.ready).map((i) => i.id)
+        : (Array.isArray(body.ids) ? body.ids.map(String) : []);
+      if (!ids.length) { sendJson(res, 400, { error: `${rest[1]}: pass {ids:[…]} or {all:true} — nothing matched`, ids: [] }); return true; }
+      if (rest[1] === 'dismiss') {
+        const laneIds = items.filter((i) => ids.includes(i.id)).flatMap((i) => i.laneIds);
+        sendJson(res, 200, { dismissed: lanes.dismiss(laneIds), laneIds });
+        return true;
+      }
+      const bundle = laneDrain.process(ids, { projectId });
+      /*
+       * A DRAIN THAT HANDED OVER NOTHING IS NOT A SUCCESS.
+       *
+       * Reproduced by an independent verifier: a server that lost the writer
+       * claim at boot (a restart overlap on the same data dir) answered HTTP
+       * 200 with the full `bundle`, `lanes: []` and the real reason buried in
+       * `skipped[]`. The client ignored `skipped`, removed the row
+       * optimistically, and the row silently came back — the user was told
+       * nothing at all, which is the worst available behaviour for a surface
+       * whose entire job is "these results are waiting for you". 503 with the
+       * store's OWN words, because the recovery path is in them.
+       */
+      if (bundle.skipped.length && !bundle.lanes.length) {
+        /*
+         * ONE REASON, NOT ONE PER LANE.
+         *
+         * Every lane in a refused drain fails for the SAME cause — the store
+         * refused the whole write — so joining `skipped.map(s => s.why)`
+         * emitted the identical ~545-character writer-claim message once per
+         * lane. Measured by a verifier on the primary button: `process all`
+         * over 18 lanes produced a **9,820-character, ~335-line** body of which
+         * 17 of the 18 copies were pure repetition, and the rail could show
+         * 2.4% of it. Two rounds of work making that row readable were wasted
+         * on text that was 18 copies of one sentence. De-duplicating puts the
+         * message back UNDER the row's height cap.
+         *
+         * `lanes` is still carried per-lane: which lanes were skipped is real
+         * information. Only the REASON is collapsed, and only when identical.
+         */
+        const reasons = [...new Set(bundle.skipped.map((s) => s.why))];
+        const lanesWord = bundle.skipped.length === 1 ? 'result' : 'results';
+        sendJson(res, 503, {
+          error: `nothing could be handed over (${bundle.skipped.length} ${lanesWord} still held): ${reasons.join('; ')}`,
+          reasons,
+          skipped: bundle.skipped,
+        });
+        return true;
+      }
+      sendJson(res, 200, bundle);
+    } catch (err) {
+      sendJson(res, 503, { error: (err as Error).message });
+    }
+    return true;
+  }
   if (rest[0] === 'agent-outcomes' && rest.length === 1 && m === 'GET') {
     const list = outcomes.list({
       projectId: url.searchParams.get('projectId'),
@@ -2214,6 +2391,64 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       options: rec.options,
       createdAt: rec.createdAt,
     });
+    return true;
+  }
+
+  /*
+   * BUG-173 — the invocation-layer git shim's CALL-TIME grant consult.
+   *
+   *   POST /api/git-shim/decide  { grantKey, argv:[...], sessionLabel? }
+   *     → { allow, reason?, offender? }
+   *
+   * The FEAT-135 PATH shim (scripts/lib/git-shim.mjs) runs in the SESSION
+   * subprocess and cannot read the host-memory grant (git-grant-store.mjs). For a
+   * classified WRITE it asks here, and this runs the SAME `evaluateGitWrite` the
+   * FEAT-108 hook runs — ONE grant authority (ARCH-010): peekGrant + leak gate on a
+   * publish + single-use consume. So the shim and the hook can never disagree, an
+   * expired/revoked grant re-blocks on the next invocation, and a granted publish
+   * still cannot leak. The shim FAILS CLOSED on any non-allow, so a malformed or
+   * partial request here simply denies. `grantKey` is the project id the shim
+   * baked at launch, so a grant for another project can never unblock this call.
+   */
+  if (rest[0] === 'git-shim' && rest[1] === 'decide' && rest.length === 2 && m === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+    } catch {
+      sendJson(res, 200, { allow: false, reason: 'git-shim decide: unreadable body — failing closed' });
+      return true;
+    }
+    const grantKey = typeof body.grantKey === 'string' && body.grantKey ? body.grantKey : null;
+    const argv = Array.isArray(body.argv) ? body.argv.filter((a): a is string => typeof a === 'string') : null;
+    const sessionLabel = typeof body.sessionLabel === 'string' ? body.sessionLabel : null;
+    // BUG-173 round 3 — authenticate the caller as an Orchard-launched shim with
+    // the host-minted secret baked into that shim at launch. A caller without the
+    // current secret (any non-session localhost process, or a stale secret from a
+    // previous host boot) is refused — fail closed. This does NOT stop a same-uid
+    // agent that reads the secret out of its own shim file, but possessing it only
+    // lets it call THIS route (which still runs the full grant + leak gate), never
+    // mint a grant; see git-shim-secret.mjs for the residual note.
+    const shimAuth = typeof body.shimAuth === 'string' ? body.shimAuth : null;
+    if (!grantKey || !argv) {
+      sendJson(res, 200, { allow: false, reason: 'git-shim decide: grantKey and argv[] required — failing closed' });
+      return true;
+    }
+    if (!isShimSecretValid(shimAuth)) {
+      sendJson(res, 200, { allow: false, reason: 'git-shim decide: missing or invalid shim secret — failing closed' });
+      return true;
+    }
+    const p = reg.getProject(grantKey);
+    const repoPath = p?.hostPath ?? null;
+    const decision = evaluateGitWrite({
+      argv,
+      projectKey: grantKey,
+      sessionLabel,
+      runLeakGate: () => runLeakGateForRepo(repoPath),
+    });
+    if (decision.allow && decision.granted) {
+      console.warn(`[orchard] git-write PERMITTED via invocation shim (subprocess) for project ${grantKey}: \`${decision.offender}\` — grant honoured (BUG-173, recorded).`);
+    }
+    sendJson(res, 200, { allow: !!decision.allow, reason: decision.reason ?? null, offender: decision.offender ?? null });
     return true;
   }
 
@@ -3463,6 +3698,57 @@ wss.on('connection', (ws: WebSocket) => {
     if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(e));
   };
 
+  /*
+   * FEAT-145 step 3 — the "Add account" login relay rides THIS socket: the same
+   * transport every other server→client event uses, not a second channel. A
+   * login is not a session, so these commands are handled ahead of the session
+   * switch below and share none of its state; the client opens its own
+   * connection for them the way app.js's passive watch socket does.
+   *
+   * `loginAccountId` is what makes cleanup honest: the attempt is OWNED by the
+   * socket that started it, so a closed tab kills the CLI's process GROUP and
+   * removes the half-made account instead of leaving both behind.
+   *
+   * The frames are `ClientCommand` / `StationEvent` members (events.ts), like
+   * every other frame on this socket. The runtime `typeof` checks below stay:
+   * the union describes the WIRE CONTRACT, and the bytes arriving here are
+   * untrusted JSON that has merely been cast to it.
+   */
+  let loginAccountId: string | null = null;
+  const sendLogin = (e: LoginEvent) => {
+    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(e));
+  };
+  const handleLoginCommand = (c: ClientCommand): c is ClaudeLoginCommand => {
+    if (c.type !== 'claude-login-start' && c.type !== 'claude-login-code' && c.type !== 'claude-login-cancel') {
+      return false;
+    }
+    try {
+      if (c.type === 'claude-login-start') {
+        if (typeof c.accountId !== 'string') throw new AccountError('claude-login-start requires an accountId', 400);
+        const begun = startClaudeLogin(c.accountId, sendLogin);
+        loginAccountId = begun.accountId;
+        send({ t: 'ack', of: 'claude-login-start', accountId: begun.accountId, label: begun.label });
+      } else if (c.type === 'claude-login-code') {
+        if (typeof loginAccountId !== 'string') throw new AccountError('this socket has no login in progress', 409);
+        // The code is never logged and never echoed back: it goes to the child's
+        // stdin, and is kept only to redact it out of the relayed output.
+        submitClaudeLoginCode(loginAccountId, c.code);
+        send({ t: 'ack', of: 'claude-login-code' });
+      } else {
+        const stopped = cancelClaudeLogin(loginAccountId ?? undefined, 'cancelled from the dashboard');
+        loginAccountId = null;
+        send({ t: 'ack', of: 'claude-login-cancel', stopped });
+      }
+    } catch (err) {
+      // `error.code` is a closed union of session-reattach codes, so the HTTP-ish
+      // status goes in the MESSAGE (which is what the panel shows) rather than
+      // widening that union from here — the refusals are all human-readable.
+      const status = err instanceof AccountError ? err.status : 500;
+      send({ t: 'error', message: `${c.type} refused (${status}): ${(err as Error).message}`, fatal: false });
+    }
+    return true;
+  };
+
   ws.on('message', (raw) => {
     let cmd: ClientCommand;
     try {
@@ -3471,6 +3757,9 @@ wss.on('connection', (ws: WebSocket) => {
       return send({ t: 'error', message: 'malformed command JSON', fatal: false });
     }
     try {
+      // FEAT-145 — the login frames are not session commands; they are handled
+      // (and answered) here, ahead of the session switch.
+      if (handleLoginCommand(cmd)) return;
       switch (cmd.type) {
         case 'start': {
           if (session || starting || (delivery && !delivery.done)) return send({ t: 'error', message: 'this socket already has a session', fatal: false });
@@ -3486,7 +3775,12 @@ wss.on('connection', (ws: WebSocket) => {
           let overrides;
           if (cmd.overrides !== undefined) {
             try {
-              overrides = validateSessionOverrides(cmd.overrides);
+              // FEAT-145 step 5: the project's isolation is part of the dialect —
+              // `claudeAccount` is a legal per-session override for a `direct`
+              // project and refused for a container one (the credential is a
+              // container bind). The parameter is required, so a new start path
+              // cannot skip that refusal by omission.
+              overrides = validateSessionOverrides(cmd.overrides, { isolation: project.isolation });
             } catch (err) {
               return send({ t: 'error', message: `start.overrides rejected: ${(err as Error).message}`, fatal: true });
             }
@@ -4091,6 +4385,16 @@ wss.on('connection', (ws: WebSocket) => {
 
   ws.on('close', () => {
     closedEarly = true;
+    /*
+     * FEAT-145 — a login belongs to the socket that started it. A closed tab is
+     * an abandoned attempt: kill the CLI's whole process group and remove the
+     * half-made account, rather than leaving a blocked-on-stdin CLI and a
+     * pending row behind with nothing able to finish either.
+     */
+    if (loginAccountId) {
+      cancelClaudeLogin(loginAccountId, 'the dashboard connection closed');
+      loginAccountId = null;
+    }
     // A leaked fs.watch is a real leak: release every follow this socket held.
     for (const h of follows.values()) h.close();
     follows.clear();
@@ -4182,6 +4486,40 @@ server.listen(PORT, HOST, () => {
    */
   startZombieReaper();
   console.log(`[orchard] zombie reaper armed (${livenessWindowsSummary()})`);
+  /*
+   * ARCH-017 step 1 — a `running` lane record is a CLAIM, not a fact. The
+   * settle write lives in this process; a server restart mid-lane would leave
+   * the record `running` forever (and, from step 2 on, silently freeze every
+   * already-settled sibling in its group). Re-check each claim against ground
+   * truth — the child's pid AND a lane-id token in its argv — and resolve it
+   * honestly. Records owned by another LIVE server are left alone. Never fatal:
+   * the ledger is write-only in this step and nothing reads it yet.
+   */
+  void (async () => {
+    try {
+      /*
+       * The ledger has ONE writer, arbitrated by the kernel (see `claimWriter`).
+       * Taking it is an awaited startup act: a second Orchard server against the
+       * same data dir is refused here and writes nothing, rather than quietly
+       * interleaving writes and losing records.
+       */
+      const claim = await lanes.claimWriter();
+      if (!claim.ok) {
+        console.warn(`[orchard] lane ledger: another process holds the writer claim for ${dataDir()} (${claim.reason}) — this server will not write or reconcile lane records`);
+        return;
+      }
+      const laneRecon = lanes.reconcileBoot();
+      if (laneRecon.checked || laneRecon.groupsClosedByDeadline) {
+        // STEP 2 added two outcomes to this pass; a boot that adopts a live
+        // fan-out or closes a forgotten group must SAY so, or the two most
+        // consequential things reconciliation now does are invisible.
+        console.log(`[orchard] lane ledger reconciled: ${laneRecon.checked} non-terminal record(s) — ${laneRecon.adopted} adopted, ${laneRecon.cut} cut, ${laneRecon.leftRunning} left to a live owner; ${laneRecon.groupsClosedByDeadline} group(s) closed by a passed deadline`);
+        for (const d of laneRecon.details) console.log(`[orchard]   ${d}`);
+      }
+    } catch (err) {
+      console.warn(`[orchard] lane ledger reconciliation failed (server unaffected): ${(err as Error).message}`);
+    }
+  })();
   /*
    * FEAT-108 round 2 — durable trail of PERMITTED agent git writes. The store's
    * ledger is memory-only (cleared on restart, fail-closed); this appends each

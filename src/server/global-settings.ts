@@ -30,6 +30,11 @@
 import * as fs from 'node:fs';
 import { globalSettingsFile, writeAtomic } from '../lib/paths.ts';
 import type { Isolation } from './events.ts';
+// FEAT-145 step 4 — the account registry is the OWNER of "which account ids
+// exist" (ARCH-010); this module reconciles the stored `claudeAccount` against
+// it rather than keeping a second list. Import direction is safe: claude-accounts
+// imports only `../lib/paths.ts`, so there is no cycle back to here.
+import { readAccounts, DEFAULT_ACCOUNT_ID } from './claude-accounts.ts';
 
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
 
@@ -72,6 +77,18 @@ export interface GlobalDefaults {
   /** Global default reasoning effort, applied where a project leaves effort unset. */
   effort: Effort;
   /**
+   * FEAT-145 step 4 — the machine-wide default Claude account every new session
+   * uses unless its project (or, once step 5 lands, the session) overrides it.
+   * `null` = the IMPLICIT default account (`~/.claude`) — today's behaviour,
+   * byte-identical. A non-null value is an account id minted by
+   * `claude-accounts.ts`; it LIVE-inherits (a project storing `null` picks up a
+   * later change on its next session, via `pickOverridable`), which is why its
+   * SEED_CHANNEL is `'projectSettings'`. Reconciled on read: an id naming a
+   * DELETED account normalises back to `null` rather than dangling (see
+   * `normalise`), so a removed account can never silently spend the wrong quota.
+   */
+  claudeAccount: string | null;
+  /**
    * FEAT-139 — the isolation tier a NEW project is created with when the create
    * request does not name one. `null` = use the built-in default
    * (`NEW_PROJECT_DEFAULT_ISOLATION`). Container is still preflighted and falls
@@ -95,6 +112,7 @@ export interface GlobalDefaults {
 export const GLOBAL_DEFAULTS: GlobalDefaults = {
   model: null,
   effort: null,
+  claudeAccount: null,
   isolation: null,
   openaiDispatch: null,
   serena: null,
@@ -139,6 +157,11 @@ export type SeedChannel = 'projectSettings' | 'isolation' | 'toolSettings' | 'ma
 export const SEED_CHANNEL = {
   model: 'projectSettings',
   effort: 'projectSettings',
+  // FEAT-145 step 4 — MUST be 'projectSettings', never 'machineOnly': the
+  // per-session override in step 5 is `Pick<ProjectSettings, ...>`
+  // (validate.ts SessionOverrides), so an override can only exist for a field
+  // that also lives on ProjectSettings. This channel is what puts it there.
+  claudeAccount: 'projectSettings',
   isolation: 'isolation',
   openaiDispatch: 'toolSettings',
   serena: 'toolSettings',
@@ -209,12 +232,31 @@ export function readGlobalDefaults(): GlobalDefaults {
  * differs from the global) always wins; the global only fills an unset (null)
  * field.
  */
-export function applyGlobalDefaults(project: { model: string | null; effort: Effort }): { model: string | null; effort: Effort } {
+export function applyGlobalDefaults(
+  project: { model: string | null; effort: Effort; claudeAccount?: string | null },
+): { model: string | null; effort: Effort; claudeAccount: string | null } {
   const g = readGlobalDefaults();
   return {
     model: project.model ?? g.model,
     effort: project.effort ?? g.effort,
+    // FEAT-145 step 4 — machine → project inheritance for the account. A project
+    // storing `null` LIVE-inherits the machine default here; a non-null project
+    // value wins. `g.claudeAccount` is already reconciled to an existing id (or
+    // null) by `normalise`, so this never returns a dangling machine default.
+    claudeAccount: project.claudeAccount ?? g.claudeAccount,
   };
+}
+
+/**
+ * FEAT-145 step 4 / ARCH-010 — the set of account ids that actually EXIST right
+ * now, read from the registry that owns them. `null` (the implicit default) and
+ * the literal `'default'` id are always valid; any other id is valid only while
+ * its account row is present, so a deleted account normalises away rather than
+ * dangling. Tolerant by construction (readAccounts returns [] on a
+ * missing/corrupt registry), so a session start never fails resolving this.
+ */
+function knownAccountIds(): ReadonlySet<string> {
+  return new Set<string>([DEFAULT_ACCOUNT_ID, ...readAccounts().map((r) => r.id)]);
 }
 
 /** A stored boolean field is honoured only when literally boolean; anything else = "unset". */
@@ -230,9 +272,21 @@ function normalise(obj: unknown): GlobalDefaults {
   // theme never null: a missing/garbage stored value resolves to the built-in
   // 'system', so a corrupt settings.json can never leave the UI themeless.
   const theme = typeof o.theme === 'string' && THEMES.has(o.theme) ? (o.theme as Theme) : 'system';
+  // FEAT-145 step 4 — reconcile the stored account id against the accounts that
+  // actually exist. The canonical form of "the default account" is `null`, so
+  // the literal 'default' sentinel AND any id whose account has been deleted both
+  // normalise to `null` — never a dangling id that would resolve to a config dir
+  // and spend the wrong plan's quota.
+  const claudeAccount =
+    typeof o.claudeAccount === 'string' &&
+    o.claudeAccount !== DEFAULT_ACCOUNT_ID &&
+    knownAccountIds().has(o.claudeAccount)
+      ? o.claudeAccount
+      : null;
   return {
     model,
     effort,
+    claudeAccount,
     isolation,
     openaiDispatch: readBool(o.openaiDispatch),
     serena: readBool(o.serena),
@@ -267,6 +321,16 @@ export function patchGlobalDefaults(patch: unknown): PatchResult {
     else if (typeof v === 'string' && EFFORTS.has(v)) next.effort = v as Effort;
     else return { ok: false, error: `effort must be null or one of ${[...EFFORTS].join(', ')}` };
   }
+  if ('claudeAccount' in p) {
+    // FEAT-145 step 4 — null (or the 'default' sentinel) clears back to the
+    // implicit default account; any other value must name an account that
+    // EXISTS right now, so the picker can never persist an id that would fail
+    // (or silently fall back to the wrong plan) at session start.
+    const v = p.claudeAccount;
+    if (v === null || v === DEFAULT_ACCOUNT_ID) next.claudeAccount = null;
+    else if (typeof v === 'string' && knownAccountIds().has(v)) next.claudeAccount = v;
+    else return { ok: false, error: `claudeAccount must be null or the id of an existing account` };
+  }
   if ('isolation' in p) {
     const v = p.isolation;
     if (v === null) next.isolation = null;
@@ -291,7 +355,7 @@ export function patchGlobalDefaults(patch: unknown): PatchResult {
     else return { ok: false, error: `theme must be null or one of ${[...THEMES].join(', ')}` };
   }
 
-  const known = new Set(['model', 'effort', 'isolation', 'openaiDispatch', 'serena', 'playwright', 'theme']);
+  const known = new Set(['model', 'effort', 'claudeAccount', 'isolation', 'openaiDispatch', 'serena', 'playwright', 'theme']);
   const unknown = Object.keys(p).filter((k) => !known.has(k));
   if (unknown.length) return { ok: false, error: `unknown field(s): ${unknown.join(', ')}` };
 

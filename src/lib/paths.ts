@@ -108,6 +108,114 @@ export function realClaudeStoreDir(env: NodeJS.ProcessEnv = process.env): string
 }
 
 /**
+ * Linux's `SYMLOOP_MAX`. A resolution that traverses more symlinks than this is
+ * a cycle in practice, and the kernel would answer ELOOP for it anyway. Shared
+ * across one whole `canonicalNearest` call (including its recursion into symlink
+ * targets), so a cycle terminates by exhausting the budget rather than by
+ * needing cycle DETECTION — and bounded recursion cannot blow the stack.
+ */
+const MAX_SYMLINK_HOPS = 40;
+
+/**
+ * Raised when a path's true destination cannot be determined. Callers MUST treat
+ * this as "this might be the real store" (arm the guard), never as "isolated".
+ */
+class UnresolvablePathError extends Error {
+  // Plain fields, not TS parameter properties: this file is loaded directly by
+  // node's strip-only TypeScript mode, which rejects parameter properties.
+  target: string;
+  detail: string;
+  constructor(target: string, detail: string) {
+    super(`cannot canonicalise ${target}: ${detail}`);
+    this.name = 'UnresolvablePathError';
+    this.target = target;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Canonicalise a path through symlinks WITHOUT requiring it to exist yet.
+ *
+ * `assertSessionStoreIsolated` decides "is this the user's REAL store?" by
+ * comparing the CLI's store dir against `realClaudeStoreDir`. A purely LEXICAL
+ * compare (`path.resolve`) is a false NEGATIVE when the store is a SYMLINK whose
+ * target IS the real store: the two strings differ, the guard returns, and the
+ * writer pollutes ~/.claude/projects unreported. That is exactly the shape
+ * multi-account support introduces — an account config dir holds
+ * `projects -> ~/.claude/projects` — so the compare must resolve symlinks.
+ *
+ * WHY NOT `fs.realpathSync.native` + nearest-existing-ancestor (the round-1
+ * shape, refuted 2026-09-18): `realpathSync` throws ENOENT on a DANGLING symlink
+ * exactly as it does on an absent plain file, so a nearest-ancestor fallback
+ * re-appends the link's own NAME lexically and never reads its TARGET. With a
+ * `projects -> ~/.claude/projects` link created before the real store exists
+ * (fresh machine; or the TOCTOU window where the CLI creates the target moments
+ * later) the guard concluded "isolated" and did not fire, while the CLI — which
+ * resolves the link on write and creates the target as needed — wrote straight
+ * into the user's real store. An ENOENT DISARMED the guard: the precise inverse
+ * of this function's own invariant.
+ *
+ * So resolution is done HERE, component by component from the root, following
+ * each symlink by reading its target with `readlinkSync` (which works on a
+ * dangling link — the link's INTENT is what we must compare) and recursing so
+ * the target's own ancestors and further hops resolve too. Relative targets are
+ * resolved against the link's own directory, as the kernel does.
+ *
+ * THE INVARIANT: a resolution failure may only ARM the guard, never disarm it.
+ * Every non-happy branch below, audited:
+ *
+ *  - `lstat` ENOENT → the component genuinely does not exist, so nothing beneath
+ *    it can exist either: there is no link left to follow and no redirection can
+ *    hide here. Keeping the lexical tail is the truthful answer, not a guess.
+ *    This is the ONLY branch that continues without knowing the destination, and
+ *    it is safe precisely because absence is a FACT, not an unknown.
+ *  - `lstat` anything else (EACCES, ELOOP, ENOTDIR, EIO…) → we do not KNOW where
+ *    this path lands. THROW. (An ENOTDIR path could never be written to at all,
+ *    so arming merely refuses a session that was already broken — the safe
+ *    direction either way.)
+ *  - hop budget exhausted → a cycle or an absurd chain. THROW.
+ *  - `readlink` failing after `lstat` said "symlink" → a concurrent replacement;
+ *    destination unknown. THROW.
+ *
+ * `..` is applied to the ALREADY-RESOLVED prefix rather than collapsed lexically
+ * up front, so `…/link/../x` means "the parent of link's target", as on disk.
+ */
+function canonicalNearest(p: string, state: { hops: number } = { hops: 0 }): string {
+  const abs = path.isAbsolute(p) ? p : path.resolve(p);
+  const root = path.parse(abs).root || path.sep;
+  let cur = root;
+  for (const part of abs.slice(root.length).split(path.sep)) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') { cur = path.dirname(cur); continue; }
+    let next = path.join(cur, part);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(next);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') { cur = next; continue; } // safe: absence is a fact (see docstring)
+      throw new UnresolvablePathError(next, code ?? String(err));   // fail-closed
+    }
+    if (st.isSymbolicLink()) {
+      if (++state.hops > MAX_SYMLINK_HOPS) {
+        throw new UnresolvablePathError(next, 'ELOOP (symlink cycle, or chain longer than SYMLOOP_MAX)');
+      }
+      let target: string;
+      try {
+        target = fs.readlinkSync(next); // works on a DANGLING link — its intent is what we compare
+      } catch (err) {
+        throw new UnresolvablePathError(next, `readlink failed: ${(err as NodeJS.ErrnoException).code ?? String(err)}`);
+      }
+      // Relative targets resolve against the LINK's own directory, as the kernel
+      // does. Recurse so the target's ancestors, and any further hop, resolve too.
+      next = canonicalNearest(path.isAbsolute(target) ? target : path.join(path.dirname(next), target), state);
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+/**
  * The ONE process that is allowed to write real ~/.claude/projects transcripts
  * through `ClaudeRuntime`: the production station server (index.ts marks itself
  * at boot). Everything else that reaches a `ClaudeRuntime` real-store write is a
@@ -159,13 +267,34 @@ export function assertSessionStoreIsolated(
   { label }: { label?: string } = {},
 ): void {
   const store = claudeStoreDir(childEnv);
-  if (path.resolve(store) !== path.resolve(realClaudeStoreDir(childEnv))) return; // isolated store: fine.
-  // The write targets the user's REAL store. Allow ONLY the production server in
-  // its normal shared-data-dir mode.
+  // Compare CANONICALISED (symlink-resolved) paths, not lexical strings: a store
+  // that is a symlink onto the real store (the multi-account `projects` symlink)
+  // must be recognised AS the real store, or this guard disarms itself silently.
+  //
+  // FAIL-CLOSED: if either side cannot be canonicalised (cycle, EACCES, a link
+  // replaced under us), we do not know whether this store IS the real store — so
+  // we take the real-store branch. "Isolated" is only ever concluded from a
+  // COMPLETED resolution; an error can never buy the early return. (Round 1
+  // shipped the opposite and an ENOENT on a dangling link disarmed the guard.)
+  let unresolved: string | null = null;
+  let isolated = false;
+  try {
+    isolated = canonicalNearest(store) !== canonicalNearest(realClaudeStoreDir(childEnv));
+  } catch (err) {
+    unresolved = err instanceof UnresolvablePathError ? err.message : String((err as Error)?.message ?? err);
+  }
+  if (isolated) return; // isolated store: fine.
+  // The write targets the user's REAL store (or an unresolvable path that may be
+  // it). Allow ONLY the production server in its normal shared-data-dir mode —
+  // unchanged semantics, including for the unresolvable case, since that branch
+  // is the same one a literal real-store path takes.
   if (sanctionedRealStoreWriter && dataDirMode(childEnv) === 'shared') return;
 
   const who = label ? ` (session: ${label})` : '';
-  const why = dataDirMode(childEnv) === 'isolated'
+  const why = unresolved
+    ? `the store path could not be canonicalised (${unresolved}), so it cannot be shown to be isolated from ` +
+      `the user's real store — refusing rather than assuming`
+    : dataDirMode(childEnv) === 'isolated'
     ? `this process isolated its station data dir (CLAUDE_STATION_DATA=${childEnv.CLAUDE_STATION_DATA}) but NOT the ` +
       `claude transcript store` +
       ((childEnv.CLAUDE_PROJECTS_DIR ?? '').trim()
@@ -216,6 +345,28 @@ export function registryFile(): string {
  */
 export function globalSettingsFile(): string {
   return path.join(dataDir(), 'settings.json');
+}
+
+/**
+ * FEAT-145 step 2 — the multi-account registry, sibling to `registry.json` and
+ * `settings.json`. Holds ONLY the extra (non-default) Claude accounts; the
+ * default account is implicit (id `'default'`, dir `~/.claude`) and is never a
+ * row on disk. See `src/server/claude-accounts.ts` for the invariant.
+ */
+export function accountsFile(): string {
+  return path.join(dataDir(), 'claude-accounts.json');
+}
+
+/**
+ * FEAT-145 step 2 — the root under which every non-default account's config dir
+ * is minted (`<this>/<accountId>`). A directory here is a THIN OVERLAY over
+ * `~/.claude`: `projects` and `settings.json` symlink into the real store and
+ * only `.credentials.json` is the account's own. This path is server-owned;
+ * `resolveAccountDir(id)` in claude-accounts.ts is the ONE place an id maps to a
+ * dir under it (ARCH-010), so nothing else derives it.
+ */
+export function accountsDir(): string {
+  return path.join(dataDir(), 'claude-accounts');
 }
 
 export function ensureDir(dir: string): void {

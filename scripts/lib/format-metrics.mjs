@@ -185,6 +185,30 @@ export function askOwnershipDefects(parsed) {
   return out;
 }
 
+/* ── completion-claim extraction (FEAT-150) ───────────────────────────────────
+ * The MECHANICAL surface for "the orchestrator said done for something that was
+ * only filed / built / unverified". A completion claim is not fuzzy prose — it is
+ * a STRUCTURED digest item whose kind is `done` (KIND_ALIAS folds
+ * done/changed/completed/complete into it). This function only EXTRACTS those
+ * items and the ticket they reference; it grades NOTHING, because the grading is a
+ * ground-truth read of the board (board-status.mjs) that must not live in this
+ * dependency-light, disk-free module. The stop-hook does the binding.
+ *
+ * Input is the parseDigest() result ({ items, ... } | null), NOT a
+ * parseResponseBlocks() result — completion claims live in the digest rail, which
+ * is the one place the reader scans for "what got done". Pure. */
+export function completionClaims(digest) {
+  const items = Array.isArray(digest?.items) ? digest.items : [];
+  const out = [];
+  for (const it of items) {
+    if (!it || it.kind !== 'done') continue;
+    const text = typeof it.text === 'string' ? it.text : '';
+    const ref = typeof it.ref === 'string' && it.ref.trim() ? it.ref.trim() : null;
+    out.push({ text, ref });
+  }
+  return out;
+}
+
 /* ── record ─────────────────────────────────────────────────────────────────── */
 
 /**

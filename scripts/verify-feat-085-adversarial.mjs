@@ -138,6 +138,17 @@ function payload(transcriptPath, extra = {}) {
 
 const GOOD_DIGEST = '```orchard-digest\n{"items":[{"text":"Did the thing","kind":"done","importance":"high"}]}\n```\n\nSome prose below.';
 
+/* FEAT-143 — the digest is now suppressible for a short reply or a single
+ * `orchard-answer` artifact. The "no digest -> BLOCK" cases here test the
+ * missing-digest path (and gating/concat properties around it) and so must use a
+ * SUBSTANTIVE reply (>= 40 words, no digest) — a one-line no-digest reply now
+ * legitimately ALLOWs. SUB_A/SUB_B are halves for the split-message cases. */
+const SUB_A = 'I reviewed the whole change end to end and it holds together. The parser '
+  + 'handles every fence case and the renderer draws each block correctly. ';
+const SUB_B = 'The metrics record one line for every graded turn, and I ran the suite '
+  + 'twice with both passes completely clean. Nothing here needs a decision from you.';
+const SUB = SUB_A + SUB_B;
+
 async function main() {
   console.log('FEAT-085 adversarial verify — hook:', HOOK);
 
@@ -155,7 +166,7 @@ async function main() {
   await expect('A11 huge junk stdin (2MB)', '{' + 'x'.repeat(2_000_000), 'ALLOW');
 
   /* ── B. Loop-cap: stop_hook_active — the wedge-prevention core ─────────── */
-  const noDigest = tmpFile('nodigest.jsonl', jsonl([asst('Just plain prose, no digest here at all.')]));
+  const noDigest = tmpFile('nodigest.jsonl', jsonl([asst(SUB)]));
   await expect('B1 stop_hook_active:true + non-compliant -> ALLOW (loop cap)', payload(noDigest, { stop_hook_active: true }), 'ALLOW');
   // Non-boolean truthy variants: documents whether the loop cap is brittle.
   await expect('B2 stop_hook_active:1 (number)  [probe]', payload(noDigest, { stop_hook_active: 1 }), 'BLOCK');
@@ -200,7 +211,7 @@ async function main() {
   // Final MAIN-thread text AFTER sidechain entries: must grade the main-thread one.
   await expect('D3 main-thread non-compliant AFTER sidechain -> BLOCK the main turn', payload(tmpFile('mixside.jsonl', jsonl([
     asst(GOOD_DIGEST, { isSidechain: true }),                 // subagent WAS compliant — must be ignored
-    asst('Main thread final: plain prose, no digest.'),       // real final -> non-compliant
+    asst(SUB),                                                // real final -> non-compliant
   ]))), 'BLOCK');
   // Compliant main-thread final AFTER a non-compliant sidechain -> ALLOW (no false wedge)
   await expect('D4 compliant main-thread AFTER non-compliant sidechain -> ALLOW', payload(tmpFile('mixside2.jsonl', jsonl([
@@ -224,7 +235,7 @@ async function main() {
     ] } }) + '\n')), 'ALLOW');
   // trailing/blank/partial lines around a valid last entry
   await expect('D8 valid entry then trailing blank/partial lines', payload(tmpFile('trailing.jsonl',
-    jsonl([asst('plain no digest')]) + '\n\n   \n{partial broken line')), 'BLOCK');
+    jsonl([asst(SUB)]) + '\n\n   \n{partial broken line')), 'BLOCK');
   // D9 — the LIVE false-block shape: ONE logical message (one message.id) split
   // across MULTIPLE JSONL lines (thinking line, then digest line, then prose
   // line). Grading only the trailing line saw no fence and falsely blocked; the
@@ -242,15 +253,15 @@ async function main() {
   await expect('D10 split message, all-prose lines (same id), no digest -> BLOCK', payload(tmpFile('splitnc.jsonl',
     [
       splitLine([{ type: 'thinking', thinking: '', signature: 's' }]),
-      splitLine([{ type: 'text', text: 'First prose line.' }]),
-      splitLine([{ type: 'text', text: ' Second prose line, still no digest.' }]),
+      splitLine([{ type: 'text', text: SUB_A }]),
+      splitLine([{ type: 'text', text: SUB_B }]),
     ].join('\n') + '\n')), 'BLOCK');
   // D11 — a PRIOR compliant turn (different id) must NOT be merged in to rescue a
   // later non-compliant turn.
   await expect('D11 different-id neighbour not merged (prior compliant does not rescue) -> BLOCK', payload(tmpFile('twoids.jsonl',
     jsonl([
       { type: 'assistant', message: { id: 'msg_prev', role: 'assistant', content: [{ type: 'text', text: GOOD_DIGEST }] } },
-      { type: 'assistant', message: { id: 'msg_next', role: 'assistant', content: [{ type: 'text', text: 'a whole new turn with no digest' }] } },
+      { type: 'assistant', message: { id: 'msg_next', role: 'assistant', content: [{ type: 'text', text: SUB }] } },
     ]))), 'BLOCK');
 
   /* ── E. Emoji false-positive hunt (legitimate chars must NOT block) ────── */
@@ -271,7 +282,7 @@ async function main() {
   await expect('F6 digest followed by huge prose (1MB)', payload(tmpFile('bigp.jsonl', jsonl([asst('```orchard-digest\n{"items":[{"text":"a","kind":"done"}]}\n```\n\n' + 'lorem ipsum dolor sit amet. '.repeat(40000))]))), 'ALLOW');
 
   /* ── G. Correct BLOCK cases (must not go permissive) ───────────────────── */
-  await expect('G1 no digest, plain prose -> BLOCK', payload(tmpFile('g1.jsonl', jsonl([asst('Here is a perfectly ordinary long answer with no digest block.')]))), 'BLOCK');
+  await expect('G1 no digest, substantive prose -> BLOCK', payload(tmpFile('g1.jsonl', jsonl([asst(SUB)]))), 'BLOCK');
   await expect('G2 fence present, malformed JSON -> BLOCK', payload(tmpFile('g2.jsonl', jsonl([asst('```orchard-digest\n{items: not valid json,,}\n```\nprose')]))), 'BLOCK');
   await expect('G3 fence present, empty items -> BLOCK', payload(tmpFile('g3.jsonl', jsonl([asst('```orchard-digest\n{"items":[]}\n```\nprose')]))), 'BLOCK');
   await expect('G4 items present but all blank text -> BLOCK', payload(tmpFile('g4.jsonl', jsonl([asst('```orchard-digest\n{"items":[{"text":"   ","kind":"done"}]}\n```\nprose')]))), 'BLOCK');
@@ -337,7 +348,7 @@ async function main() {
     const filler = jsonl([{ type: 'user', message: { role: 'user', content: 'x'.repeat(900) } }]);
     let written = 0; const target = 250 * 1024 * 1024;
     while (written < target) { ws.write(filler); written += filler.length; }
-    ws.write(jsonl([asst('plain non-compliant final line, no digest')]));
+    ws.write(jsonl([asst(SUB)]));
     await new Promise((res) => ws.end(res));
     const r = await expect(`I2 synthetic ~250MB transcript -> must not HANG/WEDGE`, payload(bigPath), 'BLOCK');
     console.log(`       (I2 took ${r.ms}ms; watchdog target 3s, hook timeout 5s)`);
@@ -371,7 +382,7 @@ async function main() {
   {
     const ADV = { ORCHARD_STOP_HOOK_ENFORCE: '' };
     const badFile = path.join(TMP, 'adv-bad.jsonl');
-    fs.writeFileSync(badFile, jsonl([asst('plain prose with no digest at all')]));
+    fs.writeFileSync(badFile, jsonl([asst(SUB)]));
     const goodFile = path.join(TMP, 'adv-good.jsonl');
     fs.writeFileSync(goodFile, jsonl([asst('```orchard-digest\n{"items":[{"text":"ok","kind":"done","importance":"high"}]}\n```\ntail prose')]));
 

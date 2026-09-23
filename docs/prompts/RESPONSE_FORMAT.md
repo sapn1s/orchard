@@ -10,7 +10,7 @@ There are two layers, and they do different jobs:
 | Layer | Block | Shape | Job |
 | --- | --- | --- | --- |
 | 1 | `orchard-digest` | JSON | a scannable state summary lifted into the UI |
-| 2 | `orchard-finding` / `orchard-outcome` / `orchard-ask` / `orchard-judgment` / `orchard-status` / `orchard-narration` | prose | every part of the reply declares WHAT IT IS |
+| 2 | `orchard-answer` / `orchard-finding` / `orchard-outcome` / `orchard-ask` / `orchard-judgment` / `orchard-status` / `orchard-narration` | prose | every part of the reply declares WHAT IT IS |
 
 Layer 1 is genuinely structured data and is unchanged by FEAT-091. Layer 2 is
 prose-shaped, because prose is what it holds.
@@ -71,8 +71,8 @@ only (advice); a mechanical length gate is filed as the follow-up.
 <!-- response-format-inject:start -->
 ## Response format (agent core)
 
-Two layers. Layer 1 is a scannable JSON summary; layer 2 declares what each part
-of the prose IS. Presentation follows from the category — never choose it.
+Two layers: layer 1 a scannable JSON summary, layer 2 declaring what each passage
+IS. Presentation follows from the category — never choose it.
 
 **Layer 1 — `orchard-digest`.** When a reply is **substantive** (it decides
 something, finishes something, or carries state the reader must track), lead the
@@ -85,9 +85,11 @@ message with one fenced block, info-string `orchard-digest`, holding JSON:
     ```
 
 - At most once, at the very top; only whitespace may precede it.
-- One sentence per item — a scan surface, not the explanation.
-- `kind`: `decision` | `done` | `in-flight` | `fyi` (common aliases map in;
-  unknown→fyi).
+- **OMIT it** for a short reply, or one whose body is a single artifact — it is a
+  scan surface, not a preamble.
+- Items are NEWS, one sentence each; an item that paraphrases prose below is not
+  news — cut it.
+- `kind`: `decision` | `done` | `in-flight` | `fyi` (aliases map in; unknown→fyi).
 - `importance`: `high` | `med` | `low` (default `med`). **No emojis, ever.**
 - `ref` (optional): a ticket id → a deep link; any other string is an inert label.
 - Ephemeral: THIS turn's state only. Do not accumulate or duplicate the board.
@@ -102,13 +104,18 @@ block; **open with 4 backticks** so ordinary ```code``` fences inside survive:
     What is TRUE: learned, diagnosed, measured, corrected, explained.
     ````
 
-Six names, three pairs. One question picks each pair, one word picks within it:
+**The thing you asked FOR is `orchard-answer`.** When you requested an artifact (a
+draft, command, number, recommendation), that deliverable is an `orchard-answer`
+block: always shown, never folded. NOT `orchard-outcome` — producing text for you
+is not a change to the world.
 
-Only the digest, `ask` and `status` stay open — the rest FOLD, each showing its
-first sentence — lead with the line they decide on.
+Everything else is six names in three pairs:
+
+Open: digest, `answer`, `ask`, `status`. The rest FOLD, each showing its first
+sentence — lead with the line they decide on.
 
 - **the world** — `orchard-finding` what is TRUE · `orchard-outcome` what I
-  CHANGED (shipped/committed/filed) and what you now see.
+  CHANGED in the world: shipped/committed/filed/deployed (never text I wrote you).
 - **a decision** — `orchard-ask` it is YOURS: a choice, question, approval or an
   action only you can take; lead with my recommendation, then `confidence:`
   high/med/low and `decider:` (taste/priority/spend/risk/direction) · `orchard-judgment` it
@@ -118,52 +125,50 @@ first sentence — lead with the line they decide on.
   INSIDE this turn.
 
 - A passage that is two of these is two passages: split it.
-- **Nothing fits** → ` ````orchard-uncategorized <short label of what it is> `.
-  It renders normally, and the label is read to name the category we are missing.
-  It is for genuine incapability, never for avoiding a choice.
+- **Nothing fits** → ` ````orchard-uncategorized <short label> `. It renders
+  normally; the label names the category we lack. For genuine incapability, not
+  to avoid a choice.
 - **Leave nothing loose.** Prose outside every block still renders, but it is
   uncategorised without saying so. A one-line reply is one block.
 - A fence closes only on a run of the same character (`` ` `` or `~`) at least as
   long as its opener.
-- **Repeat freely, in any order** (the digest is the exception: once, first).
+- **Repeat freely, in any order** (digest excepted: once, first).
   Blocks never nest. `orchard-*` is a reserved namespace — do not invent names.
-  An `orchard-*` fence inside a COLLAPSED block ends the fold
-  — never, even as an example.
+  An `orchard-*` fence inside a COLLAPSED block ends the fold — never, as an example.
 
-**Inside a block: lines, not paragraphs.** The category says what a passage IS;
-this is its shape. A reader takes one fact without reading a sentence to its end.
+**Comparisons go in a table.** Anything sharing attributes — candidate lists, cost
+breakdowns, before/after, per-option trade-offs — is a GFM pipe table (`| a | b |`,
+then `|---|---|`); the renderer draws it. Never a comma-run.
 
-- **One line, one job.** Claim, evidence, consequence on separate lines, never
-  one sentence. The lead line is the claim, no wind-up.
-- **Every line is a complete claim, not a fragment.** Shape is not compression.
-- **Cut flow-only connectives** — "which is why", "the honest part is". Carries
-  a reason → its own lead line; only smooths → delete.
-- **Parallel things, parallel slots**, same order every time — one per line, its
-  cost in the same position, so the reader compares columns.
-- `ask` and `judgment` keep the whole argument: an option without its price is
-  not a decision. Shape it, do not shorten it — recommendation, then one line
-  per alternative with what that alternative costs.
+**Inside a block: lines, not paragraphs.** A reader takes one fact without reading
+a sentence to its end.
 
-**How much to write — length is a budget, not a target.** Default: **≤120 words
-of prose**; **≤250 only** for a final handoff or a pending decision. Block
-wrappers (digest, fences) don't count.
+- **One line, one job** — claim, evidence, consequence on separate lines, each a
+  complete claim; the lead line is the claim, no wind-up.
+- **Cut flow-only connectives** ("which is why", "the honest part is"): a reason
+  earns its own lead line; a smoother is deleted.
+- **Parallel things, parallel slots**, same order, cost in the same position.
+- `ask`/`judgment` keep the whole argument — an option without its price is not a
+  decision.
+
+**How much to write — length is a budget, not a target.** Default **≤120 words of
+prose**; **≤250** only for a final handoff or pending decision. Wrappers (digest,
+fences) don't count.
 
 - Keep a sentence only if it adds new evidence, a changed outcome, a material
   limitation, or a requested decision. Else delete it.
-- Report an unchanged lane or blocker ONCE. Don't spend a turn only confirming a
-  save, a re-read, or that a lane still runs.
-- One sentence of pre-result diagnosis; no hypothesis narration unless it changes
-  an action.
-- **Never cut** (not licence to under-report): an unverified admission;
-  before/after counts and real evidence; anything affecting how a commit is
-  reviewed or staged; a retraction of an earlier claim.
+- Report an unchanged lane or blocker ONCE. One sentence of pre-result diagnosis;
+  no hypothesis narration unless it changes an action.
+- **Never cut**: an unverified admission; before/after counts and real evidence;
+  anything affecting how a commit is reviewed or staged; a retraction.
 
-**Your FINAL message to your orchestrator is a compact handoff, not a report.**
-State only: the verdict (done / refuted / needs-you + which decision); the
-decisions the orchestrator must take; and a durable pointer — the ticket id + its
-Activity-log entry, and your report id + timestamp. Full detail goes to the
-Activity log, NOT into this message as prose to replay. Use `orchard-outcome` /
-`orchard-finding`; never paste the report body.
+**Your FINAL message to your orchestrator is a compact handoff, not a report —
+and it must be your LAST message.** State the verdict (done / refuted / needs-you
++ which decision), the decisions to take, and a durable pointer: ticket id +
+Activity-log entry, report id + timestamp. Detail goes to the log; use
+`orchard-outcome` / `orchard-finding`, never paste the report body. If a cleanup pass
+(redaction, `board:gen`, gate re-run) runs after the work, re-state it last —
+the orchestrator can't `Read` your scratch, so "Redacted line 4…" is no handoff.
 <!-- response-format-inject:end -->
 
 ## Why named fenced blocks, and not one JSON object
@@ -485,9 +490,9 @@ without the words the signal it exists to produce is destroyed.
 ## Migration — the two old names keep working, forever
 
 Stored transcripts are full of `orchard-answer` and `orchard-notes`. Rule 3 of
-the extension contract ("names are frozen once shipped") forbids repurposing
-either, so they are **kept as legacy names in `KNOWN_BLOCKS`**, mapped to the
-presentation they shipped with:
+the extension contract ("names are frozen once shipped") forbids **repurposing**
+either — redefining a shipped name to mean something else. Both stay in
+`KNOWN_BLOCKS`, mapped to the presentation they shipped with:
 
 - `orchard-answer` → visible prose, **undecorated, with no category caption**. An
   archived message renders byte-for-byte as it did before round 12; captioning it
@@ -496,11 +501,20 @@ presentation they shipped with:
   original "Notes / internal narration" summary. It stays in `COLLAPSED_BLOCKS`,
   so the certainty guard covers it exactly as before.
 
-They are **removed from the injected core**, so no new turn produces one, and
-the metrics count them under their own names — a legacy count that only ever
-falls. Nothing about the parse, the fold guard, or the corpus changes for them,
-which is why the eleven prior rounds of verification carry over intact instead of
-being re-litigated.
+**Round 15 (FEAT-142) reinstates `orchard-answer` in the injected core** — for
+*the artifact the user asked for* (a draft, a command, a number, a recommendation
+text): always shown, never folded. This is NOT a repurpose and so is inside rule
+3: round 12's own note (below) records that `orchard-answer` already meant
+"responds to what you asked", which is exactly this use. Its rendering is
+unchanged (undecorated, always open), so every archived `answer` block keeps both
+its pixels AND its meaning; the reinstatement is a documentation change plus a
+tightened `orchard-outcome` (which had been absorbing this case — a requested
+draft was landing under "what I CHANGED" and folding, showing the user a preview
+line instead of the answer). `orchard-notes` remains legacy-only: it is **removed
+from the injected core**, so no new turn produces one, and the metrics count it
+under its own name — a legacy count that only ever falls. Nothing about the parse,
+the fold guard, or the corpus changes, which is why the prior rounds of
+verification carry over intact instead of being re-litigated.
 
 ## Rules in detail
 
@@ -954,9 +968,12 @@ is specified rather than assumed. Three rules make it safe:
    something else — add a new name instead. Renaming would silently reinterpret
    every archived message, which is the one thing rules 1 and 2 cannot absorb.
    Round 12 obeyed this at some cost: `orchard-answer` was the natural word for
-   "responds to what you asked", and it was NOT reused, because every archived
-   `answer` block would have silently acquired a meaning its author never chose.
-   Both old names are kept as frozen legacy aliases instead (see Migration).
+   "responds to what you asked", and it was NOT reused for a DIFFERENT meaning,
+   because every archived `answer` block would then have silently acquired a
+   meaning its author never chose. Round 15 (FEAT-142) reinstates `orchard-answer`
+   in the injected core with its ORIGINAL meaning — the artifact the user asked
+   for — which is not a repurpose: archived blocks keep both their rendering and
+   their meaning (see Migration). `orchard-notes` remains a frozen legacy alias.
 
 **Adding the SEVENTH category is a decision the metrics make, not a designer.**
 The trigger is in the report: one label, or one obvious family of labels, on a

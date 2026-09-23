@@ -500,3 +500,271 @@ group `data-focus` anchors preserved so FEAT-054 deep-links still land.
 - **Process note:** pid 2658852 / port 34805 (round-4 scratch) confirmed DEAD;
   port 34805 free. My own scratch server (pid 2715254, port 36701) killed by pid;
   all scratch ports free; 4317 untouched. No git writes; no files changed.
+
+### 2026-09-18 19:59Z — fixing lane (round 6, class=fix) — strip + rail declutter (folds in FEAT-114)
+- **Charter:** restructure the session header strip and the board side rail so a
+  control you click to CHANGE something and a number you can only READ do not look
+  the same. Three zones — Navigate / Live-readout / Config(one door) — plus the
+  permission MODE pill kept as its own language. Folds FEAT-114 (strip overflow)
+  into this ticket. User complaint: "some are status labels, some are settings and
+  then we also have settings, all visually same … board/guide can be buttons."
+- **Hypothesis check (done FIRST, against the real markup — REFINED, not
+  refuted):** the charter's hypothesis was "the strip renders settings-controls,
+  navigation and read-only status with IDENTICAL chip/pill styling." Partly true.
+  FEAT-114 had ALREADY differentiated the readouts (`.readout`, transparent) and
+  the perm chip (`.perm`, borderless) from the pills. The genuinely-undifferentiated
+  pair was NAV (Board/Guide, `.pill.board-pill`) vs CONFIG (Provider/Isolation/
+  Instructions/Settings, all plain `.pill`) — nav and config wore ONE bordered-pill
+  look, and the config chips were on the strip at all. So the clutter is (a) config
+  chips present on the strip that belong in Settings, and (b) nav==config visual
+  weight. The three-zone design is the correct fix for exactly that; I proceeded and
+  report the refinement rather than build on the literal (wrong) claim.
+- **Changed (unstaged), THIS round:**
+  - `public/app.js` — `paintCrown` no longer paints the provider/isolation/
+    instruction chips onto the strip (they move under the one Settings door);
+    `paintProvSel` keeps `#provSel` hidden; removed now-dead `ISO_META` and
+    `PROC_PORT_CAP` consts. Proc readout FACE compacted from the port-dump
+    (":4317 :34699 … · 90 procs") to a single "N ports"/"N procs" count — the full
+    port list stays ONLY in the existing `#procPop` popover (BUG-082 invariant taken
+    to its end). Side rail: `reconcileNeeds` now renders at most `NEEDS_RAIL_CAP`(3)
+    interactive needs cards + a one-click "+N more need you → board" count row
+    (`railMoreRow`), preserving the in-place focused-textarea reconcile for the
+    shown set; the Queued section renders a single "N queued → board" count instead
+    of the full ~86-row list. No data or route removed — everything is one click
+    away on the board (`navTickets`).
+  - `public/styles.css` — three distinguishable zone treatments: `.board-pill` nav
+    = opaque bg + weight 500 + hover FILL (highest affordance); `.seal .readout` =
+    chromeless, ink-4 muted (a step quieter); `.seal .perm` = a fully-rounded
+    (999px) MODE PILL with a soft filled ground + live dot, its own language.
+    `.seal-break` repurposed from a full-width tier break to a flexible spacer that
+    right-aligns the readout cluster and still shrinks-to-wrap (keeps FEAT-114's
+    no-clip). New rule `#seal #provSel,#isoBtn,#insBtn { display:none }` — REQUIRED,
+    because `.pill{display:inline-flex}` overrides the plain `[hidden]` attribute
+    (no `.pill[hidden]` reset exists), so a JS `.hidden=true` alone left them
+    visible (caught live in the browser proof). Plus `.rail-more` styling.
+  - `scripts/verify-bug-082-proc-chip.mjs`, `scripts/verify-bug-075-mount-chip.mjs`
+    — updated the strip-FACE assertions to the new design (proc face is a count,
+    not a port list; isolation/instruction chips are OFF the strip), KEEPING every
+    still-valid invariant (procPop lists all ports in :4317-first order + station
+    tag + toggle; mounts still container-gated + functional). Both green: 13/13, 9/9.
+- **Proof (headless Playwright MCP, real browser, isolated scratch server on an
+  ephemeral port, the REAL Orchard repo registered as the project → real git chip
+  + a REALISTIC BUSY board: 19 needs-you, 86 queued, 5 in-flight):**
+  - Three zones carry distinguishably different COMPUTED styles (nav opaque bg +
+    weight 500; readout transparent bg+border, ink-4; mode pill bg-distinct-from-nav
+    + 999px radius) — asserted true in BOTH light and dark.
+  - Removed items ABSENT from the strip: `#provSel`/`#isoBtn`/`#insBtn` all
+    computed display:none / offsetParent null. Reachable from Settings: opening the
+    drawer (project scope, `#dScope` spine present) surfaces provider + isolation +
+    instructions controls (one click).
+  - Mode pill present + distinct ("skips prompts"), kept as the one strip-resident
+    posture control.
+  - No horizontal overflow: `#seal` scrollWidth == clientWidth (clips:false) at
+    1400px AND 1100px (FEAT-114's original symptom).
+  - Rail: exactly 3 needs cards + "16 more need you → board"; Queued = a single
+    "86 queued → board" row (0 inline rows).
+  - **MUST-FAIL (fixed baseline = git HEAD public/, served by a second scratch
+    server built with the CURRENT src + HEAD public):** the SAME assertions FAIL —
+    `#provSel`(◆Anthropic)/`#isoBtn`(▣Container)/`#insBtn`(▤Working Agreement v4)
+    all VISIBLE; proc face = ":4317 :34699 :43767 +2 · 46 procs"; rail = 19 uncapped
+    needs cards + 86 queued rows, no count rows. Baseline is a fixed revision, not a
+    moving ref.
+  - Screenshots (viewport, real render): `docs/bugs/assets/FEAT-139-strip-rail-light.png`,
+    `FEAT-139-strip-rail-dark.png`, and the before/HEAD state
+    `FEAT-139-strip-rail-before.png`. Visual review: both themes read as three
+    clean groups; dark renders correctly (nav-button dark bg — the one white
+    `getComputedStyle` was the documented same-turn custom-property stale-read, the
+    pixels are correct).
+- **Deliberate scope decisions (flagged for the orchestrator):**
+  - The container "+ Add mount" / mount pills were LEFT on the strip (not in the
+    charter's named remove-list; container-only, rare; has its own workflow +
+    BUG-075 tests + inline remove). They are the one remaining config affordance on
+    the strip; relocating them into Settings ▸ Mounts is a clean follow-up if wanted.
+  - The Claude account selector (`#acctSel`, FEAT-145) is inserted after the now-
+    hidden `#provSel`; it only appears with >1 account, so it is out of view in the
+    common case. Not touched this round.
+- **Anti-regression:** `npm run gate` → PASS (exit 0, unpiped, read directly:
+  leak-gate, check-nul, typecheck). `verify-bug-082-proc-chip` 13/13,
+  `verify-bug-075-mount-chip` 9/9, `verify-bug-106-crossproject-strip` (checks
+  `#seal .perm` text — unaffected). `verify-bug-106` currently FAILS at fixture
+  setup ("both project headers" timeout) — I proved it fails IDENTICALLY against
+  HEAD's public/ (ran the same test pointed at git-HEAD public), so it is a
+  pre-existing shared-tree/other-lane condition, NOT this change; flagged, not hidden.
+- **Bucket / Verified-by:** contained render, zero adversarial rounds → the proof
+  above IS the deliverable (WA §N). No lifecycle/security/data path touched. An
+  independent clean-room pass is NOT warranted for this UI-only slice.
+- **Still open / handoff:** none blocking. Orchestrator owns INDEX.md + status; I
+  did not run `board:gen` (it rewrites INDEX). All scratch servers killed by pid;
+  ephemeral ports free; 4317 (user session) untouched; no git writes.
+- **Symptom of a deeper design flaw?** Same shape as the ticket's own thesis: a
+  strip that grew a chip per feature with no zone discipline, so a readout, a nav
+  link and a settings control all became "a pill". The durable fix is the zone rule
+  now expressed in code (Navigate / Live-readout / Config-one-door / Mode-pill) and
+  the ARCH-010-style single Settings door FEAT-139 already established — a new chip
+  now has to declare which zone it is. Not filing an ARCH; the invariant is in code.
+
+---
+
+### 2026-09-18 — Independent design-critic review (verify lane, round 1)
+
+Reviewed the RENDERED result on the live instance (localhost:4317, busy Orchard
+project, 134 dirty, 19 needs-you), not the diff or the builder's report. Widths
+1100 / 1400 / 1680 in light; dark judged from the on-disk dark reference plus
+computed CSS-variable contrast. Screenshots (repo root): feat139-live-1400-orchard.png,
+feat139-live-1100-orchard.png, feat139-live-1680-orchard.png, feat139-live-1680-after-polish.png.
+
+Verdict: SHIPS, with one polish applied. The felt-clutter goal is genuinely
+met — the config chips (provider / isolation / instruction stack) leaving the
+strip for the single Settings door is the big win, and the nav-vs-readout
+hierarchy is legible at a glance.
+
+Measured zone treatment (light, 1400, real state):
+- Nav (Board/Guide/Settings): white fill #FFF, 1px #E3E5E1 border, radius 6px,
+  text --ink #1B1F1D, weight 500. Clearly the "buttons".
+- Readouts (git/ports/usage): transparent bg, transparent border, flat text
+  --ink-4 #696E6B (~5.2:1 on white) weight 400. A full tone quieter and no
+  chrome — the eye separates "press" from "read". Zone distinction ACHIEVED.
+- usage warn = #B0703C (81% wk). Draws the eye (not invisible) — intent #2 met.
+- Mode pill .perm "asks first": radius 999px, border #E3E5E1, FILLED bg
+  --sunken #F1F2EF, text --ink-2 #535755, plus a status dot. Distinct from the
+  transparent tool chips (--ink-3 #60655E) — but only by a subtle ~5% fill + the
+  dot, same pill shape, and it sits glued to the tool run (6px gap) at wide.
+
+Dark: readout --ink-4 #858683 on --window #131513 ≈ 5.07:1 (AA pass; matches the
+"raised to clear AA" comment). Nav #E6E9E5 ≈ 15:1. Muted zone SURVIVES dark.
+
+Defects found (ranked, none blocking):
+1. (medium) Mode pill reads as "the filled chip at the end", not emphatically a
+   flippable live mode. Distinction rests entirely on a subtle sunken fill + dot;
+   it is not spatially set apart from the tool chips. Intent #3 only partially
+   achieved. Author's call whether to strengthen (e.g. a hair of separation or a
+   faint tint) — left untouched as a deliberate-token judgment.
+2. (medium-low) Intermediate width (~1100) fractures the readout zone: the
+   flexible .seal-break spacer collapses just enough that git clings to the nav
+   row while ports+usage wrap down and interleave with the bordered tool chips,
+   and the mode pill orphans to a 3rd row. The flat-vs-bordered treatment keeps
+   it readable, but "one muted status cluster" doesn't hold, and 3 wrapping rows
+   slightly undercut the reduce-clutter goal. Fixing properly needs a wrapper
+   (markup) or breakpoint — out of CSS-only polish scope; flagged for author.
+3. (low) Light usage-warn #B0703C ≈ 3.2:1 on white — under AA 4.5 for 11px text
+   (dark is fine ~5.9:1). It's a warn accent so noticeable, but the lightest
+   readable link in the chain. Left to author since --warn is a tuned token.
+
+Polish APPLIED (public/styles.css only): `.seal .sep:last-child { display:none }`.
+#sealSep is shown whenever a project is selected and is the LAST strip element
+(perm/integ insert before it), so it rendered as a 1px hairline dangling off the
+end of the row with nothing after it. Now hidden when final; re-appears only if a
+later state inserts content after it. Confirmed gone at 1680 (before/after shots).
+
+Could not reproduce the "+16 more need you" rail string in the live busy state —
+the rail caps via counts (19 NEEDS) + focus line + a couple expanded cards, not a
+"+N more" line, so that specific concern doesn't manifest here. Minor: the FOCUS
+line is a quiet single truncated row, not strongly prominent; and the "9 agents
+stopped" digest (6 near-identical local_bash rows) is the tallest thing in the
+rail — likely a separate feature's surface, noted for awareness.
+
+### 2026-09-19 10:49Z — fixing lane (round 2 of the strip work, class=fix) — design-review defects 1 & 2
+
+- **Charter:** close the two defects the 2026-09-18 independent design-critic
+  raised against the round-6 header-strip restructure (defect 1 = mode pill not
+  categorically distinct; defect 2 = readout zone fractures at ~1100px), plus the
+  housekeeping move of four stray root screenshots. Defect 3 (light `--warn`
+  token) is a deliberately tuned token — OUT of scope, not touched.
+- **Hypothesis check FIRST (headless Playwright MCP, real app, before any edit):**
+  booted an isolated scratch server (free port 39257, isolated
+  CLAUDE_STATION_DATA + CLAUDE_CONFIG_DIR + CLAUDE_PROJECTS_DIR via
+  scripts/lib/station-boot.mjs), drove the REAL served page, seeded a realistic
+  busy single-project state through the documented `window.__station` hooks
+  (git: main·134 dirty·+2200·−480·↑3; procs: 5 ports/90; usage: 81% wk·2d;
+  Serena integ; perm "asks first"). Background poll timers cleared so the fixture
+  isn't wiped mid-measure; seed+measure done atomically. BOTH defects reproduced
+  exactly as described — NOT refuted, so I proceeded:
+  - Defect 2 (zone fracture): a zone-mix metric over live `getBoundingClientRect`
+    rows (badMix = readout items span >1 row AND ≥1 of those rows also holds a nav
+    item). PRE-CHANGE light: 1400 (seal 923) one row, badMix=false; **1100 (seal
+    666) badMix=TRUE** — Board/Guide/Settings + git/proc/usage share row 0 while
+    integ+perm orphan to row 1; **1000 (seal 800) badMix=TRUE** — perm orphans
+    alone to row 1. overflow=false throughout (FEAT-114 intact). Same in dark.
+    Before screenshot: `FEAT-139-r2-before-1100-light.png` (nav+readouts jumbled,
+    "◆ Serena / asks first" dangling on a 3rd row).
+  - Defect 1 (mode pill): PRE-CHANGE both themes — perm was a 999px capsule,
+    `margin-left:0`, glued to the tool chips at the 6px inter-chip gap
+    (permGap=6), a flat dot (`box-shadow:none`), and NO caret (`hasCaret:false`).
+    Distinction rested only on a ~5% sunken fill — the reviewer's exact finding.
+- **Fix — defect 2 (width-independent wrapper, per charter's preferred option):**
+  - `public/index.html` — wrapped `#gitBtn`/`#procBtn`/`#usageBtn`/`#integStrip`/
+    `#sealSep` in a single `<span class="seal-readouts" id="sealReadouts">`. The
+    flexible `.seal-break` spacer stays a direct child of `#seal` BEFORE the
+    wrapper (wide right-alignment preserved). The perm pill inserts before
+    `#sealSep` (paintPerm), so it now lands INSIDE the wrapper too.
+  - `public/styles.css` — new `.seal-readouts { display:inline-flex;
+    flex-wrap:wrap; align-items:center; column-gap:6px; row-gap:7px; min-width:0 }`
+    so the cluster wraps as ONE unit below the nav (never fractures), and only its
+    own contents wrap inside it (no horizontal overflow). `.seal .sep:last-child`
+    still hides `#sealSep` — it is now last child of the wrapper, still matched.
+  - `public/app.js` — the perm remove query at the seal-chip site changed from
+    `node.seal.querySelector(':scope > .perm')` (direct-child) to
+    `node.seal.querySelector('.perm')` (subtree), because perm moved into the
+    wrapper. Mount insertion (`node.sealBreak.before(...)`) and the `.seal-vdiv`
+    query are unaffected (both still direct children of `#seal`).
+- **Fix — defect 1 (categorical mode pill), both themes:**
+  - `public/app.js` (paintPerm) — the chip now also renders a caret
+    (`svg('M4 6.5 8 10.5 12 6.5', 8, 'cx')`) in the `.sel` idiom, announcing "opens
+    something to CHANGE the mode".
+  - `public/styles.css` (`.seal .perm`) — `margin-left:8px` (clear separation from
+    the tool chips, not glued at 6px); the dot is now an LED (solid core +
+    `box-shadow: 0 0 0 2px color-mix(...)` halo ring, tint tracks the dot colour,
+    incl. the `[data-risk="true"]` variant); `.cx` caret styled at ink-4/opacity
+    .55 firming to .8 on hover. Kept QUIETER than the nav buttons: soft sunken
+    ground + ink-2, no weight-500, no hover FILL (only a firmed border). Shape
+    (999px) already distinguished it from the 6px nav buttons and the chromeless
+    readouts; these add the "live + flippable" affordance the reviewer wanted.
+- **Verified — must-FAIL then PASS, headless Playwright MCP, real served page,
+  1000/1100/1400 × light+dark (same scratch server, reloaded to pick up edits):**
+  - Defect 2: post-fix badMix=FALSE at ALL of 1000/1100/1400 in BOTH themes;
+    readout items always share ONE row as each other, distinct from the nav row
+    (1100/1000: nav on row 0, [git,proc,usage,integ,perm] together on row 1;
+    1400: single right-aligned row). `hasWrapper`/`permInWrapper`=true. overflow
+    (scrollWidth>clientWidth) = FALSE at 1000/1100/1400 both themes (no FEAT-114
+    regression). The identical metric returned badMix=TRUE at 1100/1000 pre-change
+    — non-vacuous.
+  - Defect 1: post-fix both themes — `hasCaret`=true & caret visible, dot
+    `box-shadow` is a 2px halo ring (light `…/0.35`, dark `…/0.35`), `margin-left`
+    8px, permGap=14 (was 6). Same assertions failed pre-change (no caret, ring
+    none, gap 6).
+  - After screenshots (docs/bugs/assets/): `FEAT-139-r2-after-1100-light.png`,
+    `FEAT-139-r2-after-1100-dark.png`, `FEAT-139-r2-after-1400-light.png`,
+    `FEAT-139-r2-after-1400-dark.png`, and perm close-ups
+    `FEAT-139-r2-perm-closeup-{light,dark}.png` (LED ring + caret legible in both).
+- **Anti-regression:** `npm run gate` → PASS (exit 0, unpiped, read directly:
+  leak-gate, check-nul, typecheck). `verify-bug-082-proc-chip` 13/13,
+  `verify-bug-075-mount-chip` 9/9 (both exercise the strip and still green under
+  the wrapper). `verify-bug-106-crossproject-strip` FAILS at fixture setup
+  ("both project headers" timeout, line 181) — the SAME pre-existing shared-tree
+  failure round 6 recorded and proved identical against HEAD; it aborts upstream
+  of any `#seal`/perm code, so it is not this change. (No git writes permitted, so
+  I did not re-diff against HEAD myself; cross-referenced round 6's proof.)
+- **Housekeeping:** moved the four stray root screenshots (plain `mv`) to
+  docs/bugs/assets/ as `FEAT-139-review-live-{1400,1100,1680}-orchard.png` and
+  `FEAT-139-review-live-1680-after-polish.png`; also filed my own proof shots
+  there. Two other feat139-prefixed root pngs (`feat139-live-1400-a.png`,
+  `feat139-r5-current-code-machine-highlighted.png`) were NOT in the charter's
+  named set and were left untouched.
+- **Changed (unstaged), THIS lane only:** `public/index.html`, `public/styles.css`,
+  `public/app.js` (product) + the moved/added screenshots under docs/bugs/assets/
+  (that dir is gitignored). The other `public/lib/*.js` modifications in this
+  shared tree are pre-existing, not mine.
+- **Bucket / Verified-by:** contained render, zero adversarial rounds — the proof
+  above IS the deliverable (WA §N). No lifecycle/security/data path touched. An
+  independent clean-room pass is NOT warranted for this UI-only slice.
+- **Limits / could-not-test:** the strip's available width is layout-constrained
+  (seal ~666–923px inside the crown column even at 1000–1400 viewport, with a
+  right rail present at wider viewports), so the fracture manifests at these
+  seal widths rather than at the reviewer's raw viewport numbers; the invariant
+  (no zone-mix, no overflow) is asserted at the real rendered widths. Fixture is
+  synthetic busy-state driven through the sanctioned `window.__station` hooks on
+  the REAL served page (no real multi-project live board available in an isolated
+  scratch server); git/procs/usage/perm values seeded to a realistic busy day.
+- **Still open / handoff:** none blocking. Orchestrator owns INDEX.md + status; I
+  did not run board:gen. Scratch server killed by pid; ephemeral port freed; the
+  user's 4317 and other live tabs untouched; no git writes.

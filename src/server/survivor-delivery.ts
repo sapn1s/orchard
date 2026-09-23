@@ -207,7 +207,13 @@ class DeliveryImpl implements SurvivorDelivery {
         request_id: p.rawId,
         response: allow
           ? { behavior: 'allow', updatedInput: p.input }
-          : { behavior: 'deny', message: message || 'denied from the dashboard' },
+          : {
+              behavior: 'deny',
+              // BUG-174 — verbatim to the model. The card was answered in the
+              // dashboard, not at a prompt inside this session; say which, so
+              // this cannot be read as a plan rejection or an interrupted turn.
+              message: message || 'DENIED FROM THE ORCHARD DASHBOARD — the user declined it there, not at a prompt in this session. Do not retry it; ask what they want instead.',
+            },
       },
     });
     return true;

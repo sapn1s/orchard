@@ -209,25 +209,43 @@ check('(D) legacy prose tickets still exist for the pre-fix comparison to be ABO
 // The dependent checks below say `legacyCorpus.length === 0 || …` so that a
 // fully-promoted board produces exactly ONE loud failure — the one above, which
 // carries the remedy — instead of a wall of derived ones saying the same thing.
+// ARCH-004/ARCH-017: the INCIDENTAL-DONE class — a legacy ticket the pre-fix
+// match-anywhere rules swept to Done, but whose DECLARED leading word is not
+// done. These are exactly the tickets this fix moves to Open, so both pre-fix
+// baselines (board and narrow) legitimately diverge from the board on this set
+// and no other. Named, so a NEW divergence outside the class is caught.
+const incidentalDone = legacyCorpus.filter((t) =>
+  preFixBoardIsDone(t.statusRaw) && !S.classifyLegacyStatus(t.statusRaw).done);
+const incidentalIds = new Set(incidentalDone.map((t) => t.id));
+
 const moved = legacyCorpus.filter((t) => preFixBoardIsDone(t.statusRaw) !== boardDone.has(t.id));
-check(`(D) no legacy ticket changed board placement: the done set is identical to the pre-fix board.mjs rule's (${boardDone.size} done, ${promotedCorpus.length} promoted ticket(s) excluded: ${idList(promotedCorpus) || 'none'})`,
-  legacyCorpus.length === 0 || moved.length === 0, idList(moved));
+const movedWrongWay = moved.filter((t) => !preFixBoardIsDone(t.statusRaw) && boardDone.has(t.id));
+// The fix is DIRECTIONAL: it only ever removes an incidental-DONE placement
+// (done→open), never adds one (open→done). So every moved ticket is in the
+// incidental-DONE class, and none moved the wrong way.
+check(`(D) the only legacy tickets that moved vs the pre-fix board.mjs rule are incidental-DONE corrections, done→open (${moved.length} moved: ${idList(moved) || 'none'}; ${promotedCorpus.length} promoted excluded)`,
+  legacyCorpus.length === 0 || (movedWrongWay.length === 0 && moved.every((t) => incidentalIds.has(t.id))),
+  movedWrongWay.length
+    ? `these moved open→done, which the fix must never do: ${idList(movedWrongWay)}`
+    : idList(moved.filter((t) => !incidentalIds.has(t.id))) || idList(moved));
 
 const narrowOnly = legacyCorpus.filter((t) => preFixNarrowIsDone(t.statusRaw) !== boardDone.has(t.id));
 // PROPERTY, NOT A COUNT. This asserted `narrowOnly.length === 12` and reddened
 // the moment anyone wrote a new `FIXED`/`VERIFIED` status line the old narrow
 // rule would not have matched — i.e. every time the board is used correctly.
-// (Observed 2026-08-20: closing ARCH-009 and BUG-119 and adding BUG-122 took it
-// to 15 with no defect anywhere.) The invariant the count was standing in for is
-// directional: the narrow rule UNDER-counted, calling done tickets open, and
-// never the reverse. That is what is asserted, plus non-vacuity.
+// The invariant the count stood in for is directional: the narrow rule
+// UNDER-counted (called done tickets open) via its missing FIXED/RESOLVED words,
+// AND — like the pre-fix board — OVER-counted the incidental-DONE class via its
+// own `\bDONE\b`. Post-fix the board calls the incidental-DONE class Open, so the
+// only tickets the narrow rule calls done-while-board-open are that class, named.
 const narrowSaidOpen = narrowOnly.filter((t) => boardDone.has(t.id));
 const narrowSaidDone = narrowOnly.filter((t) => !boardDone.has(t.id));
-check(`(D) the ticket API and arch-watch changed on exactly the tickets the narrow rule got wrong (${narrowOnly.length})`,
-  legacyCorpus.length === 0 || (narrowOnly.length > 0 && narrowSaidDone.length === 0),
-  narrowSaidDone.length
-    ? `narrow called these DONE while the board calls them open: ${narrowSaidDone.map((t) => t.id).join(', ')}`
-    : `${narrowSaidOpen.length} tickets the narrow rule called open and the board calls done: ${narrowSaidOpen.map((t) => t.id).join(', ')}`);
+const narrowSaidDoneUnexpected = narrowSaidDone.filter((t) => !incidentalIds.has(t.id));
+check(`(D) the ticket API/arch-watch differ from the narrow rule only where it under-counted or on the incidental-DONE class (${narrowOnly.length} differ)`,
+  legacyCorpus.length === 0 || (narrowOnly.length > 0 && narrowSaidDoneUnexpected.length === 0),
+  narrowSaidDoneUnexpected.length
+    ? `narrow called these DONE while the board calls them open and they are NOT incidental-DONE: ${narrowSaidDoneUnexpected.map((t) => t.id).join(', ')}`
+    : `${narrowSaidOpen.length} open→done by the board; incidental-DONE: ${narrowSaidDone.map((t) => t.id).join(', ') || 'none'}`);
 
 // EVERY REAL TICKET'S WORK_STATE IS DETERMINED, whichever format it is in. If
 // this fails, either a NEW unmapped status word has entered the board (the
@@ -304,7 +322,10 @@ const CASES = [
   // what the pre-fix rule did, so rejecting moves no ticket.
   ['VERIFIED2026-08-13', null, false, false],
   ['SYNTHESISDONE', null, false, false],                    // likewise run together: rejected, exactly as before
-  ['SYNTHESIS — v1 DONE, v2 pending', 'done', true, true],  // the REAL FEAT-020 shape: DONE is a separate token
+  // ARCH-004/ARCH-017: no recognised LEADING state word, so UNMAPPABLE — an
+  // incidental DONE token no longer sweeps a header to Done (the old
+  // no-leading-word branch is gone). Stays Open, where a human sees it, loudly.
+  ['SYNTHESIS — v1 DONE, v2 pending', null, false, false],
   ['VERIFIED/DONE', 'verified', true, true],
   ['DONE (2026-08-12)', 'done', true, true],
   ['FIXED', 'done', true, true],
@@ -349,19 +370,27 @@ check('(C) FIXED is work_state done + verification_state pending; VERIFIED is ve
   && S.classifyLegacyStatus('VERIFIED').verificationState === 'holds'
   && S.classifyLegacyStatus('FIXED').done === S.classifyLegacyStatus('VERIFIED').done);
 
-// The ambiguity flag: board.mjs's deliberate match-anywhere DONE, made visible.
-const amb = S.classifyLegacyStatus('IN PROGRESS — Phase R DONE; v1 shipped');
-check('(C) a not-done leading word swept to Done by an incidental DONE is placed the same as before, but flagged ambiguous',
-  amb.done === true && amb.ambiguous === true && preFixBoardIsDone('IN PROGRESS — Phase R DONE; v1 shipped') === true,
-  JSON.stringify(amb));
-check('(C) an unambiguous status is NOT flagged ambiguous', S.classifyLegacyStatus('VERIFIED 2026-08-13').ambiguous === false);
-// Ambiguity is a property of a PROSE status line — a record states one
-// `work_state` and cannot be ambiguous — so this is asserted over the legacy
-// half, and the empty-legacy case is the loud (D) failure above, not a quiet
-// pass here.
-const realAmbiguous = legacyCorpus.filter((t) => S.classifyLegacyStatus(t.statusRaw).ambiguous).map((t) => t.id);
-check(`(C) the real corpus's ambiguous placements are surfaced by name (${realAmbiguous.length}: ${realAmbiguous.join(', ')})`,
-  legacyCorpus.length === 0 || realAmbiguous.length >= 1);
+// ARCH-004/ARCH-017: the incidental-DONE sweep is REMOVED. A not-done leading
+// word with a `DONE` token later in the line keeps the LEADING word's state and
+// is NOT flagged ambiguous. This is exactly where the new rule DIVERGES from the
+// pre-fix board.mjs rule — the fix, demonstrated on the ARCH-017 shape.
+const inc = 'IN PROGRESS — Phase R DONE; v1 shipped';
+const incCls = S.classifyLegacyStatus(inc);
+check('(C) a not-done leading word is NOT swept to Done by an incidental DONE — the leading word wins, unflagged',
+  incCls.done === false && incCls.workState === 'in_progress' && incCls.matched === true && incCls.ambiguous === false,
+  JSON.stringify(incCls));
+check('(C) …and this DELIBERATELY diverges from the pre-fix match-anywhere rule, which called it done (the fix is not vacuous)',
+  preFixBoardIsDone(inc) === true && S.classifyLegacyStatus(inc).done === false);
+// A header with no recognised leading word but an incidental DONE is UNMAPPABLE,
+// not swept to Done (the old no-leading-word branch is gone).
+const synth = S.classifyLegacyStatus('SYNTHESIS — v1 DONE, v2 pending');
+check('(C) a header with no leading state word but an incidental DONE is UNMAPPABLE, not Done',
+  synth.matched === false && synth.done === false && synth.workState === null, JSON.stringify(synth));
+// No legacy status is flagged ambiguous any more: the incidental-DONE OUTCOME no
+// longer exists, so the whole real corpus is clean of it.
+const stillAmbiguous = legacyCorpus.filter((t) => S.classifyLegacyStatus(t.statusRaw).ambiguous).map((t) => t.id);
+check(`(C) NO legacy ticket is flagged ambiguous — the incidental-DONE outcome is gone (${stillAmbiguous.length}: ${stillAmbiguous.join(', ') || 'none'})`,
+  stillAmbiguous.length === 0, stillAmbiguous.join(', '));
 
 /* ────────────────────────── (E) an unclassifiable status is reported loudly */
 

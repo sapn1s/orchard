@@ -1437,14 +1437,16 @@ async function main() {
     // EVERY category name must reach the prompt: a name the agent is never told
     // about is a name it can never use, and the metrics would read that as the
     // category being unnecessary.
-    for (const n of ['orchard-finding', 'orchard-outcome', 'orchard-ask', 'orchard-judgment',
-                     'orchard-status', 'orchard-narration', 'orchard-uncategorized']) {
+    for (const n of ['orchard-answer', 'orchard-finding', 'orchard-outcome', 'orchard-ask',
+                     'orchard-judgment', 'orchard-status', 'orchard-narration', 'orchard-uncategorized']) {
       check(`layer 2 reaches the prompt (${n})`, sec.includes(n), true);
     }
-    // The RETIRED names must NOT be advertised — they still parse forever, but a
-    // new turn must not be taught to write one.
-    check('the legacy names are NOT injected (they parse, they are not taught)',
-      !sec.includes('orchard-answer') && !sec.includes('orchard-notes'), true);
+    // FEAT-142 reinstated `orchard-answer` in the injected core — for the artifact
+    // the user asked for — with its ORIGINAL meaning, so it is not a repurpose (see
+    // RESPONSE_FORMAT.md Migration). `orchard-notes` remains the one RETIRED name:
+    // it still parses forever, but a new turn must not be taught to write it.
+    check('the retired legacy name orchard-notes is NOT injected (it parses, it is not taught)',
+      !sec.includes('orchard-notes'), true);
     check('the fallback-is-not-lost rule reaches the prompt', /renders as ordinary prose/.test(sec), true);
     check('the split-a-compound-passage rule reaches the prompt', /is two passages: split it/.test(sec), true);
     check('the leave-nothing-loose rule reaches the prompt', /Leave nothing loose/i.test(sec), true);
@@ -1457,10 +1459,12 @@ async function main() {
     // This bound is the SAME budget verify:feat-084 pins; keep the two in step. It
     // was left at 4000 when round 14 (FEAT-098) grew the core to ~5245 and raised
     // only feat-084's copy to 5500; ARCH-016 added the lane-final-message contract
-    // (+~440, observed 5687) and both are now 5900, still under the 6000 maxChars
-    // cap so the core is delivered whole. Growing past this is a decision.
+    // (+~440, observed 5687) and both went to 5900. FEAT-149 folded the
+    // re-state-the-handoff-after-cleanup clause into that contract (+~200, observed
+    // 6102); both pins are now 6200 and the maxChars cap is 6400 (templates.ts) so
+    // the core is delivered whole. Growing past this is a decision.
     check('the injected core stays inside its stated budget',
-      sec.length <= 5900 && sec.length < 6000, { sectionChars: sec.length });
+      sec.length <= 6200 && sec.length < 6400, { sectionChars: sec.length });
   }
 
   if (docPresent) {

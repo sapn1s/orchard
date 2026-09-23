@@ -34,6 +34,14 @@
   --on-solid: #FFFFFF;
   --live:     #7B8F5E;   /* muted moss — running */
   --idle:     #B6BCB7;
+  /* BUG-183 — warm warning ink. It had NO definition at all: every call site read
+     `var(--warn)`, so the hardcoded light-mode fallback shipped unchanged
+     onto the dark surface. Warm ochre, never red — the house rule (see header).
+     FEAT-146 round 4: the light value was #B0703C, a terracotta that read as a
+     second BRAND accent rather than as caution. Dulled to an ochre that sits in
+     the same family as --st-needs and stops competing with the provenance chip;
+     re-checked by scripts/verify-bug-101-contrast.mjs after the change. */
+  --warn:     #967A3A;
   --window-shadow: 0 0 0 1px rgba(27,31,29,.05), 0 1px 2px rgba(27,31,29,.04), 0 24px 60px -24px rgba(27,31,29,.28);
   --pop-shadow: 0 1px 2px rgba(27,31,29,.06), 0 18px 40px -14px rgba(27,31,29,.3);
 
@@ -51,6 +59,19 @@
   --mono: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "DejaVu Sans Mono", ui-monospace, monospace;
 
   --side: 272px;
+
+  /* BUG-183 — two ALIASES, declared exactly ONCE and deliberately not repeated in
+     the three theme blocks below. They resolve through a token that is itself
+     theme-swapped on :root, so a var() alias follows the active theme with no
+     second place able to hold a different answer (CONVENTIONS.md, ARCH-010) —
+     which is the defect class this ticket exists for. Anything with genuinely
+     per-theme HEXES (--warn above) must still be repeated in all four blocks.
+       --focus  the affordance ring colour; matches the global :focus-visible rule.
+       --danger the loudest severity tone. Reuses the palette's own --st-high
+                rather than the #c0392b that was hardcoded in two fallbacks — one
+                severity red in the file, and the quieter of the two. */
+  --focus:  var(--ink-2);
+  --danger: var(--st-high);
   color-scheme: light;
 }
 
@@ -71,6 +92,7 @@
     --on-solid: #131513;
     --live:     #8FA470;
     --idle:     #454B46;
+    --warn:     #C89A6A;   /* BUG-183 — lifted for the dark surface */
     --st-prog:  #7FA6CE;   /* FEAT-066 — lifted for the dark surface */
     --st-needs: #CBA05C;
     --st-done:  #8FA470;   /* the moss --live reads well as-is on dark */
@@ -96,6 +118,7 @@
   --on-solid: #131513;
   --live:     #8FA470;
   --idle:     #454B46;
+  --warn:     #C89A6A;   /* BUG-183 — dark-theme warning ink */
   --st-prog:  #7FA6CE;   /* FEAT-066 — dark-theme status tints */
   --st-needs: #CBA05C;
   --st-done:  #8FA470;
@@ -120,6 +143,7 @@
   --on-solid: #FFFFFF;
   --live:     #7B8F5E;
   --idle:     #B6BCB7;
+  --warn:     #967A3A;   /* BUG-183 / FEAT-146 — light-theme warning ink (duller ochre) */
   --st-prog:  #4E77A8;   /* FEAT-066 — light-theme status tints */
   --st-needs: #A97A2E;
   --st-done:  #667E4B;
@@ -580,7 +604,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
    is wholly absent, so it doesn't read like a merely-truncated one at a glance. */
 .sc-warn[data-sev="missing"] { color: var(--st-high); }
 .sc-head:hover .sc-title { color: var(--ink); }
-.sc-head:focus-visible { outline: 2px solid var(--accent, var(--ink-4)); outline-offset: 2px; border-radius: 4px; }
+.sc-head:focus-visible { outline: 2px solid var(--ink-4); outline-offset: 2px; border-radius: 4px; }
 .sc-body { margin-top: 10px; }
 .sc-meta {
   font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
@@ -616,6 +640,77 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
+/* BUG-177 — the failed-quality-gate banner, pinned above the first turn like the
+   session-config card. A gate that never RAN (data-sev="crash") is the dangerous
+   case — it borrows the board's brick tint (--st-high) and a left rule so it
+   cannot be scrolled past unnoticed; a gate that ran and merely reported wears
+   the amber warn tint. Shares the sesscfg greyscale idiom otherwise. */
+.hookfail {
+  margin: 2px 0 24px; padding: 8px 12px 8px 13px;
+  border: 1px solid color-mix(in srgb, var(--st-needs) 45%, var(--hair-2));
+  border-left: 3px solid var(--st-needs);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--st-needs) 7%, var(--rail));
+}
+.hookfail[data-sev="crash"] {
+  border-color: color-mix(in srgb, var(--st-high) 50%, var(--hair-2));
+  border-left-color: var(--st-high);
+  background: color-mix(in srgb, var(--st-high) 8%, var(--rail));
+}
+.hf-head {
+  width: 100%; background: none; border: 0; cursor: pointer;
+  display: flex; align-items: baseline; gap: 8px; padding: 2px 0;
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); text-align: left;
+}
+.hf-head .tw { font-size: 7px; color: var(--ink-4); flex: none; }
+.hf-ico { flex: none; font-size: 12px; line-height: 1; align-self: center; }
+.hf-title { font-weight: 600; color: var(--ink); flex: none; }
+.hookfail[data-sev="crash"] .hf-title { color: var(--st-high); }
+.hf-sub { color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hf-head:hover .hf-title { filter: brightness(1.08); }
+.hf-head:focus-visible { outline: 2px solid var(--ink-4); outline-offset: 2px; border-radius: 4px; }
+.hf-body { margin-top: 10px; display: flex; flex-direction: column; gap: 9px; }
+.hf-grp {
+  border: 1px solid var(--hair); border-radius: 6px;
+  padding: 7px 9px; background: var(--window);
+}
+.hf-grp-head {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); margin-bottom: 5px;
+}
+.hf-hook { color: var(--ink); font-weight: 500; }
+.hf-evt { color: var(--ink-4); }
+.hf-kind {
+  font-size: 9.5px; letter-spacing: .02em; padding: 1px 6px; border-radius: 999px;
+  background: color-mix(in srgb, var(--st-needs) 16%, transparent); color: var(--st-needs);
+}
+.hf-grp[data-kind="crash"] .hf-kind {
+  background: color-mix(in srgb, var(--st-high) 16%, transparent); color: var(--st-high);
+}
+.hf-count { margin-left: auto; color: var(--ink-4); flex: none; }
+.hf-msg {
+  margin: 0; padding: 7px 9px; max-height: 200px; overflow: auto;
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-2);
+  background: var(--sunken); border-radius: 5px;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.hf-more, .hf-note { font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
+
+/* Per-turn badge (applyHookBadges): a quiet inline chip on the turn a gate
+   failed at, so scrolling to it shows the failure there too. Crash = brick. */
+.hook-turn-badge {
+  display: inline-block; margin-left: 8px; vertical-align: middle;
+  font-family: var(--mono); font-size: 9px; letter-spacing: .02em;
+  padding: 1px 6px; border-radius: 999px;
+  background: color-mix(in srgb, var(--st-needs) 15%, transparent);
+  color: var(--st-needs); border: 1px solid color-mix(in srgb, var(--st-needs) 40%, transparent);
+  cursor: default;
+}
+.hook-turn-badge[data-kind="crash"] {
+  background: color-mix(in srgb, var(--st-high) 15%, transparent);
+  color: var(--st-high); border-color: color-mix(in srgb, var(--st-high) 40%, transparent);
+}
+
 /* FEAT-072 — queued-message metadata caption. A queued/batch-delivered user
    message carries a fixed bracketed metadata prefix ("[msg N/M · queued …]");
    we lift it out of the bubble into this quiet line so the eye skips it and
@@ -647,12 +742,42 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
   column-gap: 6px; row-gap: 7px;
   margin-top: 12px;
 }
-/* Forces tier 2 (git · procs · integrations · permission) onto its own line. */
-.seal-break { flex-basis: 100%; width: 100%; height: 0; margin: 0; }
+/* FEAT-139 — the zone divider. Was a full-width break that forced the readouts
+   onto their own line. Now a flexible spacer: it eats the slack between the
+   NAVIGATE zone (Board · Guide · Settings, left) and the LIVE READOUT zone
+   (git · usage · procs · mode, right), so the two read as distinct clusters
+   pushed to opposite sides. It shrinks to nothing (min-width:0) so a narrow
+   viewport wraps the readouts below instead of clipping — FEAT-114's overflow
+   fix survives without a hard tier break. */
+.seal-break { flex: 1 1 0; min-width: 0; height: 0; margin: 0; }
+/* FEAT-139 review round 2 — the LIVE-READOUT zone, wrapped as ONE flex child so
+   git · procs · usage · integrations · mode pill wrap together as a unit rather
+   than fracturing across rows. As flat siblings the flexible .seal-break spacer
+   collapsed just enough at ~1100px to leave git on the nav row while ports,
+   usage and the mode pill orphaned onto later rows. Now the whole cluster is a
+   single item: when it fits it sits right-aligned after the spacer; when it does
+   not it wraps BELOW the nav zone intact, and only its OWN contents wrap inside
+   it (flex-wrap) — no horizontal overflow (FEAT-114), no zone-mixing. min-width:0
+   lets it shrink to wrap instead of forcing the strip to scroll. This is the
+   width-independent fix; there is deliberately no breakpoint. */
+.seal-readouts {
+  display: inline-flex; flex-wrap: wrap; align-items: center;
+  column-gap: 6px; row-gap: 7px; min-width: 0;
+}
 /* A quiet hairline between the navigation entries and the session selectors,
    so the strip reads as grouped rather than one undifferentiated run. */
 .seal-vdiv { flex: none; width: 1px; height: 15px; background: var(--hair); margin: 0 2px; }
 .seal-vdiv[hidden] { display: none; }
+
+/* FEAT-139 — the CONFIG chips (provider · isolation/connection-mode ·
+   instruction stack) left the strip entirely for the one Settings door. They
+   stay in the DOM so their popovers/handlers are untouched and every one is
+   reachable in one click via Settings, but they never render on the strip.
+   Unconditional display:none, because `.pill { display:inline-flex }` otherwise
+   OVERRIDES the plain [hidden] attribute (no `.pill[hidden]` reset exists), so
+   toggling `.hidden` in JS alone would leave them visible. The #seal #id pair
+   outranks `.pill`, so no !important is needed. */
+#seal #provSel, #seal #insBtn { display: none; }
 
 /* A session selector — isolation, provider. The chevron already signals a
    menu; the hover just firms the border so it reads as pressable. */
@@ -662,12 +787,14 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .pill.sel .g { color: var(--ink-3); }
 #provSel[data-provider="openai"] .g { color: var(--live); }
 
-/* A readout — git, processes. Informational, not a control: no button chrome
-   at rest, so the eye separates "what I can press" (tier 1) from "what this is
-   telling me" (tier 2). Still clickable to deep-link; hover reveals that. */
+/* FEAT-139 — the LIVE READOUT zone (git · usage · procs). A number you can only
+   READ must not look like a control you press: these carry NO button chrome and
+   sit a full step quieter than the nav buttons (ink-4, not ink-2), so the eye
+   separates "what needs me" from "what is merely telling me". They stay
+   clickable to open the detail popover; hover is the only time they firm up. */
 .seal .readout {
   border-color: transparent; background: transparent;
-  color: var(--ink-3); padding: 3px 5px;
+  color: var(--ink-4); padding: 3px 5px; font-size: 11px;
 }
 .seal .readout .g { color: var(--ink-4); }
 .seal .readout:hover, .seal .readout:focus-visible {
@@ -679,10 +806,10 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
    a competing chip. `unknown` reads as dim (nothing to show), never as "0%". */
 .seal .readout.usage.unknown { color: var(--ink-4); }
 .seal .readout.usage.unknown .g { color: var(--ink-4); opacity: 0.7; }
-.seal .readout.usage.warn { color: var(--warn, #B0703C); }
-.seal .readout.usage.warn .g { color: var(--warn, #B0703C); }
-.seal .readout.usage.danger { color: var(--danger, #c0392b); }
-.seal .readout.usage.danger .g { color: var(--danger, #c0392b); }
+.seal .readout.usage.warn { color: var(--warn); }
+.seal .readout.usage.warn .g { color: var(--warn); }
+.seal .readout.usage.danger { color: var(--danger); }
+.seal .readout.usage.danger .g { color: var(--danger); }
 
 /* The sidebar toggle mirrors its glyph when collapsed so the panel bar sits on
    the side the sidebar will grow toward — reading as "expand", not "collapse". */
@@ -702,10 +829,19 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 button.pill:hover { border-color: var(--ink-4); color: var(--ink); }
 button.pill[aria-expanded="true"] { border-color: var(--ink-3); color: var(--ink); background: var(--sunken); }
 
-/* FEAT-066 — the persistent board entry: a plain nav pill in the crown chips.
-   Restrained (no tint), the open count a quiet mono cue when there's work. */
+/* FEAT-066 / FEAT-139 — the NAVIGATE zone: Board · Guide. These are the highest-
+   affordance items on the strip — real destination buttons — so they carry the
+   strongest ink and a hover FILL (not just a firmed border), the treatment a
+   thing you click to GO somewhere earns. This is what sets them apart from the
+   quiet readouts (which never fill) and from the single Settings config door. */
+.seal .board-pill { color: var(--ink); font-weight: 500; }
+.seal .board-pill .g { color: var(--ink-2); }
 a.board-pill { text-decoration: none; }
-a.board-pill:hover { border-color: var(--ink-4); color: var(--ink); }
+.seal a.board-pill:hover, .seal a.board-pill:focus-visible,
+.seal button.board-pill:not(.settings-pill):hover,
+.seal button.board-pill:not(.settings-pill):focus-visible {
+  border-color: var(--ink-4); color: var(--ink); background: var(--sunken); outline: none;
+}
 a.board-pill[hidden] { display: none; }
 .board-pill .bn {
   font-family: var(--mono); font-size: 10px; color: var(--ink-3);
@@ -739,6 +875,12 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .mnt .x:hover { background: var(--hair); color: var(--ink); }
 .addm { color: var(--ink-4); border-style: dashed; }
 .sep { width: 1px; height: 13px; background: var(--hair); flex: none; margin: 0 3px; }
+/* FEAT-139 review — #sealSep is shown whenever a project is selected and is the
+   LAST element on the strip (perm/integ insert before it), so it renders as a
+   1px hairline dangling off the end of the row with nothing after it. Hide it
+   when it is the final visible chip; it re-appears only if a later state ever
+   inserts content after it. */
+.seal .sep:last-child { display: none; }
 
 /* isolation popover */
 .pop {
@@ -1005,9 +1147,9 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 /* BUG-046 — a ⚠ STALLED row: still a member of the running set, but its
    evidence stopped progressing. No spin, no sweep — those mean "alive", which
    is exactly the claim nothing can back — and the reason rides the tooltip. */
-.lag.stall .gl { color: var(--warn, #B0703C); animation: none; }
-.lag.stall .el { color: var(--warn, #B0703C); }
-.lag.stall .ty { color: var(--warn, #B0703C); }
+.lag.stall .gl { color: var(--warn); animation: none; }
+.lag.stall .el { color: var(--warn); }
+.lag.stall .ty { color: var(--warn); }
 
 /* settled record in the transcript */
 .ran-stack {
@@ -1279,17 +1421,47 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   box-shadow: 0 0 0 1.5px var(--window), 0 0 0 3px var(--ink-3);
 }
 
-/* Effective-mode chip in the crown seal. It OPENS the settings drawer, but
-   borderless dot+label it was a visual twin of the informational .sess-status
-   ("Idle") readout above — the exact "status display used as a control"
-   confusion (BUG-158). A pointer cursor, a hover/focus lift and a focus ring
-   now signal it is interactive, distinct from the flat status line. */
-.seal .perm { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--ink-3); cursor: pointer; border-radius: 5px; padding: 1px 3px; margin: -1px -3px; transition: color .12s, background .12s; }
-.seal .perm:hover { color: var(--ink); background: var(--sunken); }
-.seal .perm:focus-visible { outline: none; color: var(--ink); box-shadow: 0 0 0 2px var(--focus, var(--ink-4)); }
-.seal .perm .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--idle); flex: none; }
-.seal .perm[data-risk="true"] { color: var(--ink-2); }
-.seal .perm[data-risk="true"] .dot { background: var(--ink); }
+/* FEAT-139 — the permission MODE PILL. The one config-adjacent chip the strip
+   keeps, because it changes what happens to the user's very NEXT turn (asks /
+   plans / skips). It is deliberately its OWN visual language — neither a nav
+   button (6px-radius, opaque) nor a quiet readout (chromeless): a fully-rounded
+   status pill with a live dot and a soft filled ground, so "the mode I'm about
+   to act under" reads as a state you can flip, distinct from both zones. It
+   still opens Settings ▸ Permission mode.
+
+   FEAT-139 review round 2 — the round-1 distinction was too weak: the pill was
+   the SAME 999px capsule as its neighbours separated only by a ~5% sunken fill
+   and a flat dot, glued to the tool chips at the 6px inter-chip gap, so it read
+   as "the filled chip at the end", not a live flippable mode. It is now
+   categorically distinct: (1) a clear margin sets it apart from the tool run;
+   (2) the dot is an LED — a solid core inside a soft halo ring — so it reads as
+   a live state, not a bullet; (3) a caret in the .sel idiom announces it opens
+   something to CHANGE the mode. It stays QUIETER than the nav buttons (soft
+   sunken ground + ink-2, no weight-500, no hover FILL — only a firmed border). */
+.seal .perm {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--ink-2); cursor: pointer;
+  border: 1px solid var(--hair); border-radius: 999px;
+  background: var(--sunken); padding: 2px 9px;
+  margin-left: 8px; /* clear separation from the tool chips, not glued at the 6px gap */
+  transition: color .12s, background .12s, border-color .12s;
+}
+.seal .perm:hover { color: var(--ink); border-color: var(--ink-4); }
+.seal .perm:focus-visible { outline: none; color: var(--ink); box-shadow: 0 0 0 2px var(--focus); }
+/* LED dot: a solid core inside a soft halo ring, so it reads as a LIVE mode
+   indicator rather than a flat bullet. The ring tint tracks the dot colour. */
+.seal .perm .dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--idle); flex: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--idle) 35%, transparent);
+}
+/* Caret in the .sel selector idiom — signals "click to change the mode". */
+.seal .perm .cx { color: var(--ink-4); opacity: .55; margin-left: 1px; flex: none; }
+.seal .perm:hover .cx { opacity: .8; }
+.seal .perm[data-risk="true"] { color: var(--ink); border-color: var(--ink-4); }
+.seal .perm[data-risk="true"] .dot {
+  background: var(--ink);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ink) 30%, transparent);
+}
 .seal .perm[data-skip="false"] .dot { background: var(--idle); }
 
 .frozen[hidden] { display: none; }
@@ -1357,79 +1529,188 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .pop-foot button:hover { background: var(--sunken); }
 .pop-foot .cx { margin-left: auto; color: var(--ink-4); }
 
-/* ── the drawer ────────────────────────────── */
+/* ── overlay slide motion (ticket board, guide, git workbench) ─────────── */
 .slide-panel {
   transform: translateX(100%);
   transition: transform var(--panel-dur) var(--panel-ease);
 }
 .slide-panel.open { transform: none; }
-.drawer {
-  position: absolute; top: 0; right: 0; bottom: 0; z-index: 60;
-  width: 388px; max-width: 100%;
-  background: var(--window);
-  border-left: 1px solid var(--hair);
-  box-shadow: -20px 0 44px -28px rgba(27,31,29,.35);
-  display: flex; flex-direction: column;
-  /* Delay visibility only while closing, so the exit slide remains paintable. */
-  transition: transform var(--panel-dur) var(--panel-ease),
-              visibility 0s linear var(--panel-dur);
-  visibility: hidden;
-}
-.drawer.open {
-  visibility: visible;
-  transition: transform var(--panel-dur) var(--panel-ease), visibility 0s;
-}
 @media (prefers-reduced-motion: reduce) {
-  .slide-panel, .drawer.open { transition: none; }
-}
-:root[data-theme="dark"] .drawer, :root:not([data-theme]) .drawer { }
-@media (prefers-color-scheme: dark) {
-  .drawer { box-shadow: -20px 0 44px -24px rgba(0,0,0,.8); }
+  .slide-panel { transition: none; }
 }
 
-.d-head { flex: none; padding: 13px 14px 10px; border-bottom: 1px solid var(--hair-2); }
-.d-top { display: flex; align-items: center; gap: 8px; }
+/* ═══════════════════ FEAT-146 — the settings modal (.smodal) ═══════════════
+   Copied from the .tmodal idiom rather than abstracted into a shared base:
+   two modals with different body padding, different geometry and different
+   internal navigation do not justify one. Deliberately NO backdrop-filter —
+   this app blurs exactly once, and blurring a live transcript behind settings
+   reads as a different product.
+
+   FIXED height, never max-height: a modal that resizes as you switch
+   categories is the classic settings-dialog jank. */
+.smodal { position: fixed; inset: 0; z-index: 80; display: flex; align-items: center; justify-content: center; }
+.smodal[hidden] { display: none; }
+.smodal-back { position: absolute; inset: 0; background: color-mix(in srgb, #1B1F1D 34%, transparent); }
+:root[data-theme="dark"] .smodal-back { background: color-mix(in srgb, #000 58%, transparent); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .smodal-back { background: color-mix(in srgb, #000 58%, transparent); }
+}
+.smodal-box {
+  position: relative;
+  width: min(940px, 94vw); height: min(680px, 88vh);
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-rows: 52px minmax(0, 1fr) 44px;
+  background: var(--window); color: var(--ink);
+  border: 1px solid var(--hair); border-radius: 12px;
+  box-shadow: var(--pop-shadow);
+  animation: rise .16s ease;
+  overflow: hidden;
+}
+
+/* header spans both columns */
+.smodal-head {
+  grid-area: 1 / 1 / 2 / 3;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--hair-2);
+  min-width: 0;
+}
 .d-back[hidden] { display: none; }
 .d-back {
   width: 22px; height: 22px; border-radius: 6px; flex: none;
   display: grid; place-items: center; color: var(--ink-3);
 }
 .d-back:hover { background: var(--hair-2); color: var(--ink); }
-.d-title { min-width: 0; }
+.d-title { min-width: 0; flex: 1 1 auto; }
 .d-title .e {
   font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   letter-spacing: .02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .d-title .t {
-  font-size: 14px; margin-top: 1px; letter-spacing: -.005em;
+  font-size: 15px; font-weight: 600; margin-top: 1px; letter-spacing: -.005em;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.d-head .ic { margin-left: auto; }
+.smodal-x { flex: none; }
 
-/* FEAT-139 — the scope spine: Machine · This project · This session. A
-   segmented control that is the panel's primary navigation, so it reads as one
-   unit (shared track) rather than three loose buttons. Wraps the hint to its
-   own line when the three tabs fill the width. */
-.d-scope {
-  display: flex; flex-wrap: wrap; gap: 2px; margin-top: 11px;
+/* The scope lens. Same segmented vocabulary the old scope spine used, but it
+   is a WRITE TARGET, not navigation — two options, never three, and never
+   visible for a machine-scope category. */
+.slens {
+  display: flex; gap: 2px; flex: none;
   background: var(--sunken); border: 1px solid var(--hair-2);
   border-radius: 8px; padding: 2px;
 }
-.d-scope button {
-  font-size: 11.5px; color: var(--ink-3); flex: 1 1 auto;
-  padding: 4px 9px; border-radius: 6px;
+.slens[hidden] { display: none; }
+.slens button {
+  font-size: 11.5px; color: var(--ink-3);
+  padding: 4px 10px; border-radius: 6px;
   border: 1px solid transparent; white-space: nowrap;
   transition: color .12s ease, background .12s ease;
 }
-.d-scope button:hover { color: var(--ink-2); }
-.d-scope button[aria-pressed="true"] {
+.slens button:hover:not(:disabled) { color: var(--ink-2); }
+.slens button[aria-pressed="true"] {
   border-color: var(--hair); background: var(--window); color: var(--ink);
   box-shadow: 0 1px 2px rgba(0,0,0,.06);
 }
-.d-scope .hint {
-  flex-basis: 100%; margin: 2px 2px 1px; align-self: center;
-  font-size: 10.5px; color: var(--ink-4);
+.slens button:disabled { color: var(--ink-4); cursor: not-allowed; }
+
+/* ── the rail: content categories in two groups, rows 2-3 of the grid ──
+   FIXED — it does not scroll with the pane. The group headings deliberately
+   BREAK the app's uppercase-tracked category idiom (sentence case, no rule, no
+   tracking) so rail structure and card structure do not read as the same tier. */
+.srail {
+  grid-area: 2 / 1 / 4 / 2;
+  background: var(--rail);
+  border-right: 1px solid var(--hair-2);
+  padding: 12px 10px;
+  overflow: hidden;
+  min-width: 0;
 }
+.srail h3 {
+  font-size: 10px; font-weight: 600; color: var(--ink-4);
+  letter-spacing: 0; text-transform: none;
+  margin: 0 0 4px; padding: 0 8px;
+}
+.srail ul + h3 { margin-top: 14px; }
+.srail ul { list-style: none; margin: 0; padding: 0; }
+.srail li { margin: 0; }
+.srail-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; text-align: left;
+  font-size: 12px; font-weight: 500; color: var(--ink-3);
+  padding: 5px 8px; border-radius: 7px;
+  border: 1px solid transparent;
+  transition: color .12s ease, background .12s ease;
+}
+.srail-item:hover { color: var(--ink-2); background: var(--hair-2); }
+.srail-item[aria-current="page"] {
+  font-weight: 600; color: var(--ink);
+  background: var(--window); border-color: var(--hair-2);
+}
+.srail-item .n { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A trailing 5px dot — running (moss) or needs-you (warn). No counts, no badges. */
+.srail-item .d {
+  width: 5px; height: 5px; border-radius: 50%; flex: none;
+  background: transparent;
+}
+.srail-item[data-dot="live"] .d { background: var(--live); }
+.srail-item[data-dot="warn"] .d { background: var(--warn); }
+
+/* ── the content pane ── */
+/* FEAT-146 round 4 — `scrollbar-gutter: stable`. Cards measured 660px on the
+   seven categories whose pane does not overflow and 670px on the four that do,
+   so every switch across that boundary moved all four column rails 10px
+   sideways — the exact instability the four-rail grid exists to prevent. The
+   gutter is reserved whether or not a scrollbar is showing; it also stops the
+   UA scrollbar overlapping the card's 12px corner. */
+.spane {
+  grid-area: 2 / 2 / 3 / 3;
+  overflow-y: auto; scrollbar-width: thin; scrollbar-gutter: stable;
+  padding: 16px 20px 24px;
+  min-width: 0; min-height: 0;
+}
+/* The live-state line: ONE place says what the lens is writing to and what the
+   live session is actually running. It used to be a second footer string that
+   duplicated the write-target hint and clipped at 320px of the 476px it needed;
+   it is a note at the top of the pane now, where it has the whole width. It is
+   a static child of the scroll host (paint() only clears `.view`), so it
+   survives every repaint. */
+.slive {
+  display: block; margin: 0 0 12px; padding: 0 12px;
+  font-size: 11.5px; line-height: 1.5; color: var(--ink-3);
+  max-width: 62ch;
+}
+.slive[hidden] { display: none; }
+.spane::-webkit-scrollbar { width: 9px; }
+.spane::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 9px; border: 3px solid var(--window); }
+/* Cards are capped and LEFT-aligned — a centred column inside a 700px pane
+   reads as a landing page, not a settings surface. */
+.spane .grp { max-width: 720px; margin-left: 0; margin-right: 0; }
+.spane .sect { max-width: 720px; }
+.spane .proj-dir-box { max-width: 720px; }
+/* FEAT-146 phase 2 — one category's cards. A plain block: it exists to carry the
+   [data-focus] anchor the `<details data-sect>` section it replaced used to
+   answer, so a deep link at a whole section still lands on a real node (the
+   flash it gets is the whole category, which is what a section anchor meant). */
+.scat { display: block; }
+.scat.focus-flash { border-radius: 10px; }
+/* The template/instruction editor is a pane-level TAKEOVER inside the content
+   column (it keeps the .d-back button) — never a nested modal. */
+.spane.editing { padding: 0; overflow: hidden; display: flex; }
+
+/* ── the footer: content column only ── */
+.sfoot {
+  grid-area: 3 / 2 / 4 / 3;
+  display: flex; align-items: center; gap: 14px;
+  padding: 0 20px; border-top: 1px solid var(--hair-2);
+  font-size: 10px; color: var(--ink-4); line-height: 1.35;
+  min-width: 0;
+}
+/* One prose slot, not two. The write-target hint is the only thing here that
+   tells you where your writes are going, so it gets all the width the toggle
+   does not use. */
+.sfoot-l { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* FEAT-139 — Machine-scope segmented rows (appearance, new-project defaults).
    Reuse the .seg idiom; a label above, the seg below. */
@@ -1437,10 +1718,6 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .gseg button { flex: 1 1 auto; }
 .set.gset { align-items: baseline; margin-top: 10px; }
 .set.gset + .seg { margin-top: 4px; }
-
-.d-body { flex: 1; overflow-y: auto; scrollbar-width: thin; padding: 0 0 22px; }
-.d-body::-webkit-scrollbar { width: 9px; }
-.d-body::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 9px; border: 3px solid var(--window); }
 
 /* ── settings: each category is a distinct card, three tiers of hierarchy ──
    CATEGORY LABEL (uppercase, tracked, with a rule) > item TITLE (bright) >
@@ -1450,7 +1727,11 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   background: var(--sunken);
   border: 1px solid var(--hair-2);
   border-radius: 12px;
-  padding: 12px 15px 13px;
+  /* FEAT-146 round 4 — one padding scale. This was `12px 15px 13px`: three
+     values, two of them one pixel apart for no reason. The pane, the card and
+     the row now land on 24 / 20 / 16 / 14 / 12; 34 (row height) and 46 (the
+     gutter) stay as the two structural constants. */
+  padding: 14px 16px;
   margin: 12px 12px 0;
 }
 .grp + .grp { margin-top: 12px; }
@@ -1461,44 +1742,55 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   margin: 0 0 4px;
 }
 .grp-l::after { content: ''; flex: 1; height: 1px; background: var(--hair); }
-.grp-note { font-size: 11.5px; color: var(--ink-3); line-height: 1.55; margin-top: 7px; }
+/* 62ch, the same measure the disclosure block uses. Card prose ran 95–100
+   characters per line in a 940px modal, which is roughly half again the width
+   at which a line stops being easy to return from. */
+.grp-note { font-size: 11.5px; color: var(--ink-3); line-height: 1.55; margin-top: 7px; max-width: 62ch; }
 /* FEAT-037 P3: a warning note stays greyscale-with-one-warm-accent, matching
    the elevated-risk toggle voice — no red. */
-.grp-note[data-warn="true"] { color: var(--warn, #B0703C); }
+.grp-note[data-warn="true"] { color: var(--warn); }
 
-/* FEAT-071 — the project's host directory, a quiet reference line at the top of
-   the settings drawer. Low chrome: a small label + monospace shortPath. */
-.proj-dir { display: flex; align-items: baseline; gap: 8px; margin: 0 0 12px; }
-.proj-dir .k { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--ink-4); flex: none; }
-.proj-dir .v { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); word-break: break-all; }
-
-/* ── BUG-138: the working directory, and the way back when it is gone. ── */
-.proj-dir-box { margin: 0 0 12px; }
-.proj-dir-box .proj-dir { margin: 0; }
-.proj-dir .dir-change { margin-left: auto; flex: none; }
-.proj-dir-box[data-missing="true"] .proj-dir .v { color: var(--warn, #B0703C); }
+/* FEAT-071 / BUG-138 — the project's host directory.
+   FEAT-146 round 4: it is a CARD with a normal row in it now. It used to be the
+   only pane content outside the card system — a bare label + path + a bare
+   `Change…` link floating above the first card, with the long path wrapping
+   mid-token and its continuation aligned to nothing. */
+.proj-dir-box[data-missing="true"] .set .v { color: var(--warn); }
+/* The path is the row's VALUE — left-aligned, breaking anywhere, on its own
+   full-width line. It used to wrap mid-token with the continuation aligned to
+   nothing at all. */
+.set.stack > .v.path {
+  display: block; width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere; word-break: break-all;
+  color: var(--ink-2); line-height: 1.5;
+}
+.set .l .k { font: inherit; color: inherit; text-transform: none; letter-spacing: 0; }
+/* The action is a real bordered button, right-aligned — not a bare `Change…`
+   with no affordance at all. */
+.dir-acts { justify-content: flex-end; }
 .dir-gone {
   margin-top: 7px; padding: 8px 10px; border-radius: 8px;
   background: var(--sunken);
-  font-size: 11.5px; line-height: 1.5; color: var(--ink-3);
+  font-size: 11.5px; line-height: 1.5; color: var(--ink-3); max-width: 62ch;
 }
-.dir-gone b { color: var(--warn, #B0703C); }
+.dir-gone b { color: var(--warn); }
 .repoint { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .cand { border: 1px solid var(--hair); border-radius: 8px; padding: 8px 9px; }
 .cand[data-conf="match"] { border-color: var(--live, #4a9); }
 .cand .top { display: flex; align-items: center; gap: 8px; }
-.cand .p { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); word-break: break-all; }
+.cand .p { font-family: var(--mono); font-size: 12px; color: var(--ink-2); word-break: break-all; }
 .cand .badge {
-  flex: none; font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em;
+  flex: none; font-size: 10px; text-transform: uppercase; letter-spacing: .06em;
   color: var(--live, #4a9); border: 1px solid currentColor; border-radius: 999px; padding: 1px 6px;
 }
 .cand .top .addrow { margin-left: auto; flex: none; }
-.cand .why { margin-top: 4px; font-size: 10.5px; color: var(--ink-4); word-break: break-all; }
+.cand .cwhy { margin-top: 4px; font-size: 10px; color: var(--ink-4); word-break: break-all; }
 .dir-input {
   flex: 1 1 auto; min-width: 0;
-  font-family: var(--mono); font-size: 11.5px;
+  font-family: var(--mono); font-size: 12px;
   background: transparent; color: var(--ink-2);
-  border: 1px solid var(--hair); border-radius: 6px; padding: 4px 7px;
+  border: 1px solid var(--hair); border-radius: 8px; padding: 6px 9px;
 }
 
 /* ── FEAT-037 P3: provider picker — a .seg like the isolation tier, plus one
@@ -1506,13 +1798,13 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .prov-state {
   display: inline-flex; align-items: center; gap: 6px;
   margin-top: 9px;
-  font-family: var(--mono); font-size: 10.5px; letter-spacing: .03em;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .03em;
   color: var(--ink-3);
 }
 .prov-state .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-4-struct); flex: none; }
 .prov-state[data-status="connected"] .dot { background: var(--live); }
 .prov-state[data-status="connected"] { color: var(--ink-2); }
-.prov-state[data-status="installed-not-signed-in"] .dot { background: var(--warn, #B0703C); }
+.prov-state[data-status="installed-not-signed-in"] .dot { background: var(--warn); }
 .prov-state[data-status="not-installed"] .dot { background: transparent; box-shadow: inset 0 0 0 1px var(--ink-4-struct); }
 
 /* ── FEAT-037 P2b: sidebar session rows recorded by a non-Claude engine carry
@@ -1541,7 +1833,7 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   list-style: none; cursor: pointer;
   display: flex; align-items: center; gap: 8px;
   padding: 2px 12px 8px;
-  font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+  font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
   color: var(--ink-2); font-weight: 700;
   user-select: none;
 }
@@ -1556,53 +1848,211 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .sect[open] > .sect-l .sect-car { transform: rotate(45deg); }
 .sect .grp:first-of-type { margin-top: 0; }
 
+/* ── FEAT-146 phase 2b — the four-column scalar row ──────────────────────────
+   Four fixed columns give four hard vertical rails down the pane, and that
+   column structure — not colour, not weight — is what makes sixty rows
+   scannable:
+
+     1  label (+ its CLI flag beneath)    2  provenance chip
+     3  value                             4  a 46px affordance gutter
+
+   Column 4 is ALWAYS reserved, whatever the row's state, so nothing reflows
+   when a reset button appears or disappears. A row is either a scalar row or a
+   full-width block (`.set.stack`, a `.seg`, a form) — never both inside one
+   row; mixing them is what made the old panel look improvised. */
 .set {
-  display: flex; align-items: baseline; gap: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(110px, 200px) 46px;
+  align-items: baseline; column-gap: 10px;
+  min-height: 34px;
   width: 100%; text-align: left;
   padding: 9px 8px; margin: 0 -8px;
   border-radius: 8px;
   border-bottom: 1px solid var(--hair-2);
 }
 .set:last-child { border-bottom: 0; }
-button.set:hover { background: var(--window); }
+/* A cycle row stays a <button> — but its gutter controls must be real buttons
+   too, and a button inside a button is not valid HTML. So the cycle button
+   spans columns 1-3 as a SUBGRID (its label / chip / value land on exactly the
+   same rails as every non-cycle row) and the gutter sits OUTSIDE it, in the
+   row's own column 4. The click handler is on the row, so the whole row —
+   including its padding — still cycles, and keyboard activation of the inner
+   button bubbles to the same handler. */
+.set > .set-main {
+  grid-column: 1 / 4;
+  display: grid; grid-template-columns: subgrid;
+  align-items: baseline; column-gap: 10px;
+  width: 100%; text-align: left; min-width: 0;
+}
+/* The focus ring belongs to the whole row, not to the inner button's box. */
+.set > .set-main:focus-visible { outline: none; }
+.set:has(> .set-main:focus-visible) { outline: 2px solid var(--ink-4); outline-offset: -2px; }
+button.set:hover, .set[data-cycle="true"]:hover { background: var(--window); }
 /* item TITLE — the brightest text in a row, so titles carry the eye */
-.set .l { font-size: 12.5px; color: var(--ink); font-weight: 500; flex: none; }
+/* FEAT-146 round 4 — FOUR type steps in this pane, and only four:
+     15    item label (sans, 500)
+     12    machine value (mono) and any control text
+     11.5  prose
+     10    tracked card labels and mono sub-labels
+   There were ten, seven of them 0.5–1px apart — below the just-noticeable
+   threshold, so they read as mush rather than hierarchy. Everything the extra
+   steps used to carry is carried by weight and colour instead. */
+.set .l { font-size: 15px; color: var(--ink); font-weight: 500; min-width: 0; }
+.set > .l, .set > .set-main > .l { grid-column: 1; }
 .set .f {
-  font-family: var(--mono); font-size: 9.5px; color: var(--ink-4);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   margin-top: 3px; display: block; font-weight: 400; letter-spacing: 0;
 }
 .set .v {
-  margin-left: auto; text-align: right;
+  text-align: right;
   display: flex; align-items: baseline; justify-content: flex-end;
   font-family: var(--mono); font-size: 12px; color: var(--ink);
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+.set > .v, .set > .set-main > .v { grid-column: 3; justify-self: end; }
+/* Row 1 is the scalar row; row 2 is the disclosure. Stated explicitly because
+   auto-placement is SPARSE: the full-width `.set-why` is appended before the
+   gutter, and a gutter auto-placed after it would be pushed onto row 2 with it
+   — which puts the ⓘ half a paragraph below the label it belongs to. */
+.set > .l, .set > .prov, .set > .v, .set > .set-main, .set > .sgut, .set > input.vin { grid-row: 1; }
+.set > .set-why { grid-row: 2; }
+/* A value slot holding ACTIONS (stop this process, delete this account) is not
+   a scalar value: it takes the width it needs rather than the 200px value rail. */
+.set > .v:has(button) { grid-column: 2 / -1; }
+.set > input.vin { grid-column: 3; }
+/* dim = the built-in default, the quiet case that carries no chip at all */
 .set .v.dim { color: var(--ink-3); }
-.ovr {
-  font-family: var(--mono); font-size: 9px; letter-spacing: .03em;
-  color: var(--ink-3); border: 1px solid var(--hair); border-radius: 3px;
-  padding: 0 3px; margin-right: 6px; white-space: nowrap;
-}
-.rev {
-  cursor: pointer;
-  width: 17px; height: 17px; border-radius: 4px; flex: none;
-  display: inline-grid; place-items: center; color: var(--ink-4);
-  font-size: 11px; margin-left: 6px; align-self: center;
-}
-.rev:hover { background: var(--hair); color: var(--ink); }
-.inh { color: var(--ink-4); font-size: 9.5px; font-family: var(--mono); margin-right: 6px; opacity: 0; }
-.set:hover .inh { opacity: 1; }
 
+/* ── the provenance chip: the one loud element in this design ────────────────
+   HOLLOW  = inherited from a level above the current lens — someone else's
+             decision. FILLED = set here, at the current write target — you did
+             this. ABSENT = built-in; a chip on every untouched row would fill
+             the column with noise, so silence is the default and the value
+             dims instead.
+
+   The difference is LUMINANCE, never hue — the same on/off idiom FEAT-139
+   chose for `.seg[aria-pressed]`, so it inverts correctly per theme. It is
+   never the sole carrier either: the chip's TEXT names the level, and the
+   reset button's presence is a second signal. */
+.set .prov {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .03em;
+  min-width: 64px; text-align: center; white-space: nowrap;
+  border-radius: 3px; padding: 0 4px;
+  border: 1px solid var(--hair); color: var(--ink-3); background: none;
+}
+.set > .prov, .set > .set-main > .prov { grid-column: 2; justify-self: end; }
+.set .prov[data-fill="true"] {
+  background: var(--solid); color: var(--on-solid); border-color: var(--solid);
+}
+
+/* ── column 4: the affordance gutter, always 46px, never conditional ─────────
+   Both controls render at --ink-4 PERSISTENTLY and brighten on hover/focus.
+   The old `.inh` hover-reveal is gone entirely: information available only to
+   a mouse is not available. Visual sizes stay small (16/17px) while the hit
+   target is padded out to 24px by a transparent ::before, so touch works
+   without the row growing.
+
+   FEAT-146 round 4 — the 46px was reserved but SHARED: the two controls were
+   flex-packed from the right, so the ⓘ moved 21px sideways the moment a reset
+   appeared beside it, and the whole point of reserving the column was that
+   nothing moves. Two fixed 23px slots now, assigned by grid-column: ⓘ is
+   always slot 1, ↩ always slot 2, present or not.
+
+   And `align-self: start` + 1px: the row is baseline-aligned, so a centred
+   gutter sat on the optical centre of a TWO-LINE label block — 8px below the
+   first line box the other three columns align to. */
+.sgut {
+  /* 3px: measured, not guessed — it puts the two 16/17px controls' optical
+     centres at cy 294, against the chip's 295 and the value's 294.5, on a row
+     whose first line box centres at 293. */
+  grid-column: 4; align-self: start; margin-top: 3px;
+  display: grid; grid-template-columns: 23px 23px; justify-items: center;
+  align-items: start;
+  width: 46px; min-height: 17px;
+}
+.sgut > button.why { grid-column: 1; }
+.sgut > .rev { grid-column: 2; }
+.rev, .set button.why {
+  position: relative; cursor: pointer; flex: none;
+  display: inline-grid; place-items: center;
+  color: var(--ink-4);
+}
+.rev::before, .set button.why::before { content: ''; position: absolute; inset: -4px; }
+.rev {
+  width: 17px; height: 17px; border-radius: 4px; font-size: 12px;
+}
+.set button.why {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 1px solid currentColor;
+  font-size: 10px; font-family: var(--mono); line-height: 1;
+}
+.rev:hover, .rev:focus-visible, .set button.why:hover, .set button.why:focus-visible { color: var(--ink); }
+.rev:hover { background: var(--hair); }
+.set button.why[aria-expanded="true"] { color: var(--ink-2); }
+
+/* ── the inline disclosure — a block IN FLOW, never a tooltip ────────────────
+   Hover tooltips were rejected outright: invisible to touch, awkward by
+   keyboard, and a positioned popover would need collision logic against a
+   scrolling pane inside a modal. In-flow text is find-in-page-able, selectable
+   and reflows honestly; expansion simply pushes the rows below it down.
+
+   `--window` inside a `--sunken` card LIFTS in light and RECESSES in dark.
+   That inversion is the app's own convention and is deliberate — do not
+   "fix" it to one direction.
+
+   No height animation: a settings list that animates on every info click is
+   exhausting. Only a .12s opacity fade, and only on the click that opened it
+   (a repaint while open must not replay it).
+
+   FEAT-146 round 4 — ONE component. There used to be two: this block, and a
+   transparent `border-left` hairline variant (`.risk .why`, `.wiring-row .why`)
+   doing the identical job in Permissions, Integrations, the docker socket,
+   Snapshots and Advanced — different surface, different padding, radius 0
+   (not one of the three sanctioned radii), a different width, and a left rule
+   whose colour differed BY CATEGORY. The hairline variant is deleted; every
+   explanatory block in this modal is a `.set-why` and they are byte-identical
+   in surface, radius, padding and measure. */
+.set-why {
+  margin: 8px 0 2px; padding: 9px 11px;
+  background: var(--window); border: 1px solid var(--hair-2); border-radius: 8px;
+  font-size: 11.5px; line-height: 1.55; color: var(--ink-3);
+  max-width: 62ch;
+}
+/* Inside a row it spans every column; anywhere else it is an ordinary block. */
+.set > .set-why { grid-column: 1 / -1; margin-top: 3px; }
+.set-why[hidden] { display: none; }
+.set-why code { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+.set-why .u { display: block; margin-top: 6px; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
+.set-why.in { animation: whyIn .12s ease; }
+@keyframes whyIn { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .set-why.in { animation: none; } }
+
+/* The footer's free left slot: one toggle that expands every description in
+   every category, persisted across reloads. */
+.sfoot-tog {
+  flex: none; font-size: 10px; color: var(--ink-3);
+  border: 1px solid var(--hair); border-radius: 6px; padding: 2px 8px;
+  white-space: nowrap; cursor: pointer;
+}
+.sfoot-tog:hover { color: var(--ink); border-color: var(--ink-4); }
+.sfoot-tog[aria-pressed="true"] { background: var(--solid); color: var(--on-solid); border-color: var(--solid); }
+
+/* FEAT-146 round 4 — ONE segmented control, ONE height. There were three:
+   Provider 53px, Isolation 54px (an unintended off-by-one from the glyph line)
+   and Appearance 35px. The 53px came from a stacked glyph row — `✳ ⌬ ▣ ◑ ○`,
+   unreadable at 11px, semantically arbitrary and inconsistent between the two
+   sets — which also made a SELECTED segment a ~100px near-white slab competing
+   with the provenance chip. The glyphs are gone (drawer.js), the segments are
+   34px to match the row minimum, and the fill carries selection on its own. */
 .seg { display: flex; gap: 3px; margin: 10px 0 4px; }
 .seg button {
-  flex: 1; padding: 8px 4px; border-radius: 7px;
+  flex: 1; min-height: 34px; padding: 0 10px; border-radius: 7px;
   border: 1px solid var(--hair);
   font-size: 12px; color: var(--ink-3);
-  display: flex; flex-direction: column; align-items: center; gap: 3px;
+  display: flex; flex-direction: row; align-items: center; justify-content: center; gap: 6px;
   transition: border-color .12s, color .12s, background .12s;
 }
-.seg button .g { font-size: 11px; }
 .seg button:hover { color: var(--ink-2); border-color: var(--ink-4); }
 /* FEAT-139 — the selected option must be UNMISTAKABLE. The old treatment filled
    the pressed button with --sunken, which is EXACTLY the card background these
@@ -1614,7 +2064,6 @@ button.set:hover { background: var(--window); }
    luminance inversion (not a hue), so the state is not carried by colour alone —
    backed by the aria-pressed the buttons already set. */
 .seg button[aria-pressed="true"] { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
-.seg button[aria-pressed="true"] .g { color: var(--on-solid); }
 .seg button[aria-pressed="true"]:hover { color: var(--on-solid); border-color: var(--solid); opacity: .9; }
 
 .state-row {
@@ -1622,13 +2071,20 @@ button.set:hover { background: var(--window); }
   padding: 10px 0 2px;
 }
 .state-row .txt { font-size: 12px; color: var(--ink-3); }
-.state-row .txt b { color: var(--ink); font-weight: 500; font-family: var(--mono); font-size: 11.5px; }
+.state-row .txt b { color: var(--ink); font-weight: 500; font-family: var(--mono); font-size: 12px; }
 .state-row .acts { margin-left: auto; display: flex; gap: 4px; }
 .mini {
-  font-size: 11.5px; color: var(--ink-2);
-  border: 1px solid var(--hair); border-radius: 6px; padding: 3px 8px;
+  font-family: var(--sans); font-size: 12px; color: var(--ink-2);
+  border: 1px solid var(--hair); border-radius: 6px; padding: 4px 9px;
+  white-space: nowrap;
 }
 .mini:hover { border-color: var(--ink-4); color: var(--ink); }
+/* FEAT-146 round 4 — the actions row. Workspace stacked three different
+   idioms in one card (a bare text link with a `›`, a bordered button and a
+   bare `↻`), which also left the bordered one optically indented 19px from the
+   links beside it because only it had a border. One idiom: `.mini` in a
+   `.cacts` row. */
+.cacts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 10px; }
 
 .mrow {
   display: flex; align-items: center; gap: 8px;
@@ -1637,10 +2093,10 @@ button.set:hover { background: var(--window); }
   border-radius: 7px;
 }
 .mrow:hover { background: var(--sunken); }
-.mrow .p { font-family: var(--mono); font-size: 11px; color: var(--ink); min-width: 0; }
+.mrow .p { font-family: var(--mono); font-size: 12px; color: var(--ink); min-width: 0; }
 .mrow .p .to { color: var(--ink-4); }
 .mrow .p .dst { color: var(--ink-2); }
-.mrow .m { margin-left: auto; font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); flex: none; }
+.mrow .m { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-4); flex: none; }
 .mrow .x {
   width: 17px; height: 17px; border-radius: 4px; flex: none;
   display: grid; place-items: center; color: var(--ink-4); font-size: 12px;
@@ -1654,63 +2110,86 @@ button.set:hover { background: var(--window); }
 }
 .addrow:hover { color: var(--ink-2); }
 
-/* FEAT-118 — global-default pickers in the drawer */
+/* FEAT-118 — global-default pickers in the drawer.
+   BUG-183 — these three rules were written against FIVE tokens that have never
+   existed here (--ink-1 / --bg-2 / --line-1 / --line-2 / --accent). Every one of
+   those declarations was therefore invalid at parse time: no ink, no ground, no
+   border, and — because `outline: 2px solid var(--accent)` drops the whole
+   shorthand — NO FOCUS RING, on the global model picker, the custom-model field
+   and every input in the FEAT-145 add-account flow. Rewritten onto the real
+   palette, in the idiom the neighbouring controls use (.mini, .dc-note,
+   .modelfree-set): a field sits in --sunken, a button on --window and darkens to
+   --sunken on hover, both hairlined in --hair and promoted to --ink-4 on hover.
+   The per-component :focus-visible overrides are DELETED on purpose so the global
+   rule (`:focus-visible { outline: 1.5px solid var(--ink-2) }`) applies. */
+/* FEAT-146 round 4 — `appearance: none` + our own caret. A native <select>'s UA
+   chevron is the one piece of OS chrome in a surface that draws everything else
+   itself, and it differed between the two selects in this modal. */
 .gsel {
-  width: 100%; margin-top: 6px; padding: 7px 9px;
-  font: inherit; font-size: 13px; color: var(--ink-1);
-  background: var(--bg-2); border: 1px solid var(--line-1); border-radius: 7px;
+  width: 100%; margin-top: 6px; padding: 8px 30px 8px 10px;
+  font: inherit; font-family: var(--sans); font-size: 12px; color: var(--ink);
+  background: var(--sunken); border: 1px solid var(--hair); border-radius: 8px;
   cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-4) 50%),
+                    linear-gradient(135deg, var(--ink-4) 50%, transparent 50%);
+  background-position: right 13px top 50%, right 8px top 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
 }
-.gsel:hover { border-color: var(--line-2); }
-.gsel:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gsel:hover { border-color: var(--ink-4); }
 
 /* Free-text model id, revealed when the picker's "Other model id…" is chosen —
    the escape hatch for a CLI-accepted id the catalog does not advertise. */
 .gcustom { display: flex; gap: 6px; margin-top: 6px; }
 .gcustom[hidden] { display: none; }
 .gtext {
-  flex: 1; min-width: 0; padding: 7px 9px;
-  font: inherit; font-size: 13px; font-family: var(--mono); color: var(--ink-1);
-  background: var(--bg-2); border: 1px solid var(--line-1); border-radius: 7px;
+  flex: 1; min-width: 0; padding: 8px 10px;
+  font: inherit; font-size: 12px; font-family: var(--mono); color: var(--ink);
+  background: var(--sunken); border: 1px solid var(--hair); border-radius: 8px;
 }
-.gtext:hover { border-color: var(--line-2); }
-.gtext:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gtext:hover { border-color: var(--ink-4); }
 .gbtn {
-  flex: none; padding: 7px 12px;
-  font: inherit; font-size: 12.5px; color: var(--ink-1);
-  background: var(--bg-2); border: 1px solid var(--line-1); border-radius: 7px;
+  flex: none; padding: 8px 12px;
+  font: inherit; font-family: var(--sans); font-size: 12px; color: var(--ink);
+  background: var(--window); border: 1px solid var(--hair); border-radius: 8px;
   cursor: pointer;
 }
-.gbtn:hover { border-color: var(--line-2); background: var(--sunken); }
-.gbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.gbtn:hover { border-color: var(--ink-4); background: var(--sunken); }
+/* FEAT-146 round 4 — a field and the button that acts ON that field are one
+   control, not two boxes with a gap between them (the sign-in URL and its Copy
+   sat 15px apart and read as unrelated). */
+.gcustom.joined { gap: 0; }
+.gcustom.joined > .gtext { border-radius: 8px 0 0 8px; border-right: 0; }
+.gcustom.joined > .gbtn { border-radius: 0 8px 8px 0; }
 
 /* elevated-risk toggle: warning as text and a hairline, no red */
 .risk { margin: 10px -8px 0; padding: 10px 8px; border-radius: 8px; }
 .risk .top { display: flex; align-items: center; gap: 10px; }
-.risk .l { font-size: 13px; color: var(--ink-2); }
-.risk .why {
-  font-size: 11.5px; color: var(--ink-3); line-height: 1.55;
-  margin-top: 7px; padding-left: 10px;
-  border-left: 1px solid var(--ink-4-struct);
-}
-.risk .why code { font-family: var(--mono); font-size: 10.5px; color: var(--ink-2); }
+.risk .l { font-size: 15px; color: var(--ink); font-weight: 500; }
+/* FEAT-146 round 4 — the explanatory block here is a `.set-why`, the same
+   component the ⓘ disclosure renders. The old `.risk .why` hairline variant is
+   gone; see the `.set-why` note above for why there may only be one. */
 .risk[data-on="true"] { background: var(--sunken); }
 
-/* FEAT-076 wiring panel: one row per methodology layer, ✅/⚠️/❌/ℹ️ + Apply. */
+/* FEAT-076 wiring panel: one row per methodology layer + Apply.
+   FEAT-146 round 4 — the `.ic` column is DELETED. It carried ✅/⚠️/❌/ℹ️ at
+   13px, which fell through to Noto Color Emoji and painted Material red 500
+   (rgb(244,67,54)) and a Material blue: the only two hues in the whole product,
+   on the least important screen in the modal, out-shouting the provenance chip
+   that is supposed to own "loud". The state is a greyscale dot + word now —
+   the `.prov-state` idiom this panel already uses for the provider verdict —
+   and it sits on the right, so Advanced reads as settings rows rather than as
+   an icon-led admin panel. */
 .wiring-row { margin: 10px -8px 0; padding: 9px 8px; border-radius: 8px; }
-.wiring-row .top { display: flex; align-items: center; gap: 8px; }
-.wiring-row .ic { flex: none; font-size: 13px; line-height: 1; }
-.wiring-row .l { font-size: 13px; color: var(--ink-2); }
-.wiring-row .why {
-  font-size: 11.5px; color: var(--ink-3); line-height: 1.5;
-  margin-top: 6px; padding-left: 10px; border-left: 1px solid var(--hair);
-}
+.wiring-row .top { display: flex; align-items: center; gap: 10px; }
+.wiring-row .l { font-size: 15px; color: var(--ink); font-weight: 500; min-width: 0; }
+.wiring-row .top .prov-state { margin-top: 0; margin-left: auto; flex: none; }
 .wiring-row[data-state="missing"] { background: var(--sunken); }
 .wiring-row[data-state="warn"] { background: var(--sunken); }
-.wiring-row .wiring-apply { margin-left: auto; padding: 0; flex: none; }
-.wiring-confirm { margin-top: 8px; padding-left: 10px; border-left: 1px solid var(--ink-4-struct); }
-.wiring-confirm .addrow { display: inline-block; margin-right: 14px; }
-.wiring-confirm .wiring-go { color: var(--ink-2); }
+.wiring-row .wiring-apply { flex: none; }
+.wiring-confirm { margin-top: 8px; }
+.wiring-confirm .grp-note { margin-bottom: 8px; }
 .grp-note[data-ok="true"] { color: var(--ink-2); }
 .sw {
   margin-left: auto; flex: none;
@@ -1735,7 +2214,9 @@ button.set:hover { background: var(--window); }
   border-radius: 7px;
 }
 .trow:hover { background: var(--sunken); }
-.trow .grip { font-size: 10px; color: var(--ink-4); cursor: grab; padding-top: 2px; flex: none; }
+/* FEAT-146: `.trow .grip` (a `⠿` styled `cursor: grab`) is gone with the glyph
+   it styled — the row was never draggable and the handle's own tooltip said so.
+   The ▲/▼ arrows are the real, keyboard-reachable reorder control. */
 .trow .cb {
   width: 14px; height: 14px; border-radius: 4px; flex: none; margin-top: 1px;
   border: 1px solid var(--ink-4); display: grid; place-items: center;
@@ -1743,25 +2224,30 @@ button.set:hover { background: var(--window); }
 }
 .trow .cb[aria-pressed="true"] { background: var(--solid); border-color: var(--solid); color: var(--on-solid); }
 .trow .mid { min-width: 0; flex: 1; }
-.trow .nm { display: block; font-size: 13px; color: var(--ink); }
+.trow .nm { display: block; font-size: 15px; font-weight: 500; color: var(--ink); }
 .trow .sub {
   display: block;
-  font-size: 11px; color: var(--ink-3); margin-top: 2px; line-height: 1.4;
+  font-size: 11.5px; color: var(--ink-3); margin-top: 2px; line-height: 1.4;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.trow .sub.path { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); }
+.trow .sub.path { font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
+/* FEAT-146 round 4 — a PLAIN two-state text button. Bordered, radiused and
+   mono, it was visually identical to the hollow provenance chip while meaning
+   something entirely unrelated (append vs replace) — spending the one
+   deliberately loud element in this design on a different idea. */
 .mode {
-  font-family: var(--mono); font-size: 9.5px; letter-spacing: .03em;
-  border: 1px solid var(--hair); border-radius: 4px;
-  padding: 2px 5px; color: var(--ink-3); flex: none; margin-top: 1px;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .03em;
+  border: 0; border-radius: 0; background: none;
+  padding: 2px 0; color: var(--ink-3); flex: none; margin-top: 1px;
 }
-button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
-.mode[data-mode="replace"] { border-color: var(--ink-3); color: var(--ink); }
+button.mode { text-decoration: underline; text-decoration-color: var(--hair); text-underline-offset: 3px; }
+button.mode:hover { color: var(--ink); text-decoration-color: var(--ink-4); }
+.mode[data-mode="replace"] { color: var(--ink); }
 .trow .arrows { display: flex; flex-direction: column; gap: 1px; flex: none; opacity: 0; transition: opacity .12s; }
 .trow:hover .arrows { opacity: 1; }
 .trow .arrows button {
   width: 15px; height: 12px; border-radius: 3px; color: var(--ink-4);
-  font-size: 8px; line-height: 1; display: grid; place-items: center;
+  font-size: 10px; line-height: 1; display: grid; place-items: center;
 }
 .trow .arrows button:hover { background: var(--hair); color: var(--ink); }
 .trow .x {
@@ -1779,7 +2265,7 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
 .supersede {
   display: flex; align-items: center; gap: 8px;
   margin: 2px -8px; padding: 6px 8px;
-  font-size: 11px; color: var(--ink-3);
+  font-size: 11.5px; color: var(--ink-3);
 }
 .supersede .rule { flex: 1; height: 1px; background: var(--ink-4-struct); opacity: .5; }
 .supersede code { font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
@@ -1787,7 +2273,7 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
 .composed {
   margin: 14px 0 0; padding: 9px 10px;
   border: 1px solid var(--hair-2); border-radius: 8px;
-  font-family: var(--mono); font-size: 10.5px; color: var(--ink-4);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   line-height: 1.6;
 }
 .composed b { color: var(--ink-2); font-weight: 500; }
@@ -1799,9 +2285,18 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
   padding: 11px 8px; margin: 0 -8px;
   border-bottom: 1px solid var(--hair-2); border-radius: 7px;
 }
+/* FEAT-146 round 4 — the two rail defects in the template library.
+   (1) The `living` marker was only rendered on rows that HAVE one, so sibling
+   titles started on two left rails 25px apart; the column is reserved on every
+   row now and the marker is hidden, not absent.
+   (2) The right block ran to the card edge while every settings row's value
+   rail stops 46px short of it — a second value rail in the same pane. The
+   ::after reserves exactly that gutter. */
+.lrow .nm .spark.off { visibility: hidden; }
+.lrow::after { content: ''; flex: none; width: 46px; }
 .lrow:hover { background: var(--sunken); }
 .lrow .mid { min-width: 0; flex: 1; }
-.lrow .nm { font-size: 13.5px; color: var(--ink); display: flex; align-items: center; gap: 7px; }
+.lrow .nm { font-size: 15px; font-weight: 500; color: var(--ink); display: flex; align-items: center; gap: 7px; }
 .lrow .nm .spark { width: 5px; height: 5px; }
 .lrow .desc { display: block; font-size: 12px; color: var(--ink-3); margin-top: 3px; line-height: 1.45; }
 /* FEAT-077: source provenance — where a read-through doc comes from. */
@@ -1810,14 +2305,13 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
 .lrow .use { display: block; font-family: var(--mono); font-size: 10px; color: var(--ink-4); margin-top: 5px; white-space: nowrap; }
 
 /* editor */
-.d-scope[hidden] { display: none; }
 .ed { flex-direction: column; min-height: 0; }
 #vEditor.on { flex: 1; }
 .ed-meta {
   padding: 10px 14px; border-bottom: 1px solid var(--hair-2);
   font-size: 11.5px; color: var(--ink-3); line-height: 1.55;
 }
-.ed-meta .u { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); display: block; margin-top: 4px; }
+.ed-meta .u { font-family: var(--mono); font-size: 10px; color: var(--ink-4); display: block; margin-top: 4px; }
 .ed textarea {
   flex: 1; width: 100%; border: 0; background: none; resize: none;
   padding: 16px 16px 26px;
@@ -1833,13 +2327,82 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
 }
 .ed-foot .mini { margin-left: auto; font-family: var(--sans); }
 
+/* FEAT-146 — NO category-switch transition. Eleven categories means eleven
+   swaps a visit, and at that rate an entrance animation is friction, not
+   polish. Motion in this modal is reserved for open and close. */
 .view { display: none; }
-.view.on { display: block; animation: rise .16s ease-out; }
-.view.ed.on { display: flex; }
+.view.on { display: block; }
+.view.ed.on { display: flex; flex: 1; min-height: 0; }
 
-@media (max-width: 720px) {
-  .drawer { width: 100%; border-left: 0; }
+/* ── FEAT-146 narrow widths ──
+   <860px: one column; the rail becomes a horizontal scroll-snap strip under the
+   header (arrow keys switch to Left/Right — see drawer.js).
+   <560px: a full-bleed sheet with no backdrop; the open animation drops to
+   opacity only, because a translate on a full-screen surface reads as a page
+   navigation rather than a dialog. */
+@media (max-width: 860px) {
+  .smodal-box {
+    width: min(940px, 96vw); height: min(680px, 92vh);
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 52px auto minmax(0, 1fr) 44px;
+  }
+  .smodal-head { grid-area: 1 / 1 / 2 / 2; }
+  /* FEAT-146 round 4 — the strip measured scrollWidth 1499 against clientWidth
+     500: five categories off screen at 800px, seven at 500px, the SELECTED one
+     among them, and no fade, chevron or scrollbar to say so. Three changes:
+     drawer.js scrolls the selection into the centre on every category change;
+     a 24px mask fade on both ends says the strip continues; and the group
+     headings stop being inline text.
+
+     The headings used to scroll WITH the strip, so "This project" sat at
+     x:-327 (off the left edge) while "This machine" floated mid-strip looking
+     like a twelfth category. Below 860px they collapse to a hairline divider
+     at the group boundary — the structure survives, the false category does
+     not. The text stays in the DOM and in the accessibility tree (the two
+     <ul>s are still `aria-labelledby` it), it is simply not painted. */
+  .srail {
+    grid-area: 2 / 1 / 3 / 2;
+    border-right: 0; border-bottom: 1px solid var(--hair-2);
+    padding: 8px 10px;
+    display: flex; align-items: center; gap: 8px;
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: none;
+    /* FEAT-146 round 5 — the fade reflects the ACTUAL scroll position.
+       It used to be a fixed 24px at BOTH ends, so at scrollLeft:0 the left edge
+       faded the first category and promised content that was not there. The
+       scroll position is written once onto `data-edge` by drawer.js
+       (updateRailEdges) and read here; a 0px stop is a hard edge, i.e. no fade. */
+    --fade-s: 0px;
+    --fade-e: 0px;
+    mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-s), #000 calc(100% - var(--fade-e)), transparent 100%);
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--fade-s), #000 calc(100% - var(--fade-e)), transparent 100%);
+  }
+  .srail[data-edge~="start"] { --fade-s: 24px; }
+  .srail[data-edge~="end"] { --fade-e: 24px; }
+  .srail::-webkit-scrollbar { display: none; }
+  .srail h3 {
+    flex: none; align-self: center;
+    width: 1px; height: 22px; padding: 0; margin: 0 2px;
+    background: var(--hair);
+    font-size: 0; color: transparent; overflow: hidden;
+  }
+  .srail h3:first-child { display: none; }
+  .srail ul { display: flex; gap: 6px; flex: none; }
+  .srail ul + h3 { margin-top: 0; }
+  .srail-item { white-space: nowrap; }
+  .spane { grid-area: 3 / 1 / 4 / 2; padding: 14px 16px 20px; }
+  .sfoot { grid-area: 4 / 1 / 5 / 2; padding: 0 16px; }
 }
+@media (max-width: 560px) {
+  .smodal-back { display: none; }
+  .smodal-box {
+    width: 100vw; height: 100%;
+    border: 0; border-radius: 0;
+    animation: fadeOnly .16s ease;
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+@keyframes fadeOnly { from { opacity: 0; } to { opacity: 1; } }
 
 @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
 @keyframes ripple { 0% { transform: scale(1); opacity: .7; } 100% { transform: scale(3.4); opacity: 0; } }
@@ -1959,8 +2522,10 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
   font: inherit; font-size: 11px; padding: 6px 11px; border-radius: 7px;
   border: 1px solid var(--hair); background: var(--window); color: var(--ink); cursor: pointer;
 }
-.modelfree-set:hover { border-color: var(--line-2); background: var(--sunken); }
-.modelfree-set:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* BUG-183 — the same two undefined tokens as .gbtn above: the hover border did
+   nothing and the focus ring did not render. Hover promoted to --ink-4; the
+   per-component focus override deleted so the global rule applies. */
+.modelfree-set:hover { border-color: var(--ink-4); background: var(--sunken); }
 
 /* FEAT-089 — reachable "apply the method" opt-out at add time. */
 #picker .pick-method {
@@ -2012,10 +2577,34 @@ button.mode:hover { border-color: var(--ink-4); color: var(--ink); }
 /* ── settled-agent rows need a container even with one child ── */
 .ran-stack[hidden] { display: none; }
 
+/* ── FEAT-084 / FEAT-146 round 4 — the response-digest guidance field.
+   It had NO rule of its own, so it rendered as a raw UA widget: 201×60px,
+   radius 0, `font-family: monospace` (the literal keyword, not this app's mono
+   stack), `appearance: auto`, `resize: both`, a UA scrollbar with arrow
+   buttons, and — because nothing set a background — LIGHT GREY in dark theme.
+   A 205-character value was clipped into a 24-character three-line window. */
+.digest-guidance { margin-top: 10px; }
+.guidance-in {
+  display: block; width: 100%; min-height: 96px; resize: vertical;
+  appearance: none; -webkit-appearance: none;
+  padding: 9px 11px; text-align: left;
+  border: 1px solid var(--hair); border-radius: 8px;
+  /* --window inside a --sunken card: the same lift-in-light / recess-in-dark
+     inversion `.set-why` uses. --sunken here would be the card's own ground. */
+  background: var(--window); color: var(--ink);
+  font: 12px/1.55 var(--mono);
+  scrollbar-width: thin;
+}
+.guidance-in:hover { border-color: var(--ink-4); }
+.guidance-in:focus { outline: none; border-color: var(--ink-4); }
+.guidance-in::placeholder { color: var(--ink-4); }
+.guidance-in:disabled { color: var(--ink-4); cursor: not-allowed; }
+.guidance-count { text-align: right; font-family: var(--mono); font-size: 10px; margin-top: 5px; }
+
 /* ── drawer: textual inputs for list-valued settings ── */
 .set input.vin {
-  margin-left: auto; width: 58%; font: inherit;
-  font-family: var(--mono); font-size: 11.5px; text-align: right;
+  width: 100%; font: inherit;
+  font-family: var(--mono); font-size: 12px; text-align: right;
   border: 0; border-bottom: 1px solid transparent; background: none; color: var(--ink);
   padding: 0 0 1px;
 }
@@ -2138,8 +2727,7 @@ button.lag:hover { background: var(--rail); }
 .ran-stack .more[hidden] { display: none; }
 
 /* integration rows carry a flag sub-label like the settings rows do */
-.risk .l .f { font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); margin-top: 2px; display: block; }
-.risk .why .u { display: block; margin-top: 6px; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
+.risk .l .f { font-family: var(--mono); font-size: 10px; color: var(--ink-4); margin-top: 2px; display: block; font-weight: 400; }
 .frozen .u { display: block; margin-top: 5px; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
 
 /* A .set whose value needs the full width (the exclusion list) rather than the
@@ -2165,11 +2753,11 @@ button.lag:hover { background: var(--rail); }
 }
 .snap:hover { background: var(--sunken); }
 .snap .mid { min-width: 0; flex: 1; }
-.snap .nm { display: block; font-size: 13px; color: var(--ink); }
+.snap .nm { display: block; font-size: 15px; font-weight: 500; color: var(--ink); }
 .snap .sub { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 3px; line-height: 1.45; }
 .snap .meta {
   flex: none; text-align: right;
-  font-family: var(--mono); font-size: 10.5px; color: var(--ink-4);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   font-variant-numeric: tabular-nums;
 }
 .snap .meta span { display: block; }
@@ -2182,7 +2770,7 @@ button.lag:hover { background: var(--rail); }
 .snap.failed { opacity: .85; }
 .snap.failed:hover { background: none; }
 .snap.failed .nm { color: var(--ink-2); }
-.snap.failed .sub { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); }
+.snap.failed .sub { font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
 .snap.failed .meta { align-self: center; }
 
 .ceremony {
@@ -2191,16 +2779,16 @@ button.lag:hover { background: var(--rail); }
   border-top: 1px solid var(--hair);
   border-bottom: 1px solid var(--hair);
 }
-.ceremony .ch { font-size: 14px; line-height: 1.5; color: var(--ink-2); }
+.ceremony .ch { font-size: 15px; line-height: 1.5; color: var(--ink-2); }
 .ceremony .ch b { color: var(--ink); font-weight: 600; }
 .ceremony .cpath {
-  font-family: var(--mono); font-size: 10.5px; color: var(--ink-4);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   margin-top: 5px;
 }
 .ceremony .cwhich {
   display: flex; flex-wrap: wrap; gap: 10px;
   margin-top: 7px;
-  font-family: var(--mono); font-size: 10.5px; color: var(--ink-3);
+  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
   font-variant-numeric: tabular-nums;
 }
 .ceremony .cwhich span { white-space: nowrap; }
@@ -2211,7 +2799,7 @@ button.lag:hover { background: var(--rail); }
   font-size: 11.5px; line-height: 1.55; color: var(--ink-2);
 }
 .ceremony .cundo b { color: var(--ink); font-weight: 600; }
-.ceremony .cundo code { font-family: var(--mono); font-size: 10.5px; color: var(--ink-2); }
+.ceremony .cundo code { font-family: var(--mono); font-size: 10px; color: var(--ink-2); }
 .ceremony .ct {
   font-size: 10px; letter-spacing: .07em; text-transform: uppercase;
   color: var(--ink-4); font-weight: 600; margin-bottom: 5px;
@@ -2232,7 +2820,9 @@ button.lag:hover { background: var(--rail); }
 }
 .ceremony .cfield { margin-top: 14px; }
 .ceremony .cl { display: block; font-size: 11.5px; color: var(--ink-3); margin-bottom: 5px; }
-.ceremony .cl code { font-family: var(--mono); font-size: 11px; color: var(--ink); }
+/* FEAT-146 round 4 — the inline mono span in "Type <name> to confirm" had no
+   word space on either side, so the three ran together as one token. */
+.ceremony .cl code { font-family: var(--mono); font-size: 11.5px; color: var(--ink); margin: 0 4px; }
 .ceremony .cfield input.vin {
   width: 100%; text-align: left;
   background: var(--window);
@@ -2247,13 +2837,18 @@ button.lag:hover { background: var(--rail); }
   font-weight: 500;
 }
 .mini.danger:hover { color: var(--on-solid); }
+/* FEAT-146 round 4 — a DISABLED primary stays filled (at reduced opacity).
+   Hollowing it out made the restore ceremony's Cancel and its destructive
+   primary visually identical until the confirmation was typed, so the one
+   button that overwrites the working directory read as the same weight as the
+   one that walks away. */
 .mini.danger:disabled {
-  background: none; color: var(--ink-4); border-color: var(--hair);
-  cursor: not-allowed;
+  background: var(--solid); color: var(--on-solid); border-color: var(--solid);
+  opacity: .38; cursor: not-allowed;
 }
 /* conflict rows: the mid-turn marker has to out-weigh the id next to it */
-.ceremony .cconflict li b { color: var(--ink); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; }
-.ceremony .cconflict li .d { display: block; color: var(--ink-4); font-size: 11px; margin-top: 1px; }
+.ceremony .cconflict li b { color: var(--ink); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+.ceremony .cconflict li .d { display: block; color: var(--ink-4); font-size: 11.5px; margin-top: 1px; }
 /* the toggle before the server has resolved `enabled: null` — neither on nor off */
 .sw[data-unknown] { background: transparent; box-shadow: inset 0 0 0 1px var(--hair); }
 .sw[data-unknown] i { background: var(--ink-4); transform: translateX(6px); }
@@ -2558,6 +3153,16 @@ button.lag:hover { background: var(--rail); }
 .cs-pill:hover { color: var(--ink); border-color: var(--ink-4); }
 .tree .row.hit { display: block; height: auto; padding-top: 5px; padding-bottom: 6px; }
 .row.hit .hit-top { display: flex; align-items: baseline; gap: 6px; overflow: hidden; white-space: nowrap; }
+/* FEAT-147 — the "+ new session" affordance on a project search-hit, styled to
+   match the sidebar project header's own + (see .proj .plus). */
+.row.hit .plus {
+  margin-left: auto; flex: none; align-self: center;
+  width: 16px; height: 16px; border-radius: 4px;
+  display: grid; place-items: center; color: var(--ink-4);
+  opacity: 0; transition: opacity .12s;
+}
+.row.hit:hover .plus { opacity: 1; }
+.row.hit .plus:hover { color: var(--ink); background: var(--hair); }
 .row.hit .hit-tool {
   font-family: var(--mono); font-size: 9px; color: var(--ink-4);
   border: 1px solid var(--hair); border-radius: 3px; padding: 0 4px; margin-left: auto;
@@ -2598,7 +3203,7 @@ button.lag:hover { background: var(--rail); }
 .proj .ago + .n { margin-left: 6px; }
 
 /* ── agent memories ── */
-.grp-l.sub { margin-top: 10px; font-size: 9px; opacity: .8; }
+.grp-l.sub { margin-top: 10px; font-size: 10px; opacity: .8; }
 .memrow .membody { padding: 2px 2px 8px; }
 .memtext {
   font-family: var(--serif); font-size: 12.5px; line-height: 1.55; color: var(--ink-2);
@@ -2607,8 +3212,37 @@ button.lag:hover { background: var(--rail); }
 }
 .grp-note.inline { display: inline; padding: 0 8px 0 0; }
 
+/* ── FEAT-145: Claude accounts + the add-account sign-in panel ──
+   Same vocabulary as the rest of the drawer: .set rows for the list, .gtext /
+   .gbtn / .gcustom for the fields, the memtext left-rule for streamed text.
+   Only the CLI-output block is new, because it is the one thing here that is
+   machine output rather than prose — hence mono and a sunken well. */
+.acctlist { margin-top: 10px; }
+/* A two-line account label left its Delete… button 17px above the label
+   block's optical centre, because the row is baseline-aligned. */
+.acctlist .set > .v { display: flex; gap: 6px; align-items: center; align-self: center; }
+.acctlogin { margin-top: 8px; }
+.acctlogin .cacts { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 10px; }
+.acctlink {
+  display: inline-block; margin: 6px 0 2px;
+  font-size: 12px; color: var(--ink); font-weight: 500;
+  text-decoration: underline; text-underline-offset: 2px;
+  text-decoration-color: var(--ink-4);
+}
+.acctlink:hover { text-decoration-color: var(--ink); }
+.acctlink:focus-visible { outline: 2px solid var(--ink-4); outline-offset: 2px; border-radius: 3px; }
+.gtext.mono { font-family: var(--mono); font-size: 11px; }
+.loginout {
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3);
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 180px; overflow-y: auto;
+  background: var(--sunken); border: 1px solid var(--hair); border-radius: 6px;
+  padding: 7px 9px; margin: 8px 0 0;
+}
+.loginout:empty { display: none; }
+
 /* ── git group ── */
-.grp-note.mono-line { font-family: var(--mono); font-size: 11px; }
+.grp-note.mono-line { font-family: var(--mono); font-size: 12px; }
 .grp-note.mono-line .u { display: block; margin-top: 2px; color: var(--ink-4); }
 .vin.narrow { max-width: 160px; margin-right: 6px; }
 
@@ -2806,7 +3440,7 @@ button.lag:hover { background: var(--rail); }
    the person about to click. */
 .proj .pgone {
   flex: none; margin-left: 6px;
-  font-family: var(--mono); font-size: 9.5px; color: var(--warn, #B0703C);
+  font-family: var(--mono); font-size: 9.5px; color: var(--warn);
   border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; line-height: 14px;
   cursor: pointer;
 }
@@ -2831,6 +3465,9 @@ button.lag:hover { background: var(--rail); }
   font-family: var(--mono); font-size: 10px; color: var(--ink-3);
   letter-spacing: .04em; padding: 3px 4px 5px;
 }
+/* BUG-178: the live elapsed of the foreground step holding the boundary — the
+   honest "how long may this wait" signal, so it is weighted above the prose. */
+.qbox .q-l .q-el { color: var(--ink-2); font-weight: 600; }
 .qrow summary {
   display: flex; align-items: baseline; gap: 7px;
   padding: 3px 4px; border-radius: 6px; cursor: pointer; list-style: none;
@@ -2997,6 +3634,21 @@ button.lag:hover { background: var(--rail); }
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8.2 1C12.6 3.6 13.4 9 8.4 15 3.4 9 4.6 3.6 8.2 1Z'/%3E%3C/svg%3E") center / contain no-repeat;
 }
 
+/* FEAT-139 — the collapsed-section count row: "N queued → board", "N more need
+   you → board". A quiet, full-width affordance that stands in for a list the
+   rail no longer dumps inline; one click opens the board where the full list
+   lives. Reads as a link, not a ticket row, so it never masquerades as an ask. */
+.rail-more {
+  display: flex; align-items: center; gap: 7px; width: 100%;
+  margin-top: 6px; padding: 6px 4px;
+  border: 0; background: none; cursor: pointer; text-align: left;
+  font-size: 11.5px; color: var(--ink-3);
+  border-radius: 6px; transition: background .12s, color .12s;
+}
+.rail-more:hover, .rail-more:focus-visible { outline: none; color: var(--ink); background: color-mix(in srgb, var(--ink) 4%, transparent); }
+.rail-more .rm-n { font-family: var(--mono); font-size: 10.5px; color: var(--ink-2); flex: none; }
+.rail-more .rm-l { color: var(--ink-3); }
+
 /* FEAT-053: same per-section cap for the read-only lists (Queued / In flight /
    Done today / stopped agents) — max-height + overflow-y ONLY, no
    overscroll-behavior (BUG-032, see .needs above). */
@@ -3117,7 +3769,7 @@ button.lag:hover { background: var(--rail); }
 .req-exec.run { color: var(--live); border-color: color-mix(in srgb, var(--live) 45%, transparent); }
 .req-exec.run .req-gl { color: var(--live); animation: turn 3.2s linear infinite; }
 .req-exec.idle { color: var(--ink-4); }
-.req-exec.stall { color: var(--warn, #B0703C); border-color: color-mix(in srgb, var(--warn, #B0703C) 45%, transparent); }
+.req-exec.stall { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
 /* Completion channel — the FEAT-066 status tints, from the board STATUS only. */
 .req-comp.st-done { color: var(--st-done); border-color: color-mix(in srgb, var(--st-done) 45%, transparent); }
 .req-comp.st-prog { color: var(--st-prog); border-color: color-mix(in srgb, var(--st-prog) 45%, transparent); }
@@ -3277,7 +3929,7 @@ button.lag:hover { background: var(--rail); }
   margin: 12px 0;
   padding: 11px 14px 12px;
   border: 1px solid var(--hair);
-  border-left: 3px solid #B0703C;
+  border-left: 3px solid var(--warn);   /* BUG-183 — was the light hex, hardcoded */
   border-radius: 12px;
   background: var(--sunken);
   max-width: 620px;
@@ -3286,7 +3938,7 @@ button.lag:hover { background: var(--rail); }
   font-family: var(--mono); font-size: 10.5px; letter-spacing: .05em;
   text-transform: uppercase; color: var(--ink-2); margin-bottom: 5px;
 }
-.provider-error .pe-head::before { content: "⚠ "; color: #B0703C; }
+.provider-error .pe-head::before { content: "⚠ "; color: var(--warn); }
 .provider-error .pe-detail {
   font-size: 13px; line-height: 1.5; color: var(--ink);
   white-space: pre-wrap; overflow-wrap: anywhere;
@@ -4348,7 +5000,7 @@ a.tv-row.flaw-err:not(.kb) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--
 /* the grouped action row (err + send + foot). A plain stacked block by default;
    the wide sticky card pins it to the bottom of its scroll region (see media). */
 .dc-actions { display: grid; gap: 9px; }
-.dc-err { font-size: 11px; color: var(--danger, #c0392b); }
+.dc-err { font-size: 11px; color: var(--danger); }
 .dc-send { font: 600 12.5px var(--sans); padding: 9px 12px; border-radius: 8px; cursor: pointer; width: 100%; background: var(--solid); color: var(--on-solid); border: 1px solid var(--solid); }
 .dc-send:hover:not(:disabled) { filter: brightness(1.08); }
 /* DISABLED must RECEDE, in both themes. `opacity:.45` on the solid fill did the
@@ -4466,9 +5118,12 @@ a.tv-row.flaw-err:not(.kb) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--
 @media (max-width: 900px) { .ichip .n { display: none; } .ichip { padding: 2.5px 6px; } }
 
 /* FEAT-051 — the drawer's terse when-to-use line under each integration name. */
+/* FEAT-146 round 4 — sans, not mono. "real profile, stays logged in, survives
+   bot checks" is prose; mono in this app is the machine-string token (paths,
+   ids, flags), and setting a human sentence in it spends that signal. */
 .risk .use1 {
-  font-family: var(--mono); font-size: 10px; letter-spacing: .01em;
-  color: var(--ink-3); margin: 4px 0 2px;
+  font-family: var(--sans); font-size: 11.5px; letter-spacing: 0;
+  color: var(--ink-3); margin: 4px 0 2px; max-width: 62ch;
 }
 
 /* FEAT-054: the composer permission hairline and seal chip deep-link now. */
@@ -4878,3 +5533,51 @@ a.digest-ref-link:hover {
 /* The narration reads as subordinate: quieter ink than the reader-facing prose. */
 .orchard-notes-body .prose { color: var(--ink-3); font-size: 14px; }
 .orchard-notes-body .prose:first-child { margin-top: 0; }
+
+/* ARCH-017 step 2 (§5) — the collected drain bundle, rendered IN the rail.
+   It used to exist only in `console.info`, so "collecting" N results put them
+   somewhere only a developer would look. Monospace + wrapped + scroll-capped:
+   the rail is narrow, so this is the CONFIRMATION and the copy/select surface,
+   while the composer gets the text itself (that is the one-wakeup path). */
+.rail-sub pre.drain-bundle {
+  margin: 4px 0 6px;
+  padding: 6px 7px;
+  /* Small on purpose: the rail's job is the actionable rows above it, and the
+     full text is already in the composer. This is the receipt, not the reader. */
+  max-height: 72px;
+  overflow: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* Real tokens only — BUG-183 is this file referencing properties nothing
+     defines, which silently falls back to the initial value. */
+  background: var(--sunken);
+  border: 1px solid var(--hair);
+  border-radius: 6px;
+  color: var(--ink-2);
+}
+
+/* ARCH-017 round 3 — the pending rail's PROBLEM row must be readable.
+   `.rail-sub .brow .bt` is nowrap/ellipsis, which is right for a one-line item
+   row and wrong for a recovery instruction: a verifier measured ~38 of 1115
+   characters visible, with the actionable tail reachable only by hover. This
+   row wraps, keeps its full text, and scrolls if the store is really verbose. */
+.rail-sub .brow.problem { align-items: flex-start; }
+.rail-sub .brow.problem .bt {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  overflow: auto;
+  text-overflow: clip;
+  /* ROUND 3, from a real-browser look rather than an assertion: a px cap is not
+     a whole number of lines, so the box sliced its 8th line in half and the
+     sliced glyphs sat right on top of the next rail row. Expressing the cap as
+     8 × the line-height clips on a line boundary at any font size. */
+  line-height: 1.45;
+  max-height: 11.6em;
+  color: var(--ink-2);
+}
+/* The instruction, lifted to the front and given the only emphasis in the row. */
+.rail-sub .brow.problem .bt .fix-first { display: block; color: var(--ink); font-weight: 600; margin-bottom: 3px; }
+.rail-sub .brow.problem .lnk { align-self: flex-start; }

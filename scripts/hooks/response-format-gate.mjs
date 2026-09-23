@@ -142,18 +142,31 @@ function isTruthyEnv(v) {
  * missing-digest failure (and vice-versa). Each category carries its own
  * actionable instruction; only the categories that failed are mentioned.
  */
-function summarise({ formatReasons = [], readabilityReasons = [], blockReasons = [], lengthReasons = [], askReasons = [] }) {
+function summarise({ formatReasons = [], readabilityReasons = [], blockReasons = [], lengthReasons = [], askReasons = [], completionReasons = [] }) {
   const parts = ['Your reply does not meet this project\'s response guidelines.'];
-  // FEAT-137/138 come first: they are the ENFORCED checks (the reader is being
+  // FEAT-150 leads: a completion claim that contradicts the board is the most
+  // consequential defect (the user acts on "done"), and its fix is a ground-truth
+  // read, not a wording tweak.
+  if (completionReasons.length) {
+    parts.push(completionReasons.join(' '));
+    parts.push(
+      'A digest `kind:"done"` item is a completion claim the user acts on. It may name a ticket '
+      + 'ONLY when `npm run board:status -- <ID>` reads that ticket as verified/done. If the board '
+      + 'reads it filed / in-progress / in-verification, say THAT state (read from board:status, '
+      + 'never from memory) instead of "done".',
+    );
+  }
+  // FEAT-137/138 come next: they are the ENFORCED checks (the reader is being
   // asked to re-send), so their instruction should lead the correction.
   if (lengthReasons.length) parts.push(lengthReasons.join(' '));
   if (askReasons.length) parts.push(askReasons.join(' '));
   if (formatReasons.length) {
     parts.push(formatReasons.join(' '));
     parts.push(
-      'Lead with a valid ```orchard-digest fenced JSON block ' +
-      '({"items":[{"text":"…","kind":"decision|done|in-flight|fyi",' +
-      '"importance":"high|med|low"}]}) and use plain text only (no emojis).'
+      'When a reply is substantive, lead with a valid ```orchard-digest fenced JSON ' +
+      'block ({"items":[{"text":"…","kind":"decision|done|in-flight|fyi",' +
+      '"importance":"high|med|low"}]}); omit it for a short reply or one whose whole ' +
+      'body is a single artifact. Use plain text only (no emojis).'
     );
   }
   if (blockReasons.length) {
@@ -175,6 +188,40 @@ function summarise({ formatReasons = [], readabilityReasons = [], blockReasons =
     );
   }
   return parts.join(' ');
+}
+
+/* ── Digest-required predicate (FEAT-143) ────────────────────────────────────
+ * MIRROR of the injected core (RESPONSE_FORMAT.md, "OMIT it for a short reply, or
+ * one whose body is a single artifact"). The digest is a scan surface for a reply
+ * too long to scan, NOT a mandatory preamble — the user's complaint was the
+ * digest paraphrasing every short reply. This predicate keeps the gate from
+ * punishing the new behaviour: a MISSING digest is only a defect when the reply
+ * is substantive. A digest that is PRESENT but malformed/empty is always a defect
+ * (that branch does not consult this) — the author reached for the scan surface
+ * and produced a broken one.
+ *
+ * Two exemptions, both deliberately narrow so a genuinely substantive reply that
+ * simply forgot its digest is still caught:
+ *   - SINGLE ARTIFACT: the whole body is exactly one `orchard-answer` block, no
+ *     loose prose outside it — the reply IS the thing asked for; a headline of it
+ *     is noise.
+ *   - SHORT: below the readability minWords floor (40). A word count of the whole
+ *     reply text is used (the missing-digest branch means there is no digest JSON
+ *     to exclude); counting fences/code can only OVER-count, which biases toward
+ *     "required" — the safe direction, never a false suppression.
+ */
+const SHORT_REPLY_WORDS = 40; // matches READABILITY_THRESHOLDS.minWords
+function digestOptional(parsed, text) {
+  try {
+    const blocks = Array.isArray(parsed?.blocks)
+      ? parsed.blocks.filter((b) => b && b.name !== 'orchard-digest') : [];
+    const looseRuns = Array.isArray(parsed?.fallbackRuns) ? parsed.fallbackRuns : [];
+    if (blocks.length === 1 && blocks[0].name === 'orchard-answer' && looseRuns.length === 0) {
+      return true;
+    }
+  } catch { /* fall through to the length check */ }
+  const words = (String(text ?? '').match(/[A-Za-z][A-Za-z'-]*/g) || []).length;
+  return words < SHORT_REPLY_WORDS;
 }
 
 /* ── Launcher gate (BUG-118) ─────────────────────────────────────────────────
@@ -686,11 +733,15 @@ async function main() {
     noteCannotGrade('deps-digest-threw', err?.message, payload);
     return allow();
   }
+  // FEAT-143 — a MISSING digest is only a defect when the reply is substantive.
+  // Deferred until blocks are parsed (below) so `digestOptional` can see them; a
+  // digest that is PRESENT-but-broken is always flagged here and now.
+  let digestMissing = false;
   if (!digest) {
     // Classify WHY for a specific corrective (messaging only; mirror of the fence).
     const m = DIGEST_FENCE.exec(text);
     if (!m) {
-      formatReasons.push('Missing the leading ```orchard-digest block.');
+      digestMissing = true;
     } else {
       let json = null;
       try { json = JSON.parse(m[1]); } catch { /* malformed */ }
@@ -716,9 +767,11 @@ async function main() {
    * Wrapped whole. Parsing or the disk must never change the verdict; the module
    * is imported lazily and dynamically so a target that lacks it (an older
    * onboarded copy) simply records nothing. */
+  let parsedBlocks = null; // hoisted: the FEAT-143 digest-required check reads it below
   try {
     const { parseResponseBlocks } = await importFirst(['../lib/response-blocks.js', '../../public/lib/response-blocks.js']);
     const parsed = parseResponseBlocks(text);
+    parsedBlocks = parsed;
     try {
       const fm = await import('../lib/format-metrics.mjs');
       fm.recordTurn(parsed, { session_id: payload.session_id, cwd: payload.cwd, dataDir: dataDir() });
@@ -805,6 +858,81 @@ async function main() {
     noteCannotGrade('deps-blocks-unavailable', err?.message, payload);
   }
 
+  // FEAT-143 — resolve the deferred missing-digest defect now that blocks are
+  // parsed. Only a SUBSTANTIVE reply owes a digest; a short reply or a single
+  // artifact legitimately omits it (mirrors the injected core). If block parsing
+  // failed above, parsedBlocks is null and digestOptional falls back to the word
+  // count, which biases toward "required" — the safe direction.
+  if (digestMissing && !digestOptional(parsedBlocks, text)) {
+    formatReasons.push('Missing the leading ```orchard-digest block (required for a substantive reply).');
+  }
+
+  /* FEAT-150 — COMPLETION CLAIM GROUND TRUTH (ENFORCED).
+   *
+   * A digest `kind:"done"` item that names a ticket is a completion claim the
+   * user acts on ("all green"). The defect this ticket exists to kill: the
+   * orchestrator marks something "done" that the board says is only filed / in
+   * progress / in verification — the word does not distinguish them, so the user
+   * must spend turns asking "is it really done". The fix is ARCH-010: the WORK
+   * declares its own state and the reader READS it. This binds each ref'd done
+   * item to the board's ONE reader (board-status.mjs, itself over board.mjs /
+   * ticket-schema.mjs — no second parser) and refuses the claim unless the board
+   * agrees the ticket is verified/done. The state is read here, from ground
+   * truth, so a claim typed from memory cannot pass.
+   *
+   * SCOPE + fail-open, both deliberate:
+   *   - Only a done item WITH A ticket ref is graded. An ad-hoc, ticket-less
+   *     completion claim (the "change the sidebar to red" case) has no board
+   *     record to bind to, and inventing a git-scoped ground truth for an
+   *     arbitrary change is a separate design (see the ticket's fork note). Not
+   *     graded here — never a false block on legitimate ad-hoc "done".
+   *   - No board tooling on disk (a generic onboarded project, not Orchard's own
+   *     repo) -> the whole check silently does not fire. board:status is the
+   *     Orchard board's reader; where there is no Orchard board there is nothing
+   *     to check. Any unexpected throw fails open and is logged, never wedges. */
+  const completionReasons = [];
+  try {
+    const { completionClaims } = await import('../lib/format-metrics.mjs');
+    const claims = completionClaims(digest);
+    if (claims.some((c) => c.ref)) {
+      let bs = null, bp = null, ts = null;
+      try {
+        bs = await importFirst(['../board-status.mjs']);
+        bp = await importFirst(['../lib/board-path.mjs']);
+        ts = await importFirst(['../lib/ticket-schema.mjs']);
+      } catch {
+        bs = null; // no Orchard board tooling here -> skip, and do NOT log it as a defect
+      }
+      if (bs && bp && ts) {
+        const boardDir = bp.resolveBoardDir(payload.cwd || process.cwd());
+        const doneStates = new Set(ts.DONE_WORK_STATES);
+        for (const claim of claims) {
+          if (!claim.ref) continue; // ad-hoc claim -> not board-bound (fork)
+          const norm = bs.normalizeId(claim.ref);
+          if (!norm) continue; // ref is not a ticket id (a URL/path) -> not board-bound
+          let rep = null;
+          try { rep = bs.buildTicketReport(boardDir, norm, 0); } catch { rep = null; }
+          if (!rep) continue; // board unreadable this turn -> fail open, never wedge
+          if (!rep.ok) {
+            completionReasons.push(
+              `Your digest marks ${claim.ref} "done", but board:status finds NO ticket record for it `
+              + '— a completion claim must name a real, checkable ticket.',
+            );
+          } else if (!doneStates.has(rep.work_state)) {
+            completionReasons.push(
+              `Your digest marks ${rep.id} "done", but board:status reads work_state="${rep.work_state ?? 'unclassifiable'}"`
+              + `${rep.status_ambiguous ? ' (AMBIGUOUS status)' : ''} — board placement ${rep.board_placement}, working tree ${rep.worktree}.`,
+            );
+          }
+        }
+      }
+    }
+  } catch (err) {
+    // A completion-claim check that throws is a check that stopped running; log it
+    // (outside the repo) but never let it affect the turn.
+    noteCannotGrade('deps-completion-threw', err?.message, payload);
+  }
+
   // Readability check on the PROSE (digest/code/tables/urls excluded inside the
   // module). Additive: it follows the SAME advisory/enforce path as the format
   // checks. Biased hard toward allowing — short/mostly-code/quote replies are
@@ -825,14 +953,14 @@ async function main() {
   // ONCE for a revision (bounded by stop_hook_active upstream), folding the
   // advisory-class reasons into the SAME correction so the model fixes everything
   // in one re-send.
-  const enforced = lengthReasons.length > 0 || askReasons.length > 0;
+  const enforced = lengthReasons.length > 0 || askReasons.length > 0 || completionReasons.length > 0;
   const advisory = formatReasons.length > 0 || readabilityReasons.length > 0 || blockReasons.length > 0;
 
   if (!enforced && !advisory) {
     return allow(); // fully compliant -> silence, no advisory noise
   }
   if (enforced) {
-    return reviseTurn({ formatReasons, readabilityReasons, blockReasons, lengthReasons, askReasons }, payload);
+    return reviseTurn({ formatReasons, readabilityReasons, blockReasons, lengthReasons, askReasons, completionReasons }, payload);
   }
   // Advisory-only (unchanged behaviour): report through the env-gated path — never
   // blocks unless ORCHARD_STOP_HOOK_ENFORCE is set, preserving the FEAT-085 race

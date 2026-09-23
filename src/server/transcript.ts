@@ -298,6 +298,161 @@ export function readForward(filePath: string, opts: ForwardOptions): ForwardResu
   return { messages, offset, scannedMessages: scanned, budgetExhausted, bytesRead, fileBytes: st.size, malformedLines: malformed };
 }
 
+/* ------------------------------------------------- hook-failure roll-up */
+
+/**
+ * A quality gate (a Claude Code hook) can fail on EVERY turn and the transcript
+ * records it — as a `type:"attachment"` line whose `attachment.type` is
+ * `hook_non_blocking_error` — but that line is neither `user` nor `assistant`,
+ * so every reader above filters it out and the UI shows the user nothing. A gate
+ * whose failure is invisible is worse than no gate: it manufactures the
+ * confidence it was installed to earn. So the fact is OWNED here, at the one full
+ * scan the route already pays for (`countMessages`), and carried to the client
+ * as a session-level roll-up rather than re-derived by any reader (ARCH-010).
+ *
+ * `crash` = the hook FAILED TO RUN at all (interpreter/loader/spawn failure:
+ * module missing, ENOENT, exec-format, permission). This is the dangerous one —
+ * the gate never executed. `reported` = the hook ran and exited non-zero with a
+ * message of its own. The two are distinguished by the shape of stderr.
+ */
+export type HookErrorKind = 'crash' | 'reported';
+
+/** One distinct (hook, event, kind, message) failure, with a turn count. */
+export interface HookErrorGroup {
+  hookName: string;
+  hookEvent: string;
+  kind: HookErrorKind;
+  /** Short, human-legible error extracted from stderr/stdout. */
+  message: string;
+  exitCode: number | null;
+  /** Number of turns this exact failure occurred on. */
+  count: number;
+}
+
+/** A single occurrence, kept (capped) so the client can badge the owning turn. */
+export interface HookErrorRef {
+  parentUuid: string | null;
+  hookName: string;
+  hookEvent: string;
+  kind: HookErrorKind;
+  message: string;
+  exitCode: number | null;
+}
+
+export interface HookErrorSummary {
+  /** Total hook-failure records in the scanned span (turns affected overall). */
+  totalRecords: number;
+  crashRecords: number;
+  reportedRecords: number;
+  /** Distinct failures, most-frequent first. */
+  groups: HookErrorGroup[];
+  /** Per-occurrence refs for per-turn badges; capped for pathological sessions. */
+  records: HookErrorRef[];
+  recordsCapped: boolean;
+}
+
+/** How many per-occurrence refs we keep for badging before we stop growing. */
+const HOOK_REF_CAP = 500;
+
+/**
+ * The hook process never ran — an interpreter/loader/spawn failure, as opposed
+ * to a hook that ran and exited non-zero with its own message. These signatures
+ * come from node's module loader, the shell, and exec(); a hook that merely
+ * `process.exit(1)`s after printing prose matches none of them.
+ */
+const HOOK_CRASH_RX =
+  /Cannot find module|MODULE_NOT_FOUND|ENOENT|command not found|No such file or directory|Exec format error|Permission denied|cannot execute|is not recognized as an internal or external command|Error \[ERR_MODULE_NOT_FOUND\]/i;
+
+function classifyHookError(stderr: string, stdout: string): HookErrorKind {
+  return HOOK_CRASH_RX.test(stderr) || HOOK_CRASH_RX.test(stdout) ? 'crash' : 'reported';
+}
+
+/** Pull one legible line out of a hook's output for display + grouping. */
+function hookErrorMessage(att: Record<string, any>): string {
+  const stderr = String(att?.stderr ?? '').trim();
+  const stdout = String(att?.stdout ?? '').trim();
+  const src = stderr || stdout;
+  if (!src) {
+    const cmd = String(att?.command ?? '').trim();
+    return cmd || `hook exited ${att?.exitCode ?? '?'}`;
+  }
+  const lines = src.split('\n').map((s) => s.trim()).filter(Boolean);
+  const pick =
+    lines.find((l) => /Cannot find module|ERR_MODULE_NOT_FOUND/i.test(l)) ??
+    lines.find((l) => /^Error:/i.test(l)) ??
+    // Skip the generic wrapper header, node stack frames, and the caret line.
+    lines.find((l) => !/^Failed with non-blocking status code/i.test(l) && !/^at /.test(l) && l !== '^') ??
+    lines[0]!;
+  return pick.length > 200 ? pick.slice(0, 200) + '…' : pick;
+}
+
+/** Mutable accumulator threaded through a single scan. */
+interface HookAcc {
+  total: number;
+  crash: number;
+  reported: number;
+  groups: Map<string, HookErrorGroup>;
+  records: HookErrorRef[];
+  capped: boolean;
+}
+
+function newHookAcc(): HookAcc {
+  return { total: 0, crash: 0, reported: 0, groups: new Map(), records: [], capped: false };
+}
+
+/**
+ * If `line` is a hook-failure attachment, fold it into `acc`. Cheap-guarded by a
+ * substring test so it costs a single `indexOf` on the > 99.9% of lines that are
+ * ordinary messages — no parse, no allocation.
+ */
+function collectHookError(line: string, acc: HookAcc): void {
+  if (line.indexOf('hook_non_blocking_error') === -1) return;
+  let e: Record<string, any>;
+  try {
+    e = JSON.parse(line);
+  } catch {
+    return;
+  }
+  const att = e?.attachment;
+  if (!att || att.type !== 'hook_non_blocking_error') return;
+
+  const hookName = String(att.hookName ?? att.hookEvent ?? 'hook');
+  const hookEvent = String(att.hookEvent ?? '');
+  const exitCode = Number.isFinite(att.exitCode) ? Number(att.exitCode) : null;
+  const kind = classifyHookError(String(att.stderr ?? ''), String(att.stdout ?? ''));
+  const message = hookErrorMessage(att);
+
+  acc.total++;
+  if (kind === 'crash') acc.crash++;
+  else acc.reported++;
+
+  const key = `${hookName}\0${hookEvent}\0${kind}\0${message}`;
+  const g = acc.groups.get(key);
+  if (g) g.count++;
+  else acc.groups.set(key, { hookName, hookEvent, kind, message, exitCode, count: 1 });
+
+  if (acc.records.length < HOOK_REF_CAP) {
+    acc.records.push({
+      parentUuid: typeof e.parentUuid === 'string' ? e.parentUuid : null,
+      hookName, hookEvent, kind, message, exitCode,
+    });
+  } else {
+    acc.capped = true;
+  }
+}
+
+function finishHookAcc(acc: HookAcc): HookErrorSummary {
+  const groups = [...acc.groups.values()].sort((a, b) => b.count - a.count);
+  return {
+    totalRecords: acc.total,
+    crashRecords: acc.crash,
+    reportedRecords: acc.reported,
+    groups,
+    records: acc.records,
+    recordsCapped: acc.capped,
+  };
+}
+
 /* ------------------------------------------------------------------ totals */
 
 interface CountEntry {
@@ -306,6 +461,7 @@ interface CountEntry {
   total: number;
   bytesScanned: number;
   isLowerBound: boolean;
+  hookErrors: HookErrorSummary;
 }
 
 /**
@@ -324,6 +480,11 @@ export interface CountResult {
   isLowerBound: boolean;
   bytesScanned: number;
   cached: boolean;
+  /**
+   * Failed quality gates (hook_non_blocking_error) seen in the same single scan.
+   * Empty in the healthy case, so a reader can `if (hookErrors.totalRecords)`.
+   */
+  hookErrors: HookErrorSummary;
 }
 
 /**
@@ -372,7 +533,7 @@ export function countMessages(
   const key = `${filePath}\0${opts.cacheKeySuffix ?? ''}\0${opts.includeToolResults === true ? 'tools' : ''}\0${opts.requireRenderable === false ? 'all' : ''}`;
   const hit = countCache.get(key);
   if (hit && hit.size === st.size && hit.mtimeMs === st.mtimeMs) {
-    return { total: hit.total, isLowerBound: hit.isLowerBound, bytesScanned: hit.bytesScanned, cached: true };
+    return { total: hit.total, isLowerBound: hit.isLowerBound, bytesScanned: hit.bytesScanned, cached: true, hookErrors: hit.hookErrors };
   }
 
   const keep = opts.entryFilter ?? ((e: Record<string, any>) => isMainThreadEntry(e, opts.includeMeta === true));
@@ -382,6 +543,9 @@ export function countMessages(
   let scanned = 0;
   let carry = '';
   let isLowerBound = false;
+  // Folded into this ONE full scan — the failed-gate roll-up costs a single
+  // indexOf on lines that are not hook attachments (see collectHookError).
+  const hookAcc = newHookAcc();
   try {
     const buf = Buffer.alloc(CHUNK);
     while (scanned < st.size) {
@@ -395,18 +559,25 @@ export function countMessages(
       const text = carry + buf.toString('utf8', 0, len);
       const parts = text.split('\n');
       carry = parts.pop() ?? '';
-      for (const line of parts) if (countable(line, keep, opts)) total++;
+      for (const line of parts) {
+        if (countable(line, keep, opts)) total++;
+        collectHookError(line, hookAcc);
+      }
     }
-    if (carry.trim() && countable(carry, keep, opts)) total++;
+    if (carry.trim()) {
+      if (countable(carry, keep, opts)) total++;
+      collectHookError(carry, hookAcc);
+    }
   } finally {
     fs.closeSync(fd);
   }
 
-  const entry: CountEntry = { size: st.size, mtimeMs: st.mtimeMs, total, bytesScanned: scanned, isLowerBound };
+  const hookErrors = finishHookAcc(hookAcc);
+  const entry: CountEntry = { size: st.size, mtimeMs: st.mtimeMs, total, bytesScanned: scanned, isLowerBound, hookErrors };
   // Bounded: this map would otherwise grow once per session file ever viewed.
   if (countCache.size > 256) countCache.clear();
   countCache.set(key, entry);
-  return { total, isLowerBound, bytesScanned: scanned, cached: false };
+  return { total, isLowerBound, bytesScanned: scanned, cached: false, hookErrors };
 }
 
 /** Predicate for subagent files: every entry there is sidechain by design. */

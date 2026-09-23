@@ -32,87 +32,22 @@
  * say when it was read (asOf); bounded and non-blocking (the provider reads carry
  * the module's own hard timeouts and never throw); no credential anywhere.
  */
-import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
-import { readUsageNow, type ProviderUsage } from '../src/server/provider-usage.ts';
+import { readUsageForTarget, usageTargets, type ProviderUsage } from '../src/server/provider-usage.ts';
 import { deriveWindow, overallVerdict, verdictAdvice } from './lib/usage-burn.mjs';
-
-/* ----------------------------------------------------------------- locations */
-
-function dataDir(): string {
-  if (process.env.CLAUDE_STATION_DATA) return process.env.CLAUDE_STATION_DATA;
-  if (process.env.XDG_DATA_HOME) return path.join(process.env.XDG_DATA_HOME, 'claude-station');
-  return path.join(os.homedir(), '.local', 'share', 'claude-station');
-}
-function historyFile(): string {
-  return path.join(dataDir(), 'usage-burn-history.jsonl');
-}
+import { appendHistory, histKeyForSnapshot, priorFor, readHistory, rowsFromSnapshots } from './lib/usage-history.mjs';
 
 /* ------------------------------------------------------------------ history */
 
+/*
+ * FEAT-145 step 7: the history reader/writer now lives in
+ * `scripts/lib/usage-history.mjs` so the KEYING RULE it documents (default
+ * account = bare `'anthropic'`, byte-identical to every pre-145 row; every other
+ * account = `anthropic:<id>`, its own KEEP bucket) can be graded directly by
+ * `scripts/verify-feat-145-usage.mjs` rather than only through this CLI.
+ */
 interface HistRow { provider: string; label: string; usedPercent: number; resetsAt: number | null; at: number }
-
-/**
- * Read the burn history, tolerant of a torn tail line (this file is only written
- * by THIS command, so there is no concurrent-writer race — but a half-flushed
- * final line from an interrupted run must not lose the rest).
- */
-function readHistory(): HistRow[] {
-  const file = historyFile();
-  let raw: string;
-  try { raw = fs.readFileSync(file, 'utf8'); } catch { return []; }
-  const out: HistRow[] = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      const r = JSON.parse(line) as HistRow;
-      if (r && typeof r.provider === 'string' && typeof r.at === 'number') out.push(r);
-    } catch { /* torn tail */ }
-  }
-  return out;
-}
-
-/** The most recent prior read of a given window instance, matched on resetsAt. */
-function priorFor(history: HistRow[], provider: string, label: string, resetsAt: number | null): HistRow | null {
-  let best: HistRow | null = null;
-  for (const r of history) {
-    if (r.provider !== provider || r.label !== label) continue;
-    if (resetsAt != null && r.resetsAt !== resetsAt) continue; // same window instance only
-    if (best == null || r.at > best.at) best = r;
-  }
-  return best;
-}
-
-/**
- * Append the windows just read, and keep the file small by retaining only the
- * last N rows per (provider,label). Bounded and best-effort: a write failure is
- * swallowed — history is a nicety for the NEXT call's observed rate, never a
- * blocker for THIS call's answer.
- */
-function appendHistory(rows: HistRow[]): void {
-  if (!rows.length) return;
-  try {
-    const file = historyFile();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const all = [...readHistory(), ...rows];
-    const KEEP = 8;
-    const byKey = new Map<string, HistRow[]>();
-    for (const r of all) {
-      const k = `${r.provider}\x00${r.label}`;
-      if (!byKey.has(k)) byKey.set(k, []);
-      byKey.get(k)!.push(r);
-    }
-    const pruned: HistRow[] = [];
-    for (const list of byKey.values()) {
-      list.sort((a, b) => a.at - b.at);
-      pruned.push(...list.slice(-KEEP));
-    }
-    pruned.sort((a, b) => a.at - b.at);
-    fs.writeFileSync(file, pruned.map((r) => JSON.stringify(r)).join('\n') + '\n');
-  } catch { /* history is best-effort */ }
-}
 
 /* -------------------------------------------------------------- own spend */
 
@@ -126,7 +61,7 @@ function appendHistory(rows: HistRow[]): void {
  * fraction of any provider quota. The two never share a number.
  */
 async function ownSpend(project: string): Promise<
-  | { available: true; asOf: number; windows: { label: string; hours: number; cost: number | null; priced: number; lanes: number; unpriced: boolean }[]; ledgerFloor: string }
+  | { available: true; asOf: number; windows: { label: string; hours: number; cost: number | null; priced: number; lanes: number; unpriced: boolean; prorated: boolean }[]; ledgerFloor: string; anyProrated: boolean }
   | { available: false; note: string }
 > {
   try {
@@ -136,29 +71,79 @@ async function ownSpend(project: string): Promise<
     if (res.error) return { available: false, note: res.error };
     const lanes = res.lanes ?? [];
     const now = Date.now();
+
+    /*
+     * BUG-175 DEFECT 2. Attribute each REQUEST's cost to the window containing
+     * THAT request's own timestamp — not the whole lane's cost to the window
+     * containing its `ended_at`. The old rule dropped a 36-day session's entire
+     * $2088 into "last 7d" because that is when it ended, over-reporting 7-day
+     * spend ~4×. `request_costs` (from cost-model.laneRequestCosts, attached in
+     * memory by collect()) carries per-request at_ms + priced cost.
+     *
+     * A request with an unparseable timestamp (at_ms null) is PRORATED across the
+     * lane's [started_at, ended_at] span rather than silently mis-binned, and the
+     * output says when any proration happened.
+     */
     const mk = (label: string, hours: number) => {
       const cutoff = now - hours * 3.6e6;
-      const inWin = lanes.filter((l: any) => {
-        const t = Date.parse(l.ended_at ?? l.started_at ?? '');
-        return Number.isFinite(t) && t >= cutoff;
-      });
-      const unpriced = inWin.some((l: any) => l.cost_usd == null);
-      const priced = inWin.reduce((a: number, l: any) => a + (l.cost_priced_usd ?? 0), 0);
+      let priced = 0;
+      let unpriced = false;
+      let prorated = false;
+      const lanesTouching = new Set<string>();
+
+      for (const l of lanes as any[]) {
+        const reqs: { at_ms: number | null; cost_usd: number | null; cost_priced_usd: number }[] = l.request_costs ?? [];
+        const laneStart = Date.parse(l.started_at ?? '');
+        const laneEnd = Date.parse(l.ended_at ?? l.started_at ?? '');
+        // Fraction of the lane's own span that falls inside this window — used to
+        // prorate requests whose individual timestamp is missing.
+        const spanFrac = (() => {
+          if (!Number.isFinite(laneStart) || !Number.isFinite(laneEnd) || laneEnd <= laneStart) {
+            // A point-in-time (or undated) lane: fall back to ended_at membership.
+            return Number.isFinite(laneEnd) && laneEnd >= cutoff ? 1 : 0;
+          }
+          const lo = Math.max(laneStart, cutoff);
+          const hi = laneEnd;
+          return hi > lo ? (hi - lo) / (laneEnd - laneStart) : 0;
+        })();
+
+        for (const rq of reqs) {
+          if (rq.at_ms != null && Number.isFinite(rq.at_ms)) {
+            if (rq.at_ms >= cutoff) {
+              priced += rq.cost_priced_usd;
+              if (rq.cost_usd == null) unpriced = true;
+              lanesTouching.add(l.lane_id);
+            }
+          } else {
+            // No per-request timestamp: prorate across the lane span, flagged.
+            if (spanFrac > 0) {
+              prorated = true;
+              priced += rq.cost_priced_usd * spanFrac;
+              if (rq.cost_usd == null) unpriced = true;
+              lanesTouching.add(l.lane_id);
+            }
+          }
+        }
+      }
       return {
         label,
         hours,
         cost: unpriced ? null : Math.round(priced * 100) / 100,
         priced: Math.round(priced * 100) / 100,
-        lanes: inWin.length,
+        lanes: lanesTouching.size,
         unpriced,
+        prorated,
       };
     };
+
+    const windows = [mk('last 5h', 5), mk('last 24h', 24), mk('last 7d', 168)];
     return {
       available: true,
       asOf: now,
-      windows: [mk('last 5h', 5), mk('last 24h', 24), mk('last 7d', 168)],
+      windows,
+      anyProrated: windows.some((w) => w.prorated),
       ledgerFloor:
-        'OUR accounting (list-rate equivalent, a LOWER BOUND ~5%/session low) — NOT the provider quota above',
+        'OUR accounting (list-rate equivalent, a LOWER BOUND ~5%/session low) — NOT the provider quota above. Cost is binned per REQUEST timestamp (BUG-175), not by lane end.',
     };
   } catch (err) {
     return { available: false, note: `own-spend read failed: ${(err as Error).message}` };
@@ -169,6 +154,11 @@ async function ownSpend(project: string): Promise<
 
 interface DerivedProvider {
   provider: string;
+  /** FEAT-145: which Claude account this row is; null where there is no account axis. */
+  accountId: string | null;
+  accountLabel: string | null;
+  /** The burn-history key this account's rows live under (`histKey`). */
+  historyKey: string;
   available: boolean;
   asOf: number | null;
   plan: string | null;
@@ -178,13 +168,17 @@ interface DerivedProvider {
 }
 
 function deriveProvider(snap: ProviderUsage, history: HistRow[], now: number): DerivedProvider {
+  // The history key, NOT snap.provider: two accounts are two independent 5-hour
+  // windows and must never be matched against each other's prior reads.
+  const key = histKeyForSnapshot(snap);
   const windows = snap.available
-    ? snap.windows.map((w) =>
-        deriveWindow(w, { now, prior: priorFor(history, snap.provider, w.label, w.resetsAt) }),
-      )
+    ? snap.windows.map((w) => deriveWindow(w, { now, prior: priorFor(history, key, w.label, w.resetsAt) }))
     : [];
   return {
     provider: snap.provider,
+    accountId: snap.accountId ?? null,
+    accountLabel: snap.accountLabel ?? null,
+    historyKey: key,
     available: snap.available,
     asOf: snap.asOf,
     plan: snap.plan ?? null,
@@ -208,13 +202,20 @@ function formatText(providers: DerivedProvider[], spend: Awaited<ReturnType<type
   L.push('  Provider quota below is the PROVIDER\'S OWN measure; our spend at the end is a');
   L.push('  separate, list-rate estimate — never the same number.');
   L.push('');
+  // FEAT-145: one clearly-labelled block PER ACCOUNT, so this command answers
+  // "which plan can I dispatch on right now" rather than only "the first one".
+  // With exactly one Claude account the label is omitted, so a single-account
+  // user's readout is unchanged.
+  const claudeAccounts = providers.filter((p) => p.provider === 'anthropic');
+  const multiAccount = claudeAccounts.length > 1;
   for (const p of providers) {
+    const who = `${p.provider.toUpperCase()}${multiAccount && p.accountLabel ? ` · ${p.accountLabel}` : ''}`;
     if (!p.available) {
-      L.push(`  ${p.provider.toUpperCase()}: unavailable — ${p.note ?? 'unknown'} (last good read ${ago(p.asOf)})`);
+      L.push(`  ${who}: unavailable — ${p.note ?? 'unknown'} (last good read ${ago(p.asOf)})`);
       L.push('');
       continue;
     }
-    L.push(`  ${p.provider.toUpperCase()}${p.plan ? ` (${p.plan})` : ''}  · read ${ago(p.asOf)}`);
+    L.push(`  ${who}${p.plan ? ` (${p.plan})` : ''}  · read ${ago(p.asOf)}`);
     for (const w of p.windows) {
       const bind = w.binding ? ' [binding]' : '';
       const src = w.rateSource ? ` ${w.rateSource}` : '';
@@ -228,14 +229,36 @@ function formatText(providers: DerivedProvider[], spend: Awaited<ReturnType<type
     if (p.overall) L.push(`    → ${verdictAdvice(p.overall.verdict)} (driven by ${p.overall.window.label})`);
     L.push('');
   }
+  if (multiAccount) {
+    // Which Claude plan has the most 5h headroom RIGHT NOW — the whole point of
+    // holding two subscriptions (FEAT-145). Unknown accounts are named as
+    // unknown, never treated as 0% used.
+    const five = (p: DerivedProvider) => p.windows.find((w) => /^5h$/.test(String(w.label)));
+    const known = claudeAccounts.filter((p) => p.available && five(p) != null);
+    const unknownNames = claudeAccounts.filter((p) => !p.available || five(p) == null).map((p) => p.accountLabel ?? p.accountId ?? '?');
+    if (known.length) {
+      const best = known.reduce((a, b) => ((five(b)!.usedPercent ?? 100) < (five(a)!.usedPercent ?? 100) ? b : a));
+      L.push(`  CLAUDE ACCOUNTS — most 5h headroom: ${best.accountLabel ?? best.accountId} (${pct(five(best)!.usedPercent)} used, resets in ${hrs(five(best)!.hoursToReset)})`);
+      for (const p of known) {
+        L.push(`    ${String(p.accountLabel ?? p.accountId).padEnd(28)} ${pct(five(p)!.usedPercent).padStart(4)} of 5h · resets in ${hrs(five(p)!.hoursToReset)}`);
+      }
+    }
+    if (unknownNames.length) L.push(`    unknown (not readable right now): ${unknownNames.join(', ')}`);
+    L.push('');
+  }
   L.push('  ── OUR OWN SPEND (workspace) ──────────────────────────────────────────');
   if (!spend.available) {
     L.push(`  unavailable — ${spend.note}`);
   } else {
     L.push(`  ${spend.ledgerFloor}`);
     for (const w of spend.windows) {
-      const c = w.cost == null ? `~$${w.priced.toFixed(2)}+ (some lanes unpriced)` : `$${w.cost.toFixed(2)}`;
-      L.push(`    ${w.label.padEnd(10)} ${String(w.lanes).padStart(3)} lanes   ${c}`);
+      const c = w.cost == null ? `~$${w.priced.toFixed(2)}+ (some requests unpriced)` : `$${w.cost.toFixed(2)}`;
+      const pro = w.prorated ? ' (incl. prorated rows — some requests had no timestamp)' : '';
+      L.push(`    ${w.label.padEnd(10)} ${String(w.lanes).padStart(3)} lanes touch   ${c}${pro}`);
+    }
+    if (spend.anyProrated) {
+      L.push('    note: some requests lacked a per-request timestamp and were prorated across');
+      L.push('    their lane span rather than binned to the lane end (BUG-175).');
     }
   }
   L.push('');
@@ -257,22 +280,18 @@ async function main(): Promise<number> {
 
   // Bounded, non-blocking by construction: each reader carries the module's own
   // hard timeout and NEVER throws — a wedged provider degrades to unavailable.
-  const [anthropic, openai] = await Promise.all([readUsageNow('anthropic'), readUsageNow('openai')]);
-  const snaps = [anthropic, openai];
+  // FEAT-145: EVERY registered Claude account (default first) plus openai. One
+  // account's failure degrades only its own row; `Promise.all` is safe precisely
+  // because no reader rejects.
+  const targets = usageTargets();
+  const snaps: ProviderUsage[] = await Promise.all(targets.map((t) => readUsageForTarget(t)));
 
   const derived = snaps.map((s) => deriveProvider(s, history, now));
 
-  // Record this read so the NEXT call has an observed rate.
-  const freshRows: HistRow[] = [];
-  for (const s of snaps) {
-    if (!s.available) continue;
-    for (const w of s.windows) {
-      if (typeof w.usedPercent === 'number') {
-        freshRows.push({ provider: s.provider, label: w.label, usedPercent: w.usedPercent, resetsAt: w.resetsAt, at: now });
-      }
-    }
-  }
-  appendHistory(freshRows);
+  // Record this read so the NEXT call has an observed rate. Keyed per account
+  // (see scripts/lib/usage-history.mjs) — the default account keeps the bare
+  // `anthropic` key its existing rows already carry.
+  appendHistory(rowsFromSnapshots(snaps, now) as HistRow[]);
 
   const spend = await ownSpend(project);
 

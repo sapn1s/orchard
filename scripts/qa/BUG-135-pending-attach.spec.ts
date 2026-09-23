@@ -134,7 +134,7 @@ test('enabled-but-not-attached is visible as pending, and the drawer says why', 
 
   // 4. The drawer, where the user actually flips the switch, names it.
   await chip(page, 'playwright').click();
-  await expect(page.locator('#drawer')).toHaveClass(/open/);
+  await expect(page.locator('#smodal')).not.toHaveAttribute('hidden', ''); // FEAT-146: the drawer became a modal
   const note = page.locator('#vSettings [data-focus="integrations"] .grp-note');
   await expect(note).toContainText('Playwright');
   await expect(note).toContainText('NOT in the session you are looking at');

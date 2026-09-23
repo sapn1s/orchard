@@ -88,10 +88,18 @@ export declare function refreshOwnedLocks(input: {
   lockDir?: string | null;
   ownerPid?: number;
   host?: string;
-  /** false ⇒ the lane is provably gone (release its lock); anything else ⇒ live (refresh). */
-  isOwnerLive?: (owner: string) => boolean;
+  /**
+   * Three-way verdict, one rung per thing the caller can actually know:
+   *   false ⇒ the lane is PROVABLY gone      → release its lock now.
+   *   null  ⇒ NOT THIS SESSION'S TO JUDGE    → leave strictly alone: do not
+   *           refresh (so it ages honestly and the TTL backstop can free it),
+   *           do not release (never clobber). Required because every session on
+   *           a host shares one server pid, so `ownerPid` cannot separate them.
+   *   true / undefined ⇒ live                → refresh (never-clobber default).
+   */
+  isOwnerLive?: (owner: string) => boolean | null;
   now?: number;
-}): { refreshed: number; released: number; skipped: number };
+}): { refreshed: number; released: number; skipped: number; unjudged: number };
 
 /** The fail-loud "file busy" message shown to the agent. */
 export declare function busyRefusal(

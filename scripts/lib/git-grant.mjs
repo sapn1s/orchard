@@ -18,28 +18,45 @@
  * When no runner is available for a publishing write, we FAIL CLOSED — an
  * unverifiable commit is treated as a failed gate, never waved through.
  */
-import { decideGitWrite, gitWriteRefusal, gitWriteGateFailedRefusal } from './git-write-policy.mjs';
+import { decideGitWrite, gitWriteRefusal, gitWriteGateFailedRefusal, offenderForGit, gitWriteBlockEnabled } from './git-write-policy.mjs';
 import { peekGrant, consumeGrant, recordGitWrite } from './git-grant-store.mjs';
 
 /** Writes that put content into history / a remote — the leak exposure events. */
 export const PUBLISHING_SUBCOMMANDS = new Set(['commit', 'push']);
 
 /**
- * Decide one Bash command for a session in `projectKey`.
+ * Decide one git write for a session in `projectKey`. ONE grant authority for
+ * BOTH enforcement layers (BUG-173): pass either
+ *   - `command` — a Bash command STRING (the FEAT-108 PreToolUse hook), or
+ *   - `argv`    — the already-isolated git arguments WITHOUT the `git` head (the
+ *                 FEAT-135 PATH shim, via /api/git-shim/decide). The shim has no
+ *                 shell string; it hands the tokenized invocation straight in.
+ * Whichever shape, the SAME grant / leak-gate / single-use-consume tail runs, so
+ * the hook and the shim can never reach different decisions for the same grant
+ * state (the invariant BUG-173 exists to restore).
  * Returns { allow, offender?, reason?, granted?, gateFailed?, record? }.
  */
 export function evaluateGitWrite({
   command,
+  argv,
   projectKey = null,
   env = process.env,
   now = Date.now(),
   runLeakGate = null,
   sessionLabel = null,
 } = {}) {
-  const base = decideGitWrite(typeof command === 'string' ? command : '', env);
-  if (base.allow) return { allow: true }; // a read, or the env hatch is open
-
-  const offender = base.offender ?? 'git';
+  let offender;
+  if (Array.isArray(argv)) {
+    // Invocation-layer (shim) path: argv is already isolated git args. Mirror the
+    // command-string path's early allows exactly — env hatch open, or a read.
+    if (!gitWriteBlockEnabled(env)) return { allow: true }; // the launch-time env hatch
+    offender = offenderForGit(['git', ...argv]); // the ONE classifier (ARCH-008)
+    if (!offender) return { allow: true }; // a read / info form
+  } else {
+    const base = decideGitWrite(typeof command === 'string' ? command : '', env);
+    if (base.allow) return { allow: true }; // a read, or the env hatch is open
+    offender = base.offender ?? 'git';
+  }
   const sub = offender.startsWith('git ') ? offender.slice(4) : offender;
 
   const grant = projectKey ? peekGrant(projectKey, now) : null;

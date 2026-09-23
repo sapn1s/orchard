@@ -215,6 +215,58 @@ export function foldUsage(entries) {
 }
 
 /**
+ * BUG-175: per-REQUEST priced rows, each stamped with ITS OWN timestamp.
+ *
+ * `foldUsage` collapses a lane to one bucket per (model,tier), which is right for
+ * a lane total but throws away WHEN each request happened — so `npm run usage`
+ * bucketed a whole 36-day lane's $2088 into "last 7d" by the lane's `ended_at`,
+ * over-reporting 7-day spend ~4×. This keeps the same last-row-wins dedupe per
+ * `message.id` (so a streamed response is one request, not three) but prices each
+ * message at its own moment, so a caller can bin cost by the window containing the
+ * REQUEST rather than the lane. A row whose timestamp is unparseable carries
+ * `at_ms: null`; the caller prorates those across the lane span and says so.
+ */
+export function laneRequestCosts(entries) {
+  const byMsg = new Map();
+  let rowsSeen = 0;
+  for (const e of entries) {
+    if (e?.type !== 'assistant') continue;
+    const m = e.message;
+    const u = m?.usage;
+    if (!u || typeof u !== 'object') continue;
+    rowsSeen++;
+    const key = m.id || e.requestId || `anon-${rowsSeen}`;
+    byMsg.set(key, { e, m, u });
+  }
+  const out = [];
+  for (const { e, m, u } of byMsg.values()) {
+    const model = typeof m.model === 'string' ? m.model : 'unknown';
+    const tier = typeof u.service_tier === 'string' ? u.service_tier : 'standard';
+    const at = Date.parse(e.timestamp ?? '');
+    const bucket = {
+      model,
+      service_tier: tier,
+      input: num(u.input_tokens),
+      output: num(u.output_tokens),
+      cache_read: num(u.cache_read_input_tokens),
+      cache_write_5m: 0,
+      cache_write_1h: 0,
+      at_ms: Number.isFinite(at) ? at : null,
+    };
+    const cc = u.cache_creation;
+    if (cc && typeof cc === 'object') {
+      bucket.cache_write_5m = num(cc.ephemeral_5m_input_tokens);
+      bucket.cache_write_1h = num(cc.ephemeral_1h_input_tokens);
+    } else {
+      bucket.cache_write_5m = num(u.cache_creation_input_tokens);
+    }
+    const c = costOf(bucket);
+    out.push({ at_ms: bucket.at_ms, cost_usd: c, cost_priced_usd: c == null ? 0 : c });
+  }
+  return out;
+}
+
+/**
  * Price a set of folded buckets. `cost_usd` is null — not 0 — when ANY bucket
  * could not be priced, and `unpriced` names exactly which model/tier pairs
  * caused it, so the gap is actionable rather than mysterious.
@@ -357,6 +409,182 @@ export function phaseOfToolCall(name, input) {
   return 'other';
 }
 
+/* ------------------------------------------- BUG-175: async dispatch pairing */
+
+/**
+ * An `Agent`/`Task` dispatch returns ALMOST INSTANTLY — the tool_result is a bare
+ * "async agent launched" acknowledgement, so the tool's own span is ~0 (measured:
+ * 619 dispatches summed to 0.08 h on the reference session). The real wait is the
+ * INTER-TURN GAP between the dispatch and the `<task-notification>` that reports
+ * the lane back, and that gap exceeds the 5-minute idle cutoff for the median
+ * dispatch (10.6 min) — so `attributePhases` was booking 415 of 535 real waits as
+ * suspended-laptop idle, reporting `blocked_on_lane` at 3.8% where the truth is
+ * ~84%. These helpers recover the pairing the async return threw away.
+ */
+
+/** Match the id and status a `<task-notification>` block carries. */
+const NOTIF_TUID_RE = /<tool-use-id>(toolu_[A-Za-z0-9_-]+)<\/tool-use-id>/;
+const NOTIF_STATUS_RE = /<status>([a-z]+)<\/status>/;
+
+/**
+ * The text an entry carries that MIGHT hold a `<task-notification>`. A completion
+ * arrives as a `queue-operation` row whose `.content` is the notification blob;
+ * defensively we also scan a user/assistant message's own content, so a harness
+ * that delivers the notification as a message row is read the same way.
+ */
+function notificationText(e) {
+  if (typeof e?.content === 'string') return e.content;
+  const c = e?.message?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    let s = '';
+    for (const b of c) {
+      if (typeof b?.text === 'string') s += b.text + '\n';
+      else if (typeof b?.content === 'string') s += b.content + '\n';
+    }
+    return s;
+  }
+  return '';
+}
+
+/**
+ * Pair every async dispatch to the notification that resolves it.
+ *
+ * A dispatch is the FIRST `Agent`/`Task` tool_use seen for its id, timestamped at
+ * the assistant turn that issued it. Its resolution is the earliest
+ * `<task-notification>` carrying the same `<tool-use-id>` at a LATER timestamp —
+ * by default only a `completed` one, because a `paused`/interrupted notification
+ * is the lane coming up for air, not the dispatch settling (this is what lands the
+ * reference session at ~84% rather than over-counting). A dispatch still
+ * outstanding at end of transcript has no resolution and is reported as `unpaired`
+ * rather than paired to a fabricated end.
+ *
+ * Returns `{ dispatches, waits: [{id,start,end}], unpaired }`. `waits` are RAW and
+ * may overlap (parallel lanes); the caller merges them for occupancy.
+ */
+export function pairDispatches(entries, opts = {}) {
+  const requireCompleted = opts.requireCompleted !== false;
+  const dispatchAt = new Map();
+  for (const e of entries) {
+    if (e?.type !== 'assistant') continue;
+    const t = Date.parse(e?.timestamp ?? '');
+    if (!Number.isFinite(t)) continue;
+    for (const b of e.message?.content ?? []) {
+      if (b?.type === 'tool_use' && (b.name === 'Agent' || b.name === 'Task')) {
+        const id = String(b.id);
+        if (!dispatchAt.has(id)) dispatchAt.set(id, t);
+      }
+    }
+  }
+  const notifAt = new Map();
+  for (const e of entries) {
+    const t = Date.parse(e?.timestamp ?? '');
+    if (!Number.isFinite(t)) continue;
+    const text = notificationText(e);
+    if (!text || !text.includes('task-notification')) continue;
+    const m = NOTIF_TUID_RE.exec(text);
+    if (!m) continue;
+    if (requireCompleted) {
+      const st = NOTIF_STATUS_RE.exec(text);
+      if (!st || st[1] !== 'completed') continue;
+    }
+    const id = m[1];
+    if (!notifAt.has(id)) notifAt.set(id, []);
+    notifAt.get(id).push(t);
+  }
+  for (const list of notifAt.values()) list.sort((a, b) => a - b);
+  const waits = [];
+  let unpaired = 0;
+  for (const [id, t] of dispatchAt) {
+    const end = notifAt.get(id)?.find((x) => x > t);
+    if (end == null) {
+      unpaired++;
+      continue;
+    }
+    waits.push({ id, start: t, end });
+  }
+  return { dispatches: dispatchAt.size, waits, unpaired };
+}
+
+/** Merge (possibly overlapping) intervals into a disjoint, sorted union. */
+export function mergeIntervals(intervals) {
+  const sorted = intervals
+    .map((i) => [i.start, i.end])
+    .filter(([a, b]) => b > a)
+    .sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const [a, b] of sorted) {
+    const last = out[out.length - 1];
+    if (last && a <= last[1]) last[1] = Math.max(last[1], b);
+    else out.push([a, b]);
+  }
+  return out;
+}
+
+const sumIntervals = (merged) => merged.reduce((acc, [a, b]) => acc + (b - a), 0);
+
+/** Milliseconds of `[a,b)` that fall inside a merged (sorted, disjoint) union. */
+function overlapWithMerged(a, b, merged) {
+  let ov = 0;
+  for (const [x, y] of merged) {
+    if (y <= a) continue;
+    if (x >= b) break;
+    ov += Math.min(b, y) - Math.max(a, x);
+  }
+  return ov;
+}
+
+/**
+ * How much of a lane's wall clock had AT LEAST ONE dispatch outstanding — the
+ * number `blocked_on_lane` could never see. Occupancy is the UNION of outstanding
+ * intervals over the engaged wall (so two parallel lanes are one occupied hour,
+ * not two), and `parallelism` is summed-wait ÷ union (1.0 = strictly serial; the
+ * reference session runs ~1.5, i.e. the orchestrator is almost always waiting and
+ * almost always on one thing). `engaged_wall` is that union plus the sub-idle
+ * inter-turn gaps (hands-on turn time), so occupancy is measured against time the
+ * session was actually live, not the 827 h of wall that includes overnight parks.
+ */
+export function dispatchOccupancy(entries, opts = {}) {
+  const idleGapMs = opts.idleGapMs ?? 5 * 60 * 1000;
+  const { dispatches, waits, unpaired } = pairDispatches(entries, opts);
+  const durs = waits.map((w) => w.end - w.start).sort((a, b) => a - b);
+  const summed = durs.reduce((a, b) => a + b, 0);
+  const outstanding = mergeIntervals(waits);
+  const unionMs = sumIntervals(outstanding);
+
+  const rows = [];
+  for (const e of entries) {
+    if (e?.type !== 'user' && e?.type !== 'assistant') continue;
+    const t = Date.parse(e?.timestamp ?? '');
+    if (Number.isFinite(t)) rows.push(t);
+  }
+  rows.sort((a, b) => a - b);
+  const small = [];
+  for (let i = 0; i + 1 < rows.length; i++) {
+    const dt = rows[i + 1] - rows[i];
+    if (dt > 0 && dt <= idleGapMs) small.push({ start: rows[i], end: rows[i + 1] });
+  }
+  const engagedMs = sumIntervals(mergeIntervals([...waits, ...small]));
+  const q = (p) => (durs.length ? durs[Math.min(durs.length - 1, Math.floor(p * durs.length))] : 0);
+
+  return {
+    dispatches,
+    pairable: waits.length,
+    unpaired,
+    summed_wait_ms: summed,
+    outstanding_union_ms: unionMs,
+    engaged_wall_ms: engagedMs,
+    occupancy: engagedMs ? unionMs / engagedMs : 0,
+    parallelism: unionMs ? summed / unionMs : 0,
+    wait_ms: {
+      median: q(0.5),
+      p90: q(0.9),
+      max: durs.length ? durs[durs.length - 1] : 0,
+      mean: durs.length ? summed / durs.length : 0,
+    },
+  };
+}
+
 /**
  * Attribute a lane's WALL CLOCK across phases, from its own timeline.
  *
@@ -368,6 +596,13 @@ export function phaseOfToolCall(name, input) {
  * 40-minute gap between two reads is a suspended laptop or a parked lane, not
  * 40 minutes of reading. (The previous manual analysis had to hand-subtract
  * 8.4 h of machine suspend from two lanes; this does it by construction.)
+ *
+ * BUG-175 EXCEPTION TO THE IDLE RULE: an interval longer than `idleGapMs` is NOT
+ * idle for the portion during which a dispatch was OUTSTANDING (paired above) —
+ * an orchestrator waiting 20 minutes for a lane it dispatched is blocked on that
+ * lane, not a suspended laptop. That portion is charged to `blocked_on_lane` and
+ * only the remainder falls to `idle_gap_ms`, so async dispatch stops hiding as
+ * idle while a genuine overnight park (no dispatch outstanding) still does not.
  *
  * Returns phase totals in ms plus `idle_gap_ms`, `wall_ms` and `accounted_ms`,
  * so a reader can check the parts against the whole rather than trusting them.
@@ -418,6 +653,10 @@ export function attributePhases(entries, opts = {}) {
     return null;
   };
 
+  // BUG-175: the union of dispatch-outstanding intervals, so a long inter-turn
+  // gap spent waiting on a lane is charged to blocked_on_lane instead of idle.
+  const outstanding = mergeIntervals(pairDispatches(entries, opts).waits);
+
   const totals = Object.fromEntries(PHASES.map((p) => [p, 0]));
   let idle = 0;
   let accounted = 0;
@@ -425,7 +664,14 @@ export function attributePhases(entries, opts = {}) {
     const dt = rows[i + 1].t - rows[i].t;
     if (dt <= 0) continue;
     if (dt > idleGapMs) {
-      idle += dt;
+      // Exempt the outstanding portion from the idle rule (see header): time a
+      // dispatch was in flight is blocked_on_lane, the rest is genuine idle.
+      const blocked = outstanding.length ? overlapWithMerged(rows[i].t, rows[i + 1].t, outstanding) : 0;
+      if (blocked > 0) {
+        totals.blocked_on_lane += blocked;
+        accounted += blocked;
+      }
+      idle += dt - blocked;
       continue;
     }
     // Neither side issued or answered a tool call: this is a turn of plain
@@ -510,6 +756,10 @@ export const DISPATCH_DECL_KEYS = ['ticket', 'phase', 'round', 'class', 'request
 
 const DECL_LINE_RE = /^\s*dispatch\s*:\s*(.*)$/i;
 const TICKET_ID_ONE = /^(BUG|FEAT|ARCH|TASK)-\d{3,}$/;
+// BUG-175 — the internal marker `declValue` returns for `ticket=none`. Not a
+// ticket id and never surfaced as one; `parseDispatchDeclaration` folds it into
+// the `ticket_none` flag and leaves `tickets` null.
+const TICKET_NONE = '\x00none';
 // FEAT-126 — a user-request id the orchestrator DECLARES on the Dispatch line to
 // bind this lane (and, via the ticket id already there, this ticket) to a
 // request. Same shape of fact as `ticket=`: an id, validated, never guessed.
@@ -520,6 +770,10 @@ function emptyDecl() {
   return {
     present: false,
     tickets: null,
+    // BUG-175: `ticket=none` is a DECLARED absence (exploration/measurement), a
+    // third state distinct from `tickets` present and from never-declared. Kept
+    // as its own flag so the coverage line can report the three separately.
+    ticket_none: false,
     phase: null,
     round: null,
     class: null,
@@ -558,6 +812,11 @@ function declTokens(rest, out) {
 function declValue(key, raw, out) {
   if (key === 'ticket') {
     const ids = String(raw).split(',').map((s) => s.trim()).filter(Boolean);
+    // BUG-175: the explicit no-ticket sentinel. A ticketless dispatch honestly
+    // saying so is NOT malformed — it is a declared absence, returned as a
+    // distinct sentinel the parser folds into `ticket_none`. Only `none` alone
+    // qualifies; `none` mixed with real ids falls through to normal validation.
+    if (ids.length === 1 && ids[0].toLowerCase() === 'none') return TICKET_NONE;
     const good = ids.filter((id) => TICKET_ID_ONE.test(id));
     for (const bad of ids.filter((id) => !TICKET_ID_ONE.test(id))) {
       out.rejected.push(`ticket=${bad} (not a ticket id)`);
@@ -650,6 +909,14 @@ export function parseDispatchDeclaration(text) {
     } else if (distinct.length === 1) {
       out[field] = JSON.parse(distinct[0]);
     }
+  }
+  // BUG-175: fold the no-ticket sentinel into its own flag so `tickets` stays a
+  // list-or-null and a declared absence is never mistaken for a ticket named
+  // "\x00none". A conflict (some decl said none, another named a ticket) already
+  // dropped `tickets` to null above; treat that as not-declared-none.
+  if (out.tickets === TICKET_NONE) {
+    out.ticket_none = true;
+    out.tickets = null;
   }
   return out;
 }
@@ -779,12 +1046,16 @@ export function resolveLaneAttribution(lane, inferredRound) {
   // groups on the declared ticket when there is one, so reading it back would
   // report the declaration as if it were an independent inference.
   const inferredTicket = lane.tickets?.[0]?.id ?? null;
-  const primary = declaredTicket ?? inferredTicket;
+  // BUG-175: a declared `ticket=none` is neither an inferred ticket nor a gap —
+  // do not let prose inference override an explicit no-ticket declaration.
+  const declaredNone = d.ticket_none === true;
+  const primary = declaredTicket ?? (declaredNone ? null : inferredTicket);
   const round = d.round ?? inferredRound?.round ?? null;
   const cls = d.class ?? lane.dispatch_class ?? null;
   return {
     primary_ticket: primary,
-    ticket_source: declaredTicket ? 'declared' : inferredTicket ? 'inferred' : null,
+    ticket_declared_none: declaredNone,
+    ticket_source: declaredTicket ? 'declared' : declaredNone ? 'declared-none' : inferredTicket ? 'inferred' : null,
     declared_tickets: d.tickets ?? null,
     round,
     round_source: d.round != null ? 'declared' : inferredRound?.round != null ? 'inferred' : null,

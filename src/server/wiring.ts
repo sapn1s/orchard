@@ -295,7 +295,10 @@ export function wiringStatus(project: Project): WiringStatus {
     apply: null,
   });
 
-  /* Integrations — the attachable MCP tools (informational; managed above). */
+  /* Integrations — the attachable MCP tools (informational; managed elsewhere in
+     settings). FEAT-146 moved the Integrations card out of this pane into
+     "Permissions & tools", so "above" stopped being true — the pointer names the
+     category now, which is also the only form that survives the next re-home. */
   const tools = toolSettingsOf(project);
   const onTools = [tools.serena ? 'Serena' : null, tools.playwright ? 'Playwright' : null, tools.openaiDispatch ? 'OpenAI dispatch' : null].filter(Boolean);
   checks.push({
@@ -303,8 +306,8 @@ export function wiringStatus(project: Project): WiringStatus {
     label: 'Integrations',
     state: 'info',
     detail: onTools.length
-      ? `Attached MCP tools: ${onTools.join(', ')}. Manage these in the Integrations group above.`
-      : 'No attachable MCP tools enabled. Manage these in the Integrations group above.',
+      ? `Attached MCP tools: ${onTools.join(', ')}. Manage these under Permissions & tools.`
+      : 'No attachable MCP tools enabled. Manage these under Permissions & tools.',
     apply: null,
   });
 

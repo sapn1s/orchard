@@ -96,6 +96,17 @@ function blockReason(res) {
 
 const GOOD = '```orchard-digest\n{"items":[{"text":"Shipped the gate","kind":"done","importance":"high"}]}\n```\nPlain prose below, no emoji.';
 
+/* FEAT-143 — a MISSING digest is a defect only for a SUBSTANTIVE reply; a short
+ * reply or a single-artifact reply legitimately omits it. Fixtures that assert
+ * "no digest -> BLOCK" must therefore be substantive (>= 40 words of ordinary
+ * prose) — the old one-line fixtures now legitimately ALLOW. Kept easy to read so
+ * no readability reason muddies the missing-digest assertion. */
+const SUBSTANTIVE = 'I reviewed the whole change and it holds together end to end. '
+  + 'The parser handles every fence case, the renderer draws each block correctly, '
+  + 'and the metrics record one line for every graded turn. I ran the suite twice '
+  + 'and both passes were completely clean. Nothing here needs a decision from you '
+  + 'right now, so I will pick up the next item.';
+
 console.log('=== FEAT-085 Stop-hook gate ===');
 
 /* 1. Compliant reply -> ALLOW, and NO corrective emitted (must-FAIL guard). */
@@ -108,11 +119,36 @@ console.log('=== FEAT-085 Stop-hook gate ===');
 
 /* 2. Non-compliant variants -> BLOCK with a specific reason. */
 {
-  const tp = transcript('nodigest', 'Just some prose, no digest block at all.');
+  const tp = transcript('nodigest', SUBSTANTIVE);
   const res = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj' });
   const reason = blockReason(res);
-  check('no digest -> BLOCK', reason !== null, res);
+  check('substantive reply, no digest -> BLOCK', reason !== null, res);
   check('no digest -> reason names missing block', !!reason && /Missing the leading/.test(reason), reason);
+}
+
+/* 2b. FEAT-143 — the digest is a scan surface, not a mandatory preamble. A SHORT
+ *     reply and a SINGLE-ARTIFACT reply legitimately omit it -> ALLOW. Guard:
+ *     the single-artifact exemption must NOT rescue a substantive multi-part
+ *     reply. */
+{
+  const tp = transcript('short-nodigest', 'Yes — done, pushed.');
+  const res = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj' });
+  check('short reply, no digest -> ALLOW (digest suppressible)', isAllow(res), res);
+}
+{
+  const artifact = '````orchard-answer\nHi Anna, we would like to view the flat this Saturday at 14:00 — does that work for you?\n````';
+  const tp = transcript('answer-only', artifact);
+  const res = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj' });
+  check('single orchard-answer artifact, no digest -> ALLOW', isAllow(res), res);
+}
+{
+  // Anti-over-permissiveness: an answer block PLUS substantive loose prose is not a
+  // single artifact -> a substantive reply still owes its digest -> BLOCK.
+  const tp = transcript('answer-plus-prose',
+    '````orchard-answer\nThe recommended flat is the one on Tallinas iela.\n````\n\n' + SUBSTANTIVE);
+  const res = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj' });
+  check('answer block + substantive loose prose, no digest -> BLOCK (not a single artifact)',
+    blockReason(res) !== null, res);
 }
 {
   const tp = transcript('malformed', '```orchard-digest\n{items: [broken}\n```\nprose');
@@ -146,7 +182,7 @@ console.log('=== FEAT-085 Stop-hook gate ===');
 }
 {
   // Both failures at once: no digest AND emoji -> reason names BOTH.
-  const tp = transcript('both', 'no digest here and an emoji 👍 too');
+  const tp = transcript('both', SUBSTANTIVE + ' Nice work 👍');
   const res = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj' });
   const reason = blockReason(res);
   check('missing digest + emoji -> reason names both', !!reason && /Missing the leading/.test(reason) && /emoji/i.test(reason), reason);
@@ -220,7 +256,7 @@ console.log('=== FEAT-085 Stop-hook gate ===');
     version: 1,
     projects: [{ id: 'opt', hostPath: projDir, settings: { responseDigest: { enabled: false } } }],
   }));
-  const tp = transcript('optout', 'no digest here at all, would block');
+  const tp = transcript('optout', SUBSTANTIVE);
   const res = run(
     { hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: projDir },
     { CLAUDE_STATION_DATA: dataDir },
@@ -281,7 +317,10 @@ console.log('=== FEAT-085 Stop-hook gate ===');
 
   // Guard against over-permissiveness: a split message that is ALL prose (no
   // digest on ANY line) must still BLOCK.
-  const tpNc = splitTranscript('split-nc', 'msg_NC', ['First prose line, no digest.', '\nSecond prose line, still none.']);
+  const tpNc = splitTranscript('split-nc', 'msg_NC', [
+    'I reviewed the whole change and it holds together end to end. The parser handles every fence case.',
+    '\nThe renderer draws each block correctly and the metrics record one line per graded turn. I ran the suite twice and both passes were clean. Nothing here needs a decision from you right now.',
+  ]);
   const resNc = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tpNc, cwd: '/nonexistent/proj' });
   check('split message, all prose (no digest on any line) -> still BLOCK', blockReason(resNc) !== null, resNc);
 
@@ -290,7 +329,7 @@ console.log('=== FEAT-085 Stop-hook gate ===');
   const fileTwoTurns = path.join(TMP, 'two-turns.jsonl');
   fs.writeFileSync(fileTwoTurns, [
     JSON.stringify({ type: 'assistant', message: { id: 'msg_A', role: 'assistant', content: [{ type: 'text', text: GOOD }] } }),
-    JSON.stringify({ type: 'assistant', message: { id: 'msg_B', role: 'assistant', content: [{ type: 'text', text: 'later turn, no digest at all' }] } }),
+    JSON.stringify({ type: 'assistant', message: { id: 'msg_B', role: 'assistant', content: [{ type: 'text', text: SUBSTANTIVE }] } }),
   ].join('\n') + '\n');
   const resTwo = run({ hook_event_name: 'Stop', stop_hook_active: false, transcript_path: fileTwoTurns, cwd: '/nonexistent/proj' });
   check('prior compliant turn (different id) does NOT rescue later non-compliant -> BLOCK', blockReason(resTwo) !== null, resTwo);
@@ -312,7 +351,7 @@ console.log('=== FEAT-085 Stop-hook gate ===');
   const logFile = path.join(logDir, 'logs', 'stop-hook-advisory.log');
 
   // must-FAIL core: the blatantly non-compliant reply that BLOCKs under enforce.
-  const tpBad = transcript('adv-bad', 'Just some prose, no digest block at all.');
+  const tpBad = transcript('adv-bad', SUBSTANTIVE);
   const payBad = { hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tpBad, cwd: '/nonexistent/proj' };
 
   const resEnf = run(payBad); // default runner env = ENFORCE=1

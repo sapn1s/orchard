@@ -340,6 +340,17 @@ export interface ProjectSettings {
   provider?: Provider;
   model: string | null;
   effort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null;
+  /**
+   * FEAT-145 step 4 — the Claude account this project's sessions use. `null` =
+   * inherit the machine default (`GlobalDefaults.claudeAccount`), resolved LIVE
+   * at session start by `pickOverridable` → `applyGlobalDefaults`. A non-null
+   * value is an account id minted by `claude-accounts.ts` and pins the project
+   * to that account regardless of the machine default. Optional in stored JSON
+   * (older registries have no key → treated as `null`/inherit). Seeded onto new
+   * rows via the `'projectSettings'` SEED_CHANNEL, and (step 5) the base for the
+   * per-session override on `direct` projects.
+   */
+  claudeAccount: string | null;
   maxBudgetUsd: number | null;
   permissionMode: PermissionMode;
   allowedTools: string[];
@@ -511,6 +522,10 @@ export function defaultSettings(): ProjectSettings {
     provider: 'anthropic',
     model: null,
     effort: null,
+    // FEAT-145 step 4 — null = inherit the machine default account (~/.claude
+    // unless a machine default is set). Seeded from the machine default on
+    // creation via PROJECT_SETTINGS_SEED_KEYS, like model/effort.
+    claudeAccount: null,
     maxBudgetUsd: null,
     // Least privilege by default: 'default' routes risky tools through canUseTool
     // so the UI can approve them. Widen per project deliberately.

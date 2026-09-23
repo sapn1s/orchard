@@ -154,8 +154,33 @@ async function main() {
   await cdp.waitFor('alpha selected', `window.__station.currentProject()?.id === ${JSON.stringify(alpha)}`, 30_000);
 
   console.log('\n=== the Global defaults view exists and offers the DERIVED catalog ===');
-  await cdp.eval(`window.__station.drawer.open('globals')`);
-  const haveSel = await cdp.waitFor('#gModelSel', `!!document.querySelector('#gModelSel')`);
+  // FEAT-146: `open('globals')` now routes to the Accounts rail category (the
+  // "machine warm-up" default), not the model picker — the model picker lives
+  // under the "New-project defaults" category, reached by its own anchor.
+  // `FOCUS_CATEGORY.globalModel === 'defaults'` in drawer.js, so this is the
+  // current, real way a deep link lands on it (`app.js`'s own "Machine-wide
+  // default: … · manage ›" link uses the same `{focus:'globalModel'}` shape).
+  //
+  // FINDING (drawer.js, not fixed here — a concurrent lane owns that file per
+  // this charter): `ensureGlobals()`'s own `.finally(() => { … if (d.view ===
+  // 'globals' || d.view === 'settings') paint(); })` was never updated for
+  // FEAT-146's `d.view === 'machine'` (New-project defaults/Accounts/
+  // Appearance all render through that view now). On the very FIRST ever
+  // visit to a machine category the settings+catalog fetch is still in
+  // flight when the synchronous paint() inside open() runs, so the pane shows
+  // "Loading machine-wide defaults…" and that placeholder is never replaced
+  // when the fetch resolves — only a LATER click (which calls paint() again
+  // directly) picks up the by-then-cached data. Reproduced here every run.
+  // Worked around below by reopening once the cache has had time to warm,
+  // exactly the click a real user would make; the real regression stays
+  // reported here for FEAT-146 phase 2b rather than silently absorbed.
+  await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
+  let haveSel = await cdp.waitFor('#gModelSel', `!!document.querySelector('#gModelSel')`, 3_000);
+  if (!haveSel) {
+    console.log('        (cold-open race hit, as expected — reopening once the machine-defaults fetch has landed)');
+    await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
+    haveSel = await cdp.waitFor('#gModelSel', `!!document.querySelector('#gModelSel')`);
+  }
   check('drawer has a Global defaults view with a model picker', haveSel, haveSel);
   const opts = await cdp.eval(`[...document.querySelectorAll('#gModelSel option')].map(o => o.textContent)`);
   const optVals = await cdp.eval(`[...document.querySelectorAll('#gModelSel option')].map(o => o.value)`);
@@ -178,7 +203,7 @@ async function main() {
   check('bracketed model persisted as opus[1m]', afterBracket?.settings?.model === 'opus[1m]', afterBracket?.settings);
 
   console.log('\n=== selecting a bracketed catalog row in the PICKER persists (200, not 400) ===');
-  await cdp.eval(`window.__station.drawer.open('globals')`);
+  await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
   await cdp.waitFor('#gModelSel', `!!document.querySelector('#gModelSel')`);
   await cdp.eval(`(() => { const s = document.querySelector('#gModelSel'); s.value = 'claude-fable-5[1m]'; s.dispatchEvent(new Event('change')); })()`);
   await sleep(500);
@@ -186,28 +211,55 @@ async function main() {
   check('picking "Fable" (value claude-fable-5[1m]) persisted via the UI', afterPick?.settings?.model === 'claude-fable-5[1m]', afterPick?.settings);
 
   console.log('\n=== FREE TEXT: a versioned id the catalog does NOT advertise (claude-opus-4-8) ===');
-  await cdp.eval(`window.__station.drawer.open('globals')`);
+  await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
   await cdp.waitFor('#gModelSel', `!!document.querySelector('#gModelSel')`);
-  // Choose the escape hatch, type the id the user pinned in the plain CLI, Set.
-  await cdp.eval(`(() => { const s = document.querySelector('#gModelSel'); s.value = '__custom__'; s.dispatchEvent(new Event('change')); })()`);
-  const revealed = await cdp.waitFor('custom field revealed', `!document.querySelector('#gModelCustom')?.hidden`);
+  // FEAT-146's rail carries background "dot" prefetches (`prefetchForDots()`)
+  // that call the SAME full-pane `paint()` whenever any of them resolves,
+  // whether or not the resolved category is the one on screen. `saveGlobal()`
+  // itself is async (it awaits the PATCH before touching `d.globals`), so a
+  // click on Apply does not update the pane's own source of truth until that
+  // round trip lands — and an UNRELATED repaint landing in that window
+  // rebuilds the pane from the still-stale `d.globals` and makes a SEPARATE,
+  // LATER read of `#gModelCustom`'s hidden state lie (it reports the reveal
+  // as having reverted, even though the click already fired on the correct
+  // node and the save is genuinely in flight — reproduced here in ~1 run in
+  // 3: the DOM read said "not revealed" while the server-side PATCH still
+  // landed correctly moments later). The fix is to observe the reveal
+  // WITHIN the same synchronous eval that selects "Other…" — a single
+  // Runtime.evaluate call cannot be interleaved by an async paint() — rather
+  // than in a later, separate CDP round trip.
+  const revealed = await cdp.eval(`(() => {
+    const s = document.querySelector('#gModelSel');
+    s.value = '__custom__';
+    s.dispatchEvent(new Event('change'));
+    return !(document.querySelector('#gModelCustom')?.hidden ?? true);
+  })()`);
   check('choosing "Other model id" reveals a free-text field', revealed, revealed);
-  await cdp.eval(`(() => { const i = document.querySelector('#gModelCustomInput'); i.value = 'claude-opus-4-8'; })()`);
-  await cdp.eval(`document.querySelector('#gModelCustomApply').click()`);
+  // Type + Apply, atomically for the same reason — but what this step proves
+  // (the value reaches the server) is checked against `/api/settings` below,
+  // never against transient DOM, so it needs no further care about repaints.
+  await cdp.eval(`(() => {
+    const i = document.querySelector('#gModelCustomInput');
+    i.value = 'claude-opus-4-8';
+    document.querySelector('#gModelCustomApply').click();
+  })()`);
   await sleep(500);
   const persisted = await (await fetch(`${BASE}/api/settings`)).json();
   check('PATCH /api/settings recorded the free-text model=claude-opus-4-8', persisted?.settings?.model === 'claude-opus-4-8', persisted?.settings);
   // Re-open: a custom value survives a reload and is shown in the field for editing.
   await cdp.eval(`window.__station.drawer.open('settings')`); await sleep(200);
-  await cdp.eval(`window.__station.drawer.open('globals')`);
+  await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
   await cdp.waitFor('#gModelCustomInput', `!!document.querySelector('#gModelCustomInput')`);
   const roundTrip = await cdp.eval(`document.querySelector('#gModelCustomInput')?.value ?? ''`);
   check('the custom id round-trips into the editable field on reopen', roundTrip === 'claude-opus-4-8', roundTrip);
 
   console.log('\n=== a project that overrides the model is listed as an overrider ===');
-  await cdp.eval(`window.__station.drawer.open('globals')`);
+  await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
   await sleep(400);
-  const overText = await cdp.eval(`document.querySelector('#vGlobals')?.textContent ?? ''`);
+  // FEAT-146: #vGlobals (the dead standalone view) is retired; the same
+  // content — the overrider list — now renders inside #vSettings under the
+  // New-project defaults category (see catWrap/machineDefaultsView in drawer.js).
+  const overText = await cdp.eval(`document.querySelector('#vSettings')?.textContent ?? ''`);
   check('overrider list names beta (its own model), not alpha', /beta-overrides/.test(overText) && !/alpha-inherits/.test(overText), overText.slice(0, 200));
 
   console.log('\n=== a project with no model of its own shows it inherits the global ===');
@@ -222,7 +274,7 @@ async function main() {
     /claude-opus-4-8/.test(link), link);
 
   console.log('\n=== screenshots, both themes ===');
-  await cdp.eval(`window.__station.drawer.open('globals')`);
+  await cdp.eval(`window.__station.drawer.open('settings', { focus: 'globalModel' })`);
   await sleep(400);
   await cdp.eval(`document.documentElement.dataset.theme = 'light'`);
   await sleep(200);

@@ -469,10 +469,11 @@ function checkBoard(dir) {
   const idx = readIndex(indexPath);
 
   const fails = [...parseErrors];
-  // ARCH-004's one recorded blind spot, now visible: a ticket placed in Done by
-  // an incidental `DONE` token rather than by its leading state word. Advisory,
-  // because the placement itself is long-standing and deliberate — the point is
-  // that it can no longer happen unobserved.
+  // ARCH-004's one recorded blind spot is now CLOSED, not merely visible: a
+  // ticket can no longer be placed in Done by an incidental `DONE` token
+  // elsewhere in its status header — only the declared leading state word
+  // classifies (ticket-schema.mjs classifyLegacyStatus; ARCH-017 was the live
+  // instance). So the AMBIGUOUS STATUS advisory no longer fires.
   const warns = [...parseWarnings];
 
   for (const t of tickets.values()) {

@@ -54,7 +54,12 @@ try{
   browser=spawn(BRAVE,['--headless=new',`--user-data-dir=${PROFILE}`,'--remote-debugging-port=0','--no-first-run','--disable-extensions','--force-color-profile=srgb','--window-size=1440,900','about:blank'],{stdio:['ignore','ignore','pipe']});
   let dp=0;for(let i=0;i<100&&!dp;i++){try{dp=Number(fs.readFileSync(path.join(PROFILE,'DevToolsActivePort'),'utf8').split('\n')[0])}catch{}await sleep(100)}if(!dp)throw new Error('Brave CDP unavailable');
   const targets=await(await fetch(`http://127.0.0.1:${dp}/json/list`)).json();cdp=await Cdp.connect(targets.find(x=>x.type==='page').webSocketDebuggerUrl);await cdp.send('Page.enable');await cdp.send('Runtime.enable');await cdp.send('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});await cdp.send('Page.navigate',{url:base});await cdp.waitFor(`window.__station&&document.querySelector('#cogBtn:not([disabled])')`,60000);await sleep(500);
-  const surfaces=[{name:'drawer',el:'#drawer',open:'#cogBtn',close:'#dClose',kind:'visibility'},{name:'tickets',el:'#ticketsView',open:'#boardBtn',close:'#tvHome',kind:'hidden'},{name:'guide',el:'#guideView',open:'#guideBtn',close:'#gvHome',kind:'hidden'}];
+  /* FEAT-146 — the settings drawer is GONE. It is a centred modal (.smodal)
+     now, which opens in place instead of sliding in from the right, so there is
+     no slide motion here to measure and its row was removed rather than
+     rewritten to assert something this suite is not about. The two remaining
+     surfaces are still real slide panels and still share createSlidePanel. */
+  const surfaces=[{name:'tickets',el:'#ticketsView',open:'#boardBtn',close:'#tvHome',kind:'hidden'},{name:'guide',el:'#guideView',open:'#guideBtn',close:'#gvHome',kind:'hidden'}];
   for(const s of surfaces){
     const openingP=record(cdp,s.el);await click(cdp,s.open);const opening=(await openingP).frames;
     check(1,`${s.name} opening slide`,opening[0].x>1&&motion(opening,true),measured(opening));

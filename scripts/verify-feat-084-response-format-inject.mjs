@@ -183,10 +183,16 @@ async function main() {
   // per-turn REPLAY of lane-result prose, a far larger pool than this one-time
   // per-session core, so paying ~440 bytes here to stop that replay is the trade the
   // ticket decided from data. Raised to 5900, still under the 6000 maxChars cap so the
-  // core is delivered whole. Growing past this is a decision, not an accident.
+  // core is delivered whole. FEAT-149 folded the "re-state the handoff after any cleanup
+  // pass" clause into the lane-final-message rule (+~197 bytes, observed 6096): the
+  // orchestrator cannot Read a lane's scratch file, so the handoff IS the only channel,
+  // and a cleanup pass that overwrites it cost two extra resumes (measured) — paying
+  // ~200 bytes here to stop that is the trade. Raised to 6200, and the maxChars cap to
+  // 6400 (templates.ts) so the core is still delivered whole. Growing past this is a
+  // decision, not an accident.
   check('responseFormatSection() (default path) reads it, stays condensed (marked core only)',
-    typeof realSec === 'string' && realSec.length > 300 && realSec.length <= 5900
-      && realSec.length < 6000
+    typeof realSec === 'string' && realSec.length > 300 && realSec.length <= 6200
+      && realSec.length < 6400
       && realSec.includes('orchard-digest') && !realSec.includes('How it degrades (the UI contract)'),
     `len=${realSec?.length}`);
   const wiredReal = composeInstructions(refs, { routing: true, responseFormat: true });

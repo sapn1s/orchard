@@ -62,6 +62,7 @@ import {
 } from './container-manager.ts';
 import { ensureServices, connectSessionToServices, ServiceError } from './service-manager.ts';
 import { applyGlobalDefaults } from './global-settings.ts';
+import { resolveLaunchAccountDir } from './claude-accounts.ts';
 import { spawnSurvivable, survivalEnabled, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
 /*
  * ARCH-001: the bridge no longer decides its own liveness. It supplies the
@@ -79,7 +80,7 @@ import { livenessOfBridge, REAP_SWEEP_MS, type EndProviderError, type Liveness }
 import { snapshotOfSession, type RunningSnapshot } from './running-set.ts';
 import * as outcomes from './outcomes.ts';
 import * as requests from './requests.ts';
-import { TranscriptRecorder, resolveOrchardSessionFile } from './orchard-transcripts.ts';
+import { TranscriptRecorder, resolveOrchardSessionFile, mirrorClaudeStore } from './orchard-transcripts.ts';
 import { encodeCwd } from '../lib/session-history.ts';
 import { recordSessionProvenance } from '../lib/session-provenance.mjs';
 import { parseDispatchDeclaration } from '../../scripts/lib/cost-model.mjs';
@@ -190,7 +191,12 @@ export interface StartOptions {
   browserUnavailableReason?: string;
 }
 
-type Overridable = Pick<ProjectSettings, SessionOverridable>;
+// FEAT-145 — `claudeAccount` flows machine → project → session-effective like
+// model/effort, so it rides the resolved config here. Step 5 added it to
+// `SessionOverridable`/`SESSION_OVERRIDE_FIELDS` as well (accepted for `direct`
+// projects; refused for container ones in validate.ts), so the explicit union
+// below is now redundant — kept only because it states the intent plainly.
+type Overridable = Pick<ProjectSettings, SessionOverridable | 'claudeAccount'>;
 
 export function dispatchAvailabilityNote(enabled: boolean, route: string, unavailableReason?: string): string {
   if (!enabled) return '\n\n## OpenAI dispatch availability\nOpenAI dispatch is NOT enabled for this project. Enable Settings › Tools › OpenAI dispatch (`settings.tools.openaiDispatch`) and launch a new session.';
@@ -292,13 +298,16 @@ function pickOverridable(s: ProjectSettings): Overridable {
    * override (layered on above at start) overrides that. Provider is not global
    * (every project persists its own), so it is resolved from the project alone.
    */
-  const merged = applyGlobalDefaults({ model: s.model, effort: s.effort });
+  const merged = applyGlobalDefaults({ model: s.model, effort: s.effort, claudeAccount: s.claudeAccount });
   return {
     // FEAT-037 P3: resolved, never absent — registries written before the
     // field existed must read as the default engine.
     provider: s.provider ?? 'anthropic',
     model: merged.model,
     effort: merged.effort,
+    // FEAT-145 step 4 — the account after machine → project merge (null = the
+    // implicit default; step 5 will layer a session override on top).
+    claudeAccount: merged.claudeAccount,
     permissionMode: s.permissionMode,
     maxBudgetUsd: s.maxBudgetUsd,
     allowedTools: s.allowedTools,
@@ -773,6 +782,38 @@ export class AgentSession {
    * sibling LEAF that must never suppress an orphan's honest death).
    */
   #bgBornTasks = new Map<string, 'agent' | 'tool'>();
+  /**
+   * BUG-178 — the POSITIVE-FOREGROUND analogue of the two background sources
+   * above, and it exists ONLY to answer `isBackgroundLane()` honestly for the
+   * dock chip. The background sets say "this lane does NOT block the main-turn
+   * boundary"; absence from them is NOT the same as "this lane DOES block it" —
+   * an as-yet-unclassified lane (the birth window before the first level frame,
+   * where an SDK-default `Agent` sits in neither set) is also absent. To render
+   * the honest "waiting on a foreground step" copy we need a lane we can
+   * AFFIRMATIVELY call foreground, so we tag it here.
+   *
+   * A subagent dispatched `run_in_background:false` (the SDK default for `Agent`
+   * is background, so foreground is always EXPLICIT — sdk-tools.d.ts:502) is
+   * foreground BY CONSTRUCTION: its `task_started` echoes the dispatching
+   * tool_use id, exactly as the background born-tag works. `#fgDispatchToolUseIds`
+   * records the dispatch; the matching `task_started` promotes it into
+   * `#fgBornTasks` (the lane's own agent id). These feed NOTHING in the liveness
+   * gate or the turn-end sweep — a foreground lane is already the main turn's
+   * work there — so this is a read-only classification surface for the chip and
+   * cannot regress BUG-068/096/105. `#fgBornTasks` is deleted per-task at its
+   * terminal frame.
+   *
+   * BUG-178 (round 4) — `#fgDispatchToolUseIds` is scoped to the DISPATCH id's
+   * OWN lifetime: consumed by the matching `task_started`, and swept at the
+   * turn-end `result` if it never became a lane (FEAT-126 lifetime). It is NOT
+   * cleared on a `background_tasks_changed` level frame — doing so erased a
+   * still-pending foreground dispatch whenever a concurrent BACKGROUND lane's
+   * level frame arrived between this dispatch's tool-call frame and its own
+   * `task_started`, mis-degrading a genuinely blocking foreground lane to the
+   * friendly "delivers at the next pause" copy (the original BUG-178 incident).
+   */
+  #fgDispatchToolUseIds = new Set<string>();
+  #fgBornTasks = new Set<string>();
   /**
    * BUG-105 (1st independent clean-room verdict) — TASKS THE ENGINE ITSELF SAID
    * ARE OVER: the task ids for which a TERMINAL FRAME was observed
@@ -1460,17 +1501,36 @@ export class AgentSession {
     // is false and the adapter throws rather than faking a normal turn) must
     // reach the UI as a fatal error, not vanish into startSession's rethrow.
     try {
+      /*
+       * FEAT-145 step 4 — CLAUDE ACCOUNT → CLAUDE_CONFIG_DIR.
+       *
+       * The account is a Claude concept, so it is resolved ONLY for the anthropic
+       * provider (a Codex session must never be blocked on, or repointed by, a
+       * Claude account). `resolveLaunchAccountDir` returns null for the implicit
+       * default account — and when it is null we DO NOT set the var at all, so a
+       * default-account session's env is byte-identical to before this feature.
+       * For a named account it returns the overlay dir, and it throws LOUDLY
+       * (never silently falls back to ~/.claude) if the account is missing, not
+       * logged in, or unmaterialised — spending the wrong plan's quota without
+       * telling anyone is the exact failure this prevents. The throw lands in the
+       * catch below (busy reset, fatal error to the UI, session does not start).
+       */
+      const accountDir = provider === 'anthropic'
+        ? resolveLaunchAccountDir((s as Overridable).claudeAccount)
+        : null;
+      const accountEnv: Record<string, string> = accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {};
+      const dispatchEnv: Record<string, string> = dispatchOn && !opts.dispatchUnavailableReason ? {
+        ORCHARD_DISPATCH_ENTITLED: '1',
+        ORCHARD_DISPATCH_SOCK: opts.project.isolation === 'container' ? dispatchBroker.CONTAINER_DISPATCH_SOCKET : dispatchBroker.dispatchSocketPath(opts.project),
+        ORCHARD_DISPATCH_CMD: dispatchRoute,
+      } : dispatchOn ? {
+        ORCHARD_DISPATCH_ENTITLED: '1',
+        ORCHARD_DISPATCH_CMD: dispatchRoute,
+        ORCHARD_DISPATCH_UNAVAILABLE_REASON: opts.dispatchUnavailableReason!,
+      } : { ORCHARD_DISPATCH_ENTITLED: '0' };
       this.#runtime.start({
         cwd: opts.project.hostPath,
-        env: dispatchOn && !opts.dispatchUnavailableReason ? {
-          ORCHARD_DISPATCH_ENTITLED: '1',
-          ORCHARD_DISPATCH_SOCK: opts.project.isolation === 'container' ? dispatchBroker.CONTAINER_DISPATCH_SOCKET : dispatchBroker.dispatchSocketPath(opts.project),
-          ORCHARD_DISPATCH_CMD: dispatchRoute,
-        } : dispatchOn ? {
-          ORCHARD_DISPATCH_ENTITLED: '1',
-          ORCHARD_DISPATCH_CMD: dispatchRoute,
-          ORCHARD_DISPATCH_UNAVAILABLE_REASON: opts.dispatchUnavailableReason!,
-        } : { ORCHARD_DISPATCH_ENTITLED: '0' },
+        env: { ...dispatchEnv, ...accountEnv },
         firstPrompt,
         permissionMode: s.permissionMode,
         onApproval: (req) => this.#onCanUseTool(req.toolName, req.input, req.meta),
@@ -1867,7 +1927,14 @@ export class AgentSession {
     p.resolve(
       approved
         ? { behavior: 'allow', updatedInput: p.input }
-        : { behavior: 'deny', message: message ?? 'The user rejected this plan — keep planning.' },
+        : {
+            behavior: 'deny',
+            // BUG-174 — this text reaches the model VERBATIM (proven live), so
+            // it must name its own mechanism: a reader must be able to tell a
+            // plan rejection from an approval deny, a dashboard deny and an
+            // interrupted turn without inferring anything.
+            message: message ?? 'PLAN REJECTED BY THE USER at the Orchard plan prompt. Keep planning; do not start executing.',
+          },
     );
     return true;
   }
@@ -1887,7 +1954,13 @@ export class AgentSession {
     p.resolve(
       allow
         ? { behavior: 'allow', updatedInput: p.input }
-        : { behavior: 'deny', message: message ?? 'Denied by user' },
+        : {
+            behavior: 'deny',
+            // BUG-174 — verbatim to the model; names the mechanism (the card the
+            // user actually pressed Deny on). NOT the same wording as the plan,
+            // dashboard or abort paths, deliberately.
+            message: message ?? 'DENIED AT THE ORCHARD APPROVAL PROMPT — the user saw this call and said no. Do not retry it; ask what they want instead.',
+          },
     );
     return true;
   }
@@ -2171,6 +2244,9 @@ export class AgentSession {
     this.#retiredTasks.add(taskId);
     this.#rebuildBackgroundLevel();
     this.#bgBornTasks.delete(taskId);
+    // BUG-178 — the foreground tag is per-lane too; a terminal frame ends its
+    // membership exactly as it ends the background born-tag's.
+    this.#fgBornTasks.delete(taskId);
     // BUG-157 — a terminal frame for a revived task ends its revival: the
     // separate liveness signal is cleared so the session becomes closeable again.
     this.#revivedTasks.delete(taskId);
@@ -2533,6 +2609,38 @@ export class AgentSession {
    */
   hasLiveBackgroundLane(): boolean {
     return this.#backgroundTasks.size > 0 || this.#bgBornTasks.size > 0;
+  }
+
+  /**
+   * BUG-178 — is THIS lane a background lane? TRI-STATE, and the third state is
+   * the whole round-2 fix.
+   *
+   *  - `true`  — a background lane: the engine's background level
+   *    (`#backgroundTasks`) or the pre-level born tags (`#bgBornTasks`, a
+   *    `run_in_background:true` dispatch known background before its level frame).
+   *  - `false` — a lane POSITIVELY known foreground: dispatched
+   *    `run_in_background:false` and so tagged in `#fgBornTasks`. The main turn's
+   *    next boundary is that lane finishing — this is the ONLY state that earns
+   *    the dock chip's scary blocked-boundary copy.
+   *  - `undefined` — the owner cannot yet say. The BIRTH WINDOW: a lane whose
+   *    `task_started` has arrived but whose classifying frame has not (an
+   *    SDK-default `Agent` omits `run_in_background`, so it is never born-tagged
+   *    and is background only once the level frame lists it). Earlier this method
+   *    could only return a concrete boolean, so an unclassified lane collapsed to
+   *    `false` = foreground = the scary copy on a plain background fan-out (the
+   *    round-2 defect). Now the birth window answers `undefined` and the snapshot
+   *    OMITS `background`, so the chip degrades to its honest short-wait copy.
+   *
+   * NOTE the deliberate asymmetry with `hasMainThreadWork()`, which reads the
+   * SAME background sets but treats unknown⇒foreground as SAFE (keep the turn
+   * alive). For the chip unknown⇒foreground is DANGEROUS (it steers the user to a
+   * destructive interrupt), so unknown must NOT collapse to foreground here — it
+   * is a distinct answer.
+   */
+  isBackgroundLane(agentId: string): boolean | undefined {
+    if (this.#backgroundTasks.has(agentId) || this.#bgBornTasks.has(agentId)) return true;
+    if (this.#fgBornTasks.has(agentId)) return false;
+    return undefined;
   }
 
   /**
@@ -3655,6 +3763,21 @@ export class AgentSession {
               // frame arrives — the sweep must not fabricate a death for it.
               this.#bgDispatchToolUseIds.add(String(block.id));
             }
+            // BUG-178 — the POSITIVE-FOREGROUND dispatch. An `Agent` runs in the
+            // BACKGROUND by default (sdk-tools.d.ts:502), so a foreground subagent
+            // is always EXPLICIT: `run_in_background:false`. `isolation:"remote"`
+            // is always background and wins, so it is excluded. Remembered by
+            // tool_use id; the matching `task_started` promotes it into
+            // `#fgBornTasks`. This is the ONLY affirmative "this lane blocks the
+            // main-turn boundary" signal — read only by `isBackgroundLane()` for
+            // the dock chip, never by the liveness gate. Gated to the subagent
+            // tools so a rare `run_in_background:false` on a plain Bash does not
+            // accrue an id that never becomes a lane.
+            const bin = block.input as Record<string, unknown> | undefined;
+            if (bin?.run_in_background === false && bin?.isolation !== 'remote'
+                && (String(block.name) === 'Agent' || String(block.name) === 'Task')) {
+              this.#fgDispatchToolUseIds.add(String(block.id));
+            }
             this.#emit({
               t: 'tool-call',
               toolUseId: String(block.id),
@@ -3771,9 +3894,33 @@ export class AgentSession {
         // FEAT-126 — any dispatch decl not consumed by a task_started this turn
         // never became a lane; drop it so the map cannot grow across turns.
         this.#dispatchDeclByToolUse.clear();
+        // BUG-178 (round 4) — the foreground dispatch set has the SAME lifetime:
+        // a `run_in_background:false` dispatch is consumed by its own
+        // `task_started` (promoted to `#fgBornTasks`); if the turn ends with the
+        // id still pending it never became a lane, so drop it here. This is the
+        // set's ONLY unconditional clear — a sibling background lane's level
+        // frame no longer erases a still-pending foreground dispatch mid-birth.
+        this.#fgDispatchToolUseIds.clear();
         this.#turnUserInitiated = false; // BUG-159: the awaited turn is done; the next open re-marks
         this.lastMainFrameAt = Date.now(); // BUG-159: the boundary is main-thread activity
         if (typeof m.total_cost_usd === 'number') this.totalCostUsd += m.total_cost_usd;
+        /*
+         * FEAT-144 — mirror the Claude CLI's own jsonl into Orchard's durable
+         * store at the turn boundary, so the conversation survives the CLI's
+         * age-based pruning (cleanupPeriodDays). Only for engines that keep their
+         * own store (persistedTranscript:true — Claude); persistedTranscript:false
+         * engines are already fully captured by the recorder above, and have no
+         * CLI store to mirror. Append-only + idempotent (mirrorClaudeStore copies
+         * only the bytes past the mirror's end), so re-running at every turn end
+         * never duplicates. Best effort — a mirror failure must never break a turn.
+         */
+        if (this.#runtime.capabilities.persistedTranscript && this.sdkSessionId) {
+          try {
+            mirrorClaudeStore(encodeCwd(this.cwd), this.sdkSessionId, {
+              onError: (message) => this.#emit({ t: 'error', message, fatal: false }),
+            });
+          } catch { /* the durable mirror must never break a turn */ }
+        }
         /*
          * BUG-037 — "any agent still running at turn end has ended" was FALSE,
          * and it was the whole defect.
@@ -4084,6 +4231,25 @@ export class AgentSession {
         // now carries every lane worth sparing; drop the pre-level hints.
         this.#bgBornTasks.clear();
         this.#bgDispatchToolUseIds.clear();
+        // BUG-178 (round 4) — the foreground DISPATCH set is NOT cleared here.
+        // A level frame is the authority for the BACKGROUND sets (REPLACE
+        // semantics: `#backgroundTasks` now carries every live background lane,
+        // so the pre-level born hints above are redundant and safe to drop). It
+        // is NOT any authority over foreground lanes — a live foreground lane
+        // never appears in the background level. Clearing `#fgDispatchToolUseIds`
+        // on ANY `background_tasks_changed` erased a still-pending
+        // `run_in_background:false` dispatch whenever a CONCURRENT background
+        // lane's level frame landed in the window between the foreground
+        // dispatch's tool-call frame and its own `task_started` — so
+        // `task_started` found nothing to promote, the lane stayed `undefined`,
+        // and the chip degraded to the friendly "delivers at the next pause" for
+        // a lane that actually BLOCKS the main turn (the original BUG-178
+        // incident returning; round-3 verifier, CONFIRMED). The dispatch set's
+        // lifetime is now scoped to the id's OWN events, not a sibling's churn:
+        // its `task_started` consumes it (below), and the turn-end `result`
+        // sweep drops any decl that never became a lane (FEAT-126 lifetime).
+        // NOTE: `#fgBornTasks` is likewise not cleared here — retired per-task at
+        // its terminal frame.
         // BUG-043: the level going EMPTY is the moment a detached session that
         // was held open for its background work becomes genuinely finished —
         // nudge the close fuse so holding it open never becomes a leak (a no-op
@@ -4226,6 +4392,16 @@ export class AgentSession {
           // BUG-096: record the lane's kind — a background Task subagent can PARENT
           // a foreground child bash; a run_in_background Bash (kind:'tool') cannot.
           this.#bgBornTasks.set(agent.agentId, agent.kind ?? 'tool');
+        }
+        // BUG-178: the foreground twin. A `run_in_background:false` dispatch's
+        // task_started echoes its tool_use id — promote it to a positive
+        // foreground tag on the lane's agent id, so `isBackgroundLane()` can
+        // answer `false` (foreground, earns the honest blocked-boundary copy)
+        // instead of `undefined`. Same terminal-frame retirement guard as the
+        // background tag: a task the engine already ended is never (re-)tagged.
+        if (agent.toolUseId && this.#fgDispatchToolUseIds.delete(agent.toolUseId)
+            && !this.#retiredTasks.has(agent.agentId)) {
+          this.#fgBornTasks.add(agent.agentId);
         }
         /*
          * BUG-105 (the `b0dfaf6` REGRESSION) — A TERMINAL REPORT MARKS THE EVENTUAL

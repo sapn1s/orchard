@@ -1,26 +1,48 @@
 /**
- * FEAT-054 — crown/topbar chips deep-link to their drawer section: expand it
- * (Advanced included), scroll it into view, one brief highlight — and never
- * rewrite the user's collapse preferences.
+ * FEAT-054 — crown/topbar chips deep-link to their drawer target: select the
+ * rail CATEGORY that now contains it, scroll the target into view, one brief
+ * highlight — and never leave a stale flash or a wrong rail selection behind.
+ *
+ * FEAT-146 replaced the drawer with a modal (`.smodal`) whose content is an
+ * 11-category rail; the four `<details class="sect">` sections this spec
+ * originally keyed off (`model`/`caps`/`instr`/`isoSection`) are gone — only
+ * `advanced` (Agent memories) and `patterns` (Templates) still use a real
+ * `<details>`. `FOCUS_CATEGORY` in `public/lib/drawer.js` re-maps every one of
+ * this spec's anchors onto its new rail category: `git`/`processes` moved from
+ * "Advanced" to "Workspace" (re-homed there in phase 2a — see
+ * `docs/bugs/FEAT-146-settings-is-two-navigation-axes-fighting-each-other.md`),
+ * `permissionMode` stayed in "Permissions & tools", `mounts`/`iso` stayed in
+ * "Isolation & environment". None of the five door chips this spec drives
+ * still targets a collapsible section, so the "Advanced expands" half of the
+ * original intent has no surviving analog for THESE anchors — the guard this
+ * spec keeps instead is the one that still applies to every one of them: the
+ * right rail category gets selected, the right node is scrolled in and
+ * flashed once, and going back to a plain door leaves no stray flash.
  *
  * What this proves, user-observable (WORKING_AGREEMENT §C):
- *   1. git chip   → Advanced ▸ Git         (collapsed-by-default Advanced EXPANDS)
- *   2. proc chip  → Advanced ▸ Running here
- *   3. perm chip + composer permission hairline → Model & behaviour ▸ Permissions
- *   4. mount pill → Access ▸ Mounts
+ *   1. git chip   → Workspace ▸ Git
+ *   2. proc chip  → Workspace ▸ Running here
+ *   3. perm chip + composer permission hairline → Permissions & tools
+ *   4. mount pill → Isolation & environment ▸ Mounts
  *   5. isolation popover's settings footer → Isolation & environment
- *   For each: drawer open, mapped target visible IN the viewport, `.focus-flash`
- *   applies then CLEARS (a one-shot, never a persistent selected state).
- *   6. COLLAPSE PREFS PRESERVED — after a deep link expanded Advanced, a plain
- *      #cogBtn open lands at the default position with Advanced collapsed
- *      again, and no flash anywhere (no regression to the plain open).
+ *   For each: modal open, the mapped rail category becomes selected
+ *   (`aria-current="page"`), the mapped target visible IN the viewport,
+ *   `.focus-flash` applies then CLEARS (a one-shot, never a persistent state).
+ *   6. NO STRAY FLASH, RAIL STATE HONEST — a plain #cogBtn open never flashes
+ *      anything; a deep link's one-shot flash never survives a close/reopen;
+ *      and the modal remembers the last-selected category across a
+ *      close/reopen within one page session (current behaviour: `d.cat` is
+ *      NOT reset to the default by a plain open — see `open()` in
+ *      `drawer.js`), so the assertion is that reopening after a git-chip
+ *      visit stays on Workspace rather than silently snapping back.
  *   7. prefers-reduced-motion — the highlight is a static brief outline
  *      (animation: none), still applied and still cleared.
- *   8. the model chip stays as-is: it opens the /model picker, not the drawer.
+ *   8. the model chip stays as-is: it opens the /model picker, not the modal.
  *
  * Non-vacuity: pre-change `drawer.open('settings', {focus})` ignores the
- * object, there are no data-focus/data-sect anchors and no .focus-flash —
- * every mapped assertion fails (each chip lands at the drawer's top).
+ * object, there are no data-focus anchors and no .focus-flash — every mapped
+ * assertion fails (each chip lands at the drawer's top, on whatever category
+ * happened to be selected already).
  *
  *   npx playwright test scripts/qa/FEAT-054-chip-deep-link.spec.ts
  *
@@ -98,7 +120,7 @@ test.afterAll(async () => {
 /** target visible, inside the viewport, flash applies then CLEARS. */
 async function expectLanded(page: Page, selector: string) {
   const target = page.locator(`#vSettings ${selector}`);
-  await expect(page.locator('#drawer')).toHaveClass(/open/);
+  await expect(page.locator('#smodal')).not.toHaveAttribute('hidden', ''); // FEAT-146: the drawer became a modal
   await expect(target).toBeVisible();
   // the flash is a one-shot — catch it, then watch it clear
   await expect(target).toHaveClass(/focus-flash/, { timeout: 3000 });
@@ -134,34 +156,36 @@ test('every mapped chip lands on its drawer section — expanded, scrolled, brie
   await page.waitForFunction(() => (window as any).__station !== undefined);
   await page.waitForFunction((p) => (window as any).__station.state.current.projectId === p, pid);
 
-  // ═══ baseline: a PLAIN cog open lands at the default — Advanced collapsed ═══
+  // ═══ baseline: a PLAIN cog open lands on the default rail category (Model &
+  //      spend — `d.cat` starts life as 'model'), nothing flashed ═══
   await page.locator('#cogBtn').click();
-  await expect(page.locator('#drawer')).toHaveClass(/open/);
-  await expect(page.locator('#vSettings details[data-sect="advanced"]')).not.toHaveAttribute('open', '');
+  await expect(page.locator('#smodal')).not.toHaveAttribute('hidden', ''); // FEAT-146: the drawer became a modal
+  await expect(page.locator('#sRail-model')).toHaveAttribute('aria-current', 'page');
   expect(await page.locator('#vSettings .focus-flash').count(), 'plain open must not flash anything').toBe(0);
   await page.locator('#dClose').click();
 
-  // ═══ 1. git chip → Advanced ▸ Git (Advanced expands for the visit) ═══
+  // ═══ 1. git chip → Workspace ▸ Git (re-homed from Advanced in phase 2a) ═══
   await expect(page.locator('#gitBtn')).toBeVisible();
   await page.locator('#gitBtn').click();
-  await expect(page.locator('#vSettings details[data-sect="advanced"]')).toHaveAttribute('open', '');
+  await expect(page.locator('#sRail-workspace')).toHaveAttribute('aria-current', 'page');
   await expectLanded(page, '[data-focus="git"]');
   await page.screenshot({ path: path.join(ROOT, 'docs', 'bugs', 'assets', 'FEAT-054-git-landed.png') }).catch(() => {});
   await page.locator('#dClose').click();
 
-  // ═══ 6. PREFS PRESERVED — the deep-link expansion was ephemeral ═══
+  // ═══ 6. NO STRAY FLASH, RAIL STATE HONEST ═══
+  // A plain reopen right after a deep-linked visit: the one-shot flash from
+  // the git-chip visit above must NOT still be present, and — current
+  // behaviour, unlike the retired ephemeral-<details> model — the rail stays
+  // on Workspace rather than snapping back to the default; `d.cat` is only
+  // reset to 'model' when the previous category was in the MACHINE group.
   await page.locator('#cogBtn').click();
-  await expect(page.locator('#vSettings details[data-sect="advanced"]')).not.toHaveAttribute('open', '');
-  // …and a section the USER closed stays closed across a deep link elsewhere
-  await page.locator('#vSettings details[data-sect="instr"] summary').click();
-  await expect(page.locator('#vSettings details[data-sect="instr"]')).not.toHaveAttribute('open', '');
+  await expect(page.locator('#sRail-workspace')).toHaveAttribute('aria-current', 'page');
+  expect(await page.locator('#vSettings .focus-flash').count(), 'a plain reopen must carry no stray flash').toBe(0);
   await page.locator('#dClose').click();
   await expect(page.locator('#procBtn')).toBeVisible({ timeout: 30_000 }); // proc poll finds the squatter
-  await page.locator('#procBtn').click(); // deep link to processes
-  await expect(page.locator('#vSettings details[data-sect="advanced"]')).toHaveAttribute('open', '');
+  await page.locator('#procBtn').click(); // deep link to processes — same category (Workspace) as git
+  await expect(page.locator('#sRail-workspace')).toHaveAttribute('aria-current', 'page');
   await expectLanded(page, '[data-focus="processes"]');
-  await expect(page.locator('#vSettings details[data-sect="instr"]'),
-    'the user-closed section must stay closed').not.toHaveAttribute('open', '');
   await page.locator('#dClose').click();
 
   // ═══ 3. permission chip (seal) + composer hairline → Permissions group ═══
@@ -180,9 +204,19 @@ test('every mapped chip lands on its drawer section — expanded, scrolled, brie
   await page.locator('#dClose').click();
 
   // ═══ 5. isolation popover footer → Isolation & environment ═══
-  await page.locator('#isoBtn').click();
-  await expect(page.locator('#pop')).toHaveClass(/open/);
-  await page.locator('#popSettings').click();
+  // FINDING, unrelated to FEAT-146: `#isoBtn` (the door to `#pop`, whose
+  // footer is `#popSettings`) has been unconditionally `hidden = true` since
+  // FEAT-139 (`public/app.js:2619`, "moved into Settings... reachable in one
+  // click via Settings"), and nothing anywhere ever un-hides it — so this
+  // door is dead code a real user cannot reach, predating this ticket. Out of
+  // scope to fix here (app.js is off limits for this charter; it belongs to
+  // whoever owns FEAT-139's follow-up). The `focus:'iso'` mapping itself is
+  // still real, live product code (`#popSettings`'s own click handler calls
+  // `drawer.open('settings', {focus:'iso'})`), so this exercises that call
+  // directly rather than through the unreachable button — still proving the
+  // 'iso' anchor lands correctly, distinct from the 'mounts' anchor (#4
+  // above) that happens to share its rail category.
+  await page.evaluate(() => (window as any).__station.drawer.open('settings', { focus: 'iso' }));
   await expectLanded(page, '[data-focus="iso"]');
   await page.locator('#dClose').click();
 
@@ -206,7 +240,7 @@ test('every mapped chip lands on its drawer section — expanded, scrolled, brie
   if (await page.locator('#modelChip').isVisible()) {
     await page.locator('#modelChip').click();
     await expect(page.locator('#modelPop')).toHaveClass(/open/);
-    expect(await page.evaluate(() => document.querySelector('#drawer')!.classList.contains('open'))).toBe(false);
+    expect(await page.evaluate(() => document.querySelector('#smodal')!.hidden)).toBe(true); // FEAT-146
     await page.keyboard.press('Escape');
   }
 });

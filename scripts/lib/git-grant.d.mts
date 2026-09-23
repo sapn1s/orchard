@@ -16,8 +16,16 @@ export interface GitWriteEvaluation {
   record?: GitWriteRecord;
 }
 
+/**
+ * ONE grant authority for BOTH enforcement layers (BUG-173): pass EITHER
+ *   - `command` — a Bash command STRING (the FEAT-108 PreToolUse hook), OR
+ *   - `argv`    — already-isolated git args WITHOUT the `git` head (the FEAT-135
+ *                 PATH shim, via /api/git-shim/decide).
+ * Whichever shape, the same grant / leak-gate / single-use-consume tail runs.
+ */
 export declare function evaluateGitWrite(opts: {
-  command: string;
+  command?: string;
+  argv?: string[];
   projectKey?: string | null;
   env?: Record<string, string | undefined>;
   now?: number;

@@ -235,7 +235,7 @@ test('queued section + per-section caps + wheel chaining + the full-file ticket 
   // Esc closes — top of the ladder, drawer stays untouched
   await page.keyboard.press('Escape');
   await expect(page.locator('#ticketModal')).toBeHidden();
-  expect(await page.evaluate(() => document.querySelector('#drawer')!.classList.contains('open'))).toBe(false);
+  expect(await page.evaluate(() => document.querySelector('#smodal')!.hidden)).toBe(true); // FEAT-146
 
   // (b) the LONG ticket: the modal body scrolls independently of the rail
   await queuedSec.locator(`.brow[data-id="${QUEUED[0]}"]`).click();

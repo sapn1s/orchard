@@ -41,7 +41,19 @@ import { parseHash, formatHash, sameRoute, parseTicketsHash, formatTicketsHash, 
  * FEAT-037 P3, but this client-side mirror lacked it — so an armed session-
  * scope provider (drawer or the launch control) silently never rode `start`.
  */
-const SESSION_OVERRIDABLE = ['provider', 'model', 'effort', 'permissionMode', 'maxBudgetUsd', 'allowedTools', 'disallowedTools'];
+/*
+ * THIS IS A HAND-MAINTAINED MIRROR of `SESSION_OVERRIDE_FIELDS` in
+ * `src/server/validate.ts` (that constant names this one back). A field missing
+ * HERE is armable in the UI and then silently never put on the `start` frame —
+ * which is exactly what happened to 'provider' above. The two lists are asserted
+ * SET-EQUAL mechanically by `scripts/verify-feat-145-session-override.mjs`; run
+ * it after touching either side.
+ *
+ * FEAT-145: 'claudeAccount' — which Claude subscription this one session bills
+ * to. The server accepts it for `direct` projects and refuses it fatally for
+ * container ones (the credential is a container bind mount, not an env var).
+ */
+const SESSION_OVERRIDABLE = ['provider', 'model', 'effort', 'claudeAccount', 'permissionMode', 'maxBudgetUsd', 'allowedTools', 'disallowedTools'];
 
 const PAGE = 6;
 /** How many more a click of "N more" reveals — a screenful, not a trickle. */
@@ -149,6 +161,19 @@ const state = {
   snapStaleAt: 0,
   /** FEAT-057 — undismissed agent deaths the server recorded (rail items). */
   outcomes: [],
+  /* ARCH-017 — lane results Orchard is holding. `null` until the first poll
+   * answers, so the rail can tell "not asked yet" from "nothing waiting". */
+  pending: null,
+  pendingProblem: null,
+  /* ARCH-017 round 2 (§7) — the last FAILED drain/dismiss, shown at the user.
+   * A verifier reproduced a non-writer server answering 200 with `lanes:[]`,
+   * the client ignoring `skipped`, and the row silently reappearing with
+   * nothing said. Silence is the worst available behaviour here. */
+  pendingActionProblem: null,
+  /* ARCH-017 round 2 (§4) — the 12-row cap hid 5 of 17 items with no indicator. */
+  showAllPending: false,
+  /* ARCH-017 round 2 (§5) — the collected bundle, so it has a DOM surface. */
+  lastDrain: null,
   requests: [],      // FEAT-126 — declared user-request bindings for the open session (no status)
   /** BUG-070 — false = recent/undismissed only; true = "show all" (old + dismissed). */
   showAllOutcomes: false,
@@ -156,7 +181,7 @@ const state = {
   asks: new Map(),
   threads: new Map(), // 'main' | agentId -> thread (own .pane, own render cursor)
   viewing: 'main',
-  caps: { subagents: null, live: null, running: null, outcomes: null, requests: null }, // null = unprobed, false = route absent on this server
+  caps: { subagents: null, live: null, running: null, outcomes: null, requests: null, pending: null }, // null = unprobed, false = route absent on this server
   effective: null,         // EffectiveConfig — what the session really runs with
   /* FEAT-051 — the LIVE session's own tool list (session-init.tools), the
      ground truth for which MCP servers actually attached: an attached server
@@ -413,19 +438,41 @@ function usageAsOf(asOf) {
   if (asOf == null) return 'never read';
   return new Date(asOf).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
-/** The full both-providers detail — the decision surface lives in the tooltip. */
+/**
+ * FEAT-145 — which Claude ACCOUNT this project's next lane would run on. Same
+ * resolution shape as providerView(): an armed per-launch override wins, then
+ * the project setting, then the implicit default account. Reads defensively so
+ * this is correct both before and after the account setting exists.
+ */
+function claudeAccountView() {
+  const o = state.overrides ?? {};
+  const v = ('claudeAccount' in o ? o.claudeAccount : null) ?? currentProject()?.settings?.claudeAccount ?? null;
+  return typeof v === 'string' && v ? v : 'default';
+}
+/** A snapshot's display name: 'OpenAI', 'Claude', or 'Claude (<account label>)'. */
+function usageSnapName(s) {
+  if (s.provider === 'openai') return 'OpenAI';
+  // The default account is just "Claude" — a single-account user sees no change.
+  if (!s.accountId || s.accountId === 'default' || !s.accountLabel) return 'Claude';
+  return `Claude (${s.accountLabel})`;
+}
+/**
+ * The full detail — the decision surface lives in the tooltip. One block per
+ * snapshot in SERVER order (FEAT-145: every Claude account, default first, then
+ * openai), so two subscriptions show two independent 5-hour windows and the
+ * "which one do I switch to" answer is actually on screen.
+ */
 function usageTitle() {
   const list = state.usage ?? [];
-  const name = (pv) => (pv === 'openai' ? 'OpenAI' : 'Claude');
   const lines = [];
-  for (const pv of ['anthropic', 'openai']) {
-    const s = list.find((x) => x.provider === pv);
-    if (!s) continue;
+  for (const s of list) {
+    if (s.provider !== 'anthropic' && s.provider !== 'openai') continue;
+    const name = usageSnapName(s);
     if (!s.available) {
-      lines.push(`${name(pv)} — not available${s.note ? ` (${s.note})` : ''}${s.asOf ? ` · last read ${usageAsOf(s.asOf)}` : ''}`);
+      lines.push(`${name} — not available${s.note ? ` (${s.note})` : ''}${s.asOf ? ` · last read ${usageAsOf(s.asOf)}` : ''}`);
       continue;
     }
-    lines.push(`${name(pv)}${s.plan ? ` (${s.plan})` : ''} — as of ${usageAsOf(s.asOf)}`);
+    lines.push(`${name}${s.plan ? ` (${s.plan})` : ''} — as of ${usageAsOf(s.asOf)}`);
     for (const w of s.windows) {
       lines.push(`  ${w.label}: ${w.usedPercent}%${w.binding ? ' (binding)' : ''} · resets ${usageResetAbs(w.resetsAt)}`);
     }
@@ -440,7 +487,17 @@ function paintUsageChip() {
   const p = currentProject();
   if (!p) { btn.hidden = true; return; }
   const provider = providerView(); // the engine THIS project's next lane would use
-  const snap = (state.usage ?? []).find((s) => s.provider === provider);
+  // FEAT-145: the badge answers "can I dispatch RIGHT NOW", so it must show the
+  // window binding the account this session will ACTUALLY run on — not whichever
+  // account happens to be listed first. Falls back to the first snapshot for the
+  // provider (the default account) when the selected one is not in the list, so
+  // a single-account user's badge is byte-identical to pre-145.
+  const list = state.usage ?? [];
+  const snap =
+    provider === 'anthropic'
+      ? (list.find((s) => s.provider === 'anthropic' && (s.accountId ?? 'default') === claudeAccountView())
+        ?? list.find((s) => s.provider === 'anthropic'))
+      : list.find((s) => s.provider === provider);
   btn.classList.remove('warn', 'danger', 'unknown');
   if (!snap || !snap.available) {
     lab.textContent = 'usage —';
@@ -460,10 +517,8 @@ function paintUsageChip() {
   btn.hidden = false;
 }
 
-/** The station's own port — always shown first in the proc chip preview. */
+/** The station's own port — always shown first in the proc popover. */
 const STATION_PORT = 4317;
-/** Inline port cap for the crown proc chip; the rest collapse into "+N". */
-const PROC_PORT_CAP = 3;
 
 /**
  * BUG-082: a STABLE port order so the capped inline preview never jitters
@@ -516,9 +571,6 @@ const node = {
   seal: $('#seal'),
   sessStatus: $('#sessStatus'),
   sessStatusLbl: $('#sessStatusLbl'),
-  isoBtn: $('#isoBtn'),
-  isoG: $('#isoG'),
-  isoN: $('#isoN'),
   provSel: $('#provSel'),   // this-feat — header provider selector (opens #provPop)
   provSelG: $('#provSelG'),
   provSelN: $('#provSelN'),
@@ -538,7 +590,6 @@ const node = {
   usageN: $('#usageN'),
   procPorts: $('#procPorts'),
   sealSep: $('#sealSep'),
-  pop: $('#pop'),
   rowMenu: $('#rowMenu'),
   picker: $('#picker'),
   pickList: $('#pickList'),
@@ -591,6 +642,7 @@ const node = {
   railNeeds: $('#railNeeds'),
   railObservations: $('#railObservations'), // FEAT-079 — read-only findings lane
   railStopped: $('#railStopped'), // FEAT-057 — agents that stopped, and why
+  railPending: $('#railPending'), // ARCH-017 — lane results Orchard is holding
   railQueued: $('#railQueued'),   // FEAT-053 — the todo backlog, read-only
   railInflight: $('#railInflight'),
   railDone: $('#railDone'),
@@ -857,6 +909,22 @@ const drawer = createDrawer({
   themes: () => THEMES,
   getTheme: () => theme,
   setTheme: (t) => setThemePersist(t),
+  /*
+   * FEAT-146 — the Claude ACCOUNT list has ONE owner, and it is this file
+   * (ARCH-010). The settings modal used to keep a second list of its own
+   * (`d.claudeAccounts`, its own `api.getClaudeAccounts()` call) and a second
+   * copy of the plan-description helper, so two surfaces could disagree about
+   * which subscription a session would spend. It reads these now and stores
+   * nothing. `pickSessionAccount` is pickAccount itself, so a per-launch
+   * override still has exactly one writer — the one that persists it, tells the
+   * user, and repaints the launch pill and the usage badge.
+   */
+  accounts: () => ACCOUNTS,            // undefined = unfetched, null = no route, [] = default only
+  refreshAccounts: (opts) => refreshAccounts(opts ?? {}),
+  acctPlanDesc: (a) => acctPlanDesc(a),
+  acctUsageDesc: (id) => acctUsageDesc(id),
+  accountLockedReason: () => accountLockedReason(),
+  pickSessionAccount: (next) => pickAccount(next),
   notify: say,
   openGit: () => void gitView?.open(),
   async refreshProject() {
@@ -1197,6 +1265,7 @@ function renderProjectGroup(p) {
     // Header + sessions share a group: sticky is scoped to the group box, so
     // headers cannot pile up on each other once their project scrolls away.
     const group = el('div', { class: 'pgroup' });
+    group.dataset.pid = String(p.id); // FEAT-147 — anchor so a project search-hit can scroll here
     group.append(head);
     node.tree.append(group);
 
@@ -1804,6 +1873,25 @@ function renderSearch(raw) {
       if (hits.length >= 300) break;
     }
   }
+  // FEAT-147 — plain-text search also surfaces PROJECTS, above the session
+  // hits. The reported need: reach a project (e.g. to start a new session in
+  // it) by typing part of its name, without knowing the "#" scope grammar or
+  // scrolling the whole session list. A direct project-name match must not sit
+  // below session-title hits, so this section renders first.
+  if (pq.mode === 'plain' && text) {
+    const projHits = state.projects
+      .filter((p) => p.name.toLowerCase().includes(text))
+      .sort((a, b) =>
+        projMatchRank(a.name.toLowerCase(), text) - projMatchRank(b.name.toLowerCase(), text)
+        || (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+    if (projHits.length) {
+      node.tree.append(el('div', { class: 'search-section', text: 'Projects' }));
+      node.tree.append(el('div', { class: 'found-l', text:
+        `${projHits.length} project${projHits.length === 1 ? '' : 's'} — open, or + to start a session` }));
+      for (const p of projHits) node.tree.append(projectHitRow(p));
+    }
+  }
+
   const total = [...state.sessions.values()].filter((s) => s.loaded).reduce((n, s) => n + s.list.length, 0);
   node.tree.append(el('div', { class: 'search-section', text: 'Sessions' }));
   node.tree.append(el('div', { class: 'found-l', text:
@@ -1816,6 +1904,59 @@ function renderSearch(raw) {
   }
   if (!hits.length && (state.searchLoaded || scopeIds)) node.tree.append(el('div', { class: 'hint-row', text: 'no titles match' }));
   renderContentSearch(node.findInput.value.trim());
+}
+
+/* FEAT-147 — rank a project-name match: exact 0, prefix 1, substring 2. */
+function projMatchRank(nameLc, text) {
+  if (nameLc === text) return 0;
+  if (nameLc.startsWith(text)) return 1;
+  return 2;
+}
+
+/* FEAT-147 — dismiss the finder overlay and clear its query. Mirrors the
+   findBtn toggle's own reset so a search-hit that navigates away lands on the
+   normal tree rather than back inside the search view. */
+function closeFinder() {
+  node.finder.classList.remove('on');
+  node.findInput.value = '';
+}
+
+/* FEAT-147 — scroll a project's group into view after a search-hit reveals it. */
+function revealProject(id) {
+  node.tree.querySelector(`.pgroup[data-pid="${id}"]`)?.scrollIntoView({ block: 'nearest' });
+}
+
+/*
+ * FEAT-147 — a PROJECT result in plain-text search. Mirrors the sidebar project
+ * header's affordances so the visual/interaction idiom is identical: clicking
+ * the row opens (expands + selects) the project; the "+" starts a new session
+ * in it directly. Both close the finder first.
+ */
+function projectHitRow(p) {
+  const b = el('button', { class: 'row hit', title: `Open ${p.name}` });
+  const top = el('span', { class: 'hit-top' });
+  top.append(el('span', { class: 'when', text: when(p.lastActivityAt) }));
+  top.append(el('span', { class: `dot ${projectDot(p)}`.trim() }));
+  top.append(document.createTextNode(`#${p.name}`));
+  if (!isActiveProject(p)) top.append(el('span', { class: 'in', text: '  inactive' }));
+
+  const plus = el('span', { class: 'plus', role: 'button', tabindex: '0',
+    title: `New session in ${p.name}`, 'aria-label': `New session in ${p.name}` });
+  plus.append(iconPlus());
+  plus.addEventListener('click', (e) => { e.stopPropagation(); closeFinder(); startNew(p.id); });
+  top.append(plus);
+  b.append(top);
+
+  b.addEventListener('click', () => {
+    closeFinder();
+    state.expanded.add(p.id);
+    saveExpanded();
+    void loadSessions(p.id);
+    selectProject(p.id, { quiet: true });
+    renderTree();
+    revealProject(p.id);
+  });
+  return b;
 }
 
 /* ---------------------- content search (tier 2: rg, debounced as you type) */
@@ -2548,40 +2689,31 @@ function paintCrown() {
 
   const has = !!p;
   paintModelChip(); // FEAT-042 — chip visibility tracks project selection
-  paintProvSel();   // this-feat — header provider selector tracks selection too
-  node.isoBtn.hidden = !has;
-  node.settingsBtn.hidden = !has; // BUG-158 — visible whenever a project is selected
-  node.insBtn.hidden = !has;
-  node.seal.querySelector('.seal-vdiv').hidden = !has; // no stray hairline with nothing to divide
+  paintProvSel();   // FEAT-139 — now keeps the header provider selector hidden (moved into Settings)
+  paintAccountSel(); // FEAT-145 — which Claude subscription the next session bills to
+  // FEAT-139 — the CONFIG chips leave the strip entirely and live under the one
+  // Settings door (Machine · This project · This session spine). Provider,
+  // isolation (connection mode) and the instruction stack (Working Agreement
+  // version) are session-CONSTANT settings, not glance-worthy live signal: a
+  // control you click to CHANGE something must not sit on the strip beside the
+  // readouts you can only look at. They stay in the DOM (their popovers/handlers
+  // are untouched) but are never shown on the strip; every one is reachable in
+  // one click via Settings ▸ Capabilities / Isolation & environment / Instructions.
+  // FEAT-146 round 4 — #isoBtn and its popover are gone entirely (see
+  // index.html): a door nothing could open is not a door.
+  node.insBtn.hidden = true;
+  node.settingsBtn.hidden = !has; // BUG-158 — the ONE config door, visible whenever a project is selected
+  node.seal.querySelector('.seal-vdiv').hidden = true; // nothing left to divide — nav sits alone
   node.sealSep.hidden = !has;
   for (const m of [...node.seal.querySelectorAll('.mnt, .addm')]) m.remove();
   if (!has) return;
-
-  const iso = ISO_META[p.isolation] ?? ISO_META.direct;
-  node.isoG.textContent = iso.g;
-  node.isoN.textContent = iso.n;
-  for (const o of node.pop.querySelectorAll('.opt')) {
-    o.setAttribute('data-sel', o.dataset.iso === p.isolation ? 'true' : 'false');
-  }
-
-  const stack = (p.settings.instructions ?? []).filter((s) => s.enabled !== false);
-  if (!stack.length) {
-    node.insN.textContent = 'CLAUDE.md only';
-    node.insPlus.textContent = '';
-  } else {
-    const names = drawer.templates();
-    const first = names.find((t) => t.id === stack[0].templateId)?.name ?? stack[0].templateId;
-    node.insN.textContent = first;
-    node.insPlus.textContent = stack.length > 1 ? `+${stack.length - 1}` : '';
-  }
 
   const mounts = p.settings.mounts ?? [];
   // BUG-075: mounts are a CONTAINER-only concept — bind-mounting extra host
   // paths INTO the container. A direct/sandbox session already sees the whole
   // filesystem, so neither the mount pills NOR the "+ Add mount" affordance may
   // render there (they are inert-or-confusing). Ground truth is p.isolation —
-  // the SAME source the Direct/Container chip (isoN, above) and the isolation
-  // say() line below read, so the two can never disagree, and the strip
+  // the SAME source the say() line below reads, so the two can never disagree, and the strip
   // re-renders on every session switch (line 1540 clears the old .mnt/.addm).
   if (p.isolation === 'container') {
     for (const m of mounts) {
@@ -2620,12 +2752,6 @@ function paintCrown() {
 
   if (!state.busy) sayIso(isoLabel(p), '');
 }
-
-const ISO_META = {
-  container: { g: '▣', n: 'Container' },
-  sandbox: { g: '◑', n: 'Sandbox' },
-  direct: { g: '○', n: 'Direct' },
-};
 
 /* ─────────────────────────────── FEAT-051 — integrations strip (crown) ───
  *
@@ -2889,16 +3015,24 @@ function paintPerm() {
       ? 'Plan first — this session is driven by your terminal; toggling here only applies if you take it over from the dashboard'
       : 'Plan first — Claude reads and explores but cannot edit files or run mutating commands; it proposes a plan and waits for your approval';
 
-  // seal chip
-  node.seal.querySelector(':scope > .perm')?.remove();
+  // seal chip. FEAT-139 review round 2 — the perm pill now lives INSIDE the
+  // .seal-readouts wrapper (it inserts before #sealSep, which moved into the
+  // wrapper), so this is a subtree query, not a direct-child one.
+  node.seal.querySelector('.perm')?.remove();
   if (has) {
     // Three states, not two: "asks first" is not an honest label for plan mode,
     // where Claude cannot act at all until you approve a plan.
     const pendingChip = (armedPending && (skipping || planning)) || armedNextSkip;
     const chipNote = armedNextSkip ? ' · skip from next msg' : pendingChip ? (external ? ' · if you take over' : ' · from next send') : '';
+    // FEAT-139 review round 2 — the mode pill is its OWN category, distinct in
+    // KIND from the nav buttons (6px, opaque) and the chromeless readouts: a
+    // fully-rounded pill carrying an LED-style ringed dot (a live state) and a
+    // caret in the .sel idiom (it opens Settings to CHANGE the mode). The dot +
+    // ring recolour per posture via CSS; the caret says "flippable".
     const chip = el('span', { class: 'perm', role: 'button', tabindex: '0', 'data-risk': String(!!risky), 'data-skip': String(!!skipping), 'data-pending': String(pendingChip), 'data-external': String(pendingChip && external) },
       el('span', { class: 'dot' }),
-      el('span', { text: (skipping ? 'skips prompts' : planning ? 'plans first' : 'asks first') + chipNote }));
+      el('span', { text: (skipping ? 'skips prompts' : planning ? 'plans first' : 'asks first') + chipNote }),
+      svg('M4 6.5 8 10.5 12 6.5', 8, 'cx'));
     // FEAT-054: the chip names the permission mode — land on Model &
     // behaviour ▸ Permission mode instead of the drawer's default top.
     chip.addEventListener('click', () => void drawer.open('settings', { focus: 'permissionMode' }));
@@ -3925,6 +4059,7 @@ async function loadOlder(th) {
       note.remove();
       insertRendered(th, msgs, renderOlderInto);
     });
+    applyHookBadges(th); // BUG-177 — badge any older turns a failed gate hit
     // The server says where we now are; trust its answer, do not recompute it.
     p.oldest = Number.isInteger(t?.offset) ? t.offset : 0;
     p.cursorBytes = Number.isInteger(t?.cursorBytes) ? t.cursorBytes : null;
@@ -3964,9 +4099,11 @@ function withScrollAnchor(mutate) {
 function prependNodes(th, nodes, anchor = true) {
   const put = () => {
     // FEAT-132 — the session-config card is a persistent header pinned to the
-    // very top of the pane; older pages prepend BELOW it, never above.
-    const top = th.paneEl.querySelector(':scope > .sesscfg')
-      || th.paneEl.querySelector(':scope > .lede');
+    // very top of the pane; older pages prepend BELOW it, never above. BUG-177 —
+    // the hook-failure banner is a sibling header pinned there too; insert after
+    // whichever pinned header sits LOWEST so pages never jump above either.
+    const headers = th.paneEl.querySelectorAll(':scope > .hookfail, :scope > .sesscfg, :scope > .lede');
+    const top = headers.length ? headers[headers.length - 1] : null;
     if (top) top.after(...nodes);
     else th.paneEl.prepend(...nodes);
   };
@@ -4409,22 +4546,19 @@ function paintProcChip() {
   const p = currentProject();
   const s = p ? state.procSummary?.[p.id] : null;
   if (!p || !s || !s.count) { node.procBtn.hidden = true; if (node.procPop.classList.contains('open')) closePops(); return; }
-  // SAME grammar as the sidebar chip — ports first, then the process count.
-  // (":4317 +1" in the sidebar means one more PORT; the count here includes
-  // every process cwd'd in the project — the session's own CLI and its tool
-  // shims among them, which is why it exceeds the port count.)
-  //
-  // BUG-082: the port list was dumped inline and grew unbounded (6-7+ scratch
-  // ports crowded the other crown chips out). Now only the first PROC_PORT_CAP
-  // ports preview inline (:4317 always first, then ascending) with a "+N"
-  // overflow; the full list lives in the #procPop popover this chip opens.
+  // BUG-082 kept the port list capped inline (first few ports + "+N", full list
+  // in #procPop). FEAT-139 — the strip face is a LIVE READOUT, not a reference dump. The old
+  // face inlined ":4317 :34699 :36735 +3 · 90 procs" — a port list and a proc
+  // count that answer "what does the user do in the next 30 seconds?" with
+  // "nothing". Both are session-constant reference material, so the face now
+  // carries only a compact running indicator (how many ports are listening, or
+  // the proc count when nothing listens) and the full port list + counts live
+  // in the popover this chip opens (paintProcPop) and its tooltip. This is the
+  // same BUG-082 invariant — the face must not dump ports — taken to its end.
   const ports = orderedPorts(s.ports);
-  const shown = ports.slice(0, PROC_PORT_CAP);
-  const overflow = ports.length - shown.length;
-  const procTxt = `${s.count} proc${s.count === 1 ? '' : 's'}`;
   node.procN.textContent = ports.length
-    ? `${shown.map((x) => `:${x}`).join(' ')}${overflow > 0 ? ` +${overflow}` : ''} · ${procTxt}`
-    : procTxt;
+    ? `${ports.length} port${ports.length === 1 ? '' : 's'}`
+    : `${s.count} proc${s.count === 1 ? '' : 's'}`;
   node.procBtn.title = procChipTitle(p);
   node.procBtn.hidden = false;
   // Keep an open popover honest with the latest poll.
@@ -4655,6 +4789,127 @@ function noticeChip(th, notice) {
  * implies full knowledge.
  */
 const SC_STATUS_LABEL = { truncated: 'truncated', missing: 'missing', superseded: 'superseded', 'best-effort': '?' };
+
+/*
+ * BUG-177 — a quality gate (a Claude Code hook) can fail on EVERY turn and the
+ * transcript records it as a `hook_non_blocking_error` attachment, but Orchard
+ * used to filter that line out and show nothing. A gate whose failure is
+ * invisible is worse than no gate. The server rolls the failures up over the
+ * whole session (transcript.ts) and hands them here as `data.hookErrors`.
+ *
+ * Two things get rendered from it:
+ *  - a once-per-session BANNER (this) stating the hook, the error, whether it
+ *    ever ran, and how many turns it hit — one banner beats 21 identical badges;
+ *  - a small per-turn BADGE (applyHookBadges) on the turn each failure sits on,
+ *    so scrolling to a turn shows its gate silently failed there too.
+ *
+ * The dangerous case is a hook that never RAN (kind:'crash' — module missing,
+ * non-zero exit at launch): it manufactures the confidence it was meant to earn.
+ * That case is coloured as an error; a hook that ran and merely reported
+ * something is a warning.
+ */
+function hookBannerSeverity(he) {
+  return he.crashRecords > 0 ? 'crash' : 'reported';
+}
+
+function mountHookErrorBanner(th, hookErrors, scope) {
+  const he = hookErrors;
+  if (!he || !(he.totalRecords > 0)) return; // healthy session — render nothing
+  if (scope != null && scope !== state.txScope) return;
+  if (th.paneEl.querySelector(':scope > .hookfail')) return;
+
+  th.hookErrors = he; // kept so later-paged turns can still be badged
+
+  const sev = hookBannerSeverity(he);
+  const groups = Array.isArray(he.groups) ? he.groups : [];
+  const crashNames = [...new Set(groups.filter((g) => g.kind === 'crash').map((g) => g.hookName).filter(Boolean))];
+
+  const card = el('section', { class: 'hookfail', 'data-sev': sev, 'data-open': 'false', role: 'alert' });
+
+  const headline = sev === 'crash'
+    ? 'A quality-check step never ran'
+    : 'A quality-check step reported a problem';
+  let sub;
+  if (sev === 'crash') {
+    const t = he.crashRecords;
+    sub = `${crashNames.join(', ') || 'A hook'} failed to start on ${t} turn${t === 1 ? '' : 's'} — the check has been silently skipped.`;
+    if (he.reportedRecords > 0) sub += ` (+${he.reportedRecords} other hook warning${he.reportedRecords === 1 ? '' : 's'}.)`;
+  } else {
+    const t = he.reportedRecords;
+    sub = `Reported on ${t} turn${t === 1 ? '' : 's'}.`;
+  }
+
+  const tw = el('span', { class: 'tw', text: '▶' });
+  const head = el('button', { class: 'hf-head', 'aria-expanded': 'false', type: 'button' },
+    tw,
+    el('span', { class: 'hf-ico', 'aria-hidden': 'true', text: sev === 'crash' ? '⛔' : '⚠' }),
+    el('span', { class: 'hf-title', text: headline }),
+    el('span', { class: 'hf-sub', text: sub }));
+
+  const body = el('div', { class: 'hf-body', hidden: true });
+  for (const g of groups.slice(0, 20)) {
+    const kindLbl = g.kind === 'crash' ? 'never ran' : 'reported';
+    const row = el('div', { class: 'hf-grp', 'data-kind': g.kind },
+      el('div', { class: 'hf-grp-head' },
+        el('span', { class: 'hf-hook', text: g.hookName || 'hook' }),
+        g.hookEvent ? el('span', { class: 'hf-evt', text: g.hookEvent }) : null,
+        el('span', { class: 'hf-kind', text: kindLbl }),
+        el('span', { class: 'hf-count', text: `${g.count} turn${g.count === 1 ? '' : 's'}` })),
+      el('pre', { class: 'hf-msg', text: g.message || '(no message)' }));
+    body.append(row);
+  }
+  if (groups.length > 20) body.append(el('div', { class: 'hf-more', text: `…and ${groups.length - 20} more` }));
+  if (he.recordsCapped) body.append(el('div', { class: 'hf-note', text: 'Turn badges are shown for the first occurrences only.' }));
+
+  head.addEventListener('click', () => {
+    const open = card.getAttribute('data-open') === 'true';
+    card.setAttribute('data-open', open ? 'false' : 'true');
+    head.setAttribute('aria-expanded', open ? 'false' : 'true');
+    body.hidden = open;
+    tw.textContent = open ? '▶' : '▼';
+  });
+
+  card.append(head, body);
+  th.paneEl.prepend(card);
+}
+
+/*
+ * Best-effort per-turn badge: for each failure occurrence whose owning message
+ * (its parentUuid) is currently in the pane, tag that turn. Idempotent — safe to
+ * re-run after each page render; a turn already badged is skipped. Turns not yet
+ * paged in simply get no badge; the session banner carries the whole truth.
+ */
+function applyHookBadges(th) {
+  const he = th && th.hookErrors;
+  if (!he || !Array.isArray(he.records) || !he.records.length) return;
+  // Worst kind per parent uuid: a crash outranks a report.
+  const byParent = new Map();
+  for (const r of he.records) {
+    if (!r || typeof r.parentUuid !== 'string' || !r.parentUuid) continue;
+    const prev = byParent.get(r.parentUuid);
+    if (!prev || (prev.kind !== 'crash' && r.kind === 'crash')) byParent.set(r.parentUuid, r);
+  }
+  if (!byParent.size) return;
+  for (const [uuid, r] of byParent) {
+    const nodes = th.paneEl.querySelectorAll(`[data-uuid="${cssEscape(uuid)}"]`);
+    if (!nodes.length) continue;
+    const node = nodes[nodes.length - 1]; // the last block of that turn
+    if (node.querySelector(':scope > .hook-turn-badge')) continue;
+    const label = r.kind === 'crash' ? 'gate skipped' : 'gate warning';
+    node.append(el('span', {
+      class: 'hook-turn-badge',
+      'data-kind': r.kind,
+      title: `${r.hookName}${r.hookEvent ? ' (' + r.hookEvent + ')' : ''}: ${r.message}`,
+      text: label,
+    }));
+  }
+}
+
+/** Minimal CSS.escape fallback for attribute selectors (uuids are safe hex). */
+function cssEscape(s) {
+  if (typeof window !== 'undefined' && window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(s);
+  return String(s).replace(/["\\\]]/g, '\\$&');
+}
 
 async function mountSessionConfigCard(th, sess, scope) {
   let rec = null;
@@ -5138,13 +5393,18 @@ async function openSession(p, sess, opts = {}) {
     // never delays the transcript paint, and it stays the pane's top child
     // regardless of when it lands (prependNodes anchors older pages below it).
     mountSessionConfigCard(th, sess, scope);
+    // BUG-177 — a session-level roll-up of any silently-failed quality gates,
+    // pinned at the top. Rendered nothing when the session is healthy.
+    mountHookErrorBanner(th, t.hookErrors, scope);
     const tailStart = Number.isInteger(t.messages?.[0]?.index) ? t.messages[0].index : (t.offset ?? 0);
     if (at != null && at < tailStart) {
       // The remembered message is OLDER than the newest page: render a window
       // around it instead, and owe the rest forward (see the gap machinery).
       await openHistoryWindow(th, sess, at, t.total ?? 0, frozen);
+      applyHookBadges(th);
     } else {
       const shown = renderMessages(th, t.messages);
+      applyHookBadges(th);
       if (!shown) th.paneEl.append(el('div', { class: 'hint-row', text: 'This session has no readable messages.' }));
       th.page = pageCursor((before, beforeBytes) =>
         api.transcript(sess.encodedDir, sess.sessionId, { tail: OLDER_PAGE, before, beforeBytes }), t);
@@ -5599,6 +5859,622 @@ function dismissOutcomeIds(ids) {
   void api.dismissOutcomes(ids).catch(() => void refreshOutcomes());
 }
 
+/* ------------------------------ ARCH-017 step 2: the pending-results rail */
+/**
+ * Results Orchard is HOLDING, and the two things a user can do with them.
+ *
+ * The collapse is the feature: when every lane in a group has finished, the N
+ * results are ONE row with ONE "process" — a fan-out costs one collection
+ * instead of N wakeups. While a group is still in flight its finished members
+ * are listed individually and marked with what they are waiting on; "process"
+ * on one of those is the ESCAPE HATCH the user asked for — pull this result now
+ * without waiting for its siblings.
+ *
+ * HONESTY: `state.pending === null` means the rail has no answer yet and the
+ * section stays hidden. An empty array means a real, current "nothing is
+ * waiting". They must not render the same, because this surface exists to tell
+ * the user something IS waiting for them.
+ */
+async function refreshPending() {
+  if (state.caps.pending === false) return;
+  let r;
+  try { r = await api.pendingLanes({ projectId: state.current.projectId ?? undefined }); }
+  catch { return; /* transient — the rail keeps its last honest answer */ }
+  if (r === null) { state.caps.pending = false; return; } // older server: no such route
+  state.caps.pending = true;
+  if (r.problem) { state.pendingProblem = r.problem; renderPending(); return; }
+  state.pendingProblem = null;
+  state.pending = r.items;
+  renderPending();
+}
+
+/**
+ * The headline must account for EVERY row on the rail, not just the ready ones.
+ *
+ * Found by looking at the render rather than at the DOM: with five items the
+ * section (a shared `.rail-sub`, `max-height:158px; overflow:auto`) scrolled
+ * the last row out of sight, while the headline read "6 results ready in 3
+ * items" — so the two rows you could not see were also not counted anywhere,
+ * and the surface silently under-reported what was waiting for you. The
+ * waiting count is the thing that makes the number on screen add up to the
+ * number of rows.
+ */
+function pendingHeadline(list) {
+  const ready = list.filter((i) => i.ready);
+  const waiting = list.length - ready.length;
+  const results = ready.reduce((n, i) => n + i.laneIds.length, 0);
+  const tail = waiting ? ` · ${waiting} still finishing` : '';
+  if (!ready.length) return `${list.length} lane result${list.length === 1 ? '' : 's'} finishing`;
+  return `${results} result${results === 1 ? '' : 's'} ready in ${ready.length} item${ready.length === 1 ? '' : 's'}${tail}`;
+}
+
+/**
+ * The ONE sentence the user has to act on, lifted out of a long store message.
+ *
+ * Deliberately conservative: it returns a hint only when the text really
+ * contains an instruction, and NEVER paraphrases — a fabricated "recovery step"
+ * on a storage error would be worse than the clipping this exists to fix. The
+ * full message is always rendered underneath regardless, so a miss here costs
+ * prominence, not information.
+ */
+function recoveryHint(msg) {
+  const sentences = String(msg).split(/(?<=\.)\s+/).map((x) => x.trim()).filter(Boolean);
+  // Imperative recovery language used by the lane store's own error messages.
+  const imperative = /\b(stop it|point CLAUDE_STATION_DATA|move it aside|repair|recover by|try again|re-?run)\b/i;
+  for (let i = sentences.length - 1; i >= 0; i--) {
+    if (imperative.test(sentences[i])) return sentences[i].length > 240 ? `${sentences[i].slice(0, 240)}…` : sentences[i];
+  }
+  return null;
+}
+
+function renderPending() {
+  const host = node.railPending;
+  if (!host) return;
+  clear(host);
+  const list = state.pending ?? [];
+  if (state.pendingProblem) {
+    // The ledger is refused WHOLE (round 7's deliberate choice). Say so in the
+    // store's own words — the recovery path is in them — instead of hiding,
+    // which would claim nothing is waiting while results sit undeliverable.
+    host.hidden = false;
+    host.classList.add('stopped');
+    host.append(el('div', { class: 'sub-h', text: 'Held results — unreadable' }));
+    host.append(el('div', { class: 'brow', title: state.pendingProblem },
+      el('span', { class: 'g', text: '⛔' }),
+      el('span', { class: 'bt', text: state.pendingProblem.slice(0, 220) })));
+    return;
+  }
+  host.hidden = state.pending === null || (list.length === 0 && !state.pendingActionProblem && !state.lastDrain);
+  if (host.hidden) return;
+  host.classList.add('stopped');
+
+  /*
+   * §7 — THE FAILED ACTION, FIRST AND UNMISSABLE. Rendered above the rows
+   * because it explains why a row the user just clicked is still here. The
+   * server's own words: a non-writer store, a 503, a skipped lane all carry
+   * their recovery path in the message.
+   */
+  if (state.pendingActionProblem) {
+    /*
+     * ROUND 3 — THE MESSAGE HAS TO BE READABLE, NOT MERELY PRESENT.
+     *
+     * The round-2 fix surfaced the 503 "with the store's OWN words, because the
+     * recovery path is in them" — and then rendered those words in a `.bt`,
+     * which is `white-space:nowrap; overflow:hidden; text-overflow:ellipsis` in
+     * a 210px rail, on top of a `.slice(0, 220)`. Measured by a verifier:
+     * `{textLen:220, clientWidth:210, scrollWidth:1195, approxVisibleChars:38}`
+     * of a 1115-character message, with the actual instruction living in the
+     * TAIL and surviving only in a `title` tooltip. So the error was technically
+     * surfaced and practically unreadable — and a non-writer server is the state
+     * a user is least able to hover their way out of.
+     *
+     * Both cuts are gone: no slice, and `.brow.problem .bt` wraps. The recovery
+     * sentence is ALSO lifted to the front, because it is the only part the user
+     * has to act on and it was the part furthest from the eye.
+     */
+    const msg = state.pendingActionProblem;
+    const warn = el('div', { class: 'brow problem' });
+    warn.dataset.pendingProblem = '1';
+    warn.append(el('span', { class: 'g', text: '⚠' }));
+    const body = el('span', { class: 'bt' });
+    const hint = recoveryHint(msg);
+    /*
+     * The instruction is lifted to the front, so it must NOT also be left in
+     * the body — measured after the round-4 dedupe: the row was 753 chars for a
+     * 597-char message because the recovery sentence appeared twice, and this
+     * row already takes ~70% of the rail's viewport. Removed by exact match
+     * only; if the sentence is not found verbatim the full message renders
+     * unchanged, so this can shorten the text but never lose any of it.
+     */
+    if (hint) body.append(el('strong', { class: 'fix-first', text: hint }), el('br'));
+    const rest = hint && msg.includes(hint) ? msg.replace(hint, '').replace(/\s{2,}/g, ' ').trim() : msg;
+    body.append(document.createTextNode(rest));
+    warn.append(body);
+    const dismissWarn = el('button', { type: 'button', class: 'lnk', text: 'ok', title: 'Hide this message. It will come back if the next attempt fails too.' });
+    dismissWarn.addEventListener('click', () => { state.pendingActionProblem = null; renderPending(); });
+    warn.append(dismissWarn);
+    host.append(warn);
+  }
+
+  /*
+   * §5 — THE COLLECTED BUNDLE HAS A DOM SURFACE. It used to go only to
+   * `console.info`, so a user "collected" N results into devtools. The text is
+   * put in the message composer (that is the actual one-wakeup path: N results
+   * land in your draft and you send ONCE), and this row confirms it and can
+   * re-copy it.
+   */
+  // Nothing left to act on, but a just-collected bundle still has to render —
+  // otherwise collecting the LAST item makes its own receipt vanish.
+  if (!list.length) { renderLastDrain(host); return; }
+  const head = el('div', { class: 'sub-h', text: pendingHeadline(list) });
+  const readyIds = list.filter((i) => i.ready).map((i) => i.id);
+  if (readyIds.length > 1) {
+    const all = el('button', {
+      type: 'button', class: 'lnk', text: 'process all',
+      title: 'Collect every READY item in one go. Items still waiting on a sibling are deliberately left alone — pulling one early is a per-item choice.',
+    });
+    all.addEventListener('click', () => void processPending(readyIds));
+    head.append(all);
+  }
+  const dismissAll = el('button', {
+    type: 'button', class: 'lnk', text: 'dismiss all',
+    title: 'Discard these WITHOUT collecting them. The result files stay on disk under the lane directories; only the claim on your attention goes away.',
+  });
+  dismissAll.addEventListener('click', () => void dismissPending(list.map((i) => i.id)));
+  head.append(dismissAll);
+  host.append(head);
+
+  /*
+   * §4 — NO ROW IS UNREACHABLE. The old hard `break` at 12 left 5 of 17 items
+   * with no row at all: no per-item process, no per-item dismiss, and no
+   * indication they existed. `process all` did still collect them (it reads the
+   * list, not the DOM), which is exactly what makes the omission dangerous —
+   * the user acts on more than they can see. Capped for length, never hidden.
+   */
+  const CAP = 12;
+  const shown = state.showAllPending ? list : list.slice(0, CAP);
+  const overflow = list.length - shown.length;
+  for (const it of shown) {
+    const row = el('div', { class: 'brow', title: `${it.reason}\n\n${it.excerpt}` });
+    row.dataset.pendingId = it.id;
+    row.append(el('span', { class: 'g', text: it.ready ? (it.kind === 'group' ? '📦' : '📥') : '⏳' }));
+    const n = it.laneIds.length;
+    row.append(el('span', {
+      class: 'bt',
+      /*
+       * §6 — `waitingOn` is the count of unsettled SIBLINGS, which is 0 for an
+       * open group whose members have all settled (the normal state for up to
+       * GROUP_CLOSE_TTL_MS). The old string rendered "ready, waiting on 0 more",
+       * which is incoherent: the reason it is not ready is that the group is
+       * still OPEN, not that anything is running. Say the true reason.
+       */
+      text: it.ready
+        ? `${it.label} — ${n} result${n === 1 ? '' : 's'} ready`
+        : it.waitingOn > 0
+          ? `${it.label} — ready, waiting on ${it.waitingOn} more`
+          : `${it.label} — ready, group still open`,
+    }));
+    const go = el('button', {
+      type: 'button', class: 'lnk', text: it.ready ? 'process' : 'process now',
+      title: it.ready ? it.reason : `Escape hatch: collect this result now instead of waiting for ${it.waitingOn} sibling lane(s).`,
+    });
+    go.addEventListener('click', () => void processPending([it.id]));
+    row.append(go);
+    const x = el('button', { type: 'button', class: 'lnk', text: 'dismiss', title: 'Discard without collecting.' });
+    x.addEventListener('click', () => void dismissPending([it.id]));
+    row.append(x);
+    host.append(row);
+  }
+  if (overflow > 0 || state.showAllPending) {
+    const more = el('button', {
+      type: 'button', class: 'rail-more',
+      title: state.showAllPending
+        ? 'Collapse back to the first 12.'
+        : `${overflow} more held result(s) have no row yet — show them so you can process or dismiss each one.`,
+    },
+      el('span', { class: 'rm-n', text: state.showAllPending ? '−' : `+${overflow}` }),
+      el('span', { class: 'rm-l', text: state.showAllPending ? 'show fewer' : 'more — show all' }));
+    more.dataset.pendingMore = '1';
+    more.addEventListener('click', () => { state.showAllPending = !state.showAllPending; renderPending(); });
+    host.append(more);
+  }
+  renderLastDrain(host);
+}
+
+/*
+ * The collected bundle, rendered BELOW the actionable rows.
+ *
+ * Ordering is load-bearing and was got wrong first: rendered above the list,
+ * the bundle's <pre> filled the section's whole 158px and pushed every
+ * process/dismiss row out of view, so collecting one item hid the sixteen you
+ * had not dealt with yet. The rail's job is the rows; this is the receipt.
+ */
+function renderLastDrain(host) {
+  if (state.lastDrain) {
+    const d = state.lastDrain;
+    const row = el('div', { class: 'brow', title: d.bundle.slice(0, 1200) });
+    row.dataset.lastDrain = '1';
+    row.append(el('span', { class: 'g', text: '✓' }));
+    row.append(el('span', { class: 'bt', text: `collected ${d.lanes.length} result${d.lanes.length === 1 ? '' : 's'} → added to your message` }));
+    const copy = el('button', { type: 'button', class: 'lnk', text: 'copy', title: 'Copy the collected results to the clipboard.' });
+    copy.addEventListener('click', () => { void navigator.clipboard?.writeText(d.bundle); });
+    row.append(copy);
+    const hide = el('button', { type: 'button', class: 'lnk', text: 'hide' });
+    hide.addEventListener('click', () => { state.lastDrain = null; renderPending(); });
+    row.append(hide);
+    host.append(row);
+    // The full text, present in the DOM and selectable — not just a tooltip.
+    const pre = el('pre', { class: 'drain-bundle', text: d.bundle });
+    pre.dataset.drainBundle = '1';
+    host.append(pre);
+  }
+}
+
+
+/**
+ * Collect. TWO calls, and not by accident: `process` stamps Orchard's handoff
+ * and hands back the bytes, then `ack` stamps the acknowledgement against a
+ * digest only a holder of those bytes can produce. If this browser dies in
+ * between, the lanes stay HELD and come back on the next poll — re-offered, not
+ * lost. Optimistic removal keeps the click instant; the poll is authoritative.
+ */
+async function processPending(ids) {
+  if (!ids.length) return;
+  const set = new Set(ids);
+  const before = state.pending ?? [];
+  state.pending = before.filter((i) => !set.has(i.id));
+  state.pendingActionProblem = null;
+  renderPending();
+
+  /*
+   * ROUND 9 (finding 5) — DELIVERY IS BOUND TO THE SESSION THAT INITIATED IT.
+   *
+   * `processPending` awaits the drain, and the user can switch project/session in
+   * that gap. The composer (`node.prompt`) is a boot-time cache, so after a switch
+   * it is the NEW session's box — and A's collected results were written into B's
+   * composer and acknowledged: `rail switch: destination:"B" contains:true acks:1`,
+   * a cross-project data leak. The initiating session+project are captured here and
+   * re-checked before the results are placed and again before the ack; if the user
+   * has moved on, nothing is delivered or acknowledged (the results stay held and
+   * are re-offered) and they are told.
+   */
+  /*
+   * ROUND 10 (finding 1) — COMPARE THE FIELD SESSION SELECTION ACTUALLY STORES.
+   * Round 9 read `state.current.id`, but a selected session is `state.current`
+   * `{sessionId, projectId, encodedDir}` — there is no `.id` — so the guard
+   * compared `undefined` to `undefined` and passed for EVERY session, including
+   * none at all (`same/other/gone` all delivered A's result and acked). The
+   * screenshot that "proved" it showed only the happy path, which passes either
+   * way. This reads `sessionId`, and the negative case (C10) fails if this guard
+   * is deleted.
+   */
+  /*
+   * ROUND 11 (finding 2) — REFUSE AN ABSENT DESTINATION, KEY ON EVERYTHING
+   * SELECTION STORES, AND CATCH A RE-OPENED SAME-ID CONTEXT.
+   *
+   * The seventh review showed round 10's guard still delivered when it must not:
+   *   absent:    sessionId null on both sides ⇒ null === null passed
+   *   directory: `encodedDir` changed (which session selection DOES key on,
+   *              `openSession` sets it) but the guard never compared it
+   *   recreated: the same id re-selected is a NEW `state.current` object with
+   *              identical fields — field equality alone cannot tell it apart
+   * So delivery now refuses unless ALL of these hold at the delivery instant:
+   *   1. there IS a session (`sessionId` non-null) — you cannot deliver a
+   *      result into "no open session"; an absent id is a refusal, not a pass;
+   *   2. `sessionId`, `projectId` AND `encodedDir` all still equal the origin —
+   *      `encodedDir` is the store directory selection keys on, so a changed
+   *      one is a different destination even if the id string repeats;
+   *   3. `state.current` is the SAME object reference captured at the start —
+   *      `state.current` is only ever reassigned by navigation (openSession /
+   *      new-session, three sites, all verified), so a replaced reference means
+   *      the context was re-opened, which is the recreated-same-id case.
+   */
+  const originRef = state.current ?? null;
+  const origin = {
+    sessionId: state.current?.sessionId ?? null,
+    projectId: state.current?.projectId ?? null,
+    encodedDir: state.current?.encodedDir ?? null,
+  };
+  const sessionMoved = () =>
+    (state.current?.sessionId ?? null) == null ||               // (1) no destination
+    state.current !== originRef ||                              // (3) context re-opened
+    (state.current?.sessionId ?? null) !== origin.sessionId || // (2) …
+    (state.current?.projectId ?? null) !== origin.projectId ||
+    (state.current?.encodedDir ?? null) !== origin.encodedDir;
+
+  /*
+   * §7 — EVERY FAILURE PATH ENDS IN SOMETHING THE USER CAN SEE.
+   *
+   * Reproduced by an independent verifier against a non-writer server: the
+   * drain answered 200 with `lanes: []` and the reason inside `skipped[]`, this
+   * function ignored it, called `ack` with an empty list, got a 400, and threw
+   * out through a `finally` with no `catch` — the row reappeared and NOTHING
+   * was shown. For a surface whose whole purpose is "these results are waiting
+   * for you", a silent no-op is the worst available behaviour.
+   */
+  let r;
+  try {
+    r = await api.processLanes(ids, state.current.projectId ?? undefined);
+  } catch (err) {
+    state.pendingActionProblem = `could not collect: ${err.message}`;
+    await refreshPending();
+    return;
+  }
+  if (r === null) {
+    state.pendingActionProblem = 'this server does not support collecting held lane results (no /api/lanes/process route).';
+    await refreshPending();
+    return;
+  }
+  if (!r.receipt || !Array.isArray(r.lanes)) {
+    state.pendingActionProblem = 'the server answered without a receipt, so nothing could be collected. The results are still held.';
+    await refreshPending();
+    return;
+  }
+  // Partial success is still a failure FOR THE SKIPPED LANES, and they are the
+  // ones that will silently reappear — so they are named.
+  if (r.skipped?.length) {
+    state.pendingActionProblem = `${r.skipped.length} result(s) could not be handed over and are still held: ${r.skipped.map((x) => x.why).join('; ')}`;
+  }
+  if (!r.lanes.length) {
+    state.pendingActionProblem = state.pendingActionProblem || 'nothing was handed over — the results are still held.';
+    await refreshPending();
+    return;
+  }
+  /*
+   * DELIVER FIRST, ACKNOWLEDGE SECOND — the order is the whole point.
+   *
+   * A cross-provider review measured `4 ack: composerHasResult=false`: the
+   * acknowledgement was sent BEFORE the bundle reached the composer, so a
+   * failure or a reload in between left the ledger saying "collected" for a
+   * result that had arrived nowhere the user could see. An acknowledgement is
+   * the consumer's statement that it HAS the bytes where it said it would put
+   * them; making it before putting them there is a claim about the future.
+   *
+   * This is the same rule the store already enforces on itself (settle → write
+   * → handoff → acknowledge); the client half was doing it backwards.
+   */
+  /*
+   * DELIVERY IS VERIFIED, NOT ASSUMED, BEFORE ANYTHING IS ACKNOWLEDGED.
+   *
+   * Round 5 moved the composer write ahead of the ack, which was necessary and
+   * not sufficient. A second cross-provider review drove three failure modes
+   * through it and all three acknowledged, or escaped, silently:
+   *   5-order {"mode":"missing","diskAcknowledged":true,"composerHasFullResult":false}
+   *   5-order {"mode":"throws","refreshes":0,"visibleError":null,"escaped":"composer failed"}
+   *   5-order {"mode":"partial","diskAcknowledged":true,"composerHasFullResult":false}
+   * i.e. no composer at all, a composer that throws, and a composer that ended
+   * up holding only part of the bundle — the first and third stamped the ledger
+   * "collected" for a result the user never got, and the second left the turn
+   * with no refresh and nothing on screen.
+   *
+   * An acknowledgement claims the bytes ARE where we said we put them, so the
+   * claim is now checked against the composer's actual contents. A failure
+   * here is reported and NOT acknowledged: the results stay held and are
+   * re-offered, which is the outcome this whole design prefers.
+   */
+  // The session may have changed while the drain was in flight — do not write one
+  // project's results into another's composer.
+  if (sessionMoved()) {
+    state.pendingActionProblem = 'you switched session while these results were being collected, so they were NOT placed anywhere — they stay held and will be offered again where they belong.';
+    await refreshPending();
+    return;
+  }
+  let delivery;
+  try {
+    delivery = showPendingBundle(r);
+  } catch (err) {
+    delivery = { delivered: false, why: `the collected results could not be placed in your message box (${err.message})` };
+  }
+  if (!delivery.delivered) {
+    state.pendingActionProblem = `${delivery.why}. Nothing was marked collected, so these results are still held and will be offered again.`;
+    await refreshPending();
+    return;
+  }
+  /*
+   * The digest is computed the way the STORE computes it — `lanes.receiptDigest`
+   * — over what actually arrived: sha256(nonce ‖ len(channel) ‖ ':' ‖ channel ‖
+   * bytes). The length delimiter matters now that the channel is a free string:
+   * without it, channel `"a"` over `"bc"` and channel `"ab"` over `"c"` hash the
+   * same. The nonce makes an earlier receipt useless for a later identical
+   * bundle, and the channel states where these bytes were put.
+   */
+  /*
+   * ROUND 9 (finding 5) — A DIGEST FAILURE IS A REFUSAL, NOT AN ESCAPE. When
+   * `sha256Hex` (SubtleCrypto) is unavailable or throws, the `await` used to
+   * propagate out of `processPending` with no refresh and nothing shown (`rail
+   * digest-fails: escaped:true refresh:0 problem:false`). Without a digest no
+   * honest receipt can be produced, so the ack is refused and the user told.
+   */
+  const channelBytes = new TextEncoder().encode(r.receipt.channel ?? '').length;
+  let digest;
+  try {
+    digest = await sha256Hex(`${r.receipt.nonce}${channelBytes}:${r.receipt.channel ?? ''}${r.bundle ?? ''}`);
+  } catch (err) {
+    state.pendingActionProblem = `the delivery receipt could not be computed (${err && err.message}), so nothing was acknowledged — these results stay held and will be offered again.`;
+    await refreshPending();
+    return;
+  }
+
+  /*
+   * RE-CHECK AT THE MOMENT THE ACK IS SENT — NOT BEFORE THE AWAIT.
+   *
+   * Round 6 added an `isConnected` test inside `showPendingBundle`, and a third
+   * cross-provider review showed it only proves something about the instant it
+   * runs:
+   *
+   *   4 replace-on-input      {"acks":1,"refresh":1,"connected":false,"error":false}
+   *   4 replace-during-digest {"acks":1,"refresh":1,"connected":false,"error":false}
+   *
+   * The composer can be torn down by a listener on the very `input` event we
+   * dispatch, or during the `await` above — a genuine gap, since re-rendering
+   * on input is ordinary UI behaviour. An initially-detached node was correctly
+   * refused, which is exactly why this looked fixed.
+   *
+   * An acknowledgement is a statement about where the bytes ARE, so the only
+   * honest place to check is immediately before making it. This re-asks the
+   * whole question — still on screen, still ours, still visible, still holding
+   * these bytes — after every await has settled.
+   */
+  /*
+   * ROUND 8 — THE RE-CHECK ITSELF MUST NOT ESCAPE. A fourth cross-provider
+   * review made `composerProblem` THROW (an `isConnected` getter that throws) and
+   * the whole turn escaped: `4 throw-recheck {"acks":0,"refresh":0,"rejected":true,
+   * "problem":false}` — no ack (good), but no refresh and NOTHING shown to the
+   * user (bad). A check that cannot answer is a refusal, not an exception: any
+   * throw here is treated as "could not confirm", which refuses the ack and tells
+   * the user, exactly as an explicit problem does.
+   */
+  if (sessionMoved()) {
+    state.pendingActionProblem = 'you switched session before these results could be acknowledged, so nothing was marked collected — they stay held and will be offered again where they belong.';
+    await refreshPending();
+    return;
+  }
+  let lost;
+  try { lost = composerProblem(node.prompt, r.bundle); }
+  catch (err) { lost = `the message box could not be confirmed (${err && err.message})`; }
+  if (lost) {
+    state.pendingActionProblem = `${lost}. Nothing was marked collected, so these results are still held and will be offered again.`;
+    await refreshPending();
+    return;
+  }
+
+  try {
+    const ack = await api.ackLanes(r.lanes.map((l) => l.id), { bytes: r.receipt.bytes, digest, nonce: r.receipt.nonce, channel: r.receipt.channel });
+    if (ack?.refused?.length) {
+      state.pendingActionProblem = `${ack.refused.length} result(s) were sent but could not be marked collected, so they will be offered again: ${ack.refused.map((x) => x.why).join('; ')}`;
+    }
+  } catch (err) {
+    state.pendingActionProblem = `collected, but the acknowledgement failed (${err.message}) — these results will be offered again rather than lost.`;
+  }
+  await refreshPending();
+}
+
+/** SubtleCrypto sha256, hex. Fed `nonce ‖ channel ‖ bytes` — the store's own
+ *  receipt rule (`lanes.receiptDigest`), not a second local one. */
+async function sha256Hex(text) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * §5 — PUT THE COLLECTED BUNDLE WHERE THE USER ACTUALLY WANTS IT.
+ *
+ * This used to write the drain to `console.info` and nothing else, so a user
+ * "collected" N results into a devtools console — verified by a reviewer: after
+ * clicking process, no DOM node anywhere contained the collected text.
+ *
+ * The composer is the right destination, not a modal: the point of this whole
+ * ticket is that an N-lane fan-out should cost ONE wakeup, and N results landing
+ * in your draft so you can send ONCE is that outcome made concrete. The rail row
+ * and the `<pre>` rendered next to it are the confirmation and the copy path.
+ */
+function showPendingBundle(r) {
+  const n = (r.lanes ?? []).length;
+  if (!n) return { delivered: false, why: 'the drain returned no results to deliver' };
+  /*
+   * `node.prompt` IS A CACHE, NOT A QUESTION.
+   *
+   * `node` is built once at boot (`prompt: $('#prompt')`), so this reference
+   * survives the composer being removed, replaced or re-rendered. A detached
+   * textarea is truthy, accepts `.value`, and reads back exactly what you wrote
+   * — so the existence check passed, the read-back below passed, and the
+   * acknowledgement went out, for a result that had been written into a node no
+   * longer in the document. "Collected" for bytes the user cannot see is the
+   * precise failure this whole delivery-verdict change exists to prevent, and
+   * it survived the change.
+   *
+   * Measured in round 6: with `#prompt` removed from the DOM, the client still
+   * sent the ack (`ackWasSent:true`) and reported no problem. `isConnected` is
+   * the actual question — is this node in the document RIGHT NOW.
+   */
+  const box = node.prompt;
+  const problem = composerProblem(box, null);
+  if (problem) return { delivered: false, why: problem };
+  const header = `Results collected by Orchard (${n} lane${n === 1 ? '' : 's'}, one drain):`;
+  const before = box.value ?? '';
+  box.value = `${before ? `${before.replace(/\s+$/, '')}\n\n` : ''}${header}\n${r.bundle}\n`;
+  box.dispatchEvent(new Event('input', { bubbles: true }));
+  /*
+   * READ IT BACK. The composer is a DOM node other code also writes to, so the
+   * only honest basis for "it is there" is that it is there NOW. A partial or
+   * swallowed write is otherwise indistinguishable from a successful one.
+   */
+  const after = box.value ?? '';
+  if (!after.includes(r.bundle)) {
+    return { delivered: false, why: 'the collected results did not survive being written to your message box (it holds something else now)' };
+  }
+  state.lastDrain = { at: Date.now(), lanes: r.lanes.map((l) => l.id), bytes: r.receipt.bytes, bundle: r.bundle };
+  try { saveDraft(state.current); } catch { /* draft persistence is a nicety; the text is already in the box */ }
+  console.info(`[orchard] ARCH-017 drain — ${n} result(s), ${r.receipt.bytes} bytes:\n${r.bundle}`);
+  return { delivered: true, why: null };
+}
+
+/*
+ * IS THE COMPOSER A PLACE THESE BYTES REALLY ARE? — the ONE rule, asked twice.
+ *
+ * `node.prompt` is a boot-time cache (`prompt: $('#prompt')`), so its mere
+ * existence proves nothing: a detached, replaced, hidden or foreign-document
+ * textarea is truthy, accepts `.value`, and reads back exactly what you wrote.
+ * Round 6 checked `isConnected` once, before an `await`; a review then showed
+ * every way that is still evadable. So the question lives in one function and
+ * is asked at BOTH moments that matter — when writing, and again immediately
+ * before the acknowledgement.
+ *
+ * `wantBundle` is optional: pass it to also require that the box still HOLDS
+ * those bytes, which is the actual claim an acknowledgement makes.
+ */
+function composerProblem(box, wantBundle) {
+  if (!box) return 'there is no message box on screen to deliver the collected results into';
+  if (!box.isConnected) return 'the message box was removed from the page before the collected results could be confirmed in it';
+  /*
+   * A node whose ownerDocument is not this page's (a detached fragment, an
+   * iframe, a stub) is not a destination the user can read. `document` is
+   * referenced defensively so this is testable outside a browser.
+   */
+  const doc = typeof document === 'undefined' ? undefined : document;
+  if (box.ownerDocument && box.ownerDocument !== doc) return 'the message box no longer belongs to this page, so the collected results are not where the user is looking';
+  /*
+   * ROUND 8 — HIDDEN is inherited, so walk the ANCESTORS, not just the box.
+   * `4 hidden-ancestor {"acks":1,...}` — a composer whose own `hidden` is false
+   * but whose PARENT is hidden still acknowledged, because only `box.hidden` was
+   * checked. A textarea inside a `hidden` (or `display:none`) ancestor is not on
+   * screen; the user cannot see the result there. Walk up while ancestors are
+   * reachable and refuse if any is hidden.
+   */
+  const cs = (typeof getComputedStyle === 'function') ? getComputedStyle : null;
+  for (let el = box; el; el = el.parentElement) {
+    if (el.hidden === true) return 'the message box (or a container it is inside) is hidden, so the collected results would not be visible';
+    /*
+     * ROUND 9 (finding 5) — STRUCTURE IS NOT VISIBILITY. The `hidden` walk missed
+     * a CSS-hidden ancestor (`display:none`/`visibility:hidden`), and the result
+     * was acknowledged into a composer the user cannot see (`rail css: acks:1`).
+     * Computed style is authoritative in a real browser; the inline-style fallback
+     * keeps this answerable in a stubbed test environment where layout is absent.
+     */
+    const st = (cs && el.nodeType === 1) ? cs(el) : (el.style || null);
+    if (st && (st.display === 'none' || st.visibility === 'hidden')) {
+      return 'the message box (or a container it is inside) is not visible (display:none / visibility:hidden), so the collected results would not be seen';
+    }
+  }
+  if (wantBundle != null && !String(box.value ?? '').includes(wantBundle)) {
+    return 'the collected results are no longer in your message box (it holds something else now)';
+  }
+  return null;
+}
+
+async function dismissPending(ids) {
+  if (!ids.length) return;
+  const set = new Set(ids);
+  state.pending = (state.pending ?? []).filter((i) => !set.has(i.id));
+  state.pendingActionProblem = null;
+  renderPending();
+  // §7 — a 503 here (corrupt ledger, non-writer server) used to be swallowed and
+  // the row silently returned with no explanation.
+  try { await api.dismissPendingLanes(ids, state.current.projectId ?? undefined); }
+  catch (err) { state.pendingActionProblem = `could not discard: ${err.message}`; }
+  finally { await refreshPending(); }
+}
+
 /**
  * BUG-070 — the rail's death list. The DEFAULT view is recent + undismissed so
  * a mass event days ago cannot bury today's real death; "show all" reveals the
@@ -5746,13 +6622,17 @@ function renderRail() {
     for (const it of observations) node.railObservations.append(observationRow(it));
   }
 
-  // queued (owner — ) — FEAT-053: the todo backlog, read-only, absent when empty
+  // queued (owner — ) — FEAT-053: the todo backlog, read-only, absent when empty.
+  // FEAT-139 — the backlog is REFERENCE material, not immediate view: rendering
+  // the whole list (often ~80 tickets) buried the asks that actually need the
+  // user. The rail now shows only the count; the full, ordered list is one click
+  // away on the board (nothing removed, no route lost).
   clear(node.railQueued);
   node.railQueued.hidden = queued.length === 0;
   if (queued.length) {
     node.railQueued.classList.add('queued');
     node.railQueued.append(el('div', { class: 'sub-h', text: 'Queued' }));
-    for (const it of queued) node.railQueued.append(boardRow(it, null));
+    node.railQueued.append(railMoreRow(queued.length, 'queued'));
   }
 
   // in-flight (🤖) — read-only
@@ -6008,12 +6888,41 @@ node.railBoardLink.addEventListener('click', openBoardFromChrome);
  * INDEX edit, another client, or a runtime decision answered elsewhere) is
  * dropped; a card for a newly-appeared id is freshly built.
  */
+/**
+ * FEAT-139 — the rail's default view is IMMEDIATE, not a reference list. Show
+ * at most the focus item plus the next couple of asks as full interactive
+ * cards; everything beyond that collapses to a single one-click "+N more →
+ * board" count. No ask is deleted and no route is lost — the complete list is
+ * one click away on the board (navTickets). The in-place reconcile below is
+ * preserved for the SHOWN set, so a card a user is mid-typing in is left
+ * untouched as long as it stays within the cap.
+ */
+const NEEDS_RAIL_CAP = 3;
+
+/** A one-click "N label → board" count row for the collapsed rail sections. */
+function railMoreRow(n, label) {
+  const pid = state.boardProjectId ?? state.current.projectId;
+  const row = el('button', {
+    type: 'button', class: 'rail-more',
+    title: `${n} ${label} — open the board to see them all`,
+  }, el('span', { class: 'rm-n', text: String(n) }),
+     el('span', { class: 'rm-l', text: `${label} → board` }));
+  row.addEventListener('click', () => { if (pid) navTickets(pid, null); });
+  return row;
+}
+
 function reconcileNeeds(needs) {
   const container = node.railNeeds;
+  // The overflow count is re-derived every render — drop any prior one first so
+  // the cursor walk below sees only real cards.
+  container.querySelector('.rail-more')?.remove();
+  const shown = needs.slice(0, NEEDS_RAIL_CAP);
+  const overflow = needs.length - shown.length;
+
   const existing = new Map();
   for (const c of container.querySelectorAll('.needs-card')) existing.set(c.dataset.id, c);
 
-  if (!needs.length) {
+  if (!shown.length) {
     for (const c of existing.values()) c.remove();
     if (!container.querySelector('.rail-empty')) {
       container.append(el('div', { class: 'rail-empty' },
@@ -6030,16 +6939,19 @@ function reconcileNeeds(needs) {
   // node within the SAME live parent (never through a detached fragment) keeps
   // it connected the whole time, so a focused textarea does not blur.
   let cursor = container.firstChild;
-  for (const it of needs) {
+  for (const it of shown) {
     const have = existing.get(it.id);
     const target = have ?? needsCard(it);
     if (have) existing.delete(it.id);
     if (target === cursor) cursor = target.nextSibling; // already in place — leave untouched
     else container.insertBefore(target, cursor); // moves/inserts; cursor is still the right anchor
   }
-  // Anything left in `existing` is no longer in the board's 👤 set — resolved
-  // out-of-band. This is the fix: BUG-016's lingering card is dropped here.
+  // Anything left in `existing` is no longer shown (resolved out-of-band, or
+  // pushed past the cap) — drop its card. BUG-016's lingering card dies here too.
   for (const stale of existing.values()) stale.remove();
+
+  // The rest of the asks are reference material now — one click to the board.
+  if (overflow > 0) container.append(railMoreRow(overflow, 'more need you'));
 }
 
 /**
@@ -6407,6 +7319,11 @@ async function pollRail() {
     // nothing else is happening (the whole point of the feature) must surface
     // without any other traffic to piggyback on.
     await refreshOutcomes();
+    // ARCH-017 — held lane results ride the SAME poll, for the same reason the
+    // death ledger does: a background fan-out that settles while nothing else
+    // is happening is precisely the case this feature exists for, so it must
+    // surface with no other traffic to piggyback on.
+    await refreshPending();
   }
   scheduleRailPoll();
 }
@@ -6708,6 +7625,14 @@ function paintStripSummary(model) {
  * which is how a tab kept a killed agent's stopwatch climbing.)
  */
 setInterval(() => {
+  // BUG-178: keep the dock chip's foreground-wait elapsed honest without
+  // repainting the whole queue box (which would clobber an in-progress edit).
+  // Only the `.q-el` text is touched — the set of rows is never changed here.
+  const qel = document.getElementById('queueBox')?.querySelector('.q-el');
+  if (qel) {
+    const fw = foregroundWait();
+    if (fw && fw.startedAt) qel.textContent = fmtElapsed(Date.now() - fw.startedAt);
+  }
   if (node.strip.hidden) return;
   const model = stripModel();
   const rows = [...node.stripRows.children];
@@ -6792,6 +7717,56 @@ function idleBehindBackground() {
   return !!snap
     && !!snap.turn && snap.turn.running === false
     && Array.isArray(snap.running) && snap.running.some((r) => r.row !== 'main');
+}
+
+/**
+ * BUG-178 — the FOREGROUND twin of idleBehindBackground(). The main turn is
+ * genuinely RUNNING (turn.running is not false — the strand is handled above),
+ * and there is a non-`main` running row: a subagent or a long tool lane held
+ * inside a single in-flight tool call. That is the state where "delivers at the
+ * next pause" is a lie by omission — the pause is that step finishing, which can
+ * be minutes or tens of minutes away (measured: a foreground Agent subagent held
+ * a queued message unseen for 20 min). This reads the server's own snapshot — no
+ * guess — and returns the OLDEST such lane so the chip can name it and show how
+ * long it has already run. Returns null when the boundary is genuinely close (an
+ * ordinary tool chain hits one every few seconds, no non-main row) so the plain
+ * "delivers at the next pause" — which is honest there — is kept.
+ *
+ * BUG-178 round 2 — the FOREGROUND fact is NOT re-derived here. Round 1 read
+ * "turn.running !== false plus a non-`main` row" as foreground, which is FALSE
+ * in the common workload: the orchestrator keeps its turn running while a
+ * `run_in_background` fan-out persists, so several concurrent background lanes
+ * coexist with a running main turn whose next boundary is seconds away. That
+ * misfire named an arbitrary background lane and steered the user to a
+ * destructive Force send. The server now DECLARES the fact per lane
+ * (`RunningEntry.background`, owned by the bridge — ARCH-010), and this reads
+ * ONLY lanes explicitly marked foreground (`background === false`). A lane whose
+ * background-ness the server did not declare (older server, survivor lane) is
+ * treated as "not known to be foreground" and never triggers the blocked copy —
+ * deleting a claim we cannot substantiate beats guessing it.
+ */
+function foregroundWait() {
+  const snap = dockSnap();
+  if (!snap || !Array.isArray(snap.running)) return null;
+  // turn.running === false is the strand (idleBehindBackground); absent turn on
+  // an older server reads as running, which is correct here — state.busy holds.
+  if (snap.turn && snap.turn.running === false) return null;
+  // Only lanes the SERVER declared foreground block the boundary. `background`
+  // absent ⇒ not known to be foreground ⇒ excluded (never the scary copy).
+  const lanes = snap.running.filter((r) => r.row !== 'main' && r.background === false);
+  if (!lanes.length) return null;
+  const timed = lanes.filter((r) => Number.isFinite(r.startedAt) && r.startedAt > 0);
+  const oldest = timed.length
+    ? timed.reduce((a, b) => (a.startedAt <= b.startedAt ? a : b))
+    : lanes[0];
+  return {
+    count: lanes.length,
+    // A neutral name: the row may be a real subagent OR a bash tool lane
+    // (BUG-171), so "step" is the honest word for both. Prefer the server's
+    // short label, fall back to what it is doing, then a generic phrase.
+    label: oldest.label || oldest.description || oldest.lastTool || 'a long tool call',
+    startedAt: Number.isFinite(oldest.startedAt) && oldest.startedAt > 0 ? oldest.startedAt : null,
+  };
 }
 
 /**
@@ -9711,6 +10686,19 @@ function paintQueue() {
    * a self-retry loop that reconnects, so "not driving" would understate them.
    */
   const notDriving = !isDriving(); // BUG-153: the same predicate the chip and the guards read
+  /*
+   * BUG-178: when a message is queued behind a genuinely-running main turn that
+   * is held inside a long-lived FOREGROUND step (a subagent or a long tool
+   * lane), the bare "delivers at the next pause" reads identically to a
+   * two-second wait while the real wait can be tens of minutes. Detect that one
+   * state — same guards as the busy/not-strand chip branch below — and render a
+   * copy that names the step and shows its live elapsed. Null everywhere else,
+   * so every other branch (including the ordinary tool chain, where the pause
+   * really is seconds away) keeps its existing honest wording.
+   */
+  const fg = (pending.length && !heldRow && !pending.some((q) => q.drainWait)
+    && !state.dropped && !notDriving && state.busy && !idleBehindBackground())
+    ? foregroundWait() : null;
   const why = !pending.length
     // BUG-149: name the affordance that now exists, instead of asking the user
     // to select text out of a textarea by hand.
@@ -9746,9 +10734,13 @@ function paintQueue() {
            */
           ? (idleBehindBackground()
               ? 'queued behind background work — the idle session delivers it at the next pause'
-              : (pending.length > 1
-                  ? 'Claude is working — these deliver together at the next pause, as one turn'
-                  : 'Claude is working — delivers at the next pause'))
+              : fg
+                // BUG-178: rendered specially below (buildForegroundWhy) so the
+                // elapsed can be a live span the 1s ticker refreshes.
+                ? ''
+                : (pending.length > 1
+                    ? 'Claude is working — these deliver together at the next pause, as one turn'
+                    : 'Claude is working — delivers at the next pause'))
           : 'delivering…';
   /*
    * BUG-129: say it whatever else the dock is saying. A restored row is text
@@ -9760,7 +10752,27 @@ function paintQueue() {
   const restoredNote = pending.some((q) => q.restored)
     ? ' · restored after a reload, still unsent' : '';
   const n = pending.length || state.queue.length;
-  box.append(el('div', { class: 'q-l', text: `${n} ${pending.length ? 'queued' : 'undelivered'} message${n === 1 ? '' : 's'} · ${why}${restoredNote}` }));
+  const prefix = `${n} ${pending.length ? 'queued' : 'undelivered'} message${n === 1 ? '' : 's'} · `;
+  if (fg) {
+    // BUG-178: build the line from nodes so the elapsed is a live `.q-el` span
+    // (refreshed by the 1s strip ticker) instead of a value frozen at queue time.
+    const ql = el('div', { class: 'q-l' });
+    ql.append(document.createTextNode(`${prefix}Claude is working — “${fg.label}” `));
+    if (fg.startedAt) {
+      ql.append(document.createTextNode('has been running '));
+      ql.append(el('span', { class: 'q-el', text: fmtElapsed(Date.now() - fg.startedAt) }));
+      ql.append(document.createTextNode(', '));
+    } else {
+      ql.append(document.createTextNode('is still running, '));
+    }
+    ql.append(document.createTextNode(pending.length > 1
+      ? 'and your messages can’t reach it until that step finishes, then deliver together. Use Force send below to interrupt it (its progress is lost) and deliver now.'
+      : 'and your message can’t reach it until that step finishes. Use Force send below to interrupt it (its progress is lost) and deliver now.'));
+    if (restoredNote) ql.append(document.createTextNode(restoredNote));
+    box.append(ql);
+  } else {
+    box.append(el('div', { class: 'q-l', text: `${prefix}${why}${restoredNote}` }));
+  }
   state.queue.forEach((item, i) => {
     // BUG-129: `restored` is its own visual state — a row that outlived the tab
     // and is still unsent must not look like one on its way out.
@@ -9797,7 +10809,11 @@ function paintQueue() {
       // inventing a second "this is serious" visual language. Only offered
       // on live rows — a dead row has nothing left to interrupt over.
       const force = el('button', { class: 'mini danger force-send', text: 'Force send' });
-      force.title = 'Interrupt in-flight work and deliver this message right now';
+      // BUG-178: state the cost at the point of action, and name the step that
+      // is lost when a long foreground lane is what is holding the boundary.
+      force.title = fg
+        ? `Interrupt in-flight work (including “${fg.label}”) and deliver now — that step's progress is lost`
+        : 'Interrupt in-flight work and deliver this message right now — in-flight work is lost';
       force.addEventListener('click', () => forceSend(item));
       acts.append(force);
     }
@@ -10548,9 +11564,13 @@ function paintProvBtn() {
 // tight; the popover carries the full description.
 const PROV_SHORT = { anthropic: 'Anthropic', openai: 'OpenAI' };
 function paintProvSel() {
-  const show = !!currentProject() && !dockLive();
-  node.provSel.hidden = !show;
-  if (!show) return;
+  // FEAT-139 — the provider (engine) choice is a CONFIG control, so it leaves the
+  // strip and lives under the one Settings door (Capabilities ▸ Provider); the
+  // composer-tray #provBtn and the settings drawer remain the ways to change it.
+  // The element stays in the DOM (handlers/popover untouched) but never shows on
+  // the strip. Kept as an early return so nothing below re-reveals it.
+  node.provSel.hidden = true;
+  if (node.provSel.hidden) return;
   const cur = providerView();
   const opt = PROVIDER_OPTS.find((o) => o.v === cur);
   node.provSelN.textContent = PROV_SHORT[cur] ?? opt?.n ?? cur;
@@ -10658,6 +11678,217 @@ node.provBtn.addEventListener('click', (e) => {
   node.provBtn.setAttribute('aria-expanded', 'true');
 });
 $('#provPopSettings').addEventListener('click', () => { closePops(); void drawer.open('settings'); });
+
+/* --------------------------- Claude account at launch (FEAT-145 step 5) */
+/*
+ * WHY THIS LIVES ON THE LAUNCH SURFACE and not only in Machine settings: you
+ * switch subscription at exactly one moment — the moment the plan you are on has
+ * burned its 5-hour window and you are about to start a lane anyway. A control
+ * three clicks deep in machine settings is not reachable at that moment, so the
+ * second subscription goes on sitting unused, which is the whole symptom
+ * FEAT-145 exists to remove.
+ *
+ * Everything this arms is the per-launch override the server validates
+ * (`start.overrides.claudeAccount` — validate.ts SESSION_OVERRIDE_FIELDS), never
+ * a registry write: the project and machine defaults stay exactly where they
+ * are, and the override dies with the session. Same idiom as the provider
+ * control directly above (providerView/state.overrides → pill + popover).
+ *
+ * CONTAINER PROJECTS: the control is shown but LOCKED, with the reason on
+ * screen. Not absent (silence would read as "this feature does not exist here")
+ * and not offered-then-rejected (the server refuses it fatally — validate.ts —
+ * because a container binds the account's credential file, so a per-session
+ * switch would recreate the container under every other session on that project
+ * and outlive this one).
+ *
+ * Built in JS rather than in index.html, like the project overflow menu below:
+ * it only exists at all on a machine that has a SECOND Claude account, and it
+ * reuses the provider popover's chrome (.pill.sel / .pop / .opt) so it needs no
+ * new markup and no new CSS.
+ */
+let ACCOUNTS;                 // undefined = never fetched, null = no route/unreadable, [] = only the default
+let accountsInflight = null;
+function refreshAccounts(opts = {}) {
+  if (accountsInflight) return accountsInflight;
+  if (ACCOUNTS !== undefined && !opts.force) return Promise.resolve();
+  accountsInflight = api.getClaudeAccounts().then((list) => {
+    accountsInflight = null;
+    ACCOUNTS = Array.isArray(list) ? list : null;
+    paintAccountSel();
+    if (acctPop?.classList.contains('open')) paintAcctPop();
+  }).catch(() => { accountsInflight = null; });
+  return accountsInflight;
+}
+
+/** The rows the server knows about, default first (listAccounts guarantees that order). */
+function accountRows() { return Array.isArray(ACCOUNTS) ? ACCOUNTS.filter((a) => a && typeof a.id === 'string') : []; }
+function extraAccountRows() { return accountRows().filter((a) => a.id !== 'default'); }
+
+/** Short pill text for an account id — "Default" for the implicit ~/.claude one. */
+function acctShortName(id) {
+  if (!id || id === 'default') return 'Default';
+  const row = accountRows().find((a) => a.id === id);
+  return row?.label ?? id;
+}
+
+/**
+ * An account's plan + login state, in the same words the drawer's machine
+ * control uses — so it is obvious WHICH subscription a session will spend.
+ */
+function acctPlanDesc(a) {
+  if (!a) return '';
+  const bits = [];
+  const sub = a.lastStatus && typeof a.lastStatus.subscriptionType === 'string' ? a.lastStatus.subscriptionType : null;
+  if (sub) bits.push(sub);
+  bits.push(a.state === 'ready' ? 'logged in' : (a.state === 'pending' ? 'not logged in yet' : String(a.state)));
+  return bits.join(', ');
+}
+
+/**
+ * The account's OWN remaining window, from the per-account usage snapshots
+ * (FEAT-145 step 7 made /api/usage report one per account). This is the reason
+ * the whole feature exists — "which plan has headroom right now" has to be
+ * readable at the point of choosing, not one tooltip away.
+ */
+function acctUsageDesc(id) {
+  const snap = (state.usage ?? []).find((s) => s.provider === 'anthropic' && (s.accountId ?? 'default') === (id ?? 'default'));
+  if (!snap) return '';
+  if (!snap.available) return `usage unknown${snap.note ? ` (${snap.note})` : ''}`;
+  const b = (snap.windows ?? []).find((w) => w.binding) ?? (snap.windows ?? [])[0];
+  if (!b) return '';
+  const reset = usageResetShort(b.resetsAt);
+  return `${b.usedPercent}% of ${b.label}${reset ? ` · resets ${reset}` : ''}`;
+}
+
+let acctSel = null; let acctSelN = null; let acctPop = null; let acctOpts = null;
+function ensureAccountEls() {
+  if (acctSel) return;
+  acctSelN = el('span', { id: 'acctSelN', text: 'Default' });
+  acctSel = el('button', { class: 'pill sel', id: 'acctSel', 'aria-haspopup': 'true', 'aria-expanded': 'false' },
+    el('span', { class: 'g', text: '◑' }), acctSelN);
+  acctSel.hidden = true;
+  acctSel.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (acctPop.classList.contains('open')) return closePops();
+    closePops();
+    void refreshAccounts({ force: true }); // live truth on every open, like the provider control
+    paintAcctPop();
+    place(acctPop, acctSel, 300);
+    acctPop.classList.add('open');
+    acctSel.setAttribute('aria-expanded', 'true');
+  });
+  // Next to the provider selector in the seal strip: the two answer the same
+  // question one after the other — which engine, then which subscription.
+  node.provSel.insertAdjacentElement('afterend', acctSel);
+
+  acctOpts = el('div', { id: 'acctOpts' });
+  acctPop = el('div', { class: 'pop', id: 'acctPop', role: 'menu', 'aria-label': 'Claude account for the next session' },
+    el('h4', { text: 'Claude account' }), acctOpts);
+  const foot = el('div', { class: 'pop-foot' });
+  const b = el('button', {}, document.createTextNode('Project defaults '), el('span', { class: 'cx', text: '›' }));
+  b.addEventListener('click', () => { closePops(); void drawer.open('settings'); });
+  foot.append(b);
+  acctPop.append(foot);
+  node.provPop.insertAdjacentElement('afterend', acctPop);
+}
+
+/** Is the account choice locked to project scope for the selected project? */
+function accountLockedReason() {
+  const p = currentProject();
+  if (p?.isolation === 'container') {
+    return 'This project runs in a CONTAINER, and the account’s credential file is one of the container’s bind mounts. '
+      + 'Switching it for one session would recreate the container under every other session on this project and outlive this one, '
+      + 'so the account is pinned at project scope here. Change it in this project’s settings.';
+  }
+  return '';
+}
+
+function paintAccountSel() {
+  const p = currentProject();
+  // Only ever built/shown when there is a real choice: a second Claude account
+  // exists, a project is selected, nothing is live in view (the account is fixed
+  // for a running session, like the engine), and this project runs on Claude.
+  if (!p || ACCOUNTS === undefined) { void (p ? refreshAccounts() : null); if (acctSel) acctSel.hidden = true; return; }
+  const show = !!p && !dockLive() && providerView() === 'anthropic' && extraAccountRows().length > 0;
+  if (!show) { if (acctSel) acctSel.hidden = true; return; }
+  ensureAccountEls();
+  acctSel.hidden = false;
+  const cur = claudeAccountView(); // the ONE resolver — override → project → default
+  const armed = 'claudeAccount' in state.overrides;
+  const locked = accountLockedReason();
+  acctSelN.textContent = acctShortName(cur);
+  acctSel.dataset.set = String(armed);
+  acctSel.dataset.locked = String(!!locked);
+  const usage = acctUsageDesc(cur);
+  const scope = armed ? ' (this session only)' : ' (project default)';
+  acctSel.title = locked
+    ? `Claude account: ${acctShortName(cur)} — fixed for this project. ${locked}`
+    : `Claude account: ${acctShortName(cur)}${scope} — which subscription the next session bills to`
+      + `${usage ? `; ${usage}` : ''}. Applies when the next session starts; click to change.`;
+}
+
+function paintAcctPop() {
+  ensureAccountEls();
+  clear(acctOpts);
+  const locked = accountLockedReason();
+  const armed = 'claudeAccount' in state.overrides;
+  const armedVal = armed ? (state.overrides.claudeAccount ?? 'default') : null;
+  const dflt = accountRows().find((a) => a.id === 'default');
+  const rows = [
+    { v: undefined, n: 'Project default', d: `Inherit — currently ${acctShortName(claudeAccountView())}` },
+    { v: null, n: dflt?.label ?? 'Default (~/.claude)', d: acctPlanDesc(dflt), id: 'default' },
+    ...extraAccountRows().map((a) => ({ v: a.id, n: a.label, d: acctPlanDesc(a), id: a.id })),
+  ];
+  for (const o of rows) {
+    const isCur = o.v === undefined ? !armed : (armedVal === (o.v ?? 'default'));
+    const b = el('button', { class: 'opt', role: 'menuitem', 'aria-pressed': String(isCur), 'aria-disabled': String(!!locked) });
+    b.append(el('span', { class: 'g', text: isCur ? '●' : '○' }));
+    const mid = el('span');
+    mid.append(el('span', { class: 'n', text: o.n }));
+    // Plan + login state, then this account's OWN remaining window: the two
+    // facts the switch is made on.
+    const usage = o.id ? acctUsageDesc(o.id) : '';
+    const d = [o.d, usage].filter(Boolean).join(' · ');
+    if (d) mid.append(el('span', { class: 'd', text: d }));
+    if (isCur && !armed && o.v === undefined) mid.append(el('span', { class: 'tag', text: 'inherited' }));
+    b.append(mid);
+    b.addEventListener('click', () => pickAccount(o.v));
+    acctOpts.append(b);
+  }
+  if (locked) {
+    const warn = el('div', { class: 'grp-note', text: locked });
+    warn.dataset.warn = 'true';
+    acctOpts.append(warn);
+  } else {
+    acctOpts.append(el('div', { class: 'grp-note', text: 'Applies to the NEXT session only — the project and machine defaults are untouched. Each account is a thin overlay over ~/.claude, so the transcript history is shared; only the subscription differs.' }));
+  }
+}
+
+/**
+ * `undefined` clears the override (inherit project → machine); `null` pins this
+ * session to the implicit default account; a string pins it to that account.
+ *
+ * Note it never "clears because you picked the current value": the client cannot
+ * see the MACHINE default, so "equal to the project's stored value" is not the
+ * same question as "equal to what would be inherited". Picking a concrete
+ * account therefore always arms an explicit override — the server drops it as a
+ * no-op if it equals the resolved default anyway (agent-bridge compares values).
+ */
+function pickAccount(next) {
+  const locked = accountLockedReason();
+  if (locked) return say(`the Claude account is project-scope for a container project — ${locked}`, true);
+  if (dockLive()) return say('the Claude account is fixed for a running session — start a new session to switch', true);
+  if (next === undefined) delete state.overrides.claudeAccount;
+  else state.overrides.claudeAccount = next;
+  persistOverrides();
+  const name = next === undefined ? `${acctShortName(claudeAccountView())} (inherited)` : acctShortName(next ?? 'default');
+  const usage = acctUsageDesc(next === undefined ? claudeAccountView() : (next ?? 'default'));
+  say(`Claude account: ${name} — applies when the next session starts${usage ? ` · ${usage}` : ''}`);
+  paintAccountSel();
+  paintAcctPop();
+  paintUsageChip(); // the badge follows the account this session will actually run on
+  drawer.repaintLive?.();
+}
 
 /*
  * Matching the picker's current row against the effective model is not a
@@ -11133,41 +12364,20 @@ async function onboardProject(p) {
 
 function closePops() {
   closeRowMenu();
-  node.pop.classList.remove('open');
   node.picker.classList.remove('open');
   node.modelPop.classList.remove('open');
   node.provPop.classList.remove('open');
+  acctPop?.classList.remove('open'); // FEAT-145 — built on demand, so it may not exist yet
+  acctSel?.setAttribute('aria-expanded', 'false');
   node.procPop.classList.remove('open');
   projMenu.classList.remove('open');
   $('#treeMenu').classList.remove('open');
-  node.isoBtn.setAttribute('aria-expanded', 'false');
   node.modelBtn.setAttribute('aria-expanded', 'false');
   node.provBtn.setAttribute('aria-expanded', 'false');
   node.provSel.setAttribute('aria-expanded', 'false');
   node.procBtn.setAttribute('aria-expanded', 'false');
 }
 
-node.isoBtn.addEventListener('click', (e) => {
-  e.stopPropagation();
-  if (node.pop.classList.contains('open')) return closePops();
-  closePops();
-  place(node.pop, node.isoBtn, 292);
-  node.pop.classList.add('open');
-  node.isoBtn.setAttribute('aria-expanded', 'true');
-});
-node.pop.addEventListener('click', async (e) => {
-  const opt = e.target.closest('.opt');
-  if (!opt) return;
-  closePops();
-  const p = currentProject();
-  if (!p) return;
-  try {
-    await api.patchProject(p.id, { isolation: opt.dataset.iso });
-    await reloadProject(p.id);
-  } catch (err) { say(err.message, true); }
-});
-// FEAT-054: the isolation popover's settings footer names isolation — land there.
-$('#popSettings').addEventListener('click', () => { closePops(); void drawer.open('settings', { focus: 'iso' }); });
 node.insBtn.addEventListener('click', () => void drawer.open('instructions', 'settings'));
 // FEAT-139 — the sidebar-foot Settings door opens the one panel at Machine scope
 // ("global settings"): Appearance, Templates and the machine-wide project
@@ -11479,9 +12689,9 @@ node.findInput.addEventListener('keydown', (e) => {
 });
 
 document.addEventListener('click', (e) => {
-  if (e.target.closest('#pop') || e.target.closest('#picker') || e.target.closest('#rowMenu')
+  if (e.target.closest('#picker') || e.target.closest('#rowMenu')
     || e.target.closest('#projMenu')
-    || e.target.closest('#isoBtn') || e.target.closest('#addProjBtn') || e.target.closest('#treeMenu')) return;
+    || e.target.closest('#addProjBtn') || e.target.closest('#treeMenu')) return;
   closePops();
 });
 /* A right-click anywhere else dismisses the row menu too — otherwise the
@@ -11497,6 +12707,18 @@ document.addEventListener('keydown', (e) => {
   if (tvSheetOpen()) {
     e.preventDefault();
     closeTvSheet();
+    return;
+  }
+  // FEAT-146: settings is a real modal now, with `inert` on the app behind it
+  // and armed ceremonies inside it. It sits here — above the ticket modal,
+  // below the reply sheet — and it owns what Esc means inside itself:
+  // drawer.close() disarms the innermost armed ceremony FIRST and keeps the
+  // modal open, refuses entirely during a live sign-in or with an uncommitted
+  // free-text edit, and only closes when nothing is at stake. The second Esc
+  // is what closes it.
+  if (drawer.isOpen()) {
+    e.preventDefault();
+    drawer.close();
     return;
   }
   // FEAT-053: the rail's ticket modal is the topmost layer — Esc closes it
@@ -11531,7 +12753,6 @@ document.addEventListener('keydown', (e) => {
   const hadPop = document.querySelector('.pop.open');
   closePops();
   if (hadPop) return;
-  if (drawer.isOpen()) return drawer.close();
   backToMain(); // last: Esc walks out of a subagent thread
 });
 
@@ -14060,6 +15281,10 @@ async function boot() {
     // verify script can render a fixture transcript and assert on which entries
     // become user bubbles vs collapsed system notices.
     renderMessages, mainThread, harnessNotice, stampTime,
+    // BUG-177: the failed-quality-gate banner + per-turn badge pass, exposed so a
+    // verify script can drive the REAL server's hookErrors roll-up through the
+    // real render and assert the banner is present, classified, and readable.
+    mountHookErrorBanner, applyHookBadges,
     // BUG-168: the briefing-prefix peel — the terminator literal + the legacy
     // heuristic split, exposed so a verify script can assert the new/legacy/
     // board-snapshot/empty-body splits directly and the mid-prose "[station]" case.
@@ -14120,6 +15345,7 @@ async function boot() {
     // that switching back restores them) without re-deriving the rules.
     selectProject, dockIsForeign, paintPerm, renderRailSummary,
     refreshOutcomes, renderOutcomes, outcomesHeadline,
+    refreshPending, renderPending, pendingHeadline, processPending, dismissPending, showPendingBundle, // ARCH-017
     // FEAT-118 — session-list lifecycle markers + within-session read-mark and
     // manual bookmark, exposed so a verify script can drive the real fold/row
     // render and the real transcript marks (seed/advance/paint/jump/toggle)
@@ -14176,6 +15402,12 @@ async function boot() {
     // foreign selection B. dockSnap/dockLive/dockEffective/dockLiveTools/
     // dockLiveModel are the SINGLE gate the paint surfaces route through.
     providerView, paintProvBtn, projectDot, effectivePerm,
+    // FEAT-145 — the launch-surface Claude-account control, so a browser suite
+    // can drive the real pick/paint path (container lock, per-account window)
+    // instead of re-deriving it. `setAccountsForTest` injects the account list
+    // the server would have returned.
+    paintAccountSel, paintAcctPop, pickAccount, accountLockedReason, acctUsageDesc, claudeAccountView,
+    setAccountsForTest: (list) => { ACCOUNTS = list; },
     dockSnap, dockLive, dockEffective, dockLiveTools, dockLiveModel,
     // BUG-129: the queue's durability surface — so a verify script can drive
     // the REAL accept/persist/restore path (rather than re-deriving the storage

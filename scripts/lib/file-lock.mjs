@@ -392,6 +392,33 @@ function gitMutationTarget(sub, args) {
   return { tree: true };
 }
 
+/* ── Redirect targets that DISCARD, not clobber (BUG-176) ─────────────────────
+ * A redirect whose target is `/dev/null` or another std stream / character device
+ * destroys no lane's work — it is a bit bucket, not a file. `2>/dev/null` is
+ * idiomatic on nearly every read-only command, so locking it injected refusal
+ * ping-pong into read-only work (two lanes measured plain `ls`/`head` refused
+ * purely for their `2>/dev/null`). Such a target must NEVER be locked.
+ *
+ * Matched by EXACT normalized path, never substring: a REGULAR file that merely
+ * CONTAINS the text `/dev/null` (e.g. `./tmp/dev/null-notes.txt`) is NOT excluded
+ * and stays locked exactly as before. Kept a PURE path test (no fs stat) to
+ * preserve the classifier's no-fs invariant; the standard device nodes below are
+ * the reachable cases — a redirect to a bespoke char device a lane created is not
+ * a real contention shape and is out of scope.
+ */
+const DISCARD_REDIR_TARGETS = new Set([
+  '/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom',
+  '/dev/stdout', '/dev/stderr', '/dev/stdin', '/dev/tty', '/dev/console',
+]);
+function isDiscardRedirTarget(target) {
+  if (typeof target !== 'string' || !target) return false;
+  const norm = path.posix.normalize(target); // collapse `/dev//null`; touches no fs
+  if (DISCARD_REDIR_TARGETS.has(norm)) return true;
+  // fd dups exposed as pseudo-paths (`>/dev/fd/2`, `>/proc/self/fd/1`) are streams, not files.
+  if (/^\/dev\/fd\/\d+$/.test(norm) || /^\/proc\/(self|\d+)\/fd\/\d+$/.test(norm)) return true;
+  return false;
+}
+
 const REDIR_MARKERS = new Set(['__TRUNC__', '__APPEND__', '__IN__']);
 /** Strip our redirection markers (and the target after an __IN__) from a token list for head parsing. */
 function stripRedirs(tokens) {
@@ -451,7 +478,7 @@ export function scanBashMutation(command, depth = 0) {
   for (const rawTokens of tokenizeSegments(flattened)) {
     // Any truncating redirect in this segment clobbers its target file, whatever
     // the command is (`git show HEAD:f > f`, `node gen.mjs > f`, `cat a b > f`).
-    for (const t of redirTargets(rawTokens)) if (t) { push(t); kind ??= 'redirect'; }
+    for (const t of redirTargets(rawTokens)) if (t && !isDiscardRedirTarget(t)) { push(t); kind ??= 'redirect'; }
 
     const tokens = stripRedirs(rawTokens);
     const h = headOf(tokens);
@@ -709,11 +736,38 @@ export function heartbeatIntervalMs(ttlMs = FILE_LOCK_TTL_MS) {
  * runtime. For each lock created by this process (matched on `ownerPid` + `host`):
  *   • owner still live  → re-stamp `refreshedAt = now` (keeps it off the TTL).
  *   • owner provably gone → unlink it now (release; do not wait out the TTL).
+ *   • owner UNJUDGEABLE  → leave completely alone (see below).
  * Foreign locks (another session's pid/host) are left untouched — that session's
  * own heartbeat minds them. Returns counts for the tests. Never throws.
+ *
+ * THE THIRD RUNG — `unknown`, added 2026-09-10 (FEAT-129 defect, filed same
+ * ticket). `ownerPid` CANNOT distinguish sessions: every Orchard session runs
+ * inside the one shared server process, so `process.pid` is byte-identical on
+ * every lock every session writes on this host. The pid filter above therefore
+ * does NOT restrict this loop to our own session's locks — it only restricts it
+ * to this host's. `isOwnerLive` then met foreign owners on its "not ours to
+ * judge" branch and answered `true`, so THIS session's heartbeat re-stamped a
+ * DEAD session's lock, forever. `refreshedAt` — the one staleness signal — was
+ * manufactured by the refresher, `reclaimReason`'s TTL backstop could never
+ * fire, and dead sessions' locks were immortal for as long as any session
+ * stayed open. Measured live 2026-09-08: four such locks in one project,
+ * including `docs/HANDOFF.md`, all carrying the live session's byte-identical
+ * `refreshedAt`.
+ *
+ * The fix keeps ARCH-010's shape — the owner declares the fact rather than the
+ * reader re-deriving it. `isOwnerLive` now returns a THIRD value, `null`, for
+ * "this owner is not mine to judge", and that answer is honoured here as
+ * NEITHER live NOR dead: we do not refresh (so the lock ages honestly and the
+ * TTL backstop can free it) and we do not release (never clobber a lock we
+ * cannot prove is dead). A genuinely-live foreign session is unharmed — its OWN
+ * heartbeat matches its own owner prefix and keeps its locks fresh, which is
+ * exactly the invariant the doc comment above already claimed.
+ *
+ * `isOwnerLive` is optional and legacy callers may still return only booleans;
+ * `undefined`/absent is read as live, preserving the never-clobber default.
  */
 export function refreshOwnedLocks({ lockDir, ownerPid = process.pid, host = os.hostname(), isOwnerLive, now = Date.now() } = {}) {
-  const out = { refreshed: 0, released: 0, skipped: 0 };
+  const out = { refreshed: 0, released: 0, skipped: 0, unjudged: 0 };
   if (!lockDir) return out;
   let files;
   try { files = fs.readdirSync(lockDir).filter((f) => f.endsWith('.lock')); } catch { return out; }
@@ -722,9 +776,17 @@ export function refreshOwnedLocks({ lockDir, ownerPid = process.pid, host = os.h
     const lock = readLock(file);
     if (!lock || typeof lock !== 'object') { out.skipped++; continue; }
     // Only touch locks THIS process created — never refresh a foreign owner's.
+    // NOTE: on a shared server process this is a HOST filter, not a session
+    // filter; the `null` rung below is what actually excludes foreign sessions.
     if (lock.host !== host || !Number.isInteger(lock.ownerPid) || lock.ownerPid !== ownerPid) { out.skipped++; continue; }
-    const live = typeof isOwnerLive === 'function' ? isOwnerLive(lock.owner) !== false : true;
-    if (!live) {
+    const verdict = typeof isOwnerLive === 'function' ? isOwnerLive(lock.owner) : true;
+    if (verdict === null) {
+      // Not ours to judge → do not refresh (let it age), do not release (never
+      // clobber). Its owning session's own heartbeat keeps it alive if live.
+      out.unjudged++; out.skipped++;
+      continue;
+    }
+    if (verdict === false) {
       // Provably finished lane → release now so its file is not falsely held.
       // Race-safe: only unlink if it is still ours (rename-aside then remove).
       if (tryReclaim(file)) out.released++; else out.skipped++;

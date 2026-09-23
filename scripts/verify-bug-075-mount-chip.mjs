@@ -123,22 +123,29 @@ async function main() {
 
     const addChip = () => qa('#seal .addm');
     const mntPills = () => qa('#seal .mnt');
-    const isoName = () => q('#isoN')?.textContent?.trim() ?? '';
+    // FEAT-139 — the isolation (connection-mode) chip left the strip for the one
+    // Settings door, so the ground truth the mounts read is p.isolation directly
+    // (not a chip label). Assert the chip is OFF the strip instead of its text.
+    // FEAT-146 round 4 — it is not merely hidden any more, it is DELETED: nothing
+    // could un-hide it after FEAT-139, so the button and its popover were dead
+    // code. Absent is the stronger form of the same invariant, and this reads
+    // it that way rather than weakening to "hidden OR absent".
+    const isoHidden = () => q('#isoBtn') === null;
     const paint = (projectId) => { st.current = { ...(st.current ?? {}), projectId }; S.paintCrown(); };
 
     // ---- DIRECT session: no Add-mount chip (must FAIL pre-fix: chip present) ----
     paint('d1');
-    check('direct session: the Direct/Container chip says "Direct" (isolation ground truth)',
-      isoName() === 'Direct', `#isoN=${JSON.stringify(isoName())}`);
+    check('direct session: the isolation chip is OFF the strip (FEAT-139/146 → Settings)',
+      isoHidden(), `#isoBtn present=${q('#isoBtn') !== null}`);
     check('direct session: NO "+ Add mount" chip (must FAIL pre-fix: present)',
       addChip().length === 0, `.addm count=${addChip().length}`);
     check('direct session: NO mount pills either (mounts are container-only)',
       mntPills().length === 0, `.mnt count=${mntPills().length}`);
 
-    // ---- CONTAINER session: chip present + functional (anti-regression) ----
+    // ---- CONTAINER session: mounts present + functional (anti-regression) ----
     paint('c1');
-    check('container session: the chip says "Container" (isolation ground truth)',
-      isoName() === 'Container', `#isoN=${JSON.stringify(isoName())}`);
+    check('container session: the isolation chip stays OFF the strip (FEAT-139)',
+      isoHidden(), `#isoBtn present=${q('#isoBtn') !== null}`);
     check('container session: "+ Add mount" chip PRESENT',
       addChip().length === 1, `.addm count=${addChip().length}`);
     check('container session: the configured mount renders as a pill (real add-mount display flow)',
@@ -159,16 +166,16 @@ async function main() {
     // ---- SWITCH container -> direct hides it (no stale render) ----
     paint('d1');
     check('switch container->direct HIDES the Add-mount chip (must FAIL pre-fix: stale)',
-      addChip().length === 0 && mntPills().length === 0 && isoName() === 'Direct',
-      `.addm=${addChip().length} .mnt=${mntPills().length} #isoN=${JSON.stringify(isoName())}`);
+      addChip().length === 0 && mntPills().length === 0 && isoHidden(),
+      `.addm=${addChip().length} .mnt=${mntPills().length} #isoBtn present=${q('#isoBtn') !== null}`);
 
-    // ---- SWEEP: the OTHER chip-strip affordances are isolation-INDEPENDENT and
-    // must render identically across modes (instructions, model, integrations).
-    // Assert the instructions chip renders in BOTH modes (it is not a leak). ----
-    paint('c1'); const insC = q('#insBtn') && !q('#insBtn').hidden;
-    paint('d1'); const insD = q('#insBtn') && !q('#insBtn').hidden;
-    check('SWEEP: the instructions chip (mode-independent) renders in BOTH container and direct',
-      !!insC && !!insD, `insBtn shown container=${!!insC} direct=${!!insD}`);
+    // ---- SWEEP: FEAT-139 — the CONFIG chips (instructions/provider/isolation)
+    // no longer live on the strip in ANY mode; they moved into the one Settings
+    // door. Assert the instructions chip is OFF the strip in both modes. ----
+    paint('c1'); const insC = q('#insBtn')?.hidden === true;
+    paint('d1'); const insD = q('#insBtn')?.hidden === true;
+    check('SWEEP: the instructions chip is OFF the strip in BOTH container and direct (FEAT-139)',
+      insC && insD, `insBtn hidden container=${insC} direct=${insD}`);
   } finally {
     try {
       const st2 = win.__station?.state;

@@ -14,10 +14,26 @@
  *
  *  - Anthropic/Claude: the CLI's `/usage` view is backed by the OAuth endpoint
  *    `GET https://api.anthropic.com/api/oauth/usage`, authorized with the same
- *    subscription OAuth token Claude Code stores at ~/.claude/.credentials.json.
+ *    subscription OAuth token Claude Code stores at `<config dir>/.credentials.json`.
  *    It returns `five_hour` / `seven_day` `{ utilization, resets_at (ISO) }` plus
  *    a `limits[]` array flagging the currently-binding window. This is NOT
  *    scraping the TUI — it is the same JSON the TUI itself fetches.
+ *
+ * FEAT-145 step 7 — PER-ACCOUNT. Two Claude subscriptions are two INDEPENDENT
+ * 5-hour windows, and the number that says "switch accounts now" only exists if
+ * each account is read separately. So:
+ *  - the token is read from the ACCOUNT'S OWN config dir, which only
+ *    `claude-accounts.resolveAccountDir(id)` may map (ARCH-010 — never rederived
+ *    here). The endpoint is per-token, so nothing else about the request changes.
+ *  - the cache/inflight maps are keyed by `provider\x00accountId`, not by
+ *    provider alone — keyed by provider, account B would be served account A's
+ *    snapshot for up to the TTL.
+ *  - every snapshot keeps `provider: 'anthropic'`, and the DEFAULT account is
+ *    emitted FIRST, so the pre-145 call sites that do
+ *    `.find(s => s.provider === 'anthropic')` keep resolving to exactly the same
+ *    snapshot they did before. A single-account user sees no change at all.
+ *  - one account's 401/timeout/pending state degrades ONLY that account's
+ *    snapshot to unknown; it can never take down another account's read.
  *
  * THE HARD RULES this module keeps (from the FEAT-116 charter):
  *  - Never block a session or a UI control on this. Every read is bounded by a
@@ -32,9 +48,9 @@
 
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
 import { detectCodex } from './runtime/codex-runtime.ts';
+import { DEFAULT_ACCOUNT_ID, defaultAccountRow, listAccounts, resolveAccountDir } from './claude-accounts.ts';
 
 export type UsageProvider = 'anthropic' | 'openai';
 
@@ -53,6 +69,14 @@ export interface UsageWindow {
 /** A provider's usage snapshot. `available:false` means "unknown", not "0%". */
 export interface ProviderUsage {
   provider: UsageProvider;
+  /**
+   * FEAT-145: which Claude account this snapshot belongs to (`'default'` for the
+   * implicit `~/.claude` one). `null` for providers that have no account axis
+   * (openai). `provider` deliberately stays `'anthropic'` for every account.
+   */
+  accountId: string | null;
+  /** The account's human label, or null when there is no account axis. */
+  accountLabel: string | null;
   available: boolean;
   /** Epoch ms of the last SUCCESSFUL read, or null if never read. */
   asOf: number | null;
@@ -71,11 +95,74 @@ const CLAUDE_TIMEOUT_MS = 6_000;
 
 const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 
-const cache = new Map<UsageProvider, ProviderUsage>();
-const inflight = new Map<UsageProvider, Promise<void>>();
+/**
+ * Test seam ONLY (same idiom as `CLAUDE_STATION_CLAUDE_BIN` in claude-accounts):
+ * lets a verify script point the reader at a local stub server so the suite
+ * never touches the live Anthropic endpoint. Unset in normal operation.
+ */
+function claudeUsageUrl(): string {
+  return process.env.CLAUDE_STATION_USAGE_URL || CLAUDE_USAGE_URL;
+}
 
-function unknown(provider: UsageProvider, note: string, keepAsOf: number | null = null): ProviderUsage {
-  return { provider, available: false, asOf: keepAsOf, windows: [], plan: null, note };
+/**
+ * One thing whose usage can be read: a provider, plus (for anthropic) WHICH
+ * account. This is the unit the cache is keyed by and the unit the request
+ * surface enumerates.
+ */
+export interface UsageTarget {
+  provider: UsageProvider;
+  /** `'default'` … for anthropic; `null` for providers with no account axis. */
+  accountId: string | null;
+  accountLabel: string | null;
+}
+
+/** The cache/inflight key. Keyed by provider ALONE, account B would be served A's snapshot. */
+function targetKey(t: UsageTarget): string {
+  return `${t.provider}\x00${t.accountId ?? ''}`;
+}
+
+/**
+ * Everything worth reading right now: every registered Claude account (the
+ * implicit DEFAULT first — `listAccounts()` guarantees that order), then openai.
+ * A corrupt/unreadable registry degrades to the default account alone rather
+ * than throwing; usage must never be able to break a request path.
+ */
+export function usageTargets(): UsageTarget[] {
+  let rows;
+  try {
+    rows = listAccounts();
+  } catch {
+    rows = [defaultAccountRow()];
+  }
+  if (!rows.length) rows = [defaultAccountRow()];
+  const out: UsageTarget[] = rows.map((r) => ({
+    provider: 'anthropic' as const,
+    accountId: r.id,
+    accountLabel: r.label,
+  }));
+  out.push({ provider: 'openai', accountId: null, accountLabel: null });
+  return out;
+}
+
+const cache = new Map<string, ProviderUsage>();
+const inflight = new Map<string, Promise<void>>();
+
+function unknown(
+  provider: UsageProvider,
+  note: string,
+  keepAsOf: number | null = null,
+  account: { id: string | null; label: string | null } = { id: null, label: null },
+): ProviderUsage {
+  return {
+    provider,
+    accountId: account.id,
+    accountLabel: account.label,
+    available: false,
+    asOf: keepAsOf,
+    windows: [],
+    plan: null,
+    note,
+  };
 }
 
 /* ------------------------------------------------------------ Codex reader */
@@ -171,6 +258,8 @@ function normalizeCodex(result: unknown): ProviderUsage {
   windows[bi].binding = true;
   return {
     provider: 'openai',
+    accountId: null,
+    accountLabel: null,
     available: true,
     asOf: Date.now(),
     windows,
@@ -181,8 +270,14 @@ function normalizeCodex(result: unknown): ProviderUsage {
 
 /* ----------------------------------------------------------- Claude reader */
 
-function readClaudeToken(): { token: string; plan: string | null } | { error: string } {
-  const file = path.join(os.homedir(), '.claude', '.credentials.json');
+/**
+ * Read one ACCOUNT's OAuth token. `accountDir` is the account's config dir and
+ * is always supplied by the caller from `resolveAccountDir(id)` — this function
+ * never derives a dir itself (ARCH-010) and never consults `CLAUDE_CONFIG_DIR`,
+ * which describes the process's own session, not the account being polled.
+ */
+function readClaudeToken(accountDir: string): { token: string; plan: string | null } | { error: string } {
+  const file = path.join(accountDir, '.credentials.json');
   let raw: string;
   try { raw = fs.readFileSync(file, 'utf8'); } catch { return { error: 'not signed in to Claude (no credentials)' }; }
   let oauth: Record<string, any> | undefined;
@@ -193,15 +288,31 @@ function readClaudeToken(): { token: string; plan: string | null } | { error: st
 }
 
 /**
- * Read the Claude subscription usage windows from the OAuth usage endpoint.
- * Bounded by CLAUDE_TIMEOUT_MS via AbortSignal. The token is used only in the
- * Authorization header and never returned or logged.
+ * Read ONE Claude account's subscription usage windows from the OAuth usage
+ * endpoint. Bounded by CLAUDE_TIMEOUT_MS via AbortSignal. The token is used only
+ * in the Authorization header and never returned or logged.
+ *
+ * The endpoint is PER-TOKEN, so the account is expressed entirely by which
+ * `.credentials.json` the token came from — nothing else about the request
+ * changes. Defaults to the implicit default account, which is what every
+ * pre-FEAT-145 caller means.
  */
-export async function readClaudeUsage(opts: { url?: string; timeoutMs?: number } = {}): Promise<ProviderUsage> {
-  const url = opts.url ?? CLAUDE_USAGE_URL;
+export async function readClaudeUsage(
+  opts: { url?: string; timeoutMs?: number; accountId?: string; accountLabel?: string | null } = {},
+): Promise<ProviderUsage> {
+  const url = opts.url ?? claudeUsageUrl();
   const timeoutMs = opts.timeoutMs ?? CLAUDE_TIMEOUT_MS;
-  const cred = readClaudeToken();
-  if ('error' in cred) return unknown('anthropic', cred.error);
+  const accountId = opts.accountId ?? DEFAULT_ACCOUNT_ID;
+  const account = { id: accountId, label: opts.accountLabel ?? null };
+  let accountDir: string;
+  try {
+    accountDir = resolveAccountDir(accountId);
+  } catch (err) {
+    // A malformed id is this account's problem alone — degrade, never throw.
+    return unknown('anthropic', `unknown Claude account (${(err as Error).message})`, null, account);
+  }
+  const cred = readClaudeToken(accountDir);
+  if ('error' in cred) return unknown('anthropic', cred.error, null, account);
 
   let res: Response;
   try {
@@ -216,14 +327,20 @@ export async function readClaudeUsage(opts: { url?: string; timeoutMs?: number }
     });
   } catch (err) {
     const why = (err as Error)?.name === 'TimeoutError' ? 'Claude usage read timed out' : 'Claude usage read failed (network)';
-    return unknown('anthropic', why);
+    return unknown('anthropic', why, null, account);
   }
-  if (res.status === 401 || res.status === 403) return unknown('anthropic', 'Claude sign-in expired — re-authenticate');
-  if (!res.ok) return unknown('anthropic', `Claude usage read failed (HTTP ${res.status})`);
+  if (res.status === 401 || res.status === 403) {
+    return unknown('anthropic', 'Claude sign-in expired — re-authenticate', null, account);
+  }
+  if (!res.ok) return unknown('anthropic', `Claude usage read failed (HTTP ${res.status})`, null, account);
 
   let body: Record<string, any>;
-  try { body = (await res.json()) as Record<string, any>; } catch { return unknown('anthropic', 'Claude usage read returned non-JSON'); }
-  return normalizeClaude(body, cred.plan);
+  try {
+    body = (await res.json()) as Record<string, any>;
+  } catch {
+    return unknown('anthropic', 'Claude usage read returned non-JSON', null, account);
+  }
+  return normalizeClaude(body, cred.plan, account);
 }
 
 function isoToEpochSec(v: unknown): number | null {
@@ -232,7 +349,11 @@ function isoToEpochSec(v: unknown): number | null {
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
 }
 
-function normalizeClaude(body: Record<string, any>, plan: string | null): ProviderUsage {
+function normalizeClaude(
+  body: Record<string, any>,
+  plan: string | null,
+  account: { id: string | null; label: string | null } = { id: DEFAULT_ACCOUNT_ID, label: null },
+): ProviderUsage {
   const windows: UsageWindow[] = [];
   const five = body.five_hour as Record<string, any> | undefined;
   const seven = body.seven_day as Record<string, any> | undefined;
@@ -255,58 +376,88 @@ function normalizeClaude(body: Record<string, any>, plan: string | null): Provid
       binding: true,
     });
   }
-  if (!windows.length) return unknown('anthropic', 'Claude returned no usable windows');
+  if (!windows.length) return unknown('anthropic', 'Claude returned no usable windows', null, account);
   if (!windows.some((w) => w.binding)) {
     let bi = 0;
     for (let i = 1; i < windows.length; i++) if (windows[i].usedPercent > windows[bi].usedPercent) bi = i;
     windows[bi].binding = true;
   }
-  return { provider: 'anthropic', available: true, asOf: Date.now(), windows, plan, note: null };
+  return {
+    provider: 'anthropic',
+    accountId: account.id,
+    accountLabel: account.label,
+    available: true,
+    asOf: Date.now(),
+    windows,
+    plan,
+    note: null,
+  };
 }
 
 /* ------------------------------------------------- cache / request surface */
 
-function refresh(provider: UsageProvider): Promise<void> {
-  const existing = inflight.get(provider);
+/** Read exactly one target, bypassing the cache. Never throws. */
+export function readUsageForTarget(t: UsageTarget): Promise<ProviderUsage> {
+  if (t.provider === 'openai') return readCodexUsage();
+  return readClaudeUsage({
+    accountId: t.accountId ?? DEFAULT_ACCOUNT_ID,
+    accountLabel: t.accountLabel,
+  });
+}
+
+function refresh(t: UsageTarget): Promise<void> {
+  const key = targetKey(t);
+  const existing = inflight.get(key);
   if (existing) return existing;
-  const reader = provider === 'openai' ? readCodexUsage : readClaudeUsage;
-  const p = reader()
+  const account = { id: t.accountId, label: t.accountLabel };
+  const p = readUsageForTarget(t)
     .then((snap) => {
       if (snap.available) {
-        cache.set(provider, snap);
+        cache.set(key, snap);
       } else {
         // Degrade to unknown, but PRESERVE the last good asOf so the UI can say
         // "last read at HH:MM" instead of erasing all history.
-        const prev = cache.get(provider);
-        cache.set(provider, { ...snap, asOf: prev?.asOf ?? null });
+        const prev = cache.get(key);
+        cache.set(key, { ...snap, asOf: prev?.asOf ?? null });
       }
     })
     .catch((err) => {
-      const prev = cache.get(provider);
-      cache.set(provider, unknown(provider, `usage read error: ${(err as Error).message}`, prev?.asOf ?? null));
+      // One account's failure lands in THAT account's cache slot only — it can
+      // never overwrite or block another account's snapshot.
+      const prev = cache.get(key);
+      cache.set(key, unknown(t.provider, `usage read error: ${(err as Error).message}`, prev?.asOf ?? null, account));
     })
-    .finally(() => { inflight.delete(provider); });
-  inflight.set(provider, p);
+    .finally(() => { inflight.delete(key); });
+  inflight.set(key, p);
   return p;
 }
 
 /**
  * The request-path surface. NEVER awaits the network: it returns whatever is
  * cached right now and kicks a background refresh if the snapshot is missing or
- * older than TTL_MS. First call for a provider returns a "reading…" placeholder;
+ * older than TTL_MS. First call for a target returns a "reading…" placeholder;
  * the value lands on a later poll. This is what makes the endpoint non-blocking.
+ *
+ * FEAT-145: the DEFAULT Claude account is always first (see `usageTargets`), so
+ * `.find(s => s.provider === 'anthropic')` — which is what `public/app.js` does —
+ * still resolves to the default account's snapshot, unchanged.
  */
-export function getUsageSnapshots(providers: UsageProvider[] = ['anthropic', 'openai']): ProviderUsage[] {
+export function getUsageSnapshots(targets: UsageTarget[] = usageTargets()): ProviderUsage[] {
   const now = Date.now();
-  return providers.map((provider) => {
-    const snap = cache.get(provider);
+  return targets.map((t) => {
+    const key = targetKey(t);
+    const snap = cache.get(key);
     const fresh = snap?.asOf != null && now - snap.asOf < TTL_MS;
-    if (!fresh && !inflight.has(provider)) void refresh(provider);
-    return snap ?? unknown(provider, 'reading…');
+    if (!fresh && !inflight.has(key)) void refresh(t);
+    return snap ?? unknown(t.provider, 'reading…', null, { id: t.accountId, label: t.accountLabel });
   });
 }
 
-/** Test/verify seam: force a synchronous read of one provider, bypassing cache. */
-export async function readUsageNow(provider: UsageProvider): Promise<ProviderUsage> {
-  return provider === 'openai' ? readCodexUsage() : readClaudeUsage();
+/**
+ * Test/verify seam: force a synchronous read of one provider, bypassing cache.
+ * `accountId` selects the Claude account; omitted, it means the default one.
+ */
+export async function readUsageNow(provider: UsageProvider, accountId?: string): Promise<ProviderUsage> {
+  if (provider === 'openai') return readCodexUsage();
+  return readClaudeUsage({ accountId: accountId ?? DEFAULT_ACCOUNT_ID });
 }

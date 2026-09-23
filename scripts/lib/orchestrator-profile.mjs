@@ -621,7 +621,7 @@ export function decideBashCommand(command) {
  */
 function refusalReason(toolName, offender) {
   const what = offender ? `\`${offender}\` (via Bash)` : `\`${toolName}\``;
-  return [
+  const lines = [
     `Orchestrator tool profile: ${what} is not available to this session.`,
     '',
     'This session is running as an ORCHESTRATOR in a project where the tool',
@@ -634,11 +634,48 @@ function refusalReason(toolName, offender) {
     'not your answer — e.g. an Explore agent for "where/what is X", a worker for a',
     'change. The lane has the full toolset, including Bash; nothing is being taken',
     'away from the work, only from this session.',
+  ];
+  // FEAT-149 — the highest-value placement of the board:status redirect: it fires
+  // exactly when an orchestrator is blocked from inspecting the tree, which is
+  // when it is most tempted to substitute a lane's claim about a ticket's state
+  // (measured 2026-09-23: a status asserted four times from contradictory lane
+  // reports, wrong each time). For BOARD/ticket state there is no need to dispatch
+  // — `board:status` runs under this very profile and reads the board's own parser.
+  if (isReadShapedRefusal(toolName, offender)) {
+    lines.push(
+      '',
+      "If what you wanted was a TICKET's or the BOARD's state — its status, round",
+      'count, placement, dirty/committed, or latest activity — do NOT dispatch and',
+      'do NOT trust a lane report for it. Run `npm run board:status -- <ID>` (or',
+      'with no id for a whole-board summary). It is allowed under this profile',
+      '(node/npm only), needs no lane, and reads the board through its own parser —',
+      'so a status is CHECKED, never asserted from memory or relayed from a lane.',
+    );
+  }
+  lines.push(
     '',
     'Still available here: Agent, SendMessage, TaskStop, AskUserQuestion, Edit,',
     'Write, and Bash for npm/node/git/status commands (the gate, the board, your',
     'own commits).',
-  ].join('\n');
+  );
+  return lines.join('\n');
+}
+
+/**
+ * FEAT-149 — is this refusal about reading/searching/inspecting the tree (as
+ * opposed to, say, a refused `curl`)? Those are the calls where the orchestrator
+ * was likely trying to check a fact — often a ticket's state — so the
+ * board:status redirect is relevant. Covers the read-shaped tools and the
+ * read-shaped Bash offenders decideBashCommand names.
+ */
+function isReadShapedRefusal(toolName, offender) {
+  if (['Read', 'Grep', 'Glob'].includes(toolName)) return true;
+  if (typeof offender === 'string' && offender) {
+    return /\b(grep|rg|cat|less|more|head|tail|find|ls|sed|awk|git grep|git log|git show)\b/.test(
+      offender,
+    );
+  }
+  return false;
 }
 
 /**

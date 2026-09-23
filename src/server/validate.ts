@@ -9,6 +9,10 @@
  */
 import * as cm from './container-manager.ts';
 import type * as reg from './registry.ts';
+// FEAT-145 step 4 — the account registry owns which ids exist; the project
+// PATCH validates a chosen account against it (claude-accounts imports only
+// paths, so no cycle).
+import { readAccounts, DEFAULT_ACCOUNT_ID } from './claude-accounts.ts';
 
 const ISOLATIONS = new Set(['direct', 'container', 'sandbox']);
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -87,7 +91,7 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
   const settings: Partial<reg.ProjectSettings> = {};
   const TOP = new Set(['name', 'hostPath', 'isolation', 'settings']);
   const SETTINGS = new Set([
-    'provider', 'model', 'effort', 'maxBudgetUsd', 'permissionMode',
+    'provider', 'model', 'effort', 'claudeAccount', 'maxBudgetUsd', 'permissionMode',
     'allowedTools', 'disallowedTools', 'mounts', 'instructions', 'container', 'browser', 'tools', 'snapshots',
     'responseDigest', 'orchestratorProfile', 'methodVersion', 'services',
   ]);
@@ -148,6 +152,20 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
       throw new Error(`effort must be null or one of ${[...EFFORTS].join(', ')}`);
     }
     settings.effort = src.effort as reg.ProjectSettings['effort'];
+  }
+  if ('claudeAccount' in src) {
+    // FEAT-145 step 4 — null (or the 'default' sentinel) means "inherit the
+    // machine default account"; any other value must name an account that
+    // exists right now, so a project can never persist an id that would fail
+    // (or silently spend the wrong plan) at session start.
+    const v = src.claudeAccount;
+    if (v === null || v === DEFAULT_ACCOUNT_ID) {
+      settings.claudeAccount = null;
+    } else if (typeof v === 'string' && readAccounts().some((r) => r.id === v)) {
+      settings.claudeAccount = v;
+    } else {
+      throw new Error('claudeAccount must be null or the id of an existing account');
+    }
   }
   if ('maxBudgetUsd' in src) {
     if (src.maxBudgetUsd !== null && (typeof src.maxBudgetUsd !== 'number' || !Number.isFinite(src.maxBudgetUsd) || src.maxBudgetUsd <= 0)) {
@@ -521,6 +539,16 @@ export function validateSessionPatch(body: unknown): SessionPatch {
  * maxBudgetUsd, host-side accounting in the bridge) and therefore applies for
  * one session without touching anything the project owns on disk.
  */
+/*
+ * MIRRORED CLIENT-SIDE. `SESSION_OVERRIDABLE` in `public/app.js` (search for
+ * that name — it names this constant back) is a hand-maintained copy of this
+ * list: the browser filters `state.overrides` through it before putting them on
+ * the `start` frame, so a field missing THERE is armed in the UI and silently
+ * never sent (that is exactly what FEAT-045 found for `provider`). The two are
+ * asserted set-equal mechanically by
+ * `scripts/verify-feat-145-session-override.mjs` — if you add a field here, add
+ * it there and run that script.
+ */
 export const SESSION_OVERRIDE_FIELDS = [
   // FEAT-037 P3: the engine is launch-scoped state — it applies to exactly one
   // session's runtime construction and touches nothing on disk, so it may be
@@ -528,6 +556,12 @@ export const SESSION_OVERRIDE_FIELDS = [
   'provider',
   'model',
   'effort',
+  // FEAT-145 step 5: which Claude subscription this ONE session bills to. For a
+  // `direct` project it is pure launch-scoped state — it becomes a
+  // `CLAUDE_CONFIG_DIR` in the child's env (agent-bridge) and touches nothing on
+  // disk. For a `container` project it is REFUSED below, because there the
+  // credential is a container BIND, not an env var.
+  'claudeAccount',
   'permissionMode',
   'maxBudgetUsd',
   'allowedTools',
@@ -554,11 +588,45 @@ const OVERRIDABLE = new Set<string>(SESSION_OVERRIDE_FIELDS);
  * A silent drop here is the failure mode this project exists to avoid: the drawer
  * would show `overridden` and the agent would ignore it. So: hard error, reported
  * to the UI, session does not start.
+ *
+ * `ctx.isolation` is REQUIRED, not optional, and that is deliberate: one field
+ * (`claudeAccount`, FEAT-145) is legal for a `direct` project and illegal for a
+ * `container` one, so a caller that does not know the project cannot validate a
+ * start. Making it required means the compiler — not a reviewer — catches a new
+ * call site that would otherwise skip the container refusal.
  */
-export function validateSessionOverrides(body: unknown): SessionOverrides {
+export interface SessionOverrideContext {
+  /** The project this `start` names. Its isolation decides `claudeAccount`. */
+  isolation: reg.Project['isolation'];
+}
+
+export function validateSessionOverrides(body: unknown, ctx: SessionOverrideContext): SessionOverrides {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('overrides must be a JSON object');
   const b = body as Record<string, unknown>;
   for (const k of Object.keys(b)) {
+    /*
+     * FEAT-145 — THE CONTAINER REFUSAL. Decided at ticket-filing time and not
+     * re-opened here.
+     *
+     * For a `direct` project the account is one env var on one child process.
+     * For a CONTAINER project the account's `.credentials.json` is a BIND
+     * (`container-manager.ts` `desiredBinds()` / `accountDirForContainer`), and
+     * `desiredBinds()` is the drift oracle: `ensureContainer` recreates the
+     * container on any bind difference. So honouring this per session would
+     * (a) recreate the container out from under every OTHER session already
+     * running on that project and (b) outlive the session that asked — the
+     * exact two reasons `mounts` and `container.*` are project-scope-only just
+     * below. Container projects still get account pinning at PROJECT scope,
+     * which is where a bind change legitimately belongs.
+     */
+    if (k === 'claudeAccount' && ctx.isolation === 'container') {
+      throw new Error(
+        'overrides.claudeAccount is project-scope only for a container project: the account\'s .credentials.json is one of the ' +
+          'container\'s bind mounts, so switching it for one session would recreate the container under every other session on ' +
+          'this project and would outlive this session. Pin the account on the PROJECT instead (its settings), or run this project ' +
+          'with `direct` isolation to switch account per session.',
+      );
+    }
     if (OVERRIDABLE.has(k)) continue;
     if (k === 'instructions') {
       throw new Error('overrides.instructions is not carried here — send instruction overrides as start.templateIds');
@@ -577,7 +645,31 @@ export function validateSessionOverrides(body: unknown): SessionOverrides {
     throw new Error(`unknown override field "${k}" (allowed: ${SESSION_OVERRIDE_FIELDS.join(', ')})`);
   }
   if (!Object.keys(b).length) throw new Error('overrides was an empty object');
-  // Same dialect, literally: the registry PATCH validator does the type checking.
+  /*
+   * Same dialect, literally: the registry PATCH validator does the type
+   * checking — including `claudeAccount`, where null / the 'default' sentinel
+   * mean "the implicit ~/.claude account" and any other value must name an
+   * account that EXISTS RIGHT NOW (`readAccounts()`, the one registry). An
+   * unknown or dangling id therefore throws here and the session does not
+   * start; it is never quietly ignored into "whatever the project had", which
+   * would spend the wrong subscription's quota with nothing on screen saying so.
+   */
   const patch = validateProjectPatch({ settings: b });
-  return (patch.settings ?? {}) as SessionOverrides;
+  const settings = (patch.settings ?? {}) as Record<string, unknown>;
+  /*
+   * STRUCTURAL ANTI-SILENT-DROP. Every key accepted above must come back out of
+   * the shared dialect. If a future edit to validateProjectPatch ever normalises
+   * a field away (drops it, renames it, folds it into another), this refuses the
+   * start instead of returning an override set that is quietly smaller than what
+   * the UI showed as armed. It is the general form of the guarantee the prose
+   * above only promised field by field.
+   */
+  for (const k of Object.keys(b)) {
+    if (!(k in settings)) {
+      throw new Error(
+        `override "${k}" was accepted but did not survive validation — refusing to start a session that would silently ignore it`,
+      );
+    }
+  }
+  return settings as SessionOverrides;
 }

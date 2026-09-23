@@ -62,7 +62,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   CITATION_CONTRACT, validateVerdict, formatVerifiedBy, parseManifest,
   parseCitationReply, composeVerdict,
@@ -227,7 +227,7 @@ function gitOk(repo, ...args) {
  * project's own methodology/board. Removed from the clean room so the verifier
  * cannot inherit our framing even by reading the tree it is testing.
  */
-const CONTAMINATION = [
+export const CONTAMINATION = [
   'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', 'AGENT.md', '.cursorrules',
   '.claude', '.codex', '.github/copilot-instructions.md',
   'docs/prompts', 'docs/bugs', 'docs/DEPLOY-CONTEXT.md',
@@ -236,36 +236,113 @@ const CONTAMINATION = [
 /**
  * Boot stubs. Stripping `docs/prompts` (above) is correct — the verifier must
  * not read our methodology — but the SERVER refuses to boot without it:
- * `seedTemplates()` (src/server/templates.ts) reads exactly these six files at
+ * `seedTemplates()` (src/server/templates.ts) reads a set of doc paths at
  * startup and throws ENOENT if any is missing, which surfaces to the verifier
  * only as the opaque `server never healthy`. Every UI/server-backed
  * verification used to pay this tax by hand (a stub-creation one-liner smuggled
  * into the requirement text and `--run`). So the clean room seeds the minimum
  * set ITSELF, right after stripping.
  *
+ * WHICH PATHS (BUG-182). This script used to hold its own hardcoded list. That
+ * was a SECOND PLACE holding a fact `templates.ts` owns, and the two drifted:
+ * `templates.ts` grew `WORKING_AGREEMENT.v3.md` and `.v4.md`, the list did not,
+ * and clean-room rounds needing a live server silently degraded to static
+ * evidence behind `server never became healthy`. Per ARCH-010 the list is now
+ * DECLARED by its owner (`src/server/seed-sources.mjs`) and READ here — and
+ * read out of THE CLEAN ROOM'S OWN COPY, i.e. the revision under test, so the
+ * stub set always matches the code that will boot. A newly-added seed doc is
+ * picked up with zero edits to this file.
+ *
  * SAFETY PROPERTY (the whole point): each stub is an INERT placeholder, NOT a
  * copy of the real file. The reason we strip is that the verifier must not
  * inherit our framing; seeding real content back would defeat that entirely.
  * The server only needs these paths to EXIST and be readable — it does not care
  * what they say — so a one-line placeholder satisfies the boot path while
- * transmitting zero methodology. Keep this list in sync with `seedTemplates`'s
- * seed sources; if that set ever needs real content to boot, stop and rethink
- * rather than seeding real prose here.
+ * transmitting zero methodology. If a seeded doc ever needs real CONTENT to
+ * boot, stop and rethink rather than seeding real prose here.
  */
-const BOOT_STUBS = [
-  'docs/prompts/WORKING_AGREEMENT.md',
-  'docs/prompts/WORKING_AGREEMENT.v2.md',
-  'docs/prompts/patterns/MANAGER_SUBAGENT_TREE.md',
-  'docs/prompts/patterns/INDEX_TABLE_ROUTER.md',
-  'docs/prompts/patterns/RAW_CURATED_MEMORY_SPLIT.md',
-  'docs/prompts/patterns/GO_NO_GO_PREFLIGHT.md',
-];
+const SEED_SOURCE_DECL = path.join('src', 'server', 'seed-sources.mjs');
+/** The seeder itself: present without its declaration ⇒ the room cannot boot. */
+const SEEDER = path.join('src', 'server', 'templates.ts');
+
+/**
+ * Read the boot-required doc paths the ROOM declares. Every failure here is
+ * LOUD and names what is wrong: a clean room that cannot learn what to stub
+ * must not proceed to a health-check timeout that reads like a defect in the
+ * subject under test (BUG-182 is exactly that failure).
+ *
+ * The module is imported from the exported room. It is a tiny, dependency-free
+ * declaration file — no I/O, no side effects — which is why reading it this way
+ * is safe; it is the same rule as `--run` executing the room's own code.
+ */
+export async function declaredBootDocs(dir) {
+  const decl = path.join(dir, SEED_SOURCE_DECL);
+  if (!fs.existsSync(decl)) {
+    // A repo that has no seeding server (this script is not Orchard-only — it
+    // verifies any repo) declares nothing and needs nothing stubbed. But if the
+    // SEEDER is there and its declaration is not, the room is the BUG-182 trap
+    // again: say so instead of shipping a room whose server dies opaquely.
+    if (fs.existsSync(path.join(dir, SEEDER))) {
+      die(`clean room cannot determine its boot stubs: ${SEEDER} is present but ${SEED_SOURCE_DECL} is missing from the exported tree. ` +
+          'That file is the single declaration of the docs seedTemplates() reads at boot; without it the server would die on an ' +
+          'unexplained health-check timeout. Refusing to build a room that cannot boot.');
+    }
+    return [];
+  }
+  let mod;
+  try {
+    mod = await import(pathToFileURL(decl).href);
+  } catch (err) {
+    die(`clean room cannot read the boot-stub declaration ${SEED_SOURCE_DECL}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let rels;
+  try {
+    rels = typeof mod.seedSourceRelPaths === 'function' ? mod.seedSourceRelPaths() : null;
+  } catch (err) {
+    die(`clean room could not evaluate seedSourceRelPaths() in ${SEED_SOURCE_DECL}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!Array.isArray(rels) || rels.length === 0 || !rels.every((r) => typeof r === 'string' && r.trim())) {
+    die(`clean room got no usable boot-stub list from ${SEED_SOURCE_DECL} (expected seedSourceRelPaths() to return ` +
+        'a non-empty array of repo-relative paths). A room that stubs nothing cannot boot the server.');
+  }
+  return rels.map((r) => r.split('/').join(path.sep));
+}
 const BOOT_STUB_BODY =
   'Clean-room placeholder — independent-verify.mjs.\n\n' +
   'The real file was removed as CONTAMINATION so the verifier cannot inherit\n' +
   'this project\'s methodology or board prose. This inert placeholder exists\n' +
   'ONLY so the stripped server can boot (seedTemplates reads this path). It\n' +
   'deliberately carries no real content.\n';
+
+/**
+ * Write the inert boot stubs a stripped room needs, from the list the ROOM
+ * declares (BUG-182). Exported so the proof script can exercise the real thing
+ * rather than a re-implementation of it.
+ */
+export async function seedBootStubs(dir) {
+  const bootDocs = await declaredBootDocs(dir);
+  const seededStubs = [];
+  for (const rel of bootDocs) {
+    const p = path.join(dir, rel);
+    if (fs.existsSync(p)) continue; // survived the strip (unexpected, but respect it)
+    try {
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      fs.writeFileSync(p, BOOT_STUB_BODY);
+      seededStubs.push(rel);
+    } catch (err) {
+      die(`clean room could not seed the boot stub ${rel} (the server cannot start without it — seedTemplates reads it): ${(err instanceof Error ? err.message : String(err))}`);
+    }
+  }
+  // And PROVE it: every declared boot doc must now exist in the room. A gap here
+  // is what BUG-182 was — the server dies at boot and the round sees only
+  // `server never became healthy`. Name the missing path instead.
+  const missing = bootDocs.filter((rel) => !fs.existsSync(path.join(dir, rel)));
+  if (missing.length) {
+    die(`clean room cannot boot: seedTemplates needs ${missing.join(', ')} — declared in ${SEED_SOURCE_DECL} but not present in the room after stubbing. ` +
+        'Refusing to hand the verifier a room whose server will die on an opaque health-check timeout.');
+  }
+  return seededStubs;
+}
 
 /**
  * DEPENDENCIES — COPIED, never symlinked (BUG-112).
@@ -356,7 +433,7 @@ function auditSymlinks(dir) {
   return removed;
 }
 
-function buildCleanroom(repo, rev) {
+async function buildCleanroom(repo, rev) {
   const dir = mkdtempScratch('cleanroom-verify-');
   const tar = spawnSync('sh', ['-c', `git -C ${JSON.stringify(repo)} archive ${JSON.stringify(rev)} | tar -x -C ${JSON.stringify(dir)}`], { encoding: 'utf8' });
   if ((tar.status ?? 1) !== 0) die(`could not export ${rev} into a clean room: ${(tar.stderr || '').trim()}`);
@@ -388,21 +465,7 @@ function buildCleanroom(repo, rev) {
   })(dir);
   if (leftovers.length) die(`clean room is NOT clean — ambient instruction files remain: ${leftovers.join(', ')}`);
 
-  // Re-seed the minimum boot stubs the strip just removed (see BOOT_STUBS).
-  // Inert placeholders only — never the real content — so the server can start
-  // without the verifier ever reading our methodology.
-  const seededStubs = [];
-  for (const rel of BOOT_STUBS) {
-    const p = path.join(dir, rel);
-    if (fs.existsSync(p)) continue; // survived the strip (unexpected, but respect it)
-    try {
-      fs.mkdirSync(path.dirname(p), { recursive: true });
-      fs.writeFileSync(p, BOOT_STUB_BODY);
-      seededStubs.push(rel);
-    } catch (err) {
-      die(`clean room could not seed the boot stub ${rel} (the server cannot start without it — seedTemplates reads it): ${(err instanceof Error ? err.message : String(err))}`);
-    }
-  }
+  const seededStubs = await seedBootStubs(dir);
 
   // Dependencies: a verifier that cannot run the tests cannot produce evidence.
   const modules = provisionModules(repo, dir);
@@ -677,7 +740,7 @@ async function main() {
     return { rel: path.relative(repo, p) || path.basename(p), body: fs.readFileSync(p, 'utf8') };
   });
 
-  const room = buildCleanroom(repo, head);
+  const room = await buildCleanroom(repo, head);
   const prompt = composePrompt({
     requirement: readRequirement(opts.requirement),
     diff, truncated, fullDiffBytes, runs: opts.runs, tests, cwd: room.dir,

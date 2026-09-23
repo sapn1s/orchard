@@ -90,6 +90,38 @@ export interface RunningEntry {
    */
   ticket?: string[];
   request?: string | null;
+  /*
+   * BUG-178 — the DECLARED foreground/background fact for this lane, owned by
+   * whoever spawns/records it (the bridge). `true` = an independent background
+   * lane whose progress does NOT block the session's main-turn boundary (a
+   * `run_in_background` fan-out, or an SDK-default `Agent` which runs in the
+   * background); `false` = a lane POSITIVELY KNOWN to be FOREGROUND, one the main
+   * turn is genuinely blocked on (a subagent dispatched `run_in_background:false`),
+   * so the next model-invocation boundary is that lane finishing — possibly
+   * minutes away.
+   *
+   * TRI-STATE, and this is the whole point (BUG-178 round-2 fix). The field is
+   * ABSENT — not `false` — for a lane the owner has not yet been able to
+   * classify: the BIRTH WINDOW between a lane's `task_started` and the engine's
+   * first background-level frame, during which a default-background `Agent`
+   * (which omits `run_in_background`, so it is never pre-level born-tagged) sits
+   * in NEITHER background set. A concrete `false` there would be a false claim of
+   * foreground — and foreground is the DANGEROUS direction, because it is what
+   * renders the scary "your message can't reach it until that step finishes …
+   * Force send (its progress is lost)" copy on a plain background fan-out lane
+   * (the round-2 defect). So the owner answers `undefined` when it cannot
+   * affirmatively say, and this entry omits the field entirely.
+   *
+   * The client MUST NOT re-derive any of this. "turn.running !== false plus a
+   * non-`main` row" does NOT mean foreground: the orchestrator keeps its turn
+   * running while a background fan-out persists, and that look-alike is the
+   * COMMON workload here (the round-1 defect). The fact is owned by the bridge
+   * and written once, here. A reader treats ABSENCE (older server, survivor
+   * lane, or an as-yet-unclassified lane) as "not known to be foreground" and
+   * must NOT show the blocked-boundary copy — only a lane it reads as an explicit
+   * `false` earns it.
+   */
+  background?: boolean;
 }
 
 export interface RunningSnapshot {
@@ -144,6 +176,18 @@ export interface SnapshotSource extends BridgeLike {
    * listing the id). Optional so older/leaner sources judge on progress alone.
    */
   stallSignalFor?(agentId: string): StallSignal | null;
+  /**
+   * BUG-178 — does this lane run in the BACKGROUND? TRI-STATE: `true` a
+   * background lane (the engine's level `#backgroundTasks` ∪ the pre-level born
+   * tags `#bgBornTasks`), `false` a lane POSITIVELY known to be foreground (an
+   * `Agent` dispatched `run_in_background:false`), and `undefined` when the owner
+   * CANNOT yet classify the lane — the birth window before the first level frame.
+   * The `undefined` case is load-bearing: it is what stops an unclassified
+   * default-background lane being stamped a false `false` and rendered with the
+   * scary blocked-boundary copy. Optional so a leaner source that cannot own the
+   * fact at all simply carries no method, and the snapshot omits `background`.
+   */
+  isBackgroundLane?(agentId: string): boolean | undefined;
 }
 
 function entryFor(a: LiveAgent, source: SnapshotSource, now: number): RunningEntry {
@@ -175,6 +219,16 @@ function entryFor(a: LiveAgent, source: SnapshotSource, now: number): RunningEnt
     // charter declared it (a gap stays a gap, never a fabricated binding).
     ...(a.ticket && a.ticket.length ? { ticket: a.ticket } : {}),
     ...(a.request ? { request: a.request } : {}),
+    // BUG-178 — declare the foreground/background fact from its owner (the
+    // bridge's background bookkeeping), so no reader re-derives it. TRI-STATE: a
+    // `boolean` is stamped; `undefined` (the owner cannot yet classify the lane —
+    // the birth window before the level frame — or has no such method at all) is
+    // OMITTED. Absence ⇒ "not known to be foreground", and the dock chip degrades
+    // to its honest short-wait copy. Never stamp a guessed `false`: foreground is
+    // the dangerous direction (it is what earns the scary Force-send copy).
+    ...(typeof source.isBackgroundLane?.(a.agentId) === 'boolean'
+      ? { background: source.isBackgroundLane(a.agentId) }
+      : {}),
   };
 }
 

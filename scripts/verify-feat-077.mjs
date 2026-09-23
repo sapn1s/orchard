@@ -200,10 +200,18 @@ async function sectionC() {
     const booted = await waitFor('project list', () => qa('#tree button.proj').length > 0);
     if (!booted) throw new Error('app.js never rendered the project list');
 
-    // Open the templates library exactly as a user does: the #libBtn control.
-    const libBtn = q('#libBtn');
-    if (!libBtn) throw new Error('precondition: #libBtn missing');
-    libBtn.click();
+    // Open the templates library exactly as a user does. FEAT-139 removed the
+    // standalone #libBtn door; FEAT-146 made "Templates" a rail category one
+    // click away inside the settings modal (`#cogBtn` → `#sRail-templates`) —
+    // see docs/bugs/FEAT-146-settings-is-two-navigation-axes-fighting-each-other.md.
+    const cogBtn = q('#cogBtn');
+    if (!cogBtn) throw new Error('precondition: #cogBtn missing');
+    cogBtn.click();
+    const railReady = await waitFor('settings rail', () => qa('#sRail .srail-item').length > 0);
+    if (!railReady) throw new Error('precondition: settings rail never rendered');
+    const templatesTab = q('#sRail-templates');
+    if (!templatesTab) throw new Error('precondition: #sRail-templates missing');
+    templatesTab.click();
     const rendered = await waitFor('library rows', () => qa('#vLibrary .lrow').length >= 6);
     check('[C] library rendered all templates (6+ rows: 2 WA + 4 patterns + user)', rendered, qa('#vLibrary .lrow').length);
 
@@ -242,7 +250,17 @@ async function sectionC() {
     check('[C] the pattern row shows the NEW human description (old jargon gone)',
       goDesc.includes('yes/no checklist') && !goDesc.includes('numbered eligibility') && !goDesc.startsWith('Opt-in.'), goDesc.slice(0, 60));
   } finally {
-    for (const s of openSockets) { try { s.removeAllListeners(); s.close(); } catch { /* */ } }
+    // BUG-175-adjacent: a socket still in CONNECTING state when the test tears
+    // down closes with an ASYNC 'error' event ("WebSocket was closed before
+    // the connection was established") that fires on a later tick — after
+    // this loop's own try/catch has already returned, so a synchronous catch
+    // here cannot see it. `removeAllListeners()` before `close()` made it
+    // worse: it strips the listener the async event needs, so Node treats the
+    // unhandled 'error' as fatal and crashes the whole script AFTER every
+    // check above has already printed PASS. A permanent no-op 'error'
+    // listener (added before close, never removed) gives that later event
+    // somewhere harmless to land instead.
+    for (const s of openSockets) { try { s.on('error', () => {}); s.close(); } catch { /* */ } }
     await sleep(200);
     if (prev.document !== undefined) {
       globalThis.document = prev.document; globalThis.window = prev.window;

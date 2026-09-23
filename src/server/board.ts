@@ -813,6 +813,9 @@ export function boardStateSection(
     '',
     `_Auto-injected at launch from ${boardRel}/ (read-only). Re-read ${boardRel}/INDEX.md for the authoritative board; answer 👤 items via the dashboard's Needs-You rail._`,
     '',
+    // FEAT-149 — a ticket's state is a fact the board owns; read it, never assert it.
+    "_A ticket's status/round/placement is READ with `npm run board:status -- <ID>` (allowed under the orchestrator profile) — never asserted from memory or relayed from a lane's claim, which disagree by construction and have been wrong._",
+    '',
     // FEAT-119 — a STATIC pointer (no live numbers, so it never busts the cached
     // prefix) to the on-demand usage/burn command. Before fanning out a fleet,
     // run it to see how much of each provider's window is gone, the burn rate

@@ -70,6 +70,11 @@ import {
   DECLARED_PHASES,
   DISPATCH_CLASSES,
 } from './lib/cost-model.mjs';
+// FEAT-141: what a dispatch of a given SHAPE may cost — advertised tool set and
+// cache TTL, declared once per profile rather than defaulted per call site.
+import {
+  resolveProfile, profileEnv, profileNotice, DISPATCH_PROFILES, DEFAULT_PROFILE,
+} from './lib/dispatch-profiles.mjs';
 // A dispatched lane is an AGENT-started session by construction — this script
 // only ever runs because an orchestrator invoked it. Declare that provenance at
 // creation so the picker can fold these rows out of the human's way (they are
@@ -79,7 +84,7 @@ import { recordSessionProvenance } from '../src/lib/session-provenance.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 
-const USAGE = `usage: node scripts/dispatch.mjs --provider openai|anthropic [--model <m>] [--cwd <dir>] [--sandbox read-only|workspace-write] [--timeout-min <n>] [--allow-tools "Bash Read Write"] [--resume <session-id>] [--meta-out <file>] [--prompt-stdin] [--ticket <ID>] [--phase finding|fixing|verifying] [--round <n>] [--class trivial|fix|explore|plan+review|arch|verify] "task prompt"`;
+const USAGE = `usage: node scripts/dispatch.mjs --provider openai|anthropic [--model <m>] [--cwd <dir>] [--sandbox read-only|workspace-write] [--timeout-min <n>] [--allow-tools "Bash Read Write"] [--resume <session-id>] [--meta-out <file>] [--prompt-stdin] [--tool-profile <name>] [--ticket <ID>] [--phase finding|fixing|verifying] [--round <n>] [--class trivial|fix|explore|plan+review|arch|verify] "task prompt"`;
 
 const HELP = `${USAGE}
 
@@ -132,6 +137,26 @@ const HELP = `${USAGE}
   string concatenation of values already in argv. Omit any of them and the
   field is recorded as ABSENT — never guessed. Also written to --meta-out.
 
+--tool-profile <name>   (FEAT-141; env: ORCHARD_DISPATCH_TOOL_PROFILE)
+  anthropic only. Declare what SHAPE this dispatch is, and get that shape's
+  advertised tool set + cache TTL. Known: ${Object.keys(DISPATCH_PROFILES).join(' | ')}
+  (default \`${DEFAULT_PROFILE}\` = today's CLI defaults, unchanged).
+
+  Two facts nothing used to declare, both measured:
+    • \`--allowedTools\` does NOT restrict — it only auto-approves. \`--tools\`
+      is what shrinks the advertised set, and nothing here ever set it, so
+      every dispatch paid for every built-in schema. Measured on opus-5:
+      all built-ins = 21,312 prompt tokens; the monitor set = 13,955.
+    • Cache writes bill at 2.0x base input on the CLI's default 1-hour TTL
+      and 1.25x on the 5-minute one. A recurring headless tick re-reads its
+      cache within SECONDS (87.8% of its cache-creation is incremental
+      writes at a ~3.6s cadence), so the 1h premium buys it nothing.
+
+  A profile that trims tools also states the trim IN THE PROMPT, naming the
+  withheld tools and this flag, so a lane that needs one reports it instead
+  of hitting a bare "unknown tool". An unknown profile name is refused, never
+  defaulted. Full rationale + measurements: scripts/lib/dispatch-profiles.mjs.
+
 Exit taxonomy (both providers, stderr): \`dispatch failed [<kind>] …\` where
 kind is one of quota-window, auth-expired, rate-limited, overloaded,
 model-unavailable, network, internal, timeout, transport.`;
@@ -144,7 +169,10 @@ function die(msg, code = 2) {
 /* ------------------------------------------------------------------ args */
 
 const argv = process.argv.slice(2);
-const opts = { provider: null, model: null, cwd: process.cwd(), sandbox: 'read-only', timeoutMin: 15, allowTools: null, resume: null, metaOut: null, promptStdin: false, ticket: null, phase: null, round: null, dispatchClass: null };
+const opts = { provider: null, model: null, cwd: process.cwd(), sandbox: 'read-only', timeoutMin: 15, allowTools: null, resume: null, metaOut: null, promptStdin: false, ticket: null, phase: null, round: null, dispatchClass: null,
+  // FEAT-141: env fallback so a systemd unit / wrapper can opt a recurring
+  // dispatch into a cheaper profile without editing the consuming repo.
+  toolProfile: process.env.ORCHARD_DISPATCH_TOOL_PROFILE || null };
 const positional = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -166,6 +194,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--phase') opts.phase = take();
   else if (a === '--round') opts.round = take();
   else if (a === '--class') opts.dispatchClass = take();
+  // FEAT-141: name the dispatch SHAPE; see scripts/lib/dispatch-profiles.mjs.
+  else if (a === '--tool-profile') opts.toolProfile = take();
   else if (a === '--help' || a === '-h') { console.log(HELP); process.exit(0); }
   else if (a === '--') { positional.push(...argv.slice(i + 1)); break; } // end of options: rest is prompt text
   else if (a.startsWith('--')) die(`unknown flag ${a}\n${USAGE}`);
@@ -243,6 +273,30 @@ if (declaration) {
   progress(declaration.line);
 }
 
+/* ------------------------------------------- FEAT-141: the dispatch profile */
+
+/*
+ * Resolved BEFORE anything spawns, and refused loudly on an unknown name — a
+ * typo'd profile that quietly fell back to `full` would restore the expensive
+ * defaults while the operator believed the cheap ones were in force, and
+ * nothing would ever report it.
+ *
+ * The notice is appended to the prompt (not prepended) so it cannot displace
+ * the FEAT-100 `Dispatch:` line, which the cost collector reads positionally.
+ * On the default `full` profile there is no notice and no flag: zero tokens,
+ * zero behaviour change, every other consumer of this repo untouched.
+ */
+let profile;
+try {
+  profile = resolveProfile(opts.toolProfile);
+} catch (e) {
+  die(`${e.message}\n  (declared in scripts/lib/dispatch-profiles.mjs)`);
+}
+{
+  const notice = profileNotice(profile);
+  if (notice) task = `${task}\n\n---\n\n${notice}`;
+}
+
 /**
  * FEAT-062 (review finding #11): the machine-readable metadata channel. The
  * human-oriented stderr lines (`session <id>`, `thread <id> started`) stay,
@@ -250,15 +304,23 @@ if (declaration) {
  * over progress text. Best-effort write, never fatal — the dispatch result is
  * the primary contract.
  */
-function writeMeta({ sessionId = null, exitCode, failureKind = null }) {
+function writeMeta({ sessionId = null, exitCode, failureKind = null, usage = null }) {
   if (!opts.metaOut) return;
   try {
     fs.writeFileSync(opts.metaOut, JSON.stringify({
       provider: opts.provider, model: opts.model ?? null,
       sessionId, exitCode, failureKind, resumed: Boolean(opts.resume), ts: new Date().toISOString(),
+      // ARCH-017: per-lane cost attribution. The engine's own usage block,
+      // carried VERBATIM and null when the engine reported none — the lane
+      // ledger records it as absent rather than guessing a zero.
+      usage: usage ?? null,
       // FEAT-100: null, not omitted, when nothing was declared — a caller can
       // then tell "this dispatch declared nothing" from "this meta file is old".
       dispatch: declaration ? declaration.fields : null,
+      // FEAT-141: the launch shape actually used. Recorded rather than
+      // re-derived, so a cost postmortem can tell a cheap run from an expensive
+      // one without reconstructing argv.
+      toolProfile: profile ? { name: profile.name, tools: profile.tools, cacheTtl: profile.cacheTtl } : null,
     }, null, 2) + '\n');
   } catch (e) { progress(`meta-out not written: ${e.message}`); }
 }
@@ -317,9 +379,21 @@ async function dispatchAnthropic() {
   // of evidence. --allow-tools is the explicit, opt-in allowlist for that case;
   // it is never implied by --sandbox, so nothing else changes behavior.
   if (opts.allowTools) args.push('--allowedTools', ...opts.allowTools.split(/[,\s]+/).filter(Boolean));
-  progress(`claude -p (model ${opts.model ?? 'default'}, cwd ${opts.cwd}, sandbox ${opts.sandbox} [application-level gate, not an OS jail]${opts.allowTools ? `, allow-tools ${opts.allowTools}` : ''})`);
+  /*
+   * FEAT-141 — the dispatch tool-profile. `--allowedTools` above is an
+   * AUTO-APPROVE list and removes nothing from the request (SDK
+   * sdk.d.ts:1368-1374); `--tools` is the knob that sets the advertised base
+   * set, and until now nothing here ever set it, so every dispatch paid for
+   * every built-in schema. The profile also carries the cache-TTL choice,
+   * because both are the same kind of fact — "what may this SHAPE of dispatch
+   * cost" — and both are declared once in scripts/lib/dispatch-profiles.mjs.
+   * `full` (the default) emits neither, so every existing caller is unchanged.
+   */
+  if (profile.tools) args.push('--tools', profile.tools.join(','));
+  const childEnv = { ...process.env, ...profileEnv(profile) };
+  progress(`claude -p (model ${opts.model ?? 'default'}, cwd ${opts.cwd}, sandbox ${opts.sandbox} [application-level gate, not an OS jail]${opts.allowTools ? `, allow-tools ${opts.allowTools}` : ''}, tool-profile ${profile.name}${profile.tools ? ` [tools ${profile.tools.length}]` : ' [tools CLI-default]'}${profile.cacheTtl ? `, cache-ttl ${profile.cacheTtl}` : ''})`);
 
-  const child = spawn('claude', args, { cwd: opts.cwd, stdio: [opts.promptStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'], detached: true });
+  const child = spawn('claude', args, { cwd: opts.cwd, env: childEnv, stdio: [opts.promptStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'], detached: true });
   if (opts.promptStdin) {
     child.stdin.on('error', () => { /* EPIPE if claude dies early; the exit handler reports */ });
     child.stdin.end(task);
@@ -392,7 +466,7 @@ async function dispatchAnthropic() {
     // openai path's `thread … started` line.
     if (parsed.session_id) progress(`session ${parsed.session_id} (anthropic run id)`);
     if (parsed.usage) progress(`tokens: ${JSON.stringify(parsed.usage)}`);
-    writeMeta({ sessionId: parsed.session_id ?? null, exitCode: code === 0 ? 0 : (code ?? 1) });
+    writeMeta({ sessionId: parsed.session_id ?? null, exitCode: code === 0 ? 0 : (code ?? 1), usage: parsed.usage ?? null });
     process.stdout.write(text.endsWith('\n') ? text : `${text}\n`);
     process.exit(code === 0 ? 0 : (code ?? 1));
   });
@@ -440,6 +514,7 @@ async function dispatchOpenai() {
    *  as the turn's last agentMessage; interim ones stream to stderr anyway). */
   let finalText = null;
   let streamedDelta = false;
+  let finalUsage = null; // ARCH-017: reported usage, carried to --meta-out verbatim
 
   try {
     for await (const m of rt.messages()) {
@@ -474,6 +549,7 @@ async function dispatchOpenai() {
       }
       if (m.type === 'result') {
         clearTimeout(timer);
+        finalUsage = m.usage ?? null;
         if (m.is_error) {
           const pe = rt.classifyProviderError?.(m) ?? null;
           const kind = timedOut ? 'timeout' : (pe?.kind ?? 'internal');
@@ -505,6 +581,6 @@ async function dispatchOpenai() {
 
   rt.close();
   if (recorder.filePath) progress(`transcript: ${recorder.filePath}`);
-  writeMeta({ sessionId: openaiSessionId, exitCode, failureKind: exitCode === 0 ? null : 'see stderr taxonomy line' });
+  writeMeta({ sessionId: openaiSessionId, exitCode, failureKind: exitCode === 0 ? null : 'see stderr taxonomy line', usage: finalUsage });
   process.exit(exitCode);
 }

@@ -227,6 +227,65 @@ section('3b. live-lane-in-a-long-call — the heartbeat keeps a live lock off th
   const r2 = refreshOwnedLocks({ lockDir: foreignLockDir, isOwnerLive: () => false, now: T0 + HB });
   ok(r2.released === 0 && r2.refreshed === 0 && fs.existsSync(flf),
     'a FOREIGN session\'s lock (different pid/host) is left untouched by our heartbeat');
+
+  /*
+   * 3b. THE SHARED-PID DEFECT (filed on FEAT-129, fixed 2026-09-10).
+   * Every session on this host runs inside ONE Orchard server process, so
+   * `ownerPid` is byte-identical on every lock and the pid filter above does
+   * NOT exclude a foreign session. The old `isOwnerLive` answered `true` on its
+   * "not ours to judge" branch, so a live session re-stamped a DEAD session's
+   * lock forever: `refreshedAt` never aged and the TTL backstop never fired.
+   *
+   * The must-FAIL baseline is SYNTHESIZED (old closure semantics = `true` for a
+   * foreign owner), never read from HEAD — so it stays a real proof after this
+   * fix is committed.
+   */
+  const sharedPid = process.pid, thisHost = os.hostname();
+  const deadOwnerLock = (dir, name) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const k = lockKeyFor(path.join(repo, name), repo);
+    const p = path.join(dir, ch('sha1').update(k).digest('hex') + '.lock');
+    // A DEAD foreign session's lock, already older than the TTL, same pid+host.
+    write(p, JSON.stringify({ owner: 'sessDEAD:laneGone', ownerPid: sharedPid, host: thisHost, kind: 'edit', key: k, acquiredAt: T0, refreshedAt: T0 }));
+    return p;
+  };
+  const farFuture = T0 + FILE_LOCK_TTL_MS * 4;
+
+  // --- must-FAIL (pre-fix shape): "not ours to judge" answered `true`.
+  {
+    const dir = path.join(SCRATCH, 'locks-sharedpid-prefix');
+    const lf = deadOwnerLock(dir, 'imm-old.ts');
+    const preFixIsOwnerLive = (owner) => (owner.startsWith('sessLIVE:') ? true : true); // the old branch: foreign → true
+    const r = refreshOwnedLocks({ lockDir: dir, isOwnerLive: preFixIsOwnerLive, now: farFuture });
+    const after = JSON.parse(read(lf));
+    ok(r.refreshed === 1 && after.refreshedAt === farFuture,
+      'CONTROL (pre-fix): a live session\'s heartbeat re-stamps a DEAD session\'s lock — refreshedAt is manufactured');
+    ok(reclaimReason(after, farFuture + 1) === null,
+      'CONTROL (pre-fix): the freshly-stamped dead lock is NOT reclaimable — immortal, the measured jam');
+  }
+
+  // --- must-PASS: `null` ("not ours to judge") is neither live nor dead.
+  {
+    const dir = path.join(SCRATCH, 'locks-sharedpid-fixed');
+    const lf = deadOwnerLock(dir, 'imm-new.ts');
+    const fixedIsOwnerLive = (owner) => (owner.startsWith('sessLIVE:') ? true : null); // the shipped branch: foreign → null
+    const r = refreshOwnedLocks({ lockDir: dir, isOwnerLive: fixedIsOwnerLive, now: farFuture });
+    const after = JSON.parse(read(lf));
+    ok(r.refreshed === 0 && r.unjudged === 1, 'POST: a foreign session\'s lock is counted unjudged, never refreshed');
+    ok(after.refreshedAt === T0, 'POST: refreshedAt is NOT manufactured — the lock ages honestly');
+    ok(r.released === 0 && fs.existsSync(lf), 'POST: it is also NOT released — we never clobber a lock we cannot prove dead');
+    ok(/stale/.test(reclaimReason(after, farFuture) ?? ''), 'POST: the TTL backstop can now free it — dead sessions\' locks are mortal again');
+  }
+
+  // A live foreign session is unharmed: its OWN heartbeat matches its own prefix.
+  {
+    const dir = path.join(SCRATCH, 'locks-sharedpid-liveforeign');
+    const lf = deadOwnerLock(dir, 'imm-live.ts');
+    const asItsOwnSession = (owner) => (owner.startsWith('sessDEAD:') ? true : null); // that session judging ITSELF
+    const r = refreshOwnedLocks({ lockDir: dir, isOwnerLive: asItsOwnSession, now: farFuture });
+    ok(r.refreshed === 1 && JSON.parse(read(lf)).refreshedAt === farFuture,
+      'a LIVE session still refreshes its own locks under the shared pid (the fix costs nothing to live lanes)');
+  }
 }
 
 /* ───────────────────────────────────────── 4. single-lane unaffected */
@@ -304,6 +363,11 @@ section('7. shipped wiring — the runtime hook calls the same module');
   ok(/fileLockEnabled\(\)/.test(src), 'the launch-time hatch is consulted');
   ok(/i\.agent_id \? `\$\{fileLockSessionOwner\}:\$\{i\.agent_id\}`/.test(src), 'owner folds the per-lane agent_id onto the session id');
   ok(/file-locks/.test(src), 'the lock dir lives under the data dir (not the git tree)');
+  // The shared-pid fix is only real if the SHIPPED closure returns the third rung.
+  ok(/isOwnerLive = \(owner: string\): boolean \| null =>/.test(src),
+    'the shipped isOwnerLive declares the three-way verdict (boolean | null)');
+  ok(/if \(!owner\.startsWith\(ownerPrefix\)\) return null;/.test(src),
+    'the shipped isOwnerLive returns NULL for a foreign session — not `true` (the shared-pid defect)');
 }
 
 /* ───────────────────────────────────────── 8. hatch */

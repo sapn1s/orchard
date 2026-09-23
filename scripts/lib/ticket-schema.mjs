@@ -70,15 +70,21 @@
  * `classifyStatusField` for the list and for which are made unrepresentable
  * versus merely reported.
  *
- * AMBIGUOUS STATUSES ARE NOW NAMED
- * --------------------------------
- * board.mjs matches a bare `DONE` ANYWHERE in the status line, on purpose (its
- * comment cites "IN PROGRESS — Phase R DONE; v1 … VERIFIED"). That behaviour is
- * preserved exactly, but it is no longer invisible: when a not-done leading
- * word is overridden to done by an incidental `DONE`, the result carries
- * `ambiguous: true` and a `reason`. This is ARCH-004's ONE recorded blind spot
- * — "a ticket mis-classified as done by an incidental word" — turned from an
- * unobservable event into a reportable one.
+ * THE STATE IS THE DECLARED LEADING WORD — AN INCIDENTAL `DONE` DOES NOT DECIDE
+ * ----------------------------------------------------------------------------
+ * board.mjs historically matched a bare `DONE` ANYWHERE in the status line, so a
+ * ticket whose header merely MENTIONED the word — quoting a prior verdict, a
+ * proof bar, or the word in prose — was swept into Done. That was ARCH-004's ONE
+ * recorded blind spot ("a ticket mis-classified as done by an incidental word"),
+ * and it is now REMOVED, not merely reported: a legacy ticket's state is the
+ * DECLARED leading state word, anchored at the START of the `- **Status:**` line
+ * (every `LEGACY_STATUS_TABLE` `re` begins `^`), and nothing later in the line
+ * overrides it. This is what filed ARCH-017 — leading `IN PROGRESS`, with a
+ * `reported DONE … WAS NOT` deep in a long round-history header — under Done
+ * while its own record declared IN PROGRESS. A ticket that carries a structured
+ * `work_state` (the block format) never reaches this path: `blockSummary` reads
+ * that declared field directly, per ARCH-010 (the owner declares the fact; no
+ * reader re-derives it from prose).
  *
  * PORTABILITY CONTRACT — DO NOT BREAK
  * -----------------------------------
@@ -327,9 +333,10 @@ export const LEGACY_STATUS_TABLE = [
  *  - `matched: false` + `workState: null` ⇒ the status does not map. NOT a
  *    guess, NOT a default. `done` is `false` so the ticket stays where a human
  *    sees it, and callers are expected to REPORT it (board:check errors).
- *  - `ambiguous: true` ⇒ a not-done leading word was overridden to done by an
- *    incidental `DONE` token elsewhere in the line. board.mjs has always done
- *    this (its comment defends it); the only change is that it is now visible.
+ *  - `ambiguous` is retained in the shape (always `false` now) so consumers that
+ *    read `statusAmbiguous` keep their field. The state is the DECLARED leading
+ *    word only; an incidental `DONE` later in the line no longer overrides it
+ *    (ARCH-004 / ARCH-017), so there is no ambiguous outcome to flag.
  */
 export function classifyLegacyStatus(raw) {
   const rawStr = String(raw == null ? '' : raw);
@@ -343,25 +350,14 @@ export function classifyLegacyStatus(raw) {
   for (const entry of LEGACY_STATUS_TABLE) {
     const m = entry.re.exec(s);
     if (!m) continue;
-    const token = m[0];
-    // Preserve board.mjs's deliberate match-anywhere DONE: a leading word that
-    // is NOT done, with a DONE token later in the line, has always been placed
-    // in Done. Keep the placement; surface the ambiguity.
-    if (!isDoneWorkState(entry.workState) && /\bDONE\b/.test(s)) {
-      return {
-        ...base,
-        token,
-        workState: 'done',
-        verificationState: entry.verificationState,
-        done: true,
-        matched: true,
-        ambiguous: true,
-        reason: `leading state word "${token}" is not done, but an incidental DONE token later in the status places it in Done`,
-      };
-    }
+    // ARCH-004 / ARCH-017: the state is the DECLARED leading word, anchored at
+    // the START of the status line (every `re` begins `^`). An incidental `DONE`
+    // token later in a long status header — a quoted verdict, a proof bar, or
+    // the word in prose — is NOT a second declaration and does NOT override the
+    // leading word. There is no match-anywhere path any more.
     return {
       ...base,
-      token,
+      token: m[0],
       workState: entry.workState,
       verificationState: entry.verificationState,
       done: isDoneWorkState(entry.workState),
@@ -369,20 +365,10 @@ export function classifyLegacyStatus(raw) {
     };
   }
 
-  // No leading state word. A DONE token anywhere still closes it (unchanged
-  // behaviour — this is how e.g. "SYNTHESIS … DONE" has always been placed).
-  if (/\bDONE\b/.test(s)) {
-    return {
-      ...base,
-      workState: 'done',
-      verificationState: 'not_recorded',
-      done: true,
-      matched: true,
-      ambiguous: true,
-      reason: 'no recognised leading state word; placed in Done by a DONE token elsewhere in the status',
-    };
-  }
-
+  // No recognised leading state word. NOT swept to Done by a `DONE` token
+  // elsewhere in the line — that was the incidental-word failure ARCH-004
+  // recorded. `done` is false so the ticket stays where a human sees it, and
+  // callers REPORT the unmapped status (board:check errors).
   return {
     ...base,
     workState: null,
@@ -971,12 +957,20 @@ export function parseTitleLine(text, opts = {}) {
  */
 export function indexRowCells(line, opts = {}) {
   const t = String(line || '').trim();
+  // The board WRITES a literal `|` inside a cell as `\|` (board.mjs asCell /
+  // boardStatusFromHeader / escapeTableCell — "escape any `|` so it cannot split
+  // the row"). So a cell delimiter is an UNESCAPED `|`; splitting on every `|`
+  // shredded any cell that contained one and read a spurious extra column. That
+  // stayed latent until a pipe-bearing Status header moved into the Open table,
+  // where it produced a false SEVERITY MISMATCH (ARCH-004/ARCH-017). Split on
+  // unescaped pipes, then undo the escape so callers see the literal cell text.
+  const splitCells = (s) => s.split(/(?<!\\)\|/).map((c) => c.replace(/\\\|/g, '|').trim());
   if (opts.requireClosingPipe) {
     const m = /^\|(.+)\|\s*$/.exec(t);
-    return m ? m[1].split('|').map((c) => c.trim()) : [];
+    return m ? splitCells(m[1]) : [];
   }
   if (!t.startsWith('|')) return [];
-  return t.replace(/^\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+  return splitCells(t.replace(/^\|/, '').replace(/\|\s*$/, ''));
 }
 
 /** Newest `### YYYY-MM-DD` activity heading, or null. */

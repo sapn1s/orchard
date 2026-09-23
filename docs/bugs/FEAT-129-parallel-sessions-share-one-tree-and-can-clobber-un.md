@@ -368,3 +368,137 @@ operations cannot silently drop another lane's uncommitted work.
   for this single-fact pass.
 - **Ship implication:** no round-3 fix needed on the id-keying axis; the round-2 `VERIFIED-candidate`
   standing is upheld with its last unproven assumption now proven.
+
+### 2026-09-08 — BUG-176 classifier fix (dispatched, class=fix; see BUG-176 ticket)
+- **Regression this narrows:** the redirect-target collector in `scanBashMutation`
+  (`scripts/lib/file-lock.mjs`) locked EVERY truncating-redirect target, including
+  `/dev/null`. So read-only commands carrying `2>/dev/null` (idiomatic on nearly every
+  exploratory command) were classified as mutations and refused BUSY — measured twice by
+  two investigation lanes, and reproduced live again (the deployed hook refused this
+  fixing lane's own `grep … 2>/dev/null`).
+- **Changed:** `scripts/lib/file-lock.mjs` — new pure `isDiscardRedirTarget()` +
+  `DISCARD_REDIR_TARGETS` (std streams / char-device nodes, EXACT normalized-path match,
+  never substring); gated the redirect-target push on it. Regular-file redirects (incl.
+  paths that merely CONTAIN `/dev/null`) keep being locked exactly as before — the
+  FEAT-129 protection is unchanged. Full detail + proof in BUG-176's Activity log.
+- **Verified:** `node scripts/verify-bug-176-devnull-redirect.mjs` 15/15 (must-FAIL→PASS +
+  the non-regression that a held real-file redirect is still REFUSED); this suite
+  (`node scripts/verify-feat-129-file-lock.mjs`) **75/75** with the change (real `git` on
+  PATH). Left unstaged.
+
+### 2026-09-08 05:2xZ — DEFECT FOUND FROM OUTSIDE (filed by a `trading-volume` lane, `agent:closing-verification`): **AN ADVISORY FILE LOCK CAN NEVER EXPIRE. A DEAD SESSION'S LOCKS ARE IMMORTAL WHILE ANY SESSION IS OPEN ON THE HOST.**
+
+**Reported from a consuming project, not from Orchard.** This blocked a
+`trading-volume` lane for ~3 h (two lanes each truthfully reporting the other
+held `docs/bugs/INDEX.md`, both lanes already ENDED). It is filed here because
+the defect is in `scripts/lib/file-lock.mjs` + `claude-runtime.ts`, not in the
+consuming repo. **It will jam every future session on every project**, so this
+should be treated as blocking the ticket's `VERIFIED-candidate` standing.
+
+**THE TWO-STEP FAIL-OPEN.**
+1. `refreshOwnedLocks()` (`file-lock.mjs:725`) filters to locks it considers its
+   own with `lock.ownerPid === ownerPid`, then defers to `isOwnerLive(lock.owner)`.
+2. `isOwnerLive()` (`claude-runtime.ts:736`) resolves an owner against the
+   running-set ONLY when the owner string starts with **this session's** prefix:
+   `if (!owner.startsWith(ownerPrefix)) return true;  // foreign session — not ours to judge`
+
+The `return true` is only safe if the pid filter in step 1 has already excluded
+foreign sessions. **It has not.** `ownerPid` is the **shared Orchard server pid**,
+identical on every lock written by every session on the host — it is not the
+lane's pid. So a foreign (possibly long-dead) session's lock passes the pid
+filter, reaches the "not ours to judge → live" branch, and is **refreshed
+forever by an unrelated live session**. `refreshedAt` — the documented staleness
+signal — therefore can never age, and no expiry path exists.
+
+**MEASURED, live, 2026-09-08 05:20:58Z**, across THREE projects in
+`~/.local/share/claude-station/file-locks/`:
+- `trading-volume/ac27a252…lock` → `{"owner":"cs-mtrwwyjc-3:a4710fd79297d6a27","ownerPid":2724837,"kind":"edit","key":"docs/HANDOFF.md","acquiredAt":1788833529493,"refreshedAt":1788844858323}`. That lane **ended hours ago**; `refreshedAt` is seconds old. `docs/HANDOFF.md` is the file every session in that project is told to read and update first.
+- The reporting (live) session `cs-mts4trpt-7` carries the **byte-identical** `refreshedAt` `1788844858323` on its own locks. **One heartbeat is stamping the live session's locks and a dead session's locks with the same timestamp.**
+- Same shared `ownerPid` `2724837` observed on `claude-station`'s own locks (e.g. `docs/bugs/BUG-173-*.md`, `docs/bugs/ARCH-017-*.md`, `src/server/index.ts`) and on `job-intel`'s. Two further pids (`2794244`, `1232929`) appear on older locks — **prior server processes, now dead, whose locks are frozen rather than released**: e.g. `job-intel` and `trading-volume` memory-file locks from 2026-09-06/07 that nothing will ever clear.
+- Four dead sessions' locks were immortal in `trading-volume` alone at the time of writing.
+
+**WHY THE TWO OBVIOUS OPERATOR TESTS BOTH GIVE THE WRONG ANSWER** — worth
+recording, because both were tried and both said "held by a live owner":
+`ps` on `ownerPid` returns alive for EVERY lock forever (it is the server); and
+`refreshedAt` freshness is manufactured by the very bug being diagnosed.
+The only test that worked was behavioural: **a live lane writes.** Both stale
+files had been written once, milliseconds after the claim, and never again
+(`INDEX.md` idle 2 h 49 m, `HANDOFF.md` idle 2 h 45 m).
+
+**NOT FIXED HERE, DELIBERATELY.** The reporting lane is a consumer of Orchard and
+was scoped read-only on it; it did not touch `file-lock.mjs`. Recording the
+shape of a fix only, for whoever owns it: the pid rung cannot distinguish
+sessions and needs replacing with a per-session liveness key, and/or
+`isOwnerLive`'s "not ours to judge" branch must not be reachable for locks that
+the refresher is about to treat as its own — a lock refreshed by a session that
+cannot judge its owner is the exact contradiction above. A wall-clock TTL that
+`refreshOwnedLocks` cannot extend for a foreign owner would bound the damage
+independently of that redesign.
+
+**CROSS-REFERENCE:** full root-cause narrative, the standoff it produced and the
+decisive staleness table are in the consuming repo at
+`trading_volume/docs/bugs/ARCH-001-concurrent-writers-no-ownership.md`, entry
+`2026-09-08 05:00Z — agent:board-standoff-resolve`.
+
+### 2026-09-10 — shared-pid immortal-lock defect FIXED (dispatched lane, class=fix, round=1)
+
+Fixes the defect filed above on 2026-09-08 ("AN ADVISORY FILE LOCK CAN NEVER
+EXPIRE"). That filing named the shape of the fix and this is it, adopting the
+second of its two suggestions in the cheaper form: **`isOwnerLive`'s "not ours to
+judge" branch is no longer reachable as a refresh**, and the wall-clock TTL is
+what bounds the damage — no per-session liveness key was needed.
+
+**ROOT CAUSE, restated in one line.** `refreshOwnedLocks`'s `lock.ownerPid ===
+ownerPid` filter is a HOST filter, not a SESSION filter, because every Orchard
+session runs inside the one shared server process. `isOwnerLive` was typed
+`boolean` and had to answer *something* for an owner it could not resolve; it
+answered `true`, so a live session's heartbeat re-stamped dead sessions' locks
+forever. `refreshedAt` was manufactured by the refresher, so `reclaimReason`'s
+TTL backstop could never fire.
+
+**THE FIX — a third rung, declared by the owner (ARCH-010).** `isOwnerLive` now
+returns `boolean | null`, and `null` means *not mine to judge*. `refreshOwnedLocks`
+honours it as NEITHER live NOR dead:
+- **not refreshed** → the lock ages honestly and `reclaimReason`'s TTL frees it;
+- **not released** → we never clobber a lock we cannot prove is dead.
+
+A genuinely-live foreign session is unaffected: its OWN heartbeat matches its own
+`ownerPrefix`, so it keeps its own locks fresh — which is exactly the invariant
+`refreshOwnedLocks`'s doc comment already claimed and that the shared pid had
+quietly broken. Live lanes pay nothing.
+
+- `scripts/lib/file-lock.mjs` — `refreshOwnedLocks` three-way; new `unjudged`
+  counter in the return so the condition is observable rather than inferred.
+- `scripts/lib/file-lock.d.mts` — `isOwnerLive?: (owner) => boolean | null`,
+  return type carries `unjudged`. `undefined` still reads as live (legacy callers
+  keep the never-clobber default).
+- `src/server/runtime/claude-runtime.ts` — the shipped closure returns `null` on
+  `!owner.startsWith(ownerPrefix)`. The two OTHER fail-open `return true`s are
+  deliberately unchanged: both concern **our own** lanes (no running-set wired,
+  and a throwing `liveLaneIds()`), where fail-toward-live is still correct.
+
+**PROOF — `node scripts/verify-feat-129-file-lock.mjs`, 84/84 PASS** (was 77
+before this change; +7 assertions, new section 3b). The must-FAIL baseline is
+**synthesized, not read from HEAD** (CONVENTIONS.md: a must-FAIL proof must not be
+anchored to a moving baseline) — section 3b constructs the pre-fix closure
+literally (`foreign → true`) and grades it:
+- CONTROL: a dead session's lock, same pid+host, already 4× past the TTL, IS
+  re-stamped (`refreshed === 1`, `refreshedAt === now`) and `reclaimReason()`
+  then returns `null` — **immortal, the measured jam, reproduced**.
+- POST: same lock, shipped closure → `unjudged === 1`, `refreshed === 0`,
+  `refreshedAt` unmoved, file still present, and `reclaimReason()` now returns a
+  `stale` reason. **Dead sessions' locks are mortal again.**
+- POST: a live session judging ITSELF still refreshes under the shared pid.
+- Section 7 additionally PINS both halves of the shipped closure textually, so
+  the runtime cannot silently drift back to `return true`.
+
+`npx tsc --noEmit` is clean for these files. (One unrelated pre-existing error
+stands in `src/server/dispatch-broker.ts:178`, another lane's in-flight work,
+untouched here.)
+
+**Not claimed:** this does not give locks a per-session liveness key, so
+`ownerPid` remains unable to distinguish sessions and `reclaimReason`'s
+dead-owner rung still cannot fire for a session inside a live server. The TTL
+backstop is what collects those now — which is the bound the filing asked for.
+Left UNVERIFIED pending an independent lane, per this ticket's
+verification-class.

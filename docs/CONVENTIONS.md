@@ -48,7 +48,22 @@ ask, because 194 archived originals matter more than any one ticket.
 Worked examples on this board: `ARCH-002` (lifetime declared at dispatch, not
 inferred), `ARCH-009` (the derived proof field was deleted, and `verification[]`
 carries attributed entries instead), `FEAT-100` (the `Dispatch:` line below),
-`ARCH-001` (one liveness authority in `src/server/liveness.ts`).
+`ARCH-001` (one liveness authority in `src/server/liveness.ts`), `FEAT-145`
+(one account-id→dir authority; see the account-dir overlay section below).
+
+### A ticket's state is declared by the board — read it, don't reconstruct it (FEAT-149, 2026-09-23)
+
+A direct corollary of ARCH-010 for the one fact the orchestrator cites most: a
+ticket's status, round count, placement, dirty/committed state and latest
+activity are **declared by the board**, and a reader runs `npm run board:status
+-- <ID>` rather than reconstructing them from memory or from a lane's report.
+The command is allowed under the orchestrator profile (node/npm only) and reads
+through the board's own parser, so there is no second place able to hold a
+different answer. Measured 2026-09-23: an orchestrator asserted one ticket's
+review history four times from three contradictory lane reports and was wrong
+each time, while the user read the real answer off their own board. Lane reports
+are summaries written under their own framing and disagree by construction — the
+board is the source, so check it.
 
 ## Declare the dispatch — one line at the top of every charter (FEAT-100, 2026-08-21)
 
@@ -216,6 +231,84 @@ happened on 2026-08-25 and cost the live session its socket inode.
 product is safe; your fixture still is not, because a record naming real paths
 will mislead anything else that reads it. Rewrite `status`, `sock`, `errlog` and
 the `.ctl.json` twins to your scratch dir, then scrub pids.
+
+## A Claude account dir is an overlay, not a copy — do not tidy it (FEAT-145, 2026-09-18)
+
+Everything in this section looks like a bug in isolation. Each item is here
+because a reader who "fixed" it would split the transcript store, prune the
+user's history, or silently disarm a data-loss guard.
+
+**The invariant.** A Claude account dir is a **thin overlay over `~/.claude`
+that differs in exactly ONE file, `.credentials.json`.** `projects` and
+`settings.json` inside it are symlinks back into the real store. That is the
+whole reason this design was chosen: there is still exactly one transcript
+store, and not one reader anywhere in the codebase changed. An account is a
+billing fact, not a history fact.
+
+Under the ARCH-010 rule above, the id→dir fact is **declared by its owner in one
+place** — `resolveAccountDir` / `resolveLaunchAccountDir` in
+`src/server/claude-accounts.ts`. Nobody re-derives an account dir, and a `dir`
+stored in the registry is recomputed from the id on read, so a hand-edited
+registry cannot repoint an account at the real store. If you find yourself
+composing an account path from parts, you are the second place able to hold a
+different answer.
+
+**`settings.json` stays symlinked; copying it is a data-loss trap dressed as
+tidiness.** That file carries `cleanupPeriodDays: 36500`, the PreToolUse Bash
+guard hook, the Stop response-format gate and `enabledPlugins`. A fresh config
+dir defaults `cleanupPeriodDays` to **30**, so a copied settings file makes the
+second account's CLI prune the shared transcripts the first account wrote. The
+symlink is the only thing stopping that.
+
+**`.claude.json` is deliberately NOT shared, and that is not an oversight.** It
+caches `oauthAccount` — the account's own identity — and
+`projects[<cwd>].hasTrustDialogAccepted`. Sharing it cross-contaminates identity
+between plans. Verified against CLI 2.1.273: a fresh config dir hits no
+onboarding wall and no trust wall for `-p` sessions, so there is nothing to gain
+by sharing it and an identity mixup to lose.
+
+**The CLI's own retention sweep skips a symlinked `projects`** — it `lstat`s the
+path and bails unless `isDirectory()`. That is benign and load-bearing: the real
+store is swept once, by the default account, under its own settings. Do not
+"fix" it by chasing the symlink.
+
+**`CLAUDE_CONFIG_DIR` must never be forwarded into a container.** Only the
+credential file's host side moves — `desiredBinds()` binds that one file and
+nothing else. The account dir's `projects` and `settings.json` are HOST-path
+symlinks that dangle inside a container, so pointing the containerised CLI at
+the account dir gives it a broken transcript path; pointing it at an unset dir
+gives it a fresh one with `cleanupPeriodDays` back to 30. There is a comment on
+`ENV_PASSTHROUGH` saying so; keep it there.
+
+**Container account selection is project-scope only, never per-session.**
+`desiredBinds()` is the container drift oracle, so a per-session account switch
+recreates the container under every OTHER session on that project. This is the
+same reason `mounts` is project-scope-only. Direct (non-containerised) projects
+get the per-session override; container projects get an explicit refusal, never
+a silent no-op.
+
+**The store-isolation guard's rule, as a specification: a comparison failure may
+only ARM the guard, never disarm it.** `assertSessionStoreIsolated` concludes
+"isolated" only from a COMPLETED resolution; every unresolvable path takes the
+real-store branch. Two false-negative disarms have already been found and closed
+in that code — a dangling `projects` symlink whose leaf `realpathSync` reported
+as ENOENT, and a non-ENOENT errno (`ELOOP`/`EACCES`) hitting the same
+value-returning fallback. Both were "an error branch that returns a value
+instead of refusing". This is why the guard walks the path component by
+component and reads link **targets** with `readlinkSync` rather than delegating
+to `realpathSync`: a dangling link's INTENT is what must be compared, and
+`realpathSync` cannot report it. Do not simplify it back. `ENOENT` from `lstat`
+is the only branch allowed to continue, because absence is a fact — nothing can
+exist beneath a missing component.
+
+**`claude auth status --json` exits 1 when logged out and still prints valid
+JSON.** Parse `loggedIn`; never branch on the exit code. `email` **may or may
+not be populated** — it was seen `null` on one account and a real address on
+two others (CLI 2.1.273) — so nothing may branch on it being present or
+absent. That is not why account labels are user-supplied: the real reason is
+that a label is the user's own name for a subscription (e.g. "work" vs.
+"personal"), and an email address — even when the CLI does report one — is not
+a reliable identifier to build the UI around.
 
 ## Scratch — long-lived or expensive scratch does not go in `/tmp` here
 

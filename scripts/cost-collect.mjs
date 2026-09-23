@@ -99,6 +99,8 @@ import {
   totalTokens,
   providerOf,
   attributePhases,
+  dispatchOccupancy,
+  laneRequestCosts,
   ticketsIn,
   dispatchClassIn,
   verdictOf,
@@ -289,6 +291,7 @@ function buildLane({ kind, laneId, sessionId, projectDir, entries, meta, source,
   const priced = priceBuckets(folded.buckets);
   const tokens = totalTokens(folded.buckets);
   const phases = attributePhases(entries);
+  const dispatch = dispatchOccupancy(entries);
   const models = [...new Set(folded.buckets.map((b) => b.model))];
   const providers = [...new Set(models.map(providerOf))];
 
@@ -336,6 +339,15 @@ function buildLane({ kind, laneId, sessionId, projectDir, entries, meta, source,
     accounted_ms: phases.accounted_ms,
     idle_gap_ms: phases.idle_gap_ms,
     phases: Object.fromEntries(PHASES.map((p) => [p, phases[p]])),
+
+    // BUG-175: async dispatch occupancy — how much engaged wall had ≥1 dispatch
+    // outstanding, paired dispatch→task-notification (the wait `blocked_on_lane`
+    // could not see because the Agent tool returns instantly).
+    dispatch,
+    // BUG-175: per-request priced rows (at_ms + cost) for window binning by the
+    // usage command. Attached in memory only — STRIPPED before the ledger append
+    // (see appendLedger) so a 3000-turn orchestrator lane does not bloat the store.
+    request_costs: laneRequestCosts(entries),
 
     turns: tokens.requests,
     tools: toolHistogram(entries),
@@ -457,7 +469,13 @@ function appendLedger(lanes) {
     const prev = seen.get(l.lane_id);
     return !prev || prev.source_bytes !== l.source_bytes || prev.ended_at !== l.ended_at;
   });
-  if (fresh.length) fs.appendFileSync(file, fresh.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  // Strip the in-memory-only per-request array (BUG-175) so the ledger stays the
+  // small, durable roll-up it is meant to be — the usage command reads it from a
+  // live collect(), never from the ledger.
+  if (fresh.length) {
+    const forLedger = fresh.map(({ request_costs, ...rest }) => JSON.stringify(rest));
+    fs.appendFileSync(file, forLedger.join('\n') + '\n');
+  }
   return { file, appended: fresh.length, total: seen.size + fresh.length };
 }
 
@@ -648,6 +666,10 @@ function rollUp(lanes) {
   const coverage = {
     lanes: lanes.length,
     ticket: lanes.filter((l) => l.ticket_source === 'declared').length,
+    // BUG-175: `ticket=none` is a declared absence, reported as its own state so a
+    // ticketless-by-design dispatch is no longer counted against declaration
+    // coverage as if the dispatcher had simply forgotten.
+    ticket_none: lanes.filter((l) => l.ticket_source === 'declared-none').length,
     phase: lanes.filter((l) => l.lifecycle_phase_source === 'declared').length,
     round: lanes.filter((l) => l.round_source === 'declared').length,
     class: lanes.filter((l) => l.dispatch_class_source === 'declared').length,
@@ -727,6 +749,27 @@ function rollUp(lanes) {
     started_at: l.started_at ?? null,
   })).sort((a, b) => (b.cost_usd ?? 0) - (a.cost_usd ?? 0));
 
+  // BUG-175: fleet dispatch occupancy. Union/engaged are summed per-lane (lanes
+  // do not overlap each other in time, so their per-lane unions add), giving a
+  // fleet occupancy and a summed÷union parallelism. Only lanes that actually
+  // dispatched contribute a denominator.
+  const dispatchLanes = lanes.filter((l) => (l.dispatch?.dispatches ?? 0) > 0);
+  const dsum = (sel) => dispatchLanes.reduce((a, l) => a + (sel(l.dispatch) || 0), 0);
+  const dUnion = dsum((d) => d.outstanding_union_ms);
+  const dEngaged = dsum((d) => d.engaged_wall_ms);
+  const dSummed = dsum((d) => d.summed_wait_ms);
+  const dispatch = {
+    lanes: dispatchLanes.length,
+    dispatches: dsum((d) => d.dispatches),
+    pairable: dsum((d) => d.pairable),
+    unpaired: dsum((d) => d.unpaired),
+    summed_wait_ms: dSummed,
+    outstanding_union_ms: dUnion,
+    engaged_wall_ms: dEngaged,
+    occupancy: dEngaged ? dUnion / dEngaged : 0,
+    parallelism: dUnion ? dSummed / dUnion : 0,
+  };
+
   return {
     lanes: lanes.length,
     cost_usd: anyUnpriced ? null : Math.round(sum((l) => l.cost_usd) * 100) / 100,
@@ -738,6 +781,7 @@ function rollUp(lanes) {
     accounted_ms: sum((l) => l.accounted_ms),
     duplicate_usage_rows_dropped: sum((l) => l.duplicate_usage_rows_dropped),
     phases,
+    dispatch,
     declared_coverage: coverage,
     byLifecycle,
     byTicket: [...byTicket.values()].sort((a, b) => b.wall_ms - a.wall_ms),
@@ -788,6 +832,8 @@ function printReport(r, opts) {
     L.push(`  ${p.padEnd(22)}${hrs(r.phases[p]).padStart(9)}${((r.phases[p] / totalPhase) * 100).toFixed(1).padStart(9)}%`);
   }
   L.push('');
+  L.push(...dispatchSection(r));
+  L.push('');
   L.push('  MODEL (tier)                     provider    requests      tokens');
   for (const m of r.byModel.slice(0, 10)) {
     L.push(`  ${m.key.padEnd(33)}${m.provider.padEnd(12)}${String(m.requests).padStart(9)}${((m.tokens / 1e6).toFixed(1) + 'M').padStart(12)}`);
@@ -820,6 +866,30 @@ function printReport(r, opts) {
 }
 
 /**
+ * BUG-175 — async dispatch occupancy, the number `blocked_on_lane` structurally
+ * could not see. An `Agent` call returns instantly, so its tool span is ~0 and
+ * the real wait (dispatch → task-notification) fell past the 5-minute idle cutoff
+ * and was booked as suspended-laptop idle. This pairs the two and reports how much
+ * ENGAGED wall actually had a lane outstanding, with the summed÷union parallelism
+ * beside it so "84% blocked" and "but almost always on one lane" are both visible.
+ */
+function dispatchSection(r) {
+  const d = r.dispatch ?? {};
+  const L = [];
+  L.push('  ── ASYNC DISPATCH OCCUPANCY (BUG-175) ─────────────────────────────────');
+  if (!d.dispatches) {
+    L.push('  no async dispatches in this window (no Agent/Task calls paired to a notification).');
+    return L;
+  }
+  L.push(`  ${d.dispatches} dispatch(es) across ${d.lanes} dispatching lane(s); ${d.pairable} paired to a completion, ${d.unpaired} still-outstanding/unpaired.`);
+  L.push(`  engaged wall ${hrs(d.engaged_wall_ms)} h · with ≥1 dispatch outstanding ${hrs(d.outstanding_union_ms)} h = ${(d.occupancy * 100).toFixed(1)}% (occupancy)`);
+  L.push(`  summed wait ${hrs(d.summed_wait_ms)} h ÷ union ${hrs(d.outstanding_union_ms)} h = ${d.parallelism.toFixed(2)}× parallelism (1.0 = strictly serial)`);
+  L.push('  This REPLACES the blocked_on_lane phase share above for judging dispatch latency:');
+  L.push('  that phase measures the Agent TOOL span, which is ~0 because dispatch is async.');
+  return L;
+}
+
+/**
  * The lifecycle section — finding / fixing / verifying, DECLARED.
  *
  * Kept separate from the phase table above it because they are different axes
@@ -834,6 +904,7 @@ function lifecycleSection(r, opts) {
   const L = [];
   L.push('  ── DECLARED AT DISPATCH (FEAT-100) ────────────────────────────────────');
   L.push(`  coverage: ticket ${c.ticket}/${c.lanes} (${pct(c.ticket)}%)   phase ${c.phase}/${c.lanes} (${pct(c.phase)}%)   round ${c.round}/${c.lanes} (${pct(c.round)}%)   class ${c.class}/${c.lanes} (${pct(c.class)}%)`);
+  if (c.ticket_none) L.push(`  ticket declaration states: ${c.ticket} with a ticket, ${c.ticket_none} declared ticket=none (ticketless BY DESIGN — not a gap), ${c.lanes - c.ticket - c.ticket_none} undeclared`);
   if (c.pre_feature) L.push(`  ${c.pre_feature} lane(s) predate the declaration and carry NO record of it — that is a gap, not a zero.`);
   if (c.conflicts) L.push(`  ${c.conflicts} lane(s) carried two declarations that disagreed; those fields were dropped rather than guessed.`);
   for (const complaint of [...new Set(c.complaints)].slice(0, 5)) L.push(`  rejected in a declaration: ${complaint}`);
@@ -1073,7 +1144,11 @@ async function main() {
   const r = rollUp(lanes);
   const diffs = collectDiffs(lanes, opts);
   if (opts.json) {
-    console.log(JSON.stringify({ rollup: r, diffs, lanes }, null, 2));
+    // Drop the in-memory-only per-request array (BUG-175) — it can be thousands
+    // of rows on a long lane and the per-lane `dispatch` summary carries what a
+    // reader needs. The usage command reads request_costs from collect() directly.
+    const leanLanes = lanes.map(({ request_costs, ...rest }) => rest);
+    console.log(JSON.stringify({ rollup: r, diffs, lanes: leanLanes }, null, 2));
     return 0;
   }
   if (opts.ticket) {

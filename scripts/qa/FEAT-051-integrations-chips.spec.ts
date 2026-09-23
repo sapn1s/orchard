@@ -123,7 +123,7 @@ test('crown integrations chips: planned vs live, toggling, codex honesty, deep l
 
   // ═══ 6. CHIP CLICK → the drawer's Integrations group (deep-linked) ═══
   await chip(page, 'serena').click();
-  await expect(page.locator('#drawer')).toHaveClass(/open/);
+  await expect(page.locator('#smodal')).not.toHaveAttribute('hidden', ''); // FEAT-146: the drawer became a modal
   await expect(page.locator('#vSettings [data-focus="integrations"]')).toBeVisible();
   // 3b. the drawer rows carry the one-liners inline
   await expect(page.locator('#vSettings [data-focus="integrations"] .use1',

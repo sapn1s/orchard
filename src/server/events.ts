@@ -16,6 +16,10 @@ export type SessionOverridable =
   | 'provider'
   | 'model'
   | 'effort'
+  // FEAT-145 step 5 — which Claude subscription this session bills to. Accepted
+  // as an override for `direct` projects only; validate.ts refuses it for a
+  // container project (the credential is a bind there, not an env var).
+  | 'claudeAccount'
   | 'permissionMode'
   | 'maxBudgetUsd'
   | 'allowedTools'
@@ -399,8 +403,54 @@ export type StationEvent =
   | { t: 'session-appended'; sessionId: string; dir: string; messages: unknown[]; bytesRead: number; fileBytes: number; resynced: boolean }
   /** Answer to `follow` / `unfollow`. `live` reflects mtime recency at that instant. */
   | { t: 'follow-status'; sessionId: string; dir: string; following: boolean; live: boolean; reason?: string }
+  /*
+   * FEAT-145 step 3 — the "Add account" login relay. These ride the SAME socket
+   * as every other server→client event (a login is not a session, so index.ts
+   * answers them ahead of the session switch and they share none of its state).
+   *
+   * `src/server/claude-login.ts` derives its `LoginEvent` from THESE members
+   * (`ClaudeLoginEvent` below) rather than declaring a parallel union — one
+   * place holds the wire shape, per ARCH-010.
+   */
+  /** One chunk of the CLI's output, with every pasted code already redacted out. */
+  | { t: 'claude-login-output'; accountId: string; stream: 'stdout' | 'stderr'; text: string }
+  /**
+   * The authorize URL scraped out of that output, for the user to open. Scraped
+   * generically (`/oauth/authorize?`), never by host — the real host is
+   * `claude.com/cai/…`, not `claude.ai/oauth/…`.
+   */
+  | { t: 'claude-login-url'; accountId: string; url: string }
+  /**
+   * Progress the panel shows. `urlFound:false` carries the RAW output, so a CLI
+   * whose wording changed reads as "no URL found, here is what it said" rather
+   * than as a hang.
+   */
+  | { t: 'claude-login-status'; accountId: string; message: string; urlFound?: boolean; raw?: string }
+  /**
+   * The verdict, once. `loggedIn` comes from `claude auth status --json`, NEVER
+   * from the child's exit code (logged out exits 1 while printing valid JSON).
+   * `accountRemoved` says the half-made pending row was cleaned up.
+   */
+  | {
+      t: 'claude-login-done';
+      accountId: string;
+      ok: boolean;
+      loggedIn: boolean;
+      subscriptionType: string | null;
+      reason: string;
+      cancelled?: boolean;
+      timedOut?: boolean;
+      accountRemoved?: boolean;
+    }
   /** Bridge lifecycle, not an SDK message. */
   | { t: 'session-closed'; reason: string };
+
+/**
+ * The login relay's server→client events, projected out of `StationEvent` so the
+ * login module and the socket handler cannot drift apart (ARCH-010: the union
+ * above is the one place this wire shape is declared).
+ */
+export type ClaudeLoginEvent = Extract<StationEvent, { t: `claude-login-${string}` }>;
 
 /** Messages the UI sends up the socket. */
 export type ClientCommand =
@@ -480,4 +530,24 @@ export type ClientCommand =
    */
   | { type: 'follow'; sessionId: string; dir: string }
   | { type: 'unfollow'; sessionId?: string; dir?: string }
+  /*
+   * FEAT-145 step 3 — the "Add account" login commands. Not session commands:
+   * index.ts handles (and acks) them ahead of the session switch, on the socket
+   * that sent them. The attempt is OWNED by that socket, which is what makes
+   * cleanup honest — a closed tab kills the CLI's process GROUP and removes the
+   * half-made account rather than leaving both behind.
+   */
+  /** Begin the CLI sign-in for an existing `state:'pending'` account. */
+  | { type: 'claude-login-start'; accountId: string }
+  /**
+   * The code the user pasted back from the browser. It goes to the child's
+   * stdin and is kept ONLY as a redaction secret — never logged, never echoed
+   * into an event, never persisted.
+   */
+  | { type: 'claude-login-code'; code: string }
+  /** Abandon the attempt: kill the CLI's process group and drop the pending row. */
+  | { type: 'claude-login-cancel' }
   | { type: 'close' };
+
+/** The login relay's client→server commands, projected out of `ClientCommand`. */
+export type ClaudeLoginCommand = Extract<ClientCommand, { type: `claude-login-${string}` }>;

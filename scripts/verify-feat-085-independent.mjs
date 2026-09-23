@@ -124,6 +124,19 @@ const isBlock = (res) => blockReason(res) !== null;
 const DIG = (text = 'Shipped it', kind = 'done', imp = 'high') =>
   '```orchard-digest\n{"items":[{"text":"' + text + '","kind":"' + kind + '","importance":"' + imp + '"}]}\n```\n';
 
+/* FEAT-143 — the digest is now suppressible for a short reply or a single
+ * `orchard-answer` artifact, so a one-line no-digest reply legitimately ALLOWs.
+ * The Direction-2/3 "must still BLOCK" cases here test properties ORTHOGONAL to
+ * digest-suppression (concatenation, cross-id non-rescue, disable/opt-out gating);
+ * their non-compliant exemplar must stay non-compliant under the new contract, so
+ * they use SUBSTANTIVE prose (>= 40 words, no digest) — still a defect, unchanged
+ * in what each case proves. SUB_A/SUB_B are two halves for the split cases. */
+const SUB_A = 'I reviewed the whole change end to end and it holds together. The parser '
+  + 'handles every fence case and the renderer draws each block correctly. ';
+const SUB_B = 'The metrics record one line for every graded turn, and I ran the suite '
+  + 'twice with both passes completely clean. Nothing here needs a decision from you.';
+const SUB = SUB_A + SUB_B;
+
 console.log('=== FEAT-085 INDEPENDENT adversarial verify ===');
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -238,7 +251,7 @@ console.log('-- Direction 2: cannot let a non-compliant reply through --');
 // 2.1 all-prose message split across two same-id lines -> BLOCK (missing digest)
 {
   const id = 'msg_allprose';
-  const tp = writeJSONL([U('go'), A(id, 'first half of a plain reply, '), A(id, 'second half, still no digest')]);
+  const tp = writeJSONL([U('go'), A(id, SUB_A), A(id, SUB_B)]);
   const r = run(pay(tp));
   check('2.1 all-prose split -> BLOCK', isBlock(r) && /Missing the leading/.test(blockReason(r) || ''), blockReason(r));
 }
@@ -246,7 +259,7 @@ console.log('-- Direction 2: cannot let a non-compliant reply through --');
 {
   const tp = writeJSONL([
     U('go1'), Athink('msgY', 't'), A('msgY', DIG('prior good', 'done', 'high') + 'prior prose'),
-    U('go2'), Athink('msgX', 't'), A('msgX', 'current reply with NO digest'),
+    U('go2'), Athink('msgX', 't'), A('msgX', SUB),
   ]);
   check('2.2 prior-good turn does NOT rescue current bad turn -> BLOCK', isBlock(run(pay(tp))));
 }
@@ -256,7 +269,7 @@ console.log('-- Direction 2: cannot let a non-compliant reply through --');
   const body = [
     JSON.stringify(A('msgY', DIG('prior good') + 'prior prose')),
     '{ this is not valid json at all ',
-    JSON.stringify(A('msgX', 'current bad reply, no digest')),
+    JSON.stringify(A('msgX', SUB)),
   ].join('\n');
   fs.writeFileSync(file, body + '\n');
   check('2.3 corrupt line between turns does not bridge -> BLOCK', isBlock(run(pay(file))));
@@ -264,14 +277,14 @@ console.log('-- Direction 2: cannot let a non-compliant reply through --');
 // 2.4 prior good turn, then bad current turn separated only by a BLANK line
 {
   const file = path.join(TMP, 'blankbridge.jsonl');
-  const body = [JSON.stringify(A('msgY', DIG() + 'good')), '', JSON.stringify(A('msgX', 'bad, no digest'))].join('\n');
+  const body = [JSON.stringify(A('msgY', DIG() + 'good')), '', JSON.stringify(A('msgX', SUB))].join('\n');
   fs.writeFileSync(file, body + '\n');
   check('2.4 blank line between turns does not bridge -> BLOCK', isBlock(run(pay(file))));
 }
 // 2.5 digest is NOT at the start of the reconstructed message (intro line1, digest line2)
 {
   const id = 'msg_notstart';
-  const tp = writeJSONL([U('go'), A(id, 'Some intro prose before the digest. '), A(id, DIG())]);
+  const tp = writeJSONL([U('go'), A(id, SUB + ' '), A(id, DIG())]);
   check('2.5 digest not at start of reconstruction -> BLOCK', isBlock(run(pay(tp))));
 }
 // 2.6 empty/whitespace digest item text -> BLOCK (no usable items)
@@ -318,7 +331,7 @@ console.log('-- Direction 2: cannot let a non-compliant reply through --');
 // 2.12 digest fence not leading because a non-space char precedes it on line1
 {
   const id = 'msg_lead2';
-  const tp = writeJSONL([U('go'), A(id, 'x' + DIG())]);
+  const tp = writeJSONL([U('go'), A(id, SUB + '\n' + DIG())]);
   check('2.12 non-space before fence -> BLOCK', isBlock(run(pay(tp))));
 }
 
@@ -360,7 +373,7 @@ check('3.9 no transcript_path -> ALLOW', isAllow(run({ hook_event_name: 'Stop', 
 }
 // 3.11 disable env var -> ALLOW even for non-compliant
 {
-  const tp = writeJSONL([U('go'), A('m', 'no digest here')]);
+  const tp = writeJSONL([U('go'), A('m', SUB)]);
   check('3.11 ORCHARD_STOP_HOOK_DISABLED=1 -> ALLOW', isAllow(run(pay(tp), { ORCHARD_STOP_HOOK_DISABLED: '1' })));
   check('3.11b disable=false is NOT inert (still BLOCKs)', isBlock(run(pay(tp), { ORCHARD_STOP_HOOK_DISABLED: 'false' })));
   check('3.11c disable=0 is NOT inert (still BLOCKs)', isBlock(run(pay(tp), { ORCHARD_STOP_HOOK_DISABLED: '0' })));
@@ -372,7 +385,7 @@ check('3.9 no transcript_path -> ALLOW', isAllow(run({ hook_event_name: 'Stop', 
   fs.writeFileSync(path.join(dataDir, 'registry.json'), JSON.stringify({
     projects: [{ hostPath: proj, settings: { responseDigest: { enabled: false } } }],
   }));
-  const tp = writeJSONL([U('go'), A('m', 'no digest, non compliant')]);
+  const tp = writeJSONL([U('go'), A('m', SUB)]);
   const env = { CLAUDE_STATION_DATA: dataDir };
   check('3.12 project opt-out (enabled:false) -> ALLOW', isAllow(run(pay(tp, { cwd: proj }), env)));
   // and a project NOT opted out (enabled default) still BLOCKs
@@ -386,7 +399,7 @@ check('3.9 no transcript_path -> ALLOW', isAllow(run({ hook_event_name: 'Stop', 
 }
 // 3.14 sidechain final line ignored; MAIN is non-compliant -> BLOCK (sidechain cannot rescue)
 {
-  const tp = writeJSONL([U('go'), A('m', 'main has no digest'), Aside('s', DIG() + 'subagent had a digest')]);
+  const tp = writeJSONL([U('go'), A('m', SUB), Aside('s', DIG() + 'subagent had a digest')]);
   check('3.14 sidechain-good does NOT rescue main-bad -> BLOCK', isBlock(run(pay(tp))));
 }
 // 3.15 sidechain-only transcript (no main assistant) -> ALLOW (nothing to grade)
@@ -513,22 +526,34 @@ console.log('-- Direction 4: performance --');
     Atool('msg_inc23'),
   ]);
 
+  // FEAT-143 UPDATE. The read-during-write race mis-grades a mid-flush transcript,
+  // landing on an EARLIER, SHORT shape — a lead-in before a digest, or a bare
+  // one-line preamble. Under the new digest-suppression rule a SHORT reply owes no
+  // digest, so these shapes are now COMPLIANT: no block under enforce, and no
+  // advisory noise. That CLOSES the false-block for these short-preamble incidents
+  // — the comment above literally anticipated flipping them to expect ALLOW once
+  // grading improved; suppression reaches the same end for the short case. A
+  // SUBSTANTIVE mis-grade would still be caught (see R3b, which keeps a substantive
+  // non-compliant exemplar). NOTE: these assertions were changed by the author of
+  // the FEAT-143 change — an independent re-derivation is warranted.
   for (const [nm, f] of [['R1 incident-1 shape (prose before fence, prior turn)', inc1],
                          ['R2 incidents-2+3 shape (thinking + preamble text + tool_use, same id)', inc23]]) {
-    // Enforce mode still BLOCKs these — this is the unfixed grading gap, asserted
-    // so it cannot silently change without someone noticing.
-    check(nm + ' — still BLOCKs under ENFORCE (documents the open grading gap)', isBlock(run(pay(f))), nm);
-    // ADVISORY (the default) must never cost a turn on them.
+    // The short mis-grade target is now compliant -> ALLOW even under the opt-in.
+    check(nm + ' — short mis-grade shape ALLOWs under ENFORCE (FEAT-143 closes the false block)', isAllow(run(pay(f))), nm);
+    // ADVISORY (the default) must never cost a turn on them…
     const r = run(pay(f), ADV);
     check(nm + ' — ADVISORY: no decision:block, turn allowed',
       r.code === 0 && !/"decision"\s*:\s*"block"/.test(r.stdout), r.stdout.slice(0, 160));
-    check(nm + ' — ADVISORY: reported via systemMessage instead', /"systemMessage"/.test(r.stdout), r.stdout.slice(0, 160));
+    // …and a compliant short reply raises NO advisory (no missing-digest noise).
+    check(nm + ' — ADVISORY: silent (short reply is compliant, no advisory noise)', r.stdout.trim() === '', r.stdout.slice(0, 160));
   }
 
   // Guard the structural claim: in advisory mode the hook never emits a block on
   // ANY of the deliberately non-compliant shapes this suite already exercises.
   const hostile = [
-    writeJSONL([U('go'), A('m1', 'plain prose, no digest')]),
+    // Substantive (FEAT-143): a SHORT no-digest reply is now compliant, so the
+    // "must still block" exemplar has to owe a digest, i.e. be substantive.
+    writeJSONL([U('go'), A('m1', SUB)]),
     writeJSONL([U('go'), A('m2', '```orchard-digest\n{not json}\n```\n')]),
     writeJSONL([U('go'), A('m3', '```orchard-digest\n{"items":[]}\n```\n')]),
     writeJSONL([U('go'), A('m4', DIG('ok') + '\nparty time \u{1F389}')]),

@@ -49,8 +49,56 @@ const NET_ENV: NodeJS.ProcessEnv = {
   GIT_SSH_COMMAND: `${process.env.GIT_SSH_COMMAND ?? 'ssh'} -oBatchMode=yes -oConnectTimeout=10 -oStrictHostKeyChecking=accept-new`,
 };
 const NET_CONF = ['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=15'];
+/**
+ * A network git op needs a bound that is BOTH real and clean. `execFile`'s
+ * `timeout` is neither: it SIGTERMs the direct `git` only, and git's remote
+ * helper (`git-remote-http`/`git-remote-https`/`ssh`) — the grandchild that
+ * actually holds the socket — is orphaned and keeps running (verified: a remote
+ * that trickles bytes just above http.lowSpeedLimit rides the whole timeout and
+ * leaves a live git-remote-http behind). So spawn git as its OWN process-group
+ * leader (`detached`) and, on timeout, kill the whole group by negative pid —
+ * SIGTERM then a SIGKILL backstop — so no orphaned child survives. The env/-c
+ * fast-fail (never prompt, cap ssh connect, abort a stalled HTTP transfer) still
+ * makes the common cases fail in seconds; this is the guarantee underneath it.
+ */
 function netGit(cwd: string, args: string[], timeoutMs = 60_000): Promise<{ code: number; out: string; err: string }> {
-  return git(cwd, [...NET_CONF, ...args], timeoutMs, NET_ENV);
+  return new Promise((resolve) => {
+    const child = spawn('git', ['-C', cwd, ...NET_CONF, ...args], {
+      env: NET_ENV,
+      detached: true,                       // own process group => reap grandchildren too
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const cap = 8 * 1024 * 1024;
+    let out = '', err = '', done = false, timedOut = false;
+    child.stdout?.on('data', (d: Buffer) => { if (out.length < cap) out += d.toString('utf8'); });
+    child.stderr?.on('data', (d: Buffer) => { if (err.length < cap) err += d.toString('utf8'); });
+
+    // Kill the whole group (negative pid) — never a bare child.kill(), which
+    // would SIGTERM git alone and orphan the helper holding the socket.
+    const reap = (sig: NodeJS.Signals): void => {
+      const pid = child.pid;
+      if (!pid) return;
+      try { process.kill(-pid, sig); } catch { try { child.kill(sig); } catch { /* already gone */ } }
+    };
+    const secs = Math.round(timeoutMs / 1000);
+    const timer = setTimeout(() => {
+      timedOut = true;
+      reap('SIGTERM');
+      setTimeout(() => reap('SIGKILL'), 2_000).unref();
+    }, timeoutMs);
+
+    const finish = (code: number, extra?: string): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const reason = timedOut
+        ? (err.trim() || `timed out after ${secs}s — could not reach origin`)
+        : (err.trim() || extra || '');
+      resolve({ code, out, err: reason });
+    };
+    child.on('error', (e: Error) => finish(-1, e.message));
+    child.on('close', (code) => finish(timedOut ? 124 : (typeof code === 'number' ? code : -1)));
+  });
 }
 
 export interface GitStatus {

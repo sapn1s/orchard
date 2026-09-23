@@ -208,7 +208,7 @@ const state = {
   deliveryRelay: null,     // FEAT-065: the open ws is ONLY the approval relay for a turn delivered into the drain-held survivor (sdk id, or true)
   closingOnPurpose: false, // distinguishes our own close() from a real drop
   pendingAnswers: new Map(), // requestId -> answer awaiting the server's ack
-  decisionsByRequest: new Map(), // requestId -> question/plan card awaiting an ack
+  decisionsByRequest: new Map(), // requestId -> question/plan card still awaiting the user (BUG-166: the OWNER of "the model stopped, waiting on you"; pruned the moment a card settles — see awaitingUserDecision())
   busyWatchdog: null,
   sdkSessionId: null,
   // FEAT-022: the STATION session id (from the `start` ack) — the key the
@@ -8252,7 +8252,7 @@ function renderQuestion(th, { toolUseId, requestId, questions }) {
         payload: { type: 'question-response', requestId: card.requestId, answers },
         ui,
         word: 'answer',
-        onMatched: () => { card.answered = true; ui.answered(answers); },
+        onMatched: () => { card.answered = true; settleDecisionOwner(card); ui.answered(answers); },
       });
     },
   });
@@ -8281,7 +8281,7 @@ function renderPlan(th, { toolUseId, requestId, plan }) {
         payload: { type: 'plan-response', requestId: card.requestId, approved },
         ui,
         word: approved ? 'approval' : 'rejection',
-        onMatched: () => { card.answered = true; ui.decided(approved); },
+        onMatched: () => { card.answered = true; settleDecisionOwner(card); ui.decided(approved); },
       });
     },
   });
@@ -8291,6 +8291,26 @@ function renderPlan(th, { toolUseId, requestId, plan }) {
   if (toolUseId) decisionMap(th).set(toolUseId, card);
   if (requestId) state.decisionsByRequest.set(requestId, card);
   return card;
+}
+
+/*
+ * BUG-166 (ARCH-010) — is the model STOPPED, waiting on the user to answer a
+ * decision it raised (an AskUserQuestion or a plan)? This is a FACT owned by the
+ * pending decision cards: `decisionsByRequest` holds exactly the questions/plans
+ * still awaiting the user — each is added when the card becomes answerable and
+ * PRUNED the instant it settles (answered, or the model proceeded without one).
+ *
+ * The composer-send path (submit) and the session-status label
+ * (computeSessState) both read THIS one declaration rather than each re-reading
+ * `state.busy`. `busy` cannot tell "the model is working" from "the model is
+ * paused on a question", so two readers deriving from it disagreed: the label
+ * said "Claude is working" while the composer silently held the user's message
+ * behind a turn-end that only their own answer could produce — the lockout +
+ * mislabel this ticket is about.
+ */
+function awaitingUserDecision() {
+  for (const card of state.decisionsByRequest.values()) if (!card.answered) return true;
+  return false;
 }
 
 /** A requestId arrived after the card was drawn — rebuild it as answerable. */
@@ -8320,12 +8340,24 @@ function appendDecision(th, node) {
   }
 }
 
+/*
+ * BUG-166 — a card is no longer awaiting the user the instant it settles, so its
+ * owner drops it from `decisionsByRequest`. Called from EVERY settle path
+ * (answered, and proceeded-without-answer) so awaitingUserDecision() reflects
+ * only cards still genuinely pending — never a stale one that survives its own
+ * turn and mislabels the next one.
+ */
+function settleDecisionOwner(card) {
+  if (card?.requestId != null) state.decisionsByRequest.delete(card.requestId);
+}
+
 /**
  * The tool returned. If no ack ever settled this card, the model proceeded
  * WITHOUT an answer — the exact failure that started this work.
  */
 function settleDecisionFromResult(card, e) {
   if (card.answered) return;
+  settleDecisionOwner(card); // the model moved on — this card no longer awaits the user
   if (card.kind === 'plan') {
     return markUnanswered(card.node, 'No decision was sent — the session continued without your approval.');
   }
@@ -9228,6 +9260,7 @@ function armBusyWatchdog(why) {
 const SESS_STATUS_META = {
   thinking: { label: 'Thinking…', hint: 'Claude is working — no reply text yet.' },
   streaming: { label: 'Responding…', hint: 'Claude is streaming its reply.' },
+  awaiting: { label: 'Waiting on you', hint: 'Claude asked a question above and is paused for your answer — it is not working. You can also send a new message; it runs as your next turn.' },
   detached: { label: 'Running in background', hint: 'This turn is continuing server-side without this tab attached — send a message to take it over.' },
   reconnecting: { label: 'Reconnecting…', hint: 'Reattaching to the session — resuming shortly.' },
   error: { label: 'Error', hint: '' }, // hint filled from state.sessError at paint time
@@ -9252,6 +9285,15 @@ function computeSessState() {
    * while force-send answered "no live session". See isDriving().
    */
   if (!isDriving()) return (state.busy || state.followingLive) ? 'detached' : 'idle';
+  /*
+   * BUG-166 (ARCH-010) — a pending decision is the model STOPPED, waiting on the
+   * user, not working. The pending question owns that fact
+   * (awaitingUserDecision, from decisionsByRequest); read it here rather than
+   * presenting `busy` as "Thinking… / Claude is working" — the mislabel this
+   * ticket is about. Gated on `busy` so a card left behind by a finished turn
+   * cannot keep an idle session reading "waiting on you".
+   */
+  if (state.busy && awaitingUserDecision()) return 'awaiting';
   if (state.busy) return state.sessPhase === 'streaming' ? 'streaming' : 'thinking';
   return 'idle';
 }
@@ -11160,7 +11202,16 @@ async function submit() {
     // it at the next boundary (Part A). The fall-through send path does exactly
     // that; only the caption below marks it as behind-background.
     const behindBackground = state.busy && idleBehindBackground();
-    if (state.busy && !behindBackground) {
+    // BUG-166 — a pending decision means the model is STOPPED, waiting on the
+    // user (owned by awaitingUserDecision()). Holding the message in the CLIENT
+    // queue waits for a `turn-end` that only the user's OWN answer can produce —
+    // which reads as a lockout: the composer will not "let it through". Route it
+    // to the server instead, exactly as an idle-behind-background send does: the
+    // BUG-159 server path HOLDS it in the runtime InputQueue and marks the turn
+    // user-initiated, so it lands as the user's next turn rather than being held
+    // as if Claude were working. Same principle BUG-159 set: HELD, never refused.
+    const awaitingDecision = state.busy && awaitingUserDecision();
+    if (state.busy && !behindBackground && !awaitingDecision) {
       queueMessage(text);
       node.prompt.value = '';
       autosize();
@@ -11179,6 +11230,7 @@ async function submit() {
     setBusy(true);
     send({ type: 'send', prompt: text });
     if (behindBackground) say('queued behind background work — the idle session delivers it at the next pause');
+    else if (awaitingDecision) say('sent — it runs as your next turn once the question above is settled');
     return;
   }
 
@@ -15479,6 +15531,11 @@ async function boot() {
     // ownership is never left null and can detect a synthesized pre-fix client.
     resetTranscript,
     queueOwnerKey: () => queueKey, // which session's rows state.queue currently mirrors (null = none)
+    // BUG-166: the composer-send entry point + the pending-decision owner + the
+    // question renderer, so a verify script can render a REAL AskUserQuestion
+    // card and drive the REAL submit()/computeSessState paths against it — the
+    // lockout + mislabel — rather than re-deriving the busy-vs-awaiting rule.
+    submit, awaitingUserDecision, renderQuestion, settleDecisionFromResult,
   };
 }
 

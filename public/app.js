@@ -3460,8 +3460,9 @@ function resetTranscript() {
    * stored rows BEFORE emptying the queue. Without this the paintQueue() below
    * would mirror an empty queue over the incoming session's own stored rows and
    * destroy them (the reverse of the bug). The outgoing session's rows stay in
-   * storage, untouched, and are restored when it is opened again; adoptQueue()
-   * re-takes ownership once the incoming session is on screen.
+   * storage, untouched, and are restored when it is opened again — this same
+   * function re-takes ownership of the INCOMING session's rows at its end (see
+   * the BUG-150 note there), so queueKey is null only for the span of this reset.
    */
   queueKey = null;
   state.outbox = null; // the outgoing session's in-flight batch is not ours to retire or resend
@@ -3500,6 +3501,21 @@ function resetTranscript() {
   showThread('main');
   renderStrip();
   node.jump.hidden = true;
+  /*
+   * BUG-150 (ARCH-010) — the queue↔session binding is DECLARED here, once.
+   * resetTranscript is the single function every session boundary AND every
+   * in-place transcript reset (openSession's success and its catch, startNew,
+   * the fresh-start re-take, a route that resolves to no session) passes
+   * through, and the only place queueKey is dropped to null. So it is also the
+   * only place it is re-bound: re-take ownership of THIS session's stored rows
+   * before returning, rather than leaving queueKey null for each caller to
+   * remember to re-adopt. A caller that must reason before its transcript is on
+   * screen never can (round 1 left the catch path un-adopted — a silent-loss
+   * regression). The returned outbox descriptor is judged by the caller: after
+   * its transcript is painted where there is an await (openSession), or
+   * immediately where there is not (adoptQueue).
+   */
+  return adoptQueueRows();
 }
 
 function youBubble(th, text) {
@@ -5362,7 +5378,14 @@ async function openSession(p, sess, opts = {}) {
   closeSocket();
   paintCrown();
   renderTree();
-  resetTranscript();
+  // BUG-150 — resetTranscript re-binds the queue to state.current and hands
+  // back this session's outbox descriptor SYNCHRONOUSLY, before the transcript
+  // fetch below is awaited. So queueKey is set from the first moment the session
+  // is on screen: a message queued while the transcript is still loading
+  // persists under the right key instead of vanishing into the tab's heap. Only
+  // the outbox delivery-judgment (which reads the painted transcript) is
+  // deferred, via judgeAdoptedOutbox once the pane is on screen.
+  const adoptedOutbox = resetTranscript();
   restoreDraft(state.current); // BUG-083 — this session's own saved draft (empty if none)
   // BUG-087 — capture the transcript-pane scope AFTER resetTranscript bumped it.
   // If the user opens another session before this one's transcript fetch lands,
@@ -5434,8 +5457,11 @@ async function openSession(p, sess, opts = {}) {
      * transcript is on screen, because a handed-off batch is only judged
      * undelivered by NOT being in that transcript (transcriptHasAll). Before
      * this point the pane is empty and every restored batch would read as lost.
+     * BUG-150: the ROWS were already adopted synchronously before the fetch;
+     * only the outbox delivery-judgment is settled here, against the now-painted
+     * transcript.
      */
-    adoptQueue();
+    judgeAdoptedOutbox(adoptedOutbox);
     // Is this session being written LIVE right now (dashboard bridge OR an
     // external terminal this tab only follows)? Decided BEFORE the agent
     // summary, because a live session must not get one dumped into its tail.
@@ -5550,12 +5576,15 @@ async function openSession(p, sess, opts = {}) {
     // session's error to render: resetTranscript()+the message would wipe and
     // scribble on the pane that now belongs to the newly-opened session.
     if (scope !== state.txScope) return;
-    resetTranscript();
-    // BUG-129: the transcript could not be read, but the session's undelivered
-    // rows are still its own — restore them rather than leave them stranded.
-    // With no transcript on screen a handed-off batch cannot be confirmed, so it
+    // BUG-129 + BUG-150: the transcript could not be read, but the session's
+    // undelivered rows are still its own. resetTranscript re-binds ownership and
+    // restores those rows by construction (it is the sole owner of the queue↔
+    // session binding), so this failure path CANNOT leave queueKey null — the
+    // round-1 regression where a message typed after a failed fetch was written
+    // nowhere. With no transcript on screen a handed-off batch cannot be
+    // confirmed, so the returned outbox is judged (its own fetch fallback) and
     // comes back as an honest "not confirmed" row, which is the truth here.
-    adoptQueue();
+    judgeAdoptedOutbox(resetTranscript());
     mainThread().paneEl.append(el('div', { class: 'hint-row', text: `could not read this session: ${err.message}` }));
     say(err.message, true);
   }
@@ -7360,9 +7389,12 @@ function startNew(projectId) {
   syncUrl('push'); // BEFORE resetTranscript, whose repaints replace-sync the URL
   followCurrent(); // no session on screen any more: drops every watch
   closeSocket();
-  resetTranscript();
+  // BUG-129/BUG-150 — resetTranscript re-binds ownership and restores this
+  // project's pending-new undelivered rows (same key) by construction; judge the
+  // handed-off outbox it hands back.
+  const adoptedOutbox = resetTranscript();
   restoreDraft(state.current); // BUG-083 — this project's pending-new draft (empty if none)
-  adoptQueue(); // BUG-129 — and this project's pending-new undelivered rows, same key
+  judgeAdoptedOutbox(adoptedOutbox);
   node.box.hidden = false;
   node.frozen.hidden = true;
   node.agentDone.hidden = true;
@@ -10508,15 +10540,36 @@ async function outboxDelivered(texts) {
 
 /**
  * Take ownership of the current session's stored rows and put them back on
- * screen. Called after a session's transcript is on screen (openSession) and
- * for a pending-new session (startNew) — i.e. at the point state.current is
- * settled and resetTranscript has already emptied the queue.
+ * screen. Called for a pending-new session (startNew) and the re-take paths
+ * (route restore, fresh-start) — i.e. wherever state.current settles and
+ * resetTranscript has emptied the queue with NO await before this call.
+ *
+ * openSession has an await (the transcript fetch) between resetTranscript and
+ * the point the transcript is on screen, so it does NOT call this: it takes
+ * ownership synchronously via adoptQueueRows() BEFORE the fetch (closing the
+ * BUG-150 window) and settles the outbox via judgeAdoptedOutbox() after.
  */
 function adoptQueue() {
+  judgeAdoptedOutbox(adoptQueueRows());
+}
+
+/**
+ * The SYNCHRONOUS half of adoption, and the one that fixes BUG-150. It assigns
+ * `queueKey` — the fact "which session state.queue currently belongs to"
+ * (ARCH-010: declared here, its sole owner; read by queueTargetKey and never
+ * re-derived) — and restores this session's stored rows onto the dock. Because
+ * it is synchronous it can run BEFORE openSession's transcript fetch, with no
+ * await between resetTranscript (which nulls queueKey) and here: so from the
+ * first moment the session is on screen, persistQueue writes under the right
+ * key and a message queued during the load window is durable, not stranded in
+ * the tab's heap. Returns the handed-off outbox descriptor (for
+ * judgeAdoptedOutbox) or null when there is nothing to judge.
+ */
+function adoptQueueRows() {
   queueKey = draftKey(state.current);
-  if (!queueKey) return;
+  if (!queueKey) return null;
   const entry = readQueueStore()[queueKey];
-  if (!entry) return;
+  if (!entry) return null;
   let restored = 0;
   for (const r of (Array.isArray(entry.rows) ? entry.rows : [])) {
     if (typeof r?.text !== 'string' || !r.text.trim()) continue;
@@ -10536,32 +10589,41 @@ function adoptQueue() {
     say(`${restored} undelivered message${restored === 1 ? '' : 's'} restored from before the reload — in the dock, still unsent`);
   } else if (!obTexts.length) {
     persistQueue(); // an entry with nothing left in it — retire it
-    return;
+    return null;
   }
-  // The handed-off batch is judged against the transcript, which may need a
-  // fetch — so it settles after the rows above rather than holding them up.
-  // `mine` pins the session this answer belongs to: a switch while the fetch is
-  // in flight must not drop the outgoing session's row into the incoming one
-  // (the BUG-079 class — a late answer acting on the wrong session).
-  if (!obTexts.length) return;
-  const mine = queueKey;
-  void outboxDelivered(obTexts).then((delivered) => {
+  if (!obTexts.length) return null;
+  return { mine: queueKey, texts: obTexts, at: ob.at };
+}
+
+/**
+ * The ASYNC half of adoption: judge a handed-off batch (the outbox) against the
+ * transcript, which may need a fetch — so it settles after the rows are already
+ * on screen rather than holding them up, and after openSession's transcript is
+ * painted rather than before it. `pending.mine` pins the session this answer
+ * belongs to: a switch while the fetch is in flight must not drop the outgoing
+ * session's row into the incoming one (the BUG-079 class — a late answer acting
+ * on the wrong session).
+ */
+function judgeAdoptedOutbox(pending) {
+  if (!pending) return;
+  const { mine, texts, at } = pending;
+  void outboxDelivered(texts).then((delivered) => {
     if (queueKey !== mine) return;
     if (delivered) { persistQueue(); return; } // confirmed on disk — retire the stored copy
     // Handed to the socket, and no turn was ever seen carrying it. It may have
     // arrived; it may have been refused after the ack (that refusal is option
     // B's to fix). It comes back DEAD — readable, copyable, editable, and never
     // resent behind the user's back.
-    for (const t of obTexts) {
+    for (const t of texts) {
       state.queue.push({
         text: t,
         dead: 'sent, but this tab never saw its turn start — check the transcript before sending it again',
-        composedAt: Number.isFinite(ob.at) ? ob.at : Date.now(),
+        composedAt: Number.isFinite(at) ? at : Date.now(),
         restored: true,
       });
     }
     paintQueue();
-    say(`${obTexts.length} message${obTexts.length === 1 ? '' : 's'} sent before the reload cannot be confirmed as delivered — kept in the dock`, true);
+    say(`${texts.length} message${texts.length === 1 ? '' : 's'} sent before the reload cannot be confirmed as delivered — kept in the dock`, true);
   });
 }
 
@@ -11213,12 +11275,11 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
     if (state.sdkSessionId && mainThread().paneEl.childElementCount > 0) {
       return say('this session is no longer attached — use Reconnect, or start a new session with + in the sidebar', true);
     }
-    resetTranscript();
-    // BUG-129: resetTranscript dropped ownership of the stored rows (it cannot
-    // tell a boundary from a fresh start). This IS the session those rows were
-    // typed under, so take it straight back — otherwise nothing queued in this
-    // new session would be persisted at all.
-    adoptQueue();
+    // BUG-129/BUG-150: this IS the session those rows were typed under, and
+    // resetTranscript re-binds ownership + restores them by construction, so
+    // nothing queued in this fresh start is left un-persisted. Judge the
+    // handed-off outbox it returns.
+    judgeAdoptedOutbox(resetTranscript());
     state.current.title = titleFrom(text);
   }
   /*
@@ -15413,6 +15474,10 @@ async function boot() {
     // the REAL accept/persist/restore path (rather than re-deriving the storage
     // shape from the outside) and read back the exact key it writes under.
     queueMessage, paintQueue, adoptQueue, persistQueue, flushQueue, QUEUE_KEY,
+    // BUG-150: resetTranscript is the single owner of the queue↔session binding
+    // (it re-adopts on every exit path), exposed so a verify script can assert
+    // ownership is never left null and can detect a synthesized pre-fix client.
+    resetTranscript,
     queueOwnerKey: () => queueKey, // which session's rows state.queue currently mirrors (null = none)
   };
 }

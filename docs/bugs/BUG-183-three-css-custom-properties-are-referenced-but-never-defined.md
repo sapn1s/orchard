@@ -284,3 +284,79 @@ var(--ink-2); outline-offset: 2px; border-radius: 5px; }`) applies instead.
   structural (CSS fails silently and no tooling read the token vocabulary).
 - **Git:** all work left unstaged, per the lane rule. Files:
   `public/styles.css`, `scripts/verify-bug-183-css-tokens.mjs` (new).
+
+### 2026-09-23 — verify lane (drift re-check, round 1, class=verify) — REFUTED
+- **Ground-truth re-verification of the "landed" claim.** The fix is committed at
+  `ca672b9` (tokens `--warn`/`--focus`/`--danger` defined; `.g*`/`.modelfree-set`
+  rewritten onto real tokens; working tree clean).
+- **The ticket's OWN proof-bar suite currently FAILS on the committed tree.**
+  `node scripts/verify-bug-183-css-tokens.mjs` → **2 failure(s)**:
+  `C tokens: system-light --warn is #967A3A, expected #B0703C` and
+  `attr-light --warn is #967A3A, expected #B0703C`. Sections A (sweep), B
+  (four-block parity), D (focus rings — all eleven controls, both themes, ≥7:1
+  contrast, opaque grounds) and the dark/adapt paths PASS.
+- **Root of the failure = a stale pinned value, not a code defect.** `--warn`
+  light was retuned `#B0703C` → `#967A3A` by **FEAT-146** (same batch; see the
+  `styles.css:146` comment "BUG-183 / FEAT-146 — light-theme warning ink (duller
+  ochre)"). The verify script still hard-codes the old `#B0703C` — exactly the
+  "don't pin a value legitimate use changes" anti-pattern (CONVENTIONS.md). The
+  token is defined and DOES adapt (light `#967A3A` / dark `#C89A6A`), so the
+  ticket's actual acceptance PROPERTY holds; only the test literal is stale.
+- **Verdict: REFUTED as done.** The functional fix is present and correct, but the
+  ticket's own verification suite reddens on HEAD, so it cannot be called done
+  cleanly. Gap for the orchestrator to resolve before Done: reconcile the suite to
+  FEAT-146's `#967A3A` (assert "defined + adapts", drop the hard-coded hex) — or,
+  if `#B0703C` was the intended light value, revert FEAT-146's retune. This lane
+  changed no code and set no status.
+
+### 2026-09-23 — fix lane (round 2, class=fix) — suite de-staled onto the token owner
+- **Confirmed from ground truth which side was wrong.** FEAT-146 deliberately
+  retuned light `--warn` `#B0703C` → `#967A3A` (its Activity log: "the light
+  `--warn` moved `#B0703C` → `#967A3A`"; `styles.css:146` comment "BUG-183 /
+  FEAT-146 — light-theme warning ink (duller ochre)"). The functional fix is
+  present and correct on the committed tree; the TEST held the stale pin. So the
+  defect to fix was the test pattern, not the CSS. No `public/styles.css` change.
+- **Root defect fixed = a proof suite hard-coding a palette value it does not
+  own (ARCH-010).** `scripts/verify-bug-183-css-tokens.mjs` section C pinned
+  `--warn: #B0703C` for the two light theme paths in its `THEMES` table, so it
+  reddened the instant a legitimate retune landed. Replaced the pin with a
+  runtime read from the token's OWNER: new `tokenByBlock(css, '--warn')` parses
+  the declared value out of each of the four theme blocks in `public/styles.css`
+  (reusing the existing `blocks()`/`declsOf()` static parser), and each `THEMES`
+  path now names the block whose declaration must win on it (`root(light)`,
+  `media(dark) :root`, `[data-theme="dark"]`, `[data-theme="light"]`). Section C
+  now asserts **the browser cascade resolves, on that theme path, to exactly
+  what the owning block declares** — a genuine cross-check (static parse vs live
+  `getComputedStyle` on `:root`), not a tautology: it still bites on a real
+  regression (a later rule overriding `--warn`, a wrong block→path mapping, or
+  the token going undefined) while following any future retune automatically.
+  The independent ADAPT assertion (light ≠ dark) is unchanged.
+- **Verified (the proof IS the measured property, WA §N — palette/contained
+  render class, zero verify rounds):**
+  - `node scripts/verify-bug-183-css-tokens.mjs` → **EXIT 0, ALL PASS.** Section
+    C now reads: system-light/attr-light `--warn` resolves `#967A3A` matching
+    owning block; system-dark/attr-dark `#C89A6A` matching owning block; ADAPTS
+    light `#967A3A` vs dark `#C89A6A`. Sections A (sweep), B (four-block parity),
+    D (all eleven controls' focus rings, both themes, ≥7:1, opaque grounds) pass.
+  - Must-FAIL twin `--pre-fix` → **EXPECTED, guard bites: 51 findings across all
+    four sections**, exit 0 (its own inverted semantics). Baseline synthesized
+    inline, anchored to no revision, so it keeps biting.
+  - Pre-change must-FAIL of THIS defect is the ticket's own prior state, captured
+    at the top of this session: the unmodified suite exited **1** with two
+    section-C failures (`system-light`/`attr-light --warn is #967A3A, expected
+    #B0703C`) on the correct committed tree — i.e. the FAIL branch demonstrably
+    fires on a value mismatch; my change only moved the expected value's source
+    from a pin to the owning block, leaving that branch intact.
+  - `npm run gate` → **PASS (exit 0)** — leak-gate, check-nul, typecheck all
+    green. New comments carry no username/home path; only hex tokens and ticket
+    ids.
+- **Against BUG-183's own acceptance criteria (Proof bar): MET.** Real-browser
+  assertions that (1) the `.g*`/add-account controls have a visible focus ring
+  in both themes, (2) `--warn` resolves to a defined, theme-appropriate,
+  adapting value on all four theme paths, (3) same for `--focus` — all pass, and
+  the suite no longer goes stale on a palette retune.
+- **Files (unstaged, per lane rule):** `scripts/verify-bug-183-css-tokens.mjs`.
+  No `public/styles.css` touched (concurrent-lane fence respected).
+- **Verdict: DONE against its own acceptance criteria.** The verify lane's REFUTE
+  gap (suite reddens on HEAD) is closed. Independent clean-room verify not
+  required — low-risk test-only change, no product code moved.

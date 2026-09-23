@@ -175,6 +175,25 @@ function declsOf(body) {
   return out;
 }
 
+/**
+ * The value each theme BLOCK declares for one token, read from the sheet — i.e.
+ * from the token's OWNER, not re-declared in this test. This is the ARCH-010 fix
+ * for BUG-183 round 2: an earlier version hard-coded `--warn: #B0703C` for the
+ * light paths and went stale the instant FEAT-146 retuned the light ochre to
+ * #967A3A (the suite then reddened on a correct tree). Deriving the expected
+ * value from `public/styles.css` means the assertion still bites on a REAL
+ * regression — the browser's cascade delivering something other than what the
+ * owning block declares, or the token going undefined — while following any
+ * legitimate retune automatically. Returns block-name -> declared value (or null
+ * if that block declares nothing for the token; parity, section B, owns "missing
+ * from a block").
+ */
+function tokenByBlock(css, token) {
+  const out = {};
+  for (const b of blocks(css)) out[b.name] = b.body ? (declsOf(b.body).get(token) ?? null) : null;
+  return out;
+}
+
 function runSweep(css, label) {
   const defs = definedProps(css);
   const uses = usedProps(css);
@@ -243,12 +262,17 @@ const TARGETS = [
   { name: '.seal .perm (--focus)', sel: '#permChip', ring: 'box-shadow' },
 ];
 
-// The tokens under test and what each theme path must resolve them to.
+// The tokens under test and, for each theme path, the theme BLOCK in
+// public/styles.css whose declaration should win on that path. The expected
+// `--warn` value is READ from that block at runtime (see tokenByBlock) rather
+// than pinned here, so a legitimate retune (FEAT-146: light #B0703C → #967A3A)
+// does not falsely redden the suite; only the cascade delivering something
+// OTHER than the owning block declares — or the token going undefined — fails.
 const THEMES = [
-  { name: 'system-light', attr: null, media: 'light', warn: '#B0703C' },
-  { name: 'system-dark', attr: null, media: 'dark', warn: '#C89A6A' },
-  { name: 'attr-dark', attr: 'dark', media: 'light', warn: '#C89A6A' },
-  { name: 'attr-light', attr: 'light', media: 'dark', warn: '#B0703C' },
+  { name: 'system-light', attr: null, media: 'light', block: 'root(light)' },
+  { name: 'system-dark', attr: null, media: 'dark', block: 'media(dark) :root' },
+  { name: 'attr-dark', attr: 'dark', media: 'light', block: '[data-theme="dark"]' },
+  { name: 'attr-light', attr: 'light', media: 'dark', block: '[data-theme="light"]' },
 ];
 const TOKENS = ['--warn', '--focus', '--danger'];
 
@@ -400,6 +424,9 @@ function stopByPid(child) {
 async function main() {
   const css = fs.readFileSync(CSS_PATH, 'utf8');
   console.log(`\nBUG-183 — undefined CSS custom properties. Mode: ${PRE_FIX ? 'PRE-FIX (old rules synthesized inline)' : 'committed CSS'}`);
+  // Expected `--warn` per theme path, READ from the owning block in styles.css
+  // (ARCH-010) — not pinned in the test, so a retune does not go stale here.
+  const warnByBlock = tokenByBlock(css, '--warn');
 
   // ── A. the sweep ──────────────────────────────────────────────────────────
   // In --pre-fix mode the sweep is run against the SYNTHESIZED pre-fix source,
@@ -457,7 +484,7 @@ async function main() {
       ? `document.documentElement.dataset.theme = ${JSON.stringify(th.attr)}`
       : `delete document.documentElement.dataset.theme`);
     await sleep(120);
-    for (const r of await tab.eval(READ_TOKENS(TOKENS))) tokenRows.push({ path: th.name, expectWarn: th.warn, ...r });
+    for (const r of await tab.eval(READ_TOKENS(TOKENS))) tokenRows.push({ path: th.name, expectWarn: warnByBlock[th.block], ...r });
     // Rings are a light/dark property, measured on both real theme paths.
     for (const r of await tab.eval(MEASURE_RINGS(TARGETS))) ringRows.push({ path: th.name, ...r });
   }
@@ -470,16 +497,19 @@ async function main() {
   console.log('     literal fallback is what ships.\n');
   console.log(`     ${pad('theme path', 14)}${pad('token', 10)}${pad('declared', 12)}${pad('painted', 20)}verdict`);
   for (const r of tokenRows) {
+    const before = tokFails.length;
     const resolved = r.declared !== '' && r.painted !== SENTINEL;
     let note = resolved ? 'resolves' : 'UNDEFINED — fallback shipped';
     if (r.token === '--warn' && resolved) {
-      const want = r.expectWarn.toLowerCase();
+      // expectWarn is read from the owning theme block in styles.css, not pinned.
+      const want = (r.expectWarn || '').toLowerCase();
       const got = r.declared.toLowerCase();
-      if (got !== want) { note = `WRONG VALUE — expected ${r.expectWarn} on this path`; tokFails.push(`${r.path}: --warn is ${r.declared}, expected ${r.expectWarn}`); }
-      else note = `resolves, theme-correct (${r.expectWarn})`;
+      if (!want) { note = 'owning block declares no --warn (see B)'; tokFails.push(`${r.path}: owning block declares no --warn — parity, section B, owns this`); }
+      else if (got !== want) { note = `CASCADE MISMATCH — resolved ${r.declared}, owning block declares ${r.expectWarn}`; tokFails.push(`${r.path}: --warn cascade resolved ${r.declared}, but owning block declares ${r.expectWarn}`); }
+      else note = `resolves, matches owning block (${r.expectWarn})`;
     }
     if (!resolved) tokFails.push(`${r.path}: ${r.token} is undefined (probe painted the ${SENTINEL} fallback)`);
-    console.log(`     ${resolved && !note.startsWith('WRONG') ? 'pass ' : 'FAIL '}${pad(r.path, 14)}${pad(r.token, 10)}${pad(r.declared || '(empty)', 12)}${pad(r.painted, 20)}${note}`);
+    console.log(`     ${tokFails.length === before ? 'pass ' : 'FAIL '}${pad(r.path, 14)}${pad(r.token, 10)}${pad(r.declared || '(empty)', 12)}${pad(r.painted, 20)}${note}`);
   }
   // The adapt assertion: a token that merely "resolves" could still be one
   // hardcoded value. --warn must DIFFER between light and dark.

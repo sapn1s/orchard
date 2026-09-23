@@ -177,6 +177,27 @@ ok('minified bundle high-entropy literal stays clean',
 ok('a pure xxxx placeholder value still waived', !caught('PASS' + 'WORD=' + 'xxxxxxxxxxxxxxxxxxxxxxxx'));
 ok('your-key-here placeholder still waived', !caught('PASS' + 'WORD=your-key-here'));
 
+console.log('\nD7. Round-5 residual holes — subdomain-email waiver + password-only connection URL:');
+// The round-2/3 verifiers flagged these as OPEN; the round-4 self-verified suite
+// never covered them (drift re-check REFUTED, 2026-09-23). Bodies SPLIT/fabricated.
+const D7BODY = 'Ab3Xy' + '9Qw7Z' + 'k2Lm8' + 'Rt4Vp';   // fabricated mixed case+digit run
+// #1 — a personal email at a SUBDOMAIN of a registered maintainer domain must NOT
+// be waived (was: endsWith('.' + domain) waived a `corp.<maintainer-domain>` host).
+ok('subdomain of a maintainer domain is NOT waived (email)', !emailAllowed('alice@corp.' + 'microsoft.com'));
+ok('subdomain of a maintainer domain IS flagged in content', caught('reach me at alice@corp.' + 'microsoft.com'));
+ok('subdomain under oraios-ai.de is NOT waived', !emailAllowed('x@internal.' + 'oraios-ai.de'));
+// Precision must not regress: EXACT maintainer domain, reserved suffixes, noreply.
+ok('exact maintainer domain still waived', emailAllowed('dev@' + 'microsoft.com'));
+ok('reserved .service subdomain still waived', emailAllowed('u@1000.' + 'service'));
+ok('reserved example.com subdomain still waived', emailAllowed('a@sub.' + 'example.com'));
+ok('github noreply identity still waived', emailAllowed('123+h@users.' + 'noreply.github.com'));
+// #2 — a PASSWORD-ONLY connection URL (empty username) must be caught.
+ok('password-only redis URL IS caught', caught('cache=redis://:' + D7BODY + '@host:6379/0'));
+ok('password-only amqp URL IS caught', caught('amqp://:' + D7BODY + '@rabbit:5672'));
+// Precision: a user:pass URL still caught; a placeholder-password URL stays clean.
+ok('user:pass connection URL still caught', caught('postgres://admin:' + D7BODY + '@h/db'));
+ok('placeholder-password URL stays clean', !caught('redis://:changeme@host:6379'));
+
 // ── Enforcement in a scratch git repo (git run inside node, not Bash tool) ──
 console.log('\nE. Enforcement — pre-commit / commit-msg hooks (hand git commit):');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'feat130-repo-'));

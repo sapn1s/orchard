@@ -220,7 +220,11 @@ publish-safety bar → BROKEN.** All verified against the actual `--staged` gate
 - **MEDIUM — password-only connection URL** (`redis://:pass@host`) not matched
   (`CONN_STRING` requires a user before `:`).
 - **MEDIUM — allowed-domain subdomains waive personal email:** `endsWith('.'+domain)`
-  lets `alice@corp.microsoft.com`, `x@internal.oraios-ai.de` through.
+  lets `alice@corp.<maintainer-domain>`, `x@internal.<maintainer-domain>` through.
+  <!-- FEAT-130 round 5 self-immunity: the two synthetic example addresses on this
+  line were split to shape-form once round 5 CLOSED this subdomain hole and the gate
+  (correctly) began flagging them — same "describe the shape, never paste the value"
+  redaction the round-2 entry above applied; the entry's meaning is unchanged. -->
 - **LOW–MED — symlink targets never scanned:** a staged symlink whose TARGET string
   is a home path or a secret path commits unscanned (mode 120000 skipped).
 - **LOW — YAML block-scalar / list values** (`api_key: |` then value on next line;
@@ -463,3 +467,126 @@ list all present).
 - **Files changed (unstaged, for the user to commit):**
   `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`,
   and this ticket.
+
+### 2026-09-23 — verify lane (drift re-check, round 1, class=verify) — REFUTED
+- **Ground-truth re-verification of the "landed" claim.** The round-4 detector +
+  `--staged` enumeration IS committed (`78a8a5a`, carried through `dc1f4ea`;
+  `matchAll`/`hasEntropyChunk`/`AIza` negative-lookahead all present; working tree
+  clean). `node scripts/verify-feat-130-leak-detection.mjs` → **91 passed / 0
+  failed**. So the CODE landed and the fixer's own suite is green.
+- **But the ticket's own bar is UNMET, so this is REFUTED as done:**
+  1. The last INDEPENDENT verdict on record is **BROKEN** (2026-09-07,
+     `dispatch openai 01a07918-…`, clean-room `--working-tree`). Round 4 closed
+     those three holes but was **self-verified only** — it explicitly states
+     "independent verify warranted: YES … should be the last word, not this
+     self-verified suite." No passing `Verified-by:` exists; `board:check` would
+     flag it. Landing round-4 code without a clean-room re-verify does not clear
+     the BROKEN verdict.
+  2. Documented residual gaps remain OPEN by the fixer's own admission (round-3/4
+     "Still open"): allowed-domain SUBDOMAIN email waiver, symlink-TARGET string
+     never scanned, YAML block-scalar/list values, and the compound
+     `git add && git commit` FEAT-108-classifier gap (backstopped only by the
+     in-repo hook; a bare project without hooks is still exposed).
+- **Verdict: REFUTED — implemented but not done.** Its own security/publish-safety
+  class + 4-round regression history require an independent clean-room PASS it has
+  never received (last was BROKEN). Real legal status: IN-PROGRESS / IN
+  VERIFICATION, not Done. Recommend: dispatch a fresh clean-room re-verify of the
+  round-4 diff (re-attack placeholder/entropy granularity + provider boundaries)
+  before any Done. This lane changed no code and set no status.
+
+### 2026-09-23 — worker (fixing, round 5, class=fix) — round-4 3 holes re-confirmed CLOSED; 2 residual FALSE-PROOF holes fixed; 1 decision fork left
+
+Ground-truth re-verification of every gap the last INDEPENDENT verdict (2026-09-07
+BROKEN, `dispatch openai 01a07918-…`) and the fixers' own "Still open" notes leave,
+tested against the code at HEAD (`78a8a5a`, carried through `ca672b9`) — NOT trusting
+the fixer's 91/91 suite. Scope: `scripts/lib/leak-tokens.mjs`,
+`scripts/verify-feat-130-leak-detection.mjs` only (leak-gate.mjs needed no change —
+it imports the shared matcher). No `src/server/` / `public/` / `git-grant*` /
+`git-shim` touched (those belong to concurrent BUG-150/160/184 lanes).
+
+- **Round-4's three fixes — independently RE-CONFIRMED CLOSED** (adversarial re-run
+  of the round-3 verifier's exact inputs against HEAD `scanSecrets`, real output):
+  (1) `xxxx` spliced into a high-entropy run → CAUGHT (`secret assignment`);
+  (2) placeholder assignment before a real one on the same line → CAUGHT;
+  (3) `AIza` body ending in a hyphen → CAUGHT (`google api key`). So the last BROKEN
+  verdict's three recall breaks are genuinely fixed in landed code.
+
+- **Two residual FALSE-PROOF holes were STILL OPEN at HEAD and are now FIXED (round 5):**
+  1. **Subdomain of a maintainer domain waived a personal email (round-2/3 MEDIUM).**
+     `emailAllowed` used `domain === e || domain.endsWith('.' + e)` over a flat list, so
+     a personal address at a SUB-host of a registered maintainer domain was waived.
+     must-FAIL proof (HEAD): `emailAllowed('alice@corp.'+'microsoft.com')` → `true`;
+     scanSecrets → 0 hits. Fix: split the allow list into `ALLOWED_EMAIL_SUFFIX`
+     (RFC-2606 reserved TLDs + systemd/mDNS pseudo-hosts — suffix match kept, they can
+     never be a deliverable personal address at any depth) and
+     `ALLOWED_EMAIL_DOMAIN_EXACT` (registered noreply + dependency-maintainer domains —
+     EXACT match, no subdomain waiver). AFTER: subdomain → flagged; `dev@microsoft.com`,
+     `u@1000.service`, `a@sub.example.com`, the github noreply identity → still waived.
+  2. **Password-only connection URL (`redis://:pass@host`, empty user) slipped
+     (round-2 MEDIUM).** `CONN_STRING` required a `+` (≥1-char) userinfo user. must-FAIL
+     proof (HEAD): scanSecrets on a `redis://:<body>@host` → 0 hits. Fix: userinfo user
+     is now `*` (empty allowed); password capture still requires ≥1 char and the
+     placeholder/code-ref guards still gate it. AFTER: pwd-only redis/amqp URLs →
+     caught; `redis://:changeme@host` placeholder → clean; user:pass URLs → still caught.
+
+- **Proof — both directions, real commands/output:**
+  - Detector level: adversarial script over `scanSecrets`/`emailAllowed` — every new
+    class FAILs when seeded, every precision control stays clean (0 regressions).
+  - **End-to-end `--staged` gate** (Node-driven git harness, `/tmp/feat130r5-e2e.mjs`,
+    Bash git is shimmed): SEEDED (pwd-only URL + subdomain email staged) → gate
+    **exit 1** (blocked, secret in the index); CLEAN control (placeholder pwd URL +
+    exact-domain email staged) → gate **exit 0**.
+  - Encoded as permanent regression tests — new **D7** section (11 assertions).
+    `node scripts/verify-feat-130-leak-detection.mjs` → **102 passed / 0 failed**
+    (was 91; +11). Shared consumer `verify-leak-store-guard` → 13/13.
+  - **`npm run gate` → EXIT 0** on the real (concurrent-lane-dirty) tree, read
+    directly unpiped — leak-gate + check-nul + typecheck all PASS, only the LICENSE
+    waiver reported.
+  - **Self-immunity fallout (evidence the fix works):** once round 5 closed the
+    subdomain hole the gate (correctly) began flagging the SYNTHETIC example addresses
+    (`alice@corp.<maintainer-domain>` / `x@internal.<maintainer-domain>` shape) that a
+    prior append-only entry (round-2, line ~223) and my new files had pasted un-split. Reworded my new
+    comments to shape-form, re-split the test literals, and split the two examples in
+    the round-2 entry to `<maintainer-domain>` shape form with an inline note — the
+    same synthetic-literal redaction the round-2 worker documented earlier in this log;
+    meaning unchanged. `regressed-from:` none (these are gaps prior rounds left open,
+    not breakage they introduced; the fix is additive precision).
+
+- **STILL OPEN — one DECISION FORK for the orchestrator (not fixed here, by design):**
+  **Assignment-key synonyms** (`token=`, `auth=`, `pwd=`, `cred=`, `cookie=`,
+  `session=`) are NOT in `SECRET_KEY_SRC`, so `token=<high-entropy>` bare slips.
+  Round 3 omitted them DELIBERATELY: bare `token=`/`auth=` flood on URL query params
+  and `PWD=` collides with the ubiquitous working-directory env var. This is exactly
+  the "what counts as a secret worth blocking a publish over, and at what
+  false-positive cost" project-direction question — FORK: (a) add them (higher recall,
+  real FP risk on doc URLs / `PWD=` → gate becomes `--no-verify`-bait), vs (b) leave
+  them out (a bare `token=<secret>` in a committed file slips). Needs your call; I did
+  not guess.
+
+- **STILL OPEN — lower-risk, documented, NOT fixed (scope/frequency judgement):**
+  YAML inline-list `api_key: [value]` (the `[` truncates `ASSIGN_BARE`; low-frequency
+  shape); YAML multi-line block-scalar `api_key: |` + next-line value (architectural —
+  the line-by-line scanner cannot see the value line without lookahead);
+  staged **symlink-TARGET** never scanned (mode 120000 skipped in `--staged`; an
+  absolute home-path symlink target commits unscanned — a real but low-frequency
+  home-path leak vector; scanning it needs its own FP analysis vs scratch symlinks);
+  the compound `git add && git commit` **FEAT-108 classifier** gap (lives in
+  `src/server/`, owned by concurrent lanes — out of this lane's scope; backstopped by
+  the in-repo pre-commit hook; belongs to its own ticket/lane).
+
+- **Independent verify — WARRANTED (HIGH-STAKES).** This is a regression-prone
+  security detector, now round 5 on a file with a documented regression history, and
+  the last INDEPENDENT verdict on record is BROKEN. This lane is self-verified only.
+  A fresh clean-room pass (`scripts/independent-verify.mjs --working-tree`) over the
+  round-5 diff — re-attacking the subdomain/exact split (probe: does an EXACT
+  maintainer-domain personal address wrongly slip? does a reserved-suffix change lose a
+  real catch?) and the conn-string empty-user change (probe for new FPs on ordinary
+  userinfo-bearing URL strings of the `scheme`-slash-slash-`host`-colon-`port`-at form)
+  — should be the last word before Done, not this
+  suite.
+
+- **Files changed (unstaged, for the user to commit):**
+  `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`,
+  and this ticket. (Other dirty files in the tree — `public/app.js`, `src/server/*`,
+  `scripts/git-grant*`, `scripts/lib/git-shim.mjs`, other tickets — belong to
+  concurrent lanes; untouched by this lane.)

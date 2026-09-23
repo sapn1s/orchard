@@ -183,12 +183,29 @@ const isCodeRef = (v) => CODE_REF.test(String(v ?? ''));
  * a personal slip. Adding a new dependency's maintainer email will (correctly)
  * fail-closed until it is reviewed and added here.
  */
-export const ALLOWED_EMAIL_DOMAINS = [
+// FEAT-130 round 5 — the allow list is SPLIT by match discipline, because a blanket
+// `domain === e || domain.endsWith('.' + e)` waived any SUBDOMAIN of a registered
+// maintainer domain (round-2/3 verifier: a personal address at a SUB-host of a
+// maintainer domain — `alice@corp.<the-domain>` — slipped through). A registered domain must match
+// EXACTLY; only the RESERVED pseudo-domains — RFC-2606 reserved TLDs and the
+// systemd/mDNS pseudo-hosts, which can never be a real deliverable personal
+// address at ANY depth — keep the suffix match (systemd `user@x.service`,
+// `host.local`, `foo@bar.example.com` are all still non-personal).
+export const ALLOWED_EMAIL_SUFFIX = [
   'invalid', 'test', 'example', 'local', 'localhost', 'service',
   'example.com', 'example.org', 'example.net',
+];
+// REGISTERED, real-world-deliverable domains that are public by PUBLICATION, not a
+// personal slip (the structurally-public noreply identities and the documented
+// dependency-maintainer addresses). EXACT domain match only — a personal address at
+// a SUBDOMAIN of one of these is NOT waived.
+export const ALLOWED_EMAIL_DOMAIN_EXACT = [
   'users.noreply.github.com', 'noreply.github.com',
   'microsoft.com', 'oraios-ai.de',
 ];
+// Kept for back-compat with any consumer importing the old flat list (it is the
+// union of the two lists above; new code should use the split lists).
+export const ALLOWED_EMAIL_DOMAINS = [...ALLOWED_EMAIL_SUFFIX, ...ALLOWED_EMAIL_DOMAIN_EXACT];
 const ALLOWED_EMAIL_EXACT = ['noreply@github.com', 'noreply@anthropic.com', 'git@github.com'];
 /** The ONE sanctioned committer identity for a public repo: the GitHub noreply. */
 export const NOREPLY_IDENTITY_RE = /^\d+\+[A-Za-z0-9-]+@users\.noreply\.github\.com$/i;
@@ -197,7 +214,8 @@ export function emailAllowed(addr) {
   const a = String(addr ?? '').toLowerCase();
   if (ALLOWED_EMAIL_EXACT.includes(a)) return true;
   const domain = a.split('@')[1] ?? '';
-  return ALLOWED_EMAIL_DOMAINS.some((e) => domain === e || domain.endsWith('.' + e));
+  if (ALLOWED_EMAIL_DOMAIN_EXACT.includes(domain)) return true;      // exact only — no subdomain waiver
+  return ALLOWED_EMAIL_SUFFIX.some((e) => domain === e || domain.endsWith('.' + e));
 }
 
 const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?\.[A-Za-z]{2,}\b/g;
@@ -267,8 +285,13 @@ const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,
 // secret-shaped (looksSecretish) so a plain prose word (a config key documented
 // as "required"/"optional") is not mistaken for a live credential.
 const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{6,})', 'ig');
-// proto://user:password@host — the inline password is the leak.
-const CONN_STRING = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s:/@]+:([^\s:/@]+)@[^\s/'"]+/;
+// proto://user:password@host — the inline password is the leak. FEAT-130 round 5:
+// the userinfo user part is `*` not `+`, so a PASSWORD-ONLY URL (`redis://:pass@host`,
+// the common redis/amqp shape where the username is empty) is matched too — the
+// round-2 verifier MEDIUM. The password capture still requires ≥1 char and the
+// placeholder/code-ref guards below still gate it, so an empty-user URL with a
+// benign or templated password does not flood.
+const CONN_STRING = /\b[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^\s:/@]*:([^\s:/@]+)@[^\s/'"]+/;
 const CONN_PLACEHOLDER = /^(?:pass|passwd|password|user|username|secret|token|xxx+|changeme)$/i;
 
 /** True when an assignment/connstring VALUE looks like a live secret literal. */

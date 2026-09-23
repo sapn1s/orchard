@@ -1,6 +1,6 @@
 # BUG-169 — a live reply shows its info block twice: raw JSON, then the rail
 
-- **Status:** REOPENED (round 2, 2026-09-07) — the reported duplicate (raw JSON at top + correct rail below, digest item rendered twice) RECURRED live. Root cause: the byte-exact `startsWith` reconciliation guard this ticket INTRODUCED is fragile to line-ending skew between the streamed `text-delta` buffer and the CLI's canonical `block.text`; on a miss it appended a second render and orphaned the mid-stream raw-JSON settle. Fixed (round 2) by comparing in the renderer's normalised line-ending space. Fix landed unstaged in `public/app.js`; awaiting independent verification (high-stakes: session-lifecycle / render-correctness in a regression-prone file). See the 2026-09-07 round-2 entry. (Round 1: VERIFIED — reported double-render fixed & independently confirmed non-regressing for the diagnosed scope; the mid-delta residual split off as BUG-170.)
+- **Status:** IN VERIFICATION — REOPENED (round 2, 2026-09-07) — the reported duplicate (raw JSON at top + correct rail below, digest item rendered twice) RECURRED live. Root cause: the byte-exact `startsWith` reconciliation guard this ticket INTRODUCED is fragile to line-ending skew between the streamed `text-delta` buffer and the CLI's canonical `block.text`; on a miss it appended a second render and orphaned the mid-stream raw-JSON settle. Fixed (round 2) by comparing in the renderer's normalised line-ending space. Fix landed unstaged in `public/app.js`; awaiting independent verification (high-stakes: session-lifecycle / render-correctness in a regression-prone file). See the 2026-09-07 round-2 entry. (Round 1: VERIFIED — reported double-render fixed & independently confirmed non-regressing for the diagnosed scope; the mid-delta residual split off as BUG-170.)
 - **Severity:** medium
 - **Area:** composer / transcript renderer (client — public/app.js live stream)
 - **Reported:** 2026-09-06 by user (via orchestrator)
@@ -245,3 +245,8 @@ Exactly one render of the message, as the digest rail — never the raw JSON.
   if so is the residual a visible raw-JSON leak or (acceptably) a rarer stray? Also: the
   unreachable-in-practice `midopen-boundary` orphan (a hard boundary mid-block) remains a latent
   weakness in the shared "settle" design (7 callers), noted but not fixed here.
+
+### 2026-09-23 — status normalisation (no content change)
+Prefixed the Status header with the recognised state word `IN VERIFICATION` (per
+orchestrator decision) so `board:check` can map it; the prior "REOPENED (round 2)"
+detail is preserved verbatim as trailing text. No diagnosis or scope change.

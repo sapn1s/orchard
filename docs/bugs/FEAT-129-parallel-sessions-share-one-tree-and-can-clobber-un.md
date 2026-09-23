@@ -1,6 +1,6 @@
 # FEAT-129 — Parallel sessions on one project can silently overwrite each other's unsaved edits
 
-- **Status:** OPTION A, ROUND 3 — the one load-bearing residual (agent_id≡task_id) CONFIRMED EQUAL empirically on live subagents; heartbeat cannot self-release a live subagent lock. VERIFIED-candidate.
+- **Status:** IN VERIFICATION — OPTION A, ROUND 3 — the one load-bearing residual (agent_id≡task_id) CONFIRMED EQUAL empirically on live subagents; heartbeat cannot self-release a live subagent lock. VERIFIED-candidate.
 - **Severity:** medium
 - **Area:** server (agent-bridge cwd) / runtime / orchestration discipline
 - **Reported:** 2026-09-06 by finding lane (dispatched, read-only investigation)
@@ -502,3 +502,8 @@ dead-owner rung still cannot fire for a session inside a live server. The TTL
 backstop is what collects those now — which is the bound the filing asked for.
 Left UNVERIFIED pending an independent lane, per this ticket's
 verification-class.
+
+### 2026-09-23 — status normalisation (no content change)
+Prefixed the Status header with the recognised state word `IN VERIFICATION` (per
+orchestrator decision) so `board:check` can map it; the prior "OPTION A, ROUND 3 …"
+detail is preserved verbatim as trailing text. No diagnosis or scope change.

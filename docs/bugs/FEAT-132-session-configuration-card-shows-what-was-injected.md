@@ -1,6 +1,6 @@
 # FEAT-132 — a session's transcript hides what was injected into its context
 
-- **Status:** IMPLEMENTED — awaiting independent verify
+- **Status:** BLOCKED — implemented; clean-room verify could not launch
 - **Severity:** medium
 - **Area:** server (templates / agent-bridge) · api · drawer/transcript (app.js)
 - **Reported:** 2026-09-06 by orchestrator dispatch
@@ -174,3 +174,9 @@ clearly-labelled partial card, never one implying full knowledge.
   `scripts/verify-feat-132-ui.mjs`.
 - **Verified-by:** NONE — clean-room dispatch could not run (see BLOCKER). This is
   not a pass and not a fail; verification is still owed.
+
+### 2026-09-23 — status normalisation (no content change)
+Changed the Status word from the unmappable `IMPLEMENTED — awaiting independent verify`
+to the recognised `BLOCKED — implemented; clean-room verify could not launch` (per
+orchestrator decision), reflecting that the clean-room dispatch could not launch.
+Fixes a `board:check` UNMAPPABLE STATUS failure; no diagnosis or scope change.

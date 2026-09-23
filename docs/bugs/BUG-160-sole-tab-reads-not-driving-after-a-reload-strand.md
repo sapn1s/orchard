@@ -214,3 +214,47 @@
   ONLY on the store-isolation lane's `scripts/verify-ui.ts → ./lib/station-boot.mjs`
   implicit-any (that lane added a `.mjs` import with no `.d.mts`); not a BUG-160
   file. My files (app.js, index.ts, events.ts) typecheck clean.
+
+### 2026-09-23 — fix lane (re-dispatch, class=fix) — NO-OP: fix already landed, re-verified
+- **Ground truth first: the fix is already in HEAD.** This re-dispatch treated
+  BUG-160 as unfixed, but the round-1 fix is committed as `8016442` (verified
+  `git merge-base --is-ancestor 8016442 HEAD` = in HEAD). `reattachDriving`
+  (public/app.js ~11223), the `drivenByDashboard`→`void reattachDriving(sess)`
+  branch (~5562), the reattach-ack boundary flush (idle `flushQueue()` ~9724 /
+  busy setBusy-boundary ~9694), and the server `nothing-to-reattach` guard
+  (src/server/index.ts ~4022, src/server/events.ts ~374) are all present and
+  structurally intact. I made NO code changes.
+- **Hypothesis check (the re-dispatch's "re-derived flag" theory): CONFIRMED as
+  the original root, already addressed.** `isDriving()` required an open driving
+  socket the reloaded sole tab did not hold; the landed fix declares driving by
+  OWNING it (reattachDriving opens the socket + promptless start), not by
+  re-deriving. Nothing to rebuild.
+- **BUG-150 conflict check: NO conflict — designs are complementary.** The only
+  unstaged app.js delta in this tree is BUG-150's queue-ownership rework
+  (`resetTranscript()` returns the adopted outbox and re-binds `queueKey`
+  synchronously via `adoptQueueRows`; `adoptQueue` has no internal callers).
+  BUG-150 restores the queue *earlier and more robustly*; BUG-160's boundary
+  flush still consumes `state.queue`. `flushQueue` and its triggers are intact.
+  BUG-150 feeds the queue that BUG-160 delivers — they compose, they do not race.
+- **Regression suites (verbatim, this tree):** `verify-bug-150-load-window-queue`
+  16/0, `verify-bug-150-adversarial` 25/0, `npm run gate` PASS (exit 0,
+  leak-gate + check-nul + typecheck all green).
+- **BUG-160's own real-browser contract suite is NOT runnable-to-green in THIS
+  sandbox — environmental, not a regression.** `verify-reload-live.mjs` returned
+  1/2 twice (identical, not flaky). The seed turn genuinely started (the harness
+  throws "turn never started" on `!busy||!sid` and did NOT throw — real `sid`,
+  `busy===true` pre-reload), yet the haiku essay `CLOCKS-DONE` never streams via
+  file-follow within 240s and the turn still "ends" (idle check passes). If a
+  real model backend were producing content, `CLOCKS-DONE` would surface even on
+  a FAILED reattach (as round-1's verify lane observed pre-fix: "FIRST-DONE still
+  arrived via read-only file-follow"). It never does here → no sustained model
+  output in this sandbox. Matches round-1's note that `verify-feat-065-delivery`
+  fatally failed "seed turn never started" on both tree AND HEAD as environmental.
+  The failing signal (`sid` null after reload + zero streamed content) is
+  UPSTREAM of the reattach path and cannot be produced by BUG-150's queue-only
+  delta, so it is not a code regression.
+- **Independent clean-room verify with a REAL model backend still WARRANTED** to
+  re-confirm the user-observable proof (auto-reattach drives + restored message
+  delivered exactly once, never into a running turn) that round-1's verify lane
+  captured 9/0 post-fix / 4/2 must-FAIL pre-fix but that this sandbox cannot
+  reproduce. No code was changed this pass.

@@ -165,3 +165,34 @@ manifest asserting something false while the suite stayed permanently red — a 
 nobody can distinguish from a real breach. The old values are written above so the edit is
 reversible and auditable from the ticket alone. **This is the only reason those four archived
 files changed; the aliasing is the only content change in them.**
+
+### 2026-09-23 — re-verify pass (fixing round 1): fix already present at HEAD; dispatch hypothesis refuted
+
+Dispatched to add the missing token class on the premise that "the leak gate only scans the
+pending diff / working tree, so a private name already committed at HEAD is never examined."
+**That premise is false**, verified against the gate source, and the fix is already committed.
+
+- **Scan scope (hypothesis refuted).** `scripts/leak-gate.mjs` REPO mode enumerates files with
+  `git ls-files -z -co --exclude-standard` — every git-TRACKED-or-new text file, i.e. HEAD
+  content included. It does not restrict to the diff. The real blind spot this ticket fixed was
+  the token ALLOWLIST (a name nobody listed → PASS), not the scan scope.
+- **Fix present.** `scripts/lib/leak-tokens.mjs` carries tokens I–P (lines ~39–46) and Q, anchored
+  on the distinctive stems as the prior entry describes. Real tree: `node scripts/leak-gate.mjs`
+  → **PASS, 0 hits / 1098 files, exit 0** (names scrubbed). Root `.gitignore:42` covers
+  `docs/bugs/.arch/`; `git check-ignore -v docs/bugs/.arch/findings.json` attributes to
+  `.gitignore:42`. Full sanctioned gate `npm run gate` (unpiped) → **PASS (leak-gate / check-nul /
+  typecheck), exit 0**.
+- **Mechanism demonstrated on a SYNTHETIC token** (no real private string touched), in a throwaway
+  temp git repo, proving the false-proof class the ticket names: a codename `synthetic-zzz-widget`
+  committed at HEAD with no matching token → **gate PASS, exit 0** over a real leak (and note it
+  scanned the HEAD file — the miss is the allowlist, not the scope). Add one synthetic token,
+  nothing else changed → **gate FAIL, 1 hit, exit 1**, named. Remove the leaking line (clean tree)
+  → **gate PASS, exit 0** (negative direction: no false positive). This is exactly the before/after
+  the real I–P tokens already deliver at HEAD.
+- **Minor discrepancy noted, not acted on.** The nested `docs/bugs/.arch/.gitignore` (2 bytes) that
+  the 2026-08-25 entry said was removed still exists on disk. It is untracked (`git ls-files
+  docs/bugs/.arch/` is empty) and harmless — the root rule alone ignores the dir. Flagged for the
+  owner; not touched this round.
+
+**Verdict:** no code change required — FEAT-104's fix is implemented and verified at HEAD. Working
+tree left unstaged/clean (this Activity-log edit is the only change).

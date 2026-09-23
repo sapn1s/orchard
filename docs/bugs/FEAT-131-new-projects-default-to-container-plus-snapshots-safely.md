@@ -1,6 +1,6 @@
 # FEAT-131 — new projects default to container isolation (+ snapshots), safely
 
-- **Status:** IMPLEMENTED — awaiting independent verify
+- **Status:** IN VERIFICATION — awaiting independent verify
 - **Severity:** medium
 - **Area:** server (registry / snapshots / project creation)
 - **Reported:** 2026-09-06 by orchestrator dispatch
@@ -170,3 +170,8 @@ projects are never touched.
 - **Files changed (all UNSTAGED, no git writes):** the 24 `scripts/verify-*.mjs`
   listed above, plus this ticket. No `src/server/*`, `public/*`, or the
   collision-listed scripts were touched.
+
+### 2026-09-23 — status normalisation (no content change)
+Changed the Status word from the unmappable `IMPLEMENTED` to the recognised
+`IN VERIFICATION` (per orchestrator decision), keeping "awaiting independent verify".
+Fixes a `board:check` UNMAPPABLE STATUS failure; no diagnosis or scope change.

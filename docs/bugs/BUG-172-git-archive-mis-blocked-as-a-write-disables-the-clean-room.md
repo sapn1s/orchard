@@ -138,3 +138,23 @@ depends on are actually allowed.
   guard is a coverage test enumerating every git subcommand invoked by
   `scripts/**` and asserting each is allowed by the policy — a check, not a
   re-architecture, so it belongs on this class of ticket rather than an ARCH.
+
+### 2026-09-23 — verify lane (drift re-check, round 1, class=verify)
+- **Ground-truth re-verification of the "landed" claim.** Fix is committed at
+  `dc1f4ea` (`scripts/lib/git-write-policy.mjs` — `'archive'` in `GIT_READONLY`
+  with the scope comment; working tree clean). Re-ran from a fresh context, not
+  taken on faith:
+  - `offenderForGit(['git','archive','HEAD'])` → `null`; `['git','commit',…]` →
+    `git commit`. `decideGitShim(['archive','HEAD'],{}).allow` → `true`;
+    `['push']` → `false`.
+  - `node scripts/verify-feat-108-git-write-block.mjs` → **164 passed / 0 failed
+    / 0 skipped**; 5/5 documented evasion gaps still open (intended).
+- **Verdict: functionally CONFIRMED-done.** The read/write classification and the
+  full write-refusal anti-regression hold on the committed tree.
+- **Gap (why this lane does NOT set VERIFIED/DONE):** the ticket's own header
+  requires an independent clean-room verify before VERIFIED (safety backstop,
+  false-proof harm class) and `Verified-by:` is still **PENDING**. This lane is an
+  in-process verify dispatch, not the clean-room dispatch README rule 5 demands,
+  so it cannot satisfy that bar. Orchestrator decision: waive the clean-room gate
+  for a one-word read-allowlist add (given 164/164 + classifier proof) → Done, or
+  dispatch the cheap clean-room pass. Legal board status until then: IN-PROGRESS.

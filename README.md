@@ -40,7 +40,7 @@ features fail one by one without saying why; run it under WSL2 (with `systemd=tr
 `/etc/wsl.conf` for the background service) instead. macOS is untested.
 
 ```sh
-npm install                       # first time only
+npm ci                            # first time only (installs from the committed lockfile)
 npm start                         # -> http://127.0.0.1:4317
 ```
 
@@ -162,6 +162,9 @@ observed, and kills what it started.
 A personal project, developed in the open and moving quickly, built for one person on one
 machine. Interfaces change without deprecation periods; `docs/bugs/` is the honest record of
 what works and what does not.
+
+Issues are welcome and pull requests are discussed first in an issue — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 Deliberately out of scope: an auth tier, multiple users, a file manager, a preview proxy,
 API-key authentication.

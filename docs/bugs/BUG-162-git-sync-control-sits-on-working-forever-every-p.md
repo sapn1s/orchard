@@ -11,9 +11,9 @@
   "reported": "2026-08-28",
   "reported_by": "user",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-08-28",
+  "updated": "2026-09-28",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -100,3 +100,6 @@
 - **Regressions:** verify-git 74/0, verify-bug-156-publish-branch 9/0. `verify-git-branch-switch` flaked 2/3 on the "after explicit confirm the switch proceeds" browser-timing step — NOT attributable to this diff (branch switch uses local `git()` checkout; the change is confined to the fetch/push/pull `netGit` body). Recommend a separate flake ticket; does not block BUG-162.
 - **Could NOT test:** (a) a real git helper that both escapes the group AND holds netGit's stdout/stderr pipe (the cache daemon closed its std fds — could not construct one); (b) server-process-kill mid-fetch orphan (would require killing the real host server — out of scope); (c) deterministic pid-reuse to prove the #4 cross-group SIGKILL.
 - Verified-by: independent verifier (Opus 4.8), clean-room openai/codex cross-check; commands + real output above.
+
+### 2026-09-28 — board-hygiene lane (status correction, no code)
+- **Move: open → verified.** A board-check sweep found this ticket still `work_state: open` despite being fixed and independently verified. Ground truth: the fix landed on `main` in two commits — `257aca3` ("bound git network ops and own the sync flag so the control never hangs", round 1) and `3481e76` ("bound git network ops and reap the whole process group", round 2) — and the round-3 **independent** clean-room verify (2026-09-23, entry above) returned **PASS** with a `Verified-by:` line, having attacked five candidate defects with real repros (only latent/hardening notes remained, none blocking). Per `DONE_WORK_STATES`, `verified` moves it to the Done table on the next `board:gen`. No code, scripts, or INDEX hand-edit — record field only.

@@ -10,9 +10,9 @@
   "area": "Browser startup",
   "reported": "2026-08-19",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "agent",
   "work_state": "in_verification",
-  "human_action": "review",
+  "human_action": "none",
   "updated": "2026-08-25",
   "decision": null,
   "decision_history": [
@@ -219,3 +219,12 @@ If the adapter cannot be controlled or safely versioned, option A loses its prem
   3. **Orphan accounting when Chrome is killed out from under the daemon** (`SIGKILL` the root, not `browser.close()`): does the disconnect handler's new drop-to-lazy path leave renderer processes holding the profile, and does the next launch then trip the profile lock?
   4. **The claim that `running` stayed honest**: point the station at the *eager* daemon from the import commit and confirm the CLI's fallback still reports `running:true` — I asserted that compatibility path in code but only tested the lazy side of it.
   5. **The container mount over a long session**: the socket now outlives Chrome by design, but nothing here tests a container whose daemon is `sbmcp stop`ped mid-session — the mount goes stale and `SBMCP_AUTOSTART=0` means nothing can recover it. That is the failure this design trades for, and it should be measured rather than assumed acceptable.
+
+### 2026-09-28 — board-hygiene lane (state correction, no code)
+
+- **Why here:** `npm run board:check` FAILed with `UNREACHABLE TICKET: ARCH-007` — the ticket is open per its `IN-VERIFICATION` status, its INDEX Owner is 👤 (needs-you), yet it surfaces on no rail. Root cause read from `src/server/board.ts`: this ticket was answered (option A, 2026-08-25) AND a dated build-lane entry followed it, so `readBoard` classifies it "answered + acted → resolved" and DROPS it from every lane; meanwhile INDEX still marks 👤, so the reachability ride-along flags it. The 👤 owner is stale: nothing is pending on the user.
+- **Ground truth confirmed (not reconstructed):** the option-A decision is recorded (`decision_history[0]`, `chosen:"A"`, `chosen_by:user`, `chosen_on:2026-08-25`); the build landed and is committed — `src/server/sbmcp-lazy-shim.mjs` is deleted from the tree, `scripts/verify-arch-007-lazy-browser.mjs` exists, and `package.json` maps `verify:arch-007` to it (all present at current HEAD). The builder self-verified 83/83. But `verification[]` is EMPTY and there is no `Verified-by:` line: NO independent clean-room verification has run, and `verification_class:"arch"` is above the trivial carve-out, so per README rule 5 this may NOT be flipped to VERIFIED by the fixer. It correctly stays `in_verification`.
+- **What this ticket actually awaits: an agent action, not a user one** — an independent clean-room verify DISPATCH (`node scripts/independent-verify.mjs`) of the lazy browser lifecycle, attacking the five surfaces the build lane named above (single-flight gate under adversarial timing; truncated capability-declaration reads; orphan accounting on Chrome SIGKILL; the `running`-honesty fallback against the eager import-commit daemon; a container whose daemon is stopped mid-session). SECURITY/session-lifecycle + regression-prone + modifies a dependency with no prior history ⇒ cross-provider decorrelation warranted.
+- **Changed (this ticket file only):** record `owner` 👤/"you" → `"agent"` and `human_action` `"review"` → `"none"`, because the user is not being asked to review anything — the record now reads as "awaiting agent verification" and its board Status cell composes from `current_need` instead of falsely reading "awaiting your review". No code, no scripts, no INDEX hand-edit.
+- **Handoff — durable fix is the orchestrator's (INDEX is orchestrator-owned):** flip INDEX Owner ARCH-007 👤 → 🤖 so it lands on the in-flight lane, and dispatch the independent verify above; on a VALID/HELD verdict, record the `Verified-by:` line and move to `verified`/`done`. This lane's append makes the ticket reachable via the recently-updated (7d) lane in the interim, clearing the board:check FAIL now.
+- **Verified:** `npm run board:gen` then `npm run board:check` — FAIL cleared (see this lane's return). No product code touched; port 4317 / the service / any host scope untouched.

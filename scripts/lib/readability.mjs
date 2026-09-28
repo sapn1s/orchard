@@ -34,26 +34,53 @@ export {
 } from './structure.mjs';
 
 const INLINE_CODE = /`[^`]+`/g;
-const FENCED_BLOCK = /```[\s\S]*?```/g; // includes the leading ```orchard-digest
+const FENCED_BLOCK = /```[\s\S]*?```/g; // backtick fences (incl the leading ```orchard-digest)
+// BUG-192 round 3: tilde fences too, handled as a SEPARATE pass so backtick
+// behaviour is byte-identical to before (no readability change from this line).
+const FENCED_TILDE = /~~~[\s\S]*?~~~/g;
 const URL = /\bhttps?:\/\/[^\s)]+/gi;
+// BUG-192 round 3: a markdown link's TARGET is not prose — collapse [label](target)
+// to its label, dropping the target whatever its scheme (absolute OR relative). The
+// readability pipeline also runs stripMarkdown (idempotent on this), but the length
+// counter uses extractProse ALONE, so relative targets were being counted there.
+const MD_LINK = /\[([^\]]*)\]\((?:[^()]*|\([^()]*\))*\)/g;
+// GFM table delimiter row: cells of :?-+:?, separated by pipes, OUTER PIPES OPTIONAL,
+// and at least one internal pipe is REQUIRED (so a `---` horizontal rule is NOT a table).
+const TABLE_DELIM = /^\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?$/;
 
 /** Strip the parts that legitimately skew prose metrics. Returns plain-ish text. */
 export function extractProse(input) {
   let t = String(input ?? '');
-  // 1. Remove every fenced code block (the orchard-digest block included).
-  t = t.replace(FENCED_BLOCK, ' ');
-  // 2. Drop table rows/dividers and blockquotes line-by-line.
+  // 1. Remove every fenced code block (backtick then tilde; orchard-digest included).
+  t = t.replace(FENCED_BLOCK, ' ').replace(FENCED_TILDE, ' ');
+  // 2. Collapse markdown links to their label (drops absolute AND relative targets).
+  t = t.replace(MD_LINK, '$1');
+  // 3. Line-by-line drops. GFM tables need not carry outer pipes, so a delimiter row
+  //    is what proves a table: when we see one, drop it, the header line directly
+  //    above it, and the contiguous body rows below it (lines containing a pipe).
+  const lines = t.split('\n');
+  const drop = new Array(lines.length).fill(false);
+  for (let i = 0; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s.includes('|') || !TABLE_DELIM.test(s)) continue;
+    drop[i] = true;                                   // the delimiter row
+    if (i - 1 >= 0 && lines[i - 1].trim()) drop[i - 1] = true; // header directly above
+    for (let k = i + 1; k < lines.length; k++) {      // contiguous body rows
+      if (!lines[k].trim() || !lines[k].includes('|')) break;
+      drop[k] = true;
+    }
+  }
   const kept = [];
-  for (const line of t.split('\n')) {
-    const s = line.trim();
+  for (let i = 0; i < lines.length; i++) {
+    if (drop[i]) continue;
+    const s = lines[i].trim();
     if (!s) { kept.push(''); continue; }
-    if (s.startsWith('|')) continue;                 // markdown table row (leading pipe)
-    if (/^\|?\s*:?-{3,}:?(\s*\|\s*:?-{3,}:?)+\s*\|?$/.test(s)) continue; // table divider
-    if (s.startsWith('>')) continue;                 // blockquote
-    kept.push(line);
+    if (s.startsWith('|')) continue;                  // piped table row (outer pipe)
+    if (s.startsWith('>')) continue;                  // blockquote
+    kept.push(lines[i]);
   }
   t = kept.join('\n');
-  // 3. Remove bare URLs.
+  // 4. Remove any remaining bare (absolute) URLs — autolinks, inline references.
   t = t.replace(URL, ' ');
   return t;
 }

@@ -30,6 +30,29 @@ export function clear(node) {
   return node;
 }
 
+/* ---------------------------------------------------------- idempotent writes
+ * A ~2.6s poll that re-writes an unchanged textContent / hidden / attribute still
+ * fires a MutationObserver record (and, where a rebuilt row carries an entrance
+ * animation, a visible flicker). These write ONLY when the value actually moved,
+ * so a poll over unchanged data touches nothing (FEAT-153 r4 anti-flicker). */
+export function setText(node, text) {
+  const t = String(text);
+  if (node && node.textContent !== t) node.textContent = t;
+}
+export function setHidden(node, hidden) {
+  const h = !!hidden;
+  if (node && node.hidden !== h) node.hidden = h;
+}
+export function setAttr(node, name, value) {
+  if (!node) return;
+  if (value === null || value === undefined || value === false) {
+    if (node.hasAttribute(name)) node.removeAttribute(name);
+    return;
+  }
+  const v = value === true ? '' : String(value);
+  if (node.getAttribute(name) !== v) node.setAttribute(name, v);
+}
+
 /** Inline SVG from a literal path string. Safe: never fed user text. */
 export function svg(paths, size = 12, extra = '') {
   const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');

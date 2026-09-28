@@ -280,8 +280,10 @@ async function main() {
     chips.stopped?.count === 0 && chips.stopped?.disabled && chips.stopped?.zero,
     JSON.stringify(chips.stopped));
   // A non-empty chip must target a rendered (not-hidden) section it can reach.
+  // FEAT-153 — needs/queued/running are board-grid cards now, so those three chips
+  // scroll to the grid (#railBoardGrid); only "done" keeps its own list section.
   const targetsReachable = await cdp.eval(`(() => {
-    const map = { done: '#railDone', needs: '#railNeeds', queued: '#railQueued', running: '#railInflight' };
+    const map = { done: '#railDone', needs: '#railBoardGrid', queued: '#railBoardGrid', running: '#railBoardGrid' };
     const r = {};
     for (const [label, sel] of Object.entries(map)) {
       const chip = document.querySelector('#railSummary .rs-chip[data-target="' + label + '"]');

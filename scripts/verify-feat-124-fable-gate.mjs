@@ -156,7 +156,9 @@ ok('PIN: the reroute uses permissionDecision allow, NOT deny (the lane runs)',
 ok('PIN: the Fable gate is fleet-wide, not gated behind config.orchestratorProfile alone',
   /gitBlockOn \|\| config\.orchestratorProfile \|\| fableGateOn/.test(runtimeSrc));
 ok('PIN: the Fable gate runs BEFORE the profile decide()',
-  runtimeSrc.indexOf('decideFableTier(') < runtimeSrc.indexOf('const d = decide('));
+  // FEAT-152 moved the profile decide() into evaluateOrchestratorProfileHook (defined
+  // above the class), so pin the CALLBACK's call site of it, not the helper body.
+  runtimeSrc.indexOf('decideFableTier(') < runtimeSrc.indexOf('return evaluateOrchestratorProfileHook(i, orchBypass)'));
 ok('PIN: the open hatch is announced (never a silent bypass)',
   /Fable-tier gate DISABLED via ORCHARD_ALLOW_FABLE/.test(runtimeSrc));
 ok('PIN: both a reroute and an override are logged (announceFableTier)',

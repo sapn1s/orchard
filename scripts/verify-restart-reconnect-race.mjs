@@ -40,12 +40,20 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
+import { waitRuntimeReady } from './lib/host-admission.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ENTRY = path.join(ROOT, 'src', 'server', 'index.ts');
 const RUN_TAG = `${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-race-data-'));
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-race-work-'));
+// Isolate the CLI's TRANSCRIPT store off the user's real ~/.claude/projects. Without
+// this the driven haiku session writes its <id>.jsonl into the real store AND trips the
+// assertSessionStoreIsolated runtime guard, which refuses the session — so the suite dies
+// in setup ("session never initialised"). alsoReader points Orchard's reader at the same
+// scratch store so the transcript this test inspects is read back from isolation, not home.
+const STORE = isolatedStoreEnv(path.join(DATA, 'claude-config'), { alsoReader: true });
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -91,7 +99,7 @@ function startServerService(unit, port, overrides) {
   const args = [
     '--user', `--unit=${unit}`, '--quiet', '--collect',
     `--working-directory=${ROOT}`,
-    ...setenvArgs({ PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA, ...overrides }),
+    ...setenvArgs({ PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA, ...STORE, ...overrides }),
     process.execPath, ENTRY,
   ];
   const r = spawnSync('systemd-run', args, { encoding: 'utf8', timeout: 15000 });
@@ -233,6 +241,10 @@ async function run() {
   const port = await freePort();
   startServerService(unit, port, {}); // survival on by default
   if (!(await waitHealth(port))) throw new Error('scratch service never became healthy');
+  // FEAT-151: a new direct session is refused ("runtime check pending") until the boot
+  // runtime check completes — the seed start below would race it and die in setup. Wait on
+  // the server's own readiness signal (restartPending flips false), not a fixed sleep.
+  if (!(await waitRuntimeReady(port))) throw new Error('server1 boot runtime check never completed');
   const projectId = await registerProject(port);
   const marker = path.join(WORK, 'raced-marker.txt');
   try { fs.rmSync(marker, { force: true }); } catch { /* ignore */ }
@@ -274,16 +286,21 @@ async function run() {
   // fire-and-forget re-adopt (SIGTERM the broker to start the drain).
   const port2 = await freePort();
   server2 = spawn(process.execPath, [ENTRY], {
-    cwd: ROOT, env: { ...process.env, PORT: String(port2), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA },
+    cwd: ROOT, env: { ...process.env, PORT: String(port2), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA, ...STORE },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   server2.stderr?.on('data', (d) => process.stderr.write(`  [server2!] ${d}`));
   if (process.env.RACE_DEBUG) console.log(`DEBUG t=${new Date().toISOString()} server2 spawned; claudeAlive=${pidAlive(host.claudePid)}`);
   if (!(await waitHealth(port2))) throw new Error('restarted server never became healthy');
+  // FEAT-151: the racing resume goes through startSession's admission guard too, so if the
+  // fresh server's boot runtime check is still pending it is refused with "runtime check
+  // pending" — not the reattach under test. Wait it out on the real readiness signal. The
+  // survivor drains for ~30 s, so this stays deep inside the drain window (asserted below).
+  if (!(await waitRuntimeReady(port2))) throw new Error('server2 boot runtime check never completed');
   if (process.env.RACE_DEBUG) console.log(`DEBUG t=${new Date().toISOString()} server2 healthy; claudeAlive=${pidAlive(host.claudePid)}`);
 
   // THE RACE: resume the SAME sdkSessionId the instant the fresh server is
-  // healthy — while the survivor is still draining. A second CLI must never
+  // ready — while the survivor is still draining. A second CLI must never
   // coexist. Poll /proc across the whole window and keep the worst case.
   const preSurvivorAlive = pidAlive(host.hostPid) && pidAlive(host.claudePid);
   check('RACE PRECONDITION: survivor still alive when the fresh server starts accepting connections', preSurvivorAlive,
@@ -310,8 +327,9 @@ async function run() {
   const err = await waitEv(c2.events, (e) => e.t === 'error', 500);
 
   // POST-FIX assertions (each FAILS pre-fix):
-  check('the racing resume is REFUSED (honest error, no ack) — the guard fired',
-    !ack && !!err, { ack: ack ? { reattached: ack.reattached } : null, error: err ? err.message : null });
+  // BUG-187: the fresh server now ADOPTS the surviving CLI at boot, so the racing resume re-attaches to it (still one CLI).
+  check('the racing resume RE-ATTACHES to the adopted survivor (ack reattached:true) — no second spawn',
+    ack?.reattached === true, { ack: ack ? { reattached: ack.reattached } : null, error: err ? err.message : null });
   check('NO second `claude --resume=<sdkSessionId>` ever coexisted with the survivor',
     maxSecondCli === 0, { maxSecondResumeClaudePidsSeen: maxSecondCli, whileSurvivorAlive: sawWhileSurvivorAlive });
 
@@ -333,7 +351,7 @@ async function run() {
 
   // Give the broker a moment to finish + be reaped, then inspect the transcript.
   for (let i = 0; i < 30 && pidAlive(host.hostPid); i++) await sleep(1000);
-  const store = path.join(os.homedir(), '.claude', 'projects', WORK.replace(/[^a-zA-Z0-9]/g, '-'));
+  const store = path.join(STORE.CLAUDE_PROJECTS_DIR, WORK.replace(/[^a-zA-Z0-9]/g, '-'));
   const transcript = path.join(store, `${sdkSessionId}.jsonl`);
   let lines = [];
   try { lines = fs.readFileSync(transcript, 'utf8').split('\n').filter((l) => l.trim()); } catch { /* absent */ }
@@ -370,8 +388,9 @@ main().catch((err) => {
   stopByPid(server2);
   for (const unit of [...services]) stopService(unit);
   for (const h of readHosts()) { if (h?.hostPid && pidAlive(h.hostPid)) { try { process.kill(h.hostPid, 'SIGKILL'); } catch { /* gone */ } } }
-  const store = path.join(os.homedir(), '.claude', 'projects', WORK.replace(/[^a-zA-Z0-9]/g, '-'));
   await sleep(500);
-  for (const d of [DATA, WORK, store]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
+  // STORE lives under DATA (isolatedStoreEnv scratch config dir), so removing DATA + WORK
+  // takes the isolated transcript store with it — nothing lands in the user's real store.
+  for (const d of [DATA, WORK]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
   setTimeout(() => process.exit(process.exitCode ?? 0), 500).unref();
 });

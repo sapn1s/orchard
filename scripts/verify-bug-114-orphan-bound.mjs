@@ -46,9 +46,13 @@
  * NOT drain — proving the suite catches the regression. (Set BUG114_SKIP_MUSTFAIL=1
  * to skip that demo.)
  *
- * SAFETY: free ephemeral ports only; CLAUDE_STATION_DATA + CLAUDE_PROJECTS_DIR
- * pointed at our own scratch dirs via isolatedServerEnv() (which REFUSES to build
- * an unisolated env); scratch under scratchRoot() not /tmp; every broker/scope/
+ * SAFETY: free ephemeral ports only; CLAUDE_STATION_DATA + CLAUDE_CONFIG_DIR (the
+ * CLI's whole ~/.claude, incl. its transcript writes) + CLAUDE_PROJECTS_DIR (the
+ * reader) pointed at our own scratch dirs via isolatedServerEnv() +
+ * isolatedStoreEnv() — the latter is what satisfies assertSessionStoreIsolated so
+ * the driven haiku session is not refused (setting CLAUDE_PROJECTS_DIR alone is
+ * NOT isolation and the runtime guard rejects it); scratch under scratchRoot() not
+ * /tmp; every broker/scope/
  * server we start is recorded and reaped by pid/key in `finally`, and the reap is
  * verified. Never touches :4317, the service, or a scope we did not create.
  */
@@ -56,7 +60,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import WebSocket from 'ws';
-import { isolatedServerEnv } from './lib/station-boot.mjs';
+import { isolatedServerEnv, isolatedStoreEnv } from './lib/station-boot.mjs';
+import { waitRuntimeReady } from './lib/host-admission.mjs';
 import { mkdtempScratch, scratchRoot } from './lib/scratch.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -175,15 +180,29 @@ async function waitHealth(port, ms = 30000) {
 }
 
 async function bootServer({ dataDir, projectsDir, port, extraEnv }) {
+  // Isolate the CLI's TRANSCRIPT store off the user's real ~/.claude/projects.
+  // CLAUDE_PROJECTS_DIR alone only steers Orchard's reader, not the CLI writer, so
+  // assertSessionStoreIsolated REFUSES the driven session and no host key ever
+  // appears (setup death). CLAUDE_CONFIG_DIR redirects the whole ~/.claude — the
+  // writer — which is what satisfies the guard; alsoReader keeps read+write on the
+  // one scratch store (`projectsDir/projects`).
+  const store = isolatedStoreEnv(projectsDir, { alsoReader: true });
   const env = isolatedServerEnv({
     PORT: String(port), HOST: '127.0.0.1',
-    CLAUDE_STATION_DATA: dataDir, CLAUDE_PROJECTS_DIR: projectsDir,
+    CLAUDE_STATION_DATA: dataDir,
+    ...store,
     ...extraEnv,
   }, { requireStore: true });
   const child = spawn(process.execPath, [ENTRY], { cwd: ROOT, env, stdio: ['ignore', 'ignore', 'pipe'] });
   servers.add(child);
   child.stderr?.on('data', (d) => { const s = String(d); if (/error|adopt|orphan/i.test(s)) process.stderr.write(`  [srv:${port}] ${s}`); });
   if (!(await waitHealth(port))) throw new Error(`scratch server on ${port} never became healthy`);
+  // FEAT-151: a fresh server answers /api/health BEFORE its one-time boot runtime
+  // check completes, and until it does every new direct host session is refused
+  // fail-closed ("runtime check pending — …", code runtime-check-pending). The
+  // seed start below would race it and die in setup with "no survival host key
+  // appeared". Wait on the server's OWN readiness signal, not a fixed sleep.
+  if (!(await waitRuntimeReady(port))) throw new Error(`scratch server on ${port} never completed its boot runtime check`);
   return child;
 }
 function killServer(child) {
@@ -515,6 +534,9 @@ async function runMustFailDemo() {
   const patchedHost = path.join(dir, 'session-host.mjs');
   // Copy the sibling it imports so the relative import resolves.
   fs.copyFileSync(path.join(ROOT, 'src', 'server', 'path-env.mjs'), path.join(dir, 'path-env.mjs'));
+  // BUG-187: the broker imports its shared request floor too (absent on older trees).
+  const floorSrc = path.join(ROOT, 'src', 'server', 'request-floor.mjs');
+  if (fs.existsSync(floorSrc)) fs.copyFileSync(floorSrc, path.join(dir, 'request-floor.mjs'));
   fs.writeFileSync(patchedHost, patched);
   const fakeCli = makeFakeCli(dir);
   const env = { ...graceEnv({ abandonMs: 1200, graceMs: 2000 }), CLAUDE_STATION_HOST_DRAIN_RECHECK_MS: '700' };

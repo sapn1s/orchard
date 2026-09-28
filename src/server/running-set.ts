@@ -77,7 +77,13 @@ export interface RunningEntry {
    * never recorded as a death. Optional on the wire: an older server simply
    * sends rows without it, and clients must treat absence as `running`.
    */
-  state?: 'running' | 'stalled';
+  state?: 'running' | 'stalled' | 'blocked' | 'stopped';
+  /**
+   * BUG-187 — present iff `state` is `blocked` or `stopped`: the broker's own
+   * words for why this lane is not running (nobody attached to answer its tool
+   * calls). A client must never render such a row as running.
+   */
+  stateDetail?: string;
   /** Present iff `state === 'stalled'` — the ⚠'s quotable evidence. */
   stall?: StallEvidence;
   /*
@@ -345,8 +351,13 @@ export function snapshotOfSurvivor(
          * lanes). Claiming a stall from an absence we cannot observe would be
          * exactly the fabrication BUG-041 forbids; the lane is reported as what
          * the CLI's own level frame still declares — running.
+         *
+         * BUG-187 L1 — unless its BROKER declares otherwise: a lane whose tool
+         * calls are refused (nobody attached) is `blocked`, and one the broker
+         * stopped is `stopped`. That is the broker's own record, not a guess.
          */
-        state: 'running',
+        state: lane.state,
+        ...(lane.state !== 'running' && lane.stateDetail ? { stateDetail: lane.stateDetail } : {}),
       });
     }
   }

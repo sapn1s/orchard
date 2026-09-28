@@ -17,6 +17,34 @@
   ],
   "manifestVersion": 1,
   "tools": {
+    "claude-code": {
+      "package": "@anthropic-ai/claude-code",
+      "version": "2.1.281",
+      "entrypoint": "claude",
+      "installer": "npm-global",
+      "appliesTo": ["container"],
+      "index": "https://registry.npmjs.org",
+      "source": "https://github.com/anthropics/claude-code",
+      "publisher": "Anthropic",
+      "license": "SEE LICENSE IN README",
+      "_readme": [
+        "FEAT-151 — the Claude CLI baked into every per-project CONTAINER image.",
+        "Container sessions run THIS CLI (docker exec claude), not the host's and",
+        "not the SDK-bundled one — see src/server/container/Dockerfile and",
+        "CONTAINER_CLAUDE_BIN in container-manager.ts.",
+        "",
+        "appliesTo:['container'] keeps it OUT of host provisioning: host (direct)",
+        "sessions run the CLI bundled inside @anthropic-ai/claude-agent-sdk, updated",
+        "via the Runtime settings pane (runtime-update.ts), never this pin.",
+        "",
+        "THE TARGET: this version must track the CLI the host SDK bundles, because a",
+        "container session still runs the host SDK JS across the docker boundary and",
+        "the two ship version-locked (finding #7). The Runtime pane's 'update",
+        "container CLI' writes the host SDK's bundled --version here, which changes",
+        "provisionHash() → a new image tag → the drift check rebuilds. A bump never",
+        "force-restarts a running container: new containers pick up the new image."
+      ]
+    },
     "serena": {
       "package": "serena-agent",
       "version": "1.7.0",

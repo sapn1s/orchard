@@ -465,17 +465,27 @@ console.log(JSON.stringify({ targets, snaps, full }));
       const state = { usage: null, overrides: {} };
       const lab = { textContent: '' };
       const classes = new Set();
+      const attrs = {};
       const btn = {
         title: '', hidden: true,
         classList: { add: (c) => classes.add(c), remove: (...cs) => cs.forEach((c) => classes.delete(c)), has: (c) => classes.has(c) },
+        setAttribute: (k, v) => { attrs[k] = v; }, getAttribute: (k) => (k in attrs ? attrs[k] : null),
       };
-      const node = { usageBtn: btn, usageN: lab };
+      // FEAT-139 r3 — the badge FACE is now a filled ring (no % text); the
+      // window/percent the badge selects survives in the aria-label + tooltip.
+      // The stub ring just captures the innerHTML paintUsageRing writes.
+      const ring = { innerHTML: '' };
+      const node = { usageBtn: btn, usageN: lab, usageRing: ring };
       let project = { id: 'p', settings: {} };
       // Real source, stub environment. The functions are NEVER re-implemented here.
       const build = new Function('state', 'node', 'currentProject', 'providerView',
         `${region}\nreturn { usageTitle, paintUsageChip, claudeAccountView, usageSnapName };`);
       const api = build(state, node, () => project, () => 'anthropic');
-      return { state, btn, lab, classes, api, setProject: (p) => { project = p; } };
+      // FEAT-139 r3 — the selected window/percent moved from lab.textContent to
+      // the aria-label; `badge()` reads whichever the current surface uses so the
+      // account-selection invariants below stay expressed against the real face.
+      const badge = () => btn.getAttribute('aria-label') ?? '';
+      return { state, btn, lab, classes, api, badge, ring, setProject: (p) => { project = p; } };
     };
 
     // The pre-145 selection logic, synthesized here as a FIXED baseline.
@@ -508,13 +518,13 @@ console.log(JSON.stringify({ targets, snaps, full }));
       const single = [snap('default', 'Default (~/.claude)', 11, RESETS.A), openai];
       ui.state.usage = single;
       ui.api.paintUsageChip();
-      const newLabel = ui.lab.textContent;
+      const newLabel = ui.badge();
       const newTitle = ui.btn.title;
       // The pre-145 badge label, recomputed from the pre-145 snapshot selection.
       const pre = preBadgeSnap(single, 'anthropic');
       const isSame = pre === single[0];
       check('[D1] single account: the badge selects the SAME snapshot the pre-145 code did', isSame, `selected accountId=${single[0].accountId}`);
-      check('[D1] single account: badge text is the account\'s binding window', newLabel.startsWith('11% 5h'), `"${newLabel}"`);
+      check('[D1] single account: badge reflects the account\'s binding window (11% / 5h)', /11%/.test(newLabel) && /5h/.test(newLabel), `"${newLabel}"`);
       const expectTitle = preTitle(single, (a) => new Date(a).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), (s) => new Date(s * 1000).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
       check('[D1] single account: the tooltip is BYTE-IDENTICAL to the pre-145 tooltip', newTitle === expectTitle, `sha new=${sha(newTitle)} pre=${sha(expectTitle)}`);
       check('[D1] single account: the account label never appears — the line is plain "Claude"', newTitle.split('\n')[0] === 'Claude (max) — as of ' + new Date(ASOF).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), newTitle.split('\n')[0]);
@@ -528,7 +538,7 @@ console.log(JSON.stringify({ targets, snaps, full }));
       ui.setProject({ id: 'p', settings: { claudeAccount: ID_B } });
       check('[D2] claudeAccountView() reads the project\'s pinned account', ui.api.claudeAccountView() === ID_B, ui.api.claudeAccountView());
       ui.api.paintUsageChip();
-      check('[D2] the badge shows the window of the account THIS session will run on', ui.lab.textContent.startsWith('77% 5h'), `"${ui.lab.textContent}"`);
+      check('[D2] the badge shows the window of the account THIS session will run on', /77%/.test(ui.badge()) && /5h/.test(ui.badge()), `"${ui.badge()}"`);
       check('[D2] and is coloured by THAT account\'s pressure, not the default\'s', ui.classes.has('warn') && !ui.classes.has('danger'), [...ui.classes].join(',') || '(none)');
       // MUST-FAIL twin: the pre-145 selection would show the wrong account here.
       const preSel = preBadgeSnap(two, 'anthropic');
@@ -545,7 +555,7 @@ console.log(JSON.stringify({ targets, snaps, full }));
       ui.state.usage = two;
       ui.setProject({ id: 'p', settings: { claudeAccount: ID_B } });
       ui.api.paintUsageChip();
-      check('[D3] a pinned-but-unreadable account shows "usage —" (unknown), never another account\'s number', ui.lab.textContent === 'usage —' && ui.classes.has('unknown'), `"${ui.lab.textContent}" classes=${[...ui.classes].join(',')}`);
+      check('[D3] a pinned-but-unreadable account shows the UNKNOWN ring (no fill, unknown class), never another account\'s number', ui.classes.has('unknown') && !/class="fill"/.test(ui.ring.innerHTML) && !/11%/.test(ui.badge()), `aria="${ui.badge()}" ringHasFill=${/class="fill"/.test(ui.ring.innerHTML)} classes=${[...ui.classes].join(',')}`);
       check('[D3] and the tooltip says WHY, naming the account', /Claude \(work\) — not available \(Claude sign-in expired/.test(ui.btn.title), ui.btn.title.split('\n').find((l) => l.includes('work')));
     }
 
@@ -555,7 +565,7 @@ console.log(JSON.stringify({ targets, snaps, full }));
       ui.state.usage = [snap('default', 'Default (~/.claude)', 11, RESETS.A), openai];
       ui.setProject({ id: 'p', settings: { claudeAccount: 'ffffffffffffffffffffffff' } });
       ui.api.paintUsageChip();
-      check('[D4] an account with no snapshot yet falls back to the default account, not to blank', ui.lab.textContent.startsWith('11% 5h'), `"${ui.lab.textContent}"`);
+      check('[D4] an account with no snapshot yet falls back to the default account, not to blank', /11%/.test(ui.badge()) && /5h/.test(ui.badge()), `"${ui.badge()}"`);
     }
   }
 

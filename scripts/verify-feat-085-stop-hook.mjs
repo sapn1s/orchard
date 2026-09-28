@@ -54,8 +54,52 @@ function transcript(name, text, { extraTail = [] } = {}) {
  * payload always carries one). The launcher gate is BUG-118's own suite.
  */
 const SUITE_SESSION_ID = '0b118000-0000-4000-8000-000000000118';
-const ownPayload = (o) => (o && typeof o === 'object' && typeof o.session_id !== 'string')
-  ? { ...o, session_id: SUITE_SESSION_ID } : o;
+
+/* BUG-192 — a real Stop payload carries `last_assistant_message` = THIS turn's
+ * final text, which the hook now grades (race-immune) and which the block path
+ * requires (a transcript-only fallback can never block, under any env). Mirror
+ * Claude Code: derive it from the transcript's own final logical message (same
+ * reconstruction lastAssistantText does — last main-thread assistant message,
+ * same-id text blocks concatenated), so the grader is exercised on the block-safe
+ * path exactly as in production. Fixtures with no readable final text (missing
+ * file, tool-only turn) leave it unset and exercise the fail-open fallback. */
+function finalAssistantText(transcriptPath) {
+  let raw;
+  try { raw = fs.readFileSync(transcriptPath, 'utf8'); } catch { return ''; }
+  const lines = raw.split('\n');
+  const isMain = (ev) => ev && ev.type === 'assistant' && ev.isSidechain !== true && Array.isArray(ev?.message?.content);
+  const textOf = (content) => content.filter((c) => c && c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('');
+  let lastIdx = -1, lastEv = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].trim()) continue;
+    let ev; try { ev = JSON.parse(lines[i]); } catch { continue; }
+    if (!isMain(ev)) continue;
+    lastIdx = i; lastEv = ev; break;
+  }
+  if (lastIdx === -1) return '';
+  const id = lastEv?.message?.id;
+  const parts = [textOf(lastEv.message.content)];
+  if (typeof id === 'string' && id !== '') {
+    for (let i = lastIdx - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let ev; try { ev = JSON.parse(lines[i]); } catch { continue; }
+      if (!isMain(ev) || ev?.message?.id !== id) break;
+      parts.push(textOf(ev.message.content));
+    }
+    parts.reverse();
+  }
+  return parts.join('');
+}
+
+function ownPayload(o) {
+  if (!o || typeof o !== 'object') return o;
+  const p = typeof o.session_id !== 'string' ? { ...o, session_id: SUITE_SESSION_ID } : { ...o };
+  if (p.last_assistant_message === undefined && typeof p.transcript_path === 'string') {
+    const t = finalAssistantText(p.transcript_path);
+    if (t) p.last_assistant_message = t;
+  }
+  return p;
+}
 const ownMarker = (o) => (o && typeof o?.session_id === 'string') ? o.session_id : SUITE_SESSION_ID;
 /** Same, for suites that feed RAW stdin (including deliberate garbage). */
 function ownRaw(input) {

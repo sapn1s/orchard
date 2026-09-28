@@ -108,6 +108,10 @@ export interface GitStatus {
   branch: string | null;      // null = detached (see `detachedAt`)
   detachedAt: string | null;
   dirty: number;              // changed + untracked paths
+  /** Paths in an unmerged/conflicted state (porcelain XY of U?/?U/AA/DD). A
+   *  subset of `dirty`; >0 means the working tree is mid-conflict — the one
+   *  git state the header dot must call out distinctly, not as ordinary dirt. */
+  conflicted: number;
   /** Changed text-line totals vs HEAD. A final unterminated line counts as one;
    *  binary files contribute no text lines. null means HEAD is absent or Git
    *  could not compute the tracked totals. */
@@ -281,7 +285,7 @@ export async function diff(hostPath: string, requested: unknown): Promise<{ path
 }
 
 export async function statusOf(hostPath: string): Promise<GitStatus> {
-  const none: GitStatus = { repo: false, toplevel: null, branch: null, detachedAt: null, dirty: 0, added: null, removed: null, untrackedLinesIncluded: false, ahead: null, behind: null, upstream: null, remoteUrl: null, lastCommit: null };
+  const none: GitStatus = { repo: false, toplevel: null, branch: null, detachedAt: null, dirty: 0, conflicted: 0, added: null, removed: null, untrackedLinesIncluded: false, ahead: null, behind: null, upstream: null, remoteUrl: null, lastCommit: null };
   if (!fs.existsSync(hostPath)) return none;
   const top = await git(hostPath, ['rev-parse', '--show-toplevel']);
   if (top.code !== 0) return none;
@@ -297,7 +301,12 @@ export async function statusOf(hostPath: string): Promise<GitStatus> {
     const fields = st.out.split('\0');
     for (let i = 0; i < fields.length && fields[i]; i++) {
       s.dirty++;
-      if (fields[i][0] === 'R' || fields[i][0] === 'C' || fields[i][1] === 'R' || fields[i][1] === 'C') i++;
+      const x = fields[i][0], y = fields[i][1];
+      // Unmerged (conflict) porcelain codes: DD, AU, UD, UA, DU, AA, UU — i.e.
+      // either side is 'U', or both-added / both-deleted. A conflicted path is
+      // also counted in `dirty`; `conflicted` just isolates the merge state.
+      if (x === 'U' || y === 'U' || (x === 'A' && y === 'A') || (x === 'D' && y === 'D')) s.conflicted++;
+      if (x === 'R' || x === 'C' || y === 'R' || y === 'C') i++;
     }
   }
   const ns = await git(hostPath, ['diff', '--numstat', 'HEAD', '--']);

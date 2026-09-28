@@ -376,6 +376,29 @@ export const wsUrl = () => `ws://${location.host}/ws`;
 /** FEAT-116: per-provider rate-limit window usage snapshots. null = route absent. */
 export const usage = () => optional('/api/usage').then((r) => r?.providers ?? null);
 
+/* --------------------------------------------------------------- runtime */
+/*
+ * FEAT-151 — the Claude runtime versions Orchard uses (host SDK-bundled CLI +
+ * container baked CLI) and the on-demand host update. `null` (via optional)
+ * means the route is absent on this server, so the Runtime pane hides rather
+ * than inventing a status.
+ */
+export const runtimeVersion = () => optional('/api/runtime/version');
+
+/** Update the HOST SDK (installs & pins; requires an Orchard restart to apply). */
+export const runtimeUpdate = (target = 'host', version) =>
+  api('/api/runtime/update', {
+    method: 'POST',
+    body: JSON.stringify(version ? { target, version } : { target }),
+  });
+
+/** Write the container CLI pin (default: the host SDK's bundled CLI version). */
+export const runtimeContainerPin = (version) =>
+  api('/api/runtime/container-pin', {
+    method: 'POST',
+    body: JSON.stringify(version ? { version } : {}),
+  });
+
 /** FEAT-040/BUG-027 ground truth (survival scoping, broker state, adopted
  * survivors) — see src/server/index.ts's health route. null = route absent
  * or unreachable; callers must treat null as "unknown", never as "false". */
@@ -673,6 +696,14 @@ export async function liveSessions() {
           detached: x?.detached === true,
           // BUG-033 — see liveBridges() below: the real turn start, or null.
           turnStartedAt: Number.isFinite(x?.turnStartedAt) ? x.turnStartedAt : null,
+          // FEAT-154 (round 3): carry the liveness authority's OWN running verdict
+          // (src/server/liveness.ts, published inline as `liveness`), so the
+          // sidebar reads whether a TURN is in flight rather than treating mere
+          // presence in this list as "running" (ARCH-010: read the owner, don't
+          // re-derive). `null` = the entry is here only on transcript mtime with
+          // no bridge liveness block — which itself IS active writing, so the
+          // sidebar treats null as running.
+          running: typeof x?.liveness?.running === 'boolean' ? x.liveness.running : null,
         }))
     .filter((x) => typeof x.sessionId === 'string' && x.sessionId);
 }
@@ -697,6 +728,14 @@ export async function liveBridges() {
       // BUG-033: the honest start of the in-flight turn (epoch ms), or null on
       // an older server / when no turn is running. Never defaulted to "now".
       turnStartedAt: Number.isFinite(x?.turnStartedAt) ? x.turnStartedAt : null,
+      // FEAT-154 (round 4): the server publishes per-bridge `awaitingUser` — true
+      // while a can_use_tool / AskUserQuestion / ExitPlanMode request is
+      // outstanding (BUG-166's owner, src/server/index.ts). `refreshLive` builds
+      // `state.awaitingIds` from THIS field, so it MUST survive the mapping;
+      // dropping it (the round-2 miss) left the amber "waiting on you" marker
+      // permanently inert in the real app — no row ever showed it (ARCH-010: read
+      // the owner's field, never silently discard it).
+      awaitingUser: x?.awaitingUser === true,
     }))
     .filter((x) => typeof x.sdkSessionId === 'string' && x.sdkSessionId);
 }

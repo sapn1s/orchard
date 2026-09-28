@@ -35,12 +35,19 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { Window } from 'happy-dom';
 import WebSocket from 'ws';
+import { startWhenAdmitted } from './lib/host-admission.mjs';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ENTRY = path.join(ROOT, 'src', 'server', 'index.ts');
 const HOST_SCRIPT = path.join(ROOT, 'src', 'server', 'session-host.mjs');
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-f64-work-'));
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-f64-data-'));
+// The seed turn runs a REAL claude CLI, and the server now refuses a session whose
+// transcript would land in the user's real store (assertSessionStoreIsolated, the
+// fixture-pollutes-reality guard). Writer AND reader point at a scratch store under
+// DATA, so the UI lists exactly this suite's seed session and cleanup removes it.
+const STORE = isolatedStoreEnv(path.join(DATA, 'claude-config'), { alsoReader: true });
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -252,7 +259,7 @@ function spawnServer(port) {
   const s = spawn(process.execPath, [ENTRY], {
     cwd: ROOT,
     env: {
-      ...process.env, PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA,
+      ...process.env, ...STORE, PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA,
       CLAUDE_STATION_SURVIVE: '0', // the ONLY broker in hostsDir must be ours
       // FEAT-065: with stdin delivery enabled, this suite's held survivor (bg
       // live, foreground idle) would be DELIVERED INTO instead of refused —
@@ -311,10 +318,9 @@ async function sectionRefusalSurface() {
   });
 
   // One REAL seed turn so an on-disk session exists for the resume+UI to target.
-  const c0 = await openWs(port1);
-  c0.send({ type: 'start', projectId, prompt: 'Reply with exactly: SEED-OK' });
-  const init = await waitEv(c0.events, (e) => e.t === 'session-init', 90_000);
-  if (!init?.sessionId) throw new Error('seed turn never started');
+  // FEAT-151: retry only the boot-runtime-check refusal (scripts/lib/host-admission.mjs).
+  const { c: c0, init } = await startWhenAdmitted(openWs, port1, { type: 'start', projectId, prompt: 'Reply with exactly: SEED-OK' });
+  if (!init?.sessionId) throw new Error(`seed turn never started: ${JSON.stringify(c0?.events.slice(-4))}`);
   const sdkSessionId = init.sessionId;
   await waitEv(c0.events, (e) => e.t === 'turn-end', 90_000);
   c0.send({ type: 'close' });
@@ -428,13 +434,20 @@ async function sectionRefusalSurface() {
     let matched = false;
     while (Date.now() - t1 < 15_000) {
       chip = q('#queueBox .q-l')?.textContent ?? '';
-      if (/waiting on drain — held \S+ by 1 background agent/.test(chip)) { matched = true; break; }
+      // BUG-134 (commit e9efb92) replaced the chip FEAT-064 first shipped: the broker's
+      // drainHeldSince + background count/ids were the broker's lifetime, not the user's
+      // wait. The contract is now the ROW's own age and the condition that ends it.
+      if (/waiting on drain — .*queued \S+ ago/.test(chip)) { matched = true; break; }
       await sleep(400);
     }
-    check('S3c (fails pre-fix): the BUG-045 chip says WHAT holds the drain — "waiting on drain — held Ns by N background agent(s)"',
+    // BUG-134 (e9efb92): the assertions below replace "held Ns by N background agent(s)"
+    // and "retries itself" — the chip now reports the user's own wait, not the broker's.
+    check('S3c: the drain-held chip reports the USER\'s wait — "waiting on drain — … queued Ns ago" (BUG-134)',
       matched, { chip: chip || '(no chip rendered)' });
-    check('S3c: the chip still says the retry is automatic ("retries itself")',
-      /retries itself/.test(chip), { chip: chip || '(no chip rendered)' });
+    check('S3c: the chip still says the retry is automatic ("retries every few seconds")',
+      /retries every few seconds/.test(chip), { chip: chip || '(no chip rendered)' });
+    check('S3c: the chip does NOT attribute the wait to background agents or name their ids (BUG-134)',
+      matched && !/background agent|bg-feat064-live|held \S+ by/.test(chip), { chip: chip || '(no chip rendered)' });
     try {
       const st2 = win.__station?.state;
       if (st2?.drainWaitTimer) { clearInterval(st2.drainWaitTimer); st2.drainWaitTimer = null; }

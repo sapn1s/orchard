@@ -354,7 +354,23 @@ export type StationEvent =
       needsFork?: { resumeSessionId: string; resumeEncodedDir: string; cause: 'isolation-changed' | 'cross-os' | 'path-changed' };
       drain?: { backgroundLive: number; backgroundTaskIds: string[];
         backgroundLifetime: 'yes' | 'unknown' | 'no' | null;
-        drainHeldSince: string | null; heldForMs: number | null; brokerState: string };
+        drainHeldSince: string | null; heldForMs: number | null; brokerState: string;
+        /** BUG-191: set when the refusal came from an adopt-gated session (BUG-187 B2) — which state, and why. */
+        adoptState?: string; why?: string };
+      /**
+       * BUG-191 — which client command this refusal answers. `'send'` means a
+       * `send` over an attached socket was NOT delivered; `sendId` echoes the
+       * client's id for that attempt so the tab recovers exactly its rows.
+       */
+      of?: 'send';
+      sendId?: string;
+      /**
+       * BUG-191 — the delivery went out but its acceptance was never confirmed
+       * (a broker that did not answer in time). The message may or may not
+       * have arrived: the client judges it against the transcript and never
+       * resends it automatically. Never set together with `retryable`.
+       */
+      uncertain?: boolean;
       /**
        * BUG-149 — a machine-readable name for a refusal whose `fatal` flag does
        * NOT mean "this session is dead". `message` stays the readable fallback.
@@ -370,8 +386,13 @@ export type StationEvent =
        * found no surviving bridge to re-take. Not a dead end for any typed text
        * — the reattach carried none — so the client rolls the socket back quietly
        * and leaves the restored queue for the "To composer" affordance.
+       *
+       * 'runtime-check-pending' (BUG-190 round 3): a NEW host session was refused
+       * only because the boot runtime check (or a re-hash) is still running; it
+       * clears on its own, so retrying is correct. Never set for a block that
+       * needs a restart.
        */
-      code?: 'live-elsewhere' | 'nothing-to-reattach' }
+      code?: 'live-elsewhere' | 'nothing-to-reattach' | 'runtime-check-pending' }
   /**
    * A `send` carried `targetAgentId`, and the Agent SDK has no channel for it.
    *
@@ -443,7 +464,15 @@ export type StationEvent =
       accountRemoved?: boolean;
     }
   /** Bridge lifecycle, not an SDK message. */
-  | { t: 'session-closed'; reason: string };
+  | { t: 'session-closed'; reason: string }
+  /**
+   * BUG-187 B6 — the server's AUTHORITATIVE list of pending approval/question/
+   * plan request ids for this session. `complete:false` while an adopted
+   * session is still recovering (the engine may yet redeliver a prompt), so a
+   * client must expire nothing on it; `complete:true` = any card whose id is
+   * absent no longer exists and settles as expired.
+   */
+  | { t: 'approvals-snapshot'; requestIds: string[]; complete: boolean };
 
 /**
  * The login relay's server→client events, projected out of `StationEvent` so the
@@ -488,6 +517,12 @@ export type ClientCommand =
        * main thread, which would be worse than refusing.
        */
       targetAgentId?: string;
+      /**
+       * BUG-191 — the client's id for THIS attempt, echoed on the ack and on a
+       * refusal, so the tab recovers exactly the rows of the attempt that was
+       * refused (never a neighbour's). Optional: an older client omits it.
+       */
+      sendId?: string;
     }
   | { type: 'interrupt' }
   | { type: 'approval-response'; requestId: string; allow: boolean; message?: string }

@@ -132,7 +132,47 @@ function ackAndExit(s, f) {
   setTimeout(() => finish(code), 2000).unref?.();
 }
 function unavailable(reason, action = 'enable settings.tools.openaiDispatch for this project and launch a new session') { process.stdout.write(`openai dispatch: unavailable\nroute: none\nreason: ${reason}\naction: ${action}\n`); process.exit(1); }
+
+/*
+ * BUG-189 — direct-checkout `--check` must report a broken codex sandbox, not
+ * "available". The openai dispatch path runs codex with a bwrap sandbox that a
+ * codex 0.157.x btrfs regression makes fail to launch; a `--check` that ignores
+ * that hands the orchestrator a green light and the real dispatch then burns
+ * tokens before failing. Run the SAME zero-token probe the dispatcher runs.
+ * Dynamic import + guarded by the checkoutScript-exists branch, so the
+ * broker-only deployed copy (no checkout on disk) never loads it.
+ */
+async function directCheck() {
+  const cmd = `node ${fileURLToPath(import.meta.url)}`;
+  // BUG-189 round 3, finding 3 — probe BOTH sandbox modes the dispatch path can
+  // use (read-only default AND workspace-write opt-in). The btrfs bug breaks both
+  // identically, but a mode-specific failure must not hide behind a healthy
+  // read-only probe. First failure is reported; both are shown when healthy.
+  let results;
+  try {
+    const helper = path.resolve(here, '..', '..', 'scripts', 'lib', 'codex-sandbox-preflight.mjs');
+    const { preflightCodexSandbox } = await import(helper);
+    results = [];
+    for (const sandbox of ['read-only', 'workspace-write']) {
+      results.push(await preflightCodexSandbox({ sandbox }));
+    }
+  } catch (e) {
+    unavailable(`codex sandbox preflight could not run: ${e.message}`, 'see docs/bugs/BUG-189-*.md');
+    return;
+  }
+  const bad = results.find((r) => !r.ok);
+  if (bad) {
+    unavailable(
+      `codex sandbox cannot launch for --sandbox ${bad.mode} (${bad.version}): ${bad.errorLine}`,
+      'pin a fixed codex (>=0.158.0-alpha; do NOT `codex update` to the broken 0.157.1) — see docs/bugs/BUG-189-*.md',
+    );
+    return;
+  }
+  const ver = results[0].version;
+  process.stdout.write(`openai dispatch: available\nroute: direct host checkout\nproviders: openai\nmodels: provider default or --model\nsandbox: ok (${ver}, ${results.map((r) => r.mode).join(' + ')})\ncommand: ${cmd}\n`);
+  process.exit(0);
+}
 function socketRequest(req, check) { const s = net.createConnection(socketPath); let buf = ''; let terminal = false; s.setEncoding('utf8'); s.on('connect', () => s.write(`${JSON.stringify(req)}\n`)); s.on('data', (chunk) => { buf += chunk; for (;;) { const n = buf.indexOf('\n'); if (n < 0) break; const line = buf.slice(0,n); buf = buf.slice(n+1); let f; try { f=JSON.parse(line); } catch { continue; } if (check) { process.stdout.write(`openai dispatch: ${f.ok && f.entitled ? 'available' : 'unavailable'}\nroute: host broker unix socket ${socketPath}\nproviders: ${(f.providers||[]).join(',') || 'none'}\nmodels: ${JSON.stringify(f.models||{})}\ncommand: ${f.dispatchCmd || process.env.ORCHARD_DISPATCH_CMD || 'node /opt/orchard-dispatch/dispatch-client.mjs'}\n`); terminal=true; s.end(); process.exit(f.ok && f.entitled ? 0 : 1); } if (f.op === 'progress') process.stderr.write(f.text); if (f.op === 'result') { terminal=true; ackAndExit(s, f); return; } } }); s.on('error', (e) => check ? unavailable(`broker socket cannot be reached: ${e.message}`) : (process.stderr.write(`dispatch failed [transport] ${e.message}\n`), process.exit(1))); s.on('close', () => { if (!terminal) { process.stderr.write('dispatch failed [transport] broker closed without a terminal frame\n'); process.exit(1); } }); }
 
-if (opts.check) { if (process.env.ORCHARD_DISPATCH_ENTITLED === '0') unavailable('this session was launched with settings.tools.openaiDispatch disabled'); else if (process.env.ORCHARD_DISPATCH_UNAVAILABLE_REASON) unavailable(process.env.ORCHARD_DISPATCH_UNAVAILABLE_REASON, 'fix the reported host broker failure and launch a new session'); else if (socketPath) socketRequest({ op:'capabilities' }, true); else if (fs.existsSync(checkoutScript)) { process.stdout.write(`openai dispatch: available\nroute: direct host checkout\nproviders: openai\nmodels: provider default or --model\ncommand: node ${fileURLToPath(import.meta.url)}\n`); process.exit(0); } else unavailable('no broker socket and the Orchard checkout is not readable'); }
+if (opts.check) { if (process.env.ORCHARD_DISPATCH_ENTITLED === '0') unavailable('this session was launched with settings.tools.openaiDispatch disabled'); else if (process.env.ORCHARD_DISPATCH_UNAVAILABLE_REASON) unavailable(process.env.ORCHARD_DISPATCH_UNAVAILABLE_REASON, 'fix the reported host broker failure and launch a new session'); else if (socketPath) socketRequest({ op:'capabilities' }, true); else if (fs.existsSync(checkoutScript)) { void directCheck(); } else unavailable('no broker socket and the Orchard checkout is not readable'); }
 else { let body = prompt.join(' ').trim(); if (opts.stdin) { if (body) { process.stderr.write('dispatch failed [invalid-request] --prompt-stdin and positional prompt are mutually exclusive\n'); process.exit(2); } body=fs.readFileSync(0,'utf8'); } if (!body.trim()) { process.stderr.write('dispatch failed [invalid-request] no prompt given\n'); process.exit(2); } if (!opts.provider) opts.provider='openai'; if (socketPath) socketRequest({ op:'dispatch', ack:true, provider:opts.provider, ...(opts.model?{model:opts.model}:{}), ...(opts.sandbox?{sandbox:opts.sandbox}:{}), ...(opts.timeoutMin?{timeoutMin:Number(opts.timeoutMin)}:{}), ...(opts.ticket?{ticket:opts.ticket}:{}), ...(opts.phase?{phase:opts.phase}:{}), ...(opts.round?{round:opts.round}:{}), ...(opts.class?{class:opts.class}:{}), prompt:body }, false); else if (fs.existsSync(checkoutScript)) { const av=['--provider',opts.provider,'--prompt-stdin']; for (const [k,f] of [['model','--model'],['sandbox','--sandbox'],['timeoutMin','--timeout-min'],['ticket','--ticket'],['phase','--phase'],['round','--round'],['class','--class']]) if(opts[k]) av.push(f,String(opts[k])); direct(av,body); } else unavailable('no broker socket and the Orchard checkout is not readable'); }

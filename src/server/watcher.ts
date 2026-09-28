@@ -62,7 +62,13 @@ interface Watch {
   dir: string;
   filePath: string;
   cursor: number;
-  carry: string;
+  /** Bytes after the last newline read so far (BUG-190 round 3: BYTES, not a
+   *  decoded string — a chunk may end inside a multi-byte character). */
+  carry: Buffer;
+  /** BUG-190 round 4: `carry` (no newline yet) already parsed as a COMPLETE record
+   *  and was emitted, so the line it heads must not be emitted again when its
+   *  newline (or anything else) arrives. */
+  carryEmitted: boolean;
   watcher: fs.FSWatcher;
   timer: NodeJS.Timeout | null;
   reading: boolean;
@@ -99,7 +105,8 @@ function readAppend(w: Watch): void {
       // Truncated or rotated. Do not try to splice — say so and start over. The
       // new file's messages start at renderable index 0.
       w.cursor = 0;
-      w.carry = '';
+      w.carry = Buffer.alloc(0);
+      w.carryEmitted = false;
       w.nextIndex = 0;
       resynced = true;
     }
@@ -108,11 +115,10 @@ function readAppend(w: Watch): void {
     const len = st.size - w.cursor;
     if (len <= 0) return;
     const fd = fs.openSync(w.filePath, 'r');
-    let text: string;
+    let buf: Buffer;
     try {
-      const buf = Buffer.alloc(len);
+      buf = Buffer.alloc(len);
       fs.readSync(fd, buf, 0, len, w.cursor);
-      text = buf.toString('utf8');
     } finally {
       fs.closeSync(fd);
     }
@@ -120,23 +126,44 @@ function readAppend(w: Watch): void {
     w.totalBytesRead += len;
     w.batches++;
 
-    const parts = (w.carry + text).split('\n');
-    // Last element is either '' (clean append) or a partial line still being written.
-    w.carry = parts.pop() ?? '';
+    // BUG-190 round 3: split on the newline BYTE and decode only whole lines.
+    // Decoding each chunk on its own turned a write split inside a multi-byte
+    // character into U+FFFD on both sides of the cut.
+    const joined = w.carry.length ? Buffer.concat([w.carry, buf]) : buf;
+    const nl = joined.lastIndexOf(0x0a);
+    // Everything after the last newline has no newline YET.
+    w.carry = Buffer.from(joined.subarray(nl + 1));
+    let parts = nl >= 0 ? joined.subarray(0, nl).toString('utf8').split('\n') : [];
+    // The first whole line began as the previous carry: if that carry was
+    // already emitted as a complete record, its newline arriving adds nothing.
+    if (w.carryEmitted && nl >= 0) { parts = parts.slice(1); w.carryEmitted = false; }
 
     const messages: TranscriptMessage[] = [];
-    for (const line of parts) {
-      if (!line.trim()) continue;
+    const take = (line: string): void => {
+      if (!line.trim()) return;
       let e: Record<string, any>;
       try {
         e = JSON.parse(line);
       } catch {
-        continue; // torn line; the carry mechanism means we rarely see these
+        return; // torn line; the carry mechanism means we rarely see these
       }
-      if (!isMainThreadEntry(e)) continue;
+      if (!isMainThreadEntry(e)) return;
       const blocks = blocksOf(e, w.opts);
-      if (blocks.length === 0) continue; // canonical space excludes empty-block entries
+      if (blocks.length === 0) return; // canonical space excludes empty-block entries
       messages.push(toMessage(e, w.nextIndex++, blocks));
+    };
+    for (const line of parts) take(line);
+    /*
+     * BUG-190 round 4: a record completed WITHOUT its trailing newline (the
+     * file's final record, or a writer that flushes the record and the newline
+     * separately) is complete as soon as it parses. A transcript record is one
+     * JSON OBJECT per line, and no proper prefix of an object parses as one — a
+     * cut anywhere before the closing brace is a syntax error — so a parse
+     * decides completeness exactly, and a genuinely partial line never renders.
+     */
+    if (!w.carryEmitted && w.carry.length && isCompleteRecord(w.carry)) {
+      take(w.carry.toString('utf8'));
+      w.carryEmitted = true;
     }
 
     if (!messages.length && !resynced) return;
@@ -150,6 +177,59 @@ function readAppend(w: Watch): void {
     }
   } finally {
     w.reading = false;
+  }
+}
+
+/**
+ * Byte offset just past the file's last newline (0 if it has none), searched
+ * backward in chunks. Bounded: past the cap it falls back to `size` (the old
+ * behaviour) rather than scan an arbitrarily long single line.
+ */
+function lastLineBoundary(filePath: string, size: number): number {
+  const CHUNK = 64 * 1024;
+  const CAP = 64 * 1024 * 1024;
+  let fd: number;
+  try { fd = fs.openSync(filePath, 'r'); } catch { return size; }
+  // A last line that is already complete JSON without its newline is not
+  // "still being written" as far as every reader is concerned — the tail
+  // parser rendered it and the count includes it — so it is not re-read.
+  const complete = (b: number): number => {
+    if (b >= size) return size;
+    try {
+      const frag = Buffer.alloc(size - b);
+      fs.readSync(fd, frag, 0, size - b, b);
+      return isCompleteRecord(frag) ? size : b;
+    } catch {
+      return b;
+    }
+  };
+  try {
+    let end = size;
+    while (end > 0 && size - end < CAP) {
+      const len = Math.min(CHUNK, end);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, end - len);
+      const i = buf.lastIndexOf(0x0a);
+      if (i >= 0) return complete(end - len + i + 1);
+      end -= len;
+    }
+    return end <= 0 ? complete(0) : size;
+  } catch {
+    return size;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/** One complete JSONL record: parses, and is a JSON object (BUG-190 round 4). */
+function isCompleteRecord(bytes: Buffer): boolean {
+  const text = bytes.toString('utf8').trim();
+  if (!text.startsWith('{') || !text.endsWith('}')) return false;
+  try {
+    const v = JSON.parse(text);
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  } catch {
+    return false;
   }
 }
 
@@ -198,8 +278,13 @@ export function watchSession(
       sessionId,
       dir,
       filePath,
-      cursor: size,
-      carry: '',
+      // BUG-190 round 3: start at the last line BOUNDARY, not the raw end. A
+      // trailing line still being written is not in the tail the client already
+      // has (the tail parser skips it), so starting past it meant its completion
+      // was read as a headless fragment and never rendered.
+      cursor: lastLineBoundary(filePath, size),
+      carry: Buffer.alloc(0),
+      carryEmitted: false,
       nextIndex: seedIndex,
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       watcher: undefined as unknown as fs.FSWatcher,

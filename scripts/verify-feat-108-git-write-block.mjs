@@ -115,7 +115,9 @@ const runtimeSrc = fs.readFileSync(path.join(REPO, 'src/server/runtime/claude-ru
 // (evaluateGitWrite, which calls decideGitWrite internally), evaluated per call.
 ok('PIN: the runtime wires the git-write decision for Bash', /evaluateGitWrite\(/.test(runtimeSrc));
 ok('PIN: the runtime runs the git block BEFORE the profile decide()',
-  runtimeSrc.indexOf('evaluateGitWrite(') < runtimeSrc.indexOf('const d = decide('));
+  // FEAT-152 moved the profile decide() into evaluateOrchestratorProfileHook (defined
+  // above the class), so pin the CALLBACK's call site of it, not the helper body.
+  runtimeSrc.indexOf('evaluateGitWrite(') < runtimeSrc.indexOf('return evaluateOrchestratorProfileHook(i, orchBypass)'));
 ok('PIN: the git block is not gated behind config.orchestratorProfile',
   /gitBlockOn \|\| config\.orchestratorProfile/.test(runtimeSrc));
 

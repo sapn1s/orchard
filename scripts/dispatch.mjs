@@ -475,6 +475,27 @@ async function dispatchAnthropic() {
 /* --------------------------------------------------- openai: CodexRuntime */
 
 async function dispatchOpenai() {
+  /*
+   * BUG-189 — zero-token sandbox preflight. Every openai dispatch runs codex
+   * with --sandbox read-only|workspace-write, both of which launch codex's bwrap
+   * OS sandbox. A codex 0.157.x regression on btrfs makes that launch fail
+   * outright, and without this check the failure only surfaces AFTER an API turn
+   * has started (BUG-187 round 5 burned ~127k tokens finding it). Probe `codex
+   * sandbox … -- true` (a real bwrap launch of `true` — no API call, zero
+   * tokens) and, if it fails, exit non-zero BEFORE CodexRuntime spawns. We never
+   * fall back to danger-full-access. Cached per binary+version for the process.
+   */
+  const { preflightCodexSandbox, formatPreflightFailure } = await import(path.join(HERE, 'lib', 'codex-sandbox-preflight.mjs'));
+  const pf = await preflightCodexSandbox({ sandbox: opts.sandbox, cwd: opts.cwd });
+  if (!pf.ok) {
+    progress(`dispatch failed [sandbox-preflight] (provider openai): ${pf.errorLine}`);
+    process.stderr.write(`${formatPreflightFailure(pf)}\n`);
+    writeMeta({ exitCode: 1, failureKind: 'sandbox-preflight' });
+    process.exit(1);
+    return;
+  }
+  progress(`codex sandbox preflight ok (${pf.version}, --sandbox ${pf.mode}${pf.cached ? ', cached' : ''})`);
+
   const { CodexRuntime } = await import(path.join(ROOT, 'src', 'server', 'runtime', 'codex-runtime.ts'));
   const { TranscriptRecorder } = await import(path.join(ROOT, 'src', 'server', 'orchard-transcripts.ts'));
 

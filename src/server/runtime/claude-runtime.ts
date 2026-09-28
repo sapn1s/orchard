@@ -11,7 +11,7 @@
  *
  * This is the ONLY file above session-mutations.ts that imports the SDK.
  */
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -65,6 +65,7 @@ import type {
   ProviderErrorKind,
   RuntimeCapabilities,
   RuntimeMessage,
+  RuntimeInitOutcome,
   RuntimeModel,
   RuntimeStartConfig,
 } from './runtime.ts';
@@ -151,6 +152,12 @@ function userMessage(text: string): SDKUserMessage {
  * unbounded wait. Sessions with NO MCP servers configured never enter the
  * gate at all (zero added latency).
  */
+/** BUG-187 — CLAUDE_STATION_HOOK_TIMEOUT_S: the PreToolUse hook's CLI-side timeout (seconds); unset = CLI default. */
+export function hookTimeoutSecondsFromEnv(): number | null {
+  const n = Number(process.env.CLAUDE_STATION_HOOK_TIMEOUT_S);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 export function mcpReadyBudgetMs(): number {
   const raw = Number(process.env.CLAUDE_STATION_MCP_READY_TIMEOUT_MS ?? 20_000);
   if (!Number.isFinite(raw) || raw < 0) return 20_000;
@@ -370,6 +377,302 @@ function announceGitWrite(kind: 'permitted' | 'gate-blocked', offender: string, 
   }
 }
 
+/**
+ * FEAT-152 — the ORCH-BYPASS audit ledger: ONE FILE PER RECORD.
+ *
+ * Round 4 (design change, WA §N). Rounds 1-3 appended rows to a single shared
+ * `orch-bypass-audit.jsonl`, and three independent clean-room refutations broke
+ * that append three different ways — a swallowed error, an unchecked short
+ * write, then orphaned partial bytes fused with the next row AND concurrent
+ * sessions interleaving inside one row. Each was a property of appending to one
+ * shared file, so the append is gone rather than patched again:
+ *
+ *   1. the record is written to a temp file `.<name>.tmp` in the record dir,
+ *      opened O_CREAT|O_EXCL|O_NOFOLLOW (a fresh regular file, never a
+ *      pre-existing path, never followed through a symlink), written in FULL
+ *      (short writes looped, a no-progress write is a failure) and fsync'd;
+ *   2. it is published NO-CLOBBER with ONE `link(2)` to
+ *      `<iso-ts>-<session>-<rand>.json`, then the temp is unlinked. `link`
+ *      fails EEXIST if the final name already exists, so a planted/colliding
+ *      target is REFUSED (deny), never silently overwritten as `rename` would
+ *      (FEAT-152 F1). Hardlinks within one directory are supported on the data
+ *      dir's filesystem (btrfs/ext4/xfs); and
+ *   3. the record DIRECTORY is fsync'd so the publish itself is durable.
+ *
+ * A reader therefore sees each record complete or not at all: partial rows,
+ * fused rows and cross-session interleaving are impossible by construction
+ * (every writer owns its own file). Only an allow follows step 3; ANY failure
+ * deletes the temp (and a published-but-not-durable record) best-effort and
+ * returns false, so the caller DENIES and the count does not advance. Unlike
+ * the FEAT-108 git-write audit (a note about a decision made elsewhere), this
+ * record IS what makes the bypass legitimate, so its durable write is a
+ * precondition of the allow.
+ *
+ * The legacy `orch-bypass-audit.jsonl` (rounds 1-3) is left exactly where it
+ * is — never read, migrated or appended to. `dataDir()` is HOST-side, never the
+ * project repo, so nothing lands in a public-bound tree.
+ */
+export const ORCH_BYPASS_REASON_CAP = 2000;
+export const ORCH_BYPASS_COMMAND_CAP = 500;
+const ORCH_BYPASS_LABEL_CAP = 200;
+
+/** The one place the record directory is named (writer + reader both use it). */
+export function orchBypassAuditDir(): string {
+  return path.join(dataDir(), 'orch-bypass-audit');
+}
+
+/**
+ * Read every PUBLISHED record. Temp files (dot-prefixed) are in-flight writes
+ * and are skipped; any file that does not parse is reported by name rather
+ * than silently dropped. Records come back sorted by file name (= time).
+ *
+ * This is a RAW disk view for audit/review, NOT the per-session count source
+ * (FEAT-152 F2). The running `#N this session` count is owned solely by the
+ * in-memory tally in `makeOrchBypassRecorder`, advanced only on a durably
+ * committed bypass. A denied bypass whose directory-fsync AND rollback-unlink
+ * both fail can leave one un-withdrawn record here — a documented OVER-report
+ * (never an under-report). Because the count never comes from this directory,
+ * such a leftover changes neither the reported count nor any allow/deny
+ * outcome. Do not wire a per-session count off `records.length`.
+ */
+export function readOrchBypassAudit(): { records: Record<string, unknown>[]; unparseable: string[] } {
+  const dir = orchBypassAuditDir();
+  const records: Record<string, unknown>[] = [];
+  const unparseable: string[] = [];
+  let names: string[];
+  try { names = fs.readdirSync(dir); } catch { return { records, unparseable }; }
+  for (const name of names.sort()) {
+    if (name.startsWith('.') || !name.endsWith('.json')) continue;
+    try { records.push(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))); } catch { unparseable.push(name); }
+  }
+  return { records, unparseable };
+}
+
+function capString(v: unknown, cap: number): { value: string | null; truncated: boolean } {
+  if (typeof v !== 'string') return { value: null, truncated: false };
+  return v.length > cap ? { value: v.slice(0, cap), truncated: true } : { value: v, truncated: false };
+}
+
+function recordOrchBypass(rec: {
+  count: number;
+  reason: string;
+  command: string;
+  sessionId?: string | null;
+  sessionLabel?: string | null;
+}): boolean {
+  const at = new Date().toISOString();
+  const reason = capString(rec.reason, ORCH_BYPASS_REASON_CAP);
+  // Capped: the audit is "which escape, when, why", not a place to re-store an
+  // arbitrary payload the command may carry.
+  const command = capString(rec.command, ORCH_BYPASS_COMMAND_CAP);
+  const record = {
+    at,
+    event: 'orch-bypass',
+    count: rec.count,
+    sessionId: capString(rec.sessionId, ORCH_BYPASS_LABEL_CAP).value,
+    sessionLabel: capString(rec.sessionLabel, ORCH_BYPASS_LABEL_CAP).value,
+    reason: reason.value,
+    ...(reason.truncated ? { reasonTruncated: true } : {}),
+    command: command.value,
+    ...(command.truncated ? { commandTruncated: true } : {}),
+  };
+  const dir = orchBypassAuditDir();
+  const sess = String(rec.sessionId ?? rec.sessionLabel ?? 'nosession').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
+  const name = `${at.replace(/[:.]/g, '-')}-${sess}-${randomBytes(12).toString('hex')}.json`;
+  const finalPath = path.join(dir, name);
+  const tmpPath = path.join(dir, `.${name}.tmp`);
+  const { O_RDONLY, O_DIRECTORY, O_NOFOLLOW, O_CREAT, O_EXCL, O_WRONLY, O_NONBLOCK } = fs.constants;
+  let dirFd = -1;
+  let fd = -1;
+  let tmpCreated = false;
+  let published = false;
+  try {
+    // A missing-but-writable data dir is a legitimate first write — create it.
+    // Anything already at the path that is not a real directory (a file, a
+    // FIFO, a symlink) is refused below: O_DIRECTORY|O_NOFOLLOW + fstat.
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    dirFd = fs.openSync(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    const dst = fs.fstatSync(dirFd);
+    if (!dst.isDirectory()) throw Object.assign(new Error('ORCH-BYPASS record dir is not a directory'), { code: 'ENOTDIR' });
+    const buf = Buffer.from(JSON.stringify(record) + '\n', 'utf8');
+    fd = fs.openSync(tmpPath, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW | O_NONBLOCK, 0o600);
+    tmpCreated = true;
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw Object.assign(new Error('ORCH-BYPASS temp record is not a regular file'), { code: 'ENOTREG' });
+    // Write the FULL buffer; a short write continues from the returned offset,
+    // a no-progress write is a failure (never spun on).
+    let written = 0;
+    while (written < buf.length) {
+      const n = fs.writeSync(fd, buf, written, buf.length - written, null);
+      if (typeof n !== 'number' || n <= 0) {
+        throw Object.assign(
+          new Error(`ORCH-BYPASS audit write made no progress (${written}/${buf.length} bytes)`),
+          { code: 'ESHORTWRITE' },
+        );
+      }
+      written += n;
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = -1;
+    // NO-CLOBBER publish (FEAT-152 F1): link(2) fails EEXIST if `finalPath`
+    // already exists, so a planted or colliding target is refused rather than
+    // overwritten (renameSync would silently clobber). The temp is dropped
+    // once the final name shares its inode; a leftover dot-temp is skipped by
+    // readers, so its cleanup is best-effort and never fatal.
+    fs.linkSync(tmpPath, finalPath);
+    published = true;
+    try { fs.unlinkSync(tmpPath); tmpCreated = false; } catch { /* readers skip the dot-temp */ }
+    // The record must have landed, as the file we wrote, in the directory we
+    // are about to fsync — not somewhere a swapped path pointed the publish.
+    const fst = fs.lstatSync(finalPath);
+    const dnow = fs.lstatSync(dir);
+    if (!fst.isFile() || fst.ino !== st.ino || fst.dev !== st.dev || dnow.ino !== dst.ino || dnow.dev !== dst.dev) {
+      throw Object.assign(new Error('ORCH-BYPASS record did not land where it was written'), { code: 'EMOVED' });
+    }
+    // Durable: the publish is only on disk once its directory is synced.
+    fs.fsyncSync(dirFd);
+  } catch (err) {
+    // FAIL CLOSED for ANY failure. Withdraw what we wrote (best effort) so a
+    // denied bypass leaves no temp and no un-durable record behind.
+    if (fd >= 0) { try { fs.closeSync(fd); } catch { /* best effort */ } }
+    if (tmpCreated) { try { fs.unlinkSync(tmpPath); } catch { /* best effort */ } }
+    if (published) { try { fs.unlinkSync(finalPath); } catch { /* best effort */ } }
+    const who = rec.sessionLabel ? ` [session ${rec.sessionLabel}]` : '';
+    console.warn(
+      `[orchard] ORCH-BYPASS AUDIT FAILED${who} — record not durably written (${dir}): ` +
+      `${(err as Error).message}. Bypass DENIED (fail closed, FEAT-152 — an unauditable bypass never runs).`,
+    );
+    return false;
+  } finally {
+    if (dirFd >= 0) { try { fs.closeSync(dirFd); } catch { /* best effort */ } }
+  }
+  const who = rec.sessionLabel ? ` [session ${rec.sessionLabel}]` : '';
+  console.warn(`[orchard] ORCH-BYPASS #${rec.count}${who} (FEAT-152 — logged & reviewed): ${reason.value}`);
+  return true;
+}
+
+/**
+ * FEAT-152 — the stateful glue between a pure `decide()` bypass verdict and what
+ * the PreToolUse hook must DO about it, in ONE place so the count, the ledger
+ * row and the allow-reason are defined together (ARCH-010) and can be driven by
+ * a test without launching a model. Returns a per-session recorder: each call
+ * bumps the session's running count, appends the audit row, and yields the
+ * `allow` hook output whose reason surfaces the running count so drift is
+ * visible in context. No hard cap.
+ */
+export function makeOrchBypassRecorder(ctx: { sessionId?: string | null; sessionLabel?: string | null } = {}) {
+  let count = 0;
+  return (bypass: { reason: string; command: string }) => {
+    // Try the NEXT number, but only COMMIT it if the row is durably persisted.
+    const attempt = count + 1;
+    const logged = recordOrchBypass({
+      count: attempt,
+      reason: bypass.reason,
+      command: bypass.command,
+      sessionId: ctx.sessionId ?? null,
+      sessionLabel: ctx.sessionLabel ?? null,
+    });
+    if (!logged) {
+      // FAIL CLOSED — the bypass could not be durably audited, so it must not
+      // run. The count is NOT advanced (nothing was bypassed), and the denial
+      // never claims it was logged. Requirement #2: no bypass is silent.
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse' as const,
+          permissionDecision: 'deny' as const,
+          permissionDecisionReason:
+            'ORCH-BYPASS refused: this command carried a valid `# ORCH-BYPASS:` marker, but the ' +
+            'audit ledger could not be written, so the bypass cannot be recorded. FEAT-152 requires ' +
+            'every bypass to be durably logged — an unauditable bypass is DENIED (fail closed), never ' +
+            'run silently. Fix the record directory (dataDir()/orch-bypass-audit/) or dispatch a lane instead.',
+        },
+      };
+    }
+    count = attempt;
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse' as const,
+        permissionDecision: 'allow' as const,
+        permissionDecisionReason:
+          `ORCH-BYPASS #${count} this session — allowed and LOGGED with its reason (FEAT-152). ` +
+          'Use only when the output IS the direct input to your next decision; ' +
+          'not for exploring, reading-to-understand, or verification.',
+      },
+    };
+  };
+}
+
+/** The shape a PreToolUse hook callback returns: `{}` means allow / no decision. */
+type PreToolUseHookResult = {
+  hookSpecificOutput?: {
+    hookEventName: 'PreToolUse';
+    permissionDecision?: 'allow' | 'deny';
+    permissionDecisionReason?: string;
+    updatedInput?: Record<string, unknown>;
+  };
+};
+
+/**
+ * FEAT-152 (round 3) — the orchestrator-profile branch of the PreToolUse hook,
+ * extracted so the EXACT fail-closed decision the hook runs can be driven by a
+ * test without launching a session (the hook calls this; the test calls this —
+ * one source, ARCH-010). Grades the input with `decide()` and, on a valid
+ * `# ORCH-BYPASS:` marker, runs the per-session `orchBypass` recorder.
+ *
+ * A throw on this path — `decide()` or the recorder — is caught HERE and turned
+ * into a DENY with a specific reason. This is NOT the only fail-closed boundary:
+ * the registered callback also runs shared code (git block, Fable gate, file
+ * lock) BEFORE calling this, so its own outer catch denies in a profile session
+ * too (round 4). For a restrictive profile, "could not evaluate" is DENY.
+ */
+export function evaluateOrchestratorProfileHook(
+  input: { tool_name?: string; tool_input?: unknown; agent_id?: string | null },
+  orchBypass: (b: { reason: string; command: string }) => PreToolUseHookResult,
+): PreToolUseHookResult {
+  let d: ReturnType<typeof decide>;
+  try {
+    d = decide({
+      toolName: input.tool_name ?? '',
+      toolInput: input.tool_input,
+      agentId: input.agent_id ?? null,
+    });
+  } catch (err) {
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason:
+          'Orchestrator tool profile: the permission decision could not be evaluated ' +
+          `(${(err as Error).message}); denied (fail closed, FEAT-152). Dispatch a lane instead.`,
+      },
+    };
+  }
+  if (d.bypass) {
+    try {
+      return orchBypass(d.bypass);
+    } catch (err) {
+      return {
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'ORCH-BYPASS refused: the bypass could not be recorded ' +
+            `(${(err as Error).message}); denied (fail closed, FEAT-152 — an unauditable bypass never runs).`,
+        },
+      };
+    }
+  }
+  if (d.allow || !d.reason) return {};
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: d.reason,
+    },
+  };
+}
+
 function shortHash(buf: Buffer): string {
   return createHash('sha256').update(buf).digest('hex').slice(0, 8);
 }
@@ -504,6 +807,8 @@ export class ClaudeRuntime implements AgentRuntime {
    * so the BUG-035 pending classifier can say honestly how long we waited.
    */
   #holding = false;
+  /** BUG-187 C2 — whether this runtime's initialize carried hooks. */
+  #hooksSent = false;
   #heldSends: string[] = [];
   #closed = false;
   #mcpGate: { outcome: 'ready' | 'timeout' | 'settled'; waitedMs: number } | null = null;
@@ -717,6 +1022,10 @@ export class ClaudeRuntime implements AgentRuntime {
       ? path.join(dataDir(), 'file-locks', fileLockProjectKey.replace(/[^A-Za-z0-9._-]/g, '_'))
       : null;
     const fileLockSessionOwner = config.sessionLabel ?? declaredSessionId;
+    // FEAT-152 — per-session ORCH-BYPASS recorder. Lives in this launch closure,
+    // so its running count persists across every hook call for this session and
+    // resets when the session (re)launches.
+    const orchBypass = makeOrchBypassRecorder({ sessionId: declaredSessionId, sessionLabel: config.sessionLabel ?? null });
     /*
      * FEAT-129 — start the HEARTBEAT. This is the round-2 fix for the reaper-vs-
      * live-lock clobber: rather than a TTL deciding a live lane's lock is stale,
@@ -765,6 +1074,12 @@ export class ClaudeRuntime implements AgentRuntime {
         ...(options.hooks ?? {}),
         PreToolUse: [
           {
+            /*
+             * BUG-187 — the CLI waits this long (seconds) for an answer before it
+             * fails the tool call. Unset = the CLI's own default (600 s). A knob
+             * so a verifier can make a missing responder visible quickly.
+             */
+            ...(hookTimeoutSecondsFromEnv() ? { timeout: hookTimeoutSecondsFromEnv()! } : {}),
             hooks: [
               async (input) => {
                 try {
@@ -857,20 +1172,38 @@ export class ClaudeRuntime implements AgentRuntime {
                     }
                   }
                   if (!config.orchestratorProfile) return {};
-                  const d = decide({
-                    toolName: i.tool_name ?? '',
-                    toolInput: i.tool_input,
-                    agentId: i.agent_id ?? null,
-                  });
-                  if (d.allow || !d.reason) return {};
-                  return {
-                    hookSpecificOutput: {
-                      hookEventName: 'PreToolUse' as const,
-                      permissionDecision: 'deny' as const,
-                      permissionDecisionReason: d.reason,
-                    },
-                  };
-                } catch {
+                  /*
+                   * FEAT-152 — the profile decision AND the audited bypass are
+                   * graded inside `evaluateOrchestratorProfileHook` (the hook and
+                   * the FEAT-152 suite call the SAME function), which itself
+                   * fails CLOSED on a throw from `decide()` or the recorder.
+                   */
+                  return evaluateOrchestratorProfileHook(i, orchBypass);
+                } catch (err) {
+                  /*
+                   * FEAT-152 round 4 — the fail-closed boundary is the WHOLE
+                   * callback. A throw anywhere above — the git block, the Fable
+                   * gate, the file lock, all of which run BEFORE the profile
+                   * guard — lands here. In an orchestrator-profile session
+                   * "could not evaluate" is DENY, for every tool: returning `{}`
+                   * would be allow / no-decision, i.e. the profile failing open
+                   * (round-3 finding 3, driven through this registered
+                   * callback). Non-profile sessions keep the historical `{}`.
+                   */
+                  if (config.orchestratorProfile) {
+                    console.warn(
+                      `[orchard] PreToolUse hook threw in an orchestrator-profile session — DENIED (fail closed, FEAT-152): ${(err as Error)?.message ?? String(err)}`,
+                    );
+                    return {
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse' as const,
+                        permissionDecision: 'deny' as const,
+                        permissionDecisionReason:
+                          'Orchestrator tool profile: the permission decision could not be evaluated ' +
+                          `(${(err as Error)?.message ?? String(err)}); denied (fail closed, FEAT-152). Dispatch a lane instead.`,
+                      },
+                    };
+                  }
                   return {};
                 }
               },
@@ -911,7 +1244,14 @@ export class ClaudeRuntime implements AgentRuntime {
     if (usingRealHostCli) {
       assertSessionStoreIsolated(options.env, { label: config.sessionLabel ?? declaredSessionId });
     }
+    this.#hooksSent = !!options.hooks && Object.keys(options.hooks).length > 0;
     this.#query = query({ prompt: this.#input, options });
+    /*
+     * BUG-187 C1 — attach mode: the CLI is already running (adopted from a
+     * surviving broker). No first prompt, no MCP-readiness hold; the input queue
+     * stays open and empty until a user genuinely sends.
+     */
+    if (config.attach) return;
     /*
      * FEAT-055 — a session's first turn must HAVE its configured MCP tools (or
      * honestly wait, bounded). Without this gate the CLI starts the turn at
@@ -958,6 +1298,30 @@ export class ClaudeRuntime implements AgentRuntime {
     if (this.#closed) return;
     this.#input.push(userMessage(firstPrompt));
     for (const text of this.#heldSends.splice(0)) this.#input.push(userMessage(text));
+  }
+
+  /**
+   * BUG-187 C2 — did the engine accept this runtime's `initialize`, and did it
+   * apply the hooks it carried? A repeated initialize to an adopted CLI answers
+   * `hooks_applied: true` only from the stdin owner; anything else means this
+   * server's policy hooks are NOT the ones the CLI will call.
+   */
+  async initOutcome(): Promise<RuntimeInitOutcome> {
+    const hooksSent = this.#hooksSent;
+    if (!this.#query) return { ok: false, hooksSent, hooksApplied: undefined, adoptOutcome: 'init-failed', pendingPermissionIds: [], error: 'runtime not started' };
+    try {
+      const r = (await this.#query.initializationResult()) as unknown as Record<string, unknown>;
+      const hooksApplied = typeof r?.hooks_applied === 'boolean' ? (r.hooks_applied as boolean) : undefined;
+      return {
+        ok: true,
+        hooksSent,
+        hooksApplied,
+        adoptOutcome: hooksSent && hooksApplied !== true ? 'hooks-not-applied' : 'ok',
+        pendingPermissionIds: [],
+      };
+    } catch (err) {
+      return { ok: false, hooksSent, hooksApplied: undefined, adoptOutcome: 'init-failed', pendingPermissionIds: [], error: (err as Error)?.message ?? String(err) };
+    }
   }
 
   send(text: string): void {

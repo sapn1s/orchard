@@ -11,9 +11,9 @@
   "reported": "2026-08-12",
   "reported_by": "user",
   "owner": "agent",
-  "work_state": "verified",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-08-12",
+  "updated": "2026-09-28",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -263,3 +263,32 @@ broker-sniffed evidence. (c) The pushed snapshot at ack covers the strip until t
 4s poll; a turn that ENDS between polls clears within one poll (proven in S5). (d)
 `/api/sessions/live` now calls `scanSurvivingHosts()` per poll (status reads + pid checks, 0-2
 records in practice) — cheap, and it is the same scan `/api/health` already did.
+
+### 2026-09-27 — fixing lane, round 1 (suite red 22/47): the suite's fixture was obsoleted by BUG-187, and the product is intact
+- **Verdict:** the BUG-072 product behaviour holds. The suite went red because BUG-187 (`regressed-from: BUG-187`) now adopts a survivor holding live work at boot, so the planted broker was adopted instead of staying in delivery mode. The full classification and evidence are in the BUG-187 entry of the same date. Summary:
+  - pinned `541dd73`: 47/47;
+  - working tree: 22/47;
+  - working tree with BUG-187 boot adoption disabled: 47/47;
+  - BUG-190 is not involved.
+- **Classes:**
+  - S1 and the S2.1/S2.2/S3 checks that follow from it: (b). BUG-187 intends a survivor with live lanes to be adopted.
+  - S2.3 ×4 and S5 ×1: (c), a leftover release flag cascading from the earlier failures.
+  - Setup: (c), store isolation and FEAT-151 admission.
+  - No (a) in BUG-072's own behaviour.
+- **Changed:** `scripts/verify-bug-072-delivery-visible.mjs` only.
+  - It uses an isolated store and `startWhenAdmitted`.
+  - It clears the flag before each send.
+  - The planted broker runs in a directory no project claims. That is the unadoptable path, and the only one where delivery mode, and so this ticket, still applies.
+- **Verified:**
+  - WT: 47/47, EXIT 0.
+  - Pinned `541dd73`: 47/47, EXIT 0.
+  - Non-vacuity, with the `/running` survivor fallback removed in a scratch copy: 34/47, EXIT 1.
+  - bug-187 72/72, feat-064 19/19, feat-065 35/35.
+  - `npm run gate`: PASS, exit 0 (leak-gate, check-nul, typecheck).
+- **Found:** BUG-191. A message sent while an adoption is `pending` or `responder-only` is acked as reattached, then refused and lost. Not fixed: it changes BUG-187 behaviour.
+- **Status:** unchanged. No product code changed, so no new independent verify is needed for this round. Its original residuals still stand.
+
+### 2026-09-28 — worker (fixing, round 1)
+- **Status → DONE.** Ticket was already VERIFIED (delivery-visible behaviour
+  proven: pre-fix case failed, corrected behaviour + standing safeguards passed;
+  Verified-by on the ticket). No product code changed this round — closing to DONE.

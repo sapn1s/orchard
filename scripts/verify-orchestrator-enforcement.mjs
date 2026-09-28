@@ -206,6 +206,148 @@ for (const [i, payload] of hostile.entries()) {
   ok(`hostile payload ${i} decides in under 1s (no catastrophic backtracking)`, ms < 1000, `${ms}ms`);
 }
 
+/* ═══ 6b. The corpus-classification ORACLE (BUG-185) ═══════════════════════
+ * An INDEPENDENT cross-check of what a real command actually DOES, used by the
+ * section-7 corpus assertions to decide which commands the policy must allow
+ * (pure gate/board work) and which it must refuse (a file read / tree search).
+ * It is deliberately not `decideBashCommand` itself — an oracle that just called
+ * the policy would assert nothing — but it must model a command the SAME way the
+ * shell does: quoted prose is DATA, not commands.
+ *
+ * The first cut of this oracle split the RAW command on newlines and read the
+ * first word of every line as a command head. Two real command shapes that
+ * entered the corpus after FEAT-096 closed at 122/122 broke that, reddening a
+ * clean HEAD (BUG-185):
+ *   - a multi-line dispatch prompt — `node dispatch-client.mjs … "You are a
+ *     VERIFIER … diff the files …"` — whose prompt-line-start words and whose
+ *     "git diff"/"git show" PROSE were scored as reads. The policy correctly
+ *     ALLOWS it (a node script; the prompt is an argument).
+ *   - a `npx tsx …` / `node -e …` compound that also runs the gate — not a read,
+ *     but not pure gate work either. The policy correctly REFUSES it (`npx` /
+ *     `node -e` are not on the allow list), so it must not be expected allowed.
+ * The policy was right on both; the ORACLE was wrong. Fix: strip a command's
+ * DATA (heredoc bodies, redirections, substitutions, quoted spans, comments)
+ * before classifying — mirroring decideBashCommand — and count a command as
+ * "pure gate work" only when every stage-one head is gate/board GLUE
+ * (npm/git/cd/echo/…), never an arbitrary executable (npx/node/python/…).
+ * This file re-implements the strip because orchestrator-profile.mjs does not
+ * export it; section 6c's non-vacuity proofs keep the re-implementation honest.
+ */
+
+// Ported from orchestrator-profile.mjs `stripQuotedAndComments`: a single
+// left-to-right pass that honours whichever quote opened FIRST. A naive
+// two-regex strip mis-pairs the moment a double-quoted dispatch prompt contains
+// an apostrophe — and the real corpus has them.
+function stripQuotedAndComments(src) {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === '\\') { out += ' '; i += 2; continue; }
+    if (ch === "'" || ch === '"') {
+      const close = src.indexOf(ch, i + 1);
+      if (close < 0) { out += ' '; break; }
+      out += ' '; i = close + 1; continue;
+    }
+    if (ch === '#' && (out === '' || /\s/.test(src[i - 1] ?? ' '))) {
+      const nl = src.indexOf('\n', i);
+      if (nl < 0) { out += ' '; break; }
+      out += ' '; i = nl; continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+// A command reduced to just its executable structure, in the same order
+// decideBashCommand uses: heredoc body cut off, redirections blanked,
+// substitutions blanked, then quoted/commented spans blanked. What remains is
+// real command text, so prose inside an argument cannot masquerade as a command.
+function decidableForOracle(cmd) {
+  const heredoc = cmd.search(/<<-?\s*'?"?[A-Za-z_]/);
+  const body = (heredoc >= 0 ? cmd.slice(0, heredoc) : cmd)
+    .replace(/\d*>>?&?\d*\s*|\d*<&?\d*\s*/g, ' ')
+    .replace(/\$\([^()]*\)/g, ' ')
+    .replace(/`[^`]*`/g, ' ');
+  return stripQuotedAndComments(body);
+}
+
+const headsOfStripped = (stripped) => stripped
+  .split(/(?:\|\||&&|[;\n&])+/)
+  .map((pl) => bashSegmentHead(pl.split('|')[0]))
+  .filter(Boolean);
+
+// The stage-one command heads of a command (its DATA already stripped): the head
+// of each &&/||/;/&/newline-separated segment, ignoring downstream pipe stages.
+const stageOneHeads = (cmd) => headsOfStripped(decidableForOracle(cmd));
+
+const READ_HEADS = new Set(['rg', 'grep', 'egrep', 'fgrep', 'cat', 'find', 'ls', 'awk', 'sed', 'head', 'tail',
+  'python', 'python3', 'perl', 'xargs', 'sh', 'bash', 'wc', 'jq', 'du', 'tree', 'diff', 'stat', 'file',
+  'strings', 'od', 'xxd', 'less', 'more', 'comm', 'column']);
+
+// `git show` / `git diff` / `git grep` / `git log -p` print file bodies — reads
+// wearing a git prefix, which the policy refuses. Tested against the DATA-stripped
+// command so a "git diff" sitting in a quoted dispatch prompt is not mistaken for
+// a real read (BUG-185 offender B).
+const readsViaGit = (stripped) => /\bgit\s+(?:show|diff|grep|blame|cat-file)\b/.test(stripped)
+  || /\bgit\s+log\b[^;&|\n]*(?:\s-p\b|--patch)/.test(stripped);
+
+const readsAFile = (cmd) => {
+  const stripped = decidableForOracle(cmd);
+  return headsOfStripped(stripped).some((h) => READ_HEADS.has(h)) || readsViaGit(stripped);
+};
+
+// "Pure gate work": a command whose ONLY substantive heads are the gate/board and
+// the glue around them (cd/echo/git commit/…). An arbitrary executable (npx,
+// node, python, a service tool) means the call does something ELSE the policy may
+// legitimately refuse, so it is NOT the compliance floor this asserts — it is
+// counted among the refused-compound gate commands instead. `git` stays in the
+// set (a gate cluster commits), and `!readsAFile` still excludes `git show`.
+const GATE_CONTEXT_HEADS = new Set(['npm', 'git', 'cd', 'echo', 'true', 'false', ':', 'test', '[', '[[',
+  'set', 'export', 'printf', 'date', 'pwd', 'which', 'mkdir', 'touch', 'chmod', 'cp', 'mv', 'wait', 'sleep', 'uptime']);
+const isPureGateWork = (cmd) => /npm run (?:gate|board:(?:gen|check|tool))\b/.test(cmd)
+  && !readsAFile(cmd)
+  && stageOneHeads(cmd).every((h) => GATE_CONTEXT_HEADS.has(h));
+
+/* ═══ 6c. The oracle is HONEST — non-vacuity of the BUG-185 fix ═════════════
+ * Fixed synthetic inputs (never corpus-derived, so the baseline cannot move):
+ * the strip must not have turned readsAFile / isPureGateWork into always-false.
+ * If a future edit over-strips or blanket-loosens the oracle, these redden.
+ */
+// Genuine reads are STILL flagged.
+ok('oracle flags a bare file read', readsAFile('cat src/server/board.ts') === true);
+ok('oracle flags a tree search', readsAFile('grep -rn secret src/') === true);
+ok('oracle flags `git show` as a read', readsAFile('git show HEAD:src/a.ts') === true);
+ok('oracle flags `git diff | head` as a read', readsAFile('git diff package.json | head -20') === true);
+ok('oracle flags a read that trails a gate command',
+  readsAFile(`cd ${REPO} && npm run gate && cat src/server/board.ts`) === true);
+ok('oracle flags a read in a later pipeline segment', readsAFile('npm run gate; sed -n 1,5p src/a.ts') === true);
+// Data inside quotes/prompts is NOT a command — the two shapes BUG-185 mislabelled.
+ok('oracle does NOT read a read-verb WORD inside a quoted prompt',
+  readsAFile('node scripts/dispatch.mjs --provider openai "find the bug then diff the files and cat the log"') === false);
+ok('oracle does NOT read "git diff" PROSE inside a quoted prompt',
+  readsAFile('node src/server/dispatch-client.mjs --class verify "run git diff and git show HEAD to confirm the claim"') === false);
+// Pure-gate classification: the compliance floor is IN, non-gate work is OUT.
+ok('oracle: `cd <repo> && npm run gate` is pure gate work', isPureGateWork(`cd ${REPO} && npm run gate`) === true);
+ok('oracle: `npm run board:gen && npm run gate` is pure gate work', isPureGateWork('npm run board:gen && npm run gate') === true);
+ok('oracle: a gate command that also runs `npx` is NOT pure gate work (offender A1)',
+  isPureGateWork('npx tsx scripts/x.mjs 2>&1 | tail -3; npm run gate') === false);
+ok('oracle: a gate command that also runs `node -e` is NOT pure gate work (offender A2)',
+  isPureGateWork('npm run board:gen && node -e "console.log(1)" && npm run gate') === false);
+ok('oracle: a gate command that also reads a file is NOT pure gate work',
+  isPureGateWork('npm run gate && cat src/a.ts') === false);
+// And the policy agrees with the oracle on those synthetic offenders: pure ones
+// allowed, the non-pure ones refused — this is what section 7 asserts over the
+// real corpus, pinned here so it survives a corpus that no longer contains them.
+ok('policy allows the synthetic pure-gate command', decideBashCommand(`cd ${REPO} && npm run gate`).allow === true);
+ok('policy refuses the synthetic npx-compound gate command',
+  decideBashCommand('npx tsx scripts/x.mjs 2>&1 | tail -3; npm run gate').allow === false);
+ok('policy refuses the synthetic node-e-compound gate command',
+  decideBashCommand('npm run board:gen && node -e "console.log(1)" && npm run gate').allow === false);
+ok('policy allows the synthetic multi-line dispatch command (prompt is data)',
+  decideBashCommand('node src/server/dispatch-client.mjs --class verify "run git diff and git show HEAD to confirm the claim"').allow === true);
+
 /* ═══ 7. THE REAL CORPUS — the orchestrator's own calls ════════════════════ */
 // The transcript store dir is the repo path with separators flattened. Derived,
 // never written literally, so this file carries no absolute home path.
@@ -253,27 +395,15 @@ if (!fs.existsSync(store)) {
      * grep -o x` is a stdout filter, not a file read, and counting it as a leak
      * was an error in the test, not in the classifier.
      */
-    const stageOneHeads = (cmd) => {
-      const flat = cmd.replace(/\$\([^()]*\)/g, ' ').replace(/`[^`]*`/g, ' ')
-        .replace(/\d*>>?&?\d*\s*|\d*<&?\d*\s*/g, ' ');
-      return flat.split(/(?:\|\||&&|[;\n&])+/).map((pl) => bashSegmentHead(pl.split('|')[0])).filter(Boolean);
-    };
-    const READ_HEADS = new Set(['rg', 'grep', 'egrep', 'fgrep', 'cat', 'find', 'ls', 'awk', 'sed', 'head', 'tail',
-      'python', 'python3', 'perl', 'xargs', 'sh', 'bash', 'wc', 'jq', 'du', 'tree', 'diff', 'stat', 'file',
-      'strings', 'od', 'xxd', 'less', 'more', 'comm', 'column']);
-    // `git show` / `git diff` / `git log -p` print file bodies — they are reads
-    // wearing a git prefix, and the policy refuses them. The detector has to
-    // agree, or it scores a correct refusal as a false negative.
-    const readsViaGit = (cmd) => /\bgit\s+(?:show|diff|grep|blame|cat-file)\b/.test(cmd)
-      || /\bgit\s+log\b[^;&|\n]*(?:\s-p\b|--patch)/.test(cmd);
-    const readsAFile = (cmd) => stageOneHeads(cmd).some((h) => READ_HEADS.has(h)) || readsViaGit(cmd);
+    // The oracle (stageOneHeads / READ_HEADS / readsViaGit / readsAFile /
+    // isPureGateWork) is defined at module scope — section 6b — so the section-6c
+    // non-vacuity proofs can exercise it even when the corpus is absent.
 
     // The property that actually matters: a command that ONLY runs the gate /
     // board / its own commit is allowed. This is the compliance floor — the
     // working agreement REQUIRES the gate before a commit, so a policy that
     // refuses it makes the orchestrator non-compliant rather than restricted.
-    const pureGate = bash.filter((c) => /npm run (?:gate|board:(?:gen|check|tool))\b/.test(c)
-      && !readsAFile(c));
+    const pureGate = bash.filter(isPureGateWork);
     const pureGateAllowed = pureGate.filter((c) => decideBashCommand(c).allow);
     ok(`every real gate/board command that does not also read a file is allowed (${pureGateAllowed.length}/${pureGate.length})`,
       pureGate.length > 0 && pureGateAllowed.length === pureGate.length,
@@ -299,7 +429,8 @@ if (!fs.existsSync(store)) {
     console.log(`\n  real corpus: ${calls.length} calls since 2026-08-18 · ` +
       `${bash.length} Bash (${allowedBash.length} allowed, ${bash.length - allowedBash.length} refused)`);
     console.log(`  gate/board commands: ${gateAll.length} total, ${pureGate.length} pure (all allowed), ` +
-      `${gateCompoundRefused.length} refused because the SAME call also read a file — those must be split.`);
+      `${gateCompoundRefused.length} refused because the SAME call also reads a file or runs non-gate work ` +
+      `(e.g. npx/node -e) — those must be split.`);
     console.log(`  file-read / tree-search commands: ${realSearch.length}, all refused.`);
   }
 }

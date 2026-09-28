@@ -49,6 +49,13 @@ export declare function decideBashCommand(command: string): {
   offender: string | null;
 };
 
+export interface OrchBypass {
+  /** Non-trivial reason (>= 15 chars) the model supplied on the marker's first line. */
+  reason: string;
+  /** The full Bash command the marker admitted, for the audit ledger (hook truncates). */
+  command: string;
+}
+
 export interface ProfileDecision {
   allow: boolean;
   /** Non-null exactly when `allow` is false; the text the model (and so the user) sees. */
@@ -58,7 +65,21 @@ export interface ProfileDecision {
    * allowed — the restriction is on the orchestrating session only.
    */
   scope: 'subagent' | 'orchestrator';
+  /**
+   * FEAT-152 — present ONLY when a valid `# ORCH-BYPASS:` marker allowed an
+   * otherwise-refused Bash command. The enforcing hook logs it and counts it;
+   * `decide()` itself stays pure and performs no I/O.
+   */
+  bypass?: OrchBypass;
 }
+
+export type OrchBypassDetection =
+  | { present: false }
+  | { present: true; valid: false; reason: string; problem: string }
+  | { present: true; valid: true; reason: string };
+
+/** PURE first-line marker check. See orchestrator-profile.mjs. */
+export declare function detectOrchBypass(command: string): OrchBypassDetection;
 
 export declare function decide(call: {
   toolName: string;

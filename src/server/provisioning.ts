@@ -43,6 +43,19 @@ export interface ToolPin {
   license?: string;
   sha256?: Record<string, string>;
   integrity?: string;
+  /**
+   * FEAT-151 finding #9 — which isolation(s) this pin is installed for. Absent =
+   * both (serena/playwright, used by host AND container sessions). A
+   * container-only tool (`claude-code`) declares `["container"]` so host
+   * provisioning does NOT install a standalone CLI host sessions never use (host
+   * sessions run the SDK-bundled CLI, see runtime-update.ts).
+   */
+  appliesTo?: ('host' | 'container')[];
+}
+
+/** finding #9 — does this pin apply to the given isolation scope? Absent = both. */
+export function pinAppliesTo(pin: ToolPin, scope: 'host' | 'container'): boolean {
+  return !pin.appliesTo || pin.appliesTo.includes(scope);
 }
 
 export interface ProvisionManifest {
@@ -74,6 +87,16 @@ export function manifestTools(): { name: string; pin: ToolPin }[] {
   return Object.keys(tools).sort().map((name) => ({ name, pin: tools[name]! }));
 }
 
+/**
+ * finding #9 — the tools applicable to a given isolation scope. Host provisioning
+ * and host status read ONLY the host-applicable set, so a container-only pin
+ * (claude-code) never makes `provisionAllHost()` install a CLI host sessions do
+ * not use.
+ */
+export function manifestToolsFor(scope: 'host' | 'container'): { name: string; pin: ToolPin }[] {
+  return manifestTools().filter(({ pin }) => pinAppliesTo(pin, scope));
+}
+
 export function pinFor(tool: string): ToolPin {
   const pin = readProvisionManifest().tools[tool];
   if (!pin?.package || !pin?.version) throw new Error(`${provisionManifestPath()}: tools.${tool} must pin a package and version`);
@@ -86,6 +109,37 @@ export function serenaPin(): ToolPin {
 
 export function playwrightPin(): ToolPin {
   return pinFor('playwright');
+}
+
+/** FEAT-151 — the container CLI pin (claude-code). Container isolation only. */
+export function claudeCodePin(): ToolPin {
+  return pinFor('claude-code');
+}
+
+/**
+ * FEAT-151 finding #5 — the on-demand container update WRITES the pin. The
+ * existing rebuild installs whatever provision.json already says, so an update
+ * that only "reuses rebuild" changes nothing: the target version must be written
+ * into provision.json FIRST (which changes provisionHash() → a new image tag →
+ * the drift check sees it), and only then is a rebuild meaningful.
+ *
+ * The version is validated as an exact semver by the caller (runtime route); the
+ * name is fixed (`claude-code`) so this can never repoint the pin at another
+ * package. Writes atomically, preserving the manifest's other tools verbatim.
+ * Returns { changed } so a no-op (already at that version) is visible.
+ */
+export function writeClaudeCodePin(version: string): { changed: boolean; previous: string } {
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`invalid claude-code version ${JSON.stringify(version)} — an exact semver is required`);
+  }
+  const manifest = readProvisionManifest();
+  const pin = manifest.tools['claude-code'];
+  if (!pin) throw new Error('provision.json has no claude-code tool to pin');
+  const previous = pin.version;
+  if (previous === version) return { changed: false, previous };
+  pin.version = version;
+  writeAtomic(provisionManifestPath(), JSON.stringify(manifest, null, 2) + '\n');
+  return { changed: true, previous };
 }
 
 /* ------------------------------------------------------------------- hash */
@@ -282,9 +336,11 @@ export function hostProvisionState(opts: { verify?: boolean } = {}): HostProvisi
   return hostProvisionStateFor('serena', opts);
 }
 
-/** Every pinned tool's host state — what a pre-flight MCP panel renders. */
+/** Every pinned tool's host state — what a pre-flight MCP panel renders.
+ * finding #9: container-only pins (claude-code) are excluded — host sessions
+ * never install them. */
 export function hostProvisionStates(opts: { verify?: boolean } = {}): HostProvisionStatus[] {
-  return manifestTools().map(({ name }) => hostProvisionStateFor(name, opts));
+  return manifestToolsFor('host').map(({ name }) => hostProvisionStateFor(name, opts));
 }
 
 function run(cmd: string, args: string[], env: NodeJS.ProcessEnv, timeoutMs: number, onLog?: (s: string) => void): Promise<{ code: number; out: string }> {
@@ -402,7 +458,9 @@ export async function provisionHost(opts: { force?: boolean; onLog?: (s: string)
 /** Provision EVERY pinned tool on the host — the "Provision all" the CLI/panel runs. */
 export async function provisionAllHost(opts: { force?: boolean; onLog?: (s: string) => void } = {}): Promise<ProvisionResult[]> {
   const out: ProvisionResult[] = [];
-  for (const { name } of manifestTools()) {
+  // finding #9 — host provisioning installs ONLY host-applicable tools; a
+  // container-only pin (claude-code) is skipped here, never installed standalone.
+  for (const { name } of manifestToolsFor('host')) {
     out.push(await provisionToolOnHost(name, opts));
   }
   return out;

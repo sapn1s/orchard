@@ -129,21 +129,22 @@ async function main() {
       return (head.match(/:\d+/g) ?? []);
     };
 
-    // FEAT-139 took BUG-082's invariant to its end: the strip FACE is a live
-    // readout, so it no longer previews ANY ports inline — it shows only a
-    // compact "N ports" count and the full list lives ONLY in the popover below.
-    // So the face carries zero ":NNNN" tokens and no "+N" overflow at all.
+    // FEAT-139 took BUG-082's invariant to its end, and FEAT-139 round 3
+    // reduced the FACE to the pattern-matchable minimum: a glyph + a SINGLE
+    // count number (no "ports"/"procs" unit word — that survives in the tooltip
+    // + the popover). So the face carries zero ":NNNN" tokens, no "+N" overflow,
+    // and reads as just "9".
     check('face shows NO inline port tokens (must FAIL pre-FEAT-139: ports dumped inline)',
       inlinePorts().length === 0, `inline=${JSON.stringify(inlinePorts())} | text=${JSON.stringify(chipText())}`);
-    check('face is a compact port count "9 ports" (must FAIL pre-FEAT-139: port list + proc count)',
-      chipText() === '9 ports', `text=${JSON.stringify(chipText())}`);
+    check('face is a bare count "9" (must FAIL pre-r3: carried the "ports" unit word / a list)',
+      chipText() === '9', `text=${JSON.stringify(chipText())}`);
 
     // ---- Chip width bounded: the face is a single count no matter how many
     // ports the poll reports (the whole point, strengthened by FEAT-139). ----
     st.procSummary = { p1: { count: 40, ports: Array.from({ length: 30 }, (_, i) => 40000 + i).concat(4317), hasSelf: true } };
     paintChip();
-    check('width bounded: 31 ports still renders a single "31 ports" count, never a list',
-      inlinePorts().length === 0 && chipText() === '31 ports', `inline=${inlinePorts().length} text=${JSON.stringify(chipText())}`);
+    check('width bounded: 31 ports still renders a single "31" count, never a list',
+      inlinePorts().length === 0 && chipText() === '31', `inline=${inlinePorts().length} text=${JSON.stringify(chipText())}`);
 
     // ---- Stable across re-renders: same set, shuffled input, same face text. ----
     const SET = [44913, 4317, 37825, 35873]; // 4 ports
@@ -153,8 +154,8 @@ async function main() {
     st.procSummary = { p1: { count: 6, ports: [...SET].reverse(), hasSelf: true } };
     paintChip();
     const t2 = chipText();
-    check('stable face: same port set in a different input order → identical "4 ports" text',
-      t1 === t2 && t1 === '4 ports', `t1=${JSON.stringify(t1)} t2=${JSON.stringify(t2)}`);
+    check('stable face: same port set in a different input order → identical "4" text',
+      t1 === t2 && t1 === '4', `t1=${JSON.stringify(t1)} t2=${JSON.stringify(t2)}`);
 
     // ---- Clicking #procBtn opens #procPop listing ALL ports (the full view). ----
     st.procSummary = { p1: { count: 11, ports: RAW, hasSelf: true } };
@@ -182,14 +183,14 @@ async function main() {
     // crown assertion — one scratch port must still read ":NNNN · 1 proc"). ----
     st.procSummary = { p1: { count: 1, ports: [51515], hasSelf: false } };
     paintChip();
-    check('single port: compact "1 port" face, singular grammar (FEAT-139 face)',
-      chipText() === '1 port', `text=${JSON.stringify(chipText())}`);
+    check('single port: bare count "1" face (FEAT-139 r3 — unit moves to tooltip/popover)',
+      chipText() === '1', `text=${JSON.stringify(chipText())}`);
 
     // ---- Anti-regression: no ports → just the proc count, chip still shown. ----
     st.procSummary = { p1: { count: 3, ports: [], hasSelf: false } };
     paintChip();
-    check('no ports: chip shows only the proc count (no dangling separator)',
-      chipText() === '3 procs' && q('#procBtn').hidden === false, `text=${JSON.stringify(chipText())} hidden=${q('#procBtn').hidden}`);
+    check('no ports: chip shows only the bare proc count "3" (no dangling separator)',
+      chipText() === '3' && q('#procBtn').hidden === false, `text=${JSON.stringify(chipText())} hidden=${q('#procBtn').hidden}`);
 
     // ---- Anti-regression: zero processes hides the chip AND closes any pop. ----
     if (S.paintProcPop) { S.paintProcPop(); q('#procPop')?.classList.add('open'); }

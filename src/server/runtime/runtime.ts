@@ -278,6 +278,28 @@ export interface RuntimeStartConfig {
    * append}`) which the adapter forwards to the SDK's `Options.systemPrompt`.
    */
   systemPrompt?: string | { type: 'preset'; preset: 'claude_code'; append: string };
+  /**
+   * BUG-187 C1 — ATTACH MODE. The engine process already exists (a surviving
+   * broker's CLI) and `spawnProcess` is the attach facade: push NO first prompt,
+   * hold nothing for MCP readiness, and leave the input queue open and empty —
+   * adoption must never manufacture a user turn (review round 2, point 1).
+   */
+  attach?: boolean;
+}
+
+/** BUG-187 C2 — what the engine said about this runtime's `initialize`. */
+export interface RuntimeInitOutcome {
+  /** Did the initialize succeed at all? */
+  ok: boolean;
+  /** Were hooks carried on the initialize? */
+  hooksSent: boolean;
+  /** The engine's `hooks_applied` (undefined = absent). */
+  hooksApplied: boolean | undefined;
+  /** `hooks-not-applied`: hooks were sent and the engine did not say `true`. */
+  adoptOutcome: 'ok' | 'hooks-not-applied' | 'init-failed';
+  /** Permission prompts the engine redelivered on the initialize answer. */
+  pendingPermissionIds: string[];
+  error?: string;
 }
 
 /**
@@ -330,4 +352,6 @@ export interface AgentRuntime {
    * simply has its provider errors relayed by the legacy paths only.
    */
   classifyProviderError?(msg: RuntimeMessage): ProviderError | null;
+  /** OPTIONAL (BUG-187 C2): resolves once the engine answered this runtime's `initialize`. */
+  initOutcome?(): Promise<RuntimeInitOutcome>;
 }

@@ -36,6 +36,22 @@ import { parseDispatchDeclaration } from '../../scripts/lib/cost-model.mjs';
 export const STARTED_BY_VALUES = new Set(['user', 'agent']);
 
 /**
+ * The CLI's `entrypoint` for an INTERACTIVE session (a person at a terminal).
+ * Everything else the CLI declares — `sdk-cli`, `sdk-ts` — is a programmatic run
+ * (the Agent SDK's `query()`, an external `claude -p`, a test harness).
+ */
+export const INTERACTIVE_ENTRYPOINT = 'cli';
+
+/**
+ * True when the CLI declared a PROGRAMMATIC launch channel (not the interactive
+ * `cli`). A missing/blank entrypoint is NOT programmatic: legacy transcripts
+ * predate the field and must never be hidden on its absence.
+ */
+export function isProgrammaticEntrypoint(entrypoint) {
+  return typeof entrypoint === 'string' && entrypoint.trim() !== '' && entrypoint !== INTERACTIVE_ENTRYPOINT;
+}
+
+/**
  * MIRROR of src/lib/paths.ts#dataDir(). Any change there must change here too;
  * verify-session-provenance.mjs fails if they diverge. Self-contained so the
  * dispatch subprocess never needs the TypeScript module loaded.
@@ -171,4 +187,34 @@ export function resolveStartedBy({ sessionId, firstUserMessage, record } = {}) {
   if (rec && STARTED_BY_VALUES.has(rec.startedBy)) return rec.startedBy;
   if (looksAgentDispatched(firstUserMessage)) return 'agent';
   return 'user';
+}
+
+/**
+ * Should this session FOLD out of the default navigation list?
+ *
+ * THE ONE FACT THE NAV LIST ACTS ON, declared here so no reader re-derives it
+ * (CONVENTIONS / ARCH-010). "Orchard launched this" is not a heuristic: EVERY
+ * session Orchard starts — a dashboard session AND a dispatched lane — writes a
+ * provenance record at `system:init` / dispatch (`recordSessionProvenance`). So:
+ *
+ *   1. HAS an Orchard record → the record's `startedBy` decides:
+ *        'agent' (dispatch/verify lane) → FOLD; 'user' (a session the user
+ *        launched/uses through the dashboard — sdk-ts, but Orchard's) → SHOW.
+ *   2. NO record, but the first message is a `Dispatch:` declaration → a lane
+ *        that predates provenance → FOLD (the same conservative fallback the
+ *        picker's provenance test uses).
+ *   3. NO record and NO declaration → Orchard did not launch it. FOLD only when
+ *        the CLI declares a PROGRAMMATIC entrypoint (an external `claude -p`, an
+ *        SDK script, a test harness — e.g. the ~1038 `sdk-cli` transcripts in
+ *        one dir the user reported). Interactive `cli` sessions and legacy
+ *        transcripts with no entrypoint field stay VISIBLE.
+ *
+ * FOLD is presentation-only: the row's transcript and its URL are untouched, so
+ * a hidden session still opens on a direct deep link.
+ */
+export function foldsFromDefaultList({ sessionId, entrypoint, firstUserMessage, record } = {}) {
+  const rec = record ?? (sessionId ? readSessionProvenance(sessionId) : null);
+  if (rec && STARTED_BY_VALUES.has(rec.startedBy)) return rec.startedBy === 'agent';
+  if (looksAgentDispatched(firstUserMessage)) return true;
+  return isProgrammaticEntrypoint(entrypoint);
 }

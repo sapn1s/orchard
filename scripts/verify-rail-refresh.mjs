@@ -9,15 +9,19 @@
  * server. Everything is real: a scratch project with an opt-in docs/bugs/
  * board, registered through the API, rendered by the real public/app.js.
  *
+ * FEAT-153 — the rail's immediate view is the BOARD GRID (needs-you tickets are
+ * grid cards; the answer flow opens on click, mounted in #railNeeds). The BUG-016
+ * live-mirror invariants are unchanged, retargeted to the new surfaces:
+ *
  * Checks:
  *   (a) a card resolved OUT OF BAND — a chat/orchestrator-style append of the
- *       answer mark directly to the ticket file, NOT via the card's own Respond
- *       button — disappears from the rail within the poll interval, with NO
- *       manual reload;
+ *       answer mark directly to the ticket file, NOT via the answer flow —
+ *       disappears from the grid within the poll interval, with NO manual reload;
  *   (b) a 👤 item added OUT OF BAND — a fresh ticket file + an INDEX.md row,
- *       simulating an orchestrator INDEX edit — appears in the rail the same way;
- *   (c) a card the user is mid-typing in (still present in the board's set)
- *       is NOT wiped/reset by a background poll that happens while they type.
+ *       simulating an orchestrator INDEX edit — appears in the grid the same way;
+ *   (c) an OPEN answer flow the user is mid-typing in (its ticket still in the
+ *       board's set) is NOT wiped/reset/blurred by a background poll — the single
+ *       mounted card is preserved across the reconcile.
  *
  * Ports are OS-assigned (VERIFY_RAIL_REFRESH_PORT pins one); never 4317 (the
  * live server). Processes are killed by PID, never pkill.
@@ -113,9 +117,12 @@ function writeIndex(rows) {
     rows.map((r) => `| ${r.id} | ${r.title} | 👤 | needs decision | med |\n`).join('') +
     `\n## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
 }
-function writeTicket(id, title) {
+function writeTicket(id, title, { question = false } = {}) {
+  // An answerable ticket needs a `## Question` (BUG-025); ID_STAYS carries one so
+  // clicking its grid card opens the answer flow the user then types into.
+  const q = question ? `## Question\nWhich way should this go?\n- one\n- two\n\n` : '';
   fs.writeFileSync(path.join(bugsDir, `${id}-t.md`),
-    `# ${id} — ${title}\n\n- **Status:** OPEN\n\n## Activity log (APPEND-ONLY)\n\n### 2026-08-04 — orchestrator\n- filed.\n`);
+    `# ${id} — ${title}\n\n- **Status:** OPEN\n\n${q}## Activity log (APPEND-ONLY)\n\n### 2026-08-04 — orchestrator\n- filed.\n`);
 }
 
 async function seedBoard() {
@@ -124,7 +131,7 @@ async function seedBoard() {
     { id: ID_STAYS, title: 'keep this response field intact across a poll' },
     { id: ID_RESOLVED_OOB, title: 'ack this one out of band, like a chat resolution' },
   ]);
-  writeTicket(ID_STAYS, 'keep this response field intact across a poll');
+  writeTicket(ID_STAYS, 'keep this response field intact across a poll', { question: true });
   writeTicket(ID_RESOLVED_OOB, 'ack this one out of band, like a chat resolution');
 }
 
@@ -180,28 +187,31 @@ async function main() {
     row.click(); return true;
   })()`);
 
-  console.log('\n=== rail-refresh: boot with two 👤 cards ===');
+  console.log('\n=== rail-refresh: boot with two 👤 grid cards ===');
   await cdp.send('Page.navigate', { url: `${BASE}/` });
   await cdp.waitFor('boot', `document.querySelectorAll('#tree button.proj').length >= 1`, 30_000);
   const picked = await clickProj('Rail Refresh');
   check('PRECONDITION: the seeded project is in the sidebar and selectable', picked, `clicked=${picked}`);
-  await cdp.waitFor('two needs-you cards', `document.querySelectorAll('#railNeeds .needs-card').length === 2`, 20_000);
+  await cdp.waitFor('two needs-you grid cards', `document.querySelectorAll('#railBoardGrid .tc[data-state="needs"]').length === 2`, 20_000);
 
   const pollMs = await cdp.eval(`window.__station?.RAIL_POLL_MS ?? 0`);
   check('PRECONDITION: the page exposes a poll interval for the rail (the fix under test)', pollMs > 0, `RAIL_POLL_MS=${pollMs}`);
   const waitMs = (pollMs > 0 ? pollMs : 5000) + 4000; // one full cycle + slack, no manual refresh call
 
-  // Type a partial, unsubmitted answer into the card that STAYS — and focus it,
-  // exactly like a user paused mid-thought while a poll fires in the background.
+  // Open the answer flow for the card that STAYS, type a partial unsubmitted
+  // answer, and focus it — exactly like a user paused mid-thought while a poll
+  // fires in the background.
+  await cdp.eval(`document.querySelector('#railBoardGrid .tc[data-id=${JSON.stringify(ID_STAYS)}]').click()`);
+  await cdp.waitFor('answer mounted', `!!document.querySelector('#railNeeds .needs-card[data-id=${JSON.stringify(ID_STAYS)}] textarea.nc-input')`, 10_000);
   await cdp.eval(`(() => {
-    const c = document.querySelector('.needs-card[data-id=${JSON.stringify(ID_STAYS)}]');
+    const c = document.querySelector('#railNeeds .needs-card[data-id=${JSON.stringify(ID_STAYS)}]');
     const ta = c.querySelector('textarea.nc-input');
     ta.focus();
     ta.value = ${JSON.stringify(PARTIAL_TEXT)};
     ta.dispatchEvent(new Event('input', { bubbles: true }));
   })()`);
-  const typedOk = await cdp.eval(`document.querySelector('.needs-card[data-id=${JSON.stringify(ID_STAYS)}] textarea.nc-input')?.value`);
-  check('PRECONDITION: the partial answer was typed into the surviving card', typedOk === PARTIAL_TEXT, typedOk);
+  const typedOk = await cdp.eval(`document.querySelector('#railNeeds .needs-card[data-id=${JSON.stringify(ID_STAYS)}] textarea.nc-input')?.value`);
+  check('PRECONDITION: the partial answer was typed into the open answer flow', typedOk === PARTIAL_TEXT, typedOk);
 
   console.log('\n=== rail-refresh: resolve one card OUT OF BAND (not via its Respond button) ===');
   // Simulate a chat ack / orchestrator resolution: append the rail's own answer
@@ -218,30 +228,34 @@ async function main() {
   ]);
 
   console.log(`\n=== rail-refresh: wait up to ${waitMs}ms for the LIVE mirror to catch up — NO reload ===`);
-  const settled = await cdp.waitFor('rail reconciled to the out-of-band truth',
+  const settled = await cdp.waitFor('grid reconciled to the out-of-band truth',
     `(() => {
-      const ids = [...document.querySelectorAll('#railNeeds .needs-card')].map((c) => c.dataset.id);
+      const ids = [...document.querySelectorAll('#railBoardGrid .tc')].map((c) => c.dataset.id);
       return ids.includes(${JSON.stringify(ID_ADDED_OOB)}) && !ids.includes(${JSON.stringify(ID_RESOLVED_OOB)}) && ids.includes(${JSON.stringify(ID_STAYS)});
     })()`, waitMs);
 
   const finalState = await cdp.eval(`(() => {
-    const cards = [...document.querySelectorAll('#railNeeds .needs-card')];
+    const cards = [...document.querySelectorAll('#railBoardGrid .tc')];
+    const ta = document.querySelector('#railNeeds .needs-card[data-id=${JSON.stringify(ID_STAYS)}] textarea.nc-input');
     return {
       ids: cards.map((c) => c.dataset.id),
-      staysTextareaValue: document.querySelector('.needs-card[data-id=${JSON.stringify(ID_STAYS)}] textarea.nc-input')?.value ?? null,
-      staysStillFocused: document.activeElement === document.querySelector('.needs-card[data-id=${JSON.stringify(ID_STAYS)}] textarea.nc-input'),
+      mountPresent: !!ta,
+      staysTextareaValue: ta?.value ?? null,
+      staysStillFocused: document.activeElement === ta,
     };
   })()`);
 
-  check('(a) the OUT-OF-BAND-resolved card DISAPPEARED without a manual reload',
+  check('(a) the OUT-OF-BAND-resolved card DISAPPEARED from the grid without a manual reload',
     !finalState.ids.includes(ID_RESOLVED_OOB), JSON.stringify(finalState.ids));
-  check('(b) the OUT-OF-BAND-added card APPEARED without a manual reload',
+  check('(b) the OUT-OF-BAND-added card APPEARED in the grid without a manual reload',
     finalState.ids.includes(ID_ADDED_OOB), JSON.stringify(finalState.ids));
   check('    both reconciled inside one poll cycle (the waitFor condition itself settled)',
     settled, `settled=${settled}`);
-  check('(c) the still-present card\'s half-typed answer was NOT wiped by the background poll',
+  check('(c) the open answer flow survived the background poll (still mounted)',
+    finalState.mountPresent, `mounted=${finalState.mountPresent}`);
+  check('    its half-typed answer was NOT wiped by the background poll',
     finalState.staysTextareaValue === PARTIAL_TEXT, finalState.staysTextareaValue);
-  check('    the still-present card\'s textarea kept focus across the poll (not remounted)',
+  check('    its textarea kept focus across the poll (not remounted)',
     finalState.staysStillFocused, `focused=${finalState.staysStillFocused}`);
 
   cdp.close();

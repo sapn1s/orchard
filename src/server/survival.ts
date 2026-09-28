@@ -21,24 +21,27 @@
  *     transcript to disk. A restarted server RE-ADOPTS surviving brokers by
  *     scanning the hosts dir.
  *
- * HONEST BOUNDARY (the residual transport gap). The Agent SDK owns the
- * conversation transport INSIDE `query()`: a fresh `query({resume})` always
- * SPAWNS a new CLI via `spawnClaudeCodeProcess` and performs its own init
- * handshake — it cannot be handed the mid-flight stream of an already-running,
- * already-initialised CLI. So a restarted server cannot inject a brand-new turn
- * into the STILL-RUNNING surviving CLI. What survival guarantees is that no
- * in-flight work is killed or orphaned: the turn + its sub-agents finish and the
- * transcript is written. The restarted server re-adopts each surviving broker,
- * lets its turn drain, and reaps it; the thread then continues by the normal,
- * already-working resume-from-disk path (a new turn on a fresh CLI reading the
- * completed transcript). See the FEAT-015 ticket for the full write-up.
+ * RE-ATTACH (BUG-187). A restarted server does not have to leave a surviving
+ * CLI without a responder. The SDK's `query()` accepts a `spawnClaudeCodeProcess`
+ * override, and `attachSurvivable()` below returns one that spawns NOTHING: it
+ * connects to the existing broker's socket, so the SDK's normal first
+ * `initialize` becomes the running CLI's REPEATED initialize. The CLI answers it
+ * as its stdin owner (`hooks_applied: true`), cancels the hook callbacks it was
+ * still waiting on (the model retries them against the new responder), and
+ * redelivers its pending permission prompts with their original request ids
+ * (measured on CLI 2.1.281, BUG-187 round 2). The broker speaks a small in-band
+ * protocol with its client (`orchard_broker_*` lines, protocol 2) which the
+ * transport below strips before the SDK sees a byte.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as path from 'node:path';
+import * as outcomes from './outcomes.ts';
+import { RequestFloor } from './request-floor.mjs';
 
 import { dataDir, dataDirMode, ensureDir, isInside, projectRoot } from '../lib/paths.ts';
 /*
@@ -79,6 +82,8 @@ export interface HostStatus {
   status: string;
   stationSessionId?: string;
   resumeHint?: string | null;
+  /** BUG-187 I1 — the project this session belongs to (absent on an older broker's record). */
+  projectId?: string | null;
   /**
    * The CLI's ACTUAL on-disk session id (the transcript file name), learned by
    * the broker from the CLI's stream-json `init` message and written back here.
@@ -138,6 +143,42 @@ export interface HostStatus {
    * and `ownerEntitlesAdoption` says what happens then.
    */
   owner?: HostOwner;
+  /**
+   * BUG-187 — broker protocol 2 declarations. All optional: an older broker's
+   * record simply lacks them, and every reader treats an absent value as
+   * UNKNOWN — never as "attached", never as "healthy", never as `no`.
+   *  - `protocol`/`seq`/`statusWriteFailedAt`: freshness (H1). A reader can tell
+   *    a stale record from a fresh one, and a failed write is declared.
+   *  - `startedTasks`: lanes started (e.g. revived) that the level may not list (H2).
+   *  - `responder`/`responderLostAt`/`adoptedAt`: is anyone attached to answer
+   *    this CLI, and since when not.
+   *  - `refusals`/`pendingRequests`/`pendingUnowned`/`lanes`: the request floor's
+   *    ledger (H4/H5); a lane is `blocked` once refused, then `stopRequested`,
+   *    then `stopped` (or `stopUnconfirmed`).
+   *  - `acceptingInput`: false from the moment the broker ended the CLI's stdin (H7).
+   */
+  protocol?: number;
+  seq?: number;
+  statusWriteFailedAt?: string | null;
+  startedTasks?: string[];
+  responder?: 'attached' | 'none';
+  responderLostAt?: string | null;
+  adoptedAt?: string | null;
+  refusals?: number;
+  pendingRequests?: number;
+  pendingUnowned?: number;
+  lanes?: BrokerLane[];
+  acceptingInput?: boolean;
+}
+
+/** BUG-187 H5 — one lane's floor state, as the broker declares it. */
+export interface BrokerLane {
+  id: string;
+  refusals: number;
+  blockedSince: string | null;
+  stopRequestedAt: string | null;
+  stoppedAt: string | null;
+  stopUnconfirmed: boolean;
 }
 
 /**
@@ -164,6 +205,160 @@ export interface SurvivalHandle {
   probe(): SurvivalProbe;
   /** The same answer, unreduced — evidence, `since` and the FEAT-057 `ended` slot. */
   livenessNow(): Liveness;
+  /** BUG-187 — the in-band channel to the broker (protocol 2), or its absence. */
+  broker: BrokerChannel;
+}
+
+/**
+ * BUG-187 H3 — the client side of the broker's in-band protocol. The broker's
+ * `orchard_broker_*` lines are consumed here and never reach the SDK.
+ *  - `hello`: resolves with the broker's hello (`accepted`, `protocol`), or
+ *    `null` for a pre-protocol-2 broker (no hello within the window) or a
+ *    closed socket.
+ *  - `reclaim`: resolves with the broker's reclaim verdict after this client's
+ *    `initialize` was answered, or `null` if none arrives.
+ *  - `lifetimeQuery()`: the broker's OWN lifetime answer (the one it holds its
+ *    drain on), or `null` on timeout / old broker.
+ */
+export interface BrokerChannel {
+  hello: Promise<BrokerHello | null>;
+  reclaim: Promise<{ ok: boolean; reason?: string } | null>;
+  lifetimeQuery(timeoutMs?: number): Promise<BrokerLifetimeAnswer | null>;
+  deliver(message: unknown, timeoutMs?: number): Promise<{ accepted: boolean; reason?: string } | null>;
+}
+export interface BrokerHello { accepted: boolean; protocol: number; hostKey?: string; reason?: string }
+export interface BrokerLifetimeAnswer { lifetime: 'yes' | 'unknown' | 'no'; seq: number; statusWriteFailedAt: string | null; midTurn?: boolean }
+
+const BROKER_LINE_START = '{"type":"orchard_broker_';
+/** How long a connected client waits for a hello before concluding "old broker". */
+const HELLO_WINDOW_MS = Number(process.env.CLAUDE_STATION_BROKER_HELLO_MS ?? 1500);
+
+/**
+ * Wire a connected broker socket to the SDK-facing streams, stripping the
+ * broker's own lines out of the stream and routing them to the channel.
+ * Returns the channel. Lines are forwarded whole; a partial line waits for its
+ * newline (the SDK parses whole lines anyway).
+ */
+function wireBrokerSocket(
+  s: net.Socket,
+  stdin: PassThrough,
+  stdout: PassThrough,
+  channel: BrokerChannelImpl,
+  /**
+   * BUG-187 B5 (attach facade only): a line tap on both directions, so the
+   * request floor can run CLIENT-side for an older broker that has none.
+   * `cli(line)` sees each CLI→SDK line; `sdk(line)` sees each SDK→CLI line and
+   * returns false to DROP it (a second answer to an id the floor already
+   * settled). Without a tap, stdin is piped straight through as before.
+   */
+  tap?: { cli: (line: string) => void; sdk: (line: string) => boolean },
+): void {
+  const decoder = new StringDecoder('utf8');
+  let buf = '';
+  s.on('data', (d: Buffer) => {
+    buf += decoder.write(d);
+    let start = 0;
+    let nl: number;
+    let out = '';
+    while ((nl = buf.indexOf('\n', start)) >= 0) {
+      const line = buf.slice(start, nl);
+      start = nl + 1;
+      if (line.startsWith(BROKER_LINE_START)) {
+        let m: Record<string, unknown> | null = null;
+        try { m = JSON.parse(line); } catch { m = null; }
+        if (m) channel.onLine(m);
+        continue;
+      }
+      tap?.cli(line);
+      out += `${line}\n`;
+    }
+    buf = buf.slice(start);
+    if (out) stdout.write(out);
+  });
+  if (!tap) {
+    stdin.pipe(s);
+  } else {
+    const inDecoder = new StringDecoder('utf8');
+    let inBuf = '';
+    stdin.on('data', (d: Buffer | string) => {
+      inBuf += typeof d === 'string' ? d : inDecoder.write(d);
+      let nl: number;
+      let out = '';
+      while ((nl = inBuf.indexOf('\n')) >= 0) {
+        const line = inBuf.slice(0, nl);
+        inBuf = inBuf.slice(nl + 1);
+        if (tap.sdk(line)) out += `${line}\n`;
+      }
+      if (out && !s.destroyed) { try { s.write(out); } catch { /* socket gone */ } }
+    });
+    stdin.on('end', () => { try { s.end(); } catch { /* ignore */ } });
+  }
+  channel.attachSocket(s);
+}
+
+class BrokerChannelImpl implements BrokerChannel {
+  hello: Promise<BrokerHello | null>;
+  reclaim: Promise<{ ok: boolean; reason?: string } | null>;
+  #resolveHello!: (h: BrokerHello | null) => void;
+  #resolveReclaim!: (r: { ok: boolean; reason?: string } | null) => void;
+  #socket: net.Socket | null = null;
+  #seq = 0;
+  #waiters = new Map<string, (m: Record<string, unknown> | null) => void>();
+  #helloSeen: BrokerHello | null = null;
+  constructor() {
+    this.hello = new Promise((r) => { this.#resolveHello = r; });
+    this.reclaim = new Promise((r) => { this.#resolveReclaim = r; });
+  }
+  attachSocket(s: net.Socket): void {
+    this.#socket = s;
+    // No hello inside the window = a pre-protocol-2 broker (it never sends one).
+    const t = setTimeout(() => this.#resolveHello(null), HELLO_WINDOW_MS);
+    t.unref?.();
+    s.on('close', () => {
+      this.#resolveHello(null);
+      this.#resolveReclaim(null);
+      for (const w of this.#waiters.values()) w(null);
+      this.#waiters.clear();
+    });
+  }
+  get protocol(): number { return this.#helloSeen?.protocol ?? 0; }
+  onLine(m: Record<string, unknown>): void {
+    const kind = String(m.type).slice('orchard_broker_'.length);
+    if (kind === 'hello') {
+      this.#helloSeen = { accepted: m.accepted === true, protocol: Number(m.protocol) || 0, hostKey: m.hostKey as string | undefined, reason: m.reason as string | undefined };
+      this.#resolveHello(this.#helloSeen);
+    } else if (kind === 'reclaim') {
+      this.#resolveReclaim({ ok: m.ok === true, reason: typeof m.reason === 'string' ? m.reason : undefined });
+    } else if (kind === 'lifetime_a' || kind === 'deliver_ack') {
+      const key = `${kind}:${String(kind === 'lifetime_a' ? m.id : m.delivery_id)}`;
+      const w = this.#waiters.get(key);
+      if (w) { this.#waiters.delete(key); w(m); }
+    }
+  }
+  #ask(kind: 'lifetime_q' | 'deliver', payload: Record<string, unknown>, answerKind: string, idField: string, timeoutMs: number): Promise<Record<string, unknown> | null> {
+    const s = this.#socket;
+    if (!s || s.destroyed || this.protocol < 2) return Promise.resolve(null);
+    const id = `c${++this.#seq}`;
+    return new Promise((resolve) => {
+      const key = `${answerKind}:${id}`;
+      const t = setTimeout(() => { this.#waiters.delete(key); resolve(null); }, timeoutMs);
+      t.unref?.();
+      this.#waiters.set(key, (m) => { clearTimeout(t); resolve(m); });
+      try { s.write(`${JSON.stringify({ type: `orchard_broker_${kind}`, [idField]: id, ...payload })}\n`); } catch { clearTimeout(t); this.#waiters.delete(key); resolve(null); }
+    });
+  }
+  async lifetimeQuery(timeoutMs = 2000): Promise<BrokerLifetimeAnswer | null> {
+    const m = await this.#ask('lifetime_q', {}, 'lifetime_a', 'id', timeoutMs);
+    if (!m) return null;
+    const lt = m.lifetime;
+    if (lt !== 'yes' && lt !== 'no' && lt !== 'unknown') return null;
+    return { lifetime: lt, seq: Number(m.seq) || 0, statusWriteFailedAt: (m.statusWriteFailedAt as string | null) ?? null, midTurn: m.midTurn === true };
+  }
+  async deliver(message: unknown, timeoutMs = 5000): Promise<{ accepted: boolean; reason?: string } | null> {
+    const m = await this.#ask('deliver', { message }, 'deliver_ack', 'delivery_id', timeoutMs);
+    if (!m) return null;
+    return { accepted: m.accepted === true, reason: typeof m.reason === 'string' ? m.reason : undefined };
+  }
 }
 
 export function hostsDir(): string {
@@ -279,6 +474,16 @@ function newHostKey(): string {
 }
 
 /**
+ * The exit code/signal a broker RECORDED for its CLI when the socket closed on
+ * us (it only closes it once the CLI has exited). One reader for both facades
+ * (spawn and BUG-187 attach), so the broker's verdict is read in one place.
+ */
+function recordedExit(st: HostStatus | null): [number | null, NodeJS.Signals | null] {
+  if (st && st.state === 'exited') return [st.exitCode, (st.signal as NodeJS.Signals | null) ?? null];
+  return [null, null];
+}
+
+/**
  * Launch the CLI under a broker in its own systemd scope and return a
  * SpawnedProcess the SDK can drive. Synchronous return (the SDK requires it):
  * the returned stdin/stdout are PassThroughs that buffer until the broker's
@@ -288,7 +493,7 @@ function newHostKey(): string {
  */
 export function spawnSurvivable(
   o: SurvivalSpawnOptions,
-  meta: { stationSessionId: string; resumeHint?: string | null },
+  meta: { stationSessionId: string; resumeHint?: string | null; projectId?: string | null },
 ): { proc: SpawnedProcessLike; handle: SurvivalHandle } {
   ensureDir(hostsDir());
   const key = newHostKey();
@@ -305,7 +510,7 @@ export function spawnSurvivable(
     // it is the adoption entitlement (server side) and the broker's orphan
     // liveness token (host side).
     owner,
-    meta: { stationSessionId: meta.stationSessionId, resumeHint: meta.resumeHint ?? null, owner },
+    meta: { stationSessionId: meta.stationSessionId, resumeHint: meta.resumeHint ?? null, projectId: meta.projectId ?? null, owner },
   }), { mode: 0o600 });
 
   // The broker (and thus the CLI) lands in a fresh transient scope cgroup,
@@ -353,6 +558,7 @@ export function spawnSurvivable(
   const emitter = new EventEmitter();
   const stdin = new PassThrough();
   const stdout = new PassThrough();
+  const channel = new BrokerChannelImpl();
   let socket: net.Socket | null = null;
   let killed = false;
   let exited = false;
@@ -432,16 +638,15 @@ export function spawnSurvivable(
     s.on('connect', () => {
       socket = s;
       everConnected = true; // the broker is up in its scope — this is NOT a scope-launch failure
-      stdin.pipe(s);
-      s.pipe(stdout, { end: false });
+      // BUG-187: the broker's in-band lines are stripped here, never reach the SDK.
+      wireBrokerSocket(s, stdin, stdout, channel);
     });
     s.on('close', () => {
       if (killed) { emitExit(exitCode, signalCode); return; }
       // Socket closed without our asking — the broker ended it, which it only
       // does when the CLI has exited. Read the recorded exit code.
-      const st = readStatus();
-      if (st && st.state === 'exited') emitExit(st.exitCode, (st.signal as NodeJS.Signals | null) ?? null);
-      else emitExit(null, null);
+      const [code, sig] = recordedExit(readStatus());
+      emitExit(code, sig);
     });
     s.on('error', () => { /* close handler settles exit */ });
   };
@@ -488,9 +693,296 @@ export function spawnSurvivable(
       return asProbe(livenessNow());
     },
     livenessNow,
+    broker: channel,
   };
 
   return { proc, handle };
+}
+
+/** The attach facade's handle: a survival handle whose reap is GATED on a confirmed adoption. */
+export interface AttachHandle extends SurvivalHandle {
+  /** Set by the bridge once hello.accepted + init success (+ protocol-2 reclaim.ok) all arrived. */
+  confirmAdoption(): void;
+  readonly adoptionConfirmed: boolean;
+  /**
+   * BUG-187 B3/B5 — an OLDER broker (no floor of its own) whose engine did not
+   * apply this server's hooks: run the shared request floor here, client-side.
+   * A hook callback the SDK leaves unanswered past its grace is refused; a
+   * permission prompt the SDK surfaced (a card) is OWNED and never refused.
+   * Its limit, stated: a request the CLI emitted before this attach reached
+   * nobody, so no client can see it — the broker would have to replay it.
+   */
+  enableClientFloor(): void;
+}
+
+/**
+ * BUG-187 S1 — the ATTACH facade. Same `SpawnedProcessLike` shape as
+ * `spawnSurvivable`'s, but it spawns NOTHING: it connects to an existing
+ * broker's socket, so the SDK's first `initialize` becomes the running CLI's
+ * repeated initialize (it re-registers this server's hooks, cancels the hook
+ * callbacks it was waiting on, and redelivers pending permission prompts).
+ *
+ * `kill()` only disconnects (exactly like spawnSurvivable's). `reap()` is a
+ * NO-OP until the bridge confirms the adoption: a losing or failed adopter must
+ * never SIGTERM a broker another server owns (review round 2, point 3).
+ */
+export function attachSurvivable(st: HostStatus): { proc: SpawnedProcessLike; handle: AttachHandle } {
+  const emitter = new EventEmitter();
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const channel = new BrokerChannelImpl();
+  let socket: net.Socket | null = null;
+  let killed = false;
+  let exited = false;
+  let everConnected = false;
+  let exitCode: number | null = null;
+  let signalCode: NodeJS.Signals | null = null;
+  let adoptionConfirmed = false;
+  const statusPath = st.status;
+  let floor: RequestFloor | null = null;
+  let floorTicker: ReturnType<typeof setInterval> | null = null;
+  const tap = {
+    cli: (line: string) => {
+      if (!floor || !line.includes('"control_')) return;
+      let m: Record<string, any> | null = null;
+      try { m = JSON.parse(line); } catch { return; }
+      if (m?.type === 'control_request') floor.onCliRequest(m, m.request?.subtype === 'can_use_tool' ? 'sdk' : null);
+      else if (m?.type === 'control_cancel_request') floor.onCliCancel(m.request_id);
+    },
+    sdk: (line: string) => {
+      if (!floor || !line.includes('"control_response"')) return true;
+      let m: Record<string, any> | null = null;
+      try { m = JSON.parse(line); } catch { return true; }
+      const rid = m?.response?.request_id;
+      return rid == null ? true : floor.onClientResponse(rid, 'sdk');
+    },
+  };
+
+  const emitExit = (code: number | null, signal: NodeJS.Signals | null) => {
+    if (exited) return;
+    exited = true;
+    exitCode = code;
+    signalCode = signal;
+    try { stdout.end(); } catch { /* ignore */ }
+    emitter.emit('exit', code, signal);
+  };
+  const readStatus = (): HostStatus | null => {
+    try { return JSON.parse(fs.readFileSync(statusPath, 'utf8')) as HostStatus; } catch { return null; }
+  };
+
+  // Connect at once — the broker is already up. A missing socket is an exit.
+  setImmediate(() => {
+    if (killed || exited) return;
+    const s = net.connect(st.sock);
+    s.on('connect', () => {
+      socket = s;
+      everConnected = true;
+      wireBrokerSocket(s, stdin, stdout, channel, tap);
+    });
+    s.on('close', () => {
+      if (floorTicker) { clearInterval(floorTicker); floorTicker = null; }
+      if (killed) { emitExit(exitCode, signalCode); return; }
+      const [code, sig] = recordedExit(readStatus());
+      emitExit(code, sig);
+    });
+    s.on('error', () => { /* the close handler settles exit */ });
+  });
+
+  const proc: SpawnedProcessLike = {
+    stdin,
+    stdout,
+    get killed() { return killed; },
+    get exitCode() { return exitCode; },
+    get signalCode() { return signalCode; },
+    kill(_signal: NodeJS.Signals): boolean {
+      killed = true;
+      try { if (socket) socket.destroy(); } catch { /* ignore */ }
+      emitExit(exitCode, signalCode);
+      return true;
+    },
+    on(event: 'exit' | 'error', listener: (...a: any[]) => void) { emitter.on(event, listener); },
+    once(event: 'exit' | 'error', listener: (...a: any[]) => void) { emitter.once(event, listener); },
+    off(event: 'exit' | 'error', listener: (...a: any[]) => void) { emitter.off(event, listener); },
+  } as SpawnedProcessLike;
+
+  const livenessNow = (): Liveness =>
+    livenessOfSurvivalHandle({ exitLatched: exited, everConnected, status: readStatus() });
+  const hostKey = path.basename(statusPath).replace(/\.json$/, '');
+  const handle: AttachHandle = {
+    statusPath,
+    sock: st.sock,
+    hostKey,
+    reap() {
+      if (!adoptionConfirmed) {
+        console.log(`[orchard] BUG-187: not reaping broker ${st.hostPid} (${hostKey}) — this server never confirmed its adoption, so it has no claim to end it`);
+        return;
+      }
+      reapHost(statusPath);
+    },
+    probe(): SurvivalProbe { return asProbe(livenessNow()); },
+    livenessNow,
+    broker: channel,
+    confirmAdoption() { adoptionConfirmed = true; },
+    get adoptionConfirmed() { return adoptionConfirmed; },
+    enableClientFloor() {
+      if (floor) return;
+      floor = new RequestFloor({
+        write: (frame) => { if (socket && !socket.destroyed) { try { socket.write(`${JSON.stringify(frame)}\n`); } catch { /* gone */ } } },
+        log: (msg) => console.log(`[orchard] BUG-187 client-side floor (broker ${st.hostPid}): ${msg}`),
+      });
+      floorTicker = setInterval(() => floor?.tick(), 500);
+      floorTicker.unref?.();
+    },
+  };
+  return { proc, handle };
+}
+
+/**
+ * BUG-187 S3 / B4 — THE one close gate for a brokered session. Every automatic
+ * close (detached fuse, socket release, shutdown) asks this, and only a `no`
+ * closes. The broker is the lifetime's owner (ARCH-010): its own answer — the
+ * one it holds its drain on — is asked in-band. Missing evidence is never `no`:
+ *  - protocol 2: the in-band `lifetime_q`; no answer within the timeout → unknown;
+ *  - an older broker (no in-band channel): `no` only if its record says `no`
+ *    AND the record is newer than the last frame this bridge received AND the
+ *    bridge's own unfiltered level is empty; anything else → unknown.
+ *
+ * BUG-187 round 6 — LIVE REVIVED WORK IS NEVER A `no`. The engine keeps a
+ * SendMessage-revived lane OUT of its background level, so an older broker's
+ * fresh `no` record and an empty raw level are exactly what live revived work
+ * looks like from outside. The bridge's first-hand revived-live evidence
+ * (`revivedLive`) therefore outranks a `no` from ANY branch — the answer
+ * becomes `unknown` (conflicting evidence), which never closes. It is applied
+ * once, here, over every branch, so no branch can forget it.
+ */
+export async function brokerLifetimeForClose(
+  handle: Pick<SurvivalHandle, 'statusPath' | 'broker'> | null,
+  bridge: { lastFrameAt: number; levelRawEmpty: boolean; levelSeenSinceAttach?: boolean; revivedLive?: boolean },
+  timeoutMs = 2000,
+): Promise<{ lifetime: 'yes' | 'unknown' | 'no'; source: string }> {
+  const r = await brokerLifetimeEvidence(handle, bridge, timeoutMs);
+  if (r.lifetime === 'no' && bridge.revivedLive) {
+    return {
+      lifetime: 'unknown',
+      source: `conflicting evidence: ${r.source} — but this bridge holds a LIVE revived background lane, which the engine keeps out of its level; never read as no`,
+    };
+  }
+  return r;
+}
+async function brokerLifetimeEvidence(
+  handle: Pick<SurvivalHandle, 'statusPath' | 'broker'> | null,
+  bridge: { lastFrameAt: number; levelRawEmpty: boolean; levelSeenSinceAttach?: boolean; revivedLive?: boolean },
+  timeoutMs: number,
+): Promise<{ lifetime: 'yes' | 'unknown' | 'no'; source: string }> {
+  if (!handle) return { lifetime: 'unknown', source: 'no broker handle' };
+  const hello = await Promise.race([handle.broker.hello, new Promise<null>((r) => setTimeout(() => r(null), timeoutMs).unref?.())]);
+  if (hello && hello.protocol >= 2) {
+    const a = await handle.broker.lifetimeQuery(timeoutMs);
+    if (!a) return { lifetime: 'unknown', source: 'the broker did not answer the lifetime query in time' };
+    return { lifetime: a.lifetime, source: `the broker's own answer (seq ${a.seq})` };
+  }
+  let st: HostStatus | null = null;
+  try { st = JSON.parse(fs.readFileSync(handle.statusPath, 'utf8')) as HostStatus; } catch { st = null; }
+  if (!st) return { lifetime: 'unknown', source: 'the broker record is missing or unreadable' };
+  /*
+   * BUG-187 round 2 — a broker so old it declares NO lifetime at all. The only
+   * owner-grade evidence left is the ENGINE's own level, which the CLI re-sends
+   * right behind the answer to an adopter's repeated initialize. Use it only
+   * when it arrived after this attach (first-hand, fresh); otherwise unknown.
+   */
+  if (st.backgroundLifetime === undefined && bridge.levelSeenSinceAttach) {
+    const live = !bridge.levelRawEmpty || !!bridge.revivedLive;
+    return { lifetime: live ? 'yes' : 'no', source: 'an older broker that declares no lifetime; the engine\'s own level, re-sent on this server\'s re-initialize' };
+  }
+  const updated = st.updatedAt ? Date.parse(st.updatedAt) : NaN;
+  if (st.backgroundLifetime === 'no' && Number.isFinite(updated) && updated > bridge.lastFrameAt && bridge.levelRawEmpty) {
+    return { lifetime: 'no', source: 'an older broker record says no, is newer than the last frame, and the unfiltered level is empty' };
+  }
+  return { lifetime: st.backgroundLifetime === 'yes' ? 'yes' : 'unknown', source: `an older broker record (lifetime ${st.backgroundLifetime ?? 'absent'}), not corroborated` };
+}
+
+/**
+ * BUG-187 S2 — does this surviving broker hold work a responder must attach to?
+ * Live lanes (level, ids or started), a turn in flight, or (protocol 2) an
+ * unresolved control request. A broker with none of these is idle and is reaped
+ * exactly as before.
+ */
+export function survivorNeedsAdoption(st: HostStatus): { adopt: boolean; why: string } {
+  const lanes = (st.backgroundTasks?.length ?? 0) + (st.startedTasks?.length ?? 0);
+  const ids = st.backgroundTaskIds?.length ?? 0;
+  if (lanes > 0 || ids > 0) return { adopt: true, why: `${Math.max(lanes, ids)} live lane(s)` };
+  if (st.midTurn === true) return { adopt: true, why: 'a turn in flight' };
+  if ((st.protocol ?? 0) >= 2 && (st.pendingRequests ?? 0) > 0) return { adopt: true, why: `${st.pendingRequests} unresolved control request(s)` };
+  if (st.backgroundLifetime === 'yes' || st.backgroundLifetime === 'unknown') return { adopt: true, why: `background lifetime ${st.backgroundLifetime}` };
+  /*
+   * BUG-187 round 2 — an OLDER broker whose record declares NOTHING about its
+   * work (no lifetime, no turn state, no lanes) is not evidence of idleness; it
+   * is absence of evidence. Adopt it: re-attaching a responder to an idle CLI
+   * costs nothing (the close gate then sees the engine's own level), while
+   * reaping one with live work repeats the incident.
+   */
+  if ((st.protocol ?? 0) < 2 && st.backgroundLifetime === undefined && st.midTurn === undefined) {
+    return { adopt: true, why: 'an older broker that declares nothing about its work — unknown, not idle' };
+  }
+  return { adopt: false, why: 'idle — no live lanes, no turn in flight, nothing pending' };
+}
+
+/**
+ * BUG-187 H8 / L2 — consume broker TOMBSTONES (`<key>.ended.json`) into the
+ * FEAT-057 outcome store, then delete them. A broker writes one just before it
+ * removes its status record, so the reason a session stopped reaches the user
+ * even when no poll happened to land between the last status write and exit.
+ * Only records inside this server's own hosts dir, and only records this server
+ * is entitled to (the same rule as adoption).
+ */
+export function consumeTombstones(me: HostOwner = hostOwner()): number {
+  const dir = hostsDir();
+  let names: string[] = [];
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.ended.json')); } catch { return 0; }
+  let n = 0;
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let t: Record<string, any> | null = null;
+    try { t = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { t = null; }
+    if (!t || t.tombstone !== 1) { continue; }
+    // Entitlement: the same rule as adoption (BUG-117), on the owner the broker
+    // stamped into its tombstone.
+    if (!ownerEntitlesAdoption({ owner: t.owner ?? undefined } as HostStatus, me)) continue;
+    const sess = t.session ?? {};
+    const lanes: BrokerLane[] = Array.isArray(t.lanes) ? t.lanes : [];
+    try {
+      for (const l of lanes) {
+        if (!l.stopRequestedAt) continue;
+        outcomes.record({
+          stationSessionId: sess.stationSessionId ?? null,
+          sdkSessionId: sess.sdkSessionId ?? sess.resumeHint ?? null,
+          agentId: l.id,
+          row: 'agent',
+          label: 'background agent',
+          kind: 'killed',
+          detail:
+            `stopped by Orchard: its tool calls were refused ${l.refusals} time(s) because Orchard was not attached to this session, ` +
+            `so it could not do any more work (${l.stoppedAt ? 'the engine confirmed the stop' : 'the stop was sent but not confirmed'})`,
+          at: Date.parse(t.endedAt) || Date.now(),
+        });
+      }
+      if (Number(t.refusals) > 0 && !lanes.some((l) => l.stopRequestedAt)) {
+        outcomes.record({
+          stationSessionId: sess.stationSessionId ?? null,
+          sdkSessionId: sess.sdkSessionId ?? sess.resumeHint ?? null,
+          agentId: 'main',
+          row: 'main',
+          label: 'main',
+          kind: 'unknown',
+          detail: `the session ended after ${t.refusals} tool call(s) were refused because Orchard was not attached (${t.reason})`,
+          at: Date.parse(t.endedAt) || Date.now(),
+        });
+      }
+    } catch { /* the store is best effort; the file is still consumed below */ }
+    try { fs.rmSync(file, { force: true }); } catch { /* ignore */ }
+    n++;
+  }
+  return n;
 }
 
 /*
@@ -555,9 +1047,11 @@ export function reapHost(statusPath: string): void {
 export function scanSurvivingHosts(): HostStatus[] {
   const dir = hostsDir();
   let names: string[] = [];
-  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
-  const out: HostStatus[] = [];
   const me = hostOwner(); // BUG-117: computed once — the sweep below is entitlement-gated
+  // BUG-187 L2: tombstones are consumed into the outcome store, never read as hosts.
+  try { consumeTombstones(me); } catch { /* best effort */ }
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json') && !n.endsWith('.ctl.json') && !n.endsWith('.ended.json')); } catch { return []; }
+  const out: HostStatus[] = [];
   for (const n of names) {
     let st: HostStatus | null = null;
     try { st = JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')) as HostStatus; } catch { continue; }
@@ -643,7 +1137,17 @@ function cleanupHostFiles(st: HostStatus): void {
  * `log` lets the caller surface each re-adopt; kept side-effect-light so a boot
  * with no survivors is a no-op.
  */
-export function adoptSurvivingHosts(log: (msg: string) => void = () => {}): number {
+export type AdoptDisposition = 'adopted' | 'responder-only' | 'refused' | 'reaped';
+export function adoptSurvivingHosts(
+  log: (msg: string) => void = () => {},
+  /**
+   * BUG-187 S2 — when given, a surviving broker that holds live work (see
+   * `survivorNeedsAdoption`) is handed to this callback to be ADOPTED (a
+   * responder re-attached) instead of being SIGTERMed. Idle survivors are reaped
+   * as before. Omitted = the pre-BUG-187 behaviour (reap everything).
+   */
+  adopt?: (st: HostStatus, why: string) => void,
+): number {
   const me = hostOwner();
   const alive: HostStatus[] = [];
   for (const st of scanSurvivingHosts()) {
@@ -688,9 +1192,22 @@ export function adoptSurvivingHosts(log: (msg: string) => void = () => {}): numb
     alive.push(st);
   }
   for (const st of alive) {
+    const need = adopt ? survivorNeedsAdoption(st) : { adopt: false, why: 'adoption not offered' };
+    if (adopt && need.adopt) {
+      log(
+        `[orchard] re-adopting surviving session host (broker pid ${st.hostPid}, CLI pid ${st.claudePid ?? '?'}, ` +
+        `state ${st.state}, protocol ${st.protocol ?? 1}) — ${need.why}: re-attaching a responder instead of draining it`,
+      );
+      try { adopt(st, need.why); } catch (err) {
+        // Could not even attempt the adoption: the pre-BUG-187 graceful reap (its drain holds while lanes live).
+        log(`[orchard] adoption of broker pid ${st.hostPid} could not be attempted (${(err as Error).message}) — falling back to the graceful reap`);
+        reapHost(st.status);
+      }
+      continue;
+    }
     log(
       `[orchard] re-adopting surviving session host (broker pid ${st.hostPid}, CLI pid ${st.claudePid ?? '?'}, ` +
-      `state ${st.state}) — draining its in-flight turn to completion; the thread continues via resume-from-disk`,
+      `state ${st.state}) — draining its in-flight turn to completion; the thread continues via resume-from-disk (${need.why})`,
     );
     reapHost(st.status);
   }

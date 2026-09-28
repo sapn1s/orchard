@@ -50,6 +50,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { extractProse } from './readability.mjs';
 
 /* ── caps ───────────────────────────────────────────────────────────────────── */
 
@@ -93,26 +94,43 @@ export function metricsPath(dir) {
  *
  * The word rule matches characterise() EXACTLY (`[A-Za-z][A-Za-z'-]*`), so a
  * block body and a loose run are counted the same way and proseWords is the sum
- * of comparable units. */
+ * of comparable units.
+ *
+ * BUG-192 — before counting, each unit is run through readability's extractProse,
+ * so the length budget excludes exactly what the READABILITY check excludes:
+ * markdown tables, blockquotes (quoted evidence), URLs (link targets) and fenced
+ * code. Counting those against the budget penalised the very things the injected
+ * budget's DO-NOT-CUT list requires (before/after evidence, quoted output), and
+ * disagreed with the readability grader on the same reply. This is why fallback
+ * runs are recomputed from `r.text` rather than trusting the parser's precomputed
+ * `r.words`, which counts table/quote/link words. */
 const WORD_RE = /[A-Za-z][A-Za-z'-]*/g;
 function wordCount(s) {
   return (String(s ?? '').match(WORD_RE) || []).length;
+}
+/** Count words a reader actually reads: strip tables/quotes/links/code first. */
+function proseWordsOf(s) {
+  return wordCount(extractProse(s));
 }
 
 /**
  * Prose words a reader reads this turn, and the number of asks. Pure; derived
  * from the parseResponseBlocks() result so it needs no transcript re-read.
- * Digest JSON and fence wrappers are excluded (see the note above).
+ * Digest JSON, fence wrappers, tables, blockquotes, links and code are excluded
+ * (see the note above — consistent with the readability grader).
  */
 export function proseVolume(parsed) {
   const blocks = Array.isArray(parsed?.blocks) ? parsed.blocks : [];
   let words = 0;
   for (const b of blocks) {
     if (!b || b.name === 'orchard-digest') continue; // JSON, not prose
-    words += wordCount(b.content);
+    words += proseWordsOf(b.content);
   }
   const runs = Array.isArray(parsed?.fallbackRuns) ? parsed.fallbackRuns : [];
-  for (const r of runs) words += typeof r?.words === 'number' ? r.words : wordCount(r?.text);
+  for (const r of runs) {
+    if (typeof r?.text === 'string') words += proseWordsOf(r.text);
+    else if (typeof r?.words === 'number') words += r.words; // no text to re-strip
+  }
   const askBlocks = Number(parsed?.counts?.['orchard-ask'] || 0);
   return { proseWords: words, askBlocks };
 }

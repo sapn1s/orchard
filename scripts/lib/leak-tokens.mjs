@@ -264,6 +264,17 @@ const KEY_SHAPES = [
 // *_TOKEN constants); only high-signal secret key names are matched.
 const SECRET_KEY_SRC =
   '(?:password|passwd|secret|secret[_-]?key|api[_-]?key|apikey|access[_-]?key|client[_-]?secret|private[_-]?key|auth[_-]?token|access[_-]?token|refresh[_-]?token|bot[_-]?token|slack[_-]?token|github[_-]?token|gh[_-]?token|npm[_-]?token)';
+// FEAT-130 round 8 — the key/value SEPARATOR is a property of the SYNTAX, not of
+// each key (ARCH-010), so it is expressed ONCE here and reused by every
+// assignment regex below. Besides bare `key=value` / `key: value`, it accepts a
+// QUOTED KEY: in JSON/YAML the key's own closing quote sits BETWEEN the key name
+// and the `:` (`"token": "secret"`), which the previous `\s*[:=]` anchoring could
+// not cross — so every quoted-key config secret (`"password"`, `"api_key"`,
+// `"token"`, …) was silently MISSED (round-7 verifier finding). The optional
+// `["']?` consumes that closing quote; the opening quote before the key needs no
+// handling (no matcher left-anchors the key to an alnum char). One point of
+// truth, not a duplicated pattern per key.
+const KV_SEP = '["\']?\\s*[:=]\\s*';
 // FEAT-130 round 4 — all three assignment regexes carry the `g` flag and are
 // iterated with `matchAll` (below), never `.exec` once. `.exec` returned only the
 // FIRST assignment on a line, so a placeholder assignment written before a real
@@ -271,7 +282,7 @@ const SECRET_KEY_SRC =
 // BROKEN #2). Iterating every match on the line closes that: a benign first
 // assignment can no longer hide a malicious later one.
 const ASSIGN_DOTENV = new RegExp('(?:^|[\\s;])([A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|API_?KEY|APIKEY|ACCESS_?KEY|CLIENT_?SECRET|PRIVATE_?KEY|AUTH_?TOKEN|ACCESS_?TOKEN|REFRESH_?TOKEN|BOT_?TOKEN|SLACK_?TOKEN|GITHUB_?TOKEN|GH_?TOKEN|NPM_?TOKEN)[A-Z0-9_]*)=([^\\s"\'#]{6,})', 'g');
-const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,})\\1', 'ig');
+const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + KV_SEP + '(["\'])([^"\']{6,})\\1', 'ig');
 // FEAT-130 round 2 — the recall gap the round-1 verify hit: a LOWERCASE,
 // UNQUOTED secret assignment (a lowercase api-key/password `=`/`:` a bare
 // high-entropy value) slipped both forms above (dotenv needs ALL-CAPS, quoted
@@ -284,7 +295,7 @@ const ASSIGN_QUOTED = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{6,
 // Extra precision on top of isSecretValue: an unquoted bare value must ALSO look
 // secret-shaped (looksSecretish) so a plain prose word (a config key documented
 // as "required"/"optional") is not mistaken for a live credential.
-const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{6,})', 'ig');
+const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + KV_SEP + '([^\\s"\'`#,;<>{}()\\[\\]]{6,})', 'ig');
 // FEAT-130 round 6 — GENERIC (high-frequency, low-signal) secret key synonyms.
 // Kept in a SEPARATE list from SECRET_KEY_SRC because these fire only behind the
 // strict `looksHighEntropySecret` floor (above); the high-signal keys keep their
@@ -293,8 +304,8 @@ const ASSIGN_BARE = new RegExp(SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()
 // `session`/`auth`. The key is captured (group 1) for the reported label.
 const GENERIC_SECRET_KEY_SRC =
   '(?<![A-Za-z0-9_])(token|auth|pwd|passphrase|credentials?|cred|cookie|session|api[_-]?secret|secret[_-]?token|private[_-]?token|session[_-]?(?:token|key|secret)|client[_-]?key|access[_-]?secret)';
-const ASSIGN_GENERIC_BARE = new RegExp(GENERIC_SECRET_KEY_SRC + '\\s*[:=]\\s*([^\\s"\'`#,;<>{}()\\[\\]]{18,})', 'ig');
-const ASSIGN_GENERIC_QUOTED = new RegExp(GENERIC_SECRET_KEY_SRC + '\\s*[:=]\\s*(["\'])([^"\']{18,})\\2', 'ig');
+const ASSIGN_GENERIC_BARE = new RegExp(GENERIC_SECRET_KEY_SRC + KV_SEP + '([^\\s"\'`#,;<>{}()\\[\\]]{18,})', 'ig');
+const ASSIGN_GENERIC_QUOTED = new RegExp(GENERIC_SECRET_KEY_SRC + KV_SEP + '(["\'])([^"\']{18,})\\2', 'ig');
 // proto://user:password@host — the inline password is the leak. FEAT-130 round 5:
 // the userinfo user part is `*` not `+`, so a PASSWORD-ONLY URL (`redis://:pass@host`,
 // the common redis/amqp shape where the username is empty) is matched too — the
@@ -325,10 +336,46 @@ function isSecretValue(v) {
  * config key (value "required"/"optional" — single-class dictionary words) from
  * flooding while still catching a real mixed-case+digit key or password body.
  */
+// FEAT-130 round 12 — the SINGLE-CLASS length threshold. A value with ≥2 char
+// classes is always secret-ish; a single-class value (all lowercase, all caps, all
+// digits) needs a minimum length to distinguish a real passphrase / long token from
+// a short dictionary/type word. Round 10 set this at 24, which regressed recall: the
+// quoted high-signal path (which pre-round-10 gated on isSecretValue ALONE) stopped
+// firing on real single-class passphrases of 17–23 chars (`correcthorsebattery`,
+// `supersecretpasswd`). The round-9 schema/OpenAPI false-positive WORDS it was meant
+// to reject — `string`,`boolean`,`integer`,`number`,`required`,`optional` — are all
+// ≤ 8 chars, so a threshold anywhere in 9..16 separates the two sets cleanly; 16 is
+// the conservative end of that gap (fewest new false positives). Measured flip:
+// single-class value CAUGHT at ≥16, MISSED at ≤15 — so the narrowest real single-class
+// secret still missed is a 15-char one; every ≥2-class value is caught at any length ≥6.
+// Expressed ONCE here and shared by both the bare and quoted high-signal forms via
+// isHighSignalSecretValue (ARCH-010) — the two forms can never drift to different tunings.
+const SINGLE_CLASS_MIN_LEN = 16;
 function looksSecretish(v) {
   const s = String(v ?? '');
   const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((re) => re.test(s)).length;
-  return classes >= 2 || s.length >= 24;
+  return classes >= 2 || s.length >= SINGLE_CLASS_MIN_LEN;
+}
+
+/**
+ * The value predicate for the HIGH-SIGNAL assignment class, expressed ONCE and
+ * shared by BOTH value forms — bare (`password: value`) and quoted
+ * (`"password": "value"`) — per ARCH-010, exactly as `KV_SEP` shares the key/value
+ * separator. FEAT-130 round 10: the quoted form previously gated on `isSecretValue`
+ * ALONE while the bare form already gated on `isSecretValue && looksSecretish`, so a
+ * single-class type-name value (`"password": "string"`, `"secret": "boolean"`) in an
+ * OpenAPI / JSON-schema / doc file cleared the quoted path and FALSE-POSITIVED — the
+ * cry-wolf failure the round-6 value-shape floor exists to prevent. Applying the
+ * same `looksSecretish` shape floor to the quoted path closes it while a genuinely
+ * secret-looking quoted value (a real provider token / mixed-class password) still
+ * fires. `looksSecretish` is DELIBERATELY looser than the round-6 generic floor:
+ * the high-signal key names (`password`, `api_key`, `client_secret`, …) rarely name
+ * an ordinary variable, so their values need only look non-trivial (≥2 char classes
+ * or ≥24 chars), not clear the strict 3-class/entropy floor the low-signal generic
+ * keys require.
+ */
+function isHighSignalSecretValue(v) {
+  return isSecretValue(v) && looksSecretish(v);
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -412,10 +459,10 @@ export function scanSecrets(line) {
     if (isSecretValue(a[2])) pushAssign(`${a[1]}=…`);
   }
   for (const a of s.matchAll(ASSIGN_QUOTED)) {
-    if (isSecretValue(a[2])) pushAssign(`${a[0].split(/[:=]/)[0].trim()}=…`);
+    if (isHighSignalSecretValue(a[2])) pushAssign(`${a[0].split(/[:=]/)[0].replace(/["']/g, '').trim()}=…`);
   }
   for (const a of s.matchAll(ASSIGN_BARE)) {
-    if (isSecretValue(a[1]) && looksSecretish(a[1])) pushAssign(`${a[0].split(/[:=]/)[0].trim()}=…`);
+    if (isHighSignalSecretValue(a[1])) pushAssign(`${a[0].split(/[:=]/)[0].replace(/["']/g, '').trim()}=…`);
   }
   // FEAT-130 round 6 — GENERIC key synonyms, gated by the strict value-shape floor
   // (length ≥ 18, all three char classes, entropy ≥ 3.2), and NOT re-reporting a

@@ -39,7 +39,7 @@ import { containerSettingsOf, browserSettingsOf, toolSettingsOf } from './regist
 // `resolveLaunchAccountDir` the sole "may a launch use this account" gate.
 import { applyGlobalDefaults } from './global-settings.ts';
 import { AccountError, DEFAULT_ACCOUNT_ID, resolveAccountDir, resolveLaunchAccountDir } from './claude-accounts.ts';
-import { provisionHash, serenaPin, type ProvisionState } from './provisioning.ts';
+import { provisionHash, serenaPin, claudeCodePin, type ProvisionState } from './provisioning.ts';
 import { available as browserAvailable, browserBinds, containerEnv as browserContainerEnv, socketPath as browserSocketPath, stateHome as browserStateHome, CONTAINER_MCP_DIR } from './browser.ts';
 import { dispatchBinds, dispatchSocketPath, dispatchStateHome, CONTAINER_DISPATCH_DIR, CONTAINER_DISPATCH_SOCKET_DIR } from './dispatch-broker.ts';
 
@@ -918,6 +918,8 @@ export function containerProvisionState(project: Project): {
   custom: boolean;
   wantedSerenaVersion: string;
   imageSerenaVersion: string | null;
+  wantedClaudeVersion: string;
+  imageClaudeVersion: string | null;
   provisionHash: string;
   imageProvisionHash: string | null;
   detail: string;
@@ -925,36 +927,44 @@ export function containerProvisionState(project: Project): {
   const image = imageNameFor(project);
   const custom = !!containerSettingsOf(project).image?.trim();
   const pin = serenaPin();
+  const ccPin = claudeCodePin();
   const want = provisionHash();
   let imageHash: string | null = null;
   let imageVer: string | null = null;
+  let imageCcVer: string | null = null;
   let exists = false;
   try {
-    const r = dockerSync(['image', 'inspect', image, '--format', '{{index .Config.Labels "claude-station.provision-hash"}}\t{{index .Config.Labels "claude-station.serena-version"}}'], 10_000);
+    // FEAT-151 — read the claude-version label alongside serena's. An older image
+    // built before this label has `<no value>`, reported as null (unknown), never
+    // guessed. The docker exec fallback is deliberately NOT taken here: this is a
+    // read-only status path and must not start a container to answer.
+    const r = dockerSync(['image', 'inspect', image, '--format', '{{index .Config.Labels "claude-station.provision-hash"}}\t{{index .Config.Labels "claude-station.serena-version"}}\t{{index .Config.Labels "claude-station.claude-version"}}'], 10_000);
     exists = r.code === 0;
     if (exists) {
-      const [h = '', v = ''] = r.stdout.trim().split('\t');
+      const [h = '', v = '', cc = ''] = r.stdout.trim().split('\t');
       imageHash = h && h !== '<no value>' ? h : null;
       imageVer = v && v !== '<no value>' ? v : null;
+      imageCcVer = cc && cc !== '<no value>' ? cc : null;
     }
   } catch { /* docker unavailable — reported as missing below */ }
+  const cc = { wantedClaudeVersion: ccPin.version, imageClaudeVersion: imageCcVer };
   if (custom) {
     return { state: exists ? 'provisioned' : 'missing', image, custom: true, wantedSerenaVersion: pin.version,
-      imageSerenaVersion: imageVer, provisionHash: want, imageProvisionHash: imageHash,
+      imageSerenaVersion: imageVer, ...cc, provisionHash: want, imageProvisionHash: imageHash,
       detail: `custom image "${image}" — Claude Station does not build or provision it; its tooling is yours to manage.` };
   }
   if (!exists) {
     return { state: 'missing', image, custom: false, wantedSerenaVersion: pin.version, imageSerenaVersion: null,
-      provisionHash: want, imageProvisionHash: null,
+      ...cc, provisionHash: want, imageProvisionHash: null,
       detail: `image ${image} has not been built yet; the next session (or Rebuild) builds it.` };
   }
   if (imageHash !== want) {
     return { state: 'stale', image, custom: false, wantedSerenaVersion: pin.version, imageSerenaVersion: imageVer,
-      provisionHash: want, imageProvisionHash: imageHash,
+      ...cc, provisionHash: want, imageProvisionHash: imageHash,
       detail: `the built image was made from a different definition (${imageHash ?? 'unlabelled'} vs ${want}); it will be rebuilt on the next session.` };
   }
   return { state: 'provisioned', image, custom: false, wantedSerenaVersion: pin.version, imageSerenaVersion: imageVer,
-    provisionHash: want, imageProvisionHash: imageHash,
+    ...cc, provisionHash: want, imageProvisionHash: imageHash,
     detail: `${pin.package} ${imageVer ?? pin.version} is baked into ${image}; sessions start it locally with no fetch.` };
 }
 
@@ -1009,6 +1019,10 @@ export async function ensureImage(project: Project, opts: { force?: boolean; onL
       '--label', `claude-station.provision-hash=${provisionHash()}`,
       '--label', `claude-station.serena-version=${serenaPin().version}`,
       '--label', `claude-station.serena-package=${serenaPin().package}`,
+      // FEAT-151 — stamp the baked Claude CLI version so "which claude is in this
+      // image?" is answerable by inspecting the image, not by exec-ing into it.
+      '--label', `claude-station.claude-version=${claudeCodePin().version}`,
+      '--label', `claude-station.claude-package=${claudeCodePin().package}`,
       '-t', image,
       '-f', path.join(ctx, 'Dockerfile'),
       ctx,

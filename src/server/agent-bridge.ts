@@ -23,6 +23,7 @@ import type {
 } from './runtime/runtime.ts';
 import type { RuntimeCapabilities, WorkLifetime } from './runtime/runtime.ts';
 import { ClaudeRuntime } from './runtime/claude-runtime.ts';
+import * as runtimeUpdate from './runtime/runtime-update.ts';
 import { CodexRuntime, detectCodex } from './runtime/codex-runtime.ts';
 import type {
   EffectiveConfig,
@@ -61,9 +62,9 @@ import {
   type MemoryStatus,
 } from './container-manager.ts';
 import { ensureServices, connectSessionToServices, ServiceError } from './service-manager.ts';
-import { applyGlobalDefaults } from './global-settings.ts';
+import { applyGlobalDefaults, resolveModelForProvider } from './global-settings.ts';
 import { resolveLaunchAccountDir } from './claude-accounts.ts';
-import { spawnSurvivable, survivalEnabled, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
+import { brokerLifetimeForClose, reapHost, spawnSurvivable, survivalEnabled, type AttachHandle, type HostStatus, type SpawnedProcessLike, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
 /*
  * ARCH-001: the bridge no longer decides its own liveness. It supplies the
  * FACTS (busy, lastFrameAt, its process probe) and the one authority returns
@@ -189,6 +190,13 @@ export interface StartOptions {
   dispatchUnavailableReason?: string;
   /** Filled in by startSession(); callers never set this. */
   browserUnavailableReason?: string;
+  /**
+   * BUG-187 B1 — ADOPT an already-running CLI behind a surviving broker instead
+   * of spawning one. `proc`/`handle` come from `attachSurvivable(st)`. No
+   * briefing, no board preamble, no first prompt: adoption never manufactures a
+   * user turn. Set only by `adoptSession()`.
+   */
+  adopt?: { st: HostStatus; proc: SpawnedProcessLike; handle: AttachHandle };
 }
 
 // FEAT-145 — `claudeAccount` flows machine → project → session-effective like
@@ -299,11 +307,16 @@ function pickOverridable(s: ProjectSettings): Overridable {
    * (every project persists its own), so it is resolved from the project alone.
    */
   const merged = applyGlobalDefaults({ model: s.model, effort: s.effort, claudeAccount: s.claudeAccount });
+  // FEAT-037 P3: resolved, never absent — registries written before the field
+  // existed must read as the default engine.
+  const provider = s.provider ?? 'anthropic';
   return {
-    // FEAT-037 P3: resolved, never absent — registries written before the
-    // field existed must read as the default engine.
-    provider: s.provider ?? 'anthropic',
-    model: merged.model,
+    provider,
+    // The machine-wide global default model is a CLAUDE model id, so it may only
+    // fill an anthropic session — a Codex session inheriting `claude-*` 400s at
+    // launch. resolveModelForProvider owns that coupling (ARCH-010); merged.model
+    // is deliberately NOT used for the model field, only for effort/account below.
+    model: resolveModelForProvider(s.model, provider),
     effort: merged.effort,
     // FEAT-145 step 4 — the account after machine → project merge (null = the
     // implicit default; step 5 will layer a session override on top).
@@ -486,6 +499,28 @@ const CONTAINER_QUIET_TO_CLOSE_MS = Number(process.env.CLAUDE_STATION_CONTAINER_
  * clear it well inside this window.
  */
 const REVIVED_TASK_TTL_MS = Number(process.env.CLAUDE_STATION_REVIVED_TTL_MS) || 300_000;
+
+/**
+ * BUG-191 — how long a gated delivery waits for the broker's `deliver_ack`
+ * before the outcome is reported `uncertain` (never retried blindly).
+ */
+const GATED_DELIVER_ACK_MS = Number(process.env.CLAUDE_STATION_GATED_DELIVER_ACK_MS) || 5_000;
+
+/**
+ * BUG-191 — the `drain`-shaped payload a refusal of an adopt-gated send
+ * carries (FEAT-064's shape, plus which adoption state refused and why), so
+ * the client's BUG-045 chip names the real reason.
+ */
+export interface AdoptDrainPayload {
+  backgroundLive: number;
+  backgroundTaskIds: string[];
+  backgroundLifetime: 'yes' | 'unknown' | 'no' | null;
+  drainHeldSince: string | null;
+  heldForMs: number | null;
+  brokerState: string;
+  adoptState: 'pending' | 'responder-only' | 'none' | 'adopted' | 'failed';
+  why: string;
+}
 /*
  * BUG-157 (round 4) — round 3's `UNSETTLED_ROW_STALE_MS` (a frame-staleness bound
  * on a `running` agent row) was REMOVED. It could not serve both failure modes at
@@ -1010,6 +1045,37 @@ export class AgentSession {
    */
   #survivalConfigured = false;
   #survivalHandle: SurvivalHandle | null = null;
+  /**
+   * BUG-187 — adoption state. `none` for a session this server spawned;
+   * otherwise `pending` until the broker's hello, the engine's initialize and
+   * (protocol 2) the broker's reclaim all arrived, then `adopted` (this server
+   * owns the CLI and may reap it), `responder-only` (it answers requests and
+   * takes gated sends but NEVER reaps — the broker's own drain decides), or
+   * `failed` (disposed with no reap).
+   */
+  #adoptState: 'none' | 'pending' | 'adopted' | 'responder-only' | 'failed' = 'none';
+  /**
+   * BUG-191 round 2 (B5) — the protocol the broker hosting this session
+   * DECLARED in its hello (0 = an older broker: no hello, so no H7
+   * `deliver_ack` and no way to confirm a delivery). Written once, from the
+   * broker's own declaration, when this server binds to a broker it did not
+   * spawn; `null` for a session with no foreign broker (one this server
+   * spawned runs this tree's own broker). Every send reads it, whatever the
+   * adoption state — `adopted` included.
+   */
+  #brokerProtocol: number | null = null;
+  /** B5 — set once the refusal of a message began retiring an adopted older broker. */
+  #oldHostRetiring = false;
+  #adoptWhy: string | null = null;
+  /** BUG-187 round 2 — when the engine's last level frame arrived, and when an adoption began. */
+  #levelFrameAt = 0;
+  #adoptStartedAt = 0;
+  /** One journal line per session when the broker overrules the bridge's `no`. */
+  #fuseKeptLogged = false;
+  /** Set when a failed adoption is disposed: nothing it tears down was a death. */
+  #suppressEndRecord = false;
+  /** B6 — false while an adopted session may still receive redelivered prompts. */
+  #approvalsComplete = true;
   /** cgroup oom_kill counter at session start — see container-manager memory. */
   #oomBaseline: number | null = null;
   #memTimer: ReturnType<typeof setInterval> | null = null;
@@ -1183,6 +1249,19 @@ export class AgentSession {
      */
     let provider = s.provider ?? 'anthropic';
     /*
+     * BUG-188 round 2 — a SESSION OVERRIDE model must go through the same owner
+     * that guards the project/global model (resolveModelForProvider, ARCH-010).
+     * The override merge above wrote `opts.overrides.model` straight onto
+     * `effective.model`, bypassing that coupling; a stale `claude-*` override the
+     * UI cached for an openai session (from the pre-fix leak) would then reach the
+     * CodexRuntime and 400 at every turn. Re-resolving here drops an override that
+     * belongs to a different engine and is idempotent for a compatible one (an
+     * explicit gpt-* on openai, or the anthropic default already resolved by
+     * pickOverridable). The resume-provider-override branch below re-resolves again
+     * against the final engine if the transcript flips the provider.
+     */
+    (this.effective as { model: string | null }).model = resolveModelForProvider(this.effective.model, provider);
+    /*
      * FEAT-037 P2b — ON RESUME, THE TRANSCRIPT PICKS THE ENGINE. A session id
      * is meaningful only to the engine that minted it: a Codex thread id can
      * only continue via thread/resume, a Claude session file only via the
@@ -1213,6 +1292,17 @@ export class AgentSession {
         });
         provider = wanted;
         (this.effective as Record<string, unknown>).provider = wanted; // effectiveConfig() must keep telling the truth
+        /*
+         * The model must follow the engine the transcript just picked. `effective.model`
+         * was resolved for the CONFIGURED provider (the guard just above), so a Claude
+         * session resumed as a Codex thread still carries a `claude-*` model here — which
+         * would reach the CodexRuntime and 400. Re-resolve the CURRENT effective model
+         * (an explicit session/project override included) against the final provider, so:
+         * a Claude default that only an anthropic session inherited is dropped to null; a
+         * cross-engine override is dropped; and an override compatible with the new engine
+         * survives (BUG-188 round 2 — one owner, no per-branch special-casing).
+         */
+        (this.effective as { model: string | null }).model = resolveModelForProvider(this.effective.model, wanted);
       }
     }
     if (provider === 'openai') {
@@ -1318,6 +1408,18 @@ export class AgentSession {
       this.#memTimer.unref?.();
     } else if (iso === 'sandbox') {
       throw new Error('isolation "sandbox" (bubblewrap) is modelled but not implemented yet');
+    } else if (iso === 'direct' && opts.adopt) {
+      /*
+       * BUG-187 B1 — ADOPTION. The CLI already runs behind a surviving broker;
+       * the attach facade is handed to the SDK as its "spawn", so the SDK's first
+       * `initialize` re-attaches a responder to that running CLI. Nothing is
+       * spawned, and this session's reap stays a no-op until the adoption is
+       * confirmed (a losing adopter must never end another server's broker).
+       */
+      this.#survivalConfigured = true;
+      this.#survivalHandle = opts.adopt.handle;
+      const adoptProc = opts.adopt.proc;
+      spawnProcess = () => adoptProc as never;
     } else if (iso === 'direct') {
       /*
        * RESTART SURVIVAL (FEAT-015). By default the SDK spawns the `direct` CLI
@@ -1351,7 +1453,7 @@ export class AgentSession {
         spawnProcess = (o) => {
           const { proc, handle } = spawnSurvivable(
             { command: o.command, args: o.args, cwd: o.cwd, env: o.env },
-            { stationSessionId: id, resumeHint: opts.resumeSessionId ?? null },
+            { stationSessionId: id, resumeHint: opts.resumeSessionId ?? null, projectId: opts.project.id },
           );
           this.#survivalHandle = handle;
           return proc as never;
@@ -1429,7 +1531,8 @@ export class AgentSession {
      */
     let sp = this.composed.systemPrompt;
     sp = appendToSystemPrompt(sp, opts.extraAppend);
-    const boardSnapshot = boardStateSection(opts.project.hostPath);
+    // BUG-187 B1: an adopted session injects no board preamble (it sends no first turn).
+    const boardSnapshot = opts.adopt ? null : boardStateSection(opts.project.hostPath);
     this.#configBoardSnapshot = boardSnapshot; // FEAT-132 — for the config record
 
     // FEAT-090: the snapshot above ALREADY carries the answered-awaiting lane, so
@@ -1456,7 +1559,9 @@ export class AgentSession {
     // `extraPrefix` (part of the peelable prefix) and the user's own words stay
     // as the terminated remainder, rather than pre-merging the two into one blob
     // that a transcript re-read could not tell apart.
-    const firstPrompt = this.#withBriefing(opts.firstPrompt ?? '', opts.resumeSessionId ?? null, boardSnapshot);
+    // BUG-187 B1: no briefing on adoption — takeBriefing MARKS records as told,
+    // and an adoption tells the model nothing (it sends no turn at all).
+    const firstPrompt = opts.adopt ? '' : this.#withBriefing(opts.firstPrompt ?? '', opts.resumeSessionId ?? null, boardSnapshot);
 
     /*
      * FEAT-037 P2b — arm Orchard-owned transcript capture for engines with no
@@ -1483,10 +1588,35 @@ export class AgentSession {
     // the very first turn fails.
     this.#emit({ t: 'effective-config', ...this.effectiveConfig() });
 
-    this.busy = true;
-    this.turnStartedAt = Date.now(); // BUG-033: the ONE honest turn clock
-    this.#turnUserInitiated = true;  // BUG-159: the first prompt is a user-awaited turn
-    this.lastFrameAt = Date.now();   // BUG-033: the frameless window starts now
+    if (opts.adopt) {
+      /*
+       * BUG-187 B1 — seed from the broker's DECLARATIONS (read, not re-derived):
+       * busy from its turn tracker, lanes from its level. No user turn is
+       * opened, so `#turnUserInitiated` stays false (BUG-159's silence gate
+       * applies to whatever the CLI is doing on its own).
+       */
+      const st = opts.adopt.st;
+      this.#adoptState = 'pending';
+      this.#adoptStartedAt = Date.now();
+      this.#approvalsComplete = false;
+      this.sdkSessionId = st.sdkSessionId ?? st.resumeHint ?? null;
+      this.busy = st.midTurn === true;
+      const since = st.midTurnSince ? Date.parse(st.midTurnSince) : NaN;
+      this.turnStartedAt = this.busy ? (Number.isFinite(since) ? since : Date.now()) : null;
+      this.#turnUserInitiated = false;
+      this.lastFrameAt = Date.now();
+      for (const t of st.backgroundTasks ?? []) {
+        if (t && typeof t.id === 'string' && t.id) this.#levelRaw.set(t.id, t.type === 'local_bash' ? 'tool' : 'agent');
+      }
+      for (const id of st.startedTasks ?? []) if (typeof id === 'string' && id && !this.#levelRaw.has(id)) this.#levelRaw.set(id, 'agent');
+      this.#rebuildBackgroundLevel();
+      this.detached = true; // nobody is watching yet; the detached-close fuse governs it
+    } else {
+      this.busy = true;
+      this.turnStartedAt = Date.now(); // BUG-033: the ONE honest turn clock
+      this.#turnUserInitiated = true;  // BUG-159: the first prompt is a user-awaited turn
+      this.lastFrameAt = Date.now();   // BUG-033: the frameless window starts now
+    }
     // FEAT-057: a new turn's failures are its own. Clearing here is what stops
     // last turn's quota wall from being blamed for this turn's death.
     this.lastProviderError = null;
@@ -1556,8 +1686,11 @@ export class AgentSession {
         // set, so its held locks are kept fresh and never falsely reclaimed; a
         // finished lane drops out, so its lock is released, not wedged.
         liveLaneIds: () => this.liveAgents().filter((a) => a.status === 'running').map((a) => a.agentId),
-        resume: opts.resumeSessionId ? (this.#forkPlan?.resumeSessionId ?? opts.resumeSessionId) : undefined,
-        forkSession: opts.resumeSessionId && opts.fork ? true : undefined,
+        resume: opts.adopt
+          ? (opts.adopt.st.sdkSessionId ?? opts.adopt.st.resumeHint ?? undefined)
+          : opts.resumeSessionId ? (this.#forkPlan?.resumeSessionId ?? opts.resumeSessionId) : undefined,
+        forkSession: !opts.adopt && opts.resumeSessionId && opts.fork ? true : undefined,
+        attach: opts.adopt ? true : undefined,
         mcpServers,
         strictMcpConfig: strictMcpConfig || undefined,
         systemPrompt: sp || undefined,
@@ -1569,6 +1702,7 @@ export class AgentSession {
       throw err;
     }
     this.#pump = this.#run();
+    if (opts.adopt) void this.#completeAdoption(opts.adopt);
     // Truth about available models, refreshed opportunistically per session —
     // remembered under THIS session's engine (FEAT-045), so the Claude and
     // Codex catalogs never overwrite each other.
@@ -1631,6 +1765,36 @@ export class AgentSession {
   send(prompt: string): { delivered: boolean; queued: boolean } {
     if (this.closed) throw new Error('session is closed');
     if (this.budgetStopped) throw new Error('session stopped: budget exceeded');
+    /*
+     * BUG-187 B2 — a RESPONDER-ONLY adoption does not own the CLI: its broker is
+     * finishing a drain an earlier server decided. A user message is taken only
+     * under FEAT-065's own gate (foreground provably idle, a deliverable
+     * lifetime, input still accepted) — otherwise it is refused, retryably,
+     * rather than written into a CLI that is about to end its input.
+     */
+    /*
+     * BUG-191 — this synchronous path WRITES through the runtime and cannot
+     * learn whether the broker accepted the frame, so for an adopt-gated
+     * session it is a backstop only: every gated caller in index.ts goes
+     * through `sendGated()` (correlated broker acceptance) instead. A caller
+     * that still lands here gets the retryable refusal, now carrying the
+     * `drain` payload so it can be queued rather than dropped.
+     */
+    /*
+     * BUG-191 round 2 (B5) — and a session whose broker cannot confirm a
+     * delivery (an older, protocol < 2 broker) is refused here whatever its
+     * adoption state: an `adopted` old broker used to fall through to the raw
+     * write below, acked while the broker might drop the frame unseen.
+     */
+    const gate = this.sendGate();
+    if (!gate.ok || this.adoptGated) {
+      const err = new Error(gate.ok
+        ? 'this session is finishing after a server restart; its messages must go through a confirmed delivery — it retries when the session is free'
+        : gate.message);
+      (err as Error & { retryable?: boolean; drain?: AdoptDrainPayload }).retryable = true;
+      (err as Error & { retryable?: boolean; drain?: AdoptDrainPayload }).drain = gate.ok ? undefined : gate.drain;
+      throw err;
+    }
     /*
      * A permission-mode change deferred while a Codex turn was in flight becomes
      * REAL at the next turn/start — which this message is. The engine already
@@ -2529,6 +2693,9 @@ export class AgentSession {
    * Never `completed`: nothing here proves anything finished.
    */
   #recordSessionEnd(reason: string): void {
+    // BUG-187 B3: a failed adoption tears down only this server's transport; the
+    // CLI and its lanes keep running behind the broker — nothing here died.
+    if (this.#suppressEndRecord || this.#adoptState === 'pending' || this.#adoptState === 'failed') return;
     if (!this.busy && ![...this.#agents.values()].some((a) => a.status === 'running')) return;
     const pe = this.lastProviderError;
     const kind: outcomes.OutcomeKind = pe ? 'provider-error' : 'cut';
@@ -2704,6 +2871,284 @@ export class AgentSession {
         'Send your message again to resume the session from its transcript.',
     });
     void this.close(`zombie bridge reaped (${verdict.kind}): ${verdict.reason}`).catch(() => { /* pump may never settle — the error above is the record */ });
+  }
+
+  /** BUG-187 — this session's adoption state (`none` = spawned by this server). */
+  get adoptState(): 'none' | 'pending' | 'adopted' | 'responder-only' | 'failed' {
+    return this.#adoptState;
+  }
+
+  /**
+   * BUG-187 S3/B4 — THE lifetime a CLOSE decision may act on. For a brokered
+   * session that is the BROKER's answer (it owns the fact and holds its drain
+   * on it); the bridge's filtered + TTL'd `workLifetime()` keeps serving rows
+   * and stalls only. Missing evidence is `unknown`, never `no`. Non-brokered
+   * sessions (container, survival off) keep the bridge as the owner.
+   */
+  async closeLifetime(): Promise<{ lifetime: 'yes' | 'unknown' | 'no'; source: string }> {
+    if (this.#survivalHandle) {
+      return brokerLifetimeForClose(this.#survivalHandle, {
+        lastFrameAt: this.lastFrameAt,
+        levelRawEmpty: this.#levelRaw.size === 0,
+        // The CLI re-sends its level right behind the answer to a repeated
+        // initialize, so an adopted session holds FIRST-HAND engine evidence
+        // from after the attach — the fallback for a broker that declares nothing.
+        levelSeenSinceAttach: this.#adoptStartedAt > 0 && this.#levelFrameAt >= this.#adoptStartedAt,
+        revivedLive: this.#liveRevivedTasks().length > 0,
+      });
+    }
+    if (this.#survivalConfigured) return { lifetime: 'unknown', source: 'the session-host broker has not been spawned yet' };
+    const w = this.workLifetime();
+    return { lifetime: w.outlivesTurn, source: `the bridge's view: ${w.detail}` };
+  }
+
+  /** BUG-187 B6 — the authoritative pending-approval list, with its completeness. */
+  approvalsSnapshot(): { requestIds: string[]; complete: boolean } {
+    return { requestIds: [...this.#approvals.keys()], complete: this.#approvalsComplete };
+  }
+
+  /** BUG-187 B6/I4 — tell the attached client which cards still exist. */
+  emitApprovalsSnapshot(): void {
+    const snap = this.approvalsSnapshot();
+    this.#emit({ t: 'approvals-snapshot', requestIds: snap.requestIds, complete: snap.complete });
+  }
+
+  /**
+   * BUG-187 B1–B3 — finish an adoption: wait for the broker's hello, the
+   * engine's answer to our initialize, and (protocol 2) the broker's reclaim.
+   * Only all three make this server the broker's owner (it may then reap it).
+   */
+  async #completeAdoption(a: { st: HostStatus; proc: SpawnedProcessLike; handle: AttachHandle }): Promise<void> {
+    const st = a.st;
+    let transportGone = false;
+    a.proc.once('exit', () => { transportGone = true; });
+    const label = `broker pid ${st.hostPid} (CLI pid ${st.claudePid ?? '?'}, session ${this.id})`;
+    const hello = await a.handle.broker.hello;
+    this.#brokerProtocol = hello?.protocol ?? 0;
+    if (hello && !hello.accepted) return this.#adoptionFailed(`${label}: another client already holds the broker (${hello.reason ?? 'hello accepted:false'})`);
+    if (!hello && transportGone) return this.#adoptionFailed(`${label}: the broker socket closed before its hello`);
+    /*
+     * A broker whose CLI input is already ended cannot forward our initialize,
+     * so it answers with `reclaim ok:false stdin-ended` at once (H6). Nothing
+     * this server writes can reach that CLI any more: the session mirrors it,
+     * responder-only in name, until it exits on the old drain's schedule.
+     */
+    const stdinEnded = a.handle.broker.reclaim.then((r) => (r && !r.ok && r.reason === 'stdin-ended' ? 'stdin-ended' as const : new Promise<never>(() => {})));
+    const init = this.#runtime.initOutcome
+      ? await Promise.race([
+          this.#runtime.initOutcome(),
+          stdinEnded,
+          new Promise<null>((r) => setTimeout(() => r(null), 30_000).unref?.()),
+        ])
+      : null;
+    if (this.closed) return;
+    if (init === 'stdin-ended') {
+      this.#adoptState = 'responder-only';
+      this.#adoptWhy = 'the broker had already ended the CLI\'s input (an earlier drain committed), so nothing can be answered or sent — the session mirrors the CLI until it exits on that drain\'s schedule';
+      this.#approvalsComplete = true;
+      console.log(`[orchard] BUG-187: ${this.#adoptState} ${label} — ${this.#adoptWhy}`);
+      this.#emit({ t: 'status', status: `re-attached to the surviving session (${this.#adoptState}): ${this.#adoptWhy}` });
+      this.emitApprovalsSnapshot();
+      return;
+    }
+    /*
+     * BUG-187 round 2 — an OLDER broker (no hello) whose engine cannot be
+     * re-initialized has no request floor of its own, so leaving it would be the
+     * incident again (a CLI held with nobody able to answer it). Stop it cleanly
+     * — the graceful reap — and say so; never leave it silent.
+     */
+    const oldBroker = !hello;
+    if (!init) return this.#adoptionFailed(`${label}: the engine never answered the re-initialize`, { reapOld: oldBroker });
+    if (!init.ok) return this.#adoptionFailed(`${label}: the re-initialize failed (${init.error ?? 'unknown error'})`, { reapOld: oldBroker });
+    const protocol = hello?.protocol ?? 0;
+    if (protocol >= 2) {
+      if (init.adoptOutcome === 'hooks-not-applied') {
+        // The broker's own floor keeps answering; this server must not pose as the responder.
+        return this.#adoptionFailed(`${label}: the engine did not apply this server's hooks (hooks_applied ${String(init.hooksApplied)}) — leaving the broker to its own request floor`);
+      }
+      const rc = await Promise.race([a.handle.broker.reclaim, new Promise<null>((r) => setTimeout(() => r(null), 5_000).unref?.())]);
+      if (this.closed) return;
+      if (rc?.ok) {
+        a.handle.confirmAdoption();
+        this.#adoptState = 'adopted';
+        this.#adoptWhy = 'the broker reclaimed its CLI for this server (any earlier drain was cancelled)';
+      } else {
+        this.#adoptState = 'responder-only';
+        this.#adoptWhy = `the broker declined the reclaim (${rc?.reason ?? 'no reclaim answer'}) — answering requests only; the broker's own drain decides its end`;
+      }
+    } else if (init.adoptOutcome === 'hooks-not-applied') {
+      this.#adoptState = 'responder-only';
+      a.handle.enableClientFloor?.();
+      this.#adoptWhy = 'an older broker whose engine did not apply this server\'s hooks — responder-only, with the request floor run client-side';
+    } else if (st.state === 'draining') {
+      this.#adoptState = 'responder-only';
+      this.#adoptWhy = 'an older broker that is already draining (it cannot be reclaimed) — answering requests until its drain completes';
+    } else {
+      a.handle.confirmAdoption();
+      this.#adoptState = 'adopted';
+      this.#adoptWhy = 'an older broker that was still running — adopted';
+    }
+    this.#approvalsComplete = true;
+    console.log(`[orchard] BUG-187: ${this.#adoptState} ${label} — ${this.#adoptWhy}`);
+    this.#emit({ t: 'status', status: `re-attached to the surviving session (${this.#adoptState}): ${this.#adoptWhy}` });
+    this.emitApprovalsSnapshot();
+    if (this.detached) this.#armDetachedClose();
+  }
+
+  /**
+   * BUG-191 — is this session's send path gated by BUG-187 B2? True while an
+   * adoption is `pending` or settled `responder-only`: the session does not own
+   * its CLI, so a message may only go in under FEAT-065's gate and only with the
+   * broker's positive acceptance (`sendGated`).
+   */
+  get adoptGated(): boolean {
+    return this.#adoptState === 'pending' || this.#adoptState === 'responder-only';
+  }
+
+  /**
+   * BUG-187 B2 / BUG-191 — the gate verdict for a message into an adopt-gated
+   * session, decided ONCE from the broker's own record. A refusal carries the
+   * `drain` payload the client's BUG-045 chip renders. Always `ok` for a
+   * session that is not adopt-gated (its send path is the ordinary one).
+   * This is preflight only — the broker's `deliver_ack` is the delivery fact.
+   */
+  sendGate(): { ok: true } | { ok: false; why: string; message: string; drain: AdoptDrainPayload } {
+    const oldHost = this.#brokerProtocol !== null && this.#brokerProtocol < 2;
+    if (!this.adoptGated && !oldHost) return { ok: true };
+    let st: HostStatus | null = null;
+    try { st = this.#survivalHandle ? (JSON.parse(fs.readFileSync(this.#survivalHandle.statusPath, 'utf8')) as HostStatus) : null; } catch { st = null; }
+    const bg = typeof st?.backgroundLive === 'number' ? st.backgroundLive : 0;
+    const refuse = (why: string) => {
+      const heldSinceMs = st?.drainHeldSince ? Date.parse(st.drainHeldSince) : NaN;
+      const drain: AdoptDrainPayload = {
+        backgroundLive: bg,
+        backgroundTaskIds: Array.isArray(st?.backgroundTaskIds) ? st!.backgroundTaskIds! : [],
+        backgroundLifetime: (st?.backgroundLifetime as 'yes' | 'unknown' | 'no' | undefined) ?? null,
+        drainHeldSince: st?.drainHeldSince ?? null,
+        heldForMs: Number.isFinite(heldSinceMs) ? Math.max(0, Date.now() - heldSinceMs) : null,
+        brokerState: st?.state ?? 'unknown',
+        adoptState: this.#adoptState,
+        why,
+      };
+      const message = this.#adoptState === 'adopted'
+        ? `this session cannot take a new message yet (${why}) — your message is queued and sends itself when the session is free`
+        : this.#adoptState === 'pending'
+        ? `this session is re-attaching after a server restart and cannot take a new message yet (${why}) — your message is queued and sends itself when the session is free`
+        : `this session is finishing an earlier server's work after a restart and cannot take a new message yet (${why}) — your message is queued and sends itself when the session is free`;
+      return { ok: false as const, why, message, drain };
+    };
+    if (this.#adoptState === 'pending') return refuse('the re-attach is still completing');
+    if (oldHost) {
+      /*
+       * BUG-191 round 2 (B5) — the broker's declared protocol decides, not the
+       * adoption state. An older broker has no `deliver_ack`, so a message
+       * written into it can be dropped with no signal (e.g. once its drain has
+       * ended the CLI's input) — never acked, never written. When this server
+       * OWNS it (`adopted`), refusing alone would strand the user behind a CLI
+       * nothing will ever end, so the refusal also RETIRES it: a graceful reap
+       * (its current turn and any live lane finish first — the broker's own
+       * lifetime hold), after which the queued message resumes the session
+       * from its transcript on a fresh CLI. `responder-only` is not ours to
+       * end; its own drain is already under way.
+       */
+      if (this.#adoptState === 'adopted') {
+        this.#retireOldHost();
+        return refuse('it is held by an older session host that cannot confirm a delivery — that host is being retired once its current work finishes, and your message then resumes the session on a fresh CLI');
+      }
+      return refuse('it is held by an older session host that cannot confirm a delivery, so nothing is sent into it until it finishes');
+    }
+    if (!st) return refuse('the broker record is unreadable');
+    if (st.acceptingInput === false) return refuse('the broker has already ended the CLI\'s input');
+    if (st.midTurn !== false) return refuse('a turn is in flight');
+    const deliverable = st.backgroundLifetime === 'yes' || (st.backgroundLifetime === 'unknown' && bg > 0);
+    if (!deliverable) return refuse(`its background lifetime is ${st.backgroundLifetime ?? 'unknown'}, so its drain may commit at any moment`);
+    return { ok: true };
+  }
+
+  /**
+   * BUG-191 — deliver one user message into an adopt-gated session with the
+   * broker's CORRELATED acceptance (H7 `deliver` → `deliver_ack`), on the same
+   * socket the attach facade already owns (no second writer). Three outcomes:
+   *  - `delivered`: the broker wrote the frame (`accepted:true`) — only now may
+   *    the caller ack the client; the turn is opened here exactly as send() does;
+   *  - `refused`: definitely NOT written (the gate, or `accepted:false`) — the
+   *    caller refuses retryably and the client queues it;
+   *  - `uncertain`: the envelope went out but no answer came (timeout / the
+   *    socket closed) — the frame may or may not have reached the CLI, so the
+   *    caller must NOT invite an automatic resend (the client judges it against
+   *    the transcript, BUG-129's reconciliation).
+   */
+  async sendGated(prompt: string): Promise<
+    | { outcome: 'delivered' }
+    | { outcome: 'refused'; message: string; drain: AdoptDrainPayload | undefined }
+    | { outcome: 'uncertain'; message: string }
+  > {
+    if (this.closed) return { outcome: 'refused', message: 'session is closed', drain: undefined };
+    const gate = this.sendGate();
+    if (!gate.ok) return { outcome: 'refused', message: gate.message, drain: gate.drain };
+    if (!this.adoptGated) {
+      // Not gated (e.g. the adoption settled `adopted` since the caller checked): the ordinary path.
+      try { this.send(prompt); } catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
+      return { outcome: 'delivered' };
+    }
+    const handle = this.#survivalHandle;
+    if (!handle) return { outcome: 'refused', message: 'this session has no broker to deliver into', drain: undefined };
+    const text = this.#withBriefing(prompt);
+    const r = await handle.broker.deliver({ role: 'user', content: [{ type: 'text', text }] }, GATED_DELIVER_ACK_MS);
+    if (r && !r.accepted) {
+      const g = this.sendGate();
+      return {
+        outcome: 'refused',
+        message: `this session could not take the message (${r.reason ?? 'the broker declined it'}) — it was NOT delivered; it stays queued and sends itself when the session is free`,
+        drain: g.ok ? undefined : g.drain,
+      };
+    }
+    if (!r) {
+      return {
+        outcome: 'uncertain',
+        message: 'the session host did not confirm the delivery in time — the message may or may not have reached the session. It is not resent automatically; check the transcript before sending it again.',
+      };
+    }
+    // Accepted: the CLI has the frame. Open the turn exactly as send() does.
+    this.busy = true;
+    this.turnStartedAt = Date.now();
+    this.#turnUserInitiated = true;
+    this.lastFrameAt = Date.now();
+    this.lastProviderError = null;
+    this.#advisoryNotice = null;
+    this.#interruptRequested = false;
+    this.pushRunningSnapshot(true);
+    this.#recorder?.recordUserPrompt(text);
+    return { outcome: 'delivered' };
+  }
+
+  /**
+   * BUG-191 round 2 (B5) — retire an ADOPTED older broker, once: the graceful
+   * reap (SIGTERM → its drain: current turn, then its lifetime hold on live
+   * lanes, then stdin EOF). This bridge stays attached as the responder while
+   * it drains, so a permission the old CLI still asks is still answered.
+   */
+  #retireOldHost(): void {
+    if (this.#oldHostRetiring || this.closed || !this.#survivalHandle) return;
+    this.#oldHostRetiring = true;
+    console.log(`[orchard] BUG-191: retiring older session host for session ${this.id} — it cannot confirm a delivery, and a message is waiting (graceful: its current turn and live lanes finish first; the message then resumes the session on a fresh CLI)`);
+    this.#emit({ t: 'status', status: 'this session is held by an older session host that cannot confirm a delivery — it is being retired once its current work finishes; your message waits and then resumes the session on a fresh CLI' });
+    try { this.#survivalHandle.reap(); } catch { /* gone */ }
+  }
+
+  #adoptionFailed(why: string, o: { reapOld?: boolean } = {}): void {
+    if (this.#adoptState === 'failed') return;
+    this.#adoptState = 'failed';
+    this.#adoptWhy = why;
+    this.#suppressEndRecord = true;
+    const statusPath = this.#survivalHandle?.statusPath ?? null;
+    if (o.reapOld && statusPath) {
+      console.warn(`[orchard] BUG-187: adoption FAILED — ${why}. This is an OLDER broker with no request floor of its own, so it is stopped cleanly (graceful reap: its in-flight turn and live lanes drain first) rather than left holding a CLI nobody can answer.`);
+      void this.close(`adoption failed: ${why}`).catch(() => {}).finally(() => { try { reapHost(statusPath); } catch { /* gone */ } });
+      return;
+    }
+    console.warn(`[orchard] BUG-187: adoption FAILED — ${why}. Disposing this server's attachment WITHOUT reaping the broker.`);
+    void this.close(`adoption failed: ${why}`).catch(() => {});
   }
 
   /**
@@ -3050,6 +3495,35 @@ export class AgentSession {
           return;
         }
         this.#armDetachedClose(30_000);
+        return;
+      }
+      /*
+       * BUG-187 B4 — a BROKERED session's close is decided by the BROKER's
+       * lifetime (it owns the fact; the bridge's view is filtered by BUG-105's
+       * veto and BUG-157's TTL, and the two disagreeing is exactly how the
+       * incident closed a session whose broker then held its CLI forever with
+       * nobody to answer it). Unknown or yes → keep; only the broker's `no`, or
+       * a dead process, closes. The decision is journaled either way it closes.
+       */
+      if (this.#survivalHandle) {
+        void this.closeLifetime().then((cl) => {
+          if (!this.detached || this.busy || this.closed) return;
+          if (cl.lifetime === 'no') {
+            console.log(`[orchard] detached session ${this.id} closing: the broker's lifetime is no (${cl.source}); the bridge's own view was ${lifetime.outlivesTurn}`);
+            void this.close('finished while detached');
+            return;
+          }
+          if (this.processProbe().state === 'dead') {
+            console.log(`[orchard] detached session ${this.id} closing: its process is gone (broker lifetime was ${cl.lifetime}: ${cl.source})`);
+            void this.close(`finished while detached (work lifetime was ${cl.lifetime}, but the process is gone)`);
+            return;
+          }
+          if (lifetime.outlivesTurn === 'no' && !this.#fuseKeptLogged) {
+            this.#fuseKeptLogged = true;
+            console.log(`[orchard] detached session ${this.id} kept open: the bridge's view says no work outlives the turn, but the broker says ${cl.lifetime} (${cl.source}) — the broker decides`);
+          }
+          this.#armDetachedClose(30_000);
+        });
         return;
       }
       // `direct` — the survival-handle probe is this session's ground truth and is
@@ -4214,6 +4688,7 @@ export class AgentSession {
          * a task the engine had already declared. `#rebuildBackgroundLevel()` is the
          * one place the two are combined.
          */
+        this.#levelFrameAt = Date.now(); // BUG-187 round 2: first-hand level evidence, stamped
         this.#levelRaw = new Map(
           tasks
             .map((t: any): [string, 'agent' | 'tool'] => [
@@ -4744,6 +5219,26 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
     throw new Error(msg);
   }
   /*
+   * FEAT-151 finding #1 — NO SKEW WINDOW. A host (direct) session runs the CLI
+   * bundled inside the in-process SDK JS; those ship version-locked. Once a
+   * runtime update has started replacing the on-disk SDK, a NEW host session
+   * would pair the new binary with the still-loaded old JS (or hit half-replaced
+   * files). So block new HOST sessions from the moment install starts until a
+   * restart reconciles loaded-JS == on-disk. Already-running sessions keep their
+   * in-memory runtime and their already-spawned CLI process — nothing here
+   * touches them. Container sessions run a separate baked CLI and are unaffected.
+   */
+  if (iso === 'direct') {
+    const block = runtimeUpdate.hostSessionBlock();
+    if (block) {
+      // BUG-190 round 3: a transient block (boot check / re-hash in flight) is
+      // marked with a structured code, so a client or harness retries on the
+      // signal, never on a substring of the prose.
+      opts.onEvent({ t: 'error', message: block.reason, fatal: true, ...(block.transient ? { code: 'runtime-check-pending' as const } : {}) });
+      throw new Error(block.reason);
+    }
+  }
+  /*
    * BUG-138 — THE WORKING DIRECTORY, BEFORE ANYTHING TRIES TO USE IT.
    *
    * A renamed or deleted project directory is the single most explainable
@@ -5021,6 +5516,27 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
   return s;
 }
 
+/**
+ * BUG-187 B1/I1 — adopt a surviving broker's running CLI as a live session of
+ * THIS server, under the station id it already had (a tab that lived through
+ * the restart reattaches to it by that id or by its sdk id). Spawns nothing,
+ * sends no prompt; see AgentSession's `adopt` option. Throws when there is no
+ * project to hold it (the caller then leaves the broker to its own floor).
+ */
+export function adoptSession(
+  st: HostStatus,
+  facade: { proc: SpawnedProcessLike; handle: AttachHandle },
+  project: Project,
+  onEvent: (e: StationEvent) => void = () => { /* detached until a tab attaches */ },
+): AgentSession {
+  const id = st.stationSessionId ?? `cs-adopt-${st.hostPid}`;
+  const existing = sessions.get(id);
+  if (existing && !existing.closed) throw new Error(`a live session ${id} already exists in this server`);
+  const s = new AgentSession(id, { project, firstPrompt: '', onEvent, adopt: { st, ...facade } });
+  sessions.set(id, s);
+  return s;
+}
+
 export function getSession(id: string): AgentSession | undefined {
   return sessions.get(id);
 }
@@ -5055,9 +5571,21 @@ export async function closeAllSessions(reason = 'shutdown', opts: { handoff?: bo
     // never coerced) is handed off too, bounded downstream by the broker's own
     // lifetime-aware abandon net + drain (session-host.mjs). Only a session
     // with nothing running and nothing outliving the turn closes here.
-    if (opts.handoff && s.survivable && (s.busy || s.workLifetime().outlivesTurn !== 'no')) {
-      try { s.handoff(); } catch { /* best effort */ }
-      return Promise.resolve();
+    if (opts.handoff && s.survivable) {
+      /*
+       * BUG-187 B4 — the handoff choice reads the BROKER's lifetime (the same
+       * one close gate as the detached fuse and the socket release). Busy, yes
+       * or unknown → hand off; only the broker's `no` closes here.
+       */
+      if (s.busy) { try { s.handoff(); } catch { /* best effort */ } return Promise.resolve(); }
+      return s.closeLifetime().then((cl) => {
+        if (cl.lifetime !== 'no') {
+          try { s.handoff(); } catch { /* best effort */ }
+          return;
+        }
+        console.log(`[orchard] ${reason}: closing idle session ${s.id} — the broker's lifetime is no (${cl.source})`);
+        return s.close(reason).catch(() => {});
+      }, () => { try { s.handoff(); } catch { /* best effort */ } });
     }
     return s.close(reason).catch(() => {});
   }));

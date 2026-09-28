@@ -441,73 +441,61 @@ function noteCannotGrade(verdict, detail, payload) {
   }, payload);
 }
 
-/* ── Violation reporter: the ONE place a mode difference exists ──────────────
- * Built ONCE at startup. In advisory mode the enforcing closure — the only code
- * that can ever write {"decision":"block"} — is never constructed, so blocking
- * is impossible by construction rather than by a late conditional. */
-function makeViolationReporter() {
-  if (!isTruthyEnv(process.env.ORCHARD_STOP_HOOK_ENFORCE)) {
-    /* ADVISORY: report through non-turn-consuming channels, then ALLOW. */
-    return function advise(cats, payload) {
-      const message = summarise(cats);
-      appendAdvisoryLog(message, payload);
-      try { process.stderr.write('[orchard stop-hook advisory] ' + message + '\n'); } catch { /* ignore */ }
-      try {
-        // `systemMessage` is displayed to the user in the UI and does NOT block
-        // the stop (no `decision`, no `continue:false`). Verified against the
-        // Claude Code settings/hook-output schema.
-        process.stdout.write(JSON.stringify({
-          systemMessage: 'Response-format advisory (not enforced): ' + message,
-          suppressOutput: true,
-        }));
-      } catch { /* if we cannot report, still allow */ }
-      return allow();
-    };
-  }
-
-  /* ENFORCE (opt-in only): block the stop with a corrective reason. */
-  return function enforce(cats) {
-    const reason = summarise(cats) + ' Re-send the SAME answer, corrected.';
-    try {
-      process.stdout.write(JSON.stringify({ decision: 'block', reason }));
-    } catch {
-      // If we somehow cannot emit the block, fail open rather than hang.
-    }
-    return allow();
-  };
+/* ── Advisory reporter: reports, NEVER blocks (under any env) ─────────────────
+ * BUG-192 round 2 — this closure can never write {"decision":"block"}. The block
+ * decision now lives entirely in main(), gated on `blockSafe` (proven-this-turn
+ * text) so a stale-transcript fallback can never block under ANY env, and it never
+ * receives lengthReasons so the length budget can never appear in a block reason.
+ * The advisory channels (systemMessage + log) are non-turn-consuming; length and
+ * any category we chose not to block this turn are surfaced here. */
+function reportAdvisory(cats, payload) {
+  const message = summarise(cats);
+  appendAdvisoryLog(message, payload);
+  try { process.stderr.write('[orchard stop-hook advisory] ' + message + '\n'); } catch { /* ignore */ }
+  try {
+    // `systemMessage` is displayed to the user in the UI and does NOT block the
+    // stop (no `decision`, no `continue:false`). Verified against the Claude Code
+    // settings/hook-output schema.
+    process.stdout.write(JSON.stringify({
+      systemMessage: 'Response-format advisory (not enforced): ' + message,
+      suppressOutput: true,
+    }));
+  } catch { /* if we cannot report, still allow */ }
+  return allow();
 }
 
-const reportViolation = makeViolationReporter();
-
-/* ── FEAT-137/138: the ENFORCED checks — block ONCE for an immediate revision ──
- * The length budget and the ask-ownership rule are the two things the user has
- * demanded twice and watched fail as advice. So, UNLIKE the format/readability/
- * block checks above, these do NOT wait on ORCHARD_STOP_HOOK_ENFORCE (set in no
- * launch path): they are active on every real launched session by default.
+/* ── FEAT-137/150: the ENFORCED checks — block ONCE for an immediate revision ──
+ * ask-ownership (FEAT-137) and the completion-claim ground-truth check (FEAT-150)
+ * are the checks the user demanded and watched fail as advice, so — UNLIKE the
+ * format/readability/block/LENGTH checks — they do NOT wait on
+ * ORCHARD_STOP_HOOK_ENFORCE: they are active on every real launched session by
+ * default. (BUG-192 removed the LENGTH budget from this set — an over-budget
+ * reply must never force a second generation; length is advisory now.)
  *
  * WHY BLOCKING IS SAFE HERE, and why it is the LEAST-destructive option that
  * actually changes behaviour:
  *   - Nothing is discarded. Blocking a Stop hands `reason` back to the model as a
- *     just-in-time correction; the model RE-SENDS the same answer, tighter / with
- *     the ask owned. A visible advisory marker (the existing advisory mode) was
- *     tried for exactly these and did not move output — it tells the USER, not the
- *     model, so the model keeps doing it.
+ *     just-in-time correction; the model RE-SENDS the same answer with the ask
+ *     owned / the completion state stated. A visible advisory marker was tried for
+ *     exactly these and did not move output — it tells the USER, not the model.
  *   - It CANNOT strand the user. `stop_hook_active === true` is checked upstream
- *     and always allows, so at most ONE correction happens per turn: if the
- *     re-send is still over budget, it goes through. Worst case is one extra
- *     generation, never a loop, never a wedged conversation.
- *   - It is race-robust in the dangerous direction. The FEAT-085 read-during-write
- *     race reads a PARTIAL or EARLIER message; a partial read has FEWER words, so
- *     the length check under-counts and errs toward NOT blocking. (A false block
- *     from reading a previous long message costs one wasted re-send, bounded as
- *     above.)
+ *     and always allows, so at most ONE correction happens per turn. Worst case is
+ *     one extra generation, never a loop, never a wedged conversation.
+ *   - It cannot fire on a STALE message (BUG-192). The block path is reached only
+ *     when `blockSafe` is true — i.e. the graded text came from the payload's
+ *     `last_assistant_message`, which is provably THIS turn. When the hook falls
+ *     back to the transcript tail (payload lacks the field), it can be a
+ *     pre-current message, so the caller withholds the block and reports advisory
+ *     instead. This replaces the old (incorrect) claim that the read-during-write
+ *     race can only UNDER-count: a longer previous message OVER-counts and
+ *     produced real false blocks (the "453 words" symptom).
  *   - Kill switch already exists: ORCHARD_STOP_HOOK_DISABLED (checked upstream)
  *     turns the whole hook inert, so a live session that misbehaves is one env var
  *     from silence.
  */
 function reviseTurn(cats, payload) {
   const reason = summarise(cats)
-    + ' Re-send the SAME answer, corrected: same content, within the length budget, with every ask owned.';
+    + ' Re-send the SAME answer, corrected: same content, with every ask owned and every completion claim matching the board.';
   // Record it in our own log too (best-effort), so "why did that turn get a
   // re-prompt?" is answerable from outside the transcript.
   appendAdvisoryLog('[enforced-revision] ' + reason, payload);
@@ -641,6 +629,44 @@ function lastAssistantText(transcriptPath) {
   return parts.join('');
 }
 
+/**
+ * BUG-192 — resolve the text to grade, and say whether a BLOCK is safe on it.
+ *
+ * Root cause of the FEAT-085 false blocks: `lastAssistantText()` re-reads the
+ * transcript TAIL, and when the Stop hook fires before the current reply's JSONL
+ * line is flushed, the tail is the PREVIOUS assistant message — so a compliant
+ * 113-word reply was blocked as "453 words" (the earlier message). The old
+ * comment claimed the race can only UNDER-count; that is wrong — grading a longer
+ * previous message OVER-counts and produces a false block.
+ *
+ * The fix is to grade the message Claude Code hands us directly. The Stop payload
+ * carries `last_assistant_message` — the CURRENT turn's final text (verified live;
+ * listed in the payload-fields note above) — which is immune to the flush race.
+ *
+ *   - PAYLOAD present  -> grade it. `blockSafe:true` — this is provably this turn.
+ *   - PAYLOAD absent   -> fall back to the transcript tail, but `blockSafe:false`:
+ *                         we cannot prove the tail is THIS turn (it may be the
+ *                         still-un-flushed race case), so we FAIL OPEN toward not
+ *                         blocking. Advisory reporting still runs (unchanged from
+ *                         the pre-payload behaviour); only the enforced BLOCK is
+ *                         withheld. Every check that reads `text` — digest, emoji,
+ *                         readability, blocks, length — is fixed at once by this
+ *                         single source switch.
+ */
+function resolveGradedText(payload) {
+  const fromPayload = typeof payload?.last_assistant_message === 'string'
+    ? payload.last_assistant_message : '';
+  if (fromPayload.trim()) return { text: fromPayload, blockSafe: true };
+
+  const transcriptPath = payload?.transcript_path;
+  if (!transcriptPath || typeof transcriptPath !== 'string' || !fs.existsSync(transcriptPath)) {
+    return { text: '', blockSafe: false };
+  }
+  let text = '';
+  try { text = lastAssistantText(transcriptPath); } catch { text = ''; }
+  return { text, blockSafe: false };
+}
+
 /** Read all of stdin as a string. Never rejects; empty on any trouble. */
 function readStdin() {
   return new Promise((resolve) => {
@@ -695,12 +721,11 @@ async function main() {
   // Per-project opt-out (FEAT-083/084 parity).
   if (digestDisabledForProject(payload.cwd)) return allow();
 
-  const transcriptPath = payload.transcript_path;
-  if (!transcriptPath || typeof transcriptPath !== 'string') return allow();
-  if (!fs.existsSync(transcriptPath)) return allow(); // missing transcript -> fail open
-
-  let text;
-  try { text = lastAssistantText(transcriptPath); } catch { return allow(); }
+  // BUG-192 — grade the payload's `last_assistant_message` (this turn's text,
+  // race-immune) and fall back to the transcript tail only when it is absent.
+  // `blockSafe` is false on the fallback: the tail may be a stale (pre-current)
+  // message, so nothing may BLOCK on it — advisory reporting still runs.
+  const { text, blockSafe } = resolveGradedText(payload);
   if (!text || !text.trim()) return allow(); // nothing to check -> fail open
 
   // Authoritative digest pass/fail: the SINGLE source of truth in digest.js.
@@ -949,23 +974,42 @@ async function main() {
     noteCannotGrade('deps-readability-threw', err?.message, payload);
   }
 
-  // FEAT-137/138 — the ENFORCED categories decide the turn. If either fired, block
-  // ONCE for a revision (bounded by stop_hook_active upstream), folding the
-  // advisory-class reasons into the SAME correction so the model fixes everything
-  // in one re-send.
-  const enforced = lengthReasons.length > 0 || askReasons.length > 0 || completionReasons.length > 0;
-  const advisory = formatReasons.length > 0 || readabilityReasons.length > 0 || blockReasons.length > 0;
+  // BUG-192 — THE DECISION. Three unconditional rules, none depending on which
+  // env a launch path happens to set:
+  //   (1) The LENGTH budget is ADVISORY under EVERY env and is NEVER part of a
+  //       block reason. A block makes the user read the reply twice and re-reads
+  //       the whole (~200k-token) context to regenerate it; FEAT-127 showed 65% of
+  //       turns tripping it, so blocking was the dominant cost. No Stop-hook output
+  //       field reaches the model's NEXT turn without blocking THIS one (the Stop
+  //       contract offers only decision:block+reason, continue/stopReason,
+  //       systemMessage, suppressOutput — additionalContext is not a Stop field),
+  //       and the brevity rule is already injected into every turn's
+  //       RESPONSE_FORMAT.md core, so systemMessage + telemetry is the right home.
+  //   (2) A BLOCK may happen ONLY on text proven to be THIS turn (`blockSafe`, i.e.
+  //       from the payload's last_assistant_message). The stale-capable transcript
+  //       fallback can never block, under any env.
+  //   (3) `ORCHARD_STOP_HOOK_ENFORCE` only widens WHICH advisory categories may
+  //       block (format/readability/blocks); it can never make length block, nor
+  //       make a non-blockSafe fallback block.
+  // Block-eligible categories, EXCLUDING lengthReasons by construction:
+  const enforceEnv = isTruthyEnv(process.env.ORCHARD_STOP_HOOK_ENFORCE);
+  const alwaysBlock = askReasons.length > 0 || completionReasons.length > 0; // FEAT-137/150
+  const envBlock = formatReasons.length > 0 || readabilityReasons.length > 0 || blockReasons.length > 0;
+  const wantsBlock = alwaysBlock || (enforceEnv && envBlock);
 
-  if (!enforced && !advisory) {
-    return allow(); // fully compliant -> silence, no advisory noise
+  const anyAdvisory = formatReasons.length > 0 || readabilityReasons.length > 0
+    || blockReasons.length > 0 || lengthReasons.length > 0
+    || askReasons.length > 0 || completionReasons.length > 0;
+  if (!anyAdvisory) return allow(); // fully compliant -> silence, no advisory noise
+
+  if (wantsBlock && blockSafe) {
+    // NOTE: lengthReasons is deliberately NOT passed — length is never a block reason.
+    return reviseTurn({ formatReasons, readabilityReasons, blockReasons, askReasons, completionReasons }, payload);
   }
-  if (enforced) {
-    return reviseTurn({ formatReasons, readabilityReasons, blockReasons, lengthReasons, askReasons, completionReasons }, payload);
-  }
-  // Advisory-only (unchanged behaviour): report through the env-gated path — never
-  // blocks unless ORCHARD_STOP_HOOK_ENFORCE is set, preserving the FEAT-085 race
-  // decision for the digest/emoji/readability/block checks.
-  return reportViolation({ formatReasons, readabilityReasons, blockReasons }, payload);
+  // Everything else is advisory and NEVER blocks (any env): length always, plus any
+  // block-eligible category we could not block this turn (default mode, or a
+  // non-blockSafe fallback), so nothing is silently lost.
+  return reportAdvisory({ formatReasons, readabilityReasons, blockReasons, lengthReasons, askReasons, completionReasons }, payload);
 }
 
 main().catch(() => allow());

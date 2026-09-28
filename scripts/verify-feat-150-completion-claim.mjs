@@ -69,8 +69,11 @@ function transcript(name, text) {
 
 /** Run the hook WITHOUT ORCHARD_STOP_HOOK_ENFORCE — proving default enforcement. */
 function run(items) {
-  const tp = transcript('t' + Math.random().toString(36).slice(2), replyWithItems(items));
-  const payload = { session_id: SID, cwd: REPO, transcript_path: tp, hook_event_name: 'Stop' };
+  const reply = replyWithItems(items);
+  const tp = transcript('t' + Math.random().toString(36).slice(2), reply);
+  // BUG-192 — real Claude Code carries the final reply in last_assistant_message,
+  // which the hook now grades (race-immune) and which the block path requires.
+  const payload = { session_id: SID, cwd: REPO, transcript_path: tp, hook_event_name: 'Stop', last_assistant_message: reply };
   const env = { ...process.env, ORCHARD_SESSION: SID };
   delete env.ORCHARD_STOP_HOOK_ENFORCE; // prove it blocks by default
   const r = spawnSync('node', [HOOK], { input: JSON.stringify(payload), encoding: 'utf8', env, cwd: REPO, timeout: 15000 });

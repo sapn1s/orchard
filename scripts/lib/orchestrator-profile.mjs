@@ -612,6 +612,92 @@ export function decideBashCommand(command) {
   return { allow: true, offender: null };
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * ORCH-BYPASS (FEAT-152) — the deliberate, audited inline escape hatch.
+ *
+ * The profile removes inline reading/searching/executing because that work
+ * belongs in a dispatched lane. But sometimes the orchestrator genuinely needs
+ * a command's OUTPUT in its OWN context — a status line, a count, one short
+ * file that is the direct input to its very next decision — and dispatching a
+ * lane only to relay that exact value back is pure ceremony. This is the
+ * sanctioned way to do that, on three conditions the user set: the marker
+ * carries a REAL reason, every use is LOGGED, and the criteria live in the
+ * denial text itself so the model reads them at the wall.
+ *
+ * WHY A FIRST-LINE SHELL COMMENT. `# ORCH-BYPASS: <reason>` on the FIRST line is
+ * ignored by bash as a comment, so nothing has to strip it before the command
+ * runs. The marker MUST be the first line: a trailing `echo x # ORCH-BYPASS: …`
+ * is a comment on some other command and must NOT open the hatch, or the hatch
+ * becomes a way to smuggle a read past the profile behind a harmless-looking head.
+ *
+ * PURITY. Detection here is pure — it returns a verdict, it does not log. The
+ * ledger write + running count are the hook's job (claude-runtime.ts), for the
+ * same reason `decide()` is pure: the enforcement point owns the side effects,
+ * the policy owns the decision (ARCH-008 — one definition, two importers).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** The marker, and only on the first line. Capture group 1 is the raw reason. */
+const BYPASS_FIRST_LINE = /^\s*#\s*ORCH-BYPASS:\s*(.*)$/;
+/** A reason floor: enough to describe WHY, not just "need it" (7 chars). */
+const BYPASS_MIN_REASON = 15;
+
+/**
+ * The rules — replayed in the denial text, so kept tight. When ORCH-BYPASS is
+ * appropriate, and (the longer list) when it is not.
+ */
+const BYPASS_CRITERIA = [
+  'Deliberate escape hatch (ORCH-BYPASS): if you need this command\'s OUTPUT as the',
+  'direct input to your very NEXT decision, it is small (a status line, a count, one',
+  'short file you will act on), and dispatching a lane would only relay that exact',
+  'value straight back to you — prefix the command\'s FIRST line with a shell comment:',
+  '    # ORCH-BYPASS: <why this output must land in THIS session>',
+  `The reason is REQUIRED (>= ${BYPASS_MIN_REASON} chars). Every bypass is logged with its reason`,
+  'and reviewed, and a running count is shown. NOT for: searching or exploring, reading',
+  'code to understand it, running tests/builds/verification, anything you would then',
+  'summarise, or anything that is a ticketed change.',
+];
+
+/**
+ * Is this Bash command invoking the escape hatch? PURE — returns a verdict only.
+ *   { present:false }                       — no marker on the first line
+ *   { present:true, valid:false, problem }  — marker present, reason missing/short
+ *   { present:true, valid:true,  reason }   — marker present with a usable reason
+ */
+export function detectOrchBypass(command) {
+  const cmd = typeof command === 'string' ? command : '';
+  // Only the FIRST line. `split('\n', 1)` bounds this to the first line no matter
+  // how long the rest of the command is.
+  const firstLine = cmd.split('\n', 1)[0] ?? '';
+  const m = BYPASS_FIRST_LINE.exec(firstLine);
+  if (!m) return { present: false };
+  const reason = m[1].trim();
+  if (reason.length < BYPASS_MIN_REASON) {
+    return {
+      present: true,
+      valid: false,
+      reason,
+      problem: `the reason is ${reason.length === 0 ? 'missing' : `too short (${reason.length}/${BYPASS_MIN_REASON} chars)`}`,
+    };
+  }
+  return { present: true, valid: true, reason };
+}
+
+/**
+ * The denial for a marker that is present but unusable. Names the problem, shows
+ * the shape, and carries the same criteria as every other refusal.
+ */
+function invalidBypassReason(problem) {
+  return [
+    `Orchestrator tool profile: the \`# ORCH-BYPASS:\` marker on this command is not usable — ${problem}.`,
+    '',
+    'The escape hatch needs a real reason on the command\'s FIRST line, e.g.:',
+    '    # ORCH-BYPASS: need the live gate exit status to decide whether to commit now',
+    'then the command itself on the following line(s).',
+    '',
+    ...BYPASS_CRITERIA,
+  ].join('\n');
+}
+
 /**
  * What a refused call should TELL the model — and therefore what the user reads
  * when it comes back. A restriction that produces an unexplained error is worse
@@ -657,6 +743,8 @@ function refusalReason(toolName, offender) {
     'Still available here: Agent, SendMessage, TaskStop, AskUserQuestion, Edit,',
     'Write, and Bash for npm/node/git/status commands (the gate, the board, your',
     'own commits).',
+    '',
+    ...BYPASS_CRITERIA,
   );
   return lines.join('\n');
 }
@@ -705,12 +793,26 @@ export function decide({ toolName, toolInput, agentId } = {}) {
   const name = typeof toolName === 'string' ? toolName : '';
 
   if (name === 'Bash') {
-    const { allow, offender } = decideBashCommand(
-      toolInput && typeof toolInput === 'object' ? toolInput.command : '',
-    );
-    return allow
-      ? { allow: true, reason: null, scope: 'orchestrator' }
-      : { allow: false, reason: refusalReason(name, offender), scope: 'orchestrator' };
+    const command = toolInput && typeof toolInput === 'object' ? toolInput.command : '';
+    const { allow, offender } = decideBashCommand(command);
+    // Allowed on its own merits (npm/node/git/status): a bypass marker, if any,
+    // is just a harmless comment — nothing was bypassed, so nothing is logged.
+    if (allow) return { allow: true, reason: null, scope: 'orchestrator' };
+    // Refused by the profile. Only NOW does the audited escape hatch matter.
+    const bp = detectOrchBypass(command);
+    if (bp.present && bp.valid) {
+      // Pure: we return the bypass event; the hook logs it and counts it.
+      return {
+        allow: true,
+        reason: null,
+        scope: 'orchestrator',
+        bypass: { reason: bp.reason, command: typeof command === 'string' ? command : '' },
+      };
+    }
+    if (bp.present && !bp.valid) {
+      return { allow: false, reason: invalidBypassReason(bp.problem), scope: 'orchestrator' };
+    }
+    return { allow: false, reason: refusalReason(name, offender), scope: 'orchestrator' };
   }
 
   if (ENFORCE_ALLOWED_TOOLS.includes(name)) {

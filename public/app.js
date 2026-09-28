@@ -10,7 +10,7 @@
  * builds more DOM than the user has actually opened. Search loads every
  * project's index once, then filters in memory.
  */
-import { $, el, clear, svg, mmss, kilo, bytes, when, shortPath, toolArg, prose, inlineInto } from './lib/dom.js';
+import { $, el, clear, svg, mmss, kilo, bytes, when, shortPath, toolArg, prose, inlineInto, setText, setHidden, setAttr } from './lib/dom.js';
 import * as api from './lib/api.js';
 import { createDrawer } from './lib/drawer.js';
 import { createSlidePanel } from './lib/slide-panel.js';
@@ -221,6 +221,11 @@ const state = {
   watchWs: null,          // passive listener — see the "auto-follow" section
   watchTries: 0,
   liveIds: new Map(),  // `${dir} ${sessionId}` -> live record, for sessions being written
+  // FEAT-154 — sdkSessionIds whose bridge has an OUTSTANDING pending
+  // question/permission ("waiting on you"), published by the server on
+  // /api/sessions (`awaitingUser`) and refreshed on the live poll. The nav reads
+  // THIS for the amber waiting marker; it is never re-derived client-side.
+  awaitingIds: new Set(),
   following: false,    // is the server watching the open session file for us?
   liveTimer: null,
   forkFrom: null, // session id being branched from, set by the Windows fork bar
@@ -237,6 +242,7 @@ const state = {
    * {texts: string[], at: number}
    */
   outbox: null,
+  sendAttempts: new Map(), // BUG-191: sendId -> { texts, el, at, resume } — per-attempt ownership of an in-flight `send`
   forceSend: null, // {text, composedAt} pulled out of queue, awaiting the interrupt it triggered to land at turn-end (FEAT-031 Part A)
   /*
    * BUG-083 — unsent composer text, keyed to the project/session it was typed
@@ -262,6 +268,7 @@ const state = {
   board: null,       // {hasBoard, needsYou, queued, inflight, doneToday} for the current project
   boardProjectId: null, // which project state.board belongs to
   boardBusy: false,  // a refresh is in flight
+  openAnswerId: null, // FEAT-153 — the one needs-you ticket whose answer flow is mounted in #railNeeds
   // FEAT-040 — session-status affordance ground truth. `sessPhase` only means
   // something while `busy` is true ('thinking' until the first text-delta,
   // then 'streaming'); the others are independent flags so more than one true
@@ -283,6 +290,9 @@ const state = {
   // { key, entry, at } — key identifies which session `entry` describes.
   sessSurvival: { key: null, entry: null, at: 0 },
 };
+
+/** BUG-191 — the note a send whose delivery was never confirmed carries (read by the dock to say "not confirmed", not "not delivered"). */
+const UNCONFIRMED_NOTE = 'sent, but the session never confirmed it arrived — check the transcript before sending it again';
 
 /* ------------------------------------------------- sidebar attention state */
 /*
@@ -369,6 +379,7 @@ function unseenCount(s) {
   const cur = seenKey(state.current.encodedDir, state.current.sessionId ?? '');
   let n = 0;
   for (const x of s.list) {
+    if (foldsFromList(x)) continue; // hidden from the list ⇒ never badged "new"
     const k = seenKey(x.encodedDir, x.sessionId);
     if (k === cur) continue; // on screen right now
     const seen = state.seen.get(k) ?? dayAgo;
@@ -481,9 +492,30 @@ function usageTitle() {
   return lines.join('\n');
 }
 
+/**
+ * FEAT-139 r3 — draw the window-burn as a FILLED RING inside #usageRing. The arc
+ * length IS the reading (a near-full ring reads near-full at any hue → the state
+ * is not colour-alone); `pct === null` renders a track-only "no reading" ring.
+ * Colour is applied via the button's warn/danger class in CSS, not here.
+ */
+function paintUsageRing(pct) {
+  const R = 5.2, C = 2 * Math.PI * R;
+  const frac = pct == null ? 0 : Math.max(0, Math.min(100, pct)) / 100;
+  const off = C * (1 - frac);
+  node.usageRing.innerHTML =
+    `<svg width="14" height="14" viewBox="0 0 14 14" fill="none">` +
+    `<circle class="track" cx="7" cy="7" r="${R}" stroke-width="2.2"/>` +
+    (pct == null
+      ? ''
+      : `<circle class="fill" cx="7" cy="7" r="${R}" stroke-width="2.2" ` +
+        `stroke-dasharray="${C.toFixed(2)}" stroke-dashoffset="${off.toFixed(2)}" ` +
+        `stroke-linecap="round" transform="rotate(-90 7 7)"/>`) +
+    `</svg>`;
+}
+
 function paintUsageChip() {
-  const btn = node.usageBtn; const lab = node.usageN;
-  if (!btn || !lab) return; // markup not present (older shell)
+  const btn = node.usageBtn;
+  if (!btn || !node.usageRing) return; // markup not present (older shell)
   const p = currentProject();
   if (!p) { btn.hidden = true; return; }
   const provider = providerView(); // the engine THIS project's next lane would use
@@ -500,20 +532,24 @@ function paintUsageChip() {
       : list.find((s) => s.provider === provider);
   btn.classList.remove('warn', 'danger', 'unknown');
   if (!snap || !snap.available) {
-    lab.textContent = 'usage —';
+    paintUsageRing(null);
     btn.classList.add('unknown');
     btn.title = usageTitle() || 'Provider usage — not available';
+    btn.setAttribute('aria-label', 'Provider usage — not available');
     btn.hidden = false;
     return;
   }
   // The binding window is the one that will actually stop the next lane.
   const b = snap.windows.find((w) => w.binding) ?? snap.windows[0];
-  const short = /weekly/i.test(b.label) ? (b.label.includes('·') ? b.label.replace(/^weekly\s*·\s*/i, 'wk ') : 'wk') : b.label;
+  const short = /weekly/i.test(b.label) ? 'weekly' : b.label;
   const reset = usageResetShort(b.resetsAt);
-  lab.textContent = `${b.usedPercent}% ${short}${reset ? ` · ${reset}` : ''}`;
+  paintUsageRing(b.usedPercent);
   if (b.usedPercent >= 90) btn.classList.add('danger');
   else if (b.usedPercent >= 75) btn.classList.add('warn');
   btn.title = usageTitle();
+  // The percent + window + reset that left the FACE survive on hover (title
+  // above, full detail) and here for screen readers — nothing dropped.
+  btn.setAttribute('aria-label', `Usage — ${b.usedPercent}% of the ${short} window used${reset ? `, resets in ${reset}` : ''}`);
   btn.hidden = false;
 }
 
@@ -583,11 +619,12 @@ const node = {
   insPlus: $('#insPlus'),
   gitBtn: $('#gitBtn'),
   gitN: $('#gitN'),
+  gitDot: $('#gitDot'),       // FEAT-139 r3 — shape-coded git state dot
   procBtn: $('#procBtn'),
   procN: $('#procN'),
   procPop: $('#procPop'),
   usageBtn: $('#usageBtn'),   // FEAT-116 — provider rate-limit window readout
-  usageN: $('#usageN'),
+  usageRing: $('#usageRing'), // FEAT-139 r3 — filled window-burn ring (no % text)
   procPorts: $('#procPorts'),
   sealSep: $('#sealSep'),
   rowMenu: $('#rowMenu'),
@@ -638,6 +675,7 @@ const node = {
   boardBtn: $('#boardBtn'),           // FEAT-066 — persistent topbar board entry
   boardBtnN: $('#boardBtnN'),
   railSummary: $('#railSummary'), // FEAT-067 — server-derived top-of-rail status index
+  railBoardGrid: $('#railBoardGrid'), // FEAT-153 — the primary ticket-board grid
   railRequests: $('#railRequests'), // FEAT-126 — "Your requests" persistent status surface
   railNeeds: $('#railNeeds'),
   railObservations: $('#railObservations'), // FEAT-079 — read-only findings lane
@@ -1071,7 +1109,7 @@ function projectDot(p) {
   // being written RIGHT NOW (any process) gets the same moss dot — that is
   // "Claude is still working in here" at a glance.
   if (projectHasLive(p, s)) return 'run';
-  if (s?.loaded && s.list.length === 0) return 'none';
+  if (s?.loaded && listedCount(s) === 0) return 'none';
   return '';
 }
 
@@ -1224,7 +1262,7 @@ function renderProjectGroup(p) {
     // Number only — the moss pill IS the word "new"; the tooltip spells it out.
     const fresh = unseenCount(s);
     if (fresh) head.append(el('span', { class: 'unseen', text: String(fresh), title: `${fresh} session${fresh === 1 ? '' : 's'} with activity since you last opened ${fresh === 1 ? 'it' : 'them'}` }));
-    head.append(el('span', { class: 'n', text: s?.loaded ? String(s.list.length) : '' }));
+    head.append(el('span', { class: 'n', text: s?.loaded ? String(listedCount(s)) : '' }));
 
     const plus = el('span', { class: 'plus', role: 'button', tabindex: '0', title: 'New session', 'aria-label': `New session in ${p.name}` });
     plus.append(iconPlus());
@@ -1280,7 +1318,16 @@ function renderProjectGroup(p) {
       else if (s?.error) kids.append(el('div', { class: 'hint-row', text: `history unavailable: ${s.error}` }));
       // A pending row already fills the group; the "no history" note would then
       // read as a contradiction under a visible session, so suppress it there.
-      else if (s?.loaded && !s.list.length) { if (!pend) kids.append(emptyProjectNote(p, s)); }
+      // All-hidden counts as empty: every row folds out of the default view, so
+      // the list presents nothing — show an empty state, not a bare "N more" over
+      // invisible clutter (BUG-193 round 1 finding 3). A project that genuinely
+      // has NO session files gets the diagnostic note; one whose only sessions are
+      // folded (dispatch lanes / external scripts) gets an honest "all hidden"
+      // note instead of the false "no .jsonl files" text. Folded rows stay
+      // reachable via search and their URL.
+      else if (s?.loaded && !listedCount(s)) {
+        if (!pend) kids.append(s.list.length ? allHiddenNote(s) : emptyProjectNote(p, s));
+      }
       else if (s?.loaded) {
         const v = visibleSessions(s);
         v.rows.forEach((sess, i) => {
@@ -1318,6 +1365,22 @@ function renderProjectGroup(p) {
  * different path (a container cwd, a Windows checkout) that the logical-key
  * merge — which keys on the directory basename — could not match. Say which.
  */
+/**
+ * The empty state for a project whose ONLY sessions are folded out of the nav
+ * list (dispatch lanes, external `claude -p`/SDK scripts). Distinct from
+ * emptyProjectNote so it never claims the store holds no session files — it
+ * holds plenty; they are just hidden by design. Honest about the count and about
+ * how to still reach them.
+ */
+function allHiddenNote(s) {
+  const n = (s?.list ?? []).length;
+  const note = el('div', { class: 'hint-row' });
+  note.append(el('b', { text: 'No interactive sessions here.' }));
+  note.append(document.createTextNode(
+    ` ${n} background/scripted session${n === 1 ? '' : 's'} (agent lanes or external ‑p runs) ${n === 1 ? 'is' : 'are'} hidden from this list. Search or open one by URL to reach it.`));
+  return note;
+}
+
 function emptyProjectNote(p, s) {
   const note = el('div', { class: 'hint-row' });
   if (s.dirs && s.dirs.length) {
@@ -1538,6 +1601,35 @@ const hasLiveWork = (sess) => liveInfo(sess) != null;
 const isAgentStarted = (sess) => sess?.startedBy === 'agent';
 
 /*
+ * Whether a row FOLDS out of the default nav view. The server owns this decision
+ * (`foldByDefault`, from session-provenance.foldsFromDefaultList) so the client
+ * never re-derives it — ARCH-010. It covers TWO kinds of clutter the human never
+ * opened: an orchestrator's dispatched worker lanes (startedBy 'agent') AND
+ * external programmatic sessions Orchard never launched (an `sdk-cli`/`sdk-ts`
+ * transcript with no Orchard provenance record — e.g. a `claude -p` script). It
+ * is presentation-only: the row is still reachable via "N more", search and its
+ * URL, and a live/open row bypasses the fold via alwaysIds. The `?? isAgentStarted`
+ * fallback keeps the pre-existing lane fold working against an older server that
+ * has not yet learned to send the field.
+ */
+const foldsFromList = (sess) =>
+  (typeof sess?.foldByDefault === 'boolean' ? sess.foldByDefault : isAgentStarted(sess));
+
+/*
+ * The sessions a project's nav list actually PRESENTS — everything except the
+ * rows folded out of the default view (dispatch lanes, external programmatic
+ * sessions). This is the set every COUNT and BADGE that describes the list must
+ * measure: the header session count, the empty-state, the unseen badge and the
+ * "N sessions of history listed" toast. A folded row is still reachable via
+ * "N more"/search/URL, but it does not COUNT toward "this project has N
+ * sessions" — otherwise an all-hidden project reads "1" while showing nothing
+ * (BUG-193 round 1 finding 3). Reads the server's `foldByDefault` via
+ * `foldsFromList`; the client never recomputes the fold.
+ */
+const listedSessions = (s) => (s?.list ?? []).filter((x) => !foldsFromList(x));
+const listedCount = (s) => listedSessions(s).length;
+
+/*
  * ── FEAT-118 — the picker's per-row LIFECYCLE state, read from GROUND TRUTH ──
  *
  * Five states the user asked to tell apart, resolved WITHOUT inventing a sixth
@@ -1574,13 +1666,45 @@ function endedUnanswered(sess) {
   if (!id || !Array.isArray(state.outcomes)) return null;
   for (const o of state.outcomes) {
     if (!isRecentOutcome(o)) continue;
+    // FEAT-154 (round 3, bug B): the "ended without answering" marker is a fact
+    // about the SESSION — its own main turn ended without producing an answer.
+    // A `row:'tool'` death (a failed/killed local_bash lane) or a `row:'agent'`
+    // death (a subagent that died) is NOT the session dying: the main turn kept
+    // going and answered. The owner (outcomes.ts, `row`) already distinguishes
+    // them; read that field rather than treating every lane death as a session
+    // death. Without this, a LIVE orchestrator session whose only outcomes were
+    // failed background bash lanes rendered the red "ended without answering"
+    // triangle whenever it was momentarily not-running.
+    if (o.row !== 'main') continue;
     if (o.sdkSessionId === id || o.stationSessionId === id) return o;
   }
   return null;
 }
 
+/** Is a TURN actually in flight for this row? Reads the liveness authority's own
+ *  `running` field (ARCH-010: the owner declares it, the reader never re-derives
+ *  it). `hasLiveWork` — mere PRESENCE in the live list — is the wrong signal for
+ *  this: an alive-but-idle DETACHED bridge is present in the list with
+ *  `liveness.running===false`, which is exactly FEAT-154 bug A (a day-idle
+ *  session rendered light-blue "running"). A live-list entry that carries no
+ *  `liveness` block is there only because its transcript mtime is fresh (<30s),
+ *  which itself IS active writing — so that counts as running; likewise the
+ *  degraded no-route fallback (liveInfo's `sess.live` branch) keeps the
+ *  historical "the row's own live flag ⇒ running" answer. */
+function isSessionRunning(sess) {
+  const info = liveInfo(sess);
+  if (!info) return false;
+  // `running` is the liveness authority's verdict, carried through by
+  // api.liveSessions() (ARCH-010). `null` = a transcript-mtime-only entry with
+  // no bridge verdict (actively being written) OR the degraded no-route fallback
+  // (liveInfo's `sess.live` branch) — both keep the historical "present ⇒
+  // running" answer; only a boolean `false` (an alive-but-idle bridge) is not.
+  if (typeof info.running === 'boolean') return info.running;
+  return true;
+}
+
 function sessionLifecycle(sess) {
-  if (hasLiveWork(sess)) return 'running';
+  if (isSessionRunning(sess)) return 'running';
   if (endedUnanswered(sess)) return 'stopped';
   if (hoursSince(sess?.lastActivityAt) * 3600000 <= FINISHED_WINDOW_MS) return 'finished';
   return null;
@@ -1638,18 +1762,33 @@ function visibleSessions(s) {
   const rest = ordered.filter((x) => !api.pinnedOf(x)); // recency-ordered
   const windowed = s.windowed !== false;                // "N more" sets this false
   // Never folded, whatever the budget: the open session (on screen) and any
-  // session with live/background work in flight. Added back after capping.
-  const alwaysIds = new Set(rest.filter((x) => isAlwaysVisible(x) || hasLiveWork(x)).map((x) => x.sessionId));
+  // session with live/background work in flight — BUT NEVER a FOLDED row.
+  //   BUG-193 (user decision, round 5): a programmatic row (a dispatch/verify
+  //   lane, an external `claude -p`/codex-exec run) is not meant for the user to
+  //   interact with, so it must NOT appear in the nav list — running or not,
+  //   open or not. The two former bypasses both leaked it in: `isAlwaysVisible`
+  //   (a folded lane the user only deep-linked into) and `hasLiveWork` (a folded
+  //   lane surfaced simply because it was mid-turn — the actual cause of the
+  //   round-5 sighting: `01a0e93a`, an openai verify lane, was live when seen).
+  //   Both now yield to the fold. The row's contract is unchanged: it still
+  //   OPENS on a direct deep link and the transcript pane renders it; it stays
+  //   reachable via "N more"/URL/search; and running lanes remain observable via
+  //   the project proc chip + the orchestrator's own lane views — only the nav
+  //   row is withheld. A NON-folded live/open session (dashboard/interactive)
+  //   still always shows, so real work never vanishes.
+  const alwaysIds = new Set(rest.filter((x) =>
+    !foldsFromList(x) && (isAlwaysVisible(x) || hasLiveWork(x))).map((x) => x.sessionId));
   // The pool competing for the budget: everything not already always-in, kept if
   // it is within the (substance-scaled) recency window OR carries unseen
   // attention (so an old-but-active session still competes rather than being
   // folded outright). When the window is lifted by "N more", everything qualifies.
-  // AGENT-started rows fold out of the DEFAULT view (a dispatched worker lane is
-  // clutter the human never opened); "N more" (windowed === false) reveals them
-  // like any other folded row, and a live/open one already bypassed the pool via
-  // alwaysIds above, so running agent work is never hidden.
+  // Programmatic rows fold out of the DEFAULT view (a dispatched worker lane, or
+  // an external `claude -p`/SDK session Orchard never launched — clutter the human
+  // never opened); "N more" (windowed === false) reveals them like any other
+  // folded row, and a live/open one already bypassed the pool via alwaysIds above,
+  // so running work is never hidden. `foldsFromList` is the server-owned decision.
   const pool = rest.filter((x) => !alwaysIds.has(x.sessionId)
-    && (!windowed || (!isAgentStarted(x) && (withinRecentWindow(x) || isAttentionSession(x)))));
+    && (!windowed || (!foldsFromList(x) && (withinRecentWindow(x) || isAttentionSession(x)))));
   // Adaptive seat budget: sized by how many pool sessions are genuinely recent,
   // clamped to [MIN_SEATS, MAX_SEATS]. Lifting the window ("N more") hands the
   // budget to s.shown — the progressive reveal.
@@ -1699,12 +1838,20 @@ function sessionRow(p, sess) {
   // treatments (amber "when" for a death, muted "when" for a recent visit).
   const life = pendingRow ? null : sessionLifecycle(sess);
   const visited = !pendingRow && recentlyVisited(sess);
+  // FEAT-154 (round 2) — WAITING ON YOU: the model paused on a question/permission
+  // and needs an answer. Read from the SERVER-published set (`state.awaitingIds`,
+  // sourced from the bridge's own `#approvals` via /api/sessions `awaitingUser` —
+  // BUG-166's owner, ARCH-010), keyed by sdkSessionId. This covers EVERY row, not
+  // just the open one, and the client never re-derives it from busy flags. It
+  // out-ranks every lifecycle marker because a turn paused for input still reads
+  // `live` (would otherwise show as running/blue).
+  const awaiting = !pendingRow && state.awaitingIds.has(sess.sessionId);
   // Unread is silent while running (content is arriving) — so the class that
   // carries the unread type-lift is withheld there too, not just the tick.
   const showUnread = fresh && life !== 'running';
   const b = el('button', {
     class: `row${isWin ? ' win' : ''}${pendingRow ? ' pending' : ''}${pinned ? ' pinned' : ''}${renamed ? ' named' : ''}${showUnread ? ' fresh' : ''}`
-      + `${life === 'stopped' ? ' died' : ''}${visited ? ' visited' : ''}`,
+      + `${awaiting ? ' awaiting' : ''}${life === 'stopped' ? ' died' : ''}${visited ? ' visited' : ''}`,
     'aria-current': String(active),
     title: pendingRow ? 'New session — not sent yet' : rowTooltip(sess, pinned, renamed),
   });
@@ -1744,28 +1891,50 @@ function sessionRow(p, sess) {
    *            leading rail so it never doubles up with a lifecycle dot) and
    *            recently-visited (a persistent muted timestamp, no glyph at all).
    */
-  if (life === 'running') {
+  // Precedence (single leading marker): waiting-on-you > running > error(died) >
+  // finished > idle. `stateSr` is the plain-words state for screen readers — the
+  // glyphs are colour/shape only (aria-hidden), so a non-visual reader still hears
+  // the state (FEAT-154; colour is never the only cue).
+  let stateSr = null;
+  if (awaiting) {
+    b.append(el('span', { class: 'waiting', 'aria-hidden': 'true', title: 'Waiting on your answer' }));
+    b.dataset.awaiting = '1';
+    stateSr = 'waiting on you';
+  } else if (life === 'running') {
     const alive = liveInfo(sess);
     b.append(el('span', {
-      class: `alive${alive?.drivenByDashboard ? ' here' : ''}`,
+      class: `alive${alive?.drivenByDashboard ? ' here' : ''}`, 'aria-hidden': 'true',
       title: alive?.drivenByDashboard
         ? 'running now — this dashboard is driving it'
         : 'running now — another process is writing this session',
     }));
     b.dataset.live = alive?.drivenByDashboard ? 'here' : 'true';
+    stateSr = alive?.drivenByDashboard ? 'running now — this dashboard is driving it' : 'running now';
   } else if (life === 'stopped') {
     const o = endedUnanswered(sess);
     b.append(el('span', { class: 'stopped', 'aria-hidden': 'true', title: stoppedTip(o) }));
     b.dataset.stopped = '1';
+    stateSr = 'ended without answering';
+  } else if (showUnread) {
+    // FEAT-154 (visual-review): UNREAD lives on the LEADING rail now — a FILLED
+    // moss dot ("new / something to read"), the counterpart to the hollow
+    // finished ring below. Keeping unread in the primary scan column (not a
+    // second trailing dot) is the review's fix for finished-unread vs
+    // finished-read being told apart only by a faint timestamp, and it removes
+    // the two-different-meanings-for-a-dot ambiguity. Bold title (row.fresh) and
+    // the green timestamp still back it.
+    b.append(el('span', { class: 'settled new', 'aria-hidden': 'true', title: 'New activity since you last looked' }));
+    stateSr = life === 'finished' ? 'just finished, unread' : 'unread — new since you last looked';
   } else if (life === 'finished') {
+    // Read + just-finished: a quiet HOLLOW moss ring (no motion, no bold).
     b.append(el('span', { class: 'settled', 'aria-hidden': 'true', title: 'Just finished — no turn is running now' }));
+    stateSr = 'just finished';
   }
-  // Unread is orthogonal to lifecycle, but silent while running (content is
-  // arriving; a "new since you looked" tick there is only noise). A trailing
-  // moss tick keeps it clear of the leading rail's lifecycle marker.
-  if (showUnread) {
-    b.append(el('span', { class: 'unread', 'aria-hidden': 'true', title: 'New activity since you last looked' }));
-  }
+  // Carry the state to screen readers via aria-label (NOT a text child): the
+  // glyphs are colour/shape only, and a text child would pollute the row's
+  // textContent (breaking title-suffix matching and adding "3h — running" noise
+  // to the accessible name). aria-label names the row as "title — state".
+  if (stateSr) b.setAttribute('aria-label', `${rowTitle(sess)} — ${stateSr}`);
   // FEAT-073: the pending-new row IS the open session already — clicking it just
   // returns focus to the composer. It has no on-disk session, so openSession /
   // the rename·pin·delete row menu (which act on a real sessionId) don't apply.
@@ -4522,20 +4691,36 @@ function paintGitChip() {
   if (!g || (Date.now() - g.at > GIT_TTL_MS && !g.loading)) { void refreshGit(p.id); }
   const s = g?.status;
   if (!s?.repo) { node.gitBtn.hidden = true; return; }
-  const bits = [s.branch ?? `detached @ ${s.detachedAt ?? '?'}`];
+  // FEAT-139 r3 — the FACE carries only the CATEGORY (branch glyph), the STATE
+  // (a shape-coded dot) and the one number the user reads (dirty count). The
+  // branch name, +/− line totals and ahead/behind — everything that used to make
+  // this a sentence — move to the tooltip (the full original sentence, below) and
+  // to the Git panel this chip opens. The dot's state is carried by SHAPE + FILL
+  // first, colour only as reinforcement, so it survives colour-blindness:
+  //   clean   = hollow ring   (on a branch, nothing to commit)
+  //   dirty   = filled disc   (on a branch, uncommitted work)
+  //   conflict= filled diamond(mid-merge — a distinct silhouette, not just a hue)
+  //   detached= hollow diamond(detached HEAD — the diamond family = unusual state)
+  const conflicted = Number.isFinite(s.conflicted) && s.conflicted > 0;
+  const detached = !s.branch;
+  const dotState = conflicted ? 'conflict' : (detached ? 'detached' : (s.dirty ? 'dirty' : 'clean'));
+  node.gitDot.dataset.state = dotState;
+  // The single number: dirty count when there is dirt (clean shows none).
+  node.gitN.textContent = s.dirty ? String(s.dirty) : '';
+  // Full original sentence, on hover — nothing dropped, just relocated.
+  const bits = [s.branch ? s.branch : `detached @ ${s.detachedAt ?? '?'}`];
   if (s.dirty) bits.push(`${s.dirty} dirty`);
-  clear(node.gitN);
-  node.gitN.append(document.createTextNode(bits.join(' · ')));
-  const added = Number.isFinite(s.added);
-  const removed = Number.isFinite(s.removed);
+  if (conflicted) bits.push(`${s.conflicted} conflict${s.conflicted === 1 ? '' : 's'}`);
+  const added = Number.isFinite(s.added), removed = Number.isFinite(s.removed);
   const showLineCounts = !(added && removed && s.added === 0 && s.removed === 0);
-  const partial = s.untrackedLinesIncluded === false && showLineCounts && (added || removed);
-  if (showLineCounts && added) node.gitN.append(document.createTextNode(' · '), el('span', { class: 'git-chip-added', text: `+${s.added}`, title: partial ? 'Tracked text files only; untracked lines are not included' : '' }));
-  if (showLineCounts && removed) node.gitN.append(document.createTextNode(' · '), el('span', { class: 'git-chip-removed', text: `−${s.removed}` }));
-  if (partial) node.gitN.append(document.createTextNode(' (tracked only)'));
-  if (Number.isFinite(s.ahead) && s.ahead > 0) node.gitN.append(document.createTextNode(` · ↑${s.ahead}`));
-  if (Number.isFinite(s.behind) && s.behind > 0) node.gitN.append(document.createTextNode(` · ↓${s.behind}`));
-  node.gitBtn.title = `git: ${s.lastCommit ?? ''}${s.upstream ? ` · tracking ${s.upstream}` : ' · no upstream'}\nOpen the Git panel`;
+  if (showLineCounts && added) bits.push(`+${s.added}`);
+  if (showLineCounts && removed) bits.push(`−${s.removed}`);
+  if (s.untrackedLinesIncluded === false && showLineCounts && (added || removed)) bits.push('(tracked only)');
+  if (Number.isFinite(s.ahead) && s.ahead > 0) bits.push(`↑${s.ahead}`);
+  if (Number.isFinite(s.behind) && s.behind > 0) bits.push(`↓${s.behind}`);
+  const sentence = `⎇ ${bits.join(' · ')}`;
+  node.gitBtn.title = `${sentence}\n${s.lastCommit ?? ''}${s.upstream ? ` · tracking ${s.upstream}` : ' · no upstream'}\nOpen the Git panel`;
+  node.gitBtn.setAttribute('aria-label', `Git — ${bits.join(', ')}. Open the Git panel.`);
   node.gitBtn.hidden = false;
 }
 
@@ -4572,10 +4757,14 @@ function paintProcChip() {
   // in the popover this chip opens (paintProcPop) and its tooltip. This is the
   // same BUG-082 invariant — the face must not dump ports — taken to its end.
   const ports = orderedPorts(s.ports);
-  node.procN.textContent = ports.length
-    ? `${ports.length} port${ports.length === 1 ? '' : 's'}`
-    : `${s.count} proc${s.count === 1 ? '' : 's'}`;
+  // FEAT-139 r3 — the activity glyph carries the category, the face carries only
+  // the single count. The unit (listening ports vs background procs) and the full
+  // port list live in the tooltip + the popover this chip opens.
+  const n = ports.length || s.count;
+  const unit = ports.length ? `listening port${ports.length === 1 ? '' : 's'}` : `process${s.count === 1 ? '' : 'es'}`;
+  node.procN.textContent = String(n);
   node.procBtn.title = procChipTitle(p);
+  node.procBtn.setAttribute('aria-label', `${n} ${unit} running here — open the list`);
   node.procBtn.hidden = false;
   // Keep an open popover honest with the latest poll.
   if (node.procPop.classList.contains('open')) paintProcPop();
@@ -5428,13 +5617,18 @@ async function openSession(p, sess, opts = {}) {
     } else {
       const shown = renderMessages(th, t.messages);
       applyHookBadges(th);
-      if (!shown) th.paneEl.append(el('div', { class: 'hint-row', text: 'This session has no readable messages.' }));
+      if (!shown) th.paneEl.append(el('div', { class: 'hint-row empty-session-hint', text: 'This session has no readable messages.' }));
       th.page = pageCursor((before, beforeBytes) =>
         api.transcript(sess.encodedDir, sess.sessionId, { tail: OLDER_PAGE, before, beforeBytes }), t);
       // High-water mark for external appends: a message the tail page already
       // rendered must not re-render when the watcher replays it as an append.
+      // BUG-190 round 5: an EMPTY transcript (total 0) is a KNOWN anchor, -1 —
+      // "nothing rendered yet, the next message is #0" — not an unknown one. The
+      // old `t.total ? … : null` turned 0 into null, which the catch-up read as
+      // "no anchor, nothing to do", so the first message of an empty session was
+      // lost across a reconnect. null now means only "the store did not say".
       const lastMsg = t.messages[t.messages.length - 1];
-      th.lastIndex = Number.isInteger(lastMsg?.index) ? lastMsg.index : (t.total ? t.total - 1 : null);
+      th.lastIndex = Number.isInteger(lastMsg?.index) ? lastMsg.index : (Number.isInteger(t.total) ? t.total - 1 : null);
       // Follow AFTER the tail is in hand and the high-water mark is set: the
       // watcher starts at the file's current end, so this order cannot duplicate
       // what was just fetched, and the index dedupe covers any millisecond overlap.
@@ -5959,6 +6153,12 @@ function recoveryHint(msg) {
 function renderPending() {
   const host = node.railPending;
   if (!host) return;
+  // FEAT-153 r4 — an unchanged poll must not clear()+rebuild the held-results list.
+  const psig = JSON.stringify([
+    state.pending, state.pendingProblem, state.pendingActionProblem,
+    state.lastDrain, state.showAllPending,
+  ]);
+  if (railUnchanged(host, psig)) return;
   clear(host);
   const list = state.pending ?? [];
   if (state.pendingProblem) {
@@ -6516,8 +6716,24 @@ function renderOutcomes() {
   const full = (state.outcomes ?? []).slice().sort((a, b) => b.at - a.at);
   const showAll = state.showAllOutcomes;
   const list = showAll ? full : full.filter(isRecentOutcome);
+  // FEAT-153 r4 — an unchanged outcomes poll must not clear()+rebuild the death
+  // list (its rows are recreated otherwise, churning the panel every ~2.6s).
+  // FEAT-153 r5 — but the rows carry TIME-DERIVED output the array alone misses:
+  // datedTime()→dayLabel() renders calendar-relative "today/yesterday/Sep 27",
+  // and (default view) isRecentOutcome() filters to a rolling 48h window. A
+  // byte-stable death set therefore still changes on screen at a day boundary
+  // (a "today 23:50" death must read "yesterday 23:50" after midnight — BUG-070's
+  // own guarantee) or when a record ages out of 48h. Fold both into the sig so a
+  // boundary crossing invalidates it while an unchanged poll still costs 0 DOM:
+  //   · the local calendar day (captures every day-label transition), and
+  //   · the exact set of ids passing the 48h filter (captures recent-view churn
+  //     AND the "show all (+N)" hidden-count that both views display).
+  const dayToken = new Date().toDateString();
+  const recentIds = full.filter(isRecentOutcome).map((o) => o.id);
+  const osig = JSON.stringify([state.outcomes, showAll, dayToken, recentIds]);
+  if (railUnchanged(node.railStopped, osig)) { renderRailSummary(); return; }
   clear(node.railStopped);
-  node.railStopped.hidden = list.length === 0;
+  setHidden(node.railStopped, list.length === 0);
   // FEAT-067: keep the top-of-rail summary's "stopped" chip in lockstep with
   // this section — outcomes refresh on their own poll (refreshOutcomes), not
   // renderRail's, so repaint the derived card here too or its count goes stale.
@@ -6612,6 +6828,22 @@ function boardRow(it, glyph) {
   return row;
 }
 
+/**
+ * FEAT-153 r4 — anti-flicker gate. A rail section that clear()+rebuilds on every
+ * ~2.6s poll churns the DOM even when its inputs are byte-identical, and any row
+ * carrying a `rise` entrance animation visibly re-flashes each cycle (the "it keeps
+ * flickering every few seconds" report). Each gated renderer computes a signature
+ * of the exact inputs it reads and early-returns when it matches the last paint, so
+ * an UNCHANGED poll produces ZERO DOM mutations and no animation replay; a genuine
+ * change rebuilds exactly as before. The signature rides on the host node.
+ */
+function railUnchanged(host, sig) {
+  if (!host) return true;
+  if (host.__railSig === sig) return true;
+  host.__railSig = sig;
+  return false;
+}
+
 function renderRail() {
   const b = state.board;
   const needs = b?.needsYou ?? [];
@@ -6619,10 +6851,14 @@ function renderRail() {
   const inflight = b?.inflight ?? [];
   const done = b?.doneToday ?? [];
 
-  // count chip + badge
-  node.railCount.textContent = needs.length ? String(needs.length) : '';
-  node.railCount.hidden = needs.length === 0;
-  node.railBadgeN.textContent = String(needs.length);
+  // FEAT-153 r2 — the header count badge repeated the FEAT-067 "needs" chip and
+  // the grid's own needs cards, three places for one number. With the header now
+  // "Board", a needs-count beside it also mislabels the role, so it is retired
+  // (the element is kept as a stable anchor, just never populated). The
+  // narrow-viewport reopen badge (railBadge) is a distinct surface — kept.
+  setText(node.railCount, '');
+  setHidden(node.railCount, true);
+  setText(node.railBadgeN, String(needs.length));
   node.railBadge.classList.toggle('none', needs.length === 0);
 
   // FEAT-066: the persistent board entries (topbar pill + rail-head link) — a
@@ -6637,50 +6873,373 @@ function renderRail() {
   // the rail's primary top section above the reused Needs-You cards.
   renderRailRequests();
 
-  reconcileNeeds(needs);
+  // FEAT-153 — the board grid is the primary immediate view (current-session
+  // tickets first, the rest of the board de-emphasised); #railNeeds is now the
+  // on-demand answer MOUNT for whichever needs-you card the user opened.
+  renderBoardGrid(needs, inflight, queued);
+  renderAnswerMount(needs);
 
   // FEAT-079: OBSERVATIONS — automated, read-only findings (WA-consolidation /
   // architecture-recurrence). A distinct, lower-priority lane BELOW the asks:
   // standing attention, never a to-do. Each row is read-only + dismissible.
   const observations = b?.observations ?? [];
-  clear(node.railObservations);
-  node.railObservations.hidden = observations.length === 0;
-  if (observations.length) {
-    node.railObservations.classList.add('observations');
-    node.railObservations.append(el('div', { class: 'sub-h', text: 'Observations' }));
-    for (const it of observations) node.railObservations.append(observationRow(it));
+  const obsSig = JSON.stringify(observations);
+  if (!railUnchanged(node.railObservations, obsSig)) {
+    clear(node.railObservations);
+    setHidden(node.railObservations, observations.length === 0);
+    if (observations.length) {
+      node.railObservations.classList.add('observations');
+      node.railObservations.append(el('div', { class: 'sub-h', text: 'Observations' }));
+      for (const it of observations) node.railObservations.append(observationRow(it));
+    }
   }
 
-  // queued (owner — ) — FEAT-053: the todo backlog, read-only, absent when empty.
-  // FEAT-139 — the backlog is REFERENCE material, not immediate view: rendering
-  // the whole list (often ~80 tickets) buried the asks that actually need the
-  // user. The rail now shows only the count; the full, ordered list is one click
-  // away on the board (nothing removed, no route lost).
-  clear(node.railQueued);
-  node.railQueued.hidden = queued.length === 0;
-  if (queued.length) {
-    node.railQueued.classList.add('queued');
-    node.railQueued.append(el('div', { class: 'sub-h', text: 'Queued' }));
-    node.railQueued.append(railMoreRow(queued.length, 'queued'));
-  }
+  // FEAT-153 — queued (owner —) and in-flight (🤖) are now the board grid's own
+  // "in progress"/"queued" cards, so the separate read-only lists here would just
+  // repeat them below the fold. They are left EMPTY and hidden (their metric
+  // chips scroll to the grid instead); nothing is lost — the grid is the one
+  // place unresolved tickets live, and the full ordered list is a click to the
+  // board. Kept as nodes so the summary strip and older code have stable anchors.
+  setHidden(node.railQueued, true);
+  setHidden(node.railInflight, true);
 
-  // in-flight (🤖) — read-only
-  clear(node.railInflight);
-  node.railInflight.hidden = inflight.length === 0;
-  if (inflight.length) {
-    node.railInflight.classList.add('inflight');
-    node.railInflight.append(el('div', { class: 'sub-h', text: 'In flight' }));
-    for (const it of inflight) node.railInflight.append(boardRow(it, '🤖'));
+  // done today — read-only (the grid is unresolved-only, so done stays its own
+  // small list, and remains the "done" chip's scroll target).
+  const doneSig = JSON.stringify(done);
+  if (!railUnchanged(node.railDone, doneSig)) {
+    clear(node.railDone);
+    setHidden(node.railDone, done.length === 0);
+    if (done.length) {
+      node.railDone.classList.add('done');
+      node.railDone.append(el('div', { class: 'sub-h', text: 'Done today' }));
+      for (const it of done) node.railDone.append(boardRow(it, null));
+    }
   }
+}
 
-  // done today — read-only
-  clear(node.railDone);
-  node.railDone.hidden = done.length === 0;
-  if (done.length) {
-    node.railDone.classList.add('done');
-    node.railDone.append(el('div', { class: 'sub-h', text: 'Done today' }));
-    for (const it of done) node.railDone.append(boardRow(it, null));
+/* ═══════════════════════════════════════ FEAT-153 — the board grid ═══════
+ *
+ * The rail's PRIMARY surface. The old immediate view was a long vertical list of
+ * needs-you answer cards; here the current session's tickets and the rest of the
+ * board's unresolved work read as a dense, scannable grid of state cards, so
+ * "what is my session doing, and what else is open" is one glance instead of a
+ * scroll. Two ideas carry it:
+ *
+ *   1. WHOSE work — the current session's tickets are shown first and at full
+ *      weight; every other unresolved ticket follows, de-emphasised (lower
+ *      opacity, full on hover) and collapsible. The session↔ticket fact is not
+ *      re-derived here: it is READ from the declarations their owners already
+ *      made — the orchard-request bindings (state.requests) and each live lane's
+ *      Dispatch attribution (state.snap.running[].ticket), per ARCH-010.
+ *   2. WHAT STATE — position (this-session vs board) + a state chip + an accent
+ *      ring (needs-you) carry the state; the words stay minimal (id + title).
+ *
+ * Answering is preserved: a needs-you card opens the SAME answer flow (needsCard)
+ * on click, mounted into #railNeeds one ticket at a time.
+ */
+const GRID_STATE_PRIO = { needs: 0, prog: 1, queued: 2 };
+const GRID_STATE_LABEL = { needs: 'needs you', prog: 'in progress', queued: 'queued' };
+const RAIL_BOARD_OTHERS_KEY = 'cs.rail.boardOthers';
+
+function boardOthersOpen() {
+  try { return localStorage.getItem(RAIL_BOARD_OTHERS_KEY) !== '0'; } catch { return true; }
+}
+function setBoardOthersOpen(v) {
+  try { localStorage.setItem(RAIL_BOARD_OTHERS_KEY, v ? '1' : '0'); } catch { /* private mode — volatile is fine */ }
+}
+
+/**
+ * A needs-you item the user can ACT on (opens the answer flow), vs one that is
+ * read-only board status. Mirrors needsCard's own routing: a stall is advisory;
+ * a finding is dismissible; a decision always answerable; a plain ticket only
+ * when it actually carries a `## Question` (BUG-025 — a bare 👤 ticket is status,
+ * not an ask, and opens the ticket rather than an answer box).
+ */
+function isAnswerable(it) {
+  if (it.kind === 'stall') return false;
+  if (it.kind === 'finding' || it.kind === 'decision') return true;
+  return !!it.question;
+}
+
+/**
+ * The set of ticket ids belonging to the OPEN session, read from the two places
+ * their owners declared them (never guessed from frame order — ARCH-010):
+ *   · state.requests[].tickets — the orchard-request bindings for this session;
+ *   · state.snap.running[].ticket — each live lane's charter Dispatch attribution.
+ * Guarded by dockIsForeign(): when the open session is not the selected project's,
+ * its work is not this board's to claim (the BUG-106 observability rule), so the
+ * "this session" grid is simply empty rather than mis-attributing another
+ * project's tickets.
+ */
+function currentSessionTicketIds() {
+  const ids = new Set();
+  if (dockIsForeign()) return ids;
+  for (const r of state.requests ?? []) {
+    for (const t of (Array.isArray(r.tickets) ? r.tickets : [])) if (t) ids.add(t);
   }
+  const snap = state.snap;
+  if (snap && Array.isArray(snap.running)) {
+    for (const lane of snap.running) {
+      for (const t of (Array.isArray(lane.ticket) ? lane.ticket : [])) if (t) ids.add(t);
+    }
+  }
+  return ids;
+}
+
+/**
+ * Fold the board's three unresolved lanes into one deduped, priority-ordered set,
+ * partitioned into the open session's tickets ("mine") and everything else. A
+ * ticket in more than one lane keeps its highest-attention state (needs > prog >
+ * queued), reached by inserting in that order and never overwriting.
+ */
+function boardGridModel(b) {
+  const byId = new Map();
+  const add = (it, st, answerable, isNeeds) => {
+    if (!it || !it.id || byId.has(it.id)) return;
+    byId.set(it.id, { it, state: st, answerable, isNeeds });
+  };
+  for (const it of (b?.needsYou ?? [])) add(it, 'needs', isAnswerable(it), true);
+  for (const it of (b?.inflight ?? [])) add(it, 'prog', false, false);
+  for (const it of (b?.queued ?? [])) add(it, 'queued', false, false);
+
+  const mineIds = currentSessionTicketIds();
+  const all = [...byId.values()];
+  const key = (x) => {
+    const sev = NC_SEV_RANK[String(x.it.sev || '').toLowerCase()] || 0;
+    // needs-you first, then in-progress, then queued; within a state, higher
+    // severity first, then a stable id sort so the order never flickers on poll.
+    return [GRID_STATE_PRIO[x.state] ?? 9, -sev, x.it.id];
+  };
+  const cmp = (a, b2) => {
+    const ka = key(a), kb = key(b2);
+    for (let i = 0; i < ka.length; i++) { if (ka[i] < kb[i]) return -1; if (ka[i] > kb[i]) return 1; }
+    return 0;
+  };
+  const mine = all.filter((x) => mineIds.has(x.it.id)).sort(cmp);
+  const others = all.filter((x) => !mineIds.has(x.it.id)).sort(cmp);
+  return { mine, others };
+}
+
+/**
+ * The card's rendered SIGNATURE — everything that decides its DOM. A keyed poll
+ * update reuses a card whose signature is unchanged (so it never replays the
+ * `rise` entrance and never loses scroll/focus context) and only rebuilds one
+ * whose state/title/etc actually moved. Cheap string, compared on data-sig.
+ */
+function cardSig(x) {
+  return `${x.state}|${x.answerable ? 1 : 0}|${x.isNeeds ? 1 : 0}|${x.it.title}|${x.it.sev || ''}|${x.it.kind || ''}`;
+}
+
+/**
+ * One ticket card in the grid: id, severity mark, title, and — for the non-needs
+ * cards — a state chip. FEAT-153 r2: the KIND tag ("BUG") was dropped because it
+ * duplicated the id prefix ("BUG-201"). Needs-you emphasis is carried by the
+ * amber accent RING alone (not also a "needs you" chip — one signal, not two);
+ * the accessible name still says "needs you" for a screen reader.
+ */
+function ticketCard(x) {
+  const { it, state: st, answerable, isNeeds } = x;
+  const card = el('button', {
+    type: 'button', class: 'tc', 'data-id': it.id, 'data-state': st,
+    'data-answerable': answerable ? '1' : null,
+    'data-sig': cardSig(x),
+    'aria-label': `${it.id} — ${it.title}${isNeeds ? ' — needs you' : ''}`,
+    title: `${it.id} — ${it.title}${isNeeds ? (answerable ? ' · click to answer' : ' · needs you (read-only)') : ' · open ticket'}`,
+  });
+  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.id }));
+  const mark = ncSevMark(it.sev);
+  if (mark) top.append(mark);
+  card.append(top);
+  card.append(el('span', { class: 'tc-title', text: it.title }));
+  // Needs-you is signalled by the ring; every other card gets a quiet state chip.
+  if (!isNeeds) card.append(el('span', { class: 'tc-state', 'data-state': st, text: GRID_STATE_LABEL[st] ?? st }));
+  card.addEventListener('click', () => {
+    if (answerable) openAnswer(it);
+    else void openTicketModal(it.id);
+  });
+  return card;
+}
+
+/**
+ * Find or create a section (mine/others) in place and refresh its header, label,
+ * count and — for the collapsible "others" — its toggle, without discarding the
+ * section or its card nodes. Reused across polls so nothing below churns.
+ */
+function ensureSection(host, cls, label, count, collapsible) {
+  let sec = host.querySelector(`.bg-section.${cls}`);
+  if (!sec) {
+    sec = el('div', { class: `bg-section ${cls}` });
+    sec.append(el('div', { class: 'bg-h' },
+      el('span', { class: 'bg-lbl' }), el('span', { class: 'bg-n' })),
+      el('div', { class: 'bg-grid' }));
+  }
+  setText(sec.querySelector('.bg-lbl'), label);
+  setText(sec.querySelector('.bg-n'), String(count));
+  if (collapsible) {
+    const open = boardOthersOpen();
+    sec.classList.toggle('collapsed', !open);
+    let chev = sec.querySelector('.bg-toggle');
+    if (!chev) {
+      chev = el('button', { type: 'button', class: 'bg-toggle' }, svg('M4 6.5 8 10.5 12 6.5', 9, 'chev'));
+      chev.addEventListener('click', () => { setBoardOthersOpen(!boardOthersOpen()); renderRail(); });
+      sec.querySelector('.bg-h').append(chev);
+    }
+    setAttr(chev, 'aria-expanded', String(open));
+    setAttr(chev, 'aria-label', open ? 'Collapse' : 'Expand');
+    setAttr(chev, 'title', open ? 'Collapse' : 'Expand');
+  }
+  return sec;
+}
+
+/**
+ * Reconcile one grid's cards to `items` IN PLACE, keyed by ticket id, reusing
+ * `existing` nodes (shared across both sections so a card can migrate between
+ * "This session" and "others" without being destroyed). A node whose signature
+ * still matches is moved into place untouched (no `rise` replay); a changed one
+ * is rebuilt; a vanished one is dropped by the caller from whatever stays in
+ * `existing`. Mirrors reconcileNeeds — the same anti-flicker walk.
+ */
+function reconcileGridCards(grid, items, existing) {
+  // Position-indexed keyed reconcile. For each desired item i, ensure the right
+  // node sits at grid.children[i]: reuse a matching node (from either section,
+  // since `existing` is shared — a card can migrate), rebuild it in place with
+  // replaceWith when its signature moved, or mint a new one. We never track a
+  // cursor node that we might detach, so a sig-change / removal on the node the
+  // walk is standing on can no longer orphan the insert reference (the round-2
+  // NotFoundError in insertBefore). Stale nodes left in `existing` are dropped
+  // by the caller; any surplus children beyond items.length are stale too.
+  for (let i = 0; i < items.length; i++) {
+    const x = items[i];
+    const id = x.it.id;
+    let card = existing.get(id);
+    if (card) {
+      existing.delete(id);
+      if (card.dataset.sig !== cardSig(x)) {
+        const fresh = ticketCard(x); // rebuild only the card whose signature moved
+        card.replaceWith(fresh);     // in-place swap wherever it currently lives
+        card = fresh;
+      }
+    } else {
+      card = ticketCard(x); // genuinely new → plays the `rise` entrance once
+    }
+    const ref = grid.children[i] || null;
+    if (ref !== card) grid.insertBefore(card, ref); // moves an existing node, never recreates
+  }
+}
+
+/**
+ * Paint the board grid. Hidden entirely for a project with no board. When the
+ * board exists but nothing is unresolved, a quiet "board is clear" stands in.
+ *
+ * FEAT-153 r2 — this is a KEYED, in-place update, never a clear()+rebuild. The
+ * round-1 render rebuilt the whole subtree on every ~3s poll, which (a) replayed
+ * every card's entrance animation (periodic flicker), (b) reset scroll, and (c)
+ * combined with a per-section max-height/overflow scroller, trapped the grid in a
+ * nested scrollbox inside the taller rail. The rail column (#railPanel) is the
+ * ONE scroll surface (the FEAT-139 r4 intent, see `.bg-grid` / `.needs` CSS);
+ * reusing nodes here keeps that surface's scroll position and only animates cards
+ * that are genuinely new.
+ */
+function renderBoardGrid(needs /* , inflight, queued */) {
+  const host = node.railBoardGrid;
+  if (!host) return;
+  const b = state.board;
+  if (!b || !b.hasBoard) { clear(host); host.hidden = true; return; }
+  host.hidden = false;
+
+  const { mine, others } = boardGridModel(b);
+
+  // Empty board: a single quiet message, no sections, no error.
+  if (!mine.length && !others.length) {
+    for (const s of host.querySelectorAll('.bg-section')) s.remove();
+    const msg = needs.length ? 'nothing needs you' : 'board is clear — nothing open';
+    let empty = host.querySelector('.bg-empty');
+    if (!empty) {
+      host.append(el('div', { class: 'bg-empty' },
+        el('span', { class: 'ok', text: '✓' }), el('span', { class: 'bg-msg', text: msg })));
+    } else {
+      empty.querySelector('.bg-msg').textContent = msg;
+    }
+    return;
+  }
+  host.querySelector('.bg-empty')?.remove();
+
+  // Every current card, keyed — shared so a ticket can move between sections
+  // (e.g. a new request binding pulls it into "This session") without a rebuild.
+  const existing = new Map();
+  for (const c of host.querySelectorAll('.tc')) existing.set(c.dataset.id, c);
+
+  let mineSec = null, othersSec = null;
+  if (mine.length) {
+    mineSec = ensureSection(host, 'mine', 'This session', mine.length, false);
+    reconcileGridCards(mineSec.querySelector('.bg-grid'), mine, existing);
+  } else {
+    host.querySelector('.bg-section.mine')?.remove();
+  }
+  if (others.length) {
+    othersSec = ensureSection(host, 'others', mine.length ? 'Elsewhere on the board' : 'Open tickets', others.length, true);
+    reconcileGridCards(othersSec.querySelector('.bg-grid'), others, existing);
+  } else {
+    host.querySelector('.bg-section.others')?.remove();
+  }
+  // Whatever stayed in `existing` is no longer on the board — drop it.
+  for (const stale of existing.values()) stale.remove();
+
+  // Order: "This session" first, then "others". FEAT-153 r4 — appendChild is a
+  // MOVE (remove + re-insert), and re-inserting a still-connected subtree RESTARTS
+  // every descendant's CSS animation, so an unconditional re-append replayed every
+  // `.tc` card's `rise` entrance on every poll (~40 cards, the reported flicker).
+  // Only move a section when it is not already at its target index, so an unchanged
+  // poll touches nothing and no card re-animates.
+  const secs = [mineSec, othersSec].filter(Boolean);
+  for (let i = 0; i < secs.length; i++) {
+    if (host.children[i] !== secs[i]) host.insertBefore(secs[i], host.children[i] || null);
+  }
+}
+
+/**
+ * The on-demand answer MOUNT. Exactly one needs-you ticket's answer flow lives in
+ * #railNeeds at a time; opening a card mounts needsCard(it) here, and it is
+ * cleared once the ticket resolves (answered here, or out-of-band on a poll). A
+ * card already mounted for the open id is LEFT UNTOUCHED so a background refresh
+ * never blows away text the user is mid-typing or steals their focus (the
+ * BUG-016 property, now scoped to the single open card).
+ */
+function renderAnswerMount(needs) {
+  const host = node.railNeeds;
+  if (!host) return;
+  const id = state.openAnswerId;
+  if (!id) { clear(host); return; }
+  const it = (needs ?? []).find((x) => x.id === id);
+  if (!it) { state.openAnswerId = null; clear(host); return; } // resolved out-of-band
+  const esc = window.CSS?.escape ? CSS.escape(id) : id;
+  if (host.querySelector(`.needs-card[data-id="${esc}"]`)) return; // preserve typing/focus
+  clear(host);
+  const wrap = el('div', { class: 'answer-open' });
+  const close = el('button', { type: 'button', class: 'answer-x', title: 'Close', 'aria-label': 'Close', text: '✕' });
+  close.addEventListener('click', closeAnswer);
+  wrap.append(el('div', { class: 'answer-bar' },
+    el('span', { class: 'answer-lbl', text: 'Answering' }), close));
+  const card = needsCard(it);
+  card.classList.remove('collapsed'); // always fully open in the mount
+  card.dataset.userToggled = '1';     // keep it open across a poll's reconcile
+  wrap.append(card);
+  host.append(wrap);
+  const ta = card.querySelector('textarea.nc-input');
+  if (ta) ta.focus();
+}
+
+/** Open the answer flow for a needs-you ticket (mounts it into #railNeeds). */
+function openAnswer(it) {
+  state.openAnswerId = it.id;
+  renderAnswerMount(state.board?.needsYou ?? []);
+  node.railNeeds?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+/** Close the open answer flow without answering. */
+function closeAnswer() {
+  state.openAnswerId = null;
+  renderAnswerMount([]);
 }
 
 /**
@@ -6702,7 +7261,6 @@ function renderRail() {
 function renderRailSummary() {
   const host = node.railSummary;
   if (!host) return;
-  clear(host);
   const pid = state.current.projectId;
   const b = state.board;
   const sum = b?.summary ?? null;
@@ -6724,6 +7282,21 @@ function renderRailSummary() {
   // number here would attribute one project's live work to another (the same
   // observability lie the strip gate closes above).
   const live = snap && Array.isArray(snap.running) && !dockIsForeign() ? snap.running.length : null;
+
+  // FEAT-153 r4 — skip the full clear()+rebuild when every input this card reads
+  // is byte-identical to the last paint (an unchanged poll → zero DOM churn).
+  const sig = JSON.stringify([
+    pid, b?.hasBoard, sum,
+    needs.map((x) => [x.id, x.kind, x.title, x.sev]),
+    // FEAT-153 r5 — the FOCUS row reads the focus item's `kind` to decide whether
+    // to render the click-to-open link (isTicket gate below), so a same-id
+    // same-title kind flip on an in-flight focus item would leave the affordance
+    // stale. Capture kind on the inflight tuple too (needs already carries it).
+    inflight.map((x) => [x.id, x.kind, x.title]),
+    stopped, live,
+  ]);
+  if (railUnchanged(host, sig)) return;
+  clear(host);
 
   // The card indexes the rail's sections: show it when there's a board to
   // summarize OR deaths to point at OR a live running-set to report (any of these
@@ -6774,15 +7347,18 @@ function renderRailSummary() {
   const deploy = c.deployPending ?? 0;
   const chips = [
     { label: 'done', n: c.doneToday, target: node.railDone, hint: 'jump to the section below' },
-    { label: 'needs', n: c.needs, target: node.railNeeds, hint: 'jump to the section below' },
+    // FEAT-153 — needs / queued / running are all board-grid cards now, so their
+    // chips scroll to the grid (the one place those tickets live) rather than to
+    // the retired per-lane lists.
+    { label: 'needs', n: c.needs, target: node.railBoardGrid, hint: 'jump to the board grid' },
     // FEAT-079 — observations are a distinct read-only count, next to needs so the
     // split (asks vs standing findings) reads at a glance.
     { label: 'observations', n: c.observations ?? 0, target: node.railObservations, hint: 'jump to the section below' },
-    { label: 'queued', n: c.queued, target: node.railQueued, hint: 'jump to the section below' },
+    { label: 'queued', n: c.queued, target: node.railBoardGrid, hint: 'jump to the board grid' },
     // deploy-pending is scattered across sections (needs/queued/inflight), so it
     // links to the board portal (FEAT-066) where those tickets are all listed.
     { label: 'deploy', n: deploy, action: () => { if (pid) navTickets(pid, null); }, hint: 'open the board' },
-    { label: 'running', n: c.inflight, target: node.railInflight, hint: 'jump to the section below' },
+    { label: 'running', n: c.inflight, target: node.railBoardGrid, hint: 'jump to the board grid' },
     // "live" (real running processes) sits next to "running" (board 🤖 rows) so the
     // two distinct truths read side by side; it jumps to the running strip up top.
     ...(live === null ? [] : [{ label: 'live', n: live, target: node.strip, hint: 'jump to the running strip' }]),
@@ -6836,6 +7412,34 @@ function renderRailSummary() {
 function renderRailRequests() {
   const host = node.railRequests;
   if (!host) return;
+  // FEAT-153 r4 — the requests join is recomputed every repaint by design; gate the
+  // clear()+rebuild so an unchanged poll (same bindings, same board statuses, same
+  // running lanes) produces no DOM churn. Captures every input the join reads.
+  const rqSig = JSON.stringify([
+    state.requests ?? [],
+    (state.board?.needsYou ?? []).map((x) => [x.id, x.status]),
+    (state.board?.queued ?? []).map((x) => [x.id, x.status]),
+    (state.board?.inflight ?? []).map((x) => [x.id, x.status]),
+    (state.board?.doneToday ?? []).map((x) => [x.id, x.status]),
+    // FEAT-153 r5 — capture l.request too: attributedLanes() (requests-view.js)
+    // matches a lane to a request by `lane.request === requestId`, so an in-place
+    // change of an existing lane's .request (no length/ticket/state change) is a
+    // real join change the old tuple missed. (`owner` is kept though unused — it
+    // is a cheap, honest witness of the lane identity.)
+    (state.snap?.running ?? []).map((l) => [l.owner, l.ticket, l.state, l.request]),
+    // FEAT-153 r6 — DISCRIMINATE snapshot-unknown from snapshot-known-empty. The
+    // `?? []` map above collapses snap=null (liveness UNKNOWN → executionOf's coarse
+    // fallback reads a bound-but-unconfirmed ticket as `running`) and snap.running=[]
+    // (liveness KNOWN-idle → same ticket reads `idle`) to the same `'[]'`, so an
+    // empty snapshot that confirms the lane went idle never repaints the exec badge
+    // off "N running" (the "0 running must never read as running" observability lie
+    // FEAT-126 exists to prevent). Mirror renderRailSummary's `live` (null|count) by
+    // encoding whether the snapshot is known at all. (`state.snap` is reset to null
+    // on every session switch — BUG-034 — so this is reachable in normal use.)
+    Array.isArray(state.snap?.running),
+    dockIsForeign(),
+  ]);
+  if (railUnchanged(host, rqSig)) return;
   renderRequestsInto(host, state.requests ?? [], { board: state.board, snap: state.snap }, {
     el, clear,
     onTicket: (id) => void openTicketModal(id),
@@ -6887,13 +7491,13 @@ function paintBoardEntry(b) {
   const pid = state.current.projectId;
   const has = !!(pid && b && b.hasBoard);
   const href = has ? formatTicketsHash({ projectId: pid }) : '#/tickets';
-  node.boardBtn.hidden = !has;
-  node.railBoardLink.hidden = !has;
-  if (!has) { node.boardBtnN.textContent = ''; return; }
-  node.boardBtn.setAttribute('href', href);
-  node.railBoardLink.setAttribute('href', href);
+  setHidden(node.boardBtn, !has);
+  setHidden(node.railBoardLink, !has);
+  if (!has) { setText(node.boardBtnN, ''); return; }
+  setAttr(node.boardBtn, 'href', href);
+  setAttr(node.railBoardLink, 'href', href);
   const open = (b.needsYou?.length ?? 0) + (b.queued?.length ?? 0) + (b.inflight?.length ?? 0);
-  node.boardBtnN.textContent = open ? String(open) : '';
+  setText(node.boardBtnN, open ? String(open) : '');
 }
 
 // The board entries navigate IN PLACE (pushState) so Back returns to the
@@ -6926,7 +7530,18 @@ node.railBoardLink.addEventListener('click', openBoardFromChrome);
  * preserved for the SHOWN set, so a card a user is mid-typing in is left
  * untouched as long as it stays within the cap.
  */
-const NEEDS_RAIL_CAP = 3;
+/*
+ * FEAT-139 r4 — the cap was 3 (round 6) because each shown card was a ~400px
+ * WALL: title + full question + every option + a textarea, all always-on, so
+ * three was already too tall and eighteen was untenable. r4 collapses every
+ * non-focus card to a one-line scannable UNIT (kind tag + id + a severity MARK
+ * + the title), so the reason for the tight cap is gone: eighteen collapsed
+ * rows are shorter than three walls AND let the user pattern-match across the
+ * whole set — which is exactly what the user asked for. The count valve below
+ * still bounds a pathological board (nothing becomes unreachable — the overflow
+ * is one click to the board).
+ */
+const NEEDS_RAIL_CAP = 24;
 
 /** A one-click "N label → board" count row for the collapsed rail sections. */
 function railMoreRow(n, label) {
@@ -6938,6 +7553,103 @@ function railMoreRow(n, label) {
      el('span', { class: 'rm-l', text: `${label} → board` }));
   row.addEventListener('click', () => { if (pid) navTickets(pid, null); });
   return row;
+}
+
+/* ───────────────────── FEAT-139 r4 — scannable rail unit ─────────────────
+ *
+ * The user's diagnosis: "immediate view … cluttered with too much text; it
+ * should be represented in UI elements for pattern-matching processing for
+ * humans." Governing rule (same as the header strip): SHAPE carries the
+ * category (ticket kind), a MARK carries the state (severity), POSITION carries
+ * identity (the id), and text survives only where the words themselves are what
+ * is read (the title). So a rail row leads with a kind TAG and a severity MARK
+ * — not the words "BUG"/"high" a reader has to parse — and the question and its
+ * options collapse behind the row until the user opens it. The focus item stays
+ * expanded, so its answer flow is unchanged (one click on an option, exactly as
+ * before); every other item is one click to expand and then the same controls.
+ */
+
+/** Category of a rail item, as a short hue-independent tag. */
+function ncKindOf(it) {
+  if (it.gitWrite) return { kt: 'git', tag: 'GIT', word: 'git-write request' };
+  if (it.services) return { kt: 'svc', tag: 'SVC', word: 'services request' };
+  if (it.kind === 'decision') return { kt: 'dec', tag: 'DEC', word: 'runtime decision' };
+  if (it.kind === 'finding') return { kt: 'find', tag: 'FIND', word: 'finding — a decision is asked' };
+  if (it.kind === 'observation') return { kt: 'obs', tag: 'OBS', word: 'read-only finding' };
+  if (it.kind === 'stall') return { kt: 'stall', tag: 'STALL', word: 'stalled work — advisory' };
+  const m = typeof it.id === 'string' && it.id.match(/^([A-Z]+)-/);
+  const p = m ? m[1] : null;
+  if (p === 'BUG') return { kt: 'bug', tag: 'BUG', word: 'bug' };
+  if (p === 'FEAT') return { kt: 'feat', tag: 'FEAT', word: 'feature' };
+  if (p === 'ARCH') return { kt: 'arch', tag: 'ARCH', word: 'architecture' };
+  return { kt: 'other', tag: p || '•', word: 'ticket' };
+}
+
+/** The kind TAG element — category by letters + a per-kind SHAPE (both hue-free). */
+function ncKindTag(it) {
+  const { kt, tag, word } = ncKindOf(it);
+  return el('span', { class: 'nc-kind', 'data-kt': kt, title: `${tag} — ${word}` }, tag);
+}
+
+const NC_SEV_RANK = { high: 3, med: 2, medium: 2, low: 1 };
+
+/**
+ * Severity as a three-bar signal MARK, not the word. The RANK is the count of
+ * filled bars (3/2/1) — a shape/quantity signal that survives greyscale and any
+ * colour-vision deficiency; the accent hue is a redundant enhancement, never the
+ * sole carrier. Returns null when the item has no severity (decisions, findings).
+ */
+function ncSevMark(sev) {
+  const rank = NC_SEV_RANK[String(sev || '').toLowerCase()] || 0;
+  if (!rank) return null;
+  const m = el('span', {
+    class: 'nc-sevmark', 'data-sev': String(sev).toLowerCase(),
+    role: 'img', 'aria-label': `severity ${sev}`, title: `severity: ${sev}`,
+  });
+  for (let i = 1; i <= 3; i++) m.append(el('span', { class: `bar${i <= rank ? ' on' : ''}` }));
+  return m;
+}
+
+/**
+ * Turn a freshly-built rail card into a collapsible UNIT: prepend the kind tag,
+ * replace the severity WORD with the mark, add a chevron, and default to
+ * collapsed (the question / options / form / detail are hidden by CSS until the
+ * row is opened). `reconcileNeeds` promotes the first card to `.focus` and
+ * expands it. A user's own toggle wins over the auto-expand (data-userToggled),
+ * so a poll re-render never collapses a row the user just opened.
+ */
+function makeCollapsible(card, it) {
+  const head = card.querySelector('.nc-head');
+  if (!head) return card;
+  head.prepend(ncKindTag(it));
+  const sevEl = head.querySelector('.nc-sev');
+  const mark = ncSevMark(it.sev);
+  if (sevEl) { sevEl.textContent = ''; if (mark) sevEl.append(mark); }
+  const chev = el('button', {
+    type: 'button', class: 'nc-chev', 'aria-expanded': 'false', 'aria-label': 'Expand',
+    title: 'Expand',
+  }, svg('M4 6.5 8 10.5 12 6.5', 9, 'chev'));
+  const setState = (expanded) => {
+    card.classList.toggle('collapsed', !expanded);
+    chev.setAttribute('aria-expanded', String(expanded));
+    chev.setAttribute('aria-label', expanded ? 'Collapse' : 'Expand');
+    chev.title = expanded ? 'Collapse' : 'Expand';
+  };
+  const toggle = (e) => {
+    if (e) { e.preventDefault(); e.stopPropagation(); }
+    card.dataset.userToggled = '1';
+    setState(card.classList.contains('collapsed'));
+  };
+  chev.addEventListener('click', toggle);
+  // The whole meta row is a hit target for expand — but never swallow a click
+  // on the title (opens the ticket), an option, the textarea or a real button.
+  head.addEventListener('click', (e) => {
+    if (e.target.closest('button, a, textarea, input, .nc-title')) return;
+    toggle(e);
+  });
+  head.append(chev);
+  card.classList.add('collapsed');
+  return card;
 }
 
 function reconcileNeeds(needs) {
@@ -6978,6 +7690,28 @@ function reconcileNeeds(needs) {
   // Anything left in `existing` is no longer shown (resolved out-of-band, or
   // pushed past the cap) — drop its card. BUG-016's lingering card dies here too.
   for (const stale of existing.values()) stale.remove();
+
+  // FEAT-139 r4 — the first card is the FOCUS: more prominent, and expanded so
+  // its answer flow is unchanged (one click on an option). Every other card is
+  // collapsed to a scannable unit. A user's own toggle wins (data-userToggled),
+  // so a background poll can never collapse a row the user just opened — nor
+  // re-expand one they closed.
+  const cards = [...container.querySelectorAll('.needs-card')];
+  cards.forEach((c, i) => {
+    const isFocus = i === 0;
+    c.classList.toggle('focus', isFocus);
+    // Only the answerable ticket/decision cards are collapsible (they carry a
+    // chevron). The read-only variants — findings, board-status, stall — keep
+    // their single affordance always visible, so never toggle `collapsed` on a
+    // card that has no way to expand again.
+    const chev = c.querySelector('.nc-chev');
+    if (!chev) { c.classList.remove('collapsed'); return; }
+    if (c.dataset.userToggled === '1') return; // respect the user's choice
+    c.classList.toggle('collapsed', !isFocus);
+    chev.setAttribute('aria-expanded', String(isFocus));
+    chev.setAttribute('aria-label', isFocus ? 'Collapse' : 'Expand');
+    chev.title = isFocus ? 'Collapse' : 'Expand';
+  });
 
   // The rest of the asks are reference material now — one click to the board.
   if (overflow > 0) container.append(railMoreRow(overflow, 'more need you'));
@@ -7123,7 +7857,7 @@ function observationRow(it) {
 }
 
 function needsStallRow(it) {
-  return el('div', { class: 'needs-card status stall', 'data-id': it.id, 'data-kind': 'stall' },
+  const card = el('div', { class: 'needs-card status stall', 'data-id': it.id, 'data-kind': 'stall' },
     el('div', { class: 'nc-head' },
       el('span', { class: 'nc-id', text: '⚠ stalled work' }),
       el('span', { class: 'nc-sev', text: '' })),
@@ -7132,6 +7866,7 @@ function needsStallRow(it) {
     el('div', { class: 'nc-form' },
       el('div', { class: 'nc-acts' },
         el('span', { class: 'nc-err', text: 'advisory — clears itself if progress resumes' }))));
+  return card;
 }
 
 function needsCard(it) {
@@ -7236,7 +7971,7 @@ function needsCard(it) {
     card.append(el('div', { class: 'nc-form' }, el('div', { class: 'nc-acts' }, err)));
   }
   wireTitleModal(card, it); // FEAT-053 — the title opens the full ticket in place
-  return card;
+  return makeCollapsible(card, it);
 }
 
 /* ─────────────────────────────── FEAT-053 — rail ticket modal ────────────
@@ -7342,19 +8077,29 @@ function scheduleRailPoll() {
 }
 
 async function pollRail() {
-  if (!document.hidden && state.current.projectId) {
-    await refreshRail(true);
-    // FEAT-057: the death ledger rides the SAME poll — an agent that dies while
-    // nothing else is happening (the whole point of the feature) must surface
-    // without any other traffic to piggyback on.
-    await refreshOutcomes();
-    // ARCH-017 — held lane results ride the SAME poll, for the same reason the
-    // death ledger does: a background fan-out that settles while nothing else
-    // is happening is precisely the case this feature exists for, so it must
-    // surface with no other traffic to piggyback on.
-    await refreshPending();
+  // Self-healing: a throw anywhere in a poll cycle (e.g. a render bug in
+  // refreshRail → renderRail) must NEVER kill the loop. The finally always
+  // re-arms the next poll, so one bad render degrades to a logged blip, not a
+  // permanently frozen rail (FEAT-153 round-2: a reconcile NotFoundError used to
+  // propagate out here and stop scheduleRailPoll forever).
+  try {
+    if (!document.hidden && state.current.projectId) {
+      await refreshRail(true);
+      // FEAT-057: the death ledger rides the SAME poll — an agent that dies while
+      // nothing else is happening (the whole point of the feature) must surface
+      // without any other traffic to piggyback on.
+      await refreshOutcomes();
+      // ARCH-017 — held lane results ride the SAME poll, for the same reason the
+      // death ledger does: a background fan-out that settles while nothing else
+      // is happening is precisely the case this feature exists for, so it must
+      // surface with no other traffic to piggyback on.
+      await refreshPending();
+    }
+  } catch (err) {
+    console.error('pollRail cycle failed (loop kept alive):', err);
+  } finally {
+    scheduleRailPoll();
   }
-  scheduleRailPoll();
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -7516,6 +8261,12 @@ function stripModel() {
       // running set — it is rendered ⚠ with its evidence, never dropped.
       stalled: r.state === 'stalled',
       stallWhy: r.stall?.checked ?? '',
+      // BUG-187 — the broker's own verdict that this lane cannot run (blocked:
+      // its tool calls are refused, nobody is attached) or was stopped. Such a
+      // row is NEVER drawn as running.
+      blocked: r.state === 'blocked',
+      stopped: r.state === 'stopped',
+      stateWhy: r.stateDetail ?? '',
     }));
   }
   if (state.busy) {
@@ -7600,13 +8351,17 @@ function renderStrip() {
     // "running" is a claim the server's evidence no longer backs, and "gone"
     // would assert an end nobody proved. The reason rides the tooltip.
     cls: r.stale ? (r.row === 'main' ? 'lag main wait' : 'lag wait')
-      : r.stalled ? (r.row === 'main' ? 'lag main stall' : 'lag stall')
-        : (r.row === 'main' ? 'lag main run' : 'lag run'),
+      : r.blocked ? 'lag blocked'
+        : r.stopped ? 'lag stopped'
+          : r.stalled ? (r.row === 'main' ? 'lag main stall' : 'lag stall')
+            : (r.row === 'main' ? 'lag main run' : 'lag run'),
     ty: r.ty,
-    de: r.de,
-    gl: r.stale ? '·' : (r.stalled ? '⚠' : '◐'),
+    de: r.blocked || r.stopped ? (r.stateWhy || (r.blocked ? 'blocked — Orchard is not attached' : 'stopped')) : r.de,
+    gl: r.stale ? '·' : (r.blocked ? '⊘' : r.stopped ? '■' : (r.stalled ? '⚠' : '◐')),
     el: rowElapsed(r.startedAt, r.stale),
-    stallWhy: r.stalled ? (r.stallWhy || 'no progress evidence for this row') : '',
+    stallWhy: r.blocked || r.stopped ? (r.stateWhy || (r.blocked ? 'blocked' : 'stopped'))
+      : r.stalled ? (r.stallWhy || 'no progress evidence for this row') : '',
+    notRunning: r.blocked || r.stopped,
   }));
   for (const r of rows) {
     const row = el('button', {
@@ -7614,9 +8369,11 @@ function renderStrip() {
       class: r.cls,
       'data-thread': r.key,
       'aria-current': String(state.viewing === r.key),
-      title: r.stallWhy
-        ? `⚠ stalled — ${r.stallWhy}`
-        : (r.key === 'main' ? 'Back to the main thread' : `Open ${r.ty}'s thread`),
+      title: r.notRunning
+        ? r.stallWhy
+        : r.stallWhy
+          ? `⚠ stalled — ${r.stallWhy}`
+          : (r.key === 'main' ? 'Back to the main thread' : `Open ${r.ty}'s thread`),
     },
       el('span', { class: 'ty', text: r.ty }),
       el('span', { class: 'de', text: r.de }),
@@ -7642,12 +8399,23 @@ function paintStripSummary(model) {
   // BUG-046: stalled rows are counted out loud — "2 agents running" over a set
   // where one has silently stopped progressing is the fleet-level lie the
   // detector exists to end.
-  const stalled = agents.filter((r) => r.stalled).length;
+  const stalled = agents.filter((r) => r.stalled && !r.blocked && !r.stopped).length;
   const stallNote = stalled ? ` · ⚠ ${stalled} stalled` : '';
+  // BUG-187 — blocked/stopped lanes are counted out loud and NEVER as running.
+  const blocked = agents.filter((r) => r.blocked).length;
+  const stoppedN = agents.filter((r) => r.stopped).length;
+  const blockNote = (blocked ? ` · ⊘ ${blocked} blocked (Orchard not attached)` : '') + (stoppedN ? ` · ${stoppedN} stopped` : '');
+  const runningN = agents.length - stalled - blocked - stoppedN;
+  // BUG-187 — the header must not say "Running" (with the live spark) over a set
+  // in which nothing runs: only blocked/stopped lanes and no main turn.
+  const nothingRuns = !main && runningN === 0 && stalled === 0 && (blocked + stoppedN) > 0;
+  node.strip.classList.toggle('norun', nothingRuns);
+  const lbl = node.strip.querySelector('.strip-top .lbl');
+  if (lbl) lbl.textContent = nothingRuns ? (blocked ? 'Blocked' : 'Stopped') : 'Running';
   node.stripSum.textContent = stale
     // Says the true thing: this is the last answer we got, not the current one.
     ? `${agents.length} agent${agents.length === 1 ? '' : 's'} — unverified, the server is unreachable (as of ${clock})`
-    : `${agents.length - stalled} agent${agents.length - stalled === 1 ? '' : 's'} running${stallNote} · ${clock}`;
+    : `${runningN} agent${runningN === 1 ? '' : 's'} running${stallNote}${blockNote} · ${clock}`;
 }
 
 /*
@@ -7861,9 +8629,9 @@ function deliverQueuedBehindBackground() {
   // remove the delivered rows, keeping dead/drain-wait rows exactly as flushQueue does.
   state.outbox = { texts: items.map((q) => q.text.trim()), at: Date.now() };
   state.queue = state.queue.filter((q) => q.dead || q === state.drainWaitAttempt);
-  youBubble(mainThread(), text);
+  const bgEl = youBubble(mainThread(), text);
   if (state.viewing === 'main') scrollDown();
-  if (!send({ type: 'send', prompt: text })) {
+  if (!sendTurn(text, { texts: items.map((q) => q.text.trim()), el: bgEl })) {
     // Socket died between the decision and the send — put them ALL back.
     for (let i = items.length - 1; i >= 0; i--) state.queue.unshift(items[i]);
     state.outbox = null;
@@ -8113,7 +8881,25 @@ function settleAgent(entry) {
 
 function renderAsk(e) {
   node.asks.hidden = false;
+  /*
+   * BUG-187 P1 — UPSERT by requestId. The same request can arrive twice: a
+   * reattach replays it (BUG-008), and after a server restart the CLI
+   * REDELIVERS a still-pending permission with the SAME request id. Appending
+   * again drew a duplicate card and orphaned the first one's map entry. An
+   * existing, unsettled card is refreshed in place and kept answerable.
+   */
+  const prior = state.asks.get(e.requestId);
+  if (prior && prior.isConnected && !prior.dataset.done) {
+    prior.dataset.redelivered = '1';
+    const acts = prior.querySelector('.acts');
+    for (const b of acts ? acts.querySelectorAll('button') : []) b.disabled = false;
+    const v = prior.querySelector('.verdict');
+    if (v && v.textContent.startsWith('not ')) v.textContent = '';
+    return;
+  }
+  if (prior) { prior.remove(); state.asks.delete(e.requestId); }
   const box = el('div', { class: 'ask' });
+  box.dataset.requestId = String(e.requestId);
   let arg = '';
   try { arg = typeof e.input === 'string' ? e.input : JSON.stringify(e.input, null, 2); } catch { arg = '(uninspectable input)'; }
   box.append(el('div', { class: 'hd' },
@@ -8144,6 +8930,13 @@ function renderAsk(e) {
     const pending = {
       settle: (matched) => {
         clearTimeout(pending.timer);
+        /*
+         * BUG-187 P3 — after the server has published a COMPLETE pending list,
+         * "no such pending request" is authoritative: the request is gone (a
+         * restart, or it was answered elsewhere). Settle the card as expired;
+         * re-arming it would invite a click into nothing.
+         */
+        if (matched === false && state.approvalsComplete) return expireAsk(e.requestId, 'this request no longer exists (the server has no such pending request)');
         if (matched === false) return restore('the server had no such pending request');
         box.dataset.done = word;
         verdict.textContent = `${word} · confirmed by the server`;
@@ -8172,6 +8965,40 @@ function renderAsk(e) {
   node.asks.append(box);
   state.asks.set(e.requestId, box);
   scrollDown();
+}
+
+/**
+ * BUG-187 P2/P3 — settle a card whose request no longer exists. Kept visible
+ * (dimmed, with the reason) for a moment so the user sees what happened, then
+ * removed; its buttons are gone at once so nothing can be clicked into nothing.
+ */
+function expireAsk(requestId, why) {
+  const box = state.asks.get(requestId);
+  state.pendingAnswers.delete(requestId);
+  if (!box) return;
+  state.asks.delete(requestId);
+  box.dataset.done = 'expired';
+  for (const b of box.querySelectorAll('.acts button')) b.remove();
+  const v = box.querySelector('.verdict');
+  if (v) v.textContent = `expired — ${why}`;
+  setTimeout(() => {
+    box.remove();
+    if (!node.asks.childElementCount) node.asks.hidden = true;
+  }, 6000);
+}
+
+/**
+ * BUG-187 P2 — the server's authoritative pending list. `complete:false` (an
+ * adopted session still recovering its prompts) expires NOTHING; `complete:true`
+ * expires every card whose id is absent.
+ */
+function applyApprovalsSnapshot(e) {
+  state.approvalsComplete = e.complete === true;
+  if (e.complete !== true) return;
+  const live = new Set((e.requestIds ?? []).map(String));
+  for (const id of [...state.asks.keys()]) {
+    if (!live.has(String(id))) expireAsk(id, 'this request no longer exists (the server restarted or it was answered elsewhere)');
+  }
 }
 
 /* ------------------------------------------------------- decisions (Q / plan) */
@@ -8421,11 +9248,17 @@ function connect() {
       state.ws = null;
       state.deliveryRelay = null; // FEAT-065: the approval relay is per-socket state
       setBusy(false);
+      // BUG-191: a drain-wait retry whose socket died before ANY answer — the
+      // server may have delivered it (its ack lost with the socket). Keep it
+      // dead and visible ("not confirmed"); never resend it blindly. It is a
+      // retry's own socket, so it is not a dropped DRIVING session either.
+      const ghost = !state.closingOnPurpose && state.pendingStart != null && !!state.drainWaitAttempt;
+      if (ghost) keepUnconfirmedStart();
       // Our own close() is routine. A close we did not ask for, on a session
       // that had started, is a fault the user must see — and until they
       // resolve it we refuse to send, because the alternative (silently
       // starting a fresh session) throws away the conversation on screen.
-      if (!state.closingOnPurpose && wasLive && state.sdkSessionId) {
+      if (!ghost && !state.closingOnPurpose && wasLive && state.sdkSessionId) {
         state.dropped = true;
         say('the session connection dropped — nothing on screen was lost, but the agent is no longer attached', true);
         paintComposerFor(viewedThread());
@@ -8486,6 +9319,7 @@ function watch() {
   const retry = () => {
     if (state.watchWs !== ws) return;
     state.watchWs = null;
+    state.following = false; // BUG-190: the watch died with its socket; the reconnect re-follows and catches up
     const wait = WATCH_BACKOFF_MS[Math.min(state.watchTries++, WATCH_BACKOFF_MS.length - 1)];
     setTimeout(watch, wait);
   };
@@ -8532,11 +9366,139 @@ function followCurrent(follow = true) {
 function onFollowStatus(e) {
   if (e.sessionId !== state.current.sessionId) return;
   state.following = e.following === true;
-  if (e.following) return;
+  // BUG-190: every fresh follow starts at the file's CURRENT end, so whatever was
+  // written between the last thing rendered and this subscribe — a reconnect gap,
+  // a turn delivered while the watch was down — is caught up from the store.
+  if (e.following) return void catchUpFollow(e.sessionId, e.dir);
   // Expected refusal: the dashboard's own bridge is already feeding this
   // session, and watching the file too would double-emit. Not an error.
   if (isBridged(e.sessionId) || /driven by the dashboard/i.test(e.reason ?? '')) return;
   if (e.reason) say(`not following this session live: ${e.reason}`, true);
+}
+
+/*
+ * BUG-190 — converge the open view to the transcript after ANY (re)subscribe.
+ *
+ * The server's watch starts at the file's end when it is created, and nothing
+ * carries a resume point across an unfollow, a dropped watch socket or a fresh
+ * follow. So every line written after the last message this view rendered and
+ * before the new watch existed was silently skipped: a reconnect gap, or a turn
+ * delivered into a survivor while the watch was down, stayed missing until a
+ * reload. The client already holds the resume point — `th.lastIndex`, in the one
+ * coordinate system the store and the watcher share — so on every successful
+ * follow it reads forward from there. Appends that arrive meanwhile are buffered
+ * and replayed AFTER the catch-up, through the same index dedupe, so nothing is
+ * rendered out of order or twice: the fetch covers everything before the watch
+ * started, the watch covers everything after, and the overlap is dropped by index.
+ */
+async function catchUpFollow(sessionId, dir) {
+  const th = mainThread();
+  const cur = state.current;
+  if (!cur.sessionId || cur.sessionId !== sessionId || !cur.encodedDir) return;
+  if (dir && dir !== cur.encodedDir) return;
+  if (th.gap || isBridged(sessionId)) return; // the gap machinery owns the tail / the bridge renders it
+  if (th.lastIndex == null) {
+    /*
+     * BUG-190 round 5: an absent anchor is never "nothing to do".
+     *  - Nothing rendered in this thread: the anchor is the start, so read from
+     *    #0 (-1). An empty session's first message is caught up like any other.
+     *  - Messages rendered WITHOUT store indices (a thread the live bridge drew,
+     *    now followed from the file after the bridge went away): nothing can
+     *    splice onto it by index, so re-read the whole view from the store —
+     *    one reload that converges it, instead of silently skipping the gap.
+     */
+    if (th.paneEl.querySelector(':scope > .you, :scope > .claude')) {
+      const p = state.projects.find((x) => x.id === cur.projectId);
+      if (!p) return;
+      say('catching this view up from the transcript');
+      return void openSession(p, { encodedDir: cur.encodedDir, sessionId, displayTitle: cur.title, os: cur.os });
+    }
+    th.lastIndex = -1;
+  }
+  if (th.catchUp) { th.catchUp.again = true; return; } // one in flight: it loops once more instead
+  const run = { buffer: [], again: false };
+  th.catchUp = run;
+  const stillHere = () => state.current.sessionId === sessionId && state.current.encodedDir === cur.encodedDir && mainThread() === th;
+  const idx = (t) => (t?.messages ?? []).filter((m) => Number.isInteger(m?.index));
+  // A hung read counts as a failed read (retried below), never an endless wait.
+  const read = (opts) => Promise.race([
+    api.transcript(cur.encodedDir, sessionId, opts),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('catch-up read timed out')), 20_000)),
+  ]);
+  /*
+   * One pass: everything after `th.lastIndex`, contiguous, or it THROWS — a pass
+   * never renders a partial gap (BUG-190 round 3). Read BACKWARD from the file's
+   * end (never forward past it), newest page first, then older pages anchored by
+   * the previous page's byte cursor while the oldest message read is still newer
+   * than what is on screen. Every page must link to the next by index; a short
+   * or empty page is a failed read, not "nothing older".
+   */
+  const readGap = async () => {
+    const next = th.lastIndex + 1;
+    let t = await read({ tail: OLDER_PAGE });
+    if (!stillHere()) return null;
+    let page = idx(t);
+    let got = page.filter((m) => m.index >= next);
+    for (let pages = 0; page.length && page[0].index > next; pages++) {
+      if (pages >= 1000) throw new Error('the gap is too long to page through');
+      const before = page[0].index;
+      t = await read({
+        tail: Math.min(OLDER_PAGE, before - next), before,
+        beforeBytes: Number.isInteger(t?.cursorBytes) ? t.cursorBytes : undefined,
+      });
+      if (!stillHere()) return null;
+      page = idx(t);
+      if (!page.length || page[page.length - 1].index !== before - 1) {
+        throw new Error(`an older page did not link up (asked for messages before #${before}, got ${page.length ? `#${page[0].index}–#${page[page.length - 1].index}` : 'none'})`);
+      }
+      got = page.filter((m) => m.index >= next).concat(got);
+    }
+    const seen = new Set();
+    const fresh = got.filter((m) => m.index > th.lastIndex && !seen.has(m.index) && seen.add(m.index))
+      .sort((a, b) => a.index - b.index);
+    if (fresh.length && (fresh[0].index !== next || fresh[fresh.length - 1].index - next + 1 !== fresh.length)) {
+      throw new Error(`the read left a hole (#${next}…#${fresh[fresh.length - 1].index}, ${fresh.length} messages)`);
+    }
+    return fresh;
+  };
+  const RETRY_MS = [500, 1000, 2000, 4000, 8000, 15_000];
+  let hint = null;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      let fresh;
+      try {
+        fresh = await readGap();
+      } catch (err) {
+        if (!stillHere()) return;
+        // Never silent: say that messages written while the view was
+        // reconnecting are still being read, and keep retrying. Live appends
+        // stay buffered meanwhile so nothing renders ahead of the missing ones.
+        if (!hint) { hint = el('div', { class: 'hint-row bad' }); th.paneEl.append(hint); }
+        hint.textContent = `could not yet read the messages written while this view was reconnecting (${err.message}) — retrying`;
+        await new Promise((r) => setTimeout(r, RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)]));
+        if (!stillHere()) return;
+        continue;
+      }
+      if (fresh == null) return; // navigated away mid-read
+      if (fresh.length) {
+        finishStream(th);
+        th.settledStream = null; // persisted units replace any live body (BUG-169)
+        th.claudeBody = null;
+        th.paneEl.querySelector(':scope > .empty-session-hint')?.remove(); // BUG-190 r5: no longer true
+        renderMessages(th, fresh);
+        th.lastIndex = fresh[fresh.length - 1].index;
+        if (th.page && Number.isInteger(th.page.total)) th.page.total = Math.max(th.page.total, th.lastIndex + 1);
+        if (state.viewing === 'main') scrollDown();
+      }
+      if (!run.again) break;
+      run.again = false; // a later follow landed while this one ran — read once more
+    }
+    if (hint) say('caught up on the messages written while this view was reconnecting');
+  } finally {
+    hint?.remove();
+    if (th.catchUp === run) th.catchUp = null;
+    for (const e of run.buffer) applyAppend(e);
+  }
 }
 
 /** True when the dashboard itself is driving this session id over the bridge. */
@@ -8555,6 +9517,8 @@ function applyAppend(e) {
   // NOT a continuation of what is on screen. Splicing it on would fabricate a
   // conversation that never happened — refetch instead.
   if (e.resynced === true) return void resyncTranscript();
+  // BUG-190: a catch-up read is in flight — replay this after it, in order.
+  if (mainThread().catchUp) return void mainThread().catchUp.buffer.push(e);
 
   const msgs = Array.isArray(e.messages) ? e.messages : [];
   if (!msgs.length) return;
@@ -8586,6 +9550,7 @@ function applyAppend(e) {
   th.claudeBody = null;
   const shown = renderMessages(th, fresh);
   if (!shown) return;
+  th.paneEl.querySelector(':scope > .empty-session-hint')?.remove(); // BUG-190 r5: no longer true
   if (th.page && Number.isInteger(th.page.total)) th.page.total += fresh.length;
   // Straight into the existing rule: follow if stuck, otherwise light the pill.
   if (state.viewing === 'main') scrollDown();
@@ -8705,7 +9670,23 @@ async function refreshLive() {
       }
     }
   }
-  if (!same) renderTree(); // only repaint when the answer actually changed
+  // FEAT-154 — refresh the "waiting on you" set from the BRIDGE list, which the
+  // server owns and keeps alive as long as the bridge lives (unlike the mtime
+  // live list, which drops a session that has been paused-on-a-question and
+  // silent for >30s). The server publishes `awaitingUser` per bridge; we read it
+  // and never re-derive it. Keyed by sdkSessionId (the nav row's own id).
+  let awaitingChanged = false;
+  try {
+    const bridges = await api.liveBridges();
+    if (Array.isArray(bridges)) {
+      const nextAwaiting = new Set(
+        bridges.filter((b) => b && b.awaitingUser === true && b.sdkSessionId).map((b) => b.sdkSessionId));
+      awaitingChanged = nextAwaiting.size !== state.awaitingIds.size
+        || [...nextAwaiting].some((id) => !state.awaitingIds.has(id));
+      state.awaitingIds = nextAwaiting;
+    }
+  } catch { /* transient — keep the last honest set */ }
+  if (!same || awaitingChanged) renderTree(); // only repaint when the answer actually changed
 }
 
 function startLivePolling() {
@@ -9011,6 +9992,111 @@ function paintFrozenBar(ctx) {
   }
 }
 
+/* ============== BUG-191: a refused or unconfirmed send is never lost ========
+ * Every `send` carries a client `sendId`, and the tab records what THAT attempt
+ * carried (its rows' texts and the exact bubble it painted). The server echoes
+ * the id on its ack and on a refusal, so a refusal recovers exactly that
+ * attempt's rows — never a neighbour's, and never from `pendingSend`/`outbox`
+ * guesses, which other attempts and turn-ends overwrite.
+ *  - retryable (definitely NOT delivered, e.g. an adoption still settling):
+ *    the rows go back to the FRONT of the queue as drain-wait rows, in their
+ *    original order, persisted before the socket is released and the BUG-045
+ *    retry armed.
+ *  - uncertain (the delivery went out, its acceptance never came back): the
+ *    rows come back DEAD — visible, editable, one click to resend — and are
+ *    never resent automatically (it may already have arrived).
+ * ------------------------------------------------------------------------- */
+
+/** BUG-191: the queued-line for a refusal from an adopt-gated session, or null for any other refusal. */
+function adoptQueuedLine(drain) {
+  if (drain?.adoptState === 'pending') return 'message queued — the session is still re-attaching after a server restart; it will send itself';
+  if (drain?.adoptState) return 'message queued — the session is finishing an earlier server\'s work after a restart; it will send itself';
+  return null;
+}
+
+function sendTurn(prompt, { texts, el }) {
+  const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  state.sendAttempts.set(sendId, {
+    texts: (texts ?? []).filter((t) => t && t.trim()),
+    el: el ?? null,
+    at: Date.now(),
+    resume: state.sdkSessionId ?? state.current?.sessionId ?? null,
+  });
+  const ok = send({ type: 'send', prompt, sendId });
+  if (!ok) state.sendAttempts.delete(sendId);
+  return ok;
+}
+
+/** Undo what one attempt painted/handed off — only its own bubble and its own outbox batch. */
+function unwindSendAttempt(a) {
+  a.el?.remove?.();
+  if (state.pendingSend && state.pendingSend.el === a.el) state.pendingSend = null;
+  const ob = state.outbox?.texts;
+  if (ob && ob.length === a.texts.length && ob.every((t, i) => t === a.texts[i])) state.outbox = null;
+}
+
+/** Release this tab's socket after a refusal, so the BUG-045 retry can re-attempt the resume. */
+function releaseSocketForRetry(resume) {
+  if (state.ws) {
+    state.closingOnPurpose = true;
+    try { state.ws.close(); } catch { /* already gone */ }
+    state.ws = null; // dead NOW — see queueRetryableRefusal for why not at its close event
+    state.live = false;
+  }
+  if (resume) state.resumeOnNextSend = resume;
+  setBusy(false);
+  state.turnStartedAt = 0;
+  state.sessReconnecting = false;
+  paintSessStatus();
+}
+
+
+function queueRefusedSend(a, drain) {
+  unwindSendAttempt(a);
+  const now = Date.now();
+  const rows = a.texts.map((text) => ({
+    text, dead: null, composedAt: a.at,
+    drainWait: a.resume ?? true,
+    drainProject: state.current.projectId,
+    drain: drain ?? null, drainAt: now,
+  }));
+  state.queue.unshift(...rows);
+  paintQueue(); // BUG-129: persisted before anything below can lose it
+  releaseSocketForRetry(a.resume);
+  say(adoptQueuedLine(drain) ?? 'message queued — the session cannot take it yet; it will send itself');
+  armDrainWaitRetry();
+  paintQueue();
+}
+
+function keepUnconfirmedSend(a) {
+  unwindSendAttempt(a);
+  for (const text of a.texts) state.queue.push({ text, dead: UNCONFIRMED_NOTE, composedAt: a.at });
+  setBusy(false);
+  paintQueue();
+  say(`${a.texts.length === 1 ? 'a message' : `${a.texts.length} messages`} could not be confirmed as delivered — kept in the dock, not resent`, true);
+}
+
+/** A start (fresh Enter or a drain-wait retry) whose delivery could not be confirmed. */
+function keepUnconfirmedStart() {
+  const text = state.pendingStart;
+  const resume = state.pendingStartResume;
+  const retried = state.drainWaitAttempt;
+  state.drainWaitAttempt = null;
+  state.pendingStart = null;
+  state.pendingStartResume = null;
+  state.pendingStartKeepComposer = false;
+  if (state.pendingStartEl) state.pendingStartEl.remove();
+  else { const bs = mainThread().paneEl.querySelectorAll(':scope > .you'); bs[bs.length - 1]?.remove(); }
+  state.pendingStartEl = null;
+  if (retried) { retried.dead = UNCONFIRMED_NOTE; retried.drainWait = null; }
+  else if (text) state.queue.push({ text, dead: UNCONFIRMED_NOTE, composedAt: Date.now() });
+  paintQueue();
+  releaseSocketForRetry(resume);
+  if (!drainWaitItem()) disarmDrainWaitRetry();
+  say('your message could not be confirmed as delivered — kept in the dock, not resent', true);
+  paintQueue();
+}
+
 /* ============== BUG-045: retryable refusal queues + retries itself ==========
  * BUG-029 stopped the refusal LOSING the message; this stops it stranding the
  * user. A `retryable:true` pre-ack refusal (the BUG-022 survivor-drain guard,
@@ -9066,7 +10152,7 @@ function queueRetryableRefusal(drain) {
       drainProject: state.current.projectId,    // retries only run while this project is current
       drain: drain ?? null, drainAt: Date.now(), // FEAT-064: what holds the drain, per the server
     });
-    say('message queued — waiting for the previous turn to finish draining; it will send itself');
+    say(adoptQueuedLine(drain) ?? 'message queued — waiting for the previous turn to finish draining; it will send itself');
   }
   armDrainWaitRetry();
   paintQueue();
@@ -9099,8 +10185,16 @@ function disarmDrainWaitRetry() {
 function attemptDrainRetry({ immediate = false } = {}) {
   // An attempt whose socket died with neither an ack nor a refusal reaching us
   // would guard a ghost forever — release it once it is clearly not in flight.
+  // BUG-191: it may have been delivered (its ack lost with the socket), so it
+  // is kept DEAD — visible, one click to resend — never re-sent blindly.
   if (state.drainWaitAttempt && !state.busy && state.pendingStart == null
-    && Date.now() - (state.drainWaitLastTry || 0) > 15000) state.drainWaitAttempt = null;
+    && Date.now() - (state.drainWaitLastTry || 0) > 15000) {
+    const ghost = state.drainWaitAttempt;
+    state.drainWaitAttempt = null;
+    ghost.dead = UNCONFIRMED_NOTE;
+    ghost.drainWait = null;
+    paintQueue();
+  }
   if (state.drainWaitAttempt || state.busy || state.pendingStart != null || state.live) return;
   const item = drainWaitItem();
   if (!item) { if (!state.queue.some((q) => !q.dead && q.drainWait)) disarmDrainWaitRetry(); return; }
@@ -9629,11 +10723,15 @@ function onEvent(e) {
         }
         return;
       }
+      // BUG-191: the server confirmed (or declined) THIS attempt — it is settled either way.
+      if (e.of === 'send' && e.sendId) state.sendAttempts.delete(e.sendId);
       if (e.of === 'send' && e.delivered === false) {
         setBusy(false);
         return; // subagent-send-unsupported carries the explanation
       }
       if (e.of === 'start') {
+        // BUG-187 P2: a new attachment starts with no authoritative pending list.
+        state.approvalsComplete = false;
         if (e.deliveredVia === 'survivor') {
           /*
            * FEAT-065: the server wrote this start's prompt straight into the
@@ -9655,7 +10753,16 @@ function onEvent(e) {
           setBusy(false); // flushQueue is relay-guarded; other queued rows wait for the retry loop
           const dbs = mainThread().paneEl.querySelectorAll(':scope > .you');
           dbs[dbs.length - 1]?.remove();
-          followCurrent(true); // the watch socket streams the injected turn in from the transcript
+          /*
+           * The watch socket streams the injected turn in from the transcript.
+           * BUG-190: only (re)follow when NOT already following this session. A
+           * re-follow is unfollow+follow; the unfollow stops the server's watch
+           * and the new one starts at the file's CURRENT end — so the survivor's
+           * echo of this very message (written within ms of the stdin write,
+           * inside the watcher's 150 ms debounce) was skipped, and the user's
+           * message and reply vanished from the open view until a reload.
+           */
+          if (!state.following) followCurrent(true);
           paintSessStatus();
           paintQueue();
           say('delivered into the still-draining session — it runs there now; the reply streams in from the transcript');
@@ -9723,6 +10830,26 @@ function onEvent(e) {
          * transcript and into the queue, where it delivers at the boundary.
          */
         if (e.reattached) {
+          /*
+           * BUG-191 — `promptDelivered`: this start's prompt went into an
+           * adopt-gated session through the broker's CONFIRMED acceptance, so
+           * the turn it opened is why the session is busy. It is delivered —
+           * settle it exactly once; re-queuing it (the busy branch below) would
+           * send it a second time at the next boundary.
+           */
+          if (e.promptDelivered) {
+            if (Number.isFinite(e.turnStartedAt) && e.turnStartedAt > 0) {
+              state.turnStartedAt = e.turnStartedAt;
+              state.turnStartUnknown = false;
+            }
+            settleDrainWaitDelivery({ quiet: true });
+            state.pendingStart = null;
+            state.pendingStartResume = null;
+            state.pendingStartEl = null;
+            setBusy(!!e.busy);
+            say('re-attached — your message was delivered into the running session');
+            return;
+          }
           if (e.busy) {
             // BUG-033: the server's honest turn clock, or an honest unknown —
             // never a fresh stamp (see turnClock()).
@@ -10054,6 +11181,10 @@ function onEvent(e) {
       renderAsk(e);
       return;
 
+    case 'approvals-snapshot':
+      applyApprovalsSnapshot(e);
+      return;
+
     case 'permission-denied':
       say(`permission denied: ${e.toolName}${e.reason ? ` — ${e.reason}` : ''}`, true);
       return;
@@ -10369,6 +11500,17 @@ function onEvent(e) {
         cancelForceSend('the session hit its budget limit');
         failQueue('the session hit its budget limit');
         paintComposerFor(viewedThread());
+      } else if (e.of === 'send' && e.sendId && state.sendAttempts.has(e.sendId)) {
+        // BUG-191: a `send` the server did NOT deliver (retryable) or could not
+        // confirm (uncertain) — recover exactly that attempt's rows.
+        const attempt = state.sendAttempts.get(e.sendId);
+        state.sendAttempts.delete(e.sendId);
+        if (e.retryable) queueRefusedSend(attempt, e.drain);
+        else if (e.uncertain) keepUnconfirmedSend(attempt);
+        else if (state.busy) armBusyWatchdog(e.message);
+      } else if (state.pendingStart != null && e.uncertain) {
+        // BUG-191: a start whose delivery went out but was never confirmed.
+        keepUnconfirmedStart();
       } else if (state.pendingStart != null) {
         // BUG-029: a `start`/resume refused before its `ack` — the turn never
         // began (e.g. the retryable survivor-drain guard). BUG-045: when the
@@ -10762,6 +11904,9 @@ function paintQueue() {
     // A row restored from storage may predate composedAt — then say nothing
     // about elapsed rather than render a NaN.
     const waited = Number.isFinite(row.composedAt) ? ` · queued ${fmtElapsed(Date.now() - row.composedAt)} ago` : '';
+    // BUG-191: a refusal from an adopt-gated session names the real reason.
+    if (row.drain?.adoptState === 'pending') return `waiting for the session to finish re-attaching after a server restart — this retries every few seconds and goes in once it is ready${waited} — edit or discard below`;
+    if (row.drain?.adoptState) return `waiting — the session is finishing an earlier server's work after a restart (${row.drain.why ?? 'not ready'}); this retries every few seconds${waited} — edit or discard below`;
     return `waiting on drain — the session is mid-reply; this retries every few seconds and goes in at its next pause${waited} — edit or discard below`;
   };
   /*
@@ -10806,7 +11951,10 @@ function paintQueue() {
   const why = !pending.length
     // BUG-149: name the affordance that now exists, instead of asking the user
     // to select text out of a textarea by hand.
-    ? 'never delivered — put it back in the composer, or discard'
+    // BUG-191: a row whose delivery was never CONFIRMED may have arrived — do not call it undelivered.
+    ? (state.queue.every((q) => q.dead === UNCONFIRMED_NOTE)
+      ? 'not confirmed as delivered — check the transcript, then put it back in the composer or discard'
+      : 'never delivered — put it back in the composer, or discard')
     : heldRow
       ? heldWhy(heldRow)
       : pending.some((q) => q.drainWait)
@@ -10856,7 +12004,8 @@ function paintQueue() {
   const restoredNote = pending.some((q) => q.restored)
     ? ' · restored after a reload, still unsent' : '';
   const n = pending.length || state.queue.length;
-  const prefix = `${n} ${pending.length ? 'queued' : 'undelivered'} message${n === 1 ? '' : 's'} · `;
+  // BUG-191: rows that were sent but never confirmed are "unconfirmed", not "undelivered".
+  const prefix = `${n} ${pending.length ? 'queued' : state.queue.every((q) => q.dead === UNCONFIRMED_NOTE) ? 'unconfirmed' : 'undelivered'} message${n === 1 ? '' : 's'} · `;
   if (fg) {
     // BUG-178: build the line from nodes so the elapsed is a live `.q-el` span
     // (refreshed by the 1s strip ticker) instead of a value frozen at queue time.
@@ -10887,7 +12036,9 @@ function paintQueue() {
       el('span', { class: 'qp', text: preview + (item.text.length > 72 ? '…' : '') }),
       el('span', {
         class: 'qs',
-        text: item.dead ? `NOT delivered — ${item.dead}`
+        // BUG-191: an unconfirmed send may have arrived — say "not confirmed", never "not delivered".
+        text: item.dead === UNCONFIRMED_NOTE ? `NOT confirmed — ${item.dead}`
+          : item.dead ? `NOT delivered — ${item.dead}`
           : item.drainWait ? 'waiting on drain'
             : item.restored ? `unsent · restored${i === 0 ? ' · next' : ` · #${i + 1}`}`
               : (i === 0 ? 'next' : `#${i + 1}`),
@@ -11002,12 +12153,12 @@ function flushQueue() {
   const text = items.map((q, i) => `${queueItemNote(q, i, items.length)}\n${q.text.trim()}`).join('\n\n');
   // One bubble for the combined turn — it IS one turn now, and this matches
   // what the store writes, so reopening the session shows the same thing.
-  youBubble(mainThread(), text);
+  const flushEl = youBubble(mainThread(), text);
   if (state.viewing === 'main') scrollDown();
   state.turnStartedAt = Date.now();
   state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
   setBusy(true);
-  if (!send({ type: 'send', prompt: text })) {
+  if (!sendTurn(text, { texts: items.map((q) => q.text.trim()), el: flushEl })) {
     // The socket died between the boundary and this send — put them ALL back.
     for (let i = items.length - 1; i >= 0; i--) state.queue.unshift(items[i]);
     state.outbox = null; // nothing was handed over: the rows themselves are the record again
@@ -11066,12 +12217,12 @@ function deliverForced(item) {
   // BUG-129: forceSend already pulled this row OUT of state.queue, so from here
   // to turn-end the outbox is its only record (same window as flushQueue's).
   state.outbox = { texts: [item.text.trim()], at: Date.now() };
-  youBubble(mainThread(), text);
+  const forcedEl = youBubble(mainThread(), text);
   if (state.viewing === 'main') scrollDown();
   state.turnStartedAt = Date.now();
   state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
   setBusy(true);
-  if (!send({ type: 'send', prompt: text })) {
+  if (!sendTurn(text, { texts: [item.text.trim()], el: forcedEl })) {
     // The socket died between the interrupt landing and this send — keep the
     // text recoverable rather than silently dropping it.
     item.dead = 'the socket dropped before the force-send could go out';
@@ -11228,7 +12379,7 @@ async function submit() {
     state.turnStartedAt = Date.now();
     state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
     setBusy(true);
-    send({ type: 'send', prompt: text });
+    sendTurn(text, { texts: [text.trim()], el: bubbleEl });
     if (behindBackground) say('queued behind background work — the idle session delivers it at the next pause');
     else if (awaitingDecision) say('sent — it runs as your next turn once the question above is settled');
     return;
@@ -11393,10 +12544,44 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
 }
 
 /** The session-scope overrides that are legal to send with `start`. */
+/*
+ * BUG-188 round 2 — which engine a model id belongs to, or null when it can't be
+ * told. Mirrors the server owner (global-settings.modelProviderOf): a `claude-*`
+ * id is anthropic, a `gpt-*`/`o<n>`/`codex-*` id is openai. Used only to STOP the
+ * client replaying a model override that belongs to a different engine than the
+ * session's provider — the exact way a `claude-*` id the UI cached (from the
+ * pre-fix leak) into an openai session's persisted overrides kept reaching Codex
+ * and 400ing on every resume. Unknown → null, so a model we can't place is left
+ * alone (the server is the authority; this is just not re-sending a known-bad one).
+ */
+function modelProviderOfClient(model) {
+  if (!model || typeof model !== 'string') return null;
+  if (/^claude/i.test(model)) return 'anthropic';
+  if (/^(gpt|o\d|codex)/i.test(model)) return 'openai';
+  return null;
+}
+
 function sessionOverrides() {
   const out = {};
+  // The provider this start will run under (a session provider override wins,
+  // then the project's own setting) — the engine a model override must match.
+  const provider = ('provider' in state.overrides ? state.overrides.provider : null)
+    ?? currentProject()?.settings?.provider ?? 'anthropic';
   for (const field of SESSION_OVERRIDABLE) {
-    if (field in state.overrides) out[field] = state.overrides[field];
+    if (!(field in state.overrides)) continue;
+    if (field === 'model') {
+      const belongs = modelProviderOfClient(state.overrides.model);
+      if (belongs != null && belongs !== provider) {
+        // A stale cross-engine model override: drop it here AND from the persisted
+        // per-session memory, so it stops riding every resume. The server would
+        // neutralise it anyway (resolveModelForProvider), but not re-sending it
+        // keeps the client's own effective view honest.
+        delete state.overrides.model;
+        persistOverrides();
+        continue;
+      }
+    }
+    out[field] = state.overrides[field];
   }
   return Object.keys(out).length ? out : undefined;
 }
@@ -12719,7 +13904,7 @@ async function addProject(hostPath, name) {
     // synchronously by startNew's renderTree, so it is present now.
     (node.tree?.querySelector('button.row.pending')
       ?? node.tree?.querySelector('[aria-current="true"]'))?.scrollIntoView?.({ block: 'nearest' });
-    const n = state.sessions.get(p.id)?.list.length ?? 0;
+    const n = listedCount(state.sessions.get(p.id));
     // FEAT-089: SURFACE the method side effect — never let the user discover it.
     let methodNote = '';
     if (method?.declined) {
@@ -15381,6 +16566,10 @@ async function boot() {
     // raw command text and that every item stays within the hard length cap.
     isoLabel, restLabel, runningAgentCount, truncFine, MAX_FINE, currentProject,
     backToMain, applyAppend, refreshLive, menu, visibleSessions, rowTitle,
+    // FEAT-154: the session-row builder + its ground-truth lifecycle resolver,
+    // exposed so a verify script can drive the REAL state→indicator mapping and
+    // the waiting > running > error > finished > idle precedence directly.
+    sessionRow, sessionLifecycle,
     // FEAT-070: project ordering + session recency-window internals, so a verify
     // script can drive the sort/toggle and the window without re-deriving them.
     orderedProjects, resortProjects, toggleProjSort, paintProjSort,
@@ -15418,6 +16607,9 @@ async function boot() {
     // overrides the same way the model popover and skip-perms toggle do.
     persistOverrides, paintModelBtn, paintModelPop, sessionOverrides,
     refreshRail, renderRail,
+    // FEAT-153: the board grid + answer mount, so a verify script can drive the
+    // real grid render, the current-session partition, and the click→answer flow.
+    renderBoardGrid, boardGridModel, currentSessionTicketIds, openAnswer, closeAnswer,
     // BUG-139: the crown git chip's painter, so a verify script can assert the
     // EXACT rendered text for status payloads the live server cannot easily be
     // made to produce — chiefly a STALE server whose response predates the

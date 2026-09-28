@@ -46,6 +46,52 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as readline from 'node:readline';
 
+/*
+ * BUG-189 — the fake also stands in for the non-app-server codex subcommands the
+ * OpenAI dispatch path now shells out to BEFORE app-server: `codex --version`
+ * and the zero-token sandbox preflight `codex sandbox -c sandbox_mode=<m> -- true`.
+ * These are handled here (fast, argv-driven) so the preflight does not hang on a
+ * shim that only speaks app-server. Purely additive: the app-server readline
+ * path below is untouched, so verify-codex-runtime / verify-provider-picker
+ * (which drive app-server directly, without the preflight) are unaffected.
+ *   - `--version`               → a version line, exit 0.
+ *   - `sandbox …`               → emulate the bwrap launch: healthy exit 0, or
+ *                                 (CODEX_FAKE_SANDBOX_BROKEN set) reproduce the
+ *                                 0.157.x btrfs failure — the real error line on
+ *                                 stderr, exit 1. CODEX_FAKE_SANDBOX_LOG counts
+ *                                 probes so a test can prove caching skips them.
+ */
+const ARGV = process.argv.slice(2);
+if (ARGV.includes('--version')) {
+  process.stdout.write(`codex-cli ${process.env.CODEX_FAKE_VERSION || '0.0.0-fake'}\n`);
+  process.exit(0);
+}
+if (ARGV.includes('sandbox')) {
+  const mode = (ARGV.find((a) => a.startsWith('sandbox_mode=')) || '').split('=')[1] || 'read-only';
+  if (process.env.CODEX_FAKE_SANDBOX_LOG) {
+    // Record mode + cwd so a test can prove per-mode probing (finding 3) and that
+    // the probe ran in the dispatch's cwd (finding 4), plus count probes (caching).
+    try { fs.appendFileSync(process.env.CODEX_FAKE_SANDBOX_LOG, `probe mode=${mode} cwd=${process.cwd()} argv=${ARGV.join(' ')}\n`); } catch { /* logging must never break the probe */ }
+  }
+  // CODEX_FAKE_SANDBOX_BROKEN breaks every mode; CODEX_FAKE_SANDBOX_BROKEN_MODE
+  // breaks only that one mode (finding 3: a mode-specific sandbox failure).
+  const brokenMode = process.env.CODEX_FAKE_SANDBOX_BROKEN_MODE;
+  if (process.env.CODEX_FAKE_SANDBOX_BROKEN || (brokenMode && brokenMode === mode)) {
+    process.stderr.write('error building bubblewrap command: cannot establish app-server socket mount isolation\n');
+    process.exit(1);
+  }
+  process.exit(0);
+}
+/*
+ * BUG-189 — reaching here means this is the `app-server` invocation, i.e. the
+ * real-dispatch / API path. When CODEX_FAKE_EXEC_MARKER is set, record that it
+ * was entered, so a test can PROVE a broken-sandbox dispatch exits BEFORE any
+ * app-server (API) call ever happens (the marker must be absent in that case).
+ */
+if (process.env.CODEX_FAKE_EXEC_MARKER) {
+  try { fs.appendFileSync(process.env.CODEX_FAKE_EXEC_MARKER, `app-server ${Date.now()}\n`); } catch { /* never break the protocol */ }
+}
+
 const FIX = JSON.parse(fs.readFileSync(path.join(import.meta.dirname, 'codex-app-server.fixtures.json'), 'utf8'));
 
 const APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);

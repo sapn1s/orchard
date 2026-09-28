@@ -178,8 +178,12 @@ async function main() {
     statusRow && statusRow.question === undefined,
     JSON.stringify({ question: statusRow?.question }));
   const nb = await (await fetch(`${BASE}/api/projects/${withoutId}/board`)).json();
-  check('PRECONDITION: a project with no docs/bugs/ returns an empty board (hasBoard:false), not an error',
-    nb.hasBoard === false && (nb.needsYou?.length ?? 0) === 0, JSON.stringify(nb));
+  // Registering a project scaffolds an empty docs/bugs (onboard.mjs), so a fresh
+  // project has an EMPTY board (hasBoard true, nothing unresolved) rather than no
+  // board at all — either way the read never errors and nothing needs the user.
+  check('PRECONDITION: a freshly-registered project returns an empty board (no unresolved tickets), not an error',
+    (nb.needsYou?.length ?? 0) === 0 && (nb.inflight?.length ?? 0) === 0 && (nb.queued?.length ?? 0) === 0,
+    JSON.stringify({ hasBoard: nb.hasBoard, needs: nb.needsYou?.length, inflight: nb.inflight?.length, queued: nb.queued?.length }));
 
   browser = spawn(BRAVE, [
     '--headless=new', `--user-data-dir=${PROFILE}`, '--remote-debugging-port=0',
@@ -213,57 +217,69 @@ async function main() {
     row.click(); return true;
   })()`);
 
-  console.log('\n=== rail: a 👤 board item WITH a `## Question` renders an answerable card ===');
+  console.log('\n=== grid: a 👤 board item WITH a `## Question` is an answerable grid card ===');
   await cdp.send('Page.navigate', { url: `${BASE}/` });
   await cdp.waitFor('boot', `document.querySelectorAll('#tree button.proj').length >= 2`, 30_000);
   const picked = await clickProj('Has Board');
   check('PRECONDITION: the seeded board project is in the sidebar and selectable', picked, `clicked=${picked}`);
-  await cdp.waitFor('needs-you cards', `document.querySelectorAll('#railNeeds .needs-card').length >= 2`, 20_000);
-  const cardState = await cdp.eval(`(() => {
-    const cards = [...document.querySelectorAll('#railNeeds .needs-card')];
+  // FEAT-153 — needs-you tickets are cards in the board grid now (not a long list
+  // in #railNeeds). The answer flow OPENS on click, mounted into #railNeeds.
+  await cdp.waitFor('grid cards', `!document.querySelector('#railBoardGrid')?.hidden && document.querySelectorAll('#railBoardGrid .tc[data-state="needs"]').length >= 2`, 20_000);
+  const gridCard = await cdp.eval(`(() => {
+    const c = document.querySelector(${JSON.stringify(`#railBoardGrid .tc[data-id="${TICKET_ID}"]`)});
+    return {
+      found: !!c, state: c?.dataset.state, answerable: c?.dataset.answerable === '1',
+      title: c?.querySelector('.tc-title')?.textContent ?? '',
+      ring: c ? getComputedStyle(c).boxShadow : null,
+      mountEmpty: document.querySelectorAll('#railNeeds .needs-card').length === 0,
+    };
+  })()`);
+  check('(a) the `## Question`-bearing ticket is a needs-you grid card (accent ring, answerable), answer NOT yet mounted',
+    gridCard.found && gridCard.state === 'needs' && gridCard.answerable && gridCard.ring && gridCard.ring !== 'none' && gridCard.mountEmpty,
+    JSON.stringify(gridCard));
+  check('    the card shows the ticket title (from the ticket H1), not a placeholder',
+    /malformed rows/.test(gridCard.title), JSON.stringify(gridCard.title));
+
+  // Click it → the full answer flow mounts (question text + 2 options + textarea + submit).
+  await cdp.eval(`document.querySelector(${JSON.stringify(`#railBoardGrid .tc[data-id="${TICKET_ID}"]`)}).click()`);
+  await cdp.waitFor('answer mounted', `!!document.querySelector('#railNeeds .needs-card[data-id="${TICKET_ID}"] textarea.nc-input')`, 10_000);
+  const answer = await cdp.eval(`(() => {
     const c = document.querySelector(${JSON.stringify(`#railNeeds .needs-card[data-id="${TICKET_ID}"]`)});
     return {
-      count: cards.length,
-      id: c?.dataset.id ?? null,
-      title: c?.querySelector('.nc-title')?.textContent ?? '',
       question: c?.querySelector('.nc-question')?.textContent ?? '',
       hasField: !!c?.querySelector('textarea.nc-input'),
       hasSubmit: !!c?.querySelector('.nc-send'),
       hasOptions: c?.querySelectorAll('.nc-opt').length ?? 0,
-      emptyShown: !!document.querySelector('#railNeeds .rail-empty'),
+      hasClose: !!document.querySelector('#railNeeds .answer-x'),
     };
   })()`);
-  check('(a) the `## Question`-bearing ticket renders an answerable card WITH a response field + submit + its 2 options',
-    cardState.count === 2 && cardState.id === TICKET_ID && cardState.hasField && cardState.hasSubmit && cardState.hasOptions === 2 && !cardState.emptyShown,
-    JSON.stringify(cardState));
-  check('    the card shows the ticket title (from the ticket H1), not a placeholder',
-    /malformed rows/.test(cardState.title), JSON.stringify(cardState.title));
-  check('    (BUG-025) the card also shows the parsed `## Question` text',
-    /skip malformed rows, or halt/.test(cardState.question), JSON.stringify(cardState.question));
+  check('    clicking the card opens the SAME answer flow: response field + submit + its 2 options + a close',
+    answer.hasField && answer.hasSubmit && answer.hasOptions === 2 && answer.hasClose, JSON.stringify(answer));
+  check('    (BUG-025) the mounted answer shows the parsed `## Question` text',
+    /skip malformed rows, or halt/.test(answer.question), JSON.stringify(answer.question));
 
-  console.log('\n=== BUG-025: a bare 👤 ticket (no `## Question`) renders READ-ONLY — no answer box ===');
+  console.log('\n=== BUG-025: a bare 👤 ticket (no `## Question`) is a read-only card — opens the ticket, no answer box ===');
   const statusCard = await cdp.eval(`(() => {
-    const c = document.querySelector(${JSON.stringify(`#railNeeds .needs-card[data-id="${STATUS_ID}"]`)});
-    const open = c?.querySelector('a.nc-send');
-    return {
-      found: !!c,
-      kind: c?.dataset.kind ?? null,
-      title: c?.querySelector('.nc-title')?.textContent ?? '',
-      hasField: !!c?.querySelector('textarea.nc-input, .nc-input'),
-      hasOpenLink: !!open,
-      openHref: open?.getAttribute('href') ?? null,
-      openIsAnchor: open?.tagName === 'A',
-    };
+    const c = document.querySelector(${JSON.stringify(`#railBoardGrid .tc[data-id="${STATUS_ID}"]`)});
+    return { found: !!c, state: c?.dataset.state, answerable: c?.dataset.answerable === '1',
+             title: c?.querySelector('.tc-title')?.textContent ?? '' };
   })()`);
-  check('(BUG-025) the bare 👤 ticket is a read-only status row: NO response field/textarea at all',
-    statusCard.found && statusCard.kind === 'status' && !statusCard.hasField, JSON.stringify(statusCard));
-  check('    it shows the ticket title, and an "open ticket" affordance (an anchor with a real href), not a submit button',
-    /billing copy/.test(statusCard.title) && statusCard.hasOpenLink && statusCard.openIsAnchor && !!statusCard.openHref && statusCard.openHref !== '#',
-    JSON.stringify(statusCard));
+  check('(BUG-025) the bare 👤 ticket is a needs-you card that is NOT answerable',
+    statusCard.found && statusCard.state === 'needs' && !statusCard.answerable, JSON.stringify(statusCard));
+  check('    it shows the ticket title', /billing copy/.test(statusCard.title), JSON.stringify(statusCard.title));
+  await cdp.eval(`document.querySelector(${JSON.stringify(`#railBoardGrid .tc[data-id="${STATUS_ID}"]`)}).click()`);
+  const modal = await cdp.waitFor('ticket modal opens for the bare-status card',
+    `(() => { const m = document.querySelector('#ticketModal'); return m && !m.hidden && /${STATUS_ID}/.test(m.textContent || ''); })()`, 8_000);
+  const noBox = await cdp.eval(`document.querySelectorAll('#railNeeds .needs-card[data-id="${STATUS_ID}"]').length === 0`);
+  check('    clicking it opens the read-only ticket modal and mounts NO answer box', modal && noBox, JSON.stringify({ modal, noBox }));
+  await cdp.eval(`(() => { const c = document.querySelector('#ticketModalClose'); if (c) c.click(); })()`);
 
-  console.log('\n=== rail: answering the questioned ticket removes ONLY that card AND writes to the ticket ===');
+  console.log('\n=== grid: answering the questioned ticket clears the mount, drops it from the grid, AND writes the ticket ===');
   const ticketPath = path.join(WITH, 'docs', 'bugs', `${TICKET_ID}-importer-malformed-rows.md`);
   const before = fs.readFileSync(ticketPath, 'utf8');
+  // Re-open the answer flow (the bare-status click above opened a modal, not this).
+  await cdp.eval(`document.querySelector(${JSON.stringify(`#railBoardGrid .tc[data-id="${TICKET_ID}"]`)}).click()`);
+  await cdp.waitFor('answer re-mounted', `!!document.querySelector('#railNeeds .needs-card[data-id="${TICKET_ID}"] textarea.nc-input')`, 10_000);
   await cdp.eval(`(() => {
     const c = document.querySelector(${JSON.stringify(`#railNeeds .needs-card[data-id="${TICKET_ID}"]`)});
     const ta = c.querySelector('textarea.nc-input');
@@ -271,16 +287,14 @@ async function main() {
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     c.querySelector('.nc-send').click();
   })()`);
-  // The card leaves optimistically; the reconciling refresh must keep it gone
-  // (the server marks the answered ticket resolved). The STATUS card (a
-  // different, unrelated ticket) must stay put — answering one never touches
-  // the other. Wait for both to settle.
-  const gone = await cdp.waitFor('answered card removed, status card still present, rail not empty',
-    `document.querySelectorAll('#railNeeds .needs-card[data-id="${TICKET_ID}"]').length === 0 &&
-     document.querySelectorAll('#railNeeds .needs-card[data-id="${STATUS_ID}"]').length === 1 &&
-     !document.querySelector('#railNeeds .rail-empty')`, 20_000);
-  check('(b1) submitting removed only the answered card; the unrelated status card is untouched',
-    gone, `cards now = ${await cdp.eval(`document.querySelectorAll('#railNeeds .needs-card').length`)}`);
+  // The mount clears and the ticket leaves the grid's needs cards; the unrelated
+  // bare-status ticket stays a needs card (answering one never touches the other).
+  const gone = await cdp.waitFor('answered mount cleared + ticket off the grid, status card remains',
+    `document.querySelectorAll('#railNeeds .needs-card').length === 0 &&
+     document.querySelectorAll('#railBoardGrid .tc[data-id="${TICKET_ID}"]').length === 0 &&
+     document.querySelectorAll('#railBoardGrid .tc[data-id="${STATUS_ID}"]').length === 1`, 20_000);
+  check('(b1) after answering, the mount clears, the ticket leaves the grid, the unrelated status card is untouched',
+    gone, `needs cards now = ${await cdp.eval(`document.querySelectorAll('#railBoardGrid .tc[data-state="needs"]').length`)}`);
 
   // Give the append a beat, then read the file from disk.
   await sleep(400);
@@ -292,17 +306,17 @@ async function main() {
     after.includes(PRIOR_LOG) && after.indexOf(PRIOR_LOG) < after.indexOf(ANSWER),
     `prior entry present=${after.includes(PRIOR_LOG)}`);
 
-  console.log('\n=== rail: a project with no board shows the quiet empty state ===');
+  console.log('\n=== grid: an empty board shows the quiet "board is clear" state ===');
   const pickedNoBoard = await clickProj('No Board');
-  check('PRECONDITION: the no-board project is reachable and selectable (not stuck under "Has Board")',
+  check('PRECONDITION: the empty-board project is reachable and selectable (not stuck under "Has Board")',
     pickedNoBoard, `clicked=${pickedNoBoard}`);
-  await cdp.waitFor('board switched to the no-board project', `window.__station?.state?.current?.projectId === ${JSON.stringify(withoutId)}`, 10_000);
-  const empty = await cdp.waitFor('empty rail',
-    `!!document.querySelector('#railNeeds .rail-empty') && document.querySelectorAll('#railNeeds .needs-card').length === 0`, 15_000);
-  const emptyText = await cdp.eval(`document.querySelector('#railNeeds .rail-empty')?.textContent ?? ''`);
+  await cdp.waitFor('board switched to the empty-board project', `window.__station?.state?.current?.projectId === ${JSON.stringify(withoutId)}`, 10_000);
+  const empty = await cdp.waitFor('empty grid',
+    `!!document.querySelector('#railBoardGrid .bg-empty') && document.querySelectorAll('#railBoardGrid .tc').length === 0`, 15_000);
+  const emptyText = await cdp.eval(`document.querySelector('#railBoardGrid .bg-empty')?.textContent ?? ''`);
   const errShown = await cdp.eval(`(() => { const f = document.querySelector('#fine'); return f && !f.hidden && f.classList.contains('err') ? f.textContent : null; })()`);
-  check('(c) no-board project shows "nothing needs you" — and NOT an error',
-    empty && /nothing needs you/i.test(emptyText) && !errShown, JSON.stringify({ emptyText: emptyText.trim(), errShown }));
+  check('(c) empty-board project shows "board is clear" — and NOT an error',
+    empty && /clear/i.test(emptyText) && !errShown, JSON.stringify({ emptyText: emptyText.trim(), errShown }));
 
   console.log('\n=== rail: a narrow viewport collapses the rail to a badge ===');
   // Re-select the board project so there IS a card/count to collapse.

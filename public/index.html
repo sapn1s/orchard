@@ -188,8 +188,14 @@
                      ahead/behind. Hidden for non-repos; click opens the drawer's
                      Git group where the actions live. A .readout, not a pill —
                      it reports, it does not toggle. -->
-                <button class="pill readout" id="gitBtn" hidden>
-                  <span class="g">⎇</span><span id="gitN"></span>
+                <!-- FEAT-139 round 3 — pattern-matchable readout: branch glyph +
+                     a shape-coded state dot (clean=hollow ring / dirty=filled
+                     disc / conflict=filled diamond / detached=hollow diamond —
+                     colour never the SOLE carrier) + the single dirty count.
+                     Branch, +/− line totals and ahead/behind move to the tooltip
+                     (the full sentence) and the Git panel this chip opens. -->
+                <button class="pill readout git" id="gitBtn" hidden>
+                  <span class="g">⎇</span><span class="git-dot" id="gitDot" aria-hidden="true"></span><span class="n" id="gitN"></span>
                 </button>
                 <!-- Ambient "running here" for the CURRENT project: ports and
                      count, click opens the Running-here list in settings. -->
@@ -201,8 +207,14 @@
                      dispatch-now-vs-park call is on-screen. A .readout, not a
                      button; the full both-providers detail (percent, reset time,
                      as-of) lives in the tooltip. Painted by paintUsageChip(). -->
+                <!-- FEAT-139 round 3 — the window burn is a FILLED RING, not
+                     "63% wk · 4d" text: the arc length carries the magnitude
+                     (colour-blind safe — a near-full ring reads near-full at any
+                     hue), the warn/danger tint is a secondary cue, and the
+                     percent + window + reset survive in the tooltip + aria-label.
+                     Painted by paintUsageChip(). -->
                 <button class="pill readout usage" id="usageBtn" hidden>
-                  <span class="g">◷</span><span id="usageN"></span>
+                  <span class="usage-ring" id="usageRing" aria-hidden="true"></span>
                 </button>
                 <!-- FEAT-051: the integrations strip — one chip per attached MCP
                      capability (like browser extension icons). Hollow = planned
@@ -397,10 +409,12 @@
            waiting on the user (👤 tickets on the project board) as interactive
            cards, with the glanceable board below. Collapses to a floating badge
            on narrow viewports. Filled by app.js from /api/projects/:id/board. -->
-      <aside class="rail" id="rail" aria-label="Needs you">
+      <aside class="rail" id="rail" aria-label="Board">
         <div class="rail-panel" id="railPanel">
           <div class="rail-head">
-            <span class="lbl">Needs you</span>
+            <!-- FEAT-153 r2 — the rail is now the ticket-board grid, not a
+                 needs-you list, so the header names that role. -->
+            <span class="lbl">Board</span>
             <!-- FEAT-066: a second, in-context entry to the full board — the rail
                  is the "now" surface, this opens the archive. Href set + shown in
                  renderRail only when the project has a board. -->
@@ -414,6 +428,17 @@
                a stored snapshot (BUG-041/074 — it must not go stale). Pinned at
                the very top so "what's on my plate" is the first glance. -->
           <div class="rail-summary" id="railSummary" hidden></div>
+          <!-- FEAT-153 — the ticket-board grid: the rail's PRIMARY surface. The
+               current session's tickets (declared via orchard-request bindings +
+               live-lane Dispatch attribution) render first as a dense auto-fill
+               grid of state cards; the rest of the board's unresolved tickets
+               follow, de-emphasised and priority-ordered, in a collapsible
+               (localStorage-persisted) section. Needs-you tickets carry an accent
+               ring and open their answer flow on click (mounted into #railNeeds
+               below). Replaces the long needs-you LIST as the immediate view;
+               painted in renderRail from state.board joined against state.requests
+               + state.snap. Hidden when the project has no board. -->
+          <div class="rail-board" id="railBoardGrid" hidden></div>
           <!-- FEAT-126 — "Your requests": the persistent, request-centred status
                surface. The rail's primary top section (above #railNeeds, which is
                reused unchanged for real blockers). Each row is a DECLARED user
@@ -439,6 +464,13 @@
                agent card either: those are ephemeral and die with the session,
                and a result nobody has collected must outlive it. -->
           <div class="rail-sub" id="railPending" hidden></div>
+          <!-- FEAT-153 — the answer MOUNT for a needs-you ticket. Empty until the
+               user clicks an accent-ringed card in the board grid above; then the
+               full answer flow (question + options + response box, or a runtime
+               decision / git-write / services ask) is mounted here for exactly one
+               ticket at a time, and cleared once answered. Kept as its own always-
+               present, never-hidden node so the FEAT-067 "needs" chip still has a
+               reachable scroll target. -->
           <div class="needs" id="railNeeds"></div>
           <!-- FEAT-079 — OBSERVATIONS: automated, read-only findings
                (WA-consolidation FEAT-047, architecture-recurrence FEAT-056).

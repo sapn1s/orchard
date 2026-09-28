@@ -74,7 +74,9 @@ function ownRaw(input) {
 function run(text, env = {}) {
   const tp = transcript('t' + Math.random().toString(36).slice(2), text);
   const r = spawnSync('node', [HOOK], {
-    input: JSON.stringify({ session_id: SUITE_SESSION_ID, hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj' }),
+    // BUG-192 — real Claude Code carries the reply in last_assistant_message, which
+    // the hook grades (race-immune) and which the block path requires (blockSafe).
+    input: JSON.stringify({ session_id: SUITE_SESSION_ID, hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tp, cwd: '/nonexistent/proj', last_assistant_message: text }),
     encoding: 'utf8', env: { ...process.env, ORCHARD_SESSION: SUITE_SESSION_ID, ...env }, timeout: 15000,
   });
   return { code: r.status, stdout: (r.stdout || '').trim() };

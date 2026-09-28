@@ -20,6 +20,7 @@
  * file size, because it never touches the 285 MB it does not need.
  */
 import * as fs from 'node:fs';
+import { StringDecoder } from 'node:string_decoder';
 
 import type { TranscriptMessage } from '../lib/session-history.ts';
 import { blocksOf, isMainThreadEntry, isMessageEntry, toMessage, type BuildOptions } from './jsonl.ts';
@@ -121,7 +122,11 @@ export function tailMessages(filePath: string, opts: TailOptions): TailResult {
     const from = opts.startByte != null ? Math.max(0, Math.min(Math.floor(opts.startByte), fileBytes)) : fileBytes;
     let pos = from;
     blockStartByte = from;
-    let carry = '';
+    // BUG-190 round 4 sibling: the carry is BYTES. Chunks are read end-to-start,
+    // so a chunk boundary can fall inside a multi-byte character; decoding each
+    // chunk alone turned it into U+FFFD on both sides (3 of 4 offsets on a real
+    // emoji line). Lines are cut on the newline byte and decoded whole.
+    let carry: Buffer = Buffer.alloc(0);
 
     while (pos > 0 && collected.length < limit) {
       if (bytesRead >= MAX_TAIL_BYTES) {
@@ -136,19 +141,22 @@ export function tailMessages(filePath: string, opts: TailOptions): TailResult {
 
       // `carry` is the partial FRONT line of the later region; it continues
       // exactly where this chunk ends, so appending reconstructs that line.
-      const text = buf.toString('utf8') + carry;
-      const parts = text.split('\n');
-      // File-byte start of each part. parts[0] begins at `pos`.
-      const startBytes: number[] = new Array(parts.length);
-      startBytes[0] = pos;
-      for (let k = 1; k < parts.length; k++) startBytes[k] = startBytes[k - 1]! + Buffer.byteLength(parts[k - 1]!) + 1;
+      const joined = carry.length ? Buffer.concat([buf, carry]) : buf;
+      // Byte ranges of each newline-separated part; parts[0] begins at `pos`.
+      const bounds: [number, number][] = [];
+      for (let from = 0; ; ) {
+        const nl = joined.indexOf(0x0a, from);
+        if (nl < 0) { bounds.push([from, joined.length]); break; }
+        bounds.push([from, nl]);
+        from = nl + 1;
+      }
+      const startBytes: number[] = bounds.map(([a]) => pos + a);
       // parts[0] is the tail of a line whose start is earlier in the file, unless
       // we are at byte 0 where it is whole.
       const firstComplete = pos > 0 ? 1 : 0;
-      if (pos > 0) carry = parts[0]!;
-      else carry = '';
-      for (let i = parts.length - 1; i >= firstComplete && collected.length < limit; i--) {
-        const line = parts[i]!;
+      carry = pos > 0 ? Buffer.from(joined.subarray(bounds[0]![0], bounds[0]![1])) : Buffer.alloc(0);
+      for (let i = bounds.length - 1; i >= firstComplete && collected.length < limit; i--) {
+        const line = joined.subarray(bounds[i]![0], bounds[i]![1]).toString('utf8');
         if (!line.trim()) continue;
         let e: Record<string, any>;
         try {
@@ -172,7 +180,11 @@ export function tailMessages(filePath: string, opts: TailOptions): TailResult {
         blockStartByte = startBytes[i]!;
       }
     }
-    if (pos <= 0) blockStartByte = 0;
+    // BUG-190 round 3: only when the scan ran out of FILE before it filled the
+    // page. A small file is read to byte 0 in one chunk even when the page filled
+    // long before its start; zeroing the cursor then told the next backward page
+    // "nothing older" (beforeBytes=0 → 0 messages) and silently dropped the rest.
+    if (pos <= 0 && collected.length < limit) blockStartByte = 0;
   } finally {
     fs.closeSync(fd);
   }
@@ -241,6 +253,7 @@ export function readForward(filePath: string, opts: ForwardOptions): ForwardResu
   let malformed = 0;
   let budgetExhausted = false;
   let carry = '';
+  const fwdDecoder = new StringDecoder('utf8');
 
   try {
     const buf = Buffer.alloc(CHUNK);
@@ -253,7 +266,9 @@ export function readForward(filePath: string, opts: ForwardOptions): ForwardResu
       const len = fs.readSync(fd, buf, 0, want, bytesRead);
       if (len <= 0) break;
       bytesRead += len;
-      const parts = (carry + buf.toString('utf8', 0, len)).split('\n');
+      // BUG-190 round 4 sibling: a streaming decoder, so a multi-byte character
+      // split across two chunks decodes whole instead of as U+FFFD on each side.
+      const parts = (carry + fwdDecoder.write(buf.subarray(0, len))).split('\n');
       carry = parts.pop() ?? '';
       for (const line of parts) {
         if (!line.trim()) continue;
@@ -277,6 +292,7 @@ export function readForward(filePath: string, opts: ForwardOptions): ForwardResu
       if (messages.length >= limit && scanned > offset + limit) break;
     }
     // Final carry (a file with no trailing newline, or the live tail).
+    if (bytesRead >= st.size) carry += fwdDecoder.end();
     if (bytesRead >= st.size && carry.trim()) {
       try {
         const e = JSON.parse(carry);
@@ -542,6 +558,7 @@ export function countMessages(
   let total = 0;
   let scanned = 0;
   let carry = '';
+  const countDecoder = new StringDecoder('utf8');
   let isLowerBound = false;
   // Folded into this ONE full scan — the failed-gate roll-up costs a single
   // indexOf on lines that are not hook attachments (see collectHookError).
@@ -556,7 +573,7 @@ export function countMessages(
       const len = fs.readSync(fd, buf, 0, Math.min(CHUNK, st.size - scanned), scanned);
       if (len <= 0) break;
       scanned += len;
-      const text = carry + buf.toString('utf8', 0, len);
+      const text = carry + countDecoder.write(buf.subarray(0, len)); // BUG-190 r4 sibling: whole characters across chunks
       const parts = text.split('\n');
       carry = parts.pop() ?? '';
       for (const line of parts) {
@@ -564,6 +581,7 @@ export function countMessages(
         collectHookError(line, hookAcc);
       }
     }
+    if (!isLowerBound) carry += countDecoder.end();
     if (carry.trim()) {
       if (countable(carry, keep, opts)) total++;
       collectHookError(carry, hookAcc);

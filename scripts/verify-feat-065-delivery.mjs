@@ -20,8 +20,9 @@
  *      background empties)
  *   S2 permission arm A — approval-request relayed to the ws, answered allow,
  *      control_response reaches the CLI, turn completes APPROVED
- *   S3 permission arm B — nobody answers; the BOUNDED deny lands (knob'd 3s),
- *      turn completes DENIED, drain not wedged
+ *   S3 permission arm B — nobody answers: while the ws stays ATTACHED the card
+ *      waits (BUG-187 round 6); on responder LOSS the deny lands, the turn
+ *      completes DENIED, drain not wedged
  *   S4 mid-FOREGROUND-drain survivor (midTurn true) → queue-and-wait refusal,
  *      nothing injected
  *   S5 real app.js (happy-dom) + the BUG-045 loop: unknown lifetime → refusal
@@ -38,12 +39,22 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { Window } from 'happy-dom';
 import WebSocket from 'ws';
+import { startWhenAdmitted } from './lib/host-admission.mjs';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
+import { chromium } from 'playwright';
+import { execFileSync } from 'node:child_process';
+import * as crypto from 'node:crypto';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ENTRY = path.join(ROOT, 'src', 'server', 'index.ts');
 const HOST_SCRIPT = path.join(ROOT, 'src', 'server', 'session-host.mjs');
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-f65-work-'));
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-f65-data-'));
+// The seed turn runs a REAL claude CLI, and the server now refuses a session whose
+// transcript would land in the user's real store (assertSessionStoreIsolated, the
+// fixture-pollutes-reality guard). Writer AND reader point at a scratch store under
+// DATA, so the UI lists exactly this suite's seed session and cleanup removes it.
+const STORE = isolatedStoreEnv(path.join(DATA, 'claude-config'), { alsoReader: true });
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -285,7 +296,7 @@ function spawnServer(port, extraEnv = {}) {
   const s = spawn(process.execPath, [ENTRY], {
     cwd: ROOT,
     env: {
-      ...process.env, PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA,
+      ...process.env, ...STORE, PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA,
       CLAUDE_STATION_SURVIVE: '0', // the only brokers in hostsDir must be ours
       ...extraEnv,
     },
@@ -322,7 +333,7 @@ const waitEv = async (events, pred, ms = 30_000) => {
 };
 
 function findTranscript(sdkId) {
-  const base = path.join(os.homedir(), '.claude', 'projects');
+  const base = STORE.CLAUDE_PROJECTS_DIR;
   let dirs = [];
   try { dirs = fs.readdirSync(base); } catch { return null; }
   for (const d of dirs) {
@@ -354,10 +365,9 @@ async function setup() {
     method: 'PATCH', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ settings: { permissionMode: 'bypassPermissions', model: 'haiku' } }),
   });
-  const c0 = await openWs(port1);
-  c0.send({ type: 'start', projectId, prompt: 'Reply with exactly: SEED-OK' });
-  const init = await waitEv(c0.events, (e) => e.t === 'session-init', 90_000);
-  if (!init?.sessionId) throw new Error('seed turn never started');
+  // FEAT-151: retry only the boot-runtime-check refusal (scripts/lib/host-admission.mjs).
+  const { c: c0, init } = await startWhenAdmitted(openWs, port1, { type: 'start', projectId, prompt: 'Reply with exactly: SEED-OK' });
+  if (!init?.sessionId) throw new Error(`seed turn never started: ${JSON.stringify(c0?.events.slice(-4))}`);
   sdkSessionId = init.sessionId;
   await waitEv(c0.events, (e) => e.t === 'turn-end', 90_000);
   c0.send({ type: 'close' });
@@ -495,25 +505,30 @@ async function sectionApprovalDenyFallback() {
   check('S3 (fails pre-fix): delivered (ack deliveredVia:survivor)', ack?.deliveredVia === 'survivor', { ack: ack ?? '(refused)' });
   const req = await waitEv(c.events, (e) => e.t === 'approval-request', 15_000);
   const reqAt = Date.now();
-  check('S3: the approval-request reaches the ws (and is then deliberately ignored)', !!req, { req: req ? req.requestId : '(never)' });
-  // Nobody answers. The bounded fallback must deny and the turn must COMPLETE.
-  let settled = null;
-  while (Date.now() - reqAt < 15_000 && !settled) {
-    settled = readLines(b.eventsLog).map((l) => JSON.parse(l)).find((e) => e.ev === 'approval-settled');
-    if (!settled) await sleep(250);
-  }
-  const denyMs = settled ? settled.at - reqAt : null;
-  check('S3 (fails pre-fix): the deny lands BOUNDED (~3s knob, well under any drain window) with an honest notice',
-    settled?.allowed === false && typeof settled?.denyMessage === 'string' && /denied by claude-station/.test(settled.denyMessage) && denyMs != null && denyMs < 10_000,
-    { settled: settled ?? '(never — the turn would hang forever, probe 4)', denyMsApprox: denyMs });
-  const denied = await waitEv(c.events, (e) => e.t === 'permission-denied', 5_000);
-  check('S3: the client is TOLD about the fallback (permission-denied with the notice)',
-    !!denied && /denied so the drain can complete/.test(denied.reason ?? ''), { denied: denied ?? '(never)' });
-  const doneEv = await waitEv(c.events, (e) => e.t === 'survivor-delivery' && e.phase === 'turn-done', 10_000);
-  check('S3 (fails pre-fix): the denied turn still COMPLETES (drain not wedged) and reports turn-done',
-    !!doneEv && readLines(transcriptPath).some((l) => l.includes('DENIED-FELL-BACK') && l.includes(MARKER)),
-    { doneEv: doneEv ?? '(never)', transcriptHasDenied: readLines(transcriptPath).some((l) => l.includes('DENIED-FELL-BACK')) });
+  check('S3: the approval-request reaches the ws (and is then deliberately left undecided)', !!req, { req: req ? req.requestId : '(never)' });
+  /*
+   * BUG-187 round 6 — the invariant changed on purpose: a card an ATTACHED
+   * person owns waits for them (plan-review point 5); only responder LOSS
+   * denies it. The old 3 s bound for an attached, undecided person is gone
+   * (the broker now holds its drain under an owned card instead). So: hold
+   * well past the old knob with the ws attached → NOT denied; then drop the
+   * ws → the deny lands promptly with an honest notice and the turn completes.
+   */
+  const settledNow = () => readLines(b.eventsLog).map((l) => JSON.parse(l)).find((e) => e.ev === 'approval-settled') ?? null;
+  await sleep(7_000); // > 2 × the 3 s knob
+  const earlyDeny = settledNow();
+  check('S3 (round 6): an ATTACHED, undeciding person is NOT timed out (held > 2 × the old 3 s knob, no deny)',
+    !earlyDeny, { settledWhileAttached: earlyDeny ?? '(none — held)' });
+  const lossAt = Date.now();
   try { c.send({ type: 'close' }); c.ws.close(); } catch { /* ignore */ }
+  let settled = null;
+  while (Date.now() - lossAt < 15_000 && !settled) { settled = settledNow(); if (!settled) await sleep(250); }
+  const denyMs = settled ? settled.at - lossAt : null;
+  check('S3 (round 6): responder LOSS (the ws closes) → the deny lands promptly with an honest notice',
+    settled?.allowed === false && typeof settled?.denyMessage === 'string' && /denied by Orchard/.test(settled.denyMessage) && /disconnected/.test(settled.denyMessage) && denyMs != null && denyMs < 5_000,
+    { settled: settled ?? '(never — the turn would hang forever, probe 4)', denyMsAfterLoss: denyMs });
+  const deniedDone = await (async () => { const t0 = Date.now(); while (Date.now() - t0 < 10_000) { if (readLines(transcriptPath).some((l) => l.includes('DENIED-FELL-BACK') && l.includes(MARKER))) return true; await sleep(250); } return false; })();
+  check('S3 (fails pre-fix): the denied turn still COMPLETES (drain not wedged)', deniedDone, { transcriptHasDenied: deniedDone });
   const reaped = await settleAndReap(b, emptyFlag);
   check('S3: drain then completes and reaps cleanly', reaped, { reaped });
 }
@@ -680,6 +695,311 @@ async function sectionDomLoop() {
   check('S5: background completes → drain commits and reaps cleanly after the delivery', reaped, { reaped });
 }
 
+/* -------------------------------------------------------------------------- *
+ * SECTION 6 — BUG-190: a REAL headless browser, the transcript watch socket
+ * DISCONNECTED, and a turn delivered / lines written DURING the gap. After the
+ * watch reconnects the open view must converge to the full transcript — every
+ * gap line rendered exactly once, no reload. Pre-fix a fresh follow starts at
+ * the file's end, so the gap bytes are never rendered.
+ * -------------------------------------------------------------------------- */
+function browserPath() {
+  const want = process.env.VERIFY_BROWSER ?? 'brave';
+  if (path.isAbsolute(want)) return want;
+  try { return execFileSync('which', [want], { encoding: 'utf8' }).trim(); } catch { return null; }
+}
+async function visibleOnce(page, text) {
+  const loc = page.locator('#panes .pane').getByText(text, { exact: true });
+  const count = await loc.count();
+  let shown = false;
+  if (count === 1) { await loc.scrollIntoViewIfNeeded(); shown = await loc.isVisible(); }
+  return { count, shown, ok: count === 1 && shown };
+}
+async function waitAllOnce(page, texts, ms) {
+  const t0 = Date.now();
+  let last = {};
+  while (Date.now() - t0 < ms) {
+    last = {};
+    for (const t of texts) last[t] = await visibleOnce(page, t);
+    if (Object.values(last).every((r) => r.ok)) return { ok: true, seen: last };
+    await sleep(300);
+  }
+  return { ok: false, seen: last };
+}
+async function dropWatch(page) {
+  // Kill the passive transcript-watch socket the way a network blip would.
+  await page.evaluate(() => window.__station.state.watchWs?.close());
+  await page.waitForFunction(() => window.__station.state.watchWs == null || window.__station.state.watchWs.readyState !== 1, null, { timeout: 5_000 });
+}
+async function sectionReconnectGap() {
+  console.log('\n=== SECTION 6: REAL BROWSER — watch disconnected, turn delivered + lines written DURING the gap (BUG-190) ===');
+  const exe = browserPath();
+  if (!exe || !fs.existsSync(exe)) throw new Error(`S6 needs a real headless browser (set VERIFY_BROWSER); none found for ${process.env.VERIFY_BROWSER ?? 'brave'}`);
+  const emptyFlag = path.join(WORK, 's6-bg-empty.flag');
+  const b = await plantHeldSurvivor('s6', sdkSessionId, transcriptPath, {
+    FAKE_EMIT_BG: '1', FAKE_TASK_ID: 'bg-feat065-gap', FAKE_BG_EMPTY_FLAG: emptyFlag,
+  });
+  liveBrokers.push(b);
+  const browser = await chromium.launch({ headless: true, executablePath: exe });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1400, height: 1000 } });
+    // Must-FAIL harness: serve a pinned pre-fix app.js to the real browser without
+    // touching the shared working-tree file (other lanes edit it concurrently).
+    if (process.env.BUG190_APP_VARIANT) {
+      const body = fs.readFileSync(process.env.BUG190_APP_VARIANT, 'utf8');
+      await page.route('**/app.js*', (route) => route.fulfill({ contentType: 'text/javascript', body }));
+    }
+    await page.goto(`http://127.0.0.1:${port2}/`);
+    await page.locator('#tree button.row').first().click();
+    await page.waitForFunction(() => window.__station?.state?.following === true, null, { timeout: 30_000 });
+    await sleep(800);
+
+    // 6a — a turn DELIVERED into the survivor while the watch is down.
+    const M = 'BUG-190-GAP-DELIVERY';
+    await dropWatch(page);
+    await page.locator('#prompt').fill(M);
+    await page.locator('#go').click();
+    let persisted = false;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 20_000 && !persisted) {
+      persisted = transcriptUserLines(transcriptPath, M).length === 1 && readLines(transcriptPath).some((l) => l.includes(`ECHO:${M}`));
+      if (!persisted) await sleep(250);
+    }
+    check('S6a PRECONDITION: the gap-delivered message + reply are in the store (delivered into the survivor)', persisted, { persisted });
+    const a = await waitAllOnce(page, [M, `ECHO:${M}`], 15_000);
+    check('S6a (LOAD-BEARING, fails pre-fix): after the watch reconnects, the message delivered DURING the gap and its reply render — each exactly once, no reload',
+      a.ok, a.seen);
+    await sleep(2_000);
+    const a2 = await waitAllOnce(page, [M, `ECHO:${M}`], 1_000);
+    check('S6a: still exactly once after settling (the catch-up and the live follow do not double-render)', a2.ok, a2.seen);
+
+    // 6b — two disconnects back to back, lines written in each gap, then a
+    // control line after the view is live again.
+    const entry = (text) => JSON.stringify({ type: 'user', uuid: crypto.randomUUID(), parentUuid: null, isSidechain: false,
+      sessionId: sdkSessionId, timestamp: new Date().toISOString(), message: { role: 'user', content: text } }) + '\n';
+    const gapLines = ['BUG-190-GAP-1', 'BUG-190-GAP-2', 'BUG-190-GAP-3', 'BUG-190-GAP-4'];
+    await dropWatch(page);
+    fs.appendFileSync(transcriptPath, entry(gapLines[0]));
+    fs.appendFileSync(transcriptPath, entry(gapLines[1]));
+    await page.waitForFunction(() => window.__station.state.watchWs?.readyState === 1 && window.__station.state.following === true, null, { timeout: 15_000 });
+    await dropWatch(page); // second blip, straight after the first reconnect
+    fs.appendFileSync(transcriptPath, entry(gapLines[2]));
+    fs.appendFileSync(transcriptPath, entry(gapLines[3]));
+    await page.waitForFunction(() => window.__station.state.watchWs?.readyState === 1 && window.__station.state.following === true, null, { timeout: 20_000 });
+    fs.appendFileSync(transcriptPath, entry('BUG-190-POST-RECONNECT-CONTROL'));
+    const bRes = await waitAllOnce(page, [...gapLines, 'BUG-190-POST-RECONNECT-CONTROL'], 15_000);
+    check('S6b (LOAD-BEARING, fails pre-fix): lines written across TWO back-to-back watch gaps all render exactly once after reconnect, plus the post-reconnect control',
+      bRes.ok, bRes.seen);
+    const order = await page.evaluate((ids) => {
+      const txt = [...document.querySelectorAll('#panes .pane')].map((p) => p.innerText).join('\n');
+      return ids.map((id) => txt.indexOf(id));
+    }, [M, ...gapLines, 'BUG-190-POST-RECONNECT-CONTROL']);
+    check('S6b: the caught-up lines render in transcript order', order.every((v, i) => v >= 0 && (i === 0 || v > order[i - 1])), { order });
+
+    // 6c — the store API's backward selector names REAL indices even when asked
+    // for a window past the end (the client catch-up and loadNewer both rely on
+    // the one coordinate system; pre-fix before=total+100 relabelled the tail).
+    const dir = await page.evaluate(() => window.__station.state.current.encodedDir);
+    const base = `http://127.0.0.1:${port2}/api/transcript/${encodeURIComponent(dir)}/${encodeURIComponent(sdkSessionId)}`;
+    const whole = await (await fetch(`${base}?tail=3`)).json();
+    const past = await (await fetch(`${base}?tail=3&before=${whole.total + 100}`)).json();
+    const ix = (j) => (j.messages ?? []).map((m) => m.index);
+    check('S6c (fails pre-fix): ?before past the end is clamped — the tail keeps its REAL indices (ends at total-1)',
+      whole.total > 0 && JSON.stringify(ix(past)) === JSON.stringify(ix(whole)) && ix(past).at(-1) === whole.total - 1,
+      { total: whole.total, tail: ix(whole), pastEnd: ix(past) });
+
+    // ---- BUG-190 round 3 arms (the verifier's run 01a0e3de repros, owned here) ----
+    const append = (t) => fs.appendFileSync(transcriptPath, entry(t));
+    const connected = () => page.waitForFunction(() => window.__station.state.watchWs?.readyState === 1 && window.__station.state.following === true, null, { timeout: 20_000 });
+    // Rendered-text census in ONE evaluate: how many times each text is a whole
+    // visible line of the pane (innerText excludes what is not rendered).
+    const census = (texts) => page.evaluate((ts) => {
+      const lines = [...document.querySelectorAll('#panes .pane')].map((p) => p.innerText).join('\n').split('\n').map((l) => l.trim());
+      const count = {}; for (const t of ts) count[t] = 0;
+      for (const l of lines) if (l in count) count[l]++;
+      const joined = lines.join('\n');
+      return { count, order: ts.map((t) => joined.indexOf(t)) };
+    }, texts);
+    const converged = async (texts, ms) => {
+      const t0 = Date.now(); let c;
+      while (Date.now() - t0 < ms) {
+        c = await census(texts);
+        if (texts.every((t) => c.count[t] === 1)) break;
+        await sleep(400);
+      }
+      const bad = Object.entries(c.count).filter(([, n]) => n !== 1);
+      const inOrder = c.order.every((v, i) => v >= 0 && (i === 0 || v > c.order[i - 1]));
+      return { ok: bad.length === 0, inOrder, bad: bad.slice(0, 8), badCount: bad.length, total: texts.length };
+    };
+
+    // 6d — a trailing PARTIAL line present at reconnect, completed afterwards.
+    {
+      const P = ['BUG-190-PART-A', 'BUG-190-PART-B', 'BUG-190-PART-C', 'BUG-190-PART-D'];
+      await dropWatch(page);
+      append(P[0]); append(P[1]);
+      const line = entry(P[2]); const cut = line.length - 15;
+      fs.appendFileSync(transcriptPath, line.slice(0, cut));
+      await connected(); await sleep(1500);
+      fs.appendFileSync(transcriptPath, line.slice(cut)); append(P[3]);
+      const r = await converged(P, 15_000);
+      check('S6d (fails pre-fix): a partial trailing line present at reconnect and completed afterwards renders — all four exactly once, in order',
+        r.ok && r.inOrder, r);
+    }
+
+    // 6e — a gap LONGER than one catch-up page (260 lines, page 120), with a line
+    // appended while the first backward page is being read.
+    {
+      const G = Array.from({ length: 260 }, (_, i) => `BUG-190-BIG-${String(i).padStart(3, '0')}`);
+      let backward = 0;
+      await page.route('**/api/transcript/**', async (route) => {
+        if (route.request().url().includes('before=')) {
+          backward++;
+          if (backward === 1) { append('BUG-190-BIG-DURING-READ'); await sleep(600); }
+        }
+        await route.continue();
+      });
+      await dropWatch(page);
+      for (const t of G) append(t);
+      await connected();
+      const r = await converged([...G, 'BUG-190-BIG-DURING-READ'], 25_000);
+      await page.unroute('**/api/transcript/**');
+      check('S6e PRECONDITION: the catch-up really paged backward (more than one page behind)', backward > 0, { backward });
+      check('S6e (LOAD-BEARING, fails pre-fix): a 260-message reconnect gap converges — every line exactly once, in order, none truncated',
+        r.ok && r.inOrder, r);
+    }
+
+    // 6f — the catch-up read fails once (HTTP 503), then the store is back.
+    {
+      let failures = 0;
+      await page.route('**/api/transcript/**', async (route) => {
+        if (failures === 0 && route.request().url().includes('tail=')) { failures++; await route.fulfill({ status: 503, body: 'temporarily unavailable' }); }
+        else await route.continue();
+      });
+      await dropWatch(page);
+      append('BUG-190-FAILED-READ-GAP');
+      await connected(); await sleep(2000);
+      append('BUG-190-FAILED-READ-LIVE');
+      const r = await converged(['BUG-190-FAILED-READ-GAP', 'BUG-190-FAILED-READ-LIVE'], 20_000);
+      await page.unroute('**/api/transcript/**');
+      check('S6f PRECONDITION: one catch-up read was failed with a 503', failures === 1, { failures });
+      check('S6f (fails pre-fix): after a transient catch-up failure the view converges on its own — the gap line and the later live line, once each, in order',
+        r.ok && r.inOrder, r);
+    }
+
+    // 6g — a live append split in the middle of a multi-byte character.
+    {
+      const U = 'BUG-190-UTF8-🙂-END';
+      const bytes = Buffer.from(entry(U));
+      const at = bytes.indexOf(Buffer.from('🙂')) + 2;
+      fs.appendFileSync(transcriptPath, bytes.subarray(0, at));
+      await sleep(700);
+      fs.appendFileSync(transcriptPath, bytes.subarray(at));
+      const r = await converged([U], 10_000);
+      check('S6g (fails pre-fix): a line whose write is split inside a multi-byte character renders intact, once', r.ok, r);
+    }
+
+    // 6h — BUG-190 round 4: records completed WITHOUT a trailing newline.
+    {
+      // (i) live watch: a genuinely partial record never renders half-done…
+      const H1 = 'BUG-190-NONL-LIVE', H2 = 'BUG-190-NONL-NEXT';
+      const l1 = entry(H1).replace(/\n$/, '');
+      const cutAt = l1.length - 1; // everything but the closing brace: the marker is written, the record is not complete
+      fs.appendFileSync(transcriptPath, l1.slice(0, cutAt));
+      await sleep(1500);
+      const half = await census([H1]);
+      check('S6h: a PARTIAL record (marker written, object not closed) is never rendered half-done', half.count[H1] === 0, half);
+      // …and renders the moment it is complete, before any newline arrives.
+      fs.appendFileSync(transcriptPath, l1.slice(cutAt));
+      const r1 = await converged([H1], 10_000);
+      check('S6h (fails pre-fix): a record completed WITHOUT its trailing newline renders on the live watch, once', r1.ok, r1);
+      // The newline arriving later, and the next record, add no duplicate.
+      await sleep(600);
+      fs.appendFileSync(transcriptPath, '\n');
+      append(H2);
+      const r2 = await converged([H1, H2], 10_000);
+      check('S6h: the late newline adds nothing — the completed record stays exactly once and the next record follows, in order', r2.ok && r2.inOrder, r2);
+
+      // (ii) reconnect: a partial last line at re-subscribe, then completed with no newline.
+      const R = ['BUG-190-NONL-RC-A', 'BUG-190-NONL-RC-B'];
+      await dropWatch(page);
+      append(R[0]);
+      const lb = entry(R[1]).replace(/\n$/, '');
+      const cutB = lb.length - 12;
+      fs.appendFileSync(transcriptPath, lb.slice(0, cutB));
+      await connected(); await sleep(1500);
+      fs.appendFileSync(transcriptPath, lb.slice(cutB));
+      const r3 = await converged(R, 10_000);
+      check('S6h (fails pre-fix): after a reconnect, the last record completed with NO trailing newline renders — both lines once, in order', r3.ok && r3.inOrder, r3);
+      fs.appendFileSync(transcriptPath, '\n'); // leave the file well-formed for what follows
+    }
+
+    // 6i — BUG-190 round 5: an EMPTY session (no renderable message, total 0),
+    // watch dropped, its FIRST message written during the gap, then a live one.
+    {
+      const sid = crypto.randomUUID();
+      const file = path.join(path.dirname(transcriptPath), `${sid}.jsonl`);
+      const recFor = (text) => JSON.stringify({ type: 'user', uuid: crypto.randomUUID(), parentUuid: null, isSidechain: false,
+        sessionId: sid, timestamp: new Date().toISOString(), message: { role: 'user', content: text } }) + '\n';
+      fs.writeFileSync(file, recFor('BUG-190-EMPTY-ANCHOR')); // gives the row a title to click
+      await page.reload();
+      const row = page.locator('#tree button.row').filter({ hasText: 'BUG-190-EMPTY-ANCHOR' });
+      await row.waitFor({ timeout: 20_000 });
+      fs.writeFileSync(file, recFor('')); // now EMPTY: one record, nothing renderable
+      await row.click();
+      await page.waitForFunction((id) => window.__station.state.current.sessionId === id && window.__station.state.following === true, sid, { timeout: 20_000 });
+      await sleep(600);
+      const empty = await page.evaluate(() => ({ lastIndex: window.__station.state.threads?.get?.('main')?.lastIndex ?? null }));
+      await dropWatch(page);
+      fs.appendFileSync(file, recFor('BUG-190-EMPTY-FIRST'));
+      await connected(); await sleep(600);
+      fs.appendFileSync(file, recFor('BUG-190-EMPTY-SECOND'));
+      const r = await converged(['BUG-190-EMPTY-FIRST', 'BUG-190-EMPTY-SECOND'], 12_000);
+      check('S6i (LOAD-BEARING, fails pre-fix): an EMPTY session\'s first message, written while the watch was down, renders after reconnect — both messages once, in order',
+        r.ok && r.inOrder, { ...r, empty });
+      const hint = await page.locator('#panes .pane .empty-session-hint').count();
+      check('S6i: the "no readable messages" notice is gone once the session has a message', hint === 0, { hint });
+    }
+
+    // 6j — BUG-190 round 5 sibling: a thread the LIVE BRIDGE rendered has no store
+    // indices at all. A real new session (real CLI turn) in the browser; then its
+    // driving socket drops, the watch drops, a message lands in the gap, and the
+    // watch reconnects. The view must converge — nothing skipped, nothing twice.
+    {
+      const plus = page.locator('#tree [aria-label^="New session in "]');
+      console.log('  (S6j: project "+" buttons in the tree:', await plus.count(), JSON.stringify(await plus.evaluateAll((ns) => ns.map((n) => n.getAttribute('aria-label')))), ')');
+      await plus.first().dispatchEvent('click'); // this project's own "+" (hover-revealed, so dispatched)
+      await page.waitForFunction(() => window.__station.state.current.projectId === 'feat065-delivery' && !window.__station.state.current.sessionId, null, { timeout: 10_000 });
+      await page.locator('#prompt').fill('Reply with exactly: B190-BRIDGE-OK');
+      await page.locator('#go').click();
+      // The bridge renders the turn (the model's reply itself is not needed: this
+      // environment's CLI may not be able to authenticate, and the thread is
+      // bridge-rendered either way — the user bubble and the turn's end are).
+      await page.waitForFunction(() => window.__station.state.current.sessionId && window.__station.state.live && !window.__station.state.busy
+        && [...document.querySelectorAll('#panes .pane .you')].some((n) => n.innerText.includes('B190-BRIDGE-OK')), null, { timeout: 120_000 });
+      const live = await page.evaluate(() => ({ sid: window.__station.state.sdkSessionId, dir: window.__station.state.current.encodedDir, lastIndex: window.__station.state.threads?.get?.('main')?.lastIndex ?? '(n/a)' }));
+      const bridgeFile = path.join(STORE.CLAUDE_PROJECTS_DIR, live.dir ?? '', `${live.sid}.jsonl`);
+      check('S6j PRECONDITION: a real bridge-driven session rendered its turn and has a transcript on disk', !!live.sid && fs.existsSync(bridgeFile), { ...live, exists: fs.existsSync(bridgeFile) });
+      // The driving socket drops (the session detaches server-side), then the watch.
+      await page.evaluate(() => window.__station.state.ws?.close());
+      await page.waitForFunction(() => !window.__station.state.live, null, { timeout: 15_000 });
+      await dropWatch(page);
+      const brec = (text) => JSON.stringify({ type: 'user', uuid: crypto.randomUUID(), parentUuid: null, isSidechain: false,
+        sessionId: live.sid, timestamp: new Date().toISOString(), message: { role: 'user', content: text } }) + '\n';
+      fs.appendFileSync(bridgeFile, brec('BUG-190-BRIDGE-GAP'));
+      await page.waitForFunction(() => window.__station.state.watchWs?.readyState === 1, null, { timeout: 20_000 });
+      await sleep(2500);
+      fs.appendFileSync(bridgeFile, brec('BUG-190-BRIDGE-LIVE'));
+      const r = await converged(['BUG-190-BRIDGE-GAP', 'BUG-190-BRIDGE-LIVE'], 20_000);
+      const prompt = await page.evaluate(() => [...document.querySelectorAll('#panes .pane .you')].filter((n) => n.innerText.includes('B190-BRIDGE-OK')).length);
+      check('S6j (fails pre-fix): a bridge-rendered view followed after its bridge dropped converges — the gap line and the live line once each, in order, and the bridge-rendered prompt still exactly once',
+        r.ok && r.inOrder && prompt === 1, { ...r, prompt });
+    }
+  } finally {
+    await browser.close();
+  }
+  const reaped = await settleAndReap(b, emptyFlag);
+  check('S6: background completes → drain commits and reaps cleanly', reaped, { reaped });
+}
+
 async function main() {
   await setup();
   await sectionDelivery();
@@ -687,6 +1007,7 @@ async function main() {
   await sectionApprovalDenyFallback();
   await sectionMidForegroundRefusal();
   await sectionDomLoop();
+  await sectionReconnectGap();
   console.log(`\n${pass}/${pass + fail} checks passed`);
   if (fail) console.log(`failed: ${failures.join(' | ')}`);
   process.exitCode = fail ? 1 : 0;

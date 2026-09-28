@@ -236,6 +236,86 @@ ok('boundary: author=<secret> not matched (auth inside a word)', !caught('author
     hits.length === 1 && /github token/.test(hits[0].token));
 }
 
+console.log('\nD9. Round-8 — QUOTED-KEY (JSON) + colon forms for every key class:');
+// The round-7 verifier finding: `"token": "<secret>"` in JSON — and every quoted
+// high-signal key (`"password":`, `"api_key":`, `"secret":`) — was MISSED, because
+// every assignment matcher anchored the separator immediately after the key name and
+// the key's own closing quote sat between the name and the `:`. The separator is a
+// property of the SYNTAX (KV_SEP), fixed once. Bodies split for self-immunity; the
+// generic value clears the round-6 floor, the high-signal value only needs isSecretValue.
+const R8HI = 'hunter' + '2Pass' + 'Word9';           // high-signal value (mixed, >6)
+const R8GEN = 'Q7mR2' + 'vK9aL' + '6zB8n' + 'C4pD5'; // 20-char 3-class run, clears the floor
+// MUST FIRE — quoted key (JSON) for high-signal keys, all three separators/quotings.
+for (const key of ['password', 'api_key', 'secret', 'client_secret', 'auth_token']) {
+  ok(`quoted-key JSON caught: "${key}": "<secret>"`, caught(`"${key}": "${R8HI}"`));
+}
+// MUST FIRE — quoted key (JSON) for generic keys behind the floor.
+for (const key of ['token', 'auth', 'session', 'cookie']) {
+  ok(`quoted-key JSON caught: "${key}": "<secret>"`, caught(`"${key}": "${R8GEN}"`));
+}
+// The dispatch's stated forms, side by side: quoted-key JSON, unquoted-key YAML colon,
+// and the `=` form all catch the same generic secret.
+ok('round-8 JSON  "token": "<secret>" caught', caught(`"token": "${R8GEN}"`));
+ok('round-8 YAML  token: <secret> caught',     caught(`token: ${R8GEN}`));
+ok('round-8 EQ    token=<secret> caught',      caught(`token=${R8GEN}`));
+// High-signal provider value inside a quoted JSON key is still reported (once).
+{
+  const hits = scanSecrets(`"api_key": "${F.ghp}"`);
+  ok('quoted-key JSON with provider value reported', hits.length >= 1 && /github token/.test(hits.map(h => h.token).join()));
+}
+// MUST NOT FIRE — the quoted-key path must not weaken precision. These are the
+// dispatch's mandated FP-prone shapes: package-lock hashes, git SHAs, data URIs,
+// doc-quoted credential EXAMPLES, and JSON keys that are not secret-named.
+ok('FP: npm integrity hash clean', !caught('"integrity": "sha512-Rt5H7Yh0x3RV6VcN2Kq9L1pXmZ8wQdF3aB4cD5eF6gH7iJ8kL9mN0oP1qR2sT3uV4wX5yZ6a=="'));
+ok('FP: JSON git revision (2-class hex) clean', !caught('"revision": "9f8e7d6c5b4a3928170615243342516607182930"'));
+ok('FP: JSON quoted api_key placeholder clean', !caught('"api_key": "your-api-key-here"'));
+ok('FP: JSON quoted password placeholder clean', !caught('"password": "<redacted>"'));
+ok('FP: data-uri base64 clean', !caught('background:url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ")'));
+ok('FP: Content-Type header value clean', !caught('"Content-Type": "application/json; charset=utf-8"'));
+ok('FP: short quoted generic value below floor clean', !caught('"token": "AbCdEfGhIjKl"'));
+
+console.log('\nD10. Round-10 — quoted HIGH-SIGNAL path honours the looksSecretish floor:');
+// Round-8 fired the quoted high-signal path on isSecretValue ALONE, so an OpenAPI /
+// JSON-schema / doc file whose secret-named property maps to a single-class TYPE NAME
+// (password -> string, secret -> boolean) false-positived — cry-wolf, the failure the
+// floor exists to prevent. The high-signal value predicate (isSecretValue &&
+// looksSecretish) is now shared by BOTH the bare and quoted forms (ARCH-010).
+// MUST NOT FIRE — realistic OpenAPI/JSON-schema property->type shapes.
+for (const [key, type] of [
+  ['password', 'string'], ['api_key', 'string'], ['secret', 'boolean'],
+  ['client_secret', 'string'], ['private_key', 'string'], ['access_token', 'integer'],
+]) {
+  ok(`schema shape clean: "${key}": "${type}"`, !caught(`"${key}": "${type}"`));
+}
+ok('schema doc: bare high-signal type value clean (password: string)', !caught('password: string'));
+// MUST STILL FIRE — a genuinely secret-looking quoted value keeps recall in both forms.
+ok('recall kept: quoted mixed-class secret still caught', caught('"password": "' + 'hunter' + '2Pass' + 'Word9' + '"'));
+ok('recall kept: quoted provider token still caught', caught('"api_key": "' + F.ghp + '"'));
+ok('recall kept: bare mixed-class secret still caught', caught('api_key: ' + 'Ax9Kd' + '82bQm' + '10ZzP' + 'pLw'));
+
+console.log('\nD11. Round-12 — single-class quoted secrets (17–20 chars) restored without re-opening the FP words:');
+// Round 10 gated the quoted high-signal path on looksSecretish, whose single-class
+// branch required ≥24 chars, so real single-class passphrases of 17–23 chars (which
+// fired at 541dd73 via isSecretValue alone) started MISSING. Round 12 lowers the
+// single-class threshold to 16: the FP words (`string`/`boolean`/`required`, all ≤8)
+// stay rejected while the real passphrases fire. Bodies are single-class dictionary
+// concatenations (fabricated, not real credentials) split to ≤5-char fragments so the
+// suite source stays gate-clean; the quoted VALUE form (unquoted key) is the 541dd73 shape.
+// MUST FIRE — the three regressed real single-class secrets.
+ok('restored: quoted 19-char lowercase passphrase', caught('password: "' + 'corre' + 'cthor' + 'sebat' + 'tery' + '"'));
+ok('restored: quoted 17-char lowercase secret', caught('secret: "' + 'super' + 'secre' + 'tpass' + 'wd' + '"'));
+ok('restored: quoted 20-char lowercase run', caught('api_key: "' + 'abcde' + 'fghij' + 'klmno' + 'pqrst' + '"'));
+// Empirical flip: caught at ≥16, missed at ≤15.
+ok('flip: single-class len-16 caught', caught('password: "' + 'a'.repeat(16) + '"'));
+ok('flip: single-class len-15 missed', !caught('password: "' + 'a'.repeat(15) + '"'));
+// MUST NOT FIRE — the round-9 schema/OpenAPI FP words stay closed (all ≤8 chars).
+for (const w of ['string', 'boolean', 'integer', 'number', 'required', 'optional']) {
+  ok(`FP word stays closed: quoted ${w}`, !caught(`password: "${w}"`));
+}
+// Round-9 residuals stay caught (2-class → over-flagging placeholders, the safe direction).
+ok('residual still caught: text/plain (2-class)', caught('password: "' + 'text/plain' + '"'));
+ok('residual still caught: YOUR_CLIENT_SECRET (2-class)', caught('client_secret: "' + 'YOUR_CLIENT_SECRET' + '"'));
+
 // ── Enforcement in a scratch git repo (git run inside node, not Bash tool) ──
 console.log('\nE. Enforcement — pre-commit / commit-msg hooks (hand git commit):');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'feat130-repo-'));

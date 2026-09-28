@@ -358,6 +358,30 @@ export interface SurvivorLane {
   row: 'agent' | 'tool';
   /** When THIS broker first saw the lane in a level frame; null = an older broker that published ids only → the client renders "—", never a fake stopwatch (BUG-033). */
   startedAt: number | null;
+  /**
+   * BUG-187 L1 — the lane's state as its BROKER declares it (the request
+   * floor's per-lane record). `running` only when the broker records no
+   * refusal-block, stop request or stop for it; `blocked` once its tool calls
+   * are being refused because nobody is attached to answer them; `stopped`
+   * once the broker asked the engine to stop it (confirmed or not). An older
+   * broker publishes no floor, so its lanes stay `running` — the pre-BUG-187
+   * claim, not a new one.
+   */
+  state: 'running' | 'blocked' | 'stopped';
+  /** Plain words for a non-running state (quotable), null while running. */
+  stateDetail: string | null;
+}
+
+/** BUG-187 L1 — one lane's floor state from its broker's record. */
+export function laneStateOf(st: HostStatus, laneId: string): { state: SurvivorLane['state']; detail: string | null } {
+  const l = Array.isArray(st.lanes) ? st.lanes.find((x) => x && x.id === laneId) : undefined;
+  if (!l) return { state: 'running', detail: null };
+  if (l.stoppedAt) return { state: 'stopped', detail: 'stopped — Orchard was not attached, so its tool calls could not run' };
+  if (l.stopRequestedAt) {
+    return { state: 'stopped', detail: l.stopUnconfirmed ? 'stop requested (unconfirmed) — Orchard was not attached, so its tool calls could not run' : 'stopping — Orchard was not attached, so its tool calls could not run' };
+  }
+  if (l.blockedSince) return { state: 'blocked', detail: 'blocked — Orchard is not attached, so its tool calls cannot run' };
+  return { state: 'running', detail: null };
 }
 
 /**
@@ -415,17 +439,20 @@ export function survivorWork(st: HostStatus, delivery: DeliveryEvidence | null =
       if (!t || typeof t.id !== 'string' || !t.id) continue;
       const type = typeof t.type === 'string' && t.type ? t.type : 'background';
       const since = t.since ? Date.parse(t.since) : NaN;
+      const ls = laneStateOf(st, t.id);
       lanes.push({
         id: t.id,
         label: type,
         row: type === 'local_bash' ? 'tool' : 'agent',
         startedAt: Number.isFinite(since) ? since : null,
+        state: ls.state,
+        stateDetail: ls.detail,
       });
     }
   } else if (Array.isArray(st.backgroundTaskIds)) {
     // An older broker published ids only: the lane is real, its type and start are simply not knowable.
     for (const id of st.backgroundTaskIds) {
-      if (typeof id === 'string' && id) lanes.push({ id, label: 'background', row: 'agent', startedAt: null });
+      if (typeof id === 'string' && id) { const ls = laneStateOf(st, id); lanes.push({ id, label: 'background', row: 'agent', startedAt: null, state: ls.state, stateDetail: ls.detail }); }
     }
   }
   if (delivery?.turnLive) {
@@ -446,12 +473,15 @@ export function survivorWork(st: HostStatus, delivery: DeliveryEvidence | null =
     };
   }
   if (st.midTurn === false) {
+    const running = lanes.filter((l) => l.state === 'running').length;
+    const notRunning = lanes.length - running;
     return {
       turnRunning: false,
       turnSince: null,
       lanes,
       reason: lanes.length
-        ? `the surviving CLI is foreground-idle; ${lanes.length} declared background lane${lanes.length === 1 ? '' : 's'} still running`
+        ? `the surviving CLI is foreground-idle; ${running} declared background lane${running === 1 ? '' : 's'} still running` +
+          (notRunning ? `, ${notRunning} blocked or stopped because Orchard is not attached` : '')
         : 'the surviving CLI is foreground-idle',
     };
   }

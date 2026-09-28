@@ -128,6 +128,15 @@ export interface SessionMeta {
   gitBranch: string | null;
   /** Claude Code version that wrote the session. */
   version: string | null;
+  /**
+   * The CLI launch channel declared in the transcript: `'cli'` for an
+   * interactive session, `'sdk-cli'`/`'sdk-ts'` for a programmatic Agent-SDK or
+   * `claude -p` run, `null` on legacy transcripts written before the field
+   * existed. The nav-list fold reads it (with session-provenance) to keep
+   * external programmatic sessions out of the default view — see
+   * `foldsFromDefaultList` in session-provenance.mjs.
+   */
+  entrypoint: string | null;
   warnings: string[];
 }
 
@@ -369,6 +378,13 @@ interface RawEntry {
   sessionId?: string;
   version?: string;
   gitBranch?: string;
+  /**
+   * The CLI's own launch channel, declared on every user/assistant/attachment
+   * entry: `cli` for an interactive session, `sdk-cli`/`sdk-ts` for a
+   * programmatic Agent-SDK / `claude -p` run. Absent on legacy transcripts
+   * written before the field existed. See `SessionMeta.entrypoint`.
+   */
+  entrypoint?: string;
   isSidechain?: boolean;
   isMeta?: boolean;
   isCompactSummary?: boolean;
@@ -700,6 +716,7 @@ export function readSessionMeta(
   let cwd: string | null = null;
   let gitBranch: string | null = null;
   let version: string | null = null;
+  let entrypoint: string | null = null;
   let sessionId: string | null = null;
   const models = new Set<string>();
   let statsExact = true;
@@ -715,6 +732,9 @@ export function readSessionMeta(
     if (!cwd && typeof e.cwd === 'string' && e.cwd) cwd = e.cwd;
     if (!gitBranch && typeof e.gitBranch === 'string') gitBranch = e.gitBranch;
     if (!version && typeof e.version === 'string') version = e.version;
+    // First declared launch channel wins; it is re-emitted identically on every
+    // entry, so the head is enough and this never needs a full scan.
+    if (!entrypoint && typeof e.entrypoint === 'string' && e.entrypoint) entrypoint = e.entrypoint;
 
     const ts = isoOrNull(e.timestamp);
     if (ts) {
@@ -823,6 +843,7 @@ export function readSessionMeta(
     cwdExistsOnHost,
     gitBranch,
     version,
+    entrypoint,
     warnings,
   };
 

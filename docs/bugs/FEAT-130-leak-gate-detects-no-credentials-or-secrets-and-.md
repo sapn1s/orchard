@@ -11,9 +11,9 @@
   "reported": "2026-09-06",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-09-06",
+  "updated": "2026-09-28",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -705,3 +705,355 @@ fixer's rationale. All commands executed with real output.
   from the preferred method. Also untested: binary/non-UTF8 blobs and pathological
   single-line lengths beyond the sampled minified bundles.
 - **Verified-by:** independent verifier (fresh context, Opus 4.8), 2026-09-23.
+
+### 2026-09-23 — worker (fixing, round 8, class=fix) — quoted-KEY (JSON) form closed; separator expressed once (ARCH-010)
+
+Closed the round-7 verifier's highest-value recall gap: the QUOTED-KEY config form
+`"token": "<secret>"` (JSON) was MISSED for EVERY key — generic AND high-signal
+(`"password":`, `"api_key":`, `"secret":`). Scope: `scripts/lib/leak-tokens.mjs`
++ `scripts/verify-feat-130-leak-detection.mjs` only (`leak-gate.mjs` needed no
+change — it imports the shared matcher, so the gate and the ticket-write guard both
+inherit the fix). Left unstaged.
+
+- **Root cause (confirmed by reproduction, real output):** every assignment regex
+  anchored the separator immediately after the key name (`SECRET_KEY_SRC + '\s*[:=]'`).
+  In JSON/YAML a quoted key's own CLOSING quote sits between the name and the `:`
+  (`token"` `:` `"val"`), which `\s*[:=]` cannot cross, so the whole quoted-key form
+  slipped. (The dispatch's YAML example `token: <secret>` actually already fired via
+  `ASSIGN_BARE`/`ASSIGN_GENERIC_BARE`; the JSON quoted-key case is the true miss.
+  Verified: on HEAD `scanSecrets('"api_key": "<val>"')` → 0 hits, `'"token": "<val>"'`
+  → 0 hits; both fire after.)
+- **Fix — the separator is a property of the SYNTAX, expressed ONCE (ARCH-010):** new
+  shared `const KV_SEP = '["\']?\\s*[:=]\\s*'` — an optional closing-quote before the
+  `[:=]` — reused by all four assignment regexes (`ASSIGN_QUOTED`, `ASSIGN_BARE`,
+  `ASSIGN_GENERIC_BARE`, `ASSIGN_GENERIC_QUOTED`). Not duplicated per key. The opening
+  quote before the key needs no handling (no matcher left-anchors the key to an alnum
+  char; the generic lookbehind `(?<![A-Za-z0-9_])` is satisfied by `"`). Dedup labels
+  strip the stray key-quote so the reported label stays `api_key=…`. The round-6
+  value-shape FLOOR (len ≥18, 3 char classes, entropy ≥3.2) and every high-signal
+  provider shape are UNTOUCHED — the change is purely the separator's syntax.
+- **WHOLE-TREE false-positive MEASUREMENT (the requirement, real run):**
+  `node scripts/leak-gate.mjs` over all **1103 tracked files → 0 hits** (only the
+  LICENSE waiver), byte-identical to the pre-change baseline. `npm run gate` → **EXIT
+  0** (leak-gate + check-nul + typecheck), read directly, unpiped.
+- **FP sample-tests on the riskier colon/quoted form (dispatch-mandated), diffed
+  HEAD-vs-round-8:** package-lock `"integrity": "sha512-…"`, JSON git-SHA revisions,
+  `data:…;base64,…` URIs, CSS var hex, doc-quoted credential EXAMPLES
+  (`"api_key": "your-api-key-here"`, `"password": "<redacted>"`), `"Content-Type":`
+  headers, short-below-floor quoted values — all CLEAN. Ran both matchers over a
+  **real external corpus of 402 node_modules files / 11 138 lines** (minified bundles,
+  package-locks): HEAD 133 hits == round-8 133 hits, **0 new hits from round 8**. The
+  only line whose behaviour changed across every probe was a base64 blob assigned to a
+  QUOTED `"session":` key — which HEAD already flags in the UNQUOTED `session:"…"`
+  form (round-6 accepted, round-7-noted latent risk); round 8 only makes the quoted
+  form behave consistently with the unquoted one. Not a new FP class; the floor is
+  unchanged; it is absent from the tracked tree and the external corpus.
+- **Both directions, real gate end-to-end:** seeded an untracked `config.json` with
+  `"api_key": "<20-char 3-class>"` and `"token": "<same>"` → `node scripts/leak-gate.mjs`
+  **exit 1** (both reported: `[secret assignment] "api_key": …`, `"token": …`); removed
+  the seed → **exit 0**. must-FAIL-before proven on HEAD (0 hits) vs after (fires).
+- **Permanent regression tests — new `D9` section (+20 assertions).** Suite now totals
+  **148** (was 128): quoted-key JSON caught for 5 high-signal + 4 generic keys; the
+  three separator/quoting forms side by side; provider value inside a quoted key still
+  reported; and 7 must-NOT-fire FP guards (integrity hash, git SHA, data-URI,
+  placeholders, Content-Type, below-floor). `node scripts/verify-feat-130-leak-detection.mjs`
+  → **148 passed / 0 failed** — and the git-driving enforcement sections E/F/G ran to
+  completion in this lane's environment (scratch repos in /tmp), not skipped. Fixtures
+  split into ≤5-char fragments / template-interpolated so the tracked suite stays
+  gate-clean (whole-tree gate confirmed clean with the edited suite present).
+- **regressed-from:** none — this is a PRE-EXISTING detector boundary (present since the
+  round-2 quoted-value matcher shipped), surfaced by the round-7 verifier, not breakage
+  a prior round introduced.
+- **Independent verify — WARRANTED (HIGH-STAKES):** security/publish-safety detector,
+  8th round on a file with a documented regression history; self-verified only. A fresh
+  clean-room pass (`scripts/independent-verify.mjs --working-tree`) should re-attack the
+  `KV_SEP` change — probe for a quoted-key shape the optional-quote still misses (e.g.
+  key and value in different quote styles, TOML `"key" = "val"`, whitespace between key
+  and quote) and for any NEW quoted-key FP the base64/`session:` family might extend.
+- **STILL OPEN (unchanged, out of this lane's scope):** dictionary-word passphrases
+  structurally can't clear the entropy floor (round-7 known limitation); YAML block-scalar
+  `api_key: |` / inline-list `[value]`; staged symlink-TARGET; the compound
+  `git add && git commit` FEAT-108-classifier gap (backstopped by the in-repo hook).
+- **Files changed (unstaged, for the user to commit):**
+  `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`, and this
+  ticket.
+
+### 2026-09-23 — independent verifier (verifying, round 9)
+**VERDICT: FAIL — a realistic FALSE-POSITIVE class, not cosmetic (no STOP).** Read diff +
+test + problem statement only. Suite `verify:feat-130` = 148 passed / 0 failed; whole-tree
+`npm run gate` = PASS (exit 0). A CLEAN-ROOM CROSS-PROVIDER pass WAS run this round —
+`dispatch-client.mjs --check` reported openai available; `npm run dispatch -- --provider
+openai --prompt-stdin` handed over requirement+diff+test+run-instructions only (transcript
+`.../openai/...01a0ced7-fca0-7c13-a1b4-5fef4074ffc9.jsonl`). It independently flagged the
+same FP class (its suite run hit EROFS at D5 under the read-only sandbox — expected, the
+detection probes it ran are unaffected). All findings below re-verified by me with a
+committed-round-6 (`541dd73`) vs working-tree (round-8) before/after diff, real output.
+
+- **FALSE-POSITIVE (decisive, realistic, NEW to round 8):** round 8 makes quoted-KEY JSON
+  match, but the HIGH-SIGNAL quoted path (`ASSIGN_QUOTED`) gates only on `isSecretValue` —
+  it lacks the `looksSecretish` guard that the BARE high-signal path (`ASSIGN_BARE`) already
+  applies. So a single-token dictionary/type value on a quoted high-signal key now fires.
+  Confirmed 0→1 (round 6 → round 8), each written here as `key → value` to avoid the
+  quoted-key JSON shape the gate now matches: password → string, api_key → string,
+  secret → boolean, password → required, password → optional, password → text/plain,
+  client_secret → YOUR_CLIENT_SECRET. These are the canonical OpenAPI/Swagger/JSON-schema
+  shapes (Swagger renders the password → string field placeholder) — definitionally NOT
+  secrets, exactly the noise that gets a gate `--no-verify`'d. ROOT CAUSE is pre-existing
+  (the UNQUOTED-key form password → "string" — key not quoted, value quoted — was already
+  1→1 in round 6), but round 8 WIDENS it into JSON quoted keys — the single most common
+  config format — so the exposure is materially new.
+- **Not currently blocking:** the tracked tree does NOT trip (gate PASS); the only quoted
+  high-signal JSON keys in-tree are prose in THIS ticket. So no clean-tree FP TODAY, but the
+  gate WILL misfire the moment an OpenAPI spec / JSON schema / request-body example lands.
+  Per the charter ("run over a realistic sample of non-secret assignments … any clean hit
+  that is not a real secret is a FAIL"), this is a FAIL on the FP axis.
+- **Suggested remedy (mechanism-verified, not applied):** apply the same `looksSecretish`
+  guard to the high-signal quoted path. Measured: it drops `string`/`required`/`boolean`/
+  `optional` (looksSecretish=false) while keeping every true secret (all TP=true). It would
+  NOT catch `text/plain` (has `/`, 2-class) or `YOUR_CLIENT_SECRET` (2-class) — those want
+  a placeholder/allcaps-underscore skip too. Generic keys are unaffected (their floor
+  already requires 3 classes + entropy ≥ 3.2).
+- **FALSE-NEGATIVE (secondary):** a base64 blob that decodes to plain text on a GENERIC key
+  now fires via the quoted form too (the quoted-key JSON shape token → a 24-char base64
+  run `SGVs…MjU2` decoding to plain ASCII text) — cleared the
+  round-6 floor (3-class, len 24); pre-existing generic-FP class extended to quoted keys.
+  Still MISSED (acceptable / out of scope): backtick-delimited values (`` token=`…` ``),
+  a value containing an escaped quote, and dictionary-word passphrases (entropy floor).
+- **NEIGHBOUR REGRESSION — answered: NO silent narrowing.** KV_SEP only ADDED the quoted-key
+  match; every bare/unquoted high-signal and generic case is byte-identical round 6 → round 8
+  (before/after table), the generic value-shape floor flips at the same len=18 / entropy=3.2
+  boundary as round 7, and provider shapes (`sk-`, `ghp_`, `AKIA`) are unchanged
+  (cross-provider pass + my diff both confirm). The ONLY behavioural delta is the intended
+  new quoted-key catches — which include the FP class above.
+- **Could NOT test:** the E/F/G enforcement suite under the openai read-only sandbox (EROFS
+  on mkdtemp) — I ran it locally instead (148/0, includes E/F/G); binary/non-UTF8 blobs;
+  exhaustive repo-wide precision beyond the tracked tree + the round-7 external corpus.
+- **Verified-by:** independent verifier (fresh context, Opus 4.8) + clean-room openai
+  dispatch pass, 2026-09-23.
+
+### 2026-09-23 — worker (fixing, round 10, class=fix) — quoted HIGH-SIGNAL path now honours the value-shape floor
+
+Closed the round-9 verifier's FALSE-POSITIVE finding. Examples below are written in
+`key -> value` arrow notation (never the literal quoted-key/colon/quoted-value JSON
+shape), so this entry does NOT trip the matcher it describes; the ticket scans clean.
+Scope: `scripts/lib/leak-tokens.mjs` + `scripts/verify-feat-130-leak-detection.mjs`
+only (`leak-gate.mjs` imports the shared matcher). Left unstaged.
+
+- **Reproduced first (real output, round-8 code):** the quoted HIGH-SIGNAL path
+  (`ASSIGN_QUOTED`) gated on `isSecretValue` ALONE, while the BARE high-signal path
+  (`ASSIGN_BARE`) already gated on `isSecretValue && looksSecretish`. So a realistic
+  OpenAPI / JSON-schema / doc value fired: `password -> string`, `api_key -> string`,
+  `secret -> boolean`, `client_secret -> string`, `private_key -> string`,
+  `access_token -> integer` all returned 1 hit — the canonical Swagger/JSON-schema
+  property-to-type shape, definitionally not a secret. This became reachable when
+  round 8 let quoted JSON keys match, so the exposure is materially new even though
+  the underlying looseness pre-dates it.
+- **Fix (ARCH-010 — the guard expressed ONCE, not per key or per form):** new shared
+  `isHighSignalSecretValue(v) = isSecretValue(v) && looksSecretish(v)`, used by BOTH
+  the bare and quoted high-signal loops in `scanSecrets`. The high-signal value
+  predicate now lives in one place, exactly as `KV_SEP` shares the separator.
+  `looksSecretish` (≥2 char classes OR ≥24 chars) is DELIBERATELY looser than the
+  round-6 generic floor (3 classes + entropy ≥ 3.2): a high-signal key name is itself
+  a strong signal, so its value need only look non-trivial — a real 2-class password
+  (`hunter -> ...`) must still fire, which the strict generic floor would wrongly drop.
+- **Both directions, real runs:**
+  - schema/doc file (`password -> string`, `api_key -> string`, `secret -> boolean`)
+    seeded into the tree -> `node scripts/leak-gate.mjs` **exit 0** (no hit);
+  - real-looking secret (`api_key -> <20-char 3-class body>`) seeded -> **exit 1**
+    (caught: `secret assignment`); removed -> exit 0;
+  - recall kept: quoted mixed-class password, quoted provider token, and bare
+    mixed-class key all still fire.
+- **WHOLE-TREE false-positive count (real run):** `node scripts/leak-gate.mjs` over all
+  **1105 tracked files -> 0 hits** (only the LICENSE waiver). `npm run gate` -> **EXIT
+  0** (leak-gate + check-nul + typecheck), read directly, unpiped.
+- **Suite:** new **D10** section (+10 assertions): 6 schema property-to-type shapes
+  clean, bare type-value clean, and 3 recall-kept catches. `node
+  scripts/verify-feat-130-leak-detection.mjs` -> **158 passed / 0 failed** (was 148);
+  git-driving E/F/G ran to completion (scratch repos in /tmp).
+- **regressed-from:** FEAT-130 round 8 — round 8 widened a pre-existing bare-form
+  looseness into the quoted JSON-key form, which is what made it a realistic FP.
+- **RESIDUAL (documented, NOT silently narrowed — a precision-vs-recall call for the
+  coordinator):** `looksSecretish` still admits three LOOSER non-secret shapes on a
+  high-signal quoted key: a media type (`password -> text/plain`, 2-class via `/`), a
+  hyphenated token (`password -> ISO-8601`, 2-class), and an all-caps placeholder
+  (`client_secret -> YOUR_CLIENT_SECRET`, 2-class). The round-9 verifier flagged these
+  as beyond the `looksSecretish` remedy ("want a placeholder / allcaps-underscore skip
+  too"). Tightening to the 3-class generic floor would drop them BUT would also stop a
+  genuine weak 2-class password on a high-signal key from firing — the deliberate
+  high-signal looseness. None occurs in the tracked tree (whole-tree still 0). Left for
+  the coordinator: accept (favour high-signal recall) vs add a placeholder/allcaps skip.
+- **Independent verify — WARRANTED (HIGH-STAKES):** 10th round on a regression-prone
+  security detector; self-verified only. A clean-room pass should re-attack the shared
+  `isHighSignalSecretValue` (probe: a real weak password wrongly dropped? the three
+  residual shapes above; any bare-form recall lost by the refactor) and confirm no
+  neighbouring pattern narrowed.
+- **Files changed (unstaged, for the user to commit):**
+  `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`, and this
+  ticket.
+
+### 2026-09-23 — independent verifier (verifying, round 11)
+**VERDICT: FAIL — a real, narrow RECALL regression on the quoted high-signal path (dangerous
+direction). Not cosmetic → no STOP.** Read diff + test + problem statement only. Suite
+`verify:feat-130` = 158 passed / 0 failed; whole-tree `npm run gate` = PASS (exit 0). All
+findings re-verified against committed round-6 `541dd73` (`scanLine` imported in-memory) vs
+the working tree, real output. Values written `key → value` to stay gate-clean.
+
+- **BARE-path recall — NO regression (the asked hazard is clean):** the bare high-signal
+  path already carried `looksSecretish` since round 2, so round 10 only refactored it. Every
+  shape that fired at 541dd73 in bare/standalone form still fires (all 1→1): standalone AKIA,
+  sk-, ghp_, JWT, xox; bare password → AKIA-value, api_key → sk-value, github_token → ghp-
+  value, secret → 32-char-hex, all-lowercase-≥24, all-upper-≥24, access_key → value; and a
+  provider token inside a quoted JSON value (api_key → sk, token → ghp) all 1→1.
+- **QUOTED-path recall — REGRESSION vs 541dd73 (the real finding):** round 10 added
+  `looksSecretish` to the QUOTED high-signal path, which in round 6 gated on `isSecretValue`
+  ALONE. `looksSecretish` rejects a SINGLE-class value unless it is ≥24 chars. So a
+  single-class (all-lower / all-upper) quoted secret value of 6–23 chars that fired at
+  541dd73 is now MISSED. Confirmed 1→0: password → correcthorsebattery (19-char lowercase
+  passphrase), secret → supersecretpasswd (17), api_key → a 20-char lowercase run. A
+  hardcoded all-lowercase passphrase-password in a YAML/JS-object literal (unquoted key,
+  quoted value) is a plausible REAL leak that round 6 caught and round 10 drops — "a missed
+  real secret beats a noisy schema file." (The quoted-KEY JSON form `"password" → …` was
+  0→0: never caught at r6, so no regression there.)
+- **Remedy is clean and separable (measured, not applied):** the round-9 FP words are ALL
+  ≤8 chars (string=6, required=8, optional=8, boolean=7); the missed real secrets are ALL
+  ≥16 chars. Lowering the single-class length threshold in `looksSecretish` (or a high-signal
+  variant) from 24 to ~16 RESTORES every missed secret above while STILL rejecting all four
+  schema words. So the round-10 blunt fix over-corrected; a length split recovers recall
+  without reopening the round-9 FP.
+- **Residuals — one-line answer: none is a real-secret MISS.** password → text/plain,
+  password → an ISO-8601 timestamp, and client_secret → YOUR_CLIENT_SECRET are all still
+  CAUGHT (2-class → looksSecretish true) — i.e. residual over-flags / a placeholder flagged
+  for review (SAFE direction), not missed secrets. created → ISO-8601 is clean (non-secret
+  key). So the residuals do not change the recall picture.
+- **Round-9 FP fixture — CLOSED:** password → string, api_key → string, secret → boolean,
+  password → required, password → optional all now CLEAN. Confirmed.
+- **Could NOT test:** did not run a clean-room cross-provider pass this round (prioritised
+  the before/after recall diff against 541dd73, which is the decisive evidence and needs the
+  committed blob, not a second model); binary/non-UTF8 blobs; exhaustive repo-wide precision.
+- **Verified-by:** independent verifier (fresh context, Opus 4.8), 2026-09-23.
+
+### 2026-09-23 — worker (fixing, round 12, class=fix) — round-10 recall regression fixed: single-class threshold 24 -> 16
+
+Fixed the round-11 verifier's FAIL (recall lost in the dangerous direction). Examples
+in `key -> value` arrow notation so this entry does not trip the matcher; the ticket
+scans clean. Scope: `scripts/lib/leak-tokens.mjs` + the verify suite only.
+
+- **Reproduced against `541dd73` (real output).** The regressed shape is the
+  unquoted-KEY / quoted-VALUE form `password -> "..."`, which `ASSIGN_QUOTED` matched
+  at `541dd73` on `isSecretValue` ALONE. At `541dd73` these fired (=1); at round 10
+  they MISSED (=0): `password -> correcthorsebattery` (19-char lowercase),
+  `secret -> supersecretpasswd` (17), `api_key -> a 20-char lowercase run`. Round 10
+  added `looksSecretish` whose single-class branch required ≥24 chars, so real
+  single-class passphrases of 17–23 chars stopped firing. (Note: the fully-quoted
+  JSON KEY form `"password" -> ...` returns 0 at `541dd73` for ALL values — quoted-key
+  support is the round-8 `KV_SEP` change, absent there — so the correct baseline for
+  this shape is the unquoted-key/quoted-value form, which is what fired at `541dd73`.)
+- **Fix (ARCH-010 — one shared threshold, not a bare/quoted fork):** `looksSecretish`'s
+  single-class length minimum lowered `24 -> 16`, named once as `SINGLE_CLASS_MIN_LEN`
+  and reached by BOTH the bare and quoted high-signal forms through the round-10
+  `isHighSignalSecretValue` — the two forms cannot drift to different tunings. The
+  ≥2-char-class branch is unchanged (any mixed value fires at length ≥6).
+- **Why 16 and the empirical flip (measured, not argued):** the round-9 schema/OpenAPI
+  FP WORDS this must keep rejecting — `string`,`boolean`,`integer`,`number`,`required`,
+  `optional` — are all ≤ 8 chars; the regressed real secrets are ≥ 17. Any threshold in
+  9..16 separates the two sets; 16 is the conservative end (fewest new FPs). Measured
+  flip on a single-class value: **CAUGHT at length ≥ 16, MISSED at ≤ 15**. So the
+  **narrowest real single-class secret still missed is 15 chars**; every ≥2-class value
+  is caught at any length ≥ 6.
+- **Both directions, real runs:**
+  - the three regressed shapes all fire again (541=1 -> round-12=1);
+  - the round-9 FP words all STAY closed (round-12=0);
+  - the round-9 residuals `text/plain`, `ISO-8601`-as-password, `YOUR_CLIENT_SECRET`
+    stay CAUGHT (2-class — over-flagging placeholders, the safe direction, not chased);
+  - schema fixture (`password -> string`, `api_key -> string`) seeded -> gate **exit 0**;
+    a 17-char passphrase secret seeded -> gate **exit 1** (caught); removed -> exit 0.
+- **WHOLE-TREE false-positive count (real run):** `node scripts/leak-gate.mjs` over all
+  **1105 tracked files -> 0 hits** (only the LICENSE waiver). Lowering the threshold
+  added no tracked-tree false positive. `npm run gate` -> **EXIT 0** (leak-gate +
+  check-nul + typecheck), read directly, unpiped.
+- **Suite:** new **D11** section (+13): 3 restored single-class secrets, the len-16/15
+  flip pair, the 6 FP words staying closed, and 2 round-9 residuals staying caught.
+  `node scripts/verify-feat-130-leak-detection.mjs` -> **171 passed / 0 failed**
+  (was 158); git-driving E/F/G ran to completion.
+- **regressed-from:** FEAT-130 round 10 (the `looksSecretish` single-class threshold at
+  24 traded recall for the schema-FP precision fix; round 12 keeps the precision fix and
+  restores the recall).
+- **RESIDUAL (documented, unchanged intent):** a single-class real secret of ≤ 15 chars
+  on a high-signal key still misses — inherent to distinguishing short single-class
+  passphrases from dictionary/type words; going below 16 would begin catching common
+  ≤15-char single-class dictionary words. Left as the accepted precision floor.
+- **Independent verify — WARRANTED (HIGH-STAKES):** 12th round on a regression-prone
+  security detector. A clean-room pass should re-attack `SINGLE_CLASS_MIN_LEN` (probe:
+  a real ≤15-char single-class secret; a ≥16-char single-class NON-secret that could
+  now FP; confirm bare and quoted share the one threshold and no neighbouring pattern
+  narrowed).
+- **Files changed (unstaged, for the user to commit):**
+  `scripts/lib/leak-tokens.mjs`, `scripts/verify-feat-130-leak-detection.mjs`, and this
+  ticket.
+
+### 2026-09-23 — independent verifier (verifying, round 13)
+**VERDICT: PASS — STOP.** The round-12 threshold change is correct; the only residual is
+the accepted precision/recall cost the coordinator already chose, in the safe direction,
+and it requires a file shape this repo does not and will not contain. Per the WA stopping
+rule I am ending FEAT-130 verification and converting the residual to a standing assertion
+(below) rather than spending another round. Read diff + test + problem statement only;
+values in arrow notation to stay gate-clean.
+
+- **Suite + gate (once each, real):** `verify:feat-130` = **171 passed / 0 failed**;
+  whole-tree `npm run gate` = **PASS (exit 0)**.
+- **Both directions satisfied SIMULTANEOUSLY (541dd73 before/after, decisive artifact
+  re-run):** the round-9 schema/OpenAPI FP fixture STAYS closed (password → string,
+  api_key → string, secret → boolean, password → required/optional all CLEAN in round 12),
+  AND every shape that fired at 541dd73 fires again — standalone AKIA/sk-/ghp_, bare
+  high-signal assignments, and the three round-11 regressed single-class secrets
+  (password → a 19-char lowercase passphrase, secret → 17-char, api_key → 20-char) are all
+  1→1. The only R6→R12 delta over a broad set is a GAIN (a 16-char uppercase value now
+  caught), not a regression.
+- **External-corpus hit count (the thing a global threshold can break — real run):** over
+  the real npm `package-lock.json` + 3 minified bundles = **2102 lines, 0 hits in both R6
+  and R12 (0 new)**. Lowering 24→16 added ZERO hits on real minified/lockfile/base64/hash
+  content. What ELSE now reaches 16 that did not reach 24 is ONLY single-class (all-one-
+  class) values of 16–23 chars on a high-signal key — a shape absent from every real corpus
+  scanned and from the 1105-file tree.
+- **The one residual, executed and characterised:** a GLUED single-class placeholder-
+  instruction of ≥16 chars on a high-signal key now over-flags — e.g. password →
+  yourpasswordhere, password → enterpasswordhere, secret → replacewithrealsecret, api_key →
+  insertyourkeyhere are CAUGHT (all-lowercase, no space, no marker, so `isPlaceholder`
+  misses them). This is a FALSE POSITIVE, but (a) it is the IRREDUCIBLE cost of the recall
+  the coordinator chose — a glued-lowercase placeholder and a real glued-lowercase
+  passphrase (password → correcthorsebattery) are indistinguishable by shape; (b) it is the
+  SAFE over-flag direction (a spurious flag on a template line, never a missed secret);
+  (c) real templates almost always use a marker / caps / spaces (`<...>`, `${...}`,
+  YOUR_PASSWORD, "your password here") that ARE caught as placeholders — the surviving FP
+  needs the narrow glued-lowercase form; (d) it does NOT occur in the tracked tree or the
+  real external corpus (0 hits). This repo (Electron/Node app + ticket board) does not ship
+  credential-template `.example` files of that shape, and the gate runs only on this repo —
+  so it is a hazard needing a file this repo will not contain.
+- **Is 16 defensible? YES.** The round-9 FP words are ≤8 chars; real passphrases are ≥16;
+  any threshold in 9..16 separates them and 16 is the conservative (fewest-FP) end. The
+  real precision flip point — where single-class ENGLISH words become common — sits at
+  roughly ≤12 chars, so 16 keeps a safety margin above the dense part of the word-length
+  distribution while still catching real 16+ passphrases. Going lower would start catching
+  common ≤15-char words; 16 is the right knee.
+- **STANDING PROPERTY ASSERTION (to add to the suite, in place of another round):** lock
+  BOTH edges of the tradeoff so neither can silently drift — (1) a curated real-shaped
+  external-corpus sample (an npm integrity sha512 line, a UUID, a 40-char git SHA, a
+  minified `key=val;` run) asserts **0 hits** [partially present: integrity/revision lines];
+  (2) the single-class flip stays **caught ≥16 / missed ≤15** [present, D11]; (3) the
+  round-9 schema words (≤8) stay clean [present, D11]; (4) ADD one line documenting the
+  ACCEPTED residual as intended behaviour — a glued single-class ≥16-char placeholder on a
+  high-signal key IS flagged (recall-favoured) — so a future dev does not "fix" it and
+  silently re-open the round-11 recall regression. Items 1–3 already exist; only item 4 is
+  new. I did not edit the suite (avoid racing the fixer's unstaged file); the assertion text
+  above is ready to paste.
+- **Could NOT test:** no clean-room cross-provider pass this round (the decisive evidence is
+  the 541dd73 before/after diff, which needs the committed blob rather than a second model);
+  binary/non-UTF8 blobs; a corpus larger than the sampled bundles.
+- **Verified-by:** independent verifier (fresh context, Opus 4.8), 2026-09-23.
+
+### 2026-09-28 — worker (fixing, round 1)
+- **Status → VERIFIED.** The feature code is landed across commits `541dd73`
+  (generic credential-assignment detection behind a value-shape floor), `28eb430`
+  (closed two residual leak-gate false-proofs) and `78a8a5a`, and the ticket
+  already carries a `Verified-by:` line (independent verifier, fresh context,
+  Opus 4.8, 2026-09-23). No code change this round — status flip only.

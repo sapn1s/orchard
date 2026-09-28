@@ -132,8 +132,42 @@ function jsonl(lines) { return lines.map((o) => (typeof o === 'string' ? o : JSO
 function asst(text, extra = {}) {
   return { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] }, ...extra };
 }
+/* BUG-192 — mirror Claude Code: derive last_assistant_message from the transcript's
+ * final logical message (same reconstruction lastAssistantText does), so the grader
+ * runs on the block-safe path. Unreadable/absent transcript → left unset → the
+ * fail-open transcript fallback is exercised (and never blocks). `extra` wins. */
+function finalAssistantText(transcriptPath) {
+  let raw;
+  try { raw = fs.readFileSync(transcriptPath, 'utf8'); } catch { return ''; }
+  const lines = raw.split('\n');
+  const isMain = (ev) => ev && ev.type === 'assistant' && ev.isSidechain !== true && Array.isArray(ev?.message?.content);
+  const textOf = (content) => content.filter((c) => c && c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('');
+  let lastIdx = -1, lastEv = null;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].trim()) continue;
+    let ev; try { ev = JSON.parse(lines[i]); } catch { continue; }
+    if (!isMain(ev)) continue;
+    lastIdx = i; lastEv = ev; break;
+  }
+  if (lastIdx === -1) return '';
+  const id = lastEv?.message?.id;
+  const parts = [textOf(lastEv.message.content)];
+  if (typeof id === 'string' && id !== '') {
+    for (let i = lastIdx - 1; i >= 0; i--) {
+      if (!lines[i].trim()) continue;
+      let ev; try { ev = JSON.parse(lines[i]); } catch { continue; }
+      if (!isMain(ev) || ev?.message?.id !== id) break;
+      parts.push(textOf(ev.message.content));
+    }
+    parts.reverse();
+  }
+  return parts.join('');
+}
 function payload(transcriptPath, extra = {}) {
-  return JSON.stringify({ session_id: 's', transcript_path: transcriptPath, cwd: TMP, hook_event_name: 'Stop', stop_hook_active: false, ...extra });
+  const base = { session_id: 's', transcript_path: transcriptPath, cwd: TMP, hook_event_name: 'Stop', stop_hook_active: false };
+  const t = typeof transcriptPath === 'string' ? finalAssistantText(transcriptPath) : '';
+  if (t) base.last_assistant_message = t;
+  return JSON.stringify({ ...base, ...extra });
 }
 
 const GOOD_DIGEST = '```orchard-digest\n{"items":[{"text":"Did the thing","kind":"done","importance":"high"}]}\n```\n\nSome prose below.';
@@ -299,8 +333,9 @@ async function main() {
   // Registry-driven per-project opt-out. Point CLAUDE_STATION_DATA at a scratch registry.
   const regDir = path.join(TMP, 'regdata'); fs.mkdirSync(regDir);
   const projCwd = path.join(TMP, 'optoutproj'); fs.mkdirSync(projCwd);
-  const noDigestInProj = payload(noDigest, {}); // uses cwd:TMP; override cwd below
-  const optoutPayload = JSON.stringify({ session_id: 's', transcript_path: noDigest, cwd: projCwd, hook_event_name: 'Stop', stop_hook_active: false });
+  // BUG-192 — build via payload() so last_assistant_message (the real Stop field
+  // the block path now requires) is injected from the transcript; override cwd.
+  const optoutPayload = payload(noDigest, { cwd: projCwd });
   // registry that DISABLES the digest for projCwd
   fs.writeFileSync(path.join(regDir, 'registry.json'), JSON.stringify({ projects: [{ hostPath: projCwd, settings: { responseDigest: { enabled: false } } }] }));
   await expect('H7 registry responseDigest.enabled=false for cwd -> ALLOW', optoutPayload, 'ALLOW', { CLAUDE_STATION_DATA: regDir });

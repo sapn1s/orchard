@@ -358,6 +358,9 @@ export function listNativeCodexSessions(hostPath: string, opts: ListOptions = {}
       })(),
       gitBranch: null,
       version: null,
+      // Codex rollouts carry no Claude-CLI `entrypoint`; these are Orchard-owned
+      // sessions surfaced by provider, never external programmatic clutter.
+      entrypoint: null,
       warnings: [],
       provider: 'openai',
       native: true,

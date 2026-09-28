@@ -37,8 +37,29 @@
  */
 import * as fs from 'node:fs';
 import * as net from 'node:net';
+import * as nodePath from 'node:path';
 import { spawn } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import { augmentedPathEnv } from './path-env.mjs';
+import { RequestFloor, floorGraceFromEnv, laneBlockMsFromEnv } from './request-floor.mjs';
+
+/*
+ * BUG-187 — BROKER PROTOCOL 2.
+ *
+ * The broker is the only process whose lifetime equals the CLI's, so it owns
+ * three facts nobody else can state truthfully (ARCH-010):
+ *   - whether anyone is attached to answer the CLI (`responder`);
+ *   - which of the CLI's control requests are still unanswered, and by whom
+ *     they are owned (the request floor, request-floor.mjs);
+ *   - whether work outlives the turn (`backgroundLifetime`, now including
+ *     revived lanes the level does not list).
+ * It talks to its client in-band with `orchard_broker_*` lines that are never
+ * forwarded to the CLI (H3), and a client strips them before the SDK sees
+ * anything (survival.ts).
+ */
+const BROKER_PROTOCOL = 2;
+const BROKER_LINE_PREFIX = 'orchard_broker_';
+const BROKER_REQ_PREFIX = 'orchard-broker-';
 
 function fail(msg) {
   process.stderr.write(`[session-host] ${msg}\n`);
@@ -88,6 +109,21 @@ function writeStatus(patch) {
     // facts only: both are null/[] until the CLI's own frames say otherwise.
     midTurnSince: state.midTurnSince,
     backgroundTasks: state.backgroundTasks,
+    // BUG-187 H1 — declared freshness: the protocol this broker speaks, a
+    // monotonic sequence number, and the last moment a status write FAILED
+    // (a reader can tell a stale record from a fresh one).
+    protocol: BROKER_PROTOCOL,
+    seq: ++state.seq,
+    statusWriteFailedAt: state.statusWriteFailedAt,
+    // BUG-187 H2 — lanes revived by `task_started` that the level may not list.
+    startedTasks: [...state.startedTasks.keys()],
+    // BUG-187 H4/H5 — the responder fact and the request floor's ledger.
+    responder: state.client ? 'attached' : 'none',
+    responderLostAt: state.responderLostAt,
+    adoptedAt: state.adoptedAt,
+    ...floorStatus(),
+    // BUG-187 H7 — false from the moment stdin was ended (EOF committed).
+    acceptingInput: !state.stdinEnded,
     updatedAt: new Date().toISOString(),
   };
   state.status = now;
@@ -95,7 +131,24 @@ function writeStatus(patch) {
   try {
     fs.writeFileSync(tmp, JSON.stringify(now), { mode: 0o600 });
     fs.renameSync(tmp, status);
-  } catch { /* best effort — the /proc-visible process is the real source of truth */ }
+  } catch {
+    // Best effort — the /proc-visible process is the real source of truth. But
+    // a failed write leaves the PREVIOUS record on disk, which can say `no`
+    // while the lane is live (BUG-187 review point 4), so remember it: the
+    // in-band lifetime answer carries it, and the next successful write does.
+    state.statusWriteFailedAt = new Date().toISOString();
+  }
+}
+/** The floor's published half (absent until the floor exists — the very first write precedes it). */
+function floorStatus() {
+  if (!floor) return { refusals: 0, pendingRequests: 0, lanes: [] };
+  const snap = floor.snapshot();
+  return {
+    refusals: snap.refusals,
+    pendingRequests: snap.pending.unowned + snap.pending.owned + snap.pending.handover,
+    pendingUnowned: snap.pending.unowned,
+    lanes: snap.lanes,
+  };
 }
 
 const state = {
@@ -164,7 +217,21 @@ const state = {
   // forces an EOF (unknown still HOLDS), so genuinely-live-but-quiet work is
   // never truncated (BUG-044 stays green). null until the first live level.
   lastBackgroundActivityAt: null,
+  // BUG-187 H1: monotonic status sequence + the last failed status write.
+  seq: 0,
+  statusWriteFailedAt: null,
+  // BUG-187 H2: task ids started (task_started) that are not in the current
+  // level — a revived lane is live to the broker without needing a level frame.
+  // Cleared by the task's own terminal frame.
+  startedTasks: new Map(),
+  // BUG-187: when the last client dropped (null while one is attached), and
+  // when a client last ADOPTED this CLI (initialize with its hooks applied).
+  responderLostAt: new Date().toISOString(),
+  adoptedAt: null,
+  clientId: null,
 };
+/** Declared once the CLI is spawned; referenced by writeStatus through floorStatus(). */
+let floor = null;
 
 // BUG-074: engine background LIFECYCLE subtypes — the level frame plus the
 // per-task status events the CLI emits on the SAME stdout as foreground turn
@@ -195,11 +262,50 @@ writeStatus({ claudePid: child.pid, state: 'running' });
 // EPIPE on stdin can happen if the CLI exits first — never let it crash the host.
 child.stdin.on('error', () => { /* CLI gone; exit handler will clean up */ });
 
+/** One JSON line to the CLI's stdin (the broker's own writes: refusals, stop_task, delivered turns). */
+function writeToCli(obj) {
+  if (state.stdinEnded) return false;
+  try { child.stdin.write(`${JSON.stringify(obj)}\n`); return true; } catch { return false; }
+}
+function logHost(msg) {
+  if (errStream) { try { errStream.write(`[session-host ${new Date().toISOString()}] ${msg}\n`); } catch { /* ignore */ } }
+}
+
+/*
+ * BUG-187 H4/H5 — the request floor. Every control_request the CLI emits is
+ * recorded; one nobody attached saw (or whose owner dropped) is REFUSED after
+ * its grace, so a tool call fails fast with a reason instead of timing out
+ * after 600 s (hooks) or hanging forever (permissions). A lane blocked with
+ * nobody adopting is stopped with `stop_task` after LANE_BLOCK_MS — that lane
+ * only. Nothing here ever ends the CLI.
+ */
+let stopSeq = 0;
+floor = new RequestFloor({
+  grace: floorGraceFromEnv(process.env),
+  laneBlockMs: laneBlockMsFromEnv(process.env),
+  write: (frame) => { writeToCli(frame); },
+  stopLane: (laneId) => {
+    writeToCli({ type: 'control_request', request_id: `${BROKER_REQ_PREFIX}stop-${++stopSeq}`, request: { subtype: 'stop_task', task_id: laneId } });
+  },
+  onChange: () => writeStatus({}),
+  log: logHost,
+});
+const floorTicker = setInterval(() => { if (!state.exiting) floor.tick(); }, 250);
+floorTicker.unref?.();
+
+// BUG-187 H1 — heartbeat, so a live broker's record never looks stale.
+const HOST_HEARTBEAT_MS = Number(process.env.CLAUDE_STATION_HOST_HEARTBEAT_MS ?? 15_000);
+const heartbeat = setInterval(() => { if (!state.exiting) writeStatus({}); }, HOST_HEARTBEAT_MS > 0 ? HOST_HEARTBEAT_MS : 15_000);
+heartbeat.unref?.();
+
 // Idempotent stdin EOF — the "you may finish and exit now" signal to the CLI.
 function endStdin() {
   if (state.stdinEnded) return;
   state.stdinEnded = true;
   try { child.stdin.end(); } catch { /* already gone */ }
+  // BUG-187 H7: from here on no input is accepted — publish it at once so a
+  // delivery gate reading the record cannot hand a message to a closing CLI.
+  writeStatus({});
 }
 
 /*
@@ -219,12 +325,40 @@ function endStdin() {
  */
 let sdkIdCaptured = false;
 let lineBuf = '';
+/** Client initialize requests in flight: request_id → { clientId, carriedHooks }. */
+const initRequests = new Map();
+/** Terminal task statuses on a `task_updated` patch. */
+const TERMINAL_TASK_STATUS = new Set(['completed', 'failed', 'killed', 'stopped']);
+/**
+ * Observe one CLI stdout line. Returns false when the line is the broker's OWN
+ * business and must not be forwarded to the client (the CLI's answer to a
+ * broker-originated request such as `stop_task`, or a replay of a request the
+ * floor has already settled); true to forward it verbatim; or a STRING to
+ * forward instead (an initialize answer with settled ids stripped from its
+ * redelivery — BUG-187 round 5).
+ */
 function onStreamJsonLine(line) {
   const s = line.trim();
-  if (!s) return;
+  if (!s) return true;
   let m;
-  try { m = JSON.parse(s); } catch { return; } // partial/non-JSON — ignore
-  if (!m || typeof m !== 'object') return;
+  try { m = JSON.parse(s); } catch { return true; } // partial/non-JSON — ignore, forward verbatim
+  if (!m || typeof m !== 'object') return true;
+  // BUG-187 H4 — the control channel, CLI → client.
+  if (m.type === 'control_request') {
+    // BUG-187 round 5: a replay of an id the floor already answered (refused,
+    // answered, cancelled) is not shown again — one card, one answer.
+    if (!floor.onCliRequest(m, state.client ? state.clientId : null)) return false;
+  } else if (m.type === 'control_cancel_request') {
+    floor.onCliCancel(m.request_id);
+  } else if (m.type === 'control_response') {
+    const rid = m.response?.request_id;
+    if (typeof rid === 'string' && rid.startsWith(BROKER_REQ_PREFIX)) return false; // our own stop_task's answer
+    if (rid != null && initRequests.has(String(rid))) {
+      onInitializeAnswered(String(rid), m.response);
+      const stripped = stripSettledRedelivery(m);
+      if (stripped) return stripped;
+    }
+  }
   // FEAT-065: publish turn-boundary TRANSITIONS to the status file (one write
   // at turn open, one at close — never per-frame) so the delivery gate reads a
   // fresh midTurn instead of one up to a whole drain-recheck stale.
@@ -281,17 +415,55 @@ function onStreamJsonLine(line) {
     // frames.
     laneLevelChanged = wasLanes.length !== state.backgroundTasks.length
       || wasLanes.some((t, i) => t.id !== state.backgroundTasks[i]?.id);
+    // BUG-187 H5: a lane the level dropped has ended — a stop the floor asked
+    // for is confirmed by this as much as by the lane's own terminal frame.
+    const nowIds = new Set(state.backgroundTasks.map((t) => t.id));
+    for (const t of wasLanes) if (!nowIds.has(t.id)) floor.onLaneTerminal(t.id);
+    /*
+     * H2, bounded: a started lane is live until its terminal frame, OR until a
+     * level that had LISTED it (after its task_started) drops it — the engine
+     * itself then said it ended, and the SDK warns that a missed bookend must
+     * not wedge a running indicator. A started id no level has listed yet (a
+     * revival the level does not carry — BUG-157's shape) stays live until its
+     * own terminal frame: its absence from the level is not evidence it ended.
+     */
+    for (const [id, rec] of [...state.startedTasks]) {
+      if (nowIds.has(id)) rec.seenInLevel = true;
+      else if (rec.seenInLevel) { state.startedTasks.delete(id); floor.onLaneTerminal(id); }
+    }
     // BUG-044: any level frame supersedes the dispatch-observed hint — from here
     // on the level itself is the authority (including an empty one).
     state.bgDispatchAt = null;
   }
   // BUG-044 pre-signal race guard: a background dispatch is visible in the
   // assistant frame seconds before the engine's level frame reports it.
+  let dispatchSeen = false;
   if (m.type === 'assistant' && Array.isArray(m.message?.content)) {
     for (const block of m.message.content) {
       if (block && block.type === 'tool_use' && block.input?.run_in_background === true) {
         state.bgDispatchAt = Date.now();
+        dispatchSeen = true;
       }
+    }
+  }
+  /*
+   * BUG-187 H2 — REVIVAL EVIDENCE. A `task_started` for an id the current level
+   * does not list (a SendMessage revival of a finished agent, or a lane whose
+   * level frame has not landed) is live work to the broker from this frame on,
+   * without waiting for a level. Its own terminal frame clears it.
+   */
+  let startedChanged = false;
+  if (m.type === 'system' && typeof m.task_id === 'string' && m.task_id) {
+    if (m.subtype === 'task_started') {
+      if (!state.backgroundTaskIds.includes(m.task_id) && !state.startedTasks.has(m.task_id)) {
+        state.startedTasks.set(m.task_id, { at: Date.now(), seenInLevel: false });
+        startedChanged = true;
+      }
+      state.lastBackgroundActivityAt = Date.now();
+    } else if (m.subtype === 'task_notification'
+      || (m.subtype === 'task_updated' && TERMINAL_TASK_STATUS.has(m.patch?.status))) {
+      if (state.startedTasks.delete(m.task_id)) startedChanged = true;
+      floor.onLaneTerminal(m.task_id);
     }
   }
   if (isBackgroundLaneFrame) {
@@ -310,36 +482,131 @@ function onStreamJsonLine(line) {
     if (state.reapPending && !state.stdinEnded) { state.reapPending = false; requestDrainCommit(); }
   } else if (m.type === 'system' && m.subtype === 'init') {
     state.midTurn = false; // idle after init until the first user turn
+  } else if (m.type === 'system' || NON_TURN_TYPES.has(m.type)) {
+    /*
+     * BUG-187 H9 (fallback branch, decided by arm A17): a `system` frame is not
+     * turn activity. The real CLI emits them AFTER a turn's `result` (e.g.
+     * `stop_hook_summary`), and the old catch-all re-opened `midTurn` on them —
+     * the stale "running" the incident's survivor row showed for five hours.
+     * `session_state_changed` cannot replace the boundary logic: A17 measured
+     * `running` spanning a live background lane (it goes `idle` only after the
+     * background loop exits). Control-channel frames are not turn activity
+     * either: a background lane's hook request, or the CLI's answer to an
+     * adopter's `initialize`, must not mark the foreground busy.
+     */
   } else {
     state.midTurn = true;
   }
   // BUG-072: stamp the turn's OWN start at the boundary that opened it (and
   // clear it when the turn closes), so a delivered turn renders an honest clock.
   if (state.midTurn !== midTurnBefore) state.midTurnSince = state.midTurn ? new Date().toISOString() : null;
-  if (state.midTurn !== midTurnBefore || laneLevelChanged) writeStatus({});
+  // BUG-187 H2: a dispatch or a started task is published at once, not at the
+  // next boundary — a reader deciding a close must see it.
+  if (state.midTurn !== midTurnBefore || laneLevelChanged || startedChanged || dispatchSeen) writeStatus({});
+  return true;
+}
+const NON_TURN_TYPES = new Set(['control_request', 'control_response', 'control_cancel_request', 'keep_alive']);
+
+/*
+ * BUG-187 H6 — the CLI answered a client's `initialize`. Ownership of the
+ * redelivered permission prompts moves to that client (H4), and when the
+ * client's hooks were applied (or it sent none) the client has ADOPTED this
+ * CLI: any drain an earlier server decided is cancelled, so an adopted broker
+ * never EOFs its CLI on an old decision.
+ */
+function onInitializeAnswered(rid, response) {
+  const req = initRequests.get(rid);
+  initRequests.delete(rid);
+  const success = response?.subtype === 'success';
+  const pending = Array.isArray(response?.pending_permission_requests)
+    ? response.pending_permission_requests.map((r) => r?.request_id).filter((x) => x != null)
+    : null;
+  floor.onInitResponse(rid, pending, success);
+  if (!req) return;
+  const hooksApplied = response?.response?.hooks_applied;
+  const adopted = success && (hooksApplied === true || !req.carriedHooks);
+  // The reply rides AFTER the forwarded initialize answer (see forwardStdoutLine).
+  pendingReclaimReplies.push({ clientId: req.clientId, adopted, success, hooksApplied });
+}
+/**
+ * BUG-187 round 5 — an initialize answer that lands AFTER the floor already
+ * answered one of its redelivered prompts (the handover timed out and the
+ * grace expired first) must not show that prompt to the adopter: its answer
+ * would be dropped as a second one, so the person would be deciding nothing.
+ * Returns the rewritten line, or null when nothing is settled (forward as is).
+ */
+function stripSettledRedelivery(m) {
+  let removed = 0;
+  const strip = (holder) => {
+    if (!holder || !Array.isArray(holder.pending_permission_requests)) return;
+    const kept = holder.pending_permission_requests.filter((r) => !(r?.request_id != null && floor.isSettled(r.request_id)));
+    removed += holder.pending_permission_requests.length - kept.length;
+    holder.pending_permission_requests = kept;
+  };
+  strip(m.response);
+  strip(m.response?.response);
+  if (!removed) return null;
+  logHost(`initialize ${m.response?.request_id} answered after the floor had settled ${removed} of its redelivered prompt(s): not shown again`);
+  return JSON.stringify(m);
+}
+const pendingReclaimReplies = [];
+function flushReclaimReplies() {
+  while (pendingReclaimReplies.length) {
+    const r = pendingReclaimReplies.shift();
+    const c = state.client;
+    if (!c || state.clientId !== r.clientId) continue; // that client is gone; nothing to tell
+    let reply;
+    if (!r.success) reply = { ok: false, reason: 'initialize-failed' };
+    else if (!r.adopted) reply = { ok: false, reason: 'hooks-not-applied' };
+    else if (state.stdinEnded) reply = { ok: false, reason: 'stdin-ended' };
+    else { reclaim(); reply = { ok: true }; }
+    sendBroker(c, 'reclaim', reply);
+  }
+}
+/*
+ * BUG-187 — stdout is now forwarded LINE BY LINE (it was raw chunks), because
+ * ownership is decided per line: a control_request is owned by the client it
+ * was forwarded to, which is only well-defined when a line reaches exactly one
+ * client or none. A StringDecoder keeps a multi-byte character split across
+ * chunks intact. A single unterminated line past the cap (a very large
+ * assistant/tool message, never a small control frame) is passed through raw,
+ * unparsed, exactly as the old sniffer dropped it from parsing.
+ */
+const stdoutDecoder = new StringDecoder('utf8');
+let stdoutPassthrough = false;
+const LINE_CAP = 16_000_000;
+function forwardStdout(text) {
+  const c = state.client;
+  if (c && !c.destroyed) { try { c.write(text); } catch { /* client went away */ } }
 }
 function sniffStdout(d) {
-  lineBuf += d.toString('utf8');
+  let chunk = stdoutDecoder.write(d);
+  if (stdoutPassthrough) {
+    const nl = chunk.indexOf('\n');
+    if (nl < 0) { forwardStdout(chunk); return; }
+    forwardStdout(chunk.slice(0, nl + 1));
+    chunk = chunk.slice(nl + 1);
+    stdoutPassthrough = false;
+  }
+  lineBuf += chunk;
   let nl;
   while ((nl = lineBuf.indexOf('\n')) >= 0) {
-    onStreamJsonLine(lineBuf.slice(0, nl));
+    const line = lineBuf.slice(0, nl);
     lineBuf = lineBuf.slice(nl + 1);
+    const out = onStreamJsonLine(line);
+    if (out === true) forwardStdout(`${line}\n`);
+    else if (typeof out === 'string') forwardStdout(`${out}\n`);
+    if (pendingReclaimReplies.length) flushReclaimReplies();
   }
-  // A single unterminated line (a very large assistant/tool message) must never
-  // grow the buffer without bound; such a line is never a small `result`, so
-  // dropping the partial is safe — the reap backstop still bounds any wait.
-  if (lineBuf.length > 16_000_000) lineBuf = '';
+  if (lineBuf.length > LINE_CAP) { forwardStdout(lineBuf); lineBuf = ''; stdoutPassthrough = true; }
 }
 
 // ALWAYS drain stdout so the CLI never blocks on a full pipe even with no client
-// connected. When a client is attached, forward the bytes; otherwise drop them
+// connected. When a client is attached, forward the lines; otherwise drop them
 // (the CLI writes its own transcript to disk, which is the durable record — the
-// dropped bytes are only the live event stream nobody is watching).
-child.stdout.on('data', (d) => {
-  sniffStdout(d);
-  const c = state.client;
-  if (c && !c.destroyed) { try { c.write(d); } catch { /* client went away */ } }
-});
+// dropped bytes are only the live event stream nobody is watching). A control
+// request dropped here is NOT lost any more: the floor tracks it (BUG-187).
+child.stdout.on('data', (d) => { sniffStdout(d); });
 child.stderr.on('data', (d) => { if (errStream) { try { errStream.write(d); } catch { /* ignore */ } } });
 
 child.on('error', (err) => {
@@ -448,14 +715,114 @@ function disarmAbandon() {
   if (abandonTimer) { clearTimeout(abandonTimer); abandonTimer = null; }
 }
 
+/** One broker line to a client (never to the CLI): `orchard_broker_<kind>`. */
+function sendBroker(conn, kind, payload) {
+  if (!conn || conn.destroyed) return;
+  try { conn.write(`${JSON.stringify({ type: `${BROKER_LINE_PREFIX}${kind}`, ...payload })}\n`); } catch { /* client gone */ }
+}
+const HOST_KEY = nodePath.basename(status).replace(/\.json$/, '');
+let nextClientId = 0;
+
+/*
+ * BUG-187 H7 — a delivery, accepted only while the CLI still takes input. The
+ * ack is positive evidence the frame was written; a refusal is retryable.
+ */
+function deliver(conn, msg) {
+  const id = msg.delivery_id ?? null;
+  if (state.stdinEnded || state.exiting) {
+    sendBroker(conn, 'deliver_ack', { delivery_id: id, accepted: false, reason: 'the CLI is no longer accepting input (its stdin has been ended — the session is finishing)' });
+    return;
+  }
+  const message = msg.message && typeof msg.message === 'object'
+    ? msg.message
+    : { role: 'user', content: [{ type: 'text', text: String(msg.text ?? '') }] };
+  const ok = writeToCli({ type: 'user', message });
+  sendBroker(conn, 'deliver_ack', ok ? { delivery_id: id, accepted: true } : { delivery_id: id, accepted: false, reason: 'the write to the CLI failed' });
+}
+
+/*
+ * One line from the attached client. Line-buffered (H4): only complete lines
+ * are forwarded, so a late control_response can be dropped whole even when the
+ * client wrote it in fragments.
+ */
+function onClientLine(conn, clientId, line) {
+  const s = line.trim();
+  let m = null;
+  if (s) { try { m = JSON.parse(s); } catch { m = null; } }
+  if (m && typeof m === 'object' && typeof m.type === 'string') {
+    if (m.type.startsWith(BROKER_LINE_PREFIX)) {
+      const kind = m.type.slice(BROKER_LINE_PREFIX.length);
+      if (kind === 'lifetime_q') {
+        sendBroker(conn, 'lifetime_a', { id: m.id ?? null, lifetime: backgroundOutlivesTurn(), seq: state.seq, statusWriteFailedAt: state.statusWriteFailedAt, midTurn: state.midTurn });
+      } else if (kind === 'deliver') {
+        deliver(conn, m);
+      }
+      return; // H3: never forwarded to the CLI
+    }
+    if (m.type === 'control_response') {
+      const rid = m.response?.request_id;
+      if (rid != null && !floor.onClientResponse(rid, clientId)) return; // a second answer: dropped
+    } else if (m.type === 'control_request' && m.request?.subtype === 'initialize' && m.request_id != null) {
+      if (state.stdinEnded) {
+        // H6: the CLI's input is closed, so this initialize can never be
+        // answered — say so at once instead of leaving the client waiting.
+        sendBroker(conn, 'reclaim', { ok: false, reason: 'stdin-ended' });
+        return;
+      }
+      const hooks = m.request.hooks;
+      const carriedHooks = !!hooks && typeof hooks === 'object' && Object.keys(hooks).length > 0;
+      initRequests.set(String(m.request_id), { clientId, carriedHooks });
+      floor.onClientInitialize(clientId, String(m.request_id));
+    } else if (m.type === 'user' && state.stdinEnded) {
+      // H7: a raw user frame after EOF would be lost silently — say so instead.
+      sendBroker(conn, 'deliver_ack', { delivery_id: null, accepted: false, reason: 'the CLI is no longer accepting input' });
+      return;
+    }
+  }
+  if (state.stdinEnded) return;
+  try { child.stdin.write(`${line}\n`); } catch { /* CLI gone */ }
+}
+
 const server = net.createServer((conn) => {
   // Single client at a time. A second connection (e.g. two tabs) is refused so
-  // two servers can never both drive the same CLI.
-  if (state.client && !state.client.destroyed) { conn.destroy(); return; }
+  // two servers can never both drive the same CLI. BUG-187 H3: the loser is
+  // TOLD (`hello accepted:false`) before it is dropped, so a losing adopter can
+  // tell "someone else holds it" from "the broker died" and never reaps.
+  if (state.client && !state.client.destroyed) {
+    try { conn.end(`${JSON.stringify({ type: `${BROKER_LINE_PREFIX}hello`, accepted: false, hostKey: HOST_KEY, protocol: BROKER_PROTOCOL, reason: 'another client is attached' })}\n`); } catch { /* ignore */ }
+    setTimeout(() => { try { conn.destroy(); } catch { /* ignore */ } }, 200).unref?.();
+    return;
+  }
   disarmAbandon();
+  const clientId = ++nextClientId;
   state.client = conn;
-  conn.on('data', (d) => { try { child.stdin.write(d); } catch { /* CLI gone */ } });
-  const drop = () => { if (state.client === conn) { state.client = null; armAbandon(); } };
+  state.clientId = clientId;
+  state.responderLostAt = null;
+  // BUG-187 round 6: `holdsOwnedCards` — this broker never ends its CLI's input
+  // under a card an attached client owns (commitDrain), so a relay can let a
+  // person decide as long as they like instead of bounding the card itself.
+  sendBroker(conn, 'hello', { accepted: true, hostKey: HOST_KEY, protocol: BROKER_PROTOCOL, clientId, holdsOwnedCards: true });
+  writeStatus({});
+  const decoder = new StringDecoder('utf8');
+  let inBuf = '';
+  conn.on('data', (d) => {
+    inBuf += decoder.write(d);
+    let nl;
+    while ((nl = inBuf.indexOf('\n')) >= 0) {
+      const line = inBuf.slice(0, nl);
+      inBuf = inBuf.slice(nl + 1);
+      onClientLine(conn, clientId, line);
+    }
+  });
+  const drop = () => {
+    if (state.client !== conn) return;
+    state.client = null;
+    state.clientId = null;
+    state.responderLostAt = new Date().toISOString();
+    floor.onClientDetached(clientId); // everything it owned starts its grace clock now
+    writeStatus({});
+    armAbandon();
+  };
   // A client disconnect is SURVIVABLE: keep the CLI alive and its stdin OPEN.
   // Never forward the socket's end/close as stdin EOF — a dead server must not
   // end the turn. Only an explicit SIGTERM, or the abandon net, does that.
@@ -470,9 +837,51 @@ server.listen(sock, () => { try { fs.chmodSync(sock, 0o600); } catch { /* ignore
 // the broker must not idle forever.
 armAbandon();
 
+/*
+ * BUG-187 H8 — the TOMBSTONE. shutdown() deletes the status record, so a reader
+ * polling between two writes could miss the whole stopping interval and never
+ * learn why the session ended. Written first, consumed by the server's survival
+ * scan into the FEAT-057 outcome store, then deleted by that consumer. Carries
+ * no top-level `hostPid`/`stationSessionId`, so a reader of `*.json` host
+ * records can never mistake it for a live broker.
+ */
+function writeTombstone() {
+  const snap = floor ? floor.snapshot() : { refusals: 0, lanes: [] };
+  const st = state.status ?? {};
+  const stopped = snap.lanes.filter((l) => l.stopRequestedAt);
+  // Only a NON-ROUTINE end leaves a tombstone: a refusal or a stopped lane is
+  // something the user must be told. A clean drain/close leaves the hosts dir
+  // exactly as empty as before (BUG-023: an open→close cycle leaves nothing).
+  if (!snap.refusals && !stopped.length) return;
+  let reason;
+  if (stopped.length) reason = `${stopped.length} background lane(s) were stopped because Orchard was not attached to answer their tool calls`;
+  else if (snap.refusals > 0) reason = `${snap.refusals} tool call(s) were refused because Orchard was not attached`;
+  else if (state.stdinEnded) reason = 'the session was drained and closed';
+  else reason = 'the CLI exited';
+  const tomb = {
+    tombstone: 1,
+    hostKey: HOST_KEY,
+    owner: owner ?? null,
+    session: { stationSessionId: st.stationSessionId ?? null, sdkSessionId: st.sdkSessionId ?? null, resumeHint: st.resumeHint ?? null },
+    brokerPid: process.pid,
+    cliPid: st.claudePid ?? null,
+    reason,
+    exitCode: st.exitCode ?? null,
+    signal: st.signal ?? null,
+    refusals: snap.refusals,
+    lanes: snap.lanes,
+    endedAt: new Date().toISOString(),
+  };
+  const p = status.replace(/\.json$/, '.ended.json');
+  try { fs.writeFileSync(`${p}.tmp-${process.pid}`, JSON.stringify(tomb), { mode: 0o600 }); fs.renameSync(`${p}.tmp-${process.pid}`, p); } catch { /* best effort */ }
+}
+
 function shutdown(code) {
   if (state.exiting) return;
   state.exiting = true;
+  clearInterval(floorTicker);
+  clearInterval(heartbeat);
+  writeTombstone();
   try { server.close(); } catch { /* ignore */ }
   try { fs.rmSync(sock, { force: true }); } catch { /* ignore */ }
   if (errStream) { try { errStream.end(); } catch { /* ignore */ } }
@@ -509,6 +918,8 @@ const BG_UNKNOWN_MS = Number(process.env.CLAUDE_STATION_HOST_BG_UNKNOWN_MS ?? 12
 // (unknown still HOLDS the drain), so live work is never truncated (BUG-044).
 const BG_STALE_MS = Number(process.env.CLAUDE_STATION_HOST_BG_STALE_MS ?? 300_000);
 function backgroundOutlivesTurn() {
+  // BUG-187 H2: a started (e.g. revived) lane the level does not list is live.
+  if (state.startedTasks.size > 0) return 'yes';
   if (state.backgroundLive) {
     if (state.lastBackgroundActivityAt != null && Date.now() - state.lastBackgroundActivityAt > BG_STALE_MS) return 'unknown';
     return 'yes';
@@ -551,6 +962,36 @@ const DRAIN_TERM_MS = Number(process.env.CLAUDE_STATION_HOST_DRAIN_TERM_MS ?? 15
 const DRAIN_KILL_LAG_MS = Number(process.env.CLAUDE_STATION_HOST_DRAIN_KILL_LAG_MS ?? 10_000);
 const DRAIN_RECHECK_MS = Number(process.env.CLAUDE_STATION_HOST_DRAIN_RECHECK_MS ?? 15_000);
 let drainRequested = false;
+/*
+ * BUG-187 H6 — every drain timer keeps its handle, so an adoption can cancel a
+ * drain an earlier server decided (reclaim). Before this they were anonymous
+ * `setTimeout`s: once armed, nothing could stop them.
+ */
+const drainTimers = new Set();
+function drainLater(fn, ms) {
+  const t = setTimeout(() => { drainTimers.delete(t); fn(); }, ms);
+  t.unref?.();
+  drainTimers.add(t);
+  return t;
+}
+/**
+ * Reclaim: an adopting client's initialize succeeded with its hooks applied
+ * and stdin is still open — this CLI is driven again. Cancel the drain.
+ */
+function reclaim() {
+  const wasDraining = state.reaping || state.reapPending || drainRequested;
+  for (const t of drainTimers) clearTimeout(t);
+  drainTimers.clear();
+  state.reaping = false;
+  state.reapPending = false;
+  drainRequested = false;
+  state.midTurnCommitWaitSince = null;
+  state.drainHeldSince = null;
+  state.adoptedAt = new Date().toISOString();
+  floor.onAdopted();
+  if (wasDraining) logHost('reclaimed by an adopting client: the pending drain was cancelled');
+  writeStatus({ state: 'running' });
+}
 function requestDrainCommit() {
   if (drainRequested) return;
   drainRequested = true;
@@ -565,7 +1006,7 @@ function commitDrain() {
     // not wedged, then re-check on the short cadence.
     if (!state.drainHeldSince) state.drainHeldSince = new Date().toISOString(); // FEAT-064
     writeStatus({});
-    setTimeout(commitDrain, DRAIN_RECHECK_MS).unref?.();
+    drainLater(commitDrain, DRAIN_RECHECK_MS);
     return;
   }
   /*
@@ -580,12 +1021,28 @@ function commitDrain() {
    * window the EOF + escalation bound a stuck CLI as before. The turn's
    * `result` clears both `midTurn` and the window stamp.
    */
+  /*
+   * BUG-187 round 6 — an attached client OWNS a pending request: a person may
+   * be deciding its card (FEAT-065's relay delivers into exactly this draining
+   * broker). Ending stdin now would make their answer undeliverable — the
+   * midTurn window below is a bound for a turn whose `result` never lands, not
+   * for a person's decision. Hold, and restart that window, so the turn gets
+   * its full bound AFTER the answer. Bounded by the responder: if it drops, the
+   * floor makes the card unowned and refuses it at grace, and this clears.
+   */
+  if (floor.hasOwned()) {
+    state.midTurnCommitWaitSince = null;
+    if (!state.drainHeldSince) state.drainHeldSince = new Date().toISOString(); // FEAT-064
+    writeStatus({});
+    drainLater(commitDrain, DRAIN_RECHECK_MS);
+    return;
+  }
   if (state.midTurn) {
     if (state.midTurnCommitWaitSince == null) state.midTurnCommitWaitSince = Date.now();
     if (Date.now() - state.midTurnCommitWaitSince < DRAIN_MIDTURN_MS) {
       if (!state.drainHeldSince) state.drainHeldSince = new Date().toISOString(); // FEAT-064
       writeStatus({});
-      setTimeout(commitDrain, DRAIN_RECHECK_MS).unref?.();
+      drainLater(commitDrain, DRAIN_RECHECK_MS);
       return;
     }
     // Window expired: same bounded-truncation posture the reap backstop
@@ -595,7 +1052,7 @@ function commitDrain() {
   armDrainEscalation(DRAIN_TERM_MS);
 }
 function armDrainEscalation(delayMs) {
-  setTimeout(() => {
+  drainLater(() => {
     if (state.exiting) return;
     // Defense in depth: re-consult at fire time (a level frame may have named
     // new work inside the escalation window) — decline and re-arm if so.
@@ -607,8 +1064,10 @@ function armDrainEscalation(delayMs) {
     }
     try { child.kill('SIGTERM'); } catch { /* gone */ }
     setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } }, DRAIN_KILL_LAG_MS).unref?.();
-  }, delayMs).unref?.();
+  }, delayMs);
 }
+// The reap's wait for an in-flight turn's `result` (was a literal 90 s; a knob so a test can shrink it).
+const REAP_RESULT_WAIT_MS = Number(process.env.CLAUDE_STATION_HOST_REAP_RESULT_WAIT_MS ?? 90_000);
 function gracefulReap() {
   if (state.reaping) return;
   state.reaping = true;
@@ -623,9 +1082,9 @@ function gracefulReap() {
   // The child 'exit' handler drives the real teardown. If the turn's `result`
   // never lands, stop waiting after a generous window and move to the (still
   // lifetime-gated) drain commit, whose EOF + escalation bound a stuck CLI.
-  setTimeout(() => {
+  drainLater(() => {
     if (state.reapPending) { state.reapPending = false; requestDrainCommit(); }
-  }, 90_000).unref?.();
+  }, REAP_RESULT_WAIT_MS);
 }
 process.on('SIGTERM', gracefulReap);
 process.on('SIGINT', gracefulReap);

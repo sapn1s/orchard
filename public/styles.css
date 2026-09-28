@@ -54,6 +54,13 @@
   --st-done:  #667E4B;   /* done / verified — moss green (text weight) */
   --st-high:  #A8503A;   /* high severity — brick red accent */
 
+  /* FEAT-154 — session-list RUNNING accent. A light, slightly cyan sky-blue,
+     deliberately distinct from the slate --st-prog the pin glyph uses, so a
+     running dot and a pin are never confused. The nav's state markers adopt the
+     --st-* semantic language (blue = active, moss = done/new, amber = you,
+     red = error), replacing the old single-moss overload. */
+  --sess-run: #3E8CB8;
+
   --sans: "Avenir Next", "Segoe UI Variable Text", "Segoe UI", Cantarell, "Noto Sans", "DejaVu Sans", sans-serif;
   --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, "Charis SIL", "Noto Serif", Georgia, serif;
   --mono: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "DejaVu Sans Mono", ui-monospace, monospace;
@@ -123,6 +130,7 @@
   --st-needs: #CBA05C;
   --st-done:  #8FA470;
   --st-high:  #CC7B60;
+  --sess-run: #7CBBE0;   /* FEAT-154 — running accent, lifted for the dark surface */
   --window-shadow: 0 0 0 1px rgba(255,255,255,.05), 0 24px 60px -24px rgba(0,0,0,.8);
   --pop-shadow: 0 1px 2px rgba(0,0,0,.5), 0 18px 44px -14px rgba(0,0,0,.8);
   color-scheme: dark;
@@ -329,23 +337,34 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 }
 .row:hover .when { opacity: 1; }
 
-/* Being written by another process right now. Sits on the same left rail as
-   the project dot, in the one accent the app already owns. Ambient status, so:
-   no word, no ring, and a pulse slow enough to read as breathing. */
+/* FEAT-154 — RUNNING: the session (or its agents/subagents) is actively working
+   right now. Light-blue dot with a gentle outward pulse — blue = "active/working"
+   in the nav's semantic palette, and the motion says "in flight" at a glance.
+   `.here` = this dashboard is driving it (a hollow ring — a weight difference,
+   the same colour, so "who is running it" never reads as a different STATE).
+   Sits on the same left rail the project dot uses. */
 .row .alive {
   position: absolute; left: 8px; top: 50%; margin-top: -2.5px;
   width: 5px; height: 5px; border-radius: 50%;
-  background: var(--live);
-  animation: breathe 2.6s ease-in-out infinite;
+  background: var(--sess-run);
 }
-/* Driven by this dashboard rather than another terminal: same dot, hollow.
-   The distinction is "who is running it", so it is a difference in weight, not
-   a second colour. */
-.row .alive.here { background: none; box-shadow: inset 0 0 0 1.5px var(--live); }
-.row[aria-current="true"] .alive { animation-duration: 2.2s; }
+.row .alive::after {
+  content: ""; position: absolute; inset: -1.5px; border-radius: 50%;
+  border: 1px solid var(--sess-run);
+  animation: sess-pulse 2.4s ease-out infinite;
+}
+.row .alive.here { background: none; box-shadow: inset 0 0 0 1.5px var(--sess-run); }
+.row[aria-current="true"] .alive::after { animation-duration: 2s; }
 @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+@keyframes sess-pulse {
+  0%   { transform: scale(1);   opacity: .55; }
+  70%  { transform: scale(2.6); opacity: 0; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+/* Motion is decorative here; the dot alone carries "running". Kill it for
+   reduced-motion (and hide the ring so no static halo lingers). */
 @media (prefers-reduced-motion: reduce) {
-  .row .alive { animation: none; }
+  .row .alive::after { animation: none; opacity: 0; }
 }
 
 /* Pinned. BUG-086: an explicit pin GLYPH on the trailing edge, NOT a hairline
@@ -811,6 +830,37 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .seal .readout.usage.danger { color: var(--danger); }
 .seal .readout.usage.danger .g { color: var(--danger); }
 
+/* FEAT-139 round 3 — pattern-matchable readouts. Each readout now shows a glyph
+   (category) + at most one number (identity/value); state rides on SHAPE + FILL
+   so it never depends on hue alone (colour-blind safe), and the sentences that
+   used to sit on the strip face live in the tooltip + popover/panel. */
+
+/* Git state dot. Two orthogonal, colour-independent axes:
+     shape  circle = on a branch (normal)  ·  diamond = unusual HEAD/merge
+     fill   filled = has content            ·  hollow  = clean / none
+   so every pair of states differs by shape or fill, not just tint. The colours
+   only reinforce. Sized in px, box-sizing border-box so hollow == filled bounds. */
+.git-dot {
+  flex: none; width: 7px; height: 7px; box-sizing: border-box; display: inline-block;
+}
+.git-dot[data-state="clean"]    { border-radius: 50%; background: transparent; border: 1.5px solid var(--live); }
+.git-dot[data-state="dirty"]    { border-radius: 50%; background: var(--ink-3); }
+.git-dot[data-state="detached"] { border-radius: 1px; background: transparent; border: 1.5px solid var(--ink-4); transform: rotate(45deg); }
+.git-dot[data-state="conflict"] { border-radius: 1px; background: var(--danger); transform: rotate(45deg); }
+.seal .readout.git .n { color: var(--ink-4); font-variant-numeric: tabular-nums; }
+.seal .readout.git .n:empty { display: none; }
+
+/* Usage window-burn ring — the arc LENGTH is the reading (a near-full ring reads
+   near-full at any hue), so state is not colour-alone. Track is a faint constant
+   hairline; the fill stroke's colour only reinforces the warn/danger severity. */
+.usage-ring { flex: none; display: inline-flex; width: 14px; height: 14px; }
+.usage-ring svg { display: block; }
+.usage-ring .track { stroke: var(--hair); }
+.usage-ring .fill  { stroke: var(--ink-3); transition: stroke-dashoffset .3s ease; }
+.seal .readout.usage.warn   .usage-ring .fill { stroke: var(--warn); }
+.seal .readout.usage.danger .usage-ring .fill { stroke: var(--danger); }
+.seal .readout.usage.unknown .usage-ring .track { stroke: var(--ink-4); opacity: .5; }
+
 /* The sidebar toggle mirrors its glyph when collapsed so the panel bar sits on
    the side the sidebar will grow toward — reading as "expand", not "collapse". */
 #fold.is-collapsed svg { transform: scaleX(-1); }
@@ -1150,6 +1200,19 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .lag.stall .gl { color: var(--warn); animation: none; }
 .lag.stall .el { color: var(--warn); }
 .lag.stall .ty { color: var(--warn); }
+/* BUG-187 — a lane its broker declares BLOCKED (its tool calls are refused:
+   nobody is attached to answer them) or STOPPED. Never the running glyph or
+   sweep; the broker's own words ride the tooltip and the description slot. */
+.lag.blocked .gl, .lag.blocked .ty, .lag.blocked .el { color: var(--danger); animation: none; }
+.lag.blocked .de { color: var(--ink-3); }
+.lag.stopped .gl, .lag.stopped .ty, .lag.stopped .de, .lag.stopped .el { color: var(--ink-4); animation: none; }
+.lag.stopped .ty { text-decoration: line-through; }
+/* BUG-187 — a strip in which nothing runs (only blocked/stopped lanes): no live spark. */
+.strip.norun .strip-top .spark { background: var(--danger); animation: none; }
+.strip.norun .strip-top .spark::before, .strip.norun .strip-top .spark::after { display: none; }
+/* BUG-187 P2/P3 — a permission card whose request no longer exists. */
+.ask[data-done="expired"] { opacity: .62; }
+.ask[data-done="expired"] .verdict { color: var(--ink-3); }
 
 /* settled record in the transcript */
 .ran-stack {
@@ -1806,6 +1869,16 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 .prov-state[data-status="connected"] { color: var(--ink-2); }
 .prov-state[data-status="installed-not-signed-in"] .dot { background: var(--warn); }
 .prov-state[data-status="not-installed"] .dot { background: transparent; box-shadow: inset 0 0 0 1px var(--ink-4-struct); }
+
+/* FEAT-151 — Runtime pane state chips. Reuse the same greyscale-plus-accent
+   idiom: green for current, amber for needs-attention, grey ring for unknown. */
+.prov-state[data-status="rt-ok"] .dot { background: var(--live); }
+.prov-state[data-status="rt-ok"] { color: var(--ink-2); }
+.prov-state[data-status="rt-stale"] .dot { background: var(--warn); }
+.prov-state[data-status="rt-stale"] { color: var(--ink-2); }
+.prov-state[data-status="rt-warn"] .dot { background: var(--warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
+.prov-state[data-status="rt-warn"] { color: var(--ink-2); }
+.prov-state[data-status="rt-unknown"] .dot { background: transparent; box-shadow: inset 0 0 0 1px var(--ink-4-struct); }
 
 /* ── FEAT-037 P2b: sidebar session rows recorded by a non-Claude engine carry
    a quiet engine tag — same mono/dim voice as the crown chip's `codex ·`
@@ -3265,12 +3338,12 @@ button.lag:hover { background: var(--rail); }
    recede and unread ones read as "there's something new" without competing with
    the leading marker for the same pixels. The timestamp stays moss so a fast
    vertical scan of the trailing column still finds unread rows. */
-.row.fresh { color: color-mix(in srgb, var(--ink) 62%, var(--ink-2)); }
+/* FEAT-154 — UNREAD (finished but not yet opened): the title goes BOLD and a
+   touch brighter, so a row with something new stands out on a fast scan; moss
+   green (= "new / done") carries the trailing tick and the timestamp. Bold is
+   the user's asked-for cue and pairs with the green so it survives colour-blindness. */
+.row.fresh { color: color-mix(in srgb, var(--ink) 62%, var(--ink-2)); font-weight: 600; }
 .row.fresh .when { color: var(--live); opacity: 1; }
-.row .unread {
-  float: right; margin-left: 8px; margin-top: 5px;
-  width: 5px; height: 5px; border-radius: 50%; background: var(--live);
-}
 
 /* FEAT-118 — session-list LIFECYCLE markers, one per row on the leading rail
    (the column the `.alive` moss dot already owns). Three salience tiers, so a
@@ -3284,22 +3357,54 @@ button.lag:hover { background: var(--rail); }
      • RECENTLY FINISHED — a running session that just went quiet: the same moss
        as `.alive` but a STILL, hollow ring (no motion). It pairs with the live
        dot so the eye groups "alive / just-alive" apart from the amber alarm. */
+/* FEAT-154 — ERROR / ended without answering. Recoloured amber → brick red
+   (--st-high): a background death that lost work reads as a PROBLEM, and amber is
+   now reserved for "waiting on you". The triangle SHAPE is kept — it is legible
+   without colour and at a glance, the one alarm marker in the list. */
 .row .stopped {
   position: absolute; left: 7px; top: 50%; margin-top: -4px;
   width: 0; height: 0;
   border-left: 4px solid transparent; border-right: 4px solid transparent;
-  border-bottom: 7px solid var(--st-needs);
+  border-bottom: 7px solid var(--st-high);
 }
-.row.died .when { color: var(--st-needs); opacity: 1; }
+.row.died .when { color: var(--st-high); opacity: 1; }
+/* FEAT-154 (visual-review): the moss ring was too faint to register at marker
+   size (1px @ 70%). Full-chroma moss at 1.5px so "finished / done" reads as GREEN
+   at a glance in both themes. `.new` = UNREAD: the ring FILLS IN (a solid moss
+   dot) — filled = "something to read", hollow = "read", the same filled/hollow
+   grammar the running dot uses. */
 .row .settled {
   position: absolute; left: 8px; top: 50%; margin-top: -2.5px;
   width: 5px; height: 5px; border-radius: 50%;
-  background: none; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--live) 70%, transparent);
+  background: none; box-shadow: inset 0 0 0 1.5px var(--live);
 }
+.row .settled.new { background: var(--live); box-shadow: none; }
 /* RECENTLY VISITED — the quietest tier: no glyph, no colour, just the muted
    timestamp held visible (normally hover-only) so rows you touched today group
-   without adding a fifth accent. Never shown on a died row (amber wins there). */
-.row.visited:not(.died) .when { opacity: .5; }
+   without adding a fifth accent. Lifted from .5 → .62 so it stays legible
+   (visual-review). Never shown on a died row (red wins there). */
+.row.visited:not(.died) .when { opacity: .62; }
+
+/* FEAT-154 — WAITING ON YOU: the model paused on a question/permission and needs
+   your answer — the MOST urgent state, so it is the loudest. An amber dot inside a
+   pulsing amber halo (dot + ring, distinct from the plain running dot) plus a bold
+   title. Amber = "you must act"; it out-ranks running (a paused turn can still read
+   live). Owner: the pending-question declaration (BUG-166); on the open row today. */
+.row .waiting {
+  position: absolute; left: 8px; top: 50%; margin-top: -2.5px;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--st-needs);
+}
+.row .waiting::after {
+  content: ""; position: absolute; inset: -2px; border-radius: 50%;
+  border: 1.5px solid var(--st-needs);
+  animation: sess-pulse 1.9s ease-out infinite;
+}
+.row.awaiting { color: var(--ink); font-weight: 600; }
+/* Reduced motion: keep the halo, static, so the dot-in-ring SHAPE still reads. */
+@media (prefers-reduced-motion: reduce) {
+  .row .waiting::after { animation: none; transform: none; opacity: 1; }
+}
 
 /* ── edit-diff chips ── */
 /* The change itself, not its JSON envelope. Additions wear the moss accent;
@@ -3365,7 +3470,12 @@ button.lag:hover { background: var(--rail); }
 /* 17px, not 9: the leading 12px are the live-dot rail — at 9px the title ran
    straight over the dot on running sessions. The dot repositions to match. */
 .kids .row { padding-left: 17px; font-size: 12px; }
-.kids .row .alive { left: 5px; }
+/* FEAT-154 — every leading-rail state marker shares ONE vertical column in the
+   nested session list, so the eye tracks a single line down the rail. The dots
+   centre at x≈7.5px; the triangle (8px base, optical centre = left+4) is nudged
+   to match, and the finished ring (5px dot) sits on the same centre. */
+.kids .row .alive, .kids .row .waiting, .kids .row .settled { left: 5px; }
+.kids .row .stopped { left: 3.5px; }
 .kids .hint-row { margin-left: 2px; }
 /* Hierarchy comes from size/weight/indent — NOT brightness: full ink here
    outshone the transcript and pulled the eye sideways. */
@@ -3536,6 +3646,122 @@ button.lag:hover { background: var(--rail); }
 }
 .rail-head .ct[hidden] { display: none; }
 
+/* ═══════════════════════════════════════════════════════════
+   FEAT-153 — the ticket-board grid: the rail's primary surface.
+   Same vocabulary as the rest of the rail — greyscale surfaces,
+   hairlines, the --st-* status tints, mono for machine text. The
+   current session's tickets read at full weight; the rest of the
+   board is dimmed until hovered. State is carried by an accent ring
+   (needs-you), a state chip, and position — not by extra words.
+   ═══════════════════════════════════════════════════════════ */
+.rail-board { display: flex; flex-direction: column; gap: 16px; margin-top: 14px; }
+.rail-board[hidden] { display: none; }
+.bg-section { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.bg-h { display: flex; align-items: center; gap: 8px; margin: 0 2px; }
+.bg-lbl {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-4);
+}
+.bg-n {
+  font-family: var(--mono); font-size: 9.5px; color: var(--ink-3);
+  min-width: 15px; height: 15px; padding: 0 5px; border-radius: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--sunken); border: 1px solid var(--hair-2);
+}
+.bg-toggle {
+  margin-left: auto; appearance: none; border: 0; background: none; cursor: pointer;
+  color: var(--ink-4); padding: 2px; display: inline-flex; border-radius: 6px;
+}
+.bg-toggle:hover, .bg-toggle:focus-visible {
+  color: var(--ink-2); background: color-mix(in srgb, var(--ink) 6%, transparent); outline: none;
+}
+.bg-toggle .chev { transition: transform .14s ease; }
+.bg-section.collapsed .bg-toggle .chev { transform: rotate(-90deg); }
+.bg-section.collapsed .bg-grid { display: none; }
+
+/* The panel-fitting grid: auto-fill columns to whatever the rail is wide, and
+   NO inner scroll. FEAT-153 r2 — the round-1 cap (max-height 32/36vh +
+   overflow-y:auto) reintroduced exactly the nested-scroll-in-a-taller-panel trap
+   the FEAT-139 r4 comment on `.needs` says it removed: the grid stopped at ~1/3
+   of the rail with a scrollbar inside it while the rail sat half-empty below. The
+   rail column (#railPanel) is the ONE scroll surface; the grid flows inline and
+   the panel scrolls for the rest, so scroll position is the panel's and survives
+   a poll's keyed re-render. */
+.bg-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(94px, 1fr)); gap: 7px;
+  padding-bottom: 1px; /* keep a card's focus ring off the section edge */
+}
+
+.tc {
+  appearance: none; text-align: left; cursor: pointer; font: inherit; color: inherit;
+  display: flex; flex-direction: column; gap: 5px; min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid var(--hair); border-radius: 9px; background: var(--window);
+  transition: border-color .12s ease, box-shadow .12s ease, opacity .12s ease;
+  animation: rise .18s ease;
+}
+.tc:hover { border-color: color-mix(in srgb, var(--ink) 20%, var(--hair)); }
+.tc:focus-visible { outline: 2px solid var(--st-prog); outline-offset: 2px; }
+.tc-top { display: flex; align-items: center; gap: 6px; }
+.tc-top .nc-sevmark { margin-left: auto; }
+.tc-id { font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); }
+.tc-title {
+  font-size: 11.5px; line-height: 1.32; color: var(--ink); word-break: break-word;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.tc-state {
+  align-self: flex-start; margin-top: 1px;
+  font-family: var(--mono); font-size: 8.5px; letter-spacing: .04em; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ink) 12%, transparent);
+  color: var(--ink-3); background: var(--sunken);
+}
+.tc-state[data-state="needs"]  { color: var(--st-needs); border-color: color-mix(in srgb, var(--st-needs) 45%, transparent); }
+.tc-state[data-state="prog"]   { color: var(--st-prog);  border-color: color-mix(in srgb, var(--st-prog) 45%, transparent); }
+.tc-state[data-state="queued"] { color: var(--ink-4); }
+
+/* State carried on the card itself: needs-you gets the amber accent ring (the one
+   loud thing in the grid), in-progress a quiet slate left bar, queued nothing. */
+.tc[data-state="needs"] {
+  border-color: color-mix(in srgb, var(--st-needs) 55%, var(--hair));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--st-needs) 32%, transparent);
+}
+.tc[data-state="needs"]:hover {
+  border-color: color-mix(in srgb, var(--st-needs) 72%, var(--hair));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--st-needs) 48%, transparent);
+}
+.tc[data-state="prog"] { border-left: 2px solid color-mix(in srgb, var(--st-prog) 60%, var(--hair)); }
+
+/* The rest of the board is reference, not the focus: dimmed until the pointer or
+   keyboard lands on it (never below the WCAG-legible floor — .58, lifted on any
+   interaction). The current-session grid is never dimmed. */
+.bg-section.others .tc { opacity: .58; }
+.bg-section.others .tc:hover,
+.bg-section.others .tc:focus-visible { opacity: 1; }
+
+.bg-empty {
+  display: flex; align-items: center; gap: 8px; padding: 12px 2px;
+  color: var(--ink-3); font-size: 12px;
+}
+.bg-empty .ok { color: var(--live); font-weight: 600; }
+
+/* The on-demand answer mount (#railNeeds), shown only while a needs-you card is
+   open. A slim bar names what is being answered and offers a close; the answer
+   flow itself is the unchanged needs-card. */
+.answer-open { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
+.answer-bar { display: flex; align-items: center; gap: 8px; margin: 0 2px; }
+.answer-lbl {
+  font-family: var(--mono); font-size: 9.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--ink-4);
+}
+.answer-x {
+  margin-left: auto; appearance: none; border: 0; background: none; cursor: pointer;
+  color: var(--ink-3); font-size: 13px; line-height: 1; padding: 2px 5px; border-radius: 6px;
+}
+.answer-x:hover, .answer-x:focus-visible {
+  color: var(--ink); background: color-mix(in srgb, var(--ink) 6%, transparent); outline: none;
+}
+
 /* FEAT-053: per-section height cap — the cards can never eat the whole rail;
    past the cap the section gets its OWN scroll and shrinks to content when
    short. HARD CONSTRAINT (BUG-032): cap with max-height + overflow-y ONLY —
@@ -3545,7 +3771,13 @@ button.lag:hover { background: var(--rail); }
 .needs {
   display: flex; flex-direction: column; gap: 9px;
   flex: none;
-  max-height: 34vh; overflow-y: auto; scrollbar-width: thin;
+  /* FEAT-139 r4 — no inner scroll. The cards used to be ~400px WALLS, so a 34vh
+     cap + inner overflow kept a few from burying the sections below. r4 makes
+     every non-focus card a ~57px scannable row, and the rail column (#railPanel)
+     is already the ONE scroll container — a nested scroll here only trapped the
+     collapsed rows behind the tall focus card (1 of 18 visible). The needs list
+     is the highest-priority section, so it flows inline at the top and the rail
+     scrolls for the rest; NEEDS_RAIL_CAP still bounds a pathological board. */
 }
 
 .needs-card {
@@ -3616,6 +3848,77 @@ button.lag:hover { background: var(--rail); }
   background: color-mix(in srgb, var(--live) 9%, var(--sunken));
 }
 .needs-card .nc-opt:disabled { opacity: .5; cursor: default; }
+
+/* ─────────── FEAT-139 r4 — the rail item as a scannable UNIT ───────────
+   The user's ask: "immediate view … cluttered with too much text; represent it
+   as UI elements for pattern-matching." So every non-focus card collapses to a
+   compact row whose leading marks are read at a GLANCE — a kind TAG (category),
+   the id (identity), and a severity MARK (state, by filled-bar COUNT, never hue
+   alone) — with the question / options / form behind a chevron. The FOCUS card
+   stays expanded, so its answer flow is one click, exactly as before. */
+.needs-card { transition: border-color .12s ease, box-shadow .12s ease; }
+.needs-card .nc-head { align-items: center; }
+
+/* kind tag — the LETTERS carry the category unambiguously (always CVD-safe);
+   the per-kind shape is a glance aid layered on top, not the sole signal. */
+.nc-kind {
+  flex: none; font-family: var(--mono); font-size: 8.5px; font-weight: 600;
+  letter-spacing: .04em; line-height: 1; padding: 2px 4px;
+  color: var(--ink-3); background: var(--sunken);
+  border: 1px solid var(--hair); border-radius: 3px;
+}
+.nc-kind[data-kt="bug"]  { border-radius: 999px; }                 /* pill  */
+.nc-kind[data-kt="feat"] { border-radius: 2px; }                   /* tab   */
+.nc-kind[data-kt="arch"] { border-radius: 2px; border-left-width: 3px; } /* barred */
+.nc-kind[data-kt="dec"],
+.nc-kind[data-kt="git"],
+.nc-kind[data-kt="svc"]  { border-style: dashed; }                 /* live ask */
+.nc-kind[data-kt="obs"],
+.nc-kind[data-kt="find"],
+.nc-kind[data-kt="stall"] { color: var(--ink-4); border-style: dotted; } /* read-only */
+
+/* severity mark — three ascending bars; RANK = count of FILLED bars (3/2/1),
+   a shape/quantity signal that survives greyscale and colour-vision deficiency.
+   The accent hue is redundant reinforcement, never the only carrier. */
+.nc-sevmark { display: inline-flex; align-items: flex-end; gap: 1.5px; height: 11px; flex: none; }
+.nc-sevmark .bar { width: 2.5px; border-radius: .5px; background: var(--hair); }
+.nc-sevmark .bar:nth-child(1) { height: 4px; }
+.nc-sevmark .bar:nth-child(2) { height: 7px; }
+.nc-sevmark .bar:nth-child(3) { height: 11px; }
+.nc-sevmark .bar.on { background: var(--ink-3); }
+.nc-sevmark[data-sev="high"] .bar.on { background: var(--danger); }
+.nc-sevmark[data-sev="med"]  .bar.on { background: var(--warn); }
+.nc-sevmark[data-sev="low"]  .bar.on { background: var(--ink-4); }
+
+/* chevron — the expand affordance; the meta row is also a hit target (JS). */
+.nc-chev {
+  flex: none; width: 18px; height: 18px; margin-left: 4px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: var(--ink-4); background: none; border: none; cursor: pointer; border-radius: 4px;
+}
+.nc-chev:hover, .nc-chev:focus-visible { color: var(--ink-2); background: color-mix(in srgb, var(--ink) 6%, transparent); outline: none; }
+.nc-chev .chev { transition: transform .14s ease; }
+.needs-card.collapsed .nc-chev .chev { transform: rotate(-90deg); }
+.needs-card.collapsed .nc-head { cursor: pointer; }
+
+/* collapsed = the scannable state: body hidden, title clamped to one line. */
+.needs-card.collapsed .nc-question,
+.needs-card.collapsed .nc-opts,
+.needs-card.collapsed .nc-form,
+.needs-card.collapsed .nc-detail { display: none; }
+.needs-card.collapsed { padding-top: 8px; padding-bottom: 8px; }
+.needs-card.collapsed .nc-head { margin-bottom: 4px; }
+.needs-card.collapsed .nc-title {
+  font-size: 12px; margin: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* focus = the one item held open, with a touch more presence than the rest. */
+.needs-card.focus {
+  border-left-width: 3px;
+  box-shadow: 0 6px 18px -13px color-mix(in srgb, var(--ink) 55%, transparent);
+}
+.needs-card.focus .nc-title { font-size: 13px; }
 
 .rail-empty {
   display: flex; align-items: center; gap: 7px;
@@ -3857,11 +4160,13 @@ button.lag:hover { background: var(--rail); }
   font: inherit;
 }
 .rail-summary .rs-chip:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
-.rail-summary .rs-chip.zero {
-  cursor: default; opacity: .55;
-  background: none;
-}
-.rail-summary .rs-chip.zero:hover { background: none; }
+/* FEAT-153 — a zero-value chip indexes an empty section, so it is nothing to
+   act on: collapse it out of the strip entirely so the metrics header stays calm
+   (the user's "0 DONE · 0 OBSERVATIONS · 0 DEPLOY · 0 STOPPED" clutter). The node
+   stays in the DOM (disabled + .zero) so the counts contract is unchanged; it is
+   simply not painted. When every chip is zero the strip is empty and the summary
+   card leads cleanly with the FOCUS line (owned by FEAT-067). */
+.rail-summary .rs-chip.zero { display: none; }
 .rail-summary .rs-n {
   font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--ink);
 }

@@ -32,6 +32,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
+import { waitRuntimeReady } from './lib/host-admission.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ENTRY = path.join(ROOT, 'src', 'server', 'index.ts');
@@ -39,6 +41,11 @@ const DOCTOR = path.join(ROOT, 'scripts', 'station-doctor.mjs');
 const RUN_TAG = `${process.pid}-${Math.random().toString(36).slice(2, 7)}`;
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-hsurv-data-'));
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-hsurv-work-'));
+// Isolate the CLI's TRANSCRIPT store off the user's real ~/.claude/projects. Without this
+// the driven haiku session writes its <id>.jsonl into the real store AND trips the
+// assertSessionStoreIsolated runtime guard, which refuses the session — so the suite dies
+// in setup ("session never initialised"). alsoReader keeps read + write on one scratch store.
+const STORE = isolatedStoreEnv(path.join(DATA, 'claude-config'), { alsoReader: true });
 
 let pass = 0, fail = 0;
 const failures = [];
@@ -84,7 +91,7 @@ function startServerService(unit, port) {
   const args = [
     '--user', `--unit=${unit}`, '--quiet', '--collect',
     `--working-directory=${ROOT}`,
-    ...setenvArgs({ PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA }),
+    ...setenvArgs({ PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA, ...STORE }),
     process.execPath, ENTRY,
   ];
   const r = spawnSync('systemd-run', args, { encoding: 'utf8', timeout: 15000 });
@@ -191,6 +198,10 @@ async function main() {
   const port = await freePort();
   startServerService(unit, port);
   if (!(await waitHealth(port))) throw new Error('scratch service never became healthy');
+  // FEAT-151: a new direct session is refused ("runtime check pending") until the boot
+  // runtime check completes — the seed start below would race it and die in setup. Wait on
+  // the server's own readiness signal (restartPending flips false), not a fixed sleep.
+  if (!(await waitRuntimeReady(port))) throw new Error('server boot runtime check never completed');
   const projectId = await registerProject(port);
   const marker = path.join(WORK, 'survived.txt');
 
@@ -232,7 +243,7 @@ async function main() {
 
   const port2 = await freePort();
   server2 = spawn(process.execPath, [ENTRY], {
-    cwd: ROOT, env: { ...process.env, PORT: String(port2), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA },
+    cwd: ROOT, env: { ...process.env, PORT: String(port2), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA, ...STORE },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   server2.stderr?.on('data', (d) => process.stderr.write(`  [server2!] ${d}`));
@@ -248,7 +259,12 @@ async function main() {
     const h = await getHealth(port2);
     snapshot = h;
     const entry = (h.sessions ?? []).find((s) => s.broker && s.broker.hostPid === host.hostPid);
-    if (entry) break;
+    // Wait for the adoption to SETTLE, not merely for the entry to appear: adoption is an
+    // async broker handshake, so the entry can surface as adoptState 'pending' for a beat
+    // before it reaches 'adopted'. Breaking on first appearance made the adopted-state
+    // assertion below flaky under load; wait for a terminal adopt decision (the broker's
+    // death still breaks the loop above, so a survivor that never settles fails loudly).
+    if (entry && entry.adopted === true && ['adopted', 'responder-only'].includes(entry.adoptState)) break;
     await sleep(300);
   }
   // Optional debug capture (HSURV_DEBUG=1): snapshot the broker's status file +
@@ -273,8 +289,10 @@ async function main() {
   const survivor = sessions.find((s) => s.broker && s.broker.hostPid === host.hostPid) ?? null;
   check('THE FIX: post-restart /api/health is NOT `sessions: []` while the survivor is alive', sessions.length > 0,
     { sessions: sessions.length });
-  check('THE FIX: the survivor is listed with an explicit adopted:false + surviving state', !!survivor && survivor.adopted === false && survivor.state === 'surviving-unadopted',
-    survivor ? { adopted: survivor.adopted, state: survivor.state } : 'no entry matching the broker pid');
+  // BUG-187: a survivor with in-flight work is now ADOPTED at boot (a responder re-attached), so it is a live, adopted entry.
+  check('THE FIX: the survivor is listed as adopted by the fresh server (adopted:true, adoptState adopted/responder-only)',
+    !!survivor && survivor.adopted === true && ['adopted', 'responder-only'].includes(survivor.adoptState),
+    survivor ? { adopted: survivor.adopted, adoptState: survivor.adoptState, state: survivor.state } : 'no entry matching the broker pid');
   check('THE FIX: the survivor entry carries honest broker pids + state', !!survivor?.broker
     && survivor.broker.hostPid === host.hostPid && survivor.broker.claudePid === host.claudePid && !!survivor.broker.state,
     survivor?.broker ?? 'no broker field');
@@ -291,8 +309,9 @@ async function main() {
   if (brokerStillAlive) {
     check('THE FIX: doctor does NOT print "No live sessions" while the survivor is alive', !/No live sessions/.test(out),
       out.split('\n').slice(0, 4).join(' | '));
-    check('THE FIX: doctor NAMES the survivor (broker pid + survived label)',
-      out.includes(String(host.hostPid)) && /SURVIVED a restart/.test(out) && /adopted\s+no/.test(out),
+    // BUG-187: the survivor is adopted now, so doctor names it as an adopted live session carrying the broker pid.
+    check('THE FIX: doctor NAMES the survivor (broker pid, adopted by this server)',
+      out.includes(String(host.hostPid)) && /adopted\s+yes/.test(out),
       out.split('\n').filter((l) => /survivor|SURVIVED|hostPid|adopted/.test(l)).join(' | ') || out.slice(0, 300));
   } else {
     check('THE FIX: doctor ran within the drain window', false, 'broker drained before doctor could run — lengthen the sleep');
@@ -306,7 +325,7 @@ async function main() {
   if (process.env.HSURV_DEBUG) {
     console.log(`  [debug] broker death observed at ${new Date().toISOString()} (reaped=${reaped})`);
     try {
-      const store = path.join(os.homedir(), '.claude', 'projects', WORK.replace(/[^a-zA-Z0-9]/g, '-'));
+      const store = path.join(STORE.CLAUDE_PROJECTS_DIR, WORK.replace(/[^a-zA-Z0-9]/g, '-'));
       const tf = path.join(store, `${sdkSessionId}.jsonl`);
       const lines = fs.readFileSync(tf, 'utf8').split('\n').filter((l) => l.trim());
       console.log(`  [debug] transcript ${tf}: ${lines.length} lines`);
@@ -339,8 +358,9 @@ main().catch((err) => {
   stopByPid(server2);
   for (const unit of [...services]) stopService(unit);
   for (const h of readHosts()) { if (h?.hostPid && pidAlive(h.hostPid)) { try { process.kill(h.hostPid, 'SIGKILL'); } catch { /* gone */ } } }
-  const store = path.join(os.homedir(), '.claude', 'projects', WORK.replace(/[^a-zA-Z0-9]/g, '-'));
   await sleep(500);
-  for (const d of [DATA, WORK, store]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
+  // STORE lives under DATA (isolatedStoreEnv scratch config dir), so removing DATA + WORK
+  // takes the isolated transcript store with it — nothing lands in the user's real store.
+  for (const d of [DATA, WORK]) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
   setTimeout(() => process.exit(process.exitCode ?? 0), 500).unref();
 });

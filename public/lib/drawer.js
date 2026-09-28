@@ -68,6 +68,11 @@ export function createDrawer(ctx) {
     editing: null,
     templates: [],
     container: undefined, // undefined = not fetched, null = route missing
+    /* FEAT-151 runtime pane: undefined = unfetched, null = route absent, {…} = payload */
+    runtime: undefined,
+    runtimeInflight: false, // a /api/runtime/version fetch is in flight
+    runtimeBusy: false,   // a host update POST is in flight
+    runtimePinBusy: false, // a container-pin POST is in flight
     composed: null,
     addingMount: false,
     armSocket: false,
@@ -188,6 +193,7 @@ export function createDrawer(ctx) {
     { group: 'project', id: 'workspace', label: 'Workspace', view: 'settings' },
     { group: 'project', id: 'advanced', label: 'Advanced', view: 'settings' },
     { group: 'machine', id: 'accounts', label: 'Accounts', view: 'machine' },
+    { group: 'machine', id: 'runtime', label: 'Runtime', view: 'machine' },
     { group: 'machine', id: 'appearance', label: 'Appearance', view: 'machine' },
     { group: 'machine', id: 'defaults', label: 'New-project defaults', view: 'machine' },
     { group: 'machine', id: 'templates', label: 'Templates', view: 'library' },
@@ -3756,6 +3762,171 @@ const WIRING_STATE = {
     return catWrap(null, ag, accountsPanel(rows));
   }
 
+  /* ─────────────────────────── FEAT-151: Runtime ───────────────────────────
+     The Claude runtimes Orchard actually uses, and the on-demand host update.
+     Read-state + action buttons, modelled on accountsPane. Fetched on demand;
+     the payload's `latest` is best-effort (a registry error renders "couldn't
+     check", never a crash). */
+  function ensureRuntime() {
+    if (d.runtime !== undefined || d.runtimeInflight) return;
+    d.runtimeInflight = true;
+    api.runtimeVersion()
+      .then((r) => { d.runtime = r ?? null; })
+      .catch(() => { d.runtime = null; })
+      .finally(() => { d.runtimeInflight = false; if (isOpenNow) paint(); });
+  }
+
+  async function refreshRuntime() {
+    d.runtimeInflight = true;
+    try { d.runtime = (await api.runtimeVersion()) ?? null; }
+    catch { /* keep the last payload */ }
+    d.runtimeInflight = false;
+    if (isOpenNow) paint();
+  }
+
+  /** A greyscale state chip (dot + word), reusing the .prov-state idiom.
+     kind → data-status: ok | stale | warn | unknown (styled in styles.css). */
+  function runtimeState(kind, text) {
+    const STATUS = { ok: 'rt-ok', stale: 'rt-stale', warn: 'rt-warn', unknown: 'rt-unknown' };
+    return el('span', { class: 'prov-state', 'data-status': STATUS[kind] ?? 'rt-unknown' },
+      el('span', { class: 'dot', 'aria-hidden': 'true' }), document.createTextNode(text));
+  }
+
+  function runtimePane() {
+    ensureRuntime();
+    if (d.runtime === undefined) {
+      return catWrap(null, el('div', { class: 'grp' }, groupLabel('Runtime'), note('Checking runtime versions…')));
+    }
+    if (d.runtime === null) {
+      return catWrap(null, el('div', { class: 'grp' }, groupLabel('Runtime'),
+        note('This server does not expose the runtime version route, so there is nothing to show or update here.')));
+    }
+    const r = d.runtime;
+    const host = r.host ?? {};
+    const latest = r.latest ?? {};
+    const container = r.container ?? {};
+
+    /* ---- host runtime row ---- */
+    const hg = el('div', { class: 'grp', 'data-focus': 'runtimeHost' }, groupLabel('Claude runtime · host sessions'));
+    const hostVer = el('div', { class: 'set' });
+    hostVer.append(el('span', { class: 'l' },
+      document.createTextNode('CLI in use'),
+      el('span', { class: 'f', text: `SDK ${host.runningSdk ?? '?'} · bundled CLI ${host.runningCli ?? '?'}` })));
+    // The badge: up to date / update available / restart pending.
+    let badge;
+    if (host.restartPending) {
+      badge = runtimeState('warn', `Updated to ${host.installedSdk ?? '?'} — restart Orchard to apply`);
+    } else if (host.updateAvailable && latest.sdk) {
+      badge = runtimeState('stale', `Update available → ${latest.sdk}`);
+    } else if (latest.error) {
+      badge = runtimeState('unknown', 'Couldn’t check for updates');
+    } else {
+      badge = runtimeState('ok', 'Up to date');
+    }
+    hostVer.append(el('span', { class: 'v' }, badge));
+    hg.append(hostVer);
+
+    // The update action. Disabled while a POST is in flight or a restart is
+    // already pending (a second update before the restart would compound the
+    // skew, so it is refused with an explanatory note rather than a live button).
+    if (host.restartPending) {
+      hg.append(note('The host runtime was updated on disk. Orchard is still running the previous SDK JS in memory, so the update applies only after you restart Orchard — new host sessions are held until then; sessions already running are unaffected.'));
+    } else {
+      const canUpdate = host.updateAvailable && !!latest.sdk;
+      const btn = el('button', { class: 'addrow', id: 'gRuntimeUpdate',
+        text: d.runtimeBusy ? 'Updating…' : (canUpdate ? `Update host runtime → ${latest.sdk}` : 'Check again') });
+      btn.disabled = d.runtimeBusy;
+      btn.addEventListener('click', async () => {
+        if (d.runtimeBusy) return;
+        if (!canUpdate) { d.runtime = undefined; runtimeTried = false; ensureRuntime(); paint(); return; }
+        d.runtimeBusy = true; paint();
+        d.runtimeError = null;
+        try {
+          const res = await api.runtimeUpdate('host', latest.sdk);
+          ctx.notify(`Host runtime updated to ${res.installedSdk ?? latest.sdk} — restart Orchard to apply`);
+        } catch (err) {
+          const msg = err.status === 409 ? 'an update is already running'
+            : (err.body?.error || err.message);
+          // Show the failure IN THE PANE (the footer strip is occluded by this
+          // modal). It carries the manual rollback command when the server sent
+          // one, so a partial state stays recoverable.
+          const rb = err.body?.rollbackCommand ? ` If node_modules is left partial, reconcile with: ${err.body.rollbackCommand}` : '';
+          d.runtimeError = `Update failed: ${msg}.${rb}`;
+          ctx.notify(`could not update the host runtime: ${msg}`, true);
+        }
+        d.runtimeBusy = false;
+        await refreshRuntime();
+      });
+      hg.append(btn);
+      if (d.runtimeError) {
+        const er = note(d.runtimeError);
+        er.dataset.warn = 'true';
+        hg.append(er);
+      }
+      hg.append(note('Installs and pins the newest Claude Agent SDK (the CLI host sessions run is bundled inside it). It is manual and explicit — never automatic — and applies only after you restart Orchard, so a bump can never break work already in flight. Sessions running now keep their current runtime.'));
+    }
+
+    /* ---- container runtime row ---- */
+    const cg = el('div', { class: 'grp', 'data-focus': 'runtimeContainer' }, groupLabel('Claude runtime · container projects'));
+    const cVer = el('div', { class: 'set' });
+    cVer.append(el('span', { class: 'l' },
+      document.createTextNode('Baked CLI pin'),
+      el('span', { class: 'f', text: `provision.json pins ${container.desiredCli ?? '?'}${container.targetCli ? ` · host SDK bundles ${container.targetCli}` : ''}` })));
+    let cBadge;
+    if (container.pinBehindTarget && container.targetCli) {
+      cBadge = runtimeState('stale', `Behind host SDK → ${container.targetCli}`);
+    } else {
+      cBadge = runtimeState('ok', 'Tracks host SDK');
+    }
+    cVer.append(el('span', { class: 'v' }, cBadge));
+    cg.append(cVer);
+
+    // Per-project actual image state (finding #8: containers are per-project).
+    const projs = Array.isArray(container.projects) ? container.projects : [];
+    if (projs.length) {
+      const box = el('div', { class: 'grp acctlist' }, el('div', { class: 'grp-l sub', text: 'Container projects on this machine' }));
+      for (const p of projs) {
+        const row = el('div', { class: 'set' });
+        const behind = p.imageClaudeVersion && container.desiredCli && p.imageClaudeVersion !== container.desiredCli;
+        row.append(el('span', { class: 'l' },
+          document.createTextNode(p.name || p.id),
+          el('span', { class: 'f', text: p.custom ? 'custom image — yours to manage'
+            : `image CLI ${p.imageClaudeVersion ?? 'unknown'}${behind ? ` (pin is ${container.desiredCli})` : ''}` })));
+        row.append(el('span', { class: 'v' },
+          runtimeState(p.custom ? 'unknown' : (behind || p.state === 'stale' ? 'stale' : (p.state === 'missing' ? 'unknown' : 'ok')),
+            p.custom ? 'custom' : (p.state === 'missing' ? 'not built' : (behind || p.state === 'stale' ? 'rebuild pending' : 'current')))));
+        box.append(row);
+      }
+      cg.append(box);
+    }
+
+    // The pin action: writes the host SDK's bundled CLI into provision.json. It
+    // does NOT rebuild or restart any running container — the new image builds
+    // when each project next starts a session.
+    const pinBtn = el('button', { class: 'addrow', id: 'gRuntimePin',
+      text: d.runtimePinBusy ? 'Updating pin…' : (container.pinBehindTarget && container.targetCli
+        ? `Update container CLI → ${container.targetCli}` : 'Re-pin container CLI to host SDK') });
+    pinBtn.disabled = d.runtimePinBusy;
+    pinBtn.addEventListener('click', async () => {
+      if (d.runtimePinBusy) return;
+      d.runtimePinBusy = true; paint();
+      try {
+        const res = await api.runtimeContainerPin();
+        ctx.notify(res.changed
+          ? `Container CLI pin set to ${res.version} — rebuilds when each container project next starts`
+          : `Container CLI pin already at ${res.version}`);
+      } catch (err) {
+        ctx.notify(`could not update the container pin: ${err.body?.error || err.message}`, true);
+      }
+      d.runtimePinBusy = false;
+      await refreshRuntime();
+    });
+    cg.append(pinBtn);
+    cg.append(note('Bumps the Claude CLI baked into container images to match the host SDK’s bundled CLI (the two speak one protocol, so they must track). Writing the pin changes the image identity; the new image is built the next time each container project starts a session — running containers are never force-restarted.'));
+
+    return catWrap(null, hg, cg);
+  }
+
   /* FEAT-139 — appearance is a machine-wide preference, so it lives in the
      Machine scope beside the other machine defaults. localStorage stays the fast
      client read; this is the surface. ctx owns the <html>/localStorage write. */
@@ -3818,6 +3989,10 @@ const WIRING_STATE = {
     ensureGlobals();
     if (d.cat === 'accounts') {
       wrap.append(accountsPane());
+      return wrap;
+    }
+    if (d.cat === 'runtime') {
+      wrap.append(runtimePane());
       return wrap;
     }
     if (d.globals === undefined) {
@@ -4191,6 +4366,13 @@ const WIRING_STATE = {
     dot('isolation', d.container && !d.container.problem && d.container.running ? 'live' : null);
     dot('snapshots', snapFailed ? 'warn' : null);
     dot('accounts', (d.acctLogin && !d.acctLogin.done) || pendingAcct ? 'warn' : null);
+    // FEAT-151 — a passive "update available / restart pending" indicator. Read
+    // only from a fetched payload; unfetched (the common case until the pane is
+    // opened, or prefetchForDots resolves) gets no dot, never a false all-clear.
+    dot('runtime', (d.runtime && d.runtime.host
+      && (d.runtime.host.restartPending
+        || d.runtime.host.updateAvailable
+        || d.runtime.container?.pinBehindTarget)) ? 'warn' : null);
   }
 
   /**
@@ -4203,6 +4385,7 @@ const WIRING_STATE = {
   function prefetchForDots() {
     const p = project();
     ensureAccounts();
+    ensureRuntime(); // FEAT-151 — so the Runtime dot can light without opening the pane
     if (!p) return;
     if (d.git === undefined) void refreshGit(p.id);
     if (d.procs === undefined) void refreshProcs(p.id);
@@ -4483,6 +4666,8 @@ const WIRING_STATE = {
     d.wiringArm = null;
     d.wiringReport = null;
     d.repoint = null; // BUG-138: a repoint panel is per-visit; never reopen armed
+    d.runtime = undefined; // FEAT-151 — refetch runtime versions on each open (like snaps/wiring)
+    d.runtimeError = null;  // a prior failure note is per-visit
 
     /* FEAT-146 — resolve the CATEGORY first, then the view.
        `{scope:'machine'}` was the sidebar-foot door into the machine panel;

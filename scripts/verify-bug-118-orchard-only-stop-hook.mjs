@@ -123,6 +123,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * line), then a trailing tool-result event — the shape the hook's
  * lastAssistantText() was hardened for.
  */
+const TRANSCRIPT_REPLY = new Map(); // BUG-192: transcript path -> its final reply text
 function transcript(name, text) {
   const file = path.join(SCRATCH, `${name}.jsonl`);
   const id = 'msg_realistic_01';
@@ -133,6 +134,7 @@ function transcript(name, text) {
     JSON.stringify({ type: 'assistant', message: { id, role: 'assistant', content: [{ type: 'text', text }] } }),
   ];
   fs.writeFileSync(file, lines.join('\n') + '\n');
+  TRANSCRIPT_REPLY.set(file, text);
   return file;
 }
 
@@ -161,7 +163,11 @@ function barePayload(transcriptPath) {
     effort: { level: 'medium' },
     hook_event_name: 'Stop',
     stop_hook_active: false,
-    last_assistant_message: 'Sunlight contains all colors, but the atmosphere scatters the short wavelengths hardest.',
+    // BUG-192 — real Claude Code sets this to THIS turn's final reply, which the
+    // hook now grades (race-immune). Mirror that: use the transcript's own final
+    // text so the grading-outcome assertions exercise the reply under test.
+    last_assistant_message: TRANSCRIPT_REPLY.get(transcriptPath)
+      ?? 'Sunlight contains all colors, but the atmosphere scatters the short wavelengths hardest.',
     background_tasks: [],
     session_crons: [],
   };

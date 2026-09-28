@@ -10,6 +10,9 @@ export interface ProvenanceRecord {
 }
 
 export const STARTED_BY_VALUES: Set<string>;
+export const INTERACTIVE_ENTRYPOINT: string;
+
+export function isProgrammaticEntrypoint(entrypoint: unknown): boolean;
 
 export function stationDataDir(): string;
 export function provenanceDir(): string;
@@ -32,3 +35,10 @@ export function resolveStartedBy(opts: {
   firstUserMessage?: string | null;
   record?: ProvenanceRecord | null;
 }): StartedBy;
+
+export function foldsFromDefaultList(opts: {
+  sessionId?: string | null;
+  entrypoint?: string | null;
+  firstUserMessage?: string | null;
+  record?: ProvenanceRecord | null;
+}): boolean;

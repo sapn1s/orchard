@@ -37,12 +37,19 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { startWhenAdmitted } from './lib/host-admission.mjs';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ENTRY = path.join(ROOT, 'src', 'server', 'index.ts');
 const HOST_SCRIPT = path.join(ROOT, 'src', 'server', 'session-host.mjs');
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-b72-work-'));
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-b72-data-'));
+// The seed turn runs a REAL claude CLI, and the server refuses a session whose
+// transcript would land in the user's real store (assertSessionStoreIsolated,
+// BUG-161). Writer AND reader point at a scratch store under DATA, so cleanup of
+// DATA removes the seed transcript too (same fix as verify-feat-065, BUG-190).
+const STORE = isolatedStoreEnv(path.join(DATA, 'claude-config'), { alsoReader: true });
 const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-b72-brave-'));
 const BRAVE = process.env.VERIFY_BROWSER ?? 'brave';
 const SENDS = Number(process.env.BUG072_SENDS ?? 3);
@@ -178,7 +185,7 @@ setInterval(() => {}, 1000);
 
 /* ------------------------------------------------------------ the harness --- */
 const brokers = [];
-function mkBroker(name, env, dir, key) {
+function mkBroker(name, env, dir, key, cwd = WORK) {
   fs.mkdirSync(dir, { recursive: true });
   const ctl = path.join(dir, `${key}.ctl.json`);
   const statusPath = path.join(dir, `${key}.json`);
@@ -187,7 +194,7 @@ function mkBroker(name, env, dir, key) {
     command: process.execPath, args: [FAKE_CLI], meta: { stationSessionId: `cs-b72-${name}` },
   }));
   const broker = spawn(process.execPath, [HOST_SCRIPT, ctl], {
-    cwd: WORK,
+    cwd,
     env: {
       ...process.env,
       CLAUDE_STATION_HOST_ABANDON_MS: '300000',
@@ -218,7 +225,7 @@ function spawnServer(port, extraEnv = {}) {
   const s = spawn(process.execPath, [ENTRY], {
     cwd: ROOT,
     env: {
-      ...process.env, PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA,
+      ...process.env, ...STORE, PORT: String(port), HOST: '127.0.0.1', CLAUDE_STATION_DATA: DATA,
       CLAUDE_STATION_SURVIVE: '0', // the only brokers in hostsDir must be ours
       ...extraEnv,
     },
@@ -254,7 +261,7 @@ const waitEv = async (events, pred, ms = 30_000) => {
   return null;
 };
 function findTranscript(sdkId) {
-  const base = path.join(os.homedir(), '.claude', 'projects');
+  const base = STORE.CLAUDE_PROJECTS_DIR;
   let dirs = [];
   try { dirs = fs.readdirSync(base); } catch { return null; }
   for (const d of dirs) {
@@ -340,10 +347,9 @@ async function setup() {
     method: 'PATCH', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ settings: { permissionMode: 'bypassPermissions', model: 'haiku' } }),
   });
-  const c0 = await openWs(port1);
-  c0.send({ type: 'start', projectId, prompt: 'Reply with exactly: SEED-OK' });
-  const init = await waitEv(c0.events, (e) => e.t === 'session-init', 90_000);
-  if (!init?.sessionId) throw new Error('seed turn never started');
+  // FEAT-151: retry only the boot-runtime-check refusal (scripts/lib/host-admission.mjs).
+  const { c: c0, init } = await startWhenAdmitted(openWs, port1, { type: 'start', projectId, prompt: 'Reply with exactly: SEED-OK' });
+  if (!init?.sessionId) throw new Error(`seed turn never started: ${JSON.stringify(c0?.events.slice(-4))}`);
   sdkSessionId = init.sessionId;
   await waitEv(c0.events, (e) => e.t === 'turn-end', 90_000);
   c0.send({ type: 'close' });
@@ -357,11 +363,27 @@ async function setup() {
   // The survivor: a REAL broker declaring the seed session's sdk id, holding
   // its drain for a declared live background lane (the BUG-044 hold), planted
   // in the fresh server's hostsDir and SIGTERM'd exactly as boot's re-adopt does.
+  //
+  // BUG-187 changed which survivors reach delivery mode at all. Boot now ADOPTS a
+  // survivor holding live work (a responder is re-attached; sends become ordinary
+  // bridge sends), and FEAT-065 delivery "remains only for unadoptable brokers"
+  // (BUG-187 plan round 2; survival.ts survivorNeedsAdoption, index.ts boot I1).
+  // So the state this ticket guards — delivering into a survivor this server owns
+  // no bridge for — now arises only for a broker boot CANNOT adopt. The planted
+  // broker runs in a directory no registered project claims (no `projectId` in its
+  // meta, and its CLI's cwd matches no project's path — projectForSurvivor), which
+  // is the deterministic unadoptable path: boot falls back to the graceful reap and
+  // the drain holds for the live lane. (The other unadoptable path — an adoption
+  // attempted and failed because the engine never answers the re-initialize —
+  // costs a 30 s timeout first; this fake CLI does not speak the control protocol,
+  // so with cwd = the project it lands there. BUG-072 round-2 log, 2026-09-27.)
   const hostsDir = path.join(DATA, 'session-hosts');
+  const unclaimedCwd = path.join(WORK, 'not-a-registered-project');
+  fs.mkdirSync(unclaimedCwd, { recursive: true });
   survivor = mkBroker('s1', {
     FAKE_SDK_ID: sdkSessionId, FAKE_TRANSCRIPT: transcriptPath, FAKE_INPUT_LOG: INPUT_LOG,
     FAKE_TASK_ID: 'bg-b72-lane', FAKE_RELEASE_FLAG: RELEASE_FLAG, FAKE_BG_EMPTY_FLAG: BG_EMPTY_FLAG,
-  }, hostsDir, 'h-b72-s1');
+  }, hostsDir, 'h-b72-s1', unclaimedCwd);
   let ready = false;
   for (let i = 0; i < 60 && !ready; i++) {
     const st = readJson(survivor.statusPath);
@@ -407,6 +429,11 @@ async function s2Deliveries() {
   console.log(`\n=== S2: ${SENDS} successive sends — each DELIVERS and each is VISIBLE while it runs ===`);
   for (let i = 1; i <= SENDS; i++) {
     const MARKER = `BUG-072-HOLD-${i}`;
+    // The fake CLI consumes the release flag only while a turn is HELD, so a flag
+    // left by an earlier send whose turn never opened would release THIS turn at
+    // once and fail every later check for a reason that is not theirs. Each send
+    // starts from a clean flag, so one failure cannot cascade.
+    fs.rmSync(RELEASE_FLAG, { force: true });
     const c = await openWs(port2);
     const t0 = Date.now();
     c.send({ type: 'start', projectId, prompt: `deliver me: ${MARKER}`, resumeSessionId: sdkSessionId });
@@ -545,6 +572,7 @@ async function s5Browser() {
 
   // Deliver one more message — the turn stays open while we look at the strip.
   const MARKER = 'BUG-072-HOLD-UI';
+  fs.rmSync(RELEASE_FLAG, { force: true }); // see S2: no flag inherited from an earlier send
   const c = await openWs(port2);
   c.send({ type: 'start', projectId, prompt: `deliver me: ${MARKER}`, resumeSessionId: sdkSessionId });
   const ack = await waitEv(c.events, (e) => e.t === 'ack' && e.of === 'start', 20_000);

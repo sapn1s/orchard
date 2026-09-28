@@ -768,3 +768,179 @@ rail — likely a separate feature's surface, noted for awareness.
 - **Still open / handoff:** none blocking. Orchestrator owns INDEX.md + status; I
   did not run board:gen. Scratch server killed by pid; ephemeral port freed; the
   user's 4317 and other live tabs untouched; no git writes.
+
+### 2026-09-23 16:05Z — fixing lane (round 3, class=fix) — readouts become pattern-matchable UI
+
+- **Charter:** the user's re-report — "immediate view cluttered with too much
+  text; represent readouts as UI elements for pattern-matching." Governing rule:
+  shape=CATEGORY, position=IDENTITY, colour=STATE, text only where the number
+  itself is what's read. Level: glyph + one number (not pure glyph).
+- **Hypothesis check FIRST (real markup + live page), and TWO corrections to the
+  charter's stated hypothesis — reported, not silently accepted:**
+  1. The charter assumed "each readout already has a popover to absorb the moved
+     detail." FALSE for two of three: only `#procBtn` has a popover (`#procPop`).
+     `#gitBtn` navigates to the full Git panel (navGit) — a RICHER surface than a
+     popover; `#usageBtn` is tooltip-only (usageTitle carries the full both-
+     provider detail incl. reset time). Per the STOP rule I did NOT invent a new
+     surface and did NOT drop detail: the escape hatch the charter itself names —
+     the on-hover title/tooltip — carries the FULL original sentence for git and
+     usage, and git's line-counts/branch also remain on the Git panel. So nothing
+     became unreachable and no surface was fabricated; I proceeded and flag the
+     discrepancy for the orchestrator rather than blocking a round whose detail
+     already has a home.
+  2. Git status exposed NO conflict field (GitStatus = clean/dirty/detached
+     only), but the charter's dot names clean/dirty/CONFLICT. Rather than fake a
+     state, I added REAL data: `git.ts` now counts unmerged porcelain-v1 codes
+     (U?/?U/AA/DD) into a new `conflicted` field (a subset of `dirty`).
+- **Changed (unstaged), THIS round:**
+  - `src/server/git.ts` — `GitStatus.conflicted: number`; counted in the existing
+    porcelain loop; added to the `none` default. Real merge-state data for the dot.
+  - `public/index.html` — git chip: glyph + `#gitDot` (state dot) + `#gitN`
+    (number only). Usage chip: glyph+text replaced by `#usageRing` (SVG ring).
+  - `public/app.js` — `paintGitChip` now sets the dot's `data-state`
+    (conflict>detached>dirty>clean), renders the dirty count as the ONLY face
+    number, and builds the full original sentence into the title + aria-label
+    (branch, ±lines, ↑↓, conflict). `paintProcChip` face reduced to a bare count
+    (`▸ 5`), unit → tooltip/aria/popover. New `paintUsageRing(pct)` draws a
+    stroke-dashoffset ring; `paintUsageChip` fills it (no % text), keeps the
+    warn/danger classes and full tooltip, adds an aria-label with %+window+reset.
+    Node reg: +`gitDot`,+`usageRing`, −`usageN`.
+  - `public/styles.css` — `.git-dot[data-state=…]`: clean=hollow circle,
+    dirty=filled circle, conflict=filled diamond, detached=hollow diamond (two
+    orthogonal COLOUR-INDEPENDENT axes: circle/diamond = branch/unusual,
+    filled/hollow = content/none — every state-pair differs by shape or fill, not
+    hue). `.usage-ring` track+fill; fill stroke tints via .warn/.danger; unknown =
+    track-only. Readouts stay muted (ink-4). `--warn` token untouched.
+  - `scripts/verify-bug-082-proc-chip.mjs` — proc-face assertions updated from
+    "N ports" to the r3 bare count "N" (13/13).
+  - `scripts/verify-feat-145-usage.mjs` — the badge's account-selection
+    invariants re-expressed against the new surface (percent/window now in the
+    aria-label; unknown = ring with no `.fill`), stub extended with usageRing +
+    setAttribute; tooltip byte-identity + colour-class invariants unchanged (67/67).
+- **Proof (headless Playwright MCP, real served page, isolated scratch server on
+  ephemeral port, REAL Orchard repo registered → real git chip):**
+  - POST-change (1400px): git face = "⎇120" (glyph+dot+number, gitN is
+    number-only); proc face = "▸5"; usage face has NO %/wk/d text (ring only,
+    dashoffset 12.09 = 63% fill). Git dots by computed style: clean=circle50%
+    +border+transparent; dirty=circle50%+filled --ink-3; conflict=diamond(rotate45,
+    radius1px)+filled --danger; detached=diamond+border+transparent — colour-blind
+    safe (every pair differs by shape or fill). Usage ring severity: normal→--ink-3,
+    warn(81%)→--warn, danger(95%)→--danger, unknown→track-only no fill; dashoffset
+    tracks percent. Full sentence preserved in git/usage tooltips + aria-labels;
+    proc tooltip still lists :4317.
+  - Overflow/zones at 1000/1100/1400 in light: `#seal` scrollWidth==clientWidth
+    (NO overflow) at all three; no zone-mix (badMix=false) — readouts wrap as one
+    unit below nav at 1100, single right-aligned row at 1000/1400. Readouts stay
+    muted (--ink-4 rgb(105,110,107)) vs nav --ink rgb(27,31,29).
+  - Dark theme: strip renders on the dark surface (bodyBg rgb(7,8,7), --window
+    #131513); dot + ring legible. (The one white computed-colour read is the
+    documented same-turn stale custom-property artifact — pixels are correct; the
+    dark screenshot was re-taken after the client theme-reconcile settled.)
+  - MUST-FAIL (fixed baseline = git HEAD `public/` via `git archive HEAD public`,
+    served by a static+proxy server that rewrites the WS Origin to satisfy the
+    allowlist and proxies /api to the live backend): the SAME assertions FAIL —
+    `#gitDot`/`#usageRing` DO NOT EXIST; git face = "⎇main · 120 dirty · +22024 ·
+    −372 · ↑3" (full sentence); usage face = "◷63% wk · 4d"; proc face = "▸5 ports".
+    Baseline is a fixed revision, not a moving ref.
+  - Screenshots (docs/bugs/assets/): FEAT-139-r3-strip-light-dirty-warn.png,
+    -readouts-light-zoom.png, -strip-dark-dirty-danger.png, -strip-light-clean.png,
+    and the before/HEAD FEAT-139-r3-strip-before-HEAD-light.png.
+- **Anti-regression:** `npm run gate` → PASS (exit 0, unpiped, read directly:
+  leak-gate, check-nul, typecheck — the git.ts field compiles). verify-bug-082
+  13/13, verify-feat-145-usage 67/67, verify-bug-075-mount-chip 9/9.
+- **Could-not-test (stated honestly):** an automated LIVE merge-conflict test for
+  the server `conflicted` parse is impossible in this environment — git writes
+  (init/commit/merge) are disabled for ALL agent sessions, which also prevents
+  verify-git.mjs from running here (pre-existing, not this change). The parse is
+  verified by typecheck + code inspection (standard porcelain unmerged codes); the
+  FRONTEND consumption (conflicted>0 → dot='conflict') IS proven live via seeded
+  state. verify-bug-106-crossproject-strip's fixture-setup timeout is the same
+  pre-existing shared-tree condition rounds 6/2 recorded (aborts upstream of any
+  readout code). Git states were seeded (a real repo is only in one state at once);
+  proc/usage seeded via the sanctioned `window.__station` hooks on the real page.
+- **Bucket / Verified-by:** contained render + a small additive server field.
+  No lifecycle/security/data path. The proof above IS the deliverable (WA §N); an
+  independent clean-room pass is not warranted for this UI slice. One item for the
+  orchestrator/user: confirm the tooltip-as-escape-hatch decision for git/usage
+  (no popover exists to move detail into; detail lives in tooltip + Git panel) is
+  acceptable, or request dedicated git/usage popovers as a follow-up.
+- **Changed files (unstaged), THIS lane:** `src/server/git.ts`,
+  `public/index.html`, `public/app.js`, `public/styles.css`,
+  `scripts/verify-bug-082-proc-chip.mjs`, `scripts/verify-feat-145-usage.mjs`,
+  this ticket, and the 5 screenshots under docs/bugs/assets/ (gitignored). The
+  other pre-existing unstaged files in the shared tree (public/lib/git-view.js,
+  scripts/lib/leak-tokens.mjs, verify-feat-130, BUG-142/164 scripts+tickets) are
+  NOT mine.
+- **Symptom of a deeper design flaw?** Same thesis as the ticket: the strip grew
+  a text sentence per feature. The durable rule now in code — a readout is a glyph
+  (category) + at most one number, state on shape/fill, everything else in the
+  tooltip/popover — means a new readout must pick a glyph and a single number, not
+  add a clause. Not filing an ARCH; the invariant is expressed in the render.
+
+---
+
+### 2026-09-23 — Independent design-critic verify pass (round 3, glyph strip)
+
+Fresh-context critic; did NOT read the implementing lane's r3 activity, report, or
+verify scripts. Booted a real isolated server (`/tmp/feat139-boot.mjs`, free
+ephemeral port 41063, scratch `CLAUDE_STATION_DATA`, `isolatedStoreEnv`) and drove
+the real markup/CSS in the headless Playwright MCP browser over REAL project state
+(git dirty=15 on `main`, procs=4-8 live). Usage was `unknown` in isolation (no
+provider creds) so the ring was exercised by faithfully replaying `paintUsageRing(pct)`
++ severity classes byte-for-byte (R=5.2, C=2πR, same dasharray/offset). Widths 1000/
+1100/1400/1700, light + dark. Screenshots under repo root `feat139-*.png` (gitignored
+build artifacts, not committed).
+
+Verdict: **ships as-is.** No `styles.css` edit applied — see "polish rejected" below.
+
+Judged against the 7 criteria:
+
+1. **Cold legibility — pass with caveat.** For the target (a developer running
+   sessions) `⎇`=branch and the ring=proportion are learnable; every readout has a
+   full-sentence `title` + `aria-label` and opens detail on click. Weakest glyph is
+   `▸` for ports/procs — nothing about a right-triangle says "listening ports"; it is
+   hover-dependent. The 63% static ring can read as a loading spinner to a first-timer.
+   Both rescued by hover; neither ship-blocking.
+2. **The ring — pass (rough gauge).** Arc length conveys proportion and the
+   warn(≥75%)/danger(≥90%) colour shift makes near-limit pop at a glance. Magnitude
+   precision is poor at 14px: 63 vs 80 is a small arc delta and 80 vs 94 is nearly
+   indistinguishable by arc alone — colour carries the near-limit signal. Acceptable
+   as "rough fullness + colour alarm"; it is NOT merely decorative.
+3. **State dot — pass, the strongest part.** Clean/dirty/conflict/detached survive a
+   `grayscale(1)` CVD sim cleanly: two orthogonal, hue-independent axes — shape
+   (circle=on-branch / diamond=unusual HEAD-merge) × fill (filled=has-content /
+   hollow=none). Every pair differs by shape or fill, never tint alone. Verified in
+   both colour and greyscale (feat139-06/07).
+4. **Density & rhythm — pass.** Glyphs vertically centered (measured box tops of `⎇`
+   and `15` align to ~0.5px). Within-zone gap 6px vs a large nav↔readout zone gap at
+   wide widths — zone separation reads. At <~1450 the strip is a clean two-tier
+   (nav buttons / glyph readouts); at wide it is one row, nav-left / readouts-right.
+   One honest imbalance: `⎇` (advance 6px, thin strokes) is the faintest mark while
+   the integration `◆` (advance 10px, solid) is the boldest — but this is the CORRECT
+   hierarchy (glyph = quiet category tag; the bold dirty-dot + count are the reading),
+   not a defect.
+5. **Overshoot — borderline, defensible.** `▸ 4` is a number with no on-face unit and
+   the ring drops the % entirely; both are by-design with the value preserved in
+   tooltip+aria. Nothing reads as WORSE than the sentence it replaced.
+6. **Dark mode — pass, one minor.** Measured contrast vs body bg [7,8,7]: glyph/number
+   5.48, ring fill 6.16 — all well above 4.5, nothing vanishes. The ring TRACK is
+   `var(--hair)` = 1.33 (near-invisible in dark; light track ~1.17 but visible on
+   white). Effect: a 63% arc in dark reads slightly fuller than it is because the
+   "remaining" is not drawn. Minor; the severity colour, not precise arc, is the
+   dispatch signal. Left unchanged (faint-by-design per the CSS comment).
+7. **Deliberate exceptions — pass.** `Board <count>` sits with Guide/Settings/Add-mount
+   as a bordered nav button — belongs. The worded permission pill ("skips prompts"
+   here / "asks first") is louder (bordered, worded) than the borderless glyph
+   readouts, but reads as an intentional safety-state emphasis, not a leftover.
+
+**Polish rejected (not applied):** tested `.seal .readout.git .g{font-size:12px}`
+live via an injected style tag + 3x zoom (feat139-13). The bump is marginal — `⎇` is
+inherently low-ink so recognition barely improves — and it makes the git glyph larger
+than the proc `▸`, introducing a NEW parity break. Discarded; `styles.css` NOT edited,
+so no gate run was required (no repo file changed by this lane).
+
+**Files touched by this lane:** none in the repo. Only `/tmp/feat139-boot.mjs` and the
+gitignored `feat139-*.png` screenshots at repo root. Runtime CSS/theme tweaks were
+browser-injected and reverted.
+
+**Risk bucket:** routine UI review; no independent clean-room pass warranted.

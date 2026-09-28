@@ -30,7 +30,17 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+# FEAT-151 — the Claude CLI, PINNED and BAKED, same policy as serena/playwright.
+#
+# This used to be `npm install -g @anthropic-ai/claude-code` — UNPINNED, so a
+# newer CLI never reached an existing image (a project sat on 2.1.197 while the
+# model required 2.1.280+), the version was absent from provision.json and from
+# provisionHash(), and the baked CLI version was unreadable from image metadata.
+# It becomes a normal registry install of the EXACT version pinned in
+# provision.json, hashed into the image tag, so a bump here rebuilds instead of
+# being a silently ignored comment. The pin's target tracks the host SDK's
+# bundled CLI (runtime-update.ts) — the two speak one stream-json protocol.
+# The install block is BELOW the provision.json COPY (jq needs it); see there.
 
 # BUG-035 — `uv`/`uvx` (astral.sh). MCP servers are spawned by the CLI, which
 # for `isolation: container` means IN HERE. Without uv the CLI just reports
@@ -56,6 +66,19 @@ RUN curl -LsSf https://astral.sh/uv/install.sh \
 # src/server/provisioning.ts hashes it into the image tag so editing it actually
 # produces a different artifact instead of a silently ignored comment.
 COPY provision.json /etc/claude-station/provision.json
+
+# FEAT-151 — the Claude CLI, from the pin (see the note above the uv install).
+# Installed globally so `command -v claude` finds it for the ~/.local/bin symlink
+# below; exact version, no `@latest`, no `-y`. The build asserts the artifact
+# reports the pinned version, exactly like serena/playwright.
+RUN set -eux; \
+    CC_PKG="$(jq -r '.tools["claude-code"].package' /etc/claude-station/provision.json)"; \
+    CC_VER="$(jq -r '.tools["claude-code"].version' /etc/claude-station/provision.json)"; \
+    test -n "${CC_PKG}" && test "${CC_PKG}" != "null"; \
+    test -n "${CC_VER}" && test "${CC_VER}" != "null"; \
+    npm install -g "${CC_PKG}@${CC_VER}"; \
+    claude --version | grep -F "${CC_VER}"
+
 RUN set -eux; \
     SERENA_PKG="$(jq -r '.tools.serena.package' /etc/claude-station/provision.json)"; \
     SERENA_VER="$(jq -r '.tools.serena.version' /etc/claude-station/provision.json)"; \

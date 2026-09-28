@@ -11,7 +11,7 @@ import { WebSocketServer, type WebSocket } from 'ws';
 
 import { projectRoot, dataDir, dataDirMode, assertDataDirIntent, ensureDir, isInside, markSanctionedRealStoreWriter } from '../lib/paths.ts';
 import * as hist from '../lib/session-history.ts';
-import { loadProvenanceMap, resolveStartedBy } from '../lib/session-provenance.mjs';
+import { loadProvenanceMap, resolveStartedBy, foldsFromDefaultList } from '../lib/session-provenance.mjs';
 import * as reg from './registry.ts';
 import * as tpl from './templates.ts';
 import { readSessionConfig } from './session-config.ts';
@@ -41,6 +41,8 @@ import { evaluateGitWrite } from '../../scripts/lib/git-grant.mjs';
 // host-minted per-process secret, so it is not an open localhost endpoint.
 import { isShimSecretValid } from '../../scripts/lib/git-shim-secret.mjs';
 import { runLeakGateForRepo } from './runtime/claude-runtime.ts';
+import * as rt from './runtime/runtime-update.ts';
+import { claudeCodePin, writeClaudeCodePin } from './provisioning.ts';
 import * as procs from './processes.ts';
 import * as board from './board.ts';
 // FEAT-058 — the ticket dashboard's read/write layer over the SAME docs/bugs/
@@ -60,13 +62,13 @@ import * as lanes from './lanes.ts';
 import * as requests from './requests.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
 import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
-import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, knownSlashCommands, knownModels, startZombieReaper, type AgentSession } from './agent-bridge.ts';
+import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, knownSlashCommands, knownModels, startZombieReaper, adoptSession, type AgentSession } from './agent-bridge.ts';
 import { readGlobalDefaults, patchGlobalDefaults } from './global-settings.ts';
 import { listAccounts, createAccount, deleteAccount, AccountError } from './claude-accounts.ts';
 // FEAT-145 step 3 — the "Add account" login relay (one attempt at a time, over
 // the WebSocket below). It owns the CLI child and its process group.
 import { startClaudeLogin, submitClaudeLoginCode, cancelClaudeLogin, type LoginEvent } from './claude-login.ts';
-import { adoptSurvivingHosts, survivingHostForSdkSession, survivingHostForSession, scanSurvivingHosts, dropDeadSurvivorHost, type HostStatus } from './survival.ts';
+import { adoptSurvivingHosts, attachSurvivable, reapHost, survivingHostForSdkSession, survivingHostForSession, scanSurvivingHosts, dropDeadSurvivorHost, type HostStatus } from './survival.ts';
 import { activeDeliveryFor, deliverIntoSurvivor, deliveryEvidenceFor, survivorDeliveryEnabled, type SurvivorDelivery } from './survivor-delivery.ts';
 /*
  * ARCH-001 — every "is it alive / mid-turn" answer this file publishes or acts
@@ -385,6 +387,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   const m = req.method ?? 'GET';
   const rest = seg.slice(1);
 
+  if (rest[0] === 'runtime' && rest.length <= 2) {
+    return await handleRuntimeRoute(req, res, rest[1], m);
+  }
+
   if (rest[0] === 'health' && m === 'GET') {
     /*
      * FEAT-040: the machine half of session-state legibility. Per LIVE
@@ -445,6 +451,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         busyClaimed: s.busy, // the raw in-memory flag, named as the claim it is
         // This entry is a live in-memory AgentSession this server is driving.
         adopted: true,
+        // BUG-187 — how this server came to hold it: `none` = it spawned the CLI;
+        // `adopted` / `responder-only` / `pending` = re-attached to a surviving broker.
+        adoptState: s.adoptState,
         // FEAT-108 round 2 — is a runtime git-write grant currently ACTIVE for
         // this session's project? Surfaced so the session can show that agent
         // git writes are permitted; a grant must never be invisible.
@@ -1499,6 +1508,19 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
             firstUserMessage: s.firstUserMessage,
             record: provenance.get(s.sessionId),
           }),
+          // Whether this row folds out of the DEFAULT nav list (server-owned, so
+          // the client never re-derives it — ARCH-010). True for Orchard dispatch
+          // lanes AND external programmatic sessions Orchard never launched (an
+          // `sdk-cli`/`sdk-ts` transcript with no provenance record); false for
+          // interactive `cli`, legacy no-entrypoint rows, and dashboard sessions
+          // the user launched through Orchard. Presentation only — the transcript
+          // and its URL are untouched, so a folded row still opens on a deep link.
+          foldByDefault: foldsFromDefaultList({
+            sessionId: s.sessionId,
+            entrypoint: (s as { entrypoint?: string | null }).entrypoint ?? null,
+            firstUserMessage: s.firstUserMessage,
+            record: provenance.get(s.sessionId),
+          }),
           // FEAT-037 P2b: which engine recorded this session. 'anthropic' for
           // the Claude store; Orchard-owned rows carry their provider dir.
           provider: (s as { provider?: string }).provider ?? 'anthropic',
@@ -1872,7 +1894,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
          */
         const beforeParam = url.searchParams.get('before');
         const beforeBytesParam = url.searchParams.get('beforeBytes');
-        const before = beforeParam !== null ? intParam(beforeParam, counted.total, 0, Number.MAX_SAFE_INTEGER) : counted.total;
+        // BUG-190: clamp to the real end. The block is labelled [before - len, before), so an
+        // unclamped `before` past the end relabelled the newest messages with indices that do
+        // not exist (before=123 on a 3-message file answered 120..122). Only when the count is
+        // exact — a lower-bound total on a huge file cannot say where the end is.
+        const before = beforeParam !== null ? intParam(beforeParam, counted.total, 0, counted.isLowerBound ? Number.MAX_SAFE_INTEGER : counted.total) : counted.total;
         const maxTextChars = intParam(url.searchParams.get('maxTextChars'), 4000, 0, 200_000);
         const r = beforeBytesParam !== null
           ? tx.tailMessages(file, { limit: n, startByte: intParam(beforeBytesParam, fs.statSync(file).size, 0, Number.MAX_SAFE_INTEGER), includeToolResults, maxTextChars })
@@ -2316,6 +2342,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           containerName: s.containerName,
           busy: s.busy && v.live,
           liveness: livenessWire(v),
+          // FEAT-154 — WAITING ON YOU, published by the OWNER of pending
+          // questions/permissions (the bridge's `#approvals`, BUG-166's server
+          // side). True while a `can_use_tool` / AskUserQuestion / ExitPlanMode
+          // request is outstanding for this session. The session list reads THIS
+          // (per ARCH-010) so a non-open row can show the amber waiting state;
+          // the client never re-derives it from busy flags.
+          awaitingUser: s.approvalsSnapshot().requestIds.length > 0,
           // BUG-033 — the honest turn clock + the evidence behind `busy`.
           turnStartedAt: s.turnStartedAt,
           lastFrameAt: s.lastFrameAt || null,
@@ -2893,7 +2926,11 @@ function handleSubagentRoute(
       const tools = url.searchParams.get('tools') === '1';
       const counted = tx.countMessages(file, { entryFilter: tx.subagentEntryFilter, cacheKeySuffix: 'sub', includeToolResults: tools });
       const beforeParam = url.searchParams.get('before');
-      const before = beforeParam !== null ? intParam(beforeParam, counted.total, 0, Number.MAX_SAFE_INTEGER) : counted.total;
+      // BUG-190: clamp to the real end. The block is labelled [before - len, before), so an
+      // unclamped `before` past the end relabelled the newest messages with indices that do
+      // not exist (before=123 on a 3-message file answered 120..122). Only when the count is
+      // exact — a lower-bound total on a huge file cannot say where the end is.
+      const before = beforeParam !== null ? intParam(beforeParam, counted.total, 0, counted.isLowerBound ? Number.MAX_SAFE_INTEGER : counted.total) : counted.total;
       const skip = Math.max(0, counted.total - before);
       const r = tx.tailMessages(file, {
         limit: n,
@@ -3430,6 +3467,153 @@ async function handleSnapshotsRoute(
  * attached. Nothing in this file may answer "ok" for a container that isn't
  * actually running.
  */
+/**
+ * FEAT-151 — the runtime version + on-demand host-SDK update surface.
+ *
+ * A dedicated sub-handler mirroring handleContainerRoute, reusing sendJson /
+ * readBody. Two runtimes are surfaced (host SDK-bundled CLI, container baked
+ * CLI); only the HOST one updates in place here — the container update WRITES the
+ * provision.json pin (finding #5) and leaves the rebuild to each project's own
+ * schedule (never force-restarting a live container).
+ */
+async function handleRuntimeRoute(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  action: string | undefined,
+  method: string,
+): Promise<boolean> {
+  // GET /api/runtime/version — versions + update-available. Best-effort registry;
+  // never 500 on a network error (the payload carries latest.error instead).
+  if ((action === 'version' || action === undefined) && method === 'GET') {
+    const base = await rt.runtimeVersionPayload();
+    // Container is PER-PROJECT (finding #8): the machine-level facts are the
+    // desired pin and the target it must track (the host SDK's bundled CLI),
+    // plus each container project's ACTUAL baked image CLI. Nothing is inferred
+    // "up to date" from an unknown; a missing label reads as null.
+    const desiredCli = claudeCodePin().version;
+    const targetCli = rt.bundledCliVersion(); // the CLI the host SDK bundles
+    const pinBehindTarget = !!(targetCli && rt.compareVersions(targetCli, desiredCli) > 0);
+    const projects = reg.listProjects()
+      .filter((p) => p.isolation === 'container')
+      .map((p) => {
+        try {
+          const st = cm.containerProvisionState(p);
+          return { id: p.id, name: p.name, state: st.state, custom: st.custom, imageClaudeVersion: st.imageClaudeVersion };
+        } catch (err) {
+          return { id: p.id, name: p.name, state: 'unknown', custom: false, imageClaudeVersion: null, error: (err as Error).message };
+        }
+      });
+    sendJson(res, 200, {
+      ...base,
+      container: {
+        desiredCli,
+        targetCli,
+        latestCli: base.latest.cli,
+        pinBehindTarget,
+        projects,
+      },
+    });
+    return true;
+  }
+
+  if (method !== 'POST') {
+    sendJson(res, 405, { error: `method ${method} not allowed on /runtime/${action ?? ''}` });
+    return true;
+  }
+
+  /*
+   * finding #2 — ORIGIN + CONTENT-TYPE GUARD on the mutation. The global Host
+   * check runs already; readBody parses any content-type, and the WS Origin
+   * allowlist does not cover HTTP. So a foreign page could text/plain-POST valid
+   * JSON to localhost. Reject cross-origin/null-listed origins and any non-JSON
+   * content type BEFORE spawning npm or touching provision.json. A browser always
+   * sends Origin on a cross-site fetch; a missing Origin is a non-browser client
+   * (CLI/curl) and is allowed, exactly like the WS handshake rule.
+   */
+  const origin = req.headers.origin as string | undefined;
+  if (origin !== undefined && !originAllowed(origin)) {
+    sendJson(res, 403, { error: `forbidden: Origin "${origin}" not allowed` });
+    return true;
+  }
+  const ctype = String(req.headers['content-type'] ?? '');
+  if (!/^application\/json\b/i.test(ctype)) {
+    sendJson(res, 415, { error: `unsupported content-type ${JSON.stringify(ctype || '(none)')}; application/json required` });
+    return true;
+  }
+
+  let body: Record<string, unknown> = {};
+  try {
+    body = (await readBody(req)) as Record<string, unknown>;
+  } catch (err) {
+    sendJson(res, 400, { error: `invalid JSON body: ${(err as Error).message}` });
+    return true;
+  }
+
+  // POST /api/runtime/update { target:'host', version? } — install & pin the SDK.
+  if (action === 'update') {
+    const target = body.target ?? 'host';
+    if (target !== 'host') {
+      sendJson(res, 400, { error: `target ${JSON.stringify(target)} is not updatable in place; use the container pin route`, code: 'bad-target' });
+      return true;
+    }
+    const version = body.version === undefined ? undefined : String(body.version);
+    try {
+      const result = await rt.updateHostRuntime({ version });
+      if (!result.ok) {
+        sendJson(res, 500, result);
+        return true;
+      }
+      sendJson(res, 200, result);
+      return true;
+    } catch (err) {
+      if (err instanceof rt.UpdateInProgressError) {
+        sendJson(res, 409, { ok: false, error: err.message, code: 'update-in-progress' });
+        return true;
+      }
+      sendJson(res, 500, { ok: false, error: (err as Error).message });
+      return true;
+    }
+  }
+
+  // POST /api/runtime/container-pin { version? } — WRITE the provision.json pin
+  // (finding #5). Default target is the host SDK's bundled CLI (finding #7:
+  // probed, never string-arithmetic on the SDK version). This changes the image
+  // identity; it does NOT rebuild or restart any running container — the new
+  // image is built when each project next starts a session, so live containers
+  // are never force-replaced.
+  if (action === 'container-pin') {
+    let version: string;
+    if (body.version === undefined) {
+      const target = rt.bundledCliVersion();
+      if (!target) {
+        sendJson(res, 500, { error: 'cannot determine the host SDK bundled CLI version to pin the container to' });
+        return true;
+      }
+      version = target;
+    } else {
+      version = String(body.version);
+    }
+    try {
+      const { changed, previous } = writeClaudeCodePin(version);
+      sendJson(res, 200, {
+        ok: true,
+        changed,
+        previous,
+        version,
+        note: changed
+          ? 'container CLI pin updated. The new image builds when each container project next starts a session; running containers are not restarted.'
+          : `container CLI pin already at ${version}; nothing changed.`,
+      });
+      return true;
+    } catch (err) {
+      sendJson(res, 400, { ok: false, error: (err as Error).message });
+      return true;
+    }
+  }
+
+  return notFound(res, `no runtime action "${action ?? ''}"`);
+}
+
 async function handleContainerRoute(
   res: http.ServerResponse,
   projectId: string,
@@ -3684,6 +3868,32 @@ const server = http.createServer((req, res) => {
  * when the row settles (and every row settles at `result` on such a runtime,
  * so its idle sessions answer `no` and close exactly as before this fix).
  */
+/**
+ * BUG-187 I1 — which registered project a surviving broker belongs to. A
+ * broker spawned since BUG-187 records `projectId` in its meta; an older one
+ * does not, so its CLI's working directory (the project's hostPath, which is
+ * the cwd every direct session is spawned in) is matched against the registry.
+ */
+function projectForSurvivor(st: HostStatus): ReturnType<typeof reg.getProject> {
+  if (st.projectId) {
+    const p = reg.getProject(st.projectId);
+    if (p) return p;
+  }
+  for (const pid of [st.claudePid, st.hostPid]) {
+    if (!pid) continue;
+    let cwd: string | null = null;
+    try { cwd = fs.realpathSync(`/proc/${pid}/cwd`); } catch { cwd = null; }
+    if (!cwd) continue;
+    for (const p of reg.listProjects()) {
+      if (p.isolation !== 'direct') continue;
+      let hp = p.hostPath;
+      try { hp = fs.realpathSync(p.hostPath); } catch { /* keep as-is */ }
+      if (hp === cwd) return p;
+    }
+  }
+  return null;
+}
+
 function releaseSocketSession(session: AgentSession | null, reason: string): void {
   if (!session || session.closed) return;
   // BUG-018: a busy session detaches — an open approval card and the running
@@ -3695,6 +3905,29 @@ function releaseSocketSession(session: AgentSession | null, reason: string): voi
   // closes once the work is actually done; for a container that verdict is a
   // process probe, not a timeout.
   if (session.busy) { session.detach(); return; }
+  /*
+   * BUG-187 B4/I2 — a BROKERED session's close reads the BROKER's lifetime (the
+   * one close gate shared with the detached fuse and shutdown). Detach first —
+   * nothing is closed on the bridge's own filtered view — then close only if
+   * the broker itself says no work outlives the turn. The fuse `detach()` arms
+   * is the same gate, so a `yes`/`unknown` is simply re-checked later.
+   */
+  if (session.survivable) {
+    session.detach();
+    void session.closeLifetime().then((cl) => {
+      if (session.closed || !session.detached || session.busy) return;
+      if (cl.lifetime === 'no') {
+        console.log(`[orchard] ${reason}: closing idle session ${session.id} — the broker's lifetime is no (${cl.source})`);
+        void session.close(reason).catch(() => {});
+        return;
+      }
+      console.log(
+        `[orchard] ${reason}: session ${session.id} detached instead of closed — ` +
+        `work outlives the turn (${cl.lifetime}: per its broker — ${cl.source})`,
+      );
+    }, () => { /* unknown: stay detached — the fuse re-checks */ });
+    return;
+  }
   const lifetime = session.workLifetime();
   if (lifetime.outlivesTurn !== 'no') {
     console.log(
@@ -3719,6 +3952,18 @@ function releaseSocketSession(session: AgentSession | null, reason: string): voi
   }
   void session.close(reason).catch(() => {});
 }
+
+/**
+ * BUG-191 — one confirmed delivery at a time per session. A gated delivery
+ * (`AgentSession.sendGated`, the broker's correlated `deliver_ack`) awaits the
+ * broker; for that window the session is RESERVED here, keyed by its SDK
+ * session id and owned by the socket that started it. Acquired synchronously
+ * before the await, released in `finally` when the delivery settles — never
+ * by a socket close (a delivery in flight is still in flight). Every resume
+ * route checks it first, so a second tab can neither take the driving socket
+ * nor race a second delivery into the same moment.
+ */
+const deliveryInFlight = new Map<string, symbol>();
 
 const wss = new WebSocketServer({
   server,
@@ -3854,6 +4099,24 @@ wss.on('connection', (ws: WebSocket) => {
            */
           if (cmd.resumeSessionId) {
             /*
+             * BUG-191 — another socket is mid-way through a confirmed delivery
+             * into this session. A message is refused RETRYABLY (the tab queues
+             * it and retries in a few seconds); a promptless reattach is told the
+             * session is being driven elsewhere, exactly as BUG-149 does.
+             */
+            if (deliveryInFlight.has(cmd.resumeSessionId)) {
+              if (typeof cmd.prompt === 'string' && cmd.prompt.trim()) {
+                return send({
+                  t: 'error', fatal: false, retryable: true,
+                  message: 'another tab is delivering a message into this session right now — your message is queued and sends itself in a moment',
+                });
+              }
+              return send({
+                t: 'error', code: 'live-elsewhere', fatal: true,
+                message: 'this session is being driven in another tab — a session streams to one tab at a time. Close it there (or send from there) to take it over here; until then you can watch it here read-only.',
+              });
+            }
+            /*
              * BUG-033 — LIVENESS GATE, before the bridge is treated as live.
              * A bridge in the registry used to be proof enough that the session
              * was running; it is not. A CLI killed mid-turn leaves the bridge
@@ -3938,61 +4201,120 @@ wss.on('connection', (ws: WebSocket) => {
                * branch further down honest: it is an accepted delay behind a
                * turn known to be running, not a silent swallow behind a claim.
                */
-              running.attach(send);
-              session = running;
-              send({
-                t: 'ack', of: 'start', reattached: true, busy: running.busy,
-                // BUG-033: the REAL start of the in-flight turn (null when none).
-                // The client must not stamp "now" — a timer counting from when
-                // the tab found out is a fabricated duration.
-                turnStartedAt: running.turnStartedAt,
-                stationSessionId: running.id, isolation: project.isolation,
-                containerName: running.containerName,
-                instructionMode: running.composed.mode, appliedTemplates: running.composed.appliedIds,
-                overridden: running.overriddenFields, effective: running.effective,
-                capabilities: running.capabilities, // FEAT-037 P3: engine honesty flags
-                permissionModeSource: running.permissionModeSource,
-                fork: running.forkInfo(),
-                startSnapshotId: running.startSnapshotId,
-                startSnapshotStatus: running.startSnapshotStatus,
-                startSnapshotError: running.startSnapshotError,
-              });
-              send({
-                t: 'session-init', sessionId: running.sdkSessionId ?? cmd.resumeSessionId, cwd: running.cwd,
-                model: String(running.effective?.model ?? 'unknown'), tools: [],
-                permissionMode: running.effective?.permissionMode,
-                slashCommands: knownSlashCommands(),
-              });
+              const resumeId: string = cmd.resumeSessionId;
+              const reattach = (live: AgentSession, ackExtra: Record<string, unknown> = {}) => {
+                live.attach(send);
+                session = live;
+                send({
+                  t: 'ack', of: 'start', reattached: true, busy: live.busy, ...ackExtra,
+                  // BUG-033: the REAL start of the in-flight turn (null when none).
+                  // The client must not stamp "now" — a timer counting from when
+                  // the tab found out is a fabricated duration.
+                  turnStartedAt: live.turnStartedAt,
+                  stationSessionId: live.id, isolation: project.isolation,
+                  containerName: live.containerName,
+                  instructionMode: live.composed.mode, appliedTemplates: live.composed.appliedIds,
+                  overridden: live.overriddenFields, effective: live.effective,
+                  capabilities: live.capabilities, // FEAT-037 P3: engine honesty flags
+                  permissionModeSource: live.permissionModeSource,
+                  fork: live.forkInfo(),
+                  startSnapshotId: live.startSnapshotId,
+                  startSnapshotStatus: live.startSnapshotStatus,
+                  startSnapshotError: live.startSnapshotError,
+                });
+                send({
+                  t: 'session-init', sessionId: live.sdkSessionId ?? resumeId, cwd: live.cwd,
+                  model: String(live.effective?.model ?? 'unknown'), tools: [],
+                  permissionMode: live.effective?.permissionMode,
+                  slashCommands: knownSlashCommands(),
+                });
+                /*
+                 * BUG-008: a card (permission/question/plan) that was open when the
+                 * old socket died is still pending in this session, unanswered and
+                 * invisible — it lives only in memory, never in the transcript, so
+                 * file-follow can't surface it. Replay it to THIS socket now (after
+                 * the handshake) so the user can answer the still-open turn instead
+                 * of watching a "still working" session that is blocked forever.
+                 */
+                live.replayPending();
+                /*
+                 * BUG-187 I4 — then the AUTHORITATIVE list of what is still
+                 * pending, so a card this tab kept from before a restart (or that
+                 * was answered elsewhere) settles as expired instead of re-arming
+                 * into nothing. `complete:false` while an adoption is recovering.
+                 */
+                live.emitApprovalsSnapshot();
+                /*
+                 * BUG-020: `replayPending()` only covers open approval/question/
+                 * plan cards. A sub-agent (Task tool) keeps running server-side
+                 * across a detach (BUG-018 lineage) but the reattaching client's
+                 * live "agents running" strip was seeded ONLY by future events —
+                 * an already-completed sub-agent was never mentioned at all.
+                 * Replay the session's current agent snapshot so the strip shows
+                 * ground truth immediately, not by luck.
+                 */
+                live.replayAgents();
+                /*
+                 * ARCH-001 phase 2 / BUG-034 — and the CORRECTING answer right
+                 * behind the replay: the server's own running-set snapshot. The
+                 * replay above re-emits per-agent deltas (BUG-020, still needed
+                 * for threads and "ran" rows); THIS says what is running, as one
+                 * authoritative list, so a tab that lived through a cut and is
+                 * holding rows the server does not believe in is corrected — and
+                 * EMPTIED if that is the truth — without a page reload.
+                 */
+                live.pushRunningSnapshot(true);
+              };
+              const prompt = typeof cmd.prompt === 'string' && cmd.prompt.trim() ? cmd.prompt : null;
               /*
-               * BUG-008: a card (permission/question/plan) that was open when the
-               * old socket died is still pending in this session, unanswered and
-               * invisible — it lives only in memory, never in the transcript, so
-               * file-follow can't surface it. Replay it to THIS socket now (after
-               * the handshake) so the user can answer the still-open turn instead
-               * of watching a "still working" session that is blocked forever.
+               * BUG-191 — an ADOPT-GATED session (BUG-187 B2: adoption `pending`,
+               * or settled `responder-only`) does not own its CLI. Its message is
+               * decided BEFORE anything is acknowledged:
+               *  - the gate refuses → a retryable refusal with the `drain` payload,
+               *    no attach, no ack — the tab's BUG-045 queue keeps the text;
+               *  - the gate passes → the message goes in through the broker's
+               *    correlated acceptance (`sendGated`), and the tab is acked only
+               *    once the broker has WRITTEN it (`promptDelivered:true`), or
+               *    refused retryably if it did not, or told `uncertain` (never a
+               *    blind resend) if the broker did not answer.
+               * Before this, the ack went out first and the refusal after it, so
+               * the tab retired a message that was never delivered.
                */
-              running.replayPending();
               /*
-               * BUG-020: `replayPending()` only covers open approval/question/
-               * plan cards. A sub-agent (Task tool) keeps running server-side
-               * across a detach (BUG-018 lineage) but the reattaching client's
-               * live "agents running" strip was seeded ONLY by future events —
-               * an already-completed sub-agent was never mentioned at all.
-               * Replay the session's current agent snapshot so the strip shows
-               * ground truth immediately, not by luck.
+               * BUG-191 round 2 (B5) — the gate is decided for EVERY prompt-bearing
+               * reattach, not only an adopt-gated one: a session held by an older
+               * broker (protocol < 2) that settled `adopted` cannot confirm a
+               * delivery either, and must be refused here, before the ack.
                */
-              running.replayAgents();
-              /*
-               * ARCH-001 phase 2 / BUG-034 — and the CORRECTING answer right
-               * behind the replay: the server's own running-set snapshot. The
-               * replay above re-emits per-agent deltas (BUG-020, still needed
-               * for threads and "ran" rows); THIS says what is running, as one
-               * authoritative list, so a tab that lived through a cut and is
-               * holding rows the server does not believe in is corrected — and
-               * EMPTIED if that is the truth — without a page reload.
-               */
-              running.pushRunningSnapshot(true);
-              if (cmd.prompt) {
+              const gate = prompt ? running.sendGate() : null;
+              if (gate && !gate.ok) {
+                return send({ t: 'error', fatal: false, retryable: true, message: gate.message, drain: gate.drain });
+              }
+              if (prompt && running.adoptGated) {
+                const sid = resumeId;
+                const token = Symbol('delivery');
+                deliveryInFlight.set(sid, token);
+                starting = true;
+                const live = running;
+                void live.sendGated(prompt)
+                  .then((r) => {
+                    if (r.outcome === 'refused') return send({ t: 'error', fatal: false, retryable: true, message: r.message, drain: r.drain });
+                    if (r.outcome === 'uncertain') return send({ t: 'error', fatal: false, uncertain: true, message: r.message });
+                    // Delivered. A closed socket has nobody to tell — its tab
+                    // treats the silent attempt as unconfirmed (never resent).
+                    if (closedEarly) return;
+                    if (live.closed) return send({ t: 'error', fatal: false, uncertain: true, message: 'the message was handed to the session, which then ended before this tab could re-attach — it is not resent automatically; check the transcript before sending it again' });
+                    reattach(live, { promptDelivered: true });
+                  })
+                  .catch((err) => { send({ t: 'error', fatal: false, uncertain: true, message: `the delivery could not be confirmed (${(err as Error).message}) — it is not resent automatically; check the transcript before sending it again` }); })
+                  .finally(() => {
+                    starting = false;
+                    if (deliveryInFlight.get(sid) === token) deliveryInFlight.delete(sid);
+                  });
+                return;
+              }
+              reattach(running);
+              if (prompt) {
                 if (running.busy) {
                   // Verified mid-flight (see the refusal belt above) — the honest
                   // "later", now with the evidence that backs it named out loud.
@@ -4001,7 +4323,7 @@ wss.on('connection', (ws: WebSocket) => {
                     status: `re-attached mid-turn — the running work continues (${running.livenessVerdict().reason}); deliver your message at the next pause`,
                   });
                 } else {
-                  try { running.send(cmd.prompt); } catch (err) { send({ t: 'error', message: (err as Error).message, fatal: false }); }
+                  try { running.send(prompt); } catch (err) { send({ t: 'error', message: (err as Error).message, fatal: false }); }
                 }
               }
               return;
@@ -4124,6 +4446,10 @@ wss.on('connection', (ws: WebSocket) => {
                   || (survivor.backgroundLifetime === 'unknown' && bgCount > 0);
                 const deliverable = survivorDeliveryEnabled()
                   && typeof cmd.prompt === 'string' && cmd.prompt.trim().length > 0
+                  // BUG-187 H7/R5: never into a broker that has ended its CLI's input.
+                  && survivor.acceptingInput !== false
+                  // BUG-191: only a broker that can CONFIRM a delivery (H7, protocol 2).
+                  && (survivor.protocol ?? 0) >= 2
                   && survivor.state === 'draining'
                   && survivor.midTurn === false
                   && lifetimeDeliverable
@@ -4135,6 +4461,14 @@ wss.on('connection', (ws: WebSocket) => {
                     .then((handle) => {
                       starting = false;
                       if (!handle) return refuseDrainHeld();
+                      // BUG-191: the envelope went out and the broker never
+                      // answered — it may have arrived. Never a blind retry.
+                      if (handle === 'uncertain') {
+                        return send({
+                          t: 'error', fatal: false, uncertain: true,
+                          message: 'the surviving session did not confirm the delivery in time — your message may or may not have reached it. It is not resent automatically; check the transcript before sending it again.',
+                        });
+                      }
                       if (closedEarly) { handle.attachClient(null); return; }
                       delivery = handle;
                       console.log(
@@ -4277,8 +4611,43 @@ wss.on('connection', (ws: WebSocket) => {
           // the message in the runtime input queue and reports `queued:true`. The
           // ack carries that through so the tab can caption it honestly ("queued
           // behind background work") instead of the old bare marker or a refusal.
-          const sent = session.send(cmd.prompt);
-          return send({ t: 'ack', of: 'send', delivered: sent.delivered, queued: sent.queued });
+          /*
+           * BUG-191 — an ADOPT-GATED session takes a message only with the
+           * broker's correlated acceptance, so this ack is sent only once the
+           * broker has WRITTEN it. A refusal goes back retryable, tagged
+           * `of:'send'` + the client's `sendId`, so the tab recovers exactly that
+           * attempt's rows into its queue; an unanswered delivery is `uncertain`
+           * (never a blind resend). Before this, the gate's throw reached the
+           * socket catch-all below, which dropped `retryable`, and the tab kept a
+           * bubble for a message that was never delivered.
+           */
+          const sendId = typeof cmd.sendId === 'string' ? cmd.sendId : undefined;
+          if (session.adoptGated) {
+            const sid = session.sdkSessionId;
+            if (sid && deliveryInFlight.has(sid)) {
+              return send({ t: 'error', fatal: false, retryable: true, of: 'send', sendId, message: 'another delivery into this session is in flight — your message is queued and sends itself in a moment' });
+            }
+            const token = Symbol('delivery');
+            if (sid) deliveryInFlight.set(sid, token);
+            void session.sendGated(cmd.prompt)
+              .then((r) => {
+                if (r.outcome === 'delivered') return send({ t: 'ack', of: 'send', delivered: true, queued: false, sendId });
+                if (r.outcome === 'refused') return send({ t: 'error', fatal: false, retryable: true, of: 'send', sendId, message: r.message, drain: r.drain });
+                return send({ t: 'error', fatal: false, uncertain: true, of: 'send', sendId, message: r.message });
+              })
+              .catch((err) => { send({ t: 'error', fatal: false, uncertain: true, of: 'send', sendId, message: `the delivery could not be confirmed (${(err as Error).message}) — it is not resent automatically; check the transcript before sending it again` }); })
+              .finally(() => { if (sid && deliveryInFlight.get(sid) === token) deliveryInFlight.delete(sid); });
+            return;
+          }
+          let sent: { delivered: boolean; queued: boolean };
+          try {
+            sent = session.send(cmd.prompt);
+          } catch (err) {
+            const e = err as Error & { retryable?: boolean; drain?: unknown };
+            if (e.retryable) return send({ t: 'error', fatal: false, retryable: true, of: 'send', sendId, message: e.message, drain: e.drain as never });
+            throw err;
+          }
+          return send({ t: 'ack', of: 'send', delivered: sent.delivered, queued: sent.queued, sendId });
         }
         case 'interrupt':
           if (!session) return send({ t: 'error', message: 'no session on this socket', fatal: false });
@@ -4530,7 +4899,33 @@ server.listen(PORT, HOST, () => {
    * with no survivors is a no-op.
    */
   try {
-    const adopted = adoptSurvivingHosts((m) => console.log(m));
+    /*
+     * BUG-187 I1 — a survivor holding live work (lanes, a turn, pending
+     * requests) is ADOPTED: a responder is re-attached to its running CLI
+     * (attach facade → the SDK's initialize becomes the CLI's repeated
+     * initialize). Idle survivors are reaped as before. Each broker's
+     * disposition is logged by the session once its adoption settles.
+     */
+    const adopted = adoptSurvivingHosts((m) => console.log(m), (st, why) => {
+      const project = projectForSurvivor(st);
+      if (!project) {
+        /*
+         * Nothing to adopt it INTO: fall back to the pre-BUG-187 disposition —
+         * the graceful reap, whose drain HOLDS while its lanes are live (no EOF,
+         * BUG-044) and keeps FEAT-065 delivery possible (it gates on
+         * `draining`). A protocol-2 broker's request floor then bounds any lane
+         * that cannot get an answer.
+         */
+        console.warn(
+          `[orchard] BUG-187: cannot adopt broker pid ${st.hostPid} (${why}) — no registered project matches it ` +
+          `(record projectId ${st.projectId ?? 'absent'}). Falling back to the graceful reap (its drain holds while its lanes live).`,
+        );
+        reapHost(st.status);
+        return;
+      }
+      const facade = attachSurvivable(st);
+      adoptSession(st, facade, project);
+    });
     if (adopted) console.log(`[orchard] re-adopted ${adopted} surviving session host(s) from a prior run`);
   } catch (err) {
     console.warn(`[orchard] survivor re-adopt scan failed: ${(err as Error).message}`);

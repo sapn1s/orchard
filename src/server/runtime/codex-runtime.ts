@@ -338,6 +338,16 @@ export class CodexRuntime implements AgentRuntime {
   #mode: CodexModeConfig | null = null;
   /** Model override for the NEXT turn; undefined = untouched, null = cleared. */
   #pendingModel: string | null | undefined = undefined;
+  /**
+   * BUG-188 r3 — the model sent when Orchard has NO model to send (null =
+   * "engine default"). Codex's turn/start `model` is STICKY ("for this turn and
+   * subsequent turns") and persisted with the thread, so omitting it on a
+   * RESUMED thread does NOT mean "Codex default" — it means "keep whatever the
+   * thread last ran", which for a thread poisoned by the pre-fix leak is a model
+   * the account cannot serve (observed: `claude-opus-5-5` in ~/.codex state →
+   * 400 on every turn). Set only by #healResumedModel; null = omit as before.
+   */
+  #fallbackModel: string | null = null;
   /** Item ids we announced as tool_use — their completion becomes tool_result. */
   #toolItems = new Set<string>();
   /** Per-turn token usage — the Turn object carries NO usage on the real wire;
@@ -514,6 +524,7 @@ export class CodexRuntime implements AgentRuntime {
     }
     this.#threadId = String(threadResult?.thread?.id ?? '');
     if (!this.#threadId) throw new Error('codex app-server returned no thread id');
+    if (config.resume) await this.#healResumedModel(threadResult?.model);
 
     // The init frame AgentSession expects — session_id is the Codex thread id,
     // which is exactly what resume needs back later.
@@ -522,13 +533,44 @@ export class CodexRuntime implements AgentRuntime {
       subtype: 'init',
       session_id: this.#threadId,
       cwd: config.cwd,
-      model: config.model ?? 'codex default',
+      model: config.model ?? this.#fallbackModel ?? 'codex default',
       tools: [],
       permissionMode: config.permissionMode,
       slash_commands: [], // Codex has no Claude-style slash-command list
     });
 
     this.#startTurn(config.firstPrompt);
+  }
+
+  /**
+   * BUG-188 r3 — a resumed thread carries its OWN persisted model (the
+   * thread/resume response's `model`), and a turn/start without `model` keeps
+   * it. When Orchard has no model to send and that stored model is not one this
+   * account's Codex catalog offers (model/list — the provider's own authority,
+   * ARCH-010; no string guessing), send the catalog default instead so the
+   * thread heals on its next turn. A stored model the catalog DOES offer is left
+   * alone (no silent model change for a working thread); an unreachable/empty
+   * catalog leaves behaviour unchanged (we cannot place the model, so we do not
+   * override it).
+   */
+  async #healResumedModel(storedModel: unknown): Promise<void> {
+    if (this.#config?.model) return; // an explicit model rides every turn/start
+    if (typeof storedModel !== 'string' || !storedModel) return;
+    let data: Array<Record<string, any>> = [];
+    try {
+      const r: any = await this.#request('model/list', { includeHidden: true });
+      data = Array.isArray(r?.data) ? r.data : [];
+    } catch { return; }
+    if (!data.length) return;
+    const offered = new Set<string>();
+    for (const m of data) {
+      if (m.id != null) offered.add(String(m.id));
+      if (m.model != null) offered.add(String(m.model));
+    }
+    if (offered.has(storedModel)) return;
+    const def = data.find((m) => m.isDefault && !m.hidden) ?? data.find((m) => m.isDefault) ?? data.find((m) => !m.hidden) ?? data[0];
+    const pick = def ? String(def.id ?? def.model ?? '') : '';
+    if (pick) this.#fallbackModel = pick;
   }
 
   send(text: string): void {
@@ -557,7 +599,7 @@ export class CodexRuntime implements AgentRuntime {
       sandboxPolicy: this.#mode!.sandboxPolicy,
       ...(this.#config?.effort ? { effort: this.#config.effort } : {}),
     };
-    const model = this.#pendingModel !== undefined ? this.#pendingModel : this.#config?.model ?? null;
+    const model = (this.#pendingModel !== undefined ? this.#pendingModel : this.#config?.model ?? null) || this.#fallbackModel;
     if (model) params.model = model;
     void this.#request('turn/start', params)
       .then((r: any) => { this.#turnId = String(r?.turn?.id ?? this.#turnId ?? ''); })

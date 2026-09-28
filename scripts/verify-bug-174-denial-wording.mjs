@@ -78,10 +78,21 @@ let observed = null;
   const lines = [];
   const server = net.createServer((c) => {
     let buf = '';
+    // BUG-191: a survivor must CONFIRM a delivery (BUG-187 H7, protocol 2) — an
+    // older broker that cannot is never written to. So this fake speaks the
+    // protocol a real broker does: hello on accept, deliver_ack for a delivery.
+    c.write(`${JSON.stringify({ type: 'orchard_broker_hello', accepted: true, hostKey: 'bug174', protocol: 2 })}\n`);
     c.on('data', (b) => {
       buf += b.toString('utf8');
       let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) { lines.push(buf.slice(0, nl)); buf = buf.slice(nl + 1); }
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        lines.push(line);
+        let m = null;
+        try { m = JSON.parse(line); } catch { m = null; }
+        if (m?.type === 'orchard_broker_deliver') c.write(`${JSON.stringify({ type: 'orchard_broker_deliver_ack', delivery_id: m.delivery_id, accepted: true })}\n`);
+      }
     });
     // The survivor's stdin side: once the user frame lands, raise a real
     // permission request back at the relay.

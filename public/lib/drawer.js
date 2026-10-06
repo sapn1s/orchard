@@ -22,10 +22,25 @@
 import { $, el, clear, shortPath, bytes, stamp, when } from './dom.js';
 import * as api from './api.js';
 
-const MODEL_CYCLE = [null, 'opus', 'sonnet', 'haiku'];
-const EFFORT_CYCLE = [null, 'low', 'medium', 'high', 'xhigh', 'max'];
-const BUDGET_CYCLE = [null, 10, 25, 40];
-const PERM_CYCLE = ['default', 'plan', 'acceptEdits', 'bypassPermissions'];
+/* FEAT-159 — these used to be CYCLES: clicking the row wrote the next entry of
+   a list the user could not see. They are the option lists of real controls
+   now; the stored values are unchanged. */
+const MODEL_ALIASES = ['opus', 'sonnet', 'haiku'];
+const EFFORT_CHOICES = [
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra high' },
+  { value: 'max', label: 'Max' },
+];
+const PERM_CHOICES = [
+  { value: 'default', label: 'Ask before acting' },
+  { value: 'plan', label: 'Plan only' },
+  { value: 'acceptEdits', label: 'Auto-accept edits' },
+  { value: 'bypassPermissions', label: 'Bypass approvals' },
+];
+/** The server's own MODEL_RE (global-settings.ts), so a bad id fails before the round trip. */
+const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,79}$/;
 /* FEAT-146 round 4 — no glyphs. `▣ ◑ ○` were unreadable at 11px, arbitrary
    (nothing about a half-filled circle says "sandbox"), inconsistent with the
    provider set's `✳ ⌬`, and the stacked glyph line is what forced the segments
@@ -57,7 +72,7 @@ const REASON_TEXT = {
  */
 const WIRED_IN_SESSION = new Set(['instructions', 'model', 'effort', 'permissionMode',
   'maxBudgetUsd', 'allowedTools', 'disallowedTools', 'provider']);
-const PROJECT_ONLY = new Set(['isolation', 'mounts', 'container']);
+const PROJECT_ONLY = new Set(['isolation', 'mounts', 'container', 'laneDocker']);
 
 export function createDrawer(ctx) {
   /* ctx: { getProject(), refreshProject(), overrides, notify(msg,isErr), onStackChanged() } */
@@ -75,6 +90,7 @@ export function createDrawer(ctx) {
     runtimePinBusy: false, // a container-pin POST is in flight
     composed: null,
     addingMount: false,
+    addingEnv: false,
     armSocket: false,
     browser: undefined, // undefined = unfetched, null = route absent
     providers: undefined, // FEAT-037 P3: /api/providers verdicts (undefined = unfetched, null = route absent)
@@ -141,6 +157,9 @@ export function createDrawer(ctx) {
     whyAll: (() => { try { return localStorage.getItem('orchard.settings.descriptions') === 'all'; } catch { return false; } })(),
     whyOpen: new Set(),
     whyClosed: new Set(),
+    /** FEAT-159 — the one open "Custom…" editor: { field, text } or null. Held
+     *  here so an unrelated background repaint keeps what the user typed. */
+    customEdit: null,
     whyFade: null,
     /** The element focus returns to on close (see closeModal). */
     returnFocus: null,
@@ -215,7 +234,9 @@ export function createDrawer(ctx) {
     integrations: 'permissions',
     iso: 'isolation',
     mounts: 'isolation',
+    env: 'isolation',
     services: 'isolation',
+    laneDocker: 'isolation',
     git: 'workspace',
     processes: 'workspace',
     instructions: 'instructions',
@@ -299,6 +320,14 @@ export function createDrawer(ctx) {
   const isOvr = (field) => overriddenNow(field);
 
   async function put(field, value) {
+    // BUG-196 round 5 — a SESSION-scope provider never lands in ctx.overrides from
+    // here: it goes through the app's one guarded writer (pickProvider), which
+    // refuses a switch for an existing session id, pinned yet or not.
+    if (d.scope === 'session' && field === 'provider') {
+      ctx.pickSessionProvider?.(value ?? null);
+      paint();
+      return;
+    }
     if (d.scope === 'session') {
       if (JSON.stringify(value) === JSON.stringify(base(field))) delete ctx.overrides[field];
       else ctx.overrides[field] = value;
@@ -316,12 +345,6 @@ export function createDrawer(ctx) {
       ctx.notify(`could not save ${field}: ${err.message}`, true);
       paint();
     }
-  }
-
-  function cycle(field, list) {
-    const cur = val(field);
-    const i = list.findIndex((x) => JSON.stringify(x) === JSON.stringify(cur));
-    void put(field, list[(i + 1) % list.length]);
   }
 
   const show = (v) =>
@@ -382,15 +405,23 @@ export function createDrawer(ctx) {
   }) : null);
 
   /** The level a reset falls back TO, and the value that would then apply. */
-  function resetTarget(field) {
-    if (overriddenNow(field) && isSet(base(field))) return { level: 'project', text: show(base(field)) };
-    if (isSet(machineValue(field))) return { level: 'machine', text: show(machineValue(field)) };
-    const t = show(resetValueOf(field));
-    return { level: 'built-in', text: t === 'inherit' ? 'built-in default' : t };
+  function resetTarget(field, fmt = show) {
+    if (overriddenNow(field) && isSet(base(field))) return { level: 'project', text: fmt(base(field)) };
+    if (isSet(machineValue(field))) return { level: 'machine', text: fmt(machineValue(field)) };
+    const rv = resetValueOf(field);
+    const t = isSet(rv) ? fmt(rv) : null;
+    return { level: 'built-in', text: t && t !== 'inherit' ? t : 'built-in default' };
   }
 
   /** Undo whatever the filled chip reports: the override, or the project value. */
   function resetField(field) {
+    // BUG-196 round 5 — resetting the session provider is a provider write too:
+    // same one guarded writer (null = back to the project default).
+    if (d.scope === 'session' && field === 'provider') {
+      ctx.pickSessionProvider?.(null);
+      paint();
+      return;
+    }
     if (d.scope === 'session' && overriddenNow(field)) {
       delete ctx.overrides[field];
       ctx.onStackChanged?.();
@@ -427,6 +458,11 @@ export function createDrawer(ctx) {
     'container.image': 'The Docker image sessions in this project run inside. Left empty, Orchard uses its own '
       + 'image. A changed image takes effect the next time the container is built, not on a session '
       + 'already running.',
+    'container.dockerfile': 'A Dockerfile in this project’s own repo (path relative to the repo) that Orchard builds '
+      + 'this project’s image from. Start it with “ARG ORCHARD_BASE_IMAGE” and “FROM ${ORCHARD_BASE_IMAGE}” to keep '
+      + 'Orchard’s tooling. Orchard rebuilds when the file changes, checked each time a session starts; if a build '
+      + 'fails, the last good image keeps running. The file decides what is installed, never how the container '
+      + 'runs: the user, mounts, GPU, memory and network stay Orchard’s.',
     serena: 'Serena attaches a language server, so a session can look code up by symbol — find a definition, '
       + 'list references — instead of reading whole files. Off means sessions read files the ordinary way.',
     playwright: 'Playwright gives a session a headless browser it can drive, which is how it tests a UI it just '
@@ -522,46 +558,214 @@ export function createDrawer(ctx) {
 
   /* ------------------------------------------------------------- rows */
 
+  /**
+   * FEAT-159 — a settings row whose VALUE is edited by a real control.
+   *
+   * Until this ticket every value row was a "cycle": the whole row was a button,
+   * and clicking it wrote the NEXT entry of a list nobody could see. Its first
+   * click also silently turned an inherited value into one set here, so the chip
+   * flipped from `machine` to `project` — which is what the user read as
+   * "clicking just changes the type". A row now does nothing on its own; only its
+   * control writes, and the control says what the unset choice falls back to.
+   *
+   * `opts.control` picks the control:
+   *   - `'select'` + `opts.choices` [{value,label}]: a dropdown. `opts.inherit`
+   *     ('always' | 'session' | false) adds the first "Use …" option, which is
+   *     the same write the ↩ reset makes. `opts.custom` adds a "Custom…" option
+   *     that opens a free-text editor under the row (`customEditor`).
+   *   - `'money'`: a dollar amount field, empty = no cap.
+   *   - absent: a read-only value (`opts.text`).
+   * `opts.fmt` renders a stored value for display (e.g. a model's catalog name).
+   */
   function row(field, label, flag, opts = {}) {
-    const cycleList = opts.cycle;
     const p = fieldProv(field);
-    // The bare word "inherit" was the third of the four "where did this come
-    // from" idioms, and it was the least informative: it named the mechanism
-    // and hid the answer. The chip names the LEVEL now, so the value column is
-    // free to say what actually applies — the machine default when that is what
-    // is in force, and "built-in" when nothing is set anywhere.
-    const valueText = opts.text
-      ?? (p === null ? 'built-in'
-        : p.level === 'machine' ? show(machineValue(field))
-        : show(val(field)));
-    const n = el('div', { class: 'set' });
-    const lab = el('span', { class: 'l', text: label }, flag ? el('span', { class: 'f', text: flag }) : null);
+    const fmt = opts.fmt ?? ((x) => show(x));
+    const n = el('div', { class: 'set', 'data-field': field });
+    n.append(el('span', { class: 'l', text: label }, flag ? el('span', { class: 'f', text: flag }) : null));
     const chip = provChip(p);
-    const v = el('span', { class: `v${opts.dim || !p ? ' dim' : ''}` });
-    v.append(document.createTextNode(valueText));
+    if (chip) n.append(chip);
 
     let control = null;
-    if (cycleList) {
-      n.dataset.cycle = 'true';
-      n.title = 'Click to change';
-      // The mono flag text pollutes the computed name ("Effort --effort low"),
-      // so the row says what it is and what activating it does.
-      control = el('button', {
-        type: 'button', class: 'set-main',
-        'aria-label': `${label}: ${valueText}. Activate to change.`,
-      }, lab, chip, v);
+    if (opts.control === 'select') control = selectControl(field, label, opts, fmt);
+    else if (opts.control === 'money') control = moneyControl(field, label);
+    if (control) {
       n.append(control);
-      n.addEventListener('click', () => cycle(field, cycleList));
     } else {
-      n.append(lab);
-      if (chip) n.append(chip);
-      n.append(v);
+      const valueText = opts.text
+        ?? (p === null ? 'built-in'
+          : p.level === 'machine' ? fmt(machineValue(field))
+          : fmt(val(field)));
+      n.append(el('span', { class: `v${opts.dim || !p ? ' dim' : ''}`, text: valueText }));
     }
+    const focusable = control?.matches?.('select, input') ? control : control?.querySelector?.('select, input') ?? null;
     n.append(gutter(n, {
-      key: field, label, prov: p, why: WHY[field], control,
-      resetTo: resetTarget(field), onReset: () => resetField(field),
+      key: field, label, prov: p, why: WHY[field], control: focusable,
+      resetTo: resetTarget(field, fmt), onReset: () => resetField(field),
     }));
+    if (opts.custom && d.customEdit?.field === field) n.append(customEditor(field, label, opts.custom));
     return n;
+  }
+
+  /** Is a value stored AT the current write target (not inherited from above)? */
+  const setHere = (field) => (d.scope === 'session' ? overriddenNow(field) : isSet(base(field)));
+
+  /**
+   * The words for "nothing set here": what applies instead, named by level and
+   * value, so the option can never read as a bare "inherit".
+   */
+  function inheritLabel(field, fmt, builtIn) {
+    if (d.scope === 'session' && isSet(base(field))) return `Use project value (${fmt(base(field))})`;
+    if (isSet(machineValue(field))) return `Use machine default (${fmt(machineValue(field))})`;
+    return `Use ${builtIn ?? 'built-in default'}`;
+  }
+
+  const INHERIT_OPT = '__inherit__';
+  const CUSTOM_OPT = '__custom__';
+
+  function selectControl(field, label, opts, fmt) {
+    const choices = opts.choices ?? [];
+    const withInherit = opts.inherit === 'always' || (opts.inherit === 'session' && d.scope === 'session');
+    const here = setHere(field);
+    // What the control shows as selected: the "Use …" option whenever nothing is
+    // stored at this level, otherwise the stored value itself.
+    const cur = here || !withInherit ? val(field) : undefined;
+    const sel = el('select', { class: 'ssel', id: `sel-${cssId(field)}`, 'aria-label': label });
+    const inheritText = withInherit ? inheritLabel(field, fmt, opts.builtIn) : null;
+    if (withInherit) sel.append(el('option', { value: INHERIT_OPT, text: inheritText }));
+    // With an inherit choice on top, the concrete values sit under a heading that
+    // says what picking one DOES — it sets the value at this level — so following
+    // a default and choosing a value can never read as the same kind of pick.
+    const group = withInherit
+      ? el('optgroup', { label: d.scope === 'session' ? 'Override for this session' : 'Set for this project' })
+      : sel;
+    if (group !== sel) sel.append(group);
+    let matched = false;
+    choices.forEach((c, i) => {
+      const o = el('option', { value: `v${i}`, text: c.label ?? fmt(c.value) });
+      if (cur !== undefined && JSON.stringify(c.value) === JSON.stringify(cur)) { o.selected = true; matched = true; }
+      group.append(o);
+    });
+    // A stored value the list does not carry (an id typed elsewhere, an older
+    // catalog) is shown as itself, never silently swapped for the first option.
+    if (cur !== undefined && isSet(cur) && !matched) {
+      const o = el('option', { value: 'stored', text: `${fmt(cur)} (custom)` });
+      o.selected = true;
+      group.append(o);
+    }
+    if (opts.custom) group.append(el('option', { value: CUSTOM_OPT, text: opts.custom.option ?? 'Custom…' }));
+    if (withInherit && cur === undefined) sel.value = INHERIT_OPT;
+    // While the Custom editor is open the dropdown says so, not the old value.
+    if (opts.custom && d.customEdit?.field === field) sel.value = CUSTOM_OPT;
+    sel.title = sel.selectedOptions[0]?.textContent ?? '';
+    if (opts.disabled) sel.disabled = true;
+
+    sel.addEventListener('change', () => {
+      const v = sel.value;
+      if (v === CUSTOM_OPT) {
+        const stored = isSet(cur) ? String(cur) : '';
+        d.customEdit = { field, text: stored, focus: true };
+        paint();
+        return;
+      }
+      d.customEdit = null;
+      if (v === INHERIT_OPT) { if (here) resetField(field); else paint(); return; }
+      if (v === 'stored') return;
+      const c = choices[Number(v.slice(1))];
+      if (c) void put(field, c.value);
+    });
+    return sel;
+  }
+
+  /**
+   * The free-text editor a "Custom…" option opens, directly under its row.
+   * Save writes through the same put() as the dropdown; Cancel and Esc write
+   * nothing. The typed text lives in d.customEdit, so a background repaint (the
+   * rail's dot prefetches repaint the pane) cannot eat it.
+   */
+  function customEditor(field, label, spec) {
+    const box = el('div', { class: 'set-edit' });
+    const errId = `cust-err-${cssId(field)}`;
+    const input = el('input', {
+      type: 'text', class: 'gtext', id: `cust-${cssId(field)}`, spellcheck: 'false', autocomplete: 'off',
+      placeholder: spec.placeholder ?? '', 'aria-label': `Custom ${label.toLowerCase()}`, 'aria-describedby': errId,
+    });
+    input.value = d.customEdit.text ?? '';
+    const save = el('button', { type: 'button', class: 'mini primary', text: 'Save' });
+    const cancel = el('button', { type: 'button', class: 'mini', text: 'Cancel' });
+    const err = el('div', { class: 'set-edit-err', id: errId, role: 'alert' });
+    const fail = (msg) => { err.textContent = msg; input.setAttribute('aria-invalid', 'true'); input.focus(); };
+    const apply = () => {
+      const t = input.value.trim();
+      if (!t) { fail('Type a value, or pick one from the list.'); return; }
+      const bad = spec.validate?.(t);
+      if (bad) { fail(bad); return; }
+      d.customEdit = null;
+      void put(field, t);
+    };
+    const back = () => {
+      d.customEdit = null;
+      paint();
+      document.getElementById(`sel-${cssId(field)}`)?.focus();
+    };
+    // Save is live-gated: disabled while the field is empty, and a malformed
+    // value says why as soon as it is typed rather than on a failed click.
+    const judge = () => {
+      const t = input.value.trim();
+      const bad = t ? (spec.validate?.(t) ?? null) : null;
+      save.disabled = !t || !!bad;
+      err.textContent = bad ?? '';
+      if (bad) input.setAttribute('aria-invalid', 'true'); else input.removeAttribute('aria-invalid');
+    };
+    input.addEventListener('input', () => {
+      if (d.customEdit) d.customEdit.text = input.value;
+      judge();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); apply(); }
+    });
+    save.addEventListener('click', apply);
+    cancel.addEventListener('click', back);
+    box.append(input, el('div', { class: 'set-edit-acts' }, cancel, save), err);
+    judge();
+    if (spec.hint) box.append(el('div', { class: 'set-edit-hint', text: spec.hint }));
+    // Keep focus across repaints: the first paint after "Custom…" focuses the
+    // field; a later repaint re-focuses it only if it held focus before.
+    const hadFocus = d.customEdit.focus || document.activeElement?.id === input.id;
+    d.customEdit.focus = false;
+    if (hadFocus) {
+      queueMicrotask(() => {
+        const live = document.getElementById(input.id);
+        if (live) { live.focus(); live.setSelectionRange(live.value.length, live.value.length); }
+      });
+    }
+    return box;
+  }
+
+  /** A dollar amount. Empty means no cap. Commits on Enter or when focus leaves. */
+  function moneyControl(field, label) {
+    const cur = val(field);
+    const wrap = el('span', { class: 'smoney' });
+    const input = el('input', {
+      type: 'text', inputmode: 'decimal', class: 'snum', id: `num-${cssId(field)}`,
+      spellcheck: 'false', autocomplete: 'off', placeholder: 'No cap', 'aria-label': `${label} in US dollars`,
+    });
+    input.value = isSet(cur) ? String(Number(cur)) : '';
+    const commit = () => {
+      const t = input.value.trim().replace(/^\$/, '');
+      if (!t) { if (isSet(cur)) void put(field, null); return; }
+      const nval = Number(t);
+      if (!Number.isFinite(nval) || nval <= 0) {
+        ctx.notify(`${label}: enter an amount above zero, or leave it empty for no cap`, true);
+        input.value = isSet(cur) ? String(Number(cur)) : '';
+        return;
+      }
+      if (nval === Number(cur)) return;
+      void put(field, nval);
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+    wrap.append(el('span', { class: 'smoney-u', 'aria-hidden': 'true', text: '$' }), input);
+    return wrap;
   }
 
   function listRow(field, label, flag) {
@@ -575,7 +779,7 @@ export function createDrawer(ctx) {
       class: 'vin',
       type: 'text',
       spellcheck: 'false',
-      placeholder: 'none',
+      placeholder: 'None (e.g. Bash, Read)',
       'aria-label': label,
     });
     input.value = Array.isArray(cur) ? cur.join(', ') : '';
@@ -902,28 +1106,39 @@ export function createDrawer(ctx) {
     ensureGlobals();
     const gModel = d.globals?.model ?? null;
     const model = el('div', { class: 'grp', 'data-focus': 'projectModel' }, groupLabel('Model'));
-    const modelInheritsGlobal = !sessionScope && val('model') == null && gModel;
-    // FEAT-118: cycle over the SAME derived catalog the header popover and the
-    // global-defaults picker use (d.modelCatalog, filled by ensureGlobals from
-    // the CLI's own supportedModels) — so a versioned model the CLI reports is
-    // reachable here too, not just the three hand-written aliases. Until that
-    // list is learned (first session), fall back to the alias cycle so the row
-    // is never dead. Labels come from modelLabel, so a raw value like
-    // 'claude-fable-5[1m]' still shows its friendly name.
+    // FEAT-118: the SAME derived catalog the header popover and the machine
+    // default picker use (d.modelCatalog, filled by ensureGlobals from the CLI's
+    // own supportedModels), so a versioned model the CLI reports is offered here
+    // too. Until that list is learned (first session) the three aliases stand in.
+    // BUG-196 round 6 — in SESSION scope the list is the app's catalog for the
+    // session's REAL engine (ctx.sessionModelOpts ← activeModelOpts ← the one
+    // engine state): an OpenAI-pinned session is never offered Opus/Sonnet/Haiku,
+    // and while the engine is unknown only "project value" and Custom are offered.
+    // FEAT-159 — a dropdown with a "Custom model id…" escape hatch, never a cycle.
     const mCatalog = d.modelCatalog ?? [];
-    const modelCycle = mCatalog.length ? [null, ...mCatalog.map((m) => m.value)] : MODEL_CYCLE;
-    const mVal = val('model');
+    const sessionOpts = sessionScope ? (ctx.sessionModelOpts?.() ?? null) : null;
+    const modelChoices = sessionOpts
+      ? sessionOpts.filter((o) => o.value != null)
+      : mCatalog.length
+        ? mCatalog.map((m) => ({ value: m.value, label: m.displayName || m.value }))
+        : MODEL_ALIASES.map((a) => ({ value: a, label: a[0].toUpperCase() + a.slice(1) }));
+    const modelFmt = (x) => (x == null ? 'CLI default'
+      : sessionOpts?.find((o) => o.value === x)?.label ?? modelLabel(x));
     model.append(row('model', 'Model', '--model', {
-      cycle: modelCycle,
-      text: modelInheritsGlobal
-        ? `global default · ${modelLabel(gModel)}`
-        : (mVal != null ? modelLabel(mVal) : undefined),
+      control: 'select', choices: modelChoices, inherit: 'always', fmt: modelFmt,
+      builtIn: 'CLI default',
+      custom: {
+        option: 'Custom model id…',
+        placeholder: 'e.g. claude-opus-4-8',
+        hint: 'Any id the CLI accepts, including ones it does not list. It is checked when the next session starts.',
+        validate: (t) => (MODEL_ID_RE.test(t) ? null : 'Letters, digits and the symbols . _ : - [ ] only, up to 80 characters — like claude-opus-4-8[1m].'),
+      },
     }));
-    model.append(row('effort', 'Effort', '--effort', { cycle: EFFORT_CYCLE }));
-    model.append(row('maxBudgetUsd', 'Spend cap', '--max-budget-usd', {
-      cycle: BUDGET_CYCLE,
-      text: val('maxBudgetUsd') == null ? 'none' : `$${Number(val('maxBudgetUsd')).toFixed(2)}`,
+    model.append(row('effort', 'Effort', '--effort', {
+      control: 'select', choices: EFFORT_CHOICES, inherit: 'always',
+      fmt: (x) => EFFORT_CHOICES.find((c) => c.value === x)?.label ?? show(x),
     }));
+    model.append(row('maxBudgetUsd', 'Spend cap', '--max-budget-usd', { control: 'money' }));
     if (!sessionScope) {
       const gLink = el('button', { class: 'addrow', text: gModel
         ? `Machine-wide default: ${modelLabel(gModel)} · manage ›`
@@ -945,7 +1160,10 @@ export function createDrawer(ctx) {
      project is a spend decision and moved to Model & spend.) ---- */
   function permissionsPane(p, sessionScope) {
     const perms = el('div', { class: 'grp', 'data-focus': 'permissionMode' }, groupLabel('Permissions'));
-    perms.append(row('permissionMode', 'Permission mode', '--permission-mode', { cycle: PERM_CYCLE }));
+    perms.append(row('permissionMode', 'Permission mode', '--permission-mode', {
+      control: 'select', choices: PERM_CHOICES, inherit: 'session',
+      fmt: (x) => PERM_CHOICES.find((c) => c.value === x)?.label ?? show(x),
+    }));
     const pn = permModeNote();
     if (pn) perms.append(pn);
     perms.append(listRow('allowedTools', 'Allowed tools', '--allowed-tools'));
@@ -1027,7 +1245,38 @@ export function createDrawer(ctx) {
       if (sessionScope) access.append(projectOnlyNote('Mounts and the socket flag'));
     }
 
-    return catWrap('isoSection', runtime, access, servicesGroup(p, sessionScope));
+    return catWrap('isoSection', runtime, laneDockerGroup(p, sessionScope), access, envGroup(p, sessionScope), servicesGroup(p, sessionScope));
+  }
+
+  /* ---- BUG-223 round 4 — which Docker daemon this project's sessions and lanes
+     reach. A DECLARED project setting (settings.laneDocker), read by the server at
+     every session start and lane dispatch and never worked out from the directory
+     layout. Absent = not yet declared; the server then uses the sandbox (fail-safe),
+     so that is what the control shows, with a line saying it was not chosen. ---- */
+  function laneDockerGroup(p, sessionScope) {
+    const declared = settings().laneDocker;
+    const cur = declared === 'host' ? 'host' : 'sandbox';
+    const isContainer = (p.isolation ?? 'direct') === 'container';
+    const grp = el('div', { class: 'grp', 'data-focus': 'laneDocker' }, groupLabel('Docker daemon for sessions and lanes'));
+    const seg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Docker daemon for sessions and lanes' });
+    for (const [key, label] of [['sandbox', 'Sandbox'], ['host', 'Host']]) {
+      const b = el('button', { 'aria-pressed': cur === key ? 'true' : 'false', 'data-lane-docker': key, text: label });
+      if (sessionScope) b.disabled = true;
+      else b.addEventListener('click', () => { if (declared !== key) void put('laneDocker', key); });
+      seg.append(b);
+    }
+    grp.append(seg);
+    grp.append(note(cur === 'host'
+      ? 'Host. Docker commands run from this project’s sessions and dispatched lanes reach this machine’s own Docker daemon, where your other projects’ containers run. Pick this for a project whose own containers or compose stack live there.'
+      : 'Sandbox. Docker commands run from this project’s sessions and dispatched lanes, and every test server they start, reach the isolated Docker sandbox. They cannot touch the containers on this machine’s own daemon.'));
+    if (declared !== 'sandbox' && declared !== 'host') {
+      grp.append(note('Not chosen yet, so the sandbox is used. Pick one to record it.'));
+    }
+    grp.append(note(isContainer
+      ? 'Applies to dispatched lanes. This project’s container sessions are not affected. A change applies to the next session or lane. A running one keeps the daemon it started with.'
+      : 'A change applies to the next session or lane. A running one keeps the daemon it started with.'));
+    if (sessionScope) grp.append(note('This is set for the whole project. Switch to “This project” to change it.'));
+    return grp;
   }
 
   /* ---- Workspace: the directory this project maps to, its git state, and what
@@ -1201,30 +1450,46 @@ export function createDrawer(ctx) {
    */
   function providerGroup(sessionScope) {
     const grp = el('div', { class: 'grp', 'data-focus': 'provider' }, groupLabel('Provider'));
-    const cur = val('provider') ?? 'anthropic';
+    // BUG-196 — a session already on disk resumes on the engine its transcript
+    // pins (server-declared: ctx.lockedProvider), and the resume silently ignores
+    // any session-scope provider override. So in SESSION scope the control shows
+    // that real engine and is DISABLED with a short explanation; the project-scope
+    // control (which sets a default for FUTURE sessions) is unaffected.
+    // BUG-196 round 5 — disabled on the app's ONE guard, not only on a landed pin:
+    // the pre-pin window and a failed transcript fetch are refused too, and every
+    // click goes through ctx.pickSessionProvider.
+    // BUG-196 round 6 — engine AND refusal come from the app's one engine state
+    // (ctx.sessionEngine), the record #provBtn and its popover paint from, so the
+    // three cannot disagree; an unknown engine presses no button (round 5 pressed
+    // the project default) and the lock sentence is the app's, not a drawer copy.
+    const se = sessionScope ? (ctx.sessionEngine?.() ?? null) : null;
+    const refusal = se?.refusal ?? null;
+    const cur = se ? se.engine : (val('provider') ?? 'anthropic');
     const seg = el('div', { class: 'seg prov-seg' });
     for (const o of [
       { key: 'anthropic', n: 'Claude' },
       { key: 'openai', n: 'OpenAI Codex' },
     ]) {
       const b = el('button', { 'data-prov': o.key, 'aria-pressed': String(cur === o.key), text: o.n });
-      b.addEventListener('click', () => {
-        if (cur === o.key) return;
-        // Session scope: picking the project's own default is "no override" —
-        // clear it rather than storing an override equal to the default
-        // (base() can be undefined on registries older than this field).
-        if (d.scope === 'session' && o.key === (base('provider') ?? 'anthropic')) {
-          delete ctx.overrides.provider;
-          ctx.onStackChanged?.();
-          paint();
-          return;
-        }
-        void put('provider', o.key);
-      });
+      if (refusal) {
+        b.disabled = true;
+        b.setAttribute('aria-disabled', 'true');
+      } else {
+        b.addEventListener('click', () => {
+          if (cur === o.key) return;
+          // Session scope: put() hands the pick to ctx.pickSessionProvider, which
+          // also owns "picking the project default = no override" (BUG-196 round 5).
+          void put('provider', o.key);
+        });
+      }
       seg.append(b);
     }
     grp.append(seg);
-    if (isOvr('provider')) grp.append(note('Overridden for this session only — the next launch uses this engine; the project default is untouched.'));
+    if (refusal) {
+      const warn = note(refusal);
+      warn.dataset.warn = 'true';
+      grp.append(warn);
+    } else if (isOvr('provider')) grp.append(note('Overridden for this session only — the next launch uses this engine; the project default is untouched.'));
     else if (sessionScope) grp.append(note('Applies to the next session launched from here.'));
 
     if (d.providers === undefined) {
@@ -1873,17 +2138,25 @@ const WIRING_STATE = {
 
     if (unknown || !on) return grp;
 
-    const keepRow = el(readOnly ? 'div' : 'button', { class: 'set', title: readOnly ? '' : 'Click to change' });
+    // FEAT-159 — a dropdown, not a click-to-cycle row.
+    const keepRow = el('div', { class: 'set' });
     keepRow.append(el('span', { class: 'l' },
       document.createTextNode('Keep'),
       el('span', { class: 'f', text: '--settings › snapshots.keep' })));
-    keepRow.append(el('span', { class: 'v', text: `${keepN()} newest` }));
-    if (!readOnly) {
-      keepRow.addEventListener('click', () => {
-        const i = KEEP_CYCLE.indexOf(keepN());
-        void putSnapshots({ keep: KEEP_CYCLE[(i + 1) % KEEP_CYCLE.length] });
-      });
+    if (readOnly) {
+      keepRow.append(el('span', { class: 'v', text: `${keepN()} newest` }));
+    } else {
+      const ksel = el('select', { class: 'ssel', id: 'sel-snapshots-keep', 'aria-label': 'Snapshots to keep' });
+      const counts = KEEP_CYCLE.includes(keepN()) ? KEEP_CYCLE : [...KEEP_CYCLE, keepN()].sort((a, b) => a - b);
+      for (const k of counts) {
+        const o = el('option', { value: String(k), text: `${k} newest` });
+        if (k === keepN()) o.selected = true;
+        ksel.append(o);
+      }
+      ksel.addEventListener('change', () => void putSnapshots({ keep: Number(ksel.value) }));
+      keepRow.append(ksel);
     }
+    keepRow.append(el('span', { class: 'sgut' }));
     grp.append(keepRow);
 
     grp.append(excludeRow(readOnly));
@@ -2668,9 +2941,12 @@ const WIRING_STATE = {
       const [hostPath, containerPath, flag] = raw.split(':');
       const host = hostPath.trim();
       const name = host.replace(/\/+$/, '').split('/').pop() || 'workspace';
+      // FEAT-155 — with workspaceRoot the repo IS /workspace, so the old default
+      // `/workspace/<name>` would nest the mount inside the repo. Default beside it.
+      const base = settings().container?.workspaceRoot ? '/mnt' : '/workspace';
       void put('mounts', [...mounts, {
         hostPath: host,
-        containerPath: (containerPath || `/workspace/${name}`).trim(),
+        containerPath: (containerPath || `${base}/${name}`).trim(),
         readOnly: (flag || '').trim() === 'ro',
       }]);
     };
@@ -2843,6 +3119,71 @@ const WIRING_STATE = {
     }
   }
 
+  /**
+   * FEAT-155 round 5 — the project's own Dockerfile. Same idiom as Base image
+   * (free text, blur/Enter commits, reset to none), plus the build state from
+   * the container status and the build log behind a disclosure.
+   */
+  function dockerfileRow(p, readOnly = false) {
+    const cur = settings().container?.dockerfile ?? null;
+    const n = el('div', { class: 'set' });
+    n.append(el('span', { class: 'l' }, document.createTextNode('Dockerfile'), el('span', { class: 'f', text: '--settings › container.dockerfile' })));
+    const pv = provOf({ project: isSet(cur), projectOnly: true });
+    const chip = provChip(pv);
+    if (chip) n.append(chip);
+    const input = el('input', { class: 'vin', type: 'text', spellcheck: 'false', 'aria-label': 'Dockerfile', placeholder: 'none — a path in the repo' });
+    input.value = cur ?? '';
+    if (readOnly) input.disabled = true;
+    const commit = () => {
+      const v = input.value.trim() || null;
+      if (v === cur) return;
+      void putContainer({ dockerfile: v });
+    };
+    input.addEventListener('blur', commit);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+    n.append(input);
+    n.append(gutter(n, {
+      key: 'container.dockerfile', label: 'Dockerfile', prov: pv, why: WHY['container.dockerfile'], control: input,
+      resetTo: { level: 'built-in', text: 'none (use Base image)' },
+      onReset: readOnly ? null : () => void putContainer({ dockerfile: null }),
+    }));
+    const df = cur && d.container && !d.container.problem ? d.container.dockerfile : null;
+    if (df) {
+      const why = el('div', { class: 'set-why df-state' });
+      const b = df.build ?? {};
+      const short = (ref) => (ref ? ref.slice(ref.lastIndexOf(':') + 1) : '');
+      let text;
+      if (d.container.state === 'building' || b.state === 'building') text = `Building from ${df.path}…`;
+      else if (df.fellBack) text = `Not built: ${df.problem ?? 'the build failed'}. Running the last good image (${short(df.effectiveImage)}).`;
+      else if (df.problem && !df.effectiveImage) text = `Not built: ${df.problem}. There is no earlier image to fall back to.`;
+      else if (df.built) text = `Built from ${df.path} (${short(df.wantedImage)}). Rebuilt automatically when the file changes — checked each time a session starts.`;
+      else text = `${df.path} has changed since the image was built. The next session starts by building it (or press Rebuild).`;
+      why.append(document.createTextNode(text));
+      if (b.state && b.state !== 'idle') {
+        const tog = el('button', { class: 'addrow df-logtog', text: d.dfLogOpen ? 'Hide build log' : 'Build log ›' });
+        tog.addEventListener('click', () => {
+          d.dfLogOpen = !d.dfLogOpen;
+          d.dfLog = undefined;
+          paint();
+        });
+        why.append(el('br'), tog);
+        if (d.dfLogOpen) {
+          if (d.dfLog === undefined) {
+            d.dfLog = null;
+            void api.containerBuild(p.id)
+              .then((r) => { d.dfLog = r && !r.problem ? (r.log || '(empty)') : `could not read the build log${r?.problem ? `: ${r.problem}` : ''}`; })
+              .catch((err) => { d.dfLog = `could not read the build log: ${err.message}`; })
+              .then(() => { if (d.dfLogOpen) paint(); });
+          }
+          // textContent only: build output is untrusted text (the server also strips control sequences).
+          why.append(el('pre', { class: 'buildlog', text: d.dfLog ?? 'reading…' }));
+        }
+      }
+      n.append(why);
+    }
+    return n;
+  }
+
   /** Base image: free text, because real images are not a short enum. */
   function imageRow(readOnly = false) {
     const cur = settings().container?.image ?? null;
@@ -2871,17 +3212,72 @@ const WIRING_STATE = {
       resetTo: { level: 'built-in', text: 'Orchard’s own image' },
       onReset: readOnly ? null : () => void putContainer({ image: null }),
     }));
+    // FEAT-155 round 5 — a Dockerfile wins over this field; say so where it is set.
+    if (settings().container?.dockerfile) {
+      n.append(el('div', { class: 'set-why', text: 'Not used while this project builds its image from its own Dockerfile (below).' }));
+    }
     return n;
   }
 
-  const MEM_CYCLE = [2048, 4096, 8192, 12288];
+  const MEM_CYCLE = [2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536];
 
   function memoryRow(readOnly = false) {
     const cur = settings().container?.memoryMb ?? null;
     const n = el('div', { class: 'set' });
     const p = provOf({ project: isSet(cur), projectOnly: true });
     const lab = el('span', { class: 'l' }, document.createTextNode('Memory cap'), el('span', { class: 'f', text: '--settings › container.memoryMb' }));
-    const valueText = cur ? `${(cur / 1024).toFixed(0)} GB` : 'default';
+    const gb = (mb) => `${(mb / 1024).toFixed(0)} GB`;
+    const chip = provChip(p);
+    n.append(lab);
+    if (chip) n.append(chip);
+    let control = null;
+    if (readOnly) {
+      n.append(el('span', { class: `v${p ? '' : ' dim'}`, text: cur ? gb(cur) : 'default' }));
+    } else {
+      // FEAT-159 — a dropdown, not a cycle. There is no "unset" on the server, so
+      // "Orchard default" is shown only while nothing is stored, and cannot be
+      // chosen back once a cap is set (the reset gutter stays empty for the same reason).
+      control = el('select', { class: 'ssel', id: 'sel-container-memoryMb', 'aria-label': 'Memory cap' });
+      if (cur == null) control.append(el('option', { value: '', text: 'Orchard default', selected: true }));
+      const sizes = MEM_CYCLE.includes(cur) || cur == null ? MEM_CYCLE : [...MEM_CYCLE, cur].sort((a, b) => a - b);
+      for (const mb of sizes) {
+        const o = el('option', { value: String(mb), text: gb(mb) });
+        if (mb === cur) o.selected = true;
+        control.append(o);
+      }
+      control.addEventListener('change', () => {
+        const mb = Number(control.value);
+        if (mb && mb !== cur) void putContainer({ memoryMb: mb });
+      });
+      n.append(control);
+    }
+    n.append(gutter(n, {
+      // No reset: the server has no "unset" for this field (validate.ts requires
+      // an integer >= 512), and inventing one would mean a second write path
+      // into container settings. The gutter is still reserved, so the row's
+      // geometry matches every other row exactly.
+      key: 'container.memoryMb', label: 'Memory cap', prov: p, onReset: null, control,
+    }));
+    // Host RAM as context, so the cap reads against what it is drawn from
+    // (FEAT-155). status.hostMemoryMb is MiB; show whole GiB.
+    const hostMb = d.container?.hostMemoryMb ?? null;
+    if (hostMb) {
+      n.append(el('div', { class: 'set-why', text: `This machine has ${(hostMb / 1024).toFixed(0)} GB of RAM. The cap is how much of it this project’s container may use; changing it recreates the container.` }));
+    }
+    return n;
+  }
+
+  const GPU_CYCLE = ['auto', 'on', 'off'];
+
+  function gpuRow(readOnly = false) {
+    const cur = settings().container?.gpu ?? 'auto';
+    const live = d.container?.gpu ?? null; // { setting, effective, hostReason } from status
+    const n = el('div', { class: 'set' });
+    const p = provOf({ project: cur !== 'auto', projectOnly: true });
+    const lab = el('span', { class: 'l' }, document.createTextNode('GPU'), el('span', { class: 'f', text: '--settings › container.gpu' }));
+    // What the user sees is the SETTING; the effective + why comes from the host probe.
+    let valueText = cur;
+    if (live) valueText = cur === 'auto' ? `auto · ${live.effective ? 'on' : 'off'}` : cur;
     const v = el('span', { class: `v${p ? '' : ' dim'}`, text: valueText });
     const chip = provChip(p);
     if (readOnly) {
@@ -2889,23 +3285,150 @@ const WIRING_STATE = {
       if (chip) n.append(chip);
       n.append(v);
     } else {
-      n.dataset.cycle = 'true';
-      n.title = 'Click to change';
-      n.append(el('button', { type: 'button', class: 'set-main', 'aria-label': `Memory cap: ${valueText}. Activate to change.` },
-        lab, chip, v));
-      n.addEventListener('click', () => {
-        const i = MEM_CYCLE.indexOf(cur);
-        void putContainer({ memoryMb: MEM_CYCLE[(i + 1) % MEM_CYCLE.length] });
-      });
+      n.append(lab);
+      if (chip) n.append(chip);
+      // FEAT-159 — a dropdown, not a click-to-cycle row.
+      const gsel = el('select', { class: 'ssel', id: 'sel-container-gpu', 'aria-label': 'GPU' });
+      for (const [k, t] of [['auto', live ? `Auto (${live.effective ? 'on' : 'off'} here)` : 'Auto'], ['on', 'On'], ['off', 'Off']]) {
+        const o = el('option', { value: k, text: t });
+        if (k === cur) o.selected = true;
+        gsel.append(o);
+      }
+      gsel.addEventListener('change', () => { if (gsel.value !== cur) void putContainer({ gpu: gsel.value }); });
+      n.append(gsel);
     }
     n.append(gutter(n, {
-      // No reset: the server has no "unset" for this field (validate.ts requires
-      // an integer >= 512), and inventing one would mean a second write path
-      // into container settings. The gutter is still reserved, so the row's
-      // geometry matches every other row exactly.
-      key: 'container.memoryMb', label: 'Memory cap', prov: p, onReset: null,
+      key: 'container.gpu', label: 'GPU', prov: p,
+      onReset: readOnly ? null : () => void putContainer({ gpu: 'auto' }),
+      resetTo: { level: 'built-in', text: 'auto (on when the host supports it)' },
+    }));
+    // Say WHY when the host can't pass a GPU through — otherwise "auto · off" reads
+    // as a mystery. This is the surfaced host-prereq for the GPU feature.
+    if (live && !live.effective && live.hostReason) {
+      n.append(el('div', { class: 'set-why', text: live.hostReason }));
+    }
+    return n;
+  }
+
+  /*
+   * FEAT-155 item 3 — where the repo is mounted inside the container. Off:
+   * `/workspace/<id>` (the default). On: bare `/workspace`, for projects whose
+   * scripts hardcode `/workspace/...`. Session history is unaffected either way
+   * (the host store dir is keyed on the project id, not the path); changing it
+   * recreates the container once, which ends sessions running in it.
+   */
+  function wsRootRow(p, readOnly = false) {
+    const on = settings().container?.workspaceRoot === true;
+    const n = el('div', { class: 'set' });
+    const prov = provOf({ project: on, projectOnly: true });
+    const lab = el('span', { class: 'l' }, document.createTextNode('Repo at'), el('span', { class: 'f', text: '--settings › container.workspaceRoot' }));
+    const valueText = on ? '/workspace' : `/workspace/${p.id}`;
+    const v = el('span', { class: `v${prov ? '' : ' dim'}`, text: valueText });
+    const chip = provChip(prov);
+    if (readOnly) {
+      n.append(lab);
+      if (chip) n.append(chip);
+      n.append(v);
+    } else {
+      n.append(lab);
+      if (chip) n.append(chip);
+      // FEAT-159 — a dropdown, not a click-to-cycle row. Changing it recreates the
+      // container, so the option names say so rather than a hover title.
+      const wsel = el('select', { class: 'ssel', id: 'sel-container-workspaceRoot', 'aria-label': 'Repo mounted at (changing it recreates the container)' });
+      wsel.append(el('option', { value: 'id', text: `/workspace/${p.id}`, selected: !on }));
+      wsel.append(el('option', { value: 'root', text: '/workspace', selected: on }));
+      wsel.title = 'Changing this recreates the container';
+      wsel.addEventListener('change', () => { void putContainer({ workspaceRoot: wsel.value === 'root' }); });
+      n.append(wsel);
+    }
+    n.append(gutter(n, {
+      key: 'container.workspaceRoot', label: 'Repo at', prov,
+      onReset: readOnly ? null : () => void putContainer({ workspaceRoot: false }),
+      resetTo: { level: 'built-in', text: `/workspace/${p.id}` },
     }));
     return n;
+  }
+
+  /**
+   * FEAT-155 — per-project container environment variables
+   * (settings.container.env). Injected as `docker create --env K=V`, so they
+   * reach the CLI and everything it spawns inside the container. Container-only
+   * and project-scope (a per-session env would recreate the container under
+   * every other session on the project — the same reason mounts, the image and
+   * the memory cap are project-scope). Changing any of these recreates the
+   * container. Empty by default, so a project pays nothing until it adds one.
+   * Server-side validation (validate.ts) rejects bad names, reserved keys and
+   * oversized values; its message is surfaced inline by putContainer's notify.
+   */
+  function envGroup(p, sessionScope) {
+    if ((p.isolation ?? project().isolation) !== 'container') return null;
+    const g = el('div', { class: 'grp', 'data-focus': 'env' }, groupLabel('Environment'));
+    const env = settings().container?.env ?? {};
+    const keys = Object.keys(env);
+    if (!keys.length) {
+      g.append(note('No environment variables. Add one (e.g. PYTHONPATH=/workspace/pylibs) and it is set for every session on this project. Changing these recreates the container.'));
+    }
+    for (const k of keys) {
+      const r = el('div', { class: 'mrow' });
+      r.append(el('span', { class: 'p' },
+        el('span', { class: 'dst', text: k }),
+        el('span', { class: 'to', text: '  =  ' }),
+        document.createTextNode(env[k])));
+      if (!sessionScope) {
+        const x = el('button', { class: 'x', 'aria-label': `Remove ${k}`, text: '×' });
+        x.addEventListener('click', () => {
+          const next = { ...env };
+          delete next[k];
+          void putContainer({ env: next });
+        });
+        r.append(x);
+      }
+      g.append(r);
+    }
+    if (!sessionScope) {
+      if (d.addingEnv) g.append(envForm(env));
+      else {
+        const add = el('button', { class: 'addrow', text: '+ Add variable' });
+        add.addEventListener('click', () => { d.addingEnv = true; paint(); });
+        g.append(add);
+      }
+    } else {
+      g.append(projectOnlyNote('Environment variables'));
+    }
+    return g;
+  }
+
+  function envForm(env) {
+    const box = el('div', { class: 'mrow' });
+    const input = el('input', {
+      class: 'vin',
+      type: 'text',
+      spellcheck: 'false',
+      placeholder: 'KEY=value   e.g.  PYTHONPATH=/workspace/pylibs',
+      'aria-label': 'New environment variable',
+    });
+    input.style.width = '100%';
+    input.style.textAlign = 'left';
+    box.append(input);
+    const commit = () => {
+      const raw = input.value.trim();
+      d.addingEnv = false;
+      if (!raw) return paint();
+      // Split on the FIRST '=' only: a value may contain '=' (e.g. a query
+      // string), but a key never can. eq<1 rejects both "=v" and a bare name.
+      const eq = raw.indexOf('=');
+      if (eq < 1) { ctx.notify('an environment variable needs KEY=value', true); return paint(); }
+      const key = raw.slice(0, eq).trim();
+      const value = raw.slice(eq + 1); // not trimmed: a value may intentionally carry spaces
+      void putContainer({ env: { ...env, [key]: value } });
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); commit(); }
+      if (e.key === 'Escape') { d.addingEnv = false; paint(); }
+    });
+    input.addEventListener('blur', commit);
+    queueMicrotask(() => input.focus());
+    return box;
   }
 
   function containerBlock(p, readOnly = false) {
@@ -2922,7 +3445,7 @@ const WIRING_STATE = {
       frag.append(n, retry);
       return frag;
     }
-    frag.append(imageRow(readOnly), memoryRow(readOnly));
+    frag.append(imageRow(readOnly), dockerfileRow(p, readOnly), memoryRow(readOnly), gpuRow(readOnly), wsRootRow(p, readOnly));
     const c = d.container;
     if (c.problem) {
       // The route exists and said no — quote it rather than inventing a reason.
@@ -2970,6 +3493,14 @@ const WIRING_STATE = {
     if (c.drifted === true) {
       frag.append(note('Changed since this container started. It keeps the mounts, socket flag and limits it was created with until you rebuild.'));
     }
+    /* FEAT-155 round 8 — both are server-computed sentences; quote them. A
+       refused image blocks every launch, so it must be on screen, not only in
+       the error of the session that failed; a pending lockdown is deferred on
+       purpose and must not be silent either. */
+    if (c.imageRefused) {
+      frag.append(el('div', { class: 'set-why img-refused', text: `Refused: ${c.imageRefused}. Sessions cannot start until the image is fixed; the existing container is left as it is.` }));
+    }
+    if (c.lockdownPending) frag.append(el('div', { class: 'set-why lockdown-pending', text: c.lockdownPending }));
     return frag;
   }
 
@@ -3868,17 +4399,13 @@ const WIRING_STATE = {
 
     /* ---- container runtime row ---- */
     const cg = el('div', { class: 'grp', 'data-focus': 'runtimeContainer' }, groupLabel('Claude runtime · container projects'));
+    // FEAT-157 — containers no longer carry a pinned CLI: each gets the host SDK's own
+    // CLI as a thin layer at its next launch with no live session. Nothing to press.
     const cVer = el('div', { class: 'set' });
     cVer.append(el('span', { class: 'l' },
-      document.createTextNode('Baked CLI pin'),
-      el('span', { class: 'f', text: `provision.json pins ${container.desiredCli ?? '?'}${container.targetCli ? ` · host SDK bundles ${container.targetCli}` : ''}` })));
-    let cBadge;
-    if (container.pinBehindTarget && container.targetCli) {
-      cBadge = runtimeState('stale', `Behind host SDK → ${container.targetCli}`);
-    } else {
-      cBadge = runtimeState('ok', 'Tracks host SDK');
-    }
-    cVer.append(el('span', { class: 'v' }, cBadge));
+      document.createTextNode('Container CLI'),
+      el('span', { class: 'f', text: `follows the host SDK: ${container.desiredCli ?? '?'}` })));
+    cVer.append(el('span', { class: 'v' }, runtimeState('ok', 'Follows host SDK')));
     cg.append(cVer);
 
     // Per-project actual image state (finding #8: containers are per-project).
@@ -3887,42 +4414,19 @@ const WIRING_STATE = {
       const box = el('div', { class: 'grp acctlist' }, el('div', { class: 'grp-l sub', text: 'Container projects on this machine' }));
       for (const p of projs) {
         const row = el('div', { class: 'set' });
-        const behind = p.imageClaudeVersion && container.desiredCli && p.imageClaudeVersion !== container.desiredCli;
+        const behind = !p.custom && p.imageClaudeVersion && container.desiredCli && p.imageClaudeVersion !== container.desiredCli;
         row.append(el('span', { class: 'l' },
           document.createTextNode(p.name || p.id),
           el('span', { class: 'f', text: p.custom ? 'custom image — yours to manage'
-            : `image CLI ${p.imageClaudeVersion ?? 'unknown'}${behind ? ` (pin is ${container.desiredCli})` : ''}` })));
+            : `CLI ${p.imageClaudeVersion ?? 'not yet layered'}${behind ? ` → ${container.desiredCli} at the next idle launch` : ''}` })));
         row.append(el('span', { class: 'v' },
           runtimeState(p.custom ? 'unknown' : (behind || p.state === 'stale' ? 'stale' : (p.state === 'missing' ? 'unknown' : 'ok')),
-            p.custom ? 'custom' : (p.state === 'missing' ? 'not built' : (behind || p.state === 'stale' ? 'rebuild pending' : 'current')))));
+            p.custom ? 'custom' : (p.state === 'missing' ? 'not built' : (behind || p.state === 'stale' ? 'update pending' : 'current')))));
         box.append(row);
       }
       cg.append(box);
     }
-
-    // The pin action: writes the host SDK's bundled CLI into provision.json. It
-    // does NOT rebuild or restart any running container — the new image builds
-    // when each project next starts a session.
-    const pinBtn = el('button', { class: 'addrow', id: 'gRuntimePin',
-      text: d.runtimePinBusy ? 'Updating pin…' : (container.pinBehindTarget && container.targetCli
-        ? `Update container CLI → ${container.targetCli}` : 'Re-pin container CLI to host SDK') });
-    pinBtn.disabled = d.runtimePinBusy;
-    pinBtn.addEventListener('click', async () => {
-      if (d.runtimePinBusy) return;
-      d.runtimePinBusy = true; paint();
-      try {
-        const res = await api.runtimeContainerPin();
-        ctx.notify(res.changed
-          ? `Container CLI pin set to ${res.version} — rebuilds when each container project next starts`
-          : `Container CLI pin already at ${res.version}`);
-      } catch (err) {
-        ctx.notify(`could not update the container pin: ${err.body?.error || err.message}`, true);
-      }
-      d.runtimePinBusy = false;
-      await refreshRuntime();
-    });
-    cg.append(pinBtn);
-    cg.append(note('Bumps the Claude CLI baked into container images to match the host SDK’s bundled CLI (the two speak one protocol, so they must track). Writing the pin changes the image identity; the new image is built the next time each container project starts a session — running containers are never force-restarted.'));
+    cg.append(note('A container project pins an Orchard base release (OS and toolchain); the Claude CLI is not part of it. Orchard adds the host SDK’s own CLI as a thin layer on top, so the two always match. After a host SDK update, each container gets the new CLI at its next launch with no live session — a running session is never interrupted.'));
 
     return catWrap(null, hg, cg);
   }
@@ -4029,11 +4533,11 @@ const WIRING_STATE = {
     // the plain CLI, or an older cache) is shown as a real selected row so the
     // setting never silently vanishes — and editable via the custom field below.
     if (isCustom) {
-      const o = el('option', { value: g.model, text: `${g.model} (custom — not in the CLI’s list)` });
+      const o = el('option', { value: g.model, text: `${g.model} (custom)` });
       o.selected = true;
       sel.append(o);
     }
-    const customOpt = el('option', { value: CUSTOM, text: 'Other model id — type it…' });
+    const customOpt = el('option', { value: CUSTOM, text: 'Custom model id…' });
     sel.append(customOpt);
 
     // The free-text row: hidden until the user chooses "Other…", or shown open
@@ -4069,16 +4573,16 @@ const WIRING_STATE = {
     mg.append(sel);
     mg.append(customRow);
     mg.append(note(catalog.length
-      ? 'From the CLI’s own model list — versions included. Not listed? Choose “Other model id” and type it (e.g. claude-opus-4-8); the CLI accepts ids it doesn’t advertise. Setting this drops the tier for every project that hasn’t chosen its own.'
-      : 'No model list learned yet — start one session and the engine’s own models fill this in, or choose “Other model id” and type one (e.g. claude-opus-4-8).'));
+      ? 'From the CLI’s own model list — versions included. Not listed? Choose “Custom model id…” and type it (e.g. claude-opus-4-8); the CLI accepts ids it doesn’t advertise. Setting this drops the tier for every project that hasn’t chosen its own.'
+      : 'No model list learned yet — start one session and the engine’s own models fill this in, or choose “Custom model id…” and type one (e.g. claude-opus-4-8).'));
     wrap.append(mg);
 
     /* ---- default effort ---- */
     const eg = el('div', { class: 'grp', 'data-focus': 'globalEffort' }, groupLabel('Default effort'));
     const esel = el('select', { class: 'gsel', id: 'gEffortSel', 'aria-label': 'Global default effort' });
     esel.append(el('option', { value: '', text: 'No global default' }));
-    for (const ev of ['low', 'medium', 'high', 'xhigh', 'max']) {
-      const o = el('option', { value: ev, text: ev });
+    for (const { value: ev, label: evLabel } of EFFORT_CHOICES) {
+      const o = el('option', { value: ev, text: evLabel });
       if (g.effort === ev) o.selected = true;
       esel.append(o);
     }
@@ -4616,6 +5120,13 @@ const WIRING_STATE = {
     if (d.gitArm) { d.gitArm = null; paint(); return true; }
     if (d.wiringArm) { d.wiringArm = null; paint(); return true; }
     if (d.repoint?.arm) { d.repoint.arm = null; paint(); return true; }
+    if (d.customEdit) {
+      const f = d.customEdit.field;
+      d.customEdit = null;
+      paint();
+      document.getElementById(`sel-${cssId(f)}`)?.focus();
+      return true;
+    }
     return false;
   }
 
@@ -4666,6 +5177,7 @@ const WIRING_STATE = {
     d.wiringArm = null;
     d.wiringReport = null;
     d.repoint = null; // BUG-138: a repoint panel is per-visit; never reopen armed
+    d.customEdit = null; // FEAT-159: a half-typed custom value is per-visit too
     d.runtime = undefined; // FEAT-151 — refetch runtime versions on each open (like snaps/wiring)
     d.runtimeError = null;  // a prior failure note is per-visit
 

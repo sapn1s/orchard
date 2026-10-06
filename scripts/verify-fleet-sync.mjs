@@ -27,7 +27,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { onboard } from './onboard.mjs';
+import { onboard, orchardFileManifest } from './onboard.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -79,17 +79,18 @@ try {
 
   for (const d of [staleDir, identicalDir, handsOffDir, explicitExcludeDir]) {
     fs.mkdirSync(d, { recursive: true });
-    onboard(d, {}); // scaffolds docs/bugs + scripts/board.mjs (byte-identical to source at this point)
+    onboard(d, {}); // scaffolds .orchard/ (board.mjs byte-identical to source at this point)
   }
-  fs.mkdirSync(noBoardDir, { recursive: true }); // deliberately never onboarded — no docs/bugs
+  fs.mkdirSync(noBoardDir, { recursive: true }); // deliberately never onboarded — no board layout
 
+  const boardCopyPath = (d) => path.join(d, '.orchard', 'board.mjs');
   // Diverge the copies that should be reported stale.
-  fs.appendFileSync(path.join(staleDir, 'scripts', 'board.mjs'), '\n// LOCAL DIVERGENCE (stale)\n');
-  fs.appendFileSync(path.join(handsOffDir, 'scripts', 'board.mjs'), '\n// LOCAL DIVERGENCE (hands-off)\n');
-  fs.appendFileSync(path.join(explicitExcludeDir, 'scripts', 'board.mjs'), '\n// LOCAL DIVERGENCE (explicit exclude)\n');
-  const staleTextBefore = fs.readFileSync(path.join(staleDir, 'scripts', 'board.mjs'), 'utf8');
-  const handsOffTextBefore = fs.readFileSync(path.join(handsOffDir, 'scripts', 'board.mjs'), 'utf8');
-  const explicitTextBefore = fs.readFileSync(path.join(explicitExcludeDir, 'scripts', 'board.mjs'), 'utf8');
+  fs.appendFileSync(boardCopyPath(staleDir), '\n// LOCAL DIVERGENCE (stale)\n');
+  fs.appendFileSync(boardCopyPath(handsOffDir), '\n// LOCAL DIVERGENCE (hands-off)\n');
+  fs.appendFileSync(boardCopyPath(explicitExcludeDir), '\n// LOCAL DIVERGENCE (explicit exclude)\n');
+  const staleTextBefore = fs.readFileSync(boardCopyPath(staleDir), 'utf8');
+  const handsOffTextBefore = fs.readFileSync(boardCopyPath(handsOffDir), 'utf8');
+  const explicitTextBefore = fs.readFileSync(boardCopyPath(explicitExcludeDir), 'utf8');
 
   const projects = [
     { id: 'stale-project', hostPath: staleDir },
@@ -120,26 +121,19 @@ try {
   // ---------------------------------------------------------------------
   // 0. The COPY/SWEEP gap that let scripts/lib/verdict-contract.mjs rot in
   //    every onboarded repo: onboard.mjs COPIED it out and fleet-sync never
-  //    SWEPT it, so the copies were free to drift behind this repo's version
-  //    while board.mjs (which imports it) was kept current. Anything onboard
-  //    copies must be swept, or onboarding a tool is a one-way write.
+  //    SWEPT it. FEAT-106 closes this STRUCTURALLY — fleet-sync sweeps exactly
+  //    onboard's manifest (orchardFileManifest), the one source of truth, so the
+  //    two can no longer be different lists. Assert the manifest is non-empty,
+  //    covers board.mjs + the Stop hook, and includes a file whose SOURCE is
+  //    public/lib/* flattened into .orchard/lib/ (the FEAT-106 fold).
   // ---------------------------------------------------------------------
   {
-    const onboardSrc = fs.readFileSync(path.join(repoRoot, 'scripts', 'onboard.mjs'), 'utf8');
-    const syncSrc = fs.readFileSync(path.join(repoRoot, 'scripts', 'fleet-sync.mjs'), 'utf8');
-    const listOf = (src, name) => {
-      const m = new RegExp(`const ${name} = \\[([^\\]]*)\\]`).exec(src);
-      return m ? [...m[1].matchAll(/'([^']+)'/g)].map((x) => x[1]) : [];
-    };
-    const copied = listOf(onboardSrc, 'COPIED_TOOLS');
-    const synced = listOf(syncSrc, 'SYNCED_TOOLS');
-    const unswept = copied.filter((t) => !synced.includes(t));
-    check('COPIED_TOOLS is non-empty (the lists were actually parsed)', copied.length > 0, JSON.stringify(copied));
-    check(
-      'every COPIED_TOOL is also a SYNCED_TOOL (no copy-once-never-update tool)',
-      unswept.length === 0,
-      `unswept: ${JSON.stringify(unswept)} — copied=${JSON.stringify(copied)} synced=${JSON.stringify(synced)}`,
-    );
+    const manifest = orchardFileManifest(identicalDir);
+    const labels = manifest.map((e) => e.label);
+    check('orchard file manifest is non-empty', manifest.length > 0, String(manifest.length));
+    check('manifest sweeps .orchard/board.mjs + the Stop hook', labels.includes('.orchard/board.mjs') && labels.includes('.orchard/hooks/response-format-gate.mjs'), JSON.stringify(labels));
+    const flattened = manifest.find((e) => e.label === '.orchard/lib/digest.js');
+    check('a public/lib source is flattened into .orchard/lib/ (FEAT-106 fold)', !!flattened && /public[/\\]lib[/\\]digest\.js$/.test(flattened.src), flattened ? flattened.src : 'digest.js missing');
   }
 
   const dry = await run(['--base', base, '--exclude', 'explicitly-excluded-project']);
@@ -154,15 +148,15 @@ try {
   // Non-vacuous: dry-run must NOT have written anything.
   check(
     'dry-run wrote NOTHING to stale-project board.mjs',
-    fs.readFileSync(path.join(staleDir, 'scripts', 'board.mjs'), 'utf8') === staleTextBefore
+    fs.readFileSync(boardCopyPath(staleDir), 'utf8') === staleTextBefore
   );
   check(
     'dry-run wrote NOTHING to the excluded hands-off-project board.mjs (hands-off honored even hypothetically)',
-    fs.readFileSync(path.join(handsOffDir, 'scripts', 'board.mjs'), 'utf8') === handsOffTextBefore
+    fs.readFileSync(boardCopyPath(handsOffDir), 'utf8') === handsOffTextBefore
   );
   check(
     'dry-run wrote NOTHING to the explicitly-excluded project',
-    fs.readFileSync(path.join(explicitExcludeDir, 'scripts', 'board.mjs'), 'utf8') === explicitTextBefore
+    fs.readFileSync(boardCopyPath(explicitExcludeDir), 'utf8') === explicitTextBefore
   );
 
   // ---------------------------------------------------------------------
@@ -175,23 +169,23 @@ try {
 
   check(
     '--apply: stale-project board.mjs re-synced back to source',
-    fs.readFileSync(path.join(staleDir, 'scripts', 'board.mjs'), 'utf8') === boardSourceText
+    fs.readFileSync(boardCopyPath(staleDir), 'utf8') === boardSourceText
   );
   check(
     '--apply: identical-project board.mjs stays identical (no spurious write)',
-    fs.readFileSync(path.join(identicalDir, 'scripts', 'board.mjs'), 'utf8') === boardSourceText
+    fs.readFileSync(boardCopyPath(identicalDir), 'utf8') === boardSourceText
   );
   check(
     '--apply: hands-off-project (default-excluded) board.mjs is UNTOUCHED — still diverged',
-    fs.readFileSync(path.join(handsOffDir, 'scripts', 'board.mjs'), 'utf8') === handsOffTextBefore
+    fs.readFileSync(boardCopyPath(handsOffDir), 'utf8') === handsOffTextBefore
   );
   check(
     '--apply: explicitly-excluded-project board.mjs is UNTOUCHED — still diverged',
-    fs.readFileSync(path.join(explicitExcludeDir, 'scripts', 'board.mjs'), 'utf8') === explicitTextBefore
+    fs.readFileSync(boardCopyPath(explicitExcludeDir), 'utf8') === explicitTextBefore
   );
   check(
-    '--apply: no-board-project was never touched (no scripts/ dir created)',
-    !fs.existsSync(path.join(noBoardDir, 'scripts'))
+    '--apply: no-board-project was never touched (no .orchard/ dir created)',
+    !fs.existsSync(path.join(noBoardDir, '.orchard'))
   );
 
   // ---------------------------------------------------------------------

@@ -545,6 +545,11 @@ async function main() {
       hasDigest: !!q('.digest'),
       answerCount: host.querySelectorAll('.orchard-answer').length,
       answerText: [...host.querySelectorAll('.orchard-answer')].map((a) => a.textContent.trim()),
+      // The category class of each VISIBLE block and each FOLD, in document order,
+      // so "which categories are visible vs folded" is read off the real DOM and
+      // checked against a FIXED documented oracle (not the module under test).
+      answerCats: [...host.querySelectorAll('.orchard-answer')].map((a) => [...a.classList].find((c) => c.startsWith('ob-') && !c.startsWith('ob-cap')) ?? null),
+      notesCats: notes.map((d) => [...d.classList].find((c) => c.startsWith('ob-') && !c.startsWith('ob-cap')) ?? null),
       notesCount: notes.length,
       notesOpen: notes.map((d) => d.open),
       notesSummary: notes.map((d) => (d.querySelector('summary')?.textContent ?? '').replace(/\\s+/g, ' ').trim()),
@@ -662,8 +667,29 @@ async function main() {
   const HOOK_FILE = path.join(ROOT, 'scripts', 'hooks', 'response-format-gate.mjs');
   const hookSrc = fs.readFileSync(HOOK_FILE, 'utf8');
   const HOOK_SPEC = '../../public/lib/response-blocks.js';
-  check('the Stop hook imports the grammar by the shared path (source-of-truth read)',
-    hookSrc.includes(`import('${HOOK_SPEC}')`), HOOK_SPEC);
+  // FEAT-106 (3192ed5) made the hook layout-INDEPENDENT: it loads the grammar via
+  // `importFirst([...])`, trying the deployed `../lib/` layout first and falling
+  // back to this repo's shared `../../public/lib/` module.
+  //
+  // BUG-200 round 1 asserted a SOURCE-TEXT REGEX and was refuted (run a6a749bf): it
+  // passed a hook that named the shared path only in a COMMENT while loading a
+  // private copy, and a hook whose importFirst tried a private copy FIRST. So this
+  // leg now models `importFirst`'s actual semantics — it loads the FIRST candidate
+  // that EXISTS — by parsing the real candidate ARRAY from the importFirst call
+  // (a comment is not inside it), resolving each on disk, and asserting the first
+  // existing one IS the one shared served grammar by realpath identity. A private
+  // copy tried first fails (first-existing ≠ served); a comment-only mention fails
+  // (not in the array). Byte-identity of served ⇄ browser is the next leg (sha256).
+  const rbCall = hookSrc.match(/importFirst\(\s*\[([^\]]*response-blocks[^\]]*)\]\s*\)/);
+  const rbCandidates = rbCall ? [...rbCall[1].matchAll(/['"]([^'"]+)['"]/g)].map((x) => x[1]) : [];
+  const rbFirstExisting = rbCandidates
+    .map((c) => path.resolve(path.dirname(HOOK_FILE), c))
+    .find((p) => fs.existsSync(p));
+  const rbFirstReal = rbFirstExisting ? fs.realpathSync(rbFirstExisting) : null;
+  const rbServedReal = fs.realpathSync(path.join(ROOT, 'public', 'lib', 'response-blocks.js'));
+  check('the module the Stop hook ACTUALLY loads (first importable importFirst candidate) IS the one shared served grammar — not a comment-only mention, not a private copy tried first',
+    rbCandidates.length > 0 && !!rbFirstReal && rbFirstReal === rbServedReal,
+    { candidates: rbCandidates, firstReal: rbFirstReal, servedReal: rbServedReal });
   const fromHook = fs.realpathSync(path.resolve(path.dirname(HOOK_FILE), HOOK_SPEC));
   const served = fs.realpathSync(path.join(ROOT, 'public', 'lib', 'response-blocks.js'));
   check('...and that specifier resolves to the very file the browser is served', fromHook === served, { fromHook, served });
@@ -900,23 +926,56 @@ async function main() {
    * and does an archived legacy message still render the way it always did. */
   console.log('\n=== [S] semantic categories: captioned, one fold, fallback visible ===');
   const sem = await cdp.eval(RENDER('SEMANTIC'));
-  check('the four reader-addressed categories + the fallback render visibly (5 blocks)',
-    sem.answerCount === 5, { visibleBlocks: sem.answerCount, cats: sem.cats });
-  // THE HIDING SURFACE, asked as the RULE and not as a count. Round 13 folded
-  // `finding` as well, so "exactly one folds" was a description of the set, not
-  // the invariant. The invariant is that nothing ADDRESSED TO THE READER folds.
-  check('the supporting record folds — finding and narration, both closed',
-    sem.notesCount === 2 && sem.notesOpen.every((o) => o === false)
-      && JSON.stringify(sem.cats.filter((c) => ['ob-finding', 'ob-narration'].includes(c)))
-        === JSON.stringify(['ob-finding', 'ob-narration']),
-    { folds: sem.notesCount, open: sem.notesOpen, cats: sem.cats });
-  check('nothing addressed to the reader is behind a fold',
-    ['SEM-OUTCOME', 'SEM-ASK', 'SEM-JUDGMENT', 'SEM-STATUS', 'SEM-UNCAT']
-      .every((t) => sem.visibleText.includes(t) && !sem.notesBodyText.join(' ').includes(t)),
-    sem.notesBodyText.map((t) => t.slice(0, 40)));
-  check('each visible category carries its own caption, in document order',
-    JSON.stringify(sem.caps) === JSON.stringify(['Changed', 'Needs you', 'My call', 'Where things stand', 'Uncategorised']),
-    sem.caps);
+  /* ── the FIXED documented oracle (BUG-200 round 2) ──────────────────────────
+   * Round 1 derived each expectation from the renderer's OWN COLLAPSED_BLOCKS at
+   * runtime and was REFUTED (clean-room run a6a749bf): a regression that folds a
+   * reader-addressed category MOVES that same constant, so the derived expectation
+   * moves with it and the leg still passes — "one shared helper that still DERIVES
+   * is the same defect with fewer copies" (docs/CONVENTIONS.md, ARCH-010). So the
+   * partition is now a FIXED LITERAL taken from the DOCUMENTED contract, never read
+   * back out of the module under test:
+   *   docs/prompts/RESPONSE_FORMAT.md (response-format-inject core): "Open: digest,
+   *     `answer`, `ask`, `status`. The rest FOLD, each showing its first sentence";
+   *   "Presentation follows from the category": finding/outcome/judgment/narration
+   *     are the supporting record that folds; "a folded finding shows its own first
+   *     sentence on the summary line, a folded narration shows a bare label" (so
+   *     narration is the one fold with NO preview); and the fallback
+   *     `orchard-uncategorized` "is visible because hiding the thing we could not
+   *     classify is the worst possible direction".
+   * Applied to the SEMANTIC fixture's authored order
+   * [finding, outcome, ask, judgment, status, narration, uncategorized]: */
+  const SEM_VISIBLE_CATS = ['ob-ask', 'ob-status', 'ob-uncat'];                  // ask+status are OPEN; uncat is the always-visible fallback
+  const SEM_FOLD_CATS = ['ob-finding', 'ob-outcome', 'ob-judgment', 'ob-narration'];
+  const SEM_VISIBLE_TOK = ['SEM-ASK', 'SEM-STATUS', 'SEM-UNCAT'];                // the reader-addressed tokens that MUST be visible and never folded
+  const SEM_VISIBLE_CAPS = ['Needs you', 'Where things stand', 'Uncategorised']; // the documented caption of each visible category, in document order
+  const SEM_PREVIEW_FOLDS = ['ob-finding', 'ob-outcome', 'ob-judgment'];         // fold WITH a first-sentence preview
+  const SEM_BARE_FOLDS = ['ob-narration'];                                       // fold with a BARE label, no preview
+  // All five partition verdicts as pure functions of a render, so the SAME grader
+  // runs against the real renderer (each must be true) AND against a deliberately
+  // mutated grammar below (each must be false). A render that folds a reader
+  // category, reverts the partition, or mis-captions is rejected by construction,
+  // because every expectation here is a fixed literal.
+  const semVerdicts = (r) => ({
+    visiblePartition: JSON.stringify(r.answerCats) === JSON.stringify(SEM_VISIBLE_CATS),
+    foldPartition: r.notesCount === SEM_FOLD_CATS.length && r.notesOpen.every((o) => o === false)
+      && JSON.stringify(r.notesCats) === JSON.stringify(SEM_FOLD_CATS),
+    readerNotFolded: SEM_VISIBLE_TOK.every((t) => r.visibleText.includes(t) && !r.notesBodyText.join(' ').includes(t)),
+    captions: JSON.stringify(r.caps) === JSON.stringify(SEM_VISIBLE_CAPS),
+    previews: r.notesCats.length === SEM_FOLD_CATS.length
+      && r.notesCats.every((c, i) => c === SEM_FOLD_CATS[i])
+      && r.notesPrev.every((p, i) => SEM_BARE_FOLDS.includes(SEM_FOLD_CATS[i])
+        ? p === null
+        : (SEM_PREVIEW_FOLDS.includes(SEM_FOLD_CATS[i]) && typeof p === 'string' && p.length > 0)),
+  });
+  const V = semVerdicts(sem);
+  check('the VISIBLE blocks are exactly {ask, status, uncat-fallback}, in document order (fixed oracle)',
+    V.visiblePartition, { answerCats: sem.answerCats, expected: SEM_VISIBLE_CATS });
+  check('the FOLDED blocks are exactly {finding, outcome, judgment, narration}, all closed, in document order (fixed oracle)',
+    V.foldPartition, { notesCount: sem.notesCount, open: sem.notesOpen, notesCats: sem.notesCats, expected: SEM_FOLD_CATS });
+  check('nothing addressed to the reader (ask/status/uncat) is behind a fold',
+    V.readerNotFolded, { visTokens: SEM_VISIBLE_TOK, foldBodies: sem.notesBodyText.map((t) => t.slice(0, 40)) });
+  check('each visible category carries its own documented caption, in document order (fixed oracle)',
+    V.captions, { caps: sem.caps, expected: SEM_VISIBLE_CAPS });
   check('the category classes are distinct per block (presentation derives from the name)',
     JSON.stringify(sem.cats.filter((c) => !['ob-narration', 'ob-finding'].includes(c))) ===
       JSON.stringify(['ob-outcome', 'ob-ask', 'ob-judgment', 'ob-status', 'ob-uncat']),
@@ -944,11 +1003,13 @@ async function main() {
       && !sem.notesPrev[0].includes('still in review'),
     sem.notesPrev);
   // A NARRATION FOLD GETS NO PREVIEW — presentation is per CATEGORY, so this is
-  // what proves the flag is read rather than the fold branch being blanket. The
-  // fold order is finding then narration, as authored.
-  check('exactly one fold carries a preview, and it is the finding',
-    sem.notesPrev.length === 2 && typeof sem.notesPrev[0] === 'string' && sem.notesPrev[1] === null,
-    sem.notesPrev);
+  // what proves the flag is read rather than the fold branch being blanket. Round
+  // 14 (FEAT-098) gave `outcome` and `judgment` the same first-sentence preview as
+  // `finding` (they are the long "what I did / why" prose); `narration` alone folds
+  // to a bare label. So the invariant is: every fold shows a preview EXCEPT
+  // narration. (Was "exactly one fold, the finding" — a description of the r13 set.)
+  check('every folded category shows a first-sentence preview except narration (bare label, fixed oracle)',
+    V.previews, { notesCats: sem.notesCats, prev: sem.notesPrev, previewFolds: SEM_PREVIEW_FOLDS, bareFolds: SEM_BARE_FOLDS });
   check('nothing was lost: every authored region is somewhere in the render',
     ['SEM-FINDING', 'SEM-FINDING-BODY', 'SEM-OUTCOME', 'SEM-ASK', 'SEM-JUDGMENT', 'SEM-STATUS', 'SEM-NARRATION', 'SEM-UNCAT']
       .every((t) => sem.text.includes(t)), 'all present');
@@ -956,9 +1017,22 @@ async function main() {
     // The screen-reader read of the same claim: captions are real text nodes, the
     // ask is reachable, the narration is not — asked of the AX tree, never markup.
     const axSem = await cdp.send('Accessibility.getFullAXTree');
-    const axSemText = JSON.stringify(axSem.nodes.filter((n) => !n.ignored));
-    check('a screen reader reaches the ask AND its category caption',
-      axSemText.includes('SEM-ASK') && axSemText.includes('Needs you'), 'ask + caption in AX tree');
+    const axLive = axSem.nodes.filter((n) => !n.ignored);
+    const axSemText = JSON.stringify(axLive);
+    const axNames = axLive.map((n) => (n.name?.value ?? '').trim());
+    // The caption span carries `text-transform: uppercase` (styles.css .ob-cap-lbl),
+    // and Chrome folds text-transform into the computed accessible NAME, so the ask
+    // caption's own AX node reads exactly "NEEDS YOU". BUG-200 round 1 matched a
+    // case-insensitive SUBSTRING over the whole AX JSON and was refuted as vacuous:
+    // the status BODY in this fixture ("…nothing needs you.") contains "needs you",
+    // so the caption half passed even with the caption missing or mis-labelled.
+    // Fixed oracle: the ask BODY must reach the tree AND a SEPARATE node must carry
+    // EXACTLY the documented caption (SEM_VISIBLE_CAPS[0] → uppercased by the CSS),
+    // so a folded ask (body gone) or a wrong caption fails.
+    const axAskCap = SEM_VISIBLE_CAPS[0].toUpperCase(); // 'NEEDS YOU'
+    check('a screen reader reaches the ask body AND its OWN caption node (exact node, not a substring)',
+      axNames.some((t) => t.includes('SEM-ASK')) && axNames.some((t) => t.toUpperCase() === axAskCap),
+      { askBody: axNames.some((t) => t.includes('SEM-ASK')), capNode: axNames.some((t) => t.toUpperCase() === axAskCap) });
     check('...and does NOT reach the folded narration while it is closed',
       !axSemText.includes('SEM-NARRATION'), 'absent while closed');
     // The preview is a real text node on the summary, so a screen reader gets the
@@ -1368,7 +1442,23 @@ async function main() {
        * for a pinned prior generation via CDP request interception — the real
        * renderer, the real browser, an old grammar — and this leg's own grader is
        * required to fire, in that generation's OWN defect direction.
-       * Fixed shas, never a moving baseline. */
+       * Fixed shas, never a moving baseline.
+       *
+       * BUG-179: the swap serves the WHOLE parser-touching import closure of the
+       * pinned generation, not response-blocks.js alone. Current dom.js:6 does
+       * `import { fenceSegments } from './response-blocks.js'` — a symbol the
+       * round-7/round-9 generations never exported — so leaving dom.js at HEAD
+       * while pinning only response-blocks.js linked a mixed ES-module graph the
+       * browser rejects (`does not provide an export named 'fenceSegments'`),
+       * FATALing the whole run. digest.js imports el/prose from dom.js,
+       * formatTicketsHash from route.js and parseResponseBlocks from
+       * response-blocks.js, and dom.js imports from response-blocks.js — so this
+       * closure is exactly {digest,dom,route,response-blocks}.js. Serving all four
+       * from the one pinned commit is internally consistent BY CONSTRUCTION (it is
+       * a real historical renderer), and the OLD parser behaviour is still what is
+       * under test. If any file in the closure is unreachable in this tree (a
+       * clean-room export with no .git), the whole generation SKIPs with a reason. */
+      const CAL_CLOSURE = ['response-blocks.js', 'dom.js', 'route.js', 'digest.js'];
       // `floor` is a REQUIRED number of violations in that generation's own defect
       // direction, not merely >0: a calibration that passes on a single hit is one
       // unlucky shuffle away from a green run that proved nothing. Measured rates
@@ -1387,19 +1477,33 @@ async function main() {
       const calStride = Math.max(1, Math.floor(picked.length / CAL_N));
       const calDocs = picked.filter((_, k) => k % calStride === 0).slice(0, CAL_N);
       for (const gen of CAL) {
-        const shown = spawnSync('git', ['show', `${gen.sha}:public/lib/response-blocks.js`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
-        if (shown.status !== 0 || !shown.stdout) {
-          check(`calibration ${gen.label} (${gen.sha}) SKIPPED — history unavailable in this tree (clean-room export has no .git)`, true, shown.stderr?.slice(0, 120) ?? 'no git');
+        // Pin the WHOLE parser-touching closure of this generation (BUG-179), so
+        // the served ES-module graph is internally consistent instead of a HEAD
+        // dom.js linked against an old response-blocks.js. If any closure file is
+        // unreachable (clean-room export with no .git), SKIP the generation.
+        const genFiles = new Map();
+        let missing = null;
+        for (const f of CAL_CLOSURE) {
+          const s = spawnSync('git', ['show', `${gen.sha}:public/lib/${f}`], { cwd: ROOT, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+          if (s.status !== 0 || !s.stdout) { missing = { f, err: s.stderr?.slice(0, 120) ?? 'no git' }; break; }
+          genFiles.set(f, s.stdout);
+        }
+        if (missing) {
+          check(`calibration ${gen.label} (${gen.sha}) SKIPPED — history unavailable in this tree (clean-room export has no .git): ${missing.f}`, true, missing.err);
           continue;
         }
-        await cdp.send('Fetch.enable', { patterns: [{ urlPattern: '*/lib/response-blocks.js', requestStage: 'Response' }] });
+        await cdp.send('Fetch.enable', { patterns: CAL_CLOSURE.map((f) => ({ urlPattern: `*/lib/${f}`, requestStage: 'Response' })) });
         const onPaused = (raw) => {
           const m = JSON.parse(raw.toString());
           if (m.method !== 'Fetch.requestPaused') return;
+          const reqUrl = m.params.request?.url ?? '';
+          const base = reqUrl.split('?')[0].split('/').pop();
+          const body = genFiles.get(base);
+          if (body == null) { cdp.send('Fetch.continueRequest', { requestId: m.params.requestId }).catch(() => {}); return; }
           cdp.send('Fetch.fulfillRequest', {
             requestId: m.params.requestId, responseCode: 200,
             responseHeaders: [{ name: 'content-type', value: 'text/javascript; charset=utf-8' }],
-            body: Buffer.from(shown.stdout, 'utf8').toString('base64'),
+            body: Buffer.from(body, 'utf8').toString('base64'),
           }).catch(() => { /* target gone */ });
         };
         cdp.ws.on('message', onPaused);
@@ -1423,6 +1527,71 @@ async function main() {
         cdp.ws.off('message', onPaused);
         await cdp.send('Fetch.disable');
       }
+
+      /* ── BUG-200 round 2: the FIXED-ORACLE [S] legs must REJECT a real GRAMMAR
+       * regression, not just a synthetic `sem` object. Round 1 derived the [S]
+       * expectations from the live COLLAPSED_BLOCKS, so a regression that folded a
+       * reader-addressed category moved the expectation with it and the leg still
+       * passed (clean-room run a6a749bf logged 28 such acceptances). Here the REAL
+       * renderer is driven, in the REAL browser, over two deliberately-mutated
+       * generations of the grammar — served via the same CDP request interception
+       * the calibration above uses — and the fixed-oracle `semVerdicts` grader is
+       * required to REJECT each. The live restore below wipes the module map, so no
+       * mutated module leaks past this block. */
+      {
+        const liveRB = fs.readFileSync(path.join(ROOT, 'public', 'lib', 'response-blocks.js'), 'utf8');
+        const liveDigest = fs.readFileSync(path.join(ROOT, 'public', 'lib', 'digest.js'), 'utf8');
+        // (A) fold a reader-addressed category: add `orchard-ask` to COLLAPSED_BLOCKS.
+        const rbFoldAsk = liveRB.replace(
+          /export const COLLAPSED_BLOCKS = Object\.freeze\(\[[\s\S]*?\]\)/,
+          "export const COLLAPSED_BLOCKS = Object.freeze(['orchard-ask', 'orchard-finding', 'orchard-outcome', 'orchard-judgment', 'orchard-narration', 'orchard-notes'])");
+        // (B) mis-caption a visible category: change the `orchard-ask` label.
+        const digestWrongCap = liveDigest.replace("label: 'Needs you'", "label: 'Question'");
+        const renderMutated = async (fileName, bytes) => {
+          await cdp.send('Fetch.enable', { patterns: [{ urlPattern: `*/lib/${fileName}`, requestStage: 'Response' }] });
+          const handler = (raw) => {
+            const m = JSON.parse(raw.toString());
+            if (m.method !== 'Fetch.requestPaused') return;
+            const base = (m.params.request?.url ?? '').split('?')[0].split('/').pop();
+            if (base === fileName) {
+              cdp.send('Fetch.fulfillRequest', { requestId: m.params.requestId, responseCode: 200,
+                responseHeaders: [{ name: 'content-type', value: 'text/javascript; charset=utf-8' }],
+                body: Buffer.from(bytes, 'utf8').toString('base64') }).catch(() => {});
+            } else {
+              cdp.send('Fetch.continueRequest', { requestId: m.params.requestId }).catch(() => {});
+            }
+          };
+          cdp.ws.on('message', handler);
+          await cdp.send('Page.navigate', { url: `${BASE}/?mut=${fileName}` });
+          await cdp.waitFor('reboot (mutated grammar)', `!!document.querySelector('link[rel="stylesheet"]')`, 30_000);
+          await cdp.eval(`(async () => { window.__f091 = await import('/lib/digest.js'); window.__FIX = ${JSON.stringify(FIXTURES)}; return true; })()`);
+          const sMut = await cdp.eval(RENDER('SEMANTIC'));
+          const ax = await cdp.send('Accessibility.getFullAXTree');
+          const axNames = ax.nodes.filter((n) => !n.ignored).map((n) => (n.name?.value ?? '').trim());
+          cdp.ws.off('message', handler);
+          await cdp.send('Fetch.disable');
+          return { sem: sMut, axNames };
+        };
+
+        const A = await renderMutated('response-blocks.js', rbFoldAsk);
+        const wA = semVerdicts(A.sem);
+        check('MUST-FAIL (real mutated grammar): folding `orchard-ask` into COLLAPSED_BLOCKS is REJECTED by every fixed-oracle [S] partition leg',
+          rbFoldAsk !== liveRB && !wA.visiblePartition && !wA.foldPartition && !wA.readerNotFolded && !wA.captions && !wA.previews,
+          { mutationApplied: rbFoldAsk !== liveRB, rejected: wA, answerCats: A.sem.answerCats, notesCats: A.sem.notesCats });
+        check('MUST-FAIL (real mutated grammar): with `orchard-ask` folded, the ask BODY is absent from the accessibility tree (leg 7 fires)',
+          !A.axNames.some((t) => t.includes('SEM-ASK')),
+          { askBodyInAX: A.axNames.some((t) => t.includes('SEM-ASK')) });
+
+        const B = await renderMutated('digest.js', digestWrongCap);
+        const wB = semVerdicts(B.sem);
+        check('MUST-FAIL (real mutated renderer): a wrong ask caption is REJECTED by the caption leg, while the partition legs stay valid',
+          digestWrongCap !== liveDigest && !wB.captions && wB.visiblePartition && wB.readerNotFolded,
+          { mutationApplied: digestWrongCap !== liveDigest, caps: B.sem.caps, rejected: { captions: wB.captions }, stillValid: { visiblePartition: wB.visiblePartition, readerNotFolded: wB.readerNotFolded } });
+        check('MUST-FAIL (real mutated renderer): the wrong caption node is absent from the accessibility tree while the ask body remains (leg 7 fires on the caption, not the status body)',
+          !B.axNames.some((t) => t.toUpperCase() === SEM_VISIBLE_CAPS[0].toUpperCase()) && B.axNames.some((t) => t.includes('SEM-ASK')),
+          { wrongCapNodePresent: B.axNames.some((t) => t.toUpperCase() === SEM_VISIBLE_CAPS[0].toUpperCase()) });
+      }
+
       // Back to the LIVE parser for everything after this point.
       await cdp.send('Page.navigate', { url: `${BASE}/` });
       await cdp.waitFor('reboot on the live parser', `!!document.querySelector('link[rel="stylesheet"]')`, 30_000);

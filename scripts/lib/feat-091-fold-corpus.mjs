@@ -1360,6 +1360,582 @@ export function generateCorpus() {
     });
   }
 
+  /* ── THE FOLD GUARD (C1/C2) INSIDE A CONTAINER ────────────────────────────
+   * THE ROUND-13/14 STRATUM. The `bq` and `list` strata above pin a fold whose
+   * body is quoted or indented NARRATION — the fence and its OWN content in a
+   * container. They never wrap the CERTAINTY GUARD's inputs: a fold body that
+   * contains a reserved opener (C1) or an unpaired inner fence (C2). That gap is
+   * exactly what the independent pass found — `foldUncertainty`'s `openerOf` /
+   * `isClosingFence` ran on the RAW `>`-prefixed line, where `openerOf` sees no
+   * reserved opener and no unpaired fence, so an authored `orchard-answer` inside
+   * a quoted fold rendered in a CLOSED <details> with `malformed: []`. Same
+   * "a guard reads the raw line where the parser reads the container-stripped
+   * line" family as rounds 8 and 9, reached through a block-quote / list wrapper
+   * that the corpus only exercised at top level.
+   *
+   * So the guard's two inputs are wrapped in every container the module models —
+   * a quote (spaced and tight), a nested quote (mixed depth), a list item, and a
+   * list item inside a quote — under both fence characters. In each:
+   *   C1 — the fold body holds a reserved (`orchard-answer`) opener at the
+   *        container's content column. The fold must END there, the opener must
+   *        become its own VISIBLE block, and `ambiguous-fold` must be reported.
+   *   C2 — the fold body holds an inner fence one run SHORTER than the opener,
+   *        never closed inside the body. The fold must end at it and the content
+   *        after it must be VISIBLE (fallback), reported `unpaired-fence-in-fold`.
+   * `expected: null` (like the reported cases): the parse is a deliberate
+   * deviation, so I1/I2 + "not silently absorbed" grade it, and the anti-vacuity
+   * check in the suite pins both C1 and C2 as populated so the stratum cannot
+   * quietly vanish. */
+  {
+    // [id, lead lines, opener prefix Q, body/close prefix P]. For a list the fence
+    // opens on a CONTINUATION line, so Q === P === the item's content indent and a
+    // marker line leads; for a quote the marker IS the prefix and there is no lead.
+    const FOLD_CONTAINERS = [
+      ['bq-d1', [], '> ', '> '],
+      ['bq-tight', [], '>', '>'],
+      ['bq-d2', [], '> > ', '> > '],
+      ['list', ['- item'], '  ', '  '],
+      ['list-in-q', ['> - item'], '>   ', '>   '],
+    ];
+    for (const [cid, lead, Q, P] of FOLD_CONTAINERS) {
+      for (const ch of CORPUS_CHARS) {
+        const F4 = ch.repeat(4), F3 = ch.repeat(3);
+        {
+          // C1 — a reserved opener inside the quoted/indented fold.
+          const narr = T(), vis = T();
+          cases.push({
+            id: `bqfold/c1/${cid}/${CHAR_TAG[ch]}`,
+            shape: 'bqfold',
+            eol: 'lf',
+            text: [...lead,
+              `${Q}${F4}orchard-notes`, `${P}${narr}`,
+              `${P}${F4}orchard-answer`, `${P}${vis}`, `${P}${F4}`].join('\n'),
+            tokens: [{ tok: narr, mustBeVisible: false }, { tok: vis, mustBeVisible: true }],
+            wellFormed: false,
+            expected: null,
+          });
+        }
+        {
+          // C2 — an unpaired inner fence inside the quoted/indented fold.
+          const body = T(), vis = T();
+          cases.push({
+            id: `bqfold/c2/${cid}/${CHAR_TAG[ch]}`,
+            shape: 'bqfold',
+            eol: 'lf',
+            text: [...lead,
+              `${Q}${F4}orchard-notes`, `${P}${body}`,
+              `${P}${F3}`, `${P}${vis}`, `${P}${F4}`].join('\n'),
+            tokens: [{ tok: body, mustBeVisible: false }, { tok: vis, mustBeVisible: true }],
+            wellFormed: false,
+            expected: null,
+          });
+        }
+      }
+    }
+  }
+
+  /* ── THE FOLD GUARD'S C1 AT A DEEPER CONTAINER THAN THE FOLD ───────────────
+   * THE BUG-201 STRATUM. The `bqfold` block above wraps the guard's inputs in a
+   * container, but the reserved opener always sits at the fold's OWN container
+   * depth (opener prefix === body prefix). BUG-201 is one container level further
+   * in: an `orchard-*` opener written DEEPER than the fold —
+   *
+   *     > ````orchard-narration
+   *     > narr
+   *     > > ````orchard-ask
+   *     > > VIS
+   *     > ````
+   *
+   * The round-15 fix routed the guard through the fold's OWN container-stripped
+   * view (`restOfLine(fold-stack, line)`), which strips only the fold's stack — so
+   * a `> >`-prefixed opener kept its inner `>`, `openerOf` saw a leading `>` and
+   * returned null, C1 never fired, and the whole `orchard-ask` folded away with
+   * `malformed: []`. The same hidden-content class, reached one quote/list level
+   * deeper. The fix gives C1 a MAXIMAL strip (`innermostContent`) that consumes
+   * every leading `>`/list marker; C2 and `findClose` keep the fold-stack view.
+   *
+   * TWO directions, both in this stratum:
+   *   HIDE — a fence-shaped reserved opener at depth 2-4 below the fold, mixed
+   *     quote/list. C1 must fire: the fold ENDS there, the deeper block is promoted
+   *     toward VISIBLE, and the deviation is REPORTED. (`expected: null` + tokens,
+   *     like `bqfold`; the parse is a deliberate deviation.)
+   *   NO-FIRE — the OVER-FIRE guard, and the care item of the ticket: a WELL-FORMED
+   *     notes fold whose deeper body line MENTIONS `orchard-*` but is NOT a fence
+   *     opener — an inline mention, a run of only two fence characters, or a fence
+   *     indented 4+ columns past its innermost container (indented code, which a
+   *     naive "strip all leading whitespace" probe would wrongly promote). C1 must
+   *     NOT fire: the fold stays whole and the parse is SILENT. This is what keeps
+   *     the maximal strip from being more aggressive than the fence shape allows. */
+  {
+    // [id, lead lines, Q = fold opener/close prefix, D = the DEEPER opener prefix].
+    // For a list the fold opens on a continuation line, so a marker line leads and
+    // Q is the item's content indent; D adds one more container inside it.
+    const DEEP_CONTAINERS = [
+      ['q>q', [], '> ', '> > '],
+      ['q>q>q', [], '> ', '> > > '],
+      ['q>q>q>q', [], '> ', '> > > > '],
+      ['q>list', [], '> ', '> - '],
+      ['list>q', ['- item'], '  ', '  > '],
+      ['list>list', ['- item'], '  ', '  - '],
+    ];
+    for (const [cid, lead, Q, D] of DEEP_CONTAINERS) {
+      for (const ch of CORPUS_CHARS) {
+        const F4 = ch.repeat(4), F3 = ch.repeat(3), F2 = ch.repeat(2);
+        {
+          // HIDE — a fence-shaped reserved opener DEEPER than the fold. C1 must fire.
+          const narr = T(), vis = T();
+          cases.push({
+            id: `deepfold/hide/${cid}/${CHAR_TAG[ch]}`,
+            shape: 'deepfold',
+            eol: 'lf',
+            text: [...lead,
+              `${Q}${F4}orchard-notes`, `${Q}${narr}`,
+              `${D}${F4}orchard-answer`, `${D}${vis}`, `${Q}${F4}`].join('\n'),
+            tokens: [{ tok: narr, mustBeVisible: false }, { tok: vis, mustBeVisible: true }],
+            wellFormed: false,
+            expected: null,
+          });
+        }
+        {
+          // NO-FIRE (inline) — an `orchard-*` word at the deeper container that is
+          // not a fence at all. The fold is whole and silent; the mention folds.
+          const narr = T(), mention = T();
+          const body = [`${Q}${narr}`, `${D}orchard-answer ${mention}`];
+          cases.push({
+            id: `deepfold/nofire-inline/${cid}/${CHAR_TAG[ch]}`,
+            shape: 'deepfold',
+            eol: 'lf',
+            text: [...lead, `${Q}${F4}orchard-notes`, ...body, `${Q}${F4}`].join('\n'),
+            tokens: [{ tok: narr, mustBeVisible: false }, { tok: mention, mustBeVisible: false }],
+            wellFormed: true,
+            expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+            expectedFlags: [],
+          });
+        }
+        {
+          // NO-FIRE (short run) — only TWO fence characters deeper: not an opener.
+          const narr = T(), mention = T();
+          const body = [`${Q}${narr}`, `${D}${F2}orchard-answer ${mention}`];
+          cases.push({
+            id: `deepfold/nofire-shortrun/${cid}/${CHAR_TAG[ch]}`,
+            shape: 'deepfold',
+            eol: 'lf',
+            text: [...lead, `${Q}${F4}orchard-notes`, ...body, `${Q}${F4}`].join('\n'),
+            tokens: [{ tok: narr, mustBeVisible: false }, { tok: mention, mustBeVisible: false }],
+            wellFormed: true,
+            expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+            expectedFlags: [],
+          });
+        }
+        {
+          // NO-FIRE (indented code) — the CRITICAL over-fire case. A fence-shaped
+          // run four columns past the DEEPER container is indented code, not an
+          // opener; a strip that greedily ate the whitespace would promote it, so
+          // this pins that the maximal strip stops at the content column. Folds,
+          // silent.
+          const narr = T(), example = T();
+          const body = [`${Q}${narr}`, `${D}    ${F3}orchard-answer`, `${D}    ${example}`, `${D}    ${F3}`];
+          cases.push({
+            id: `deepfold/nofire-icode/${cid}/${CHAR_TAG[ch]}`,
+            shape: 'deepfold',
+            eol: 'lf',
+            text: [...lead, `${Q}${F4}orchard-notes`, ...body, `${Q}${F4}`].join('\n'),
+            tokens: [{ tok: narr, mustBeVisible: false }, { tok: example, mustBeVisible: false }],
+            wellFormed: true,
+            expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+            expectedFlags: [],
+          });
+        }
+      }
+    }
+  }
+
+  /* ── THE LIST CONTENT COLUMN, at every width — round-1 regression (BUG-201) ──
+   * The first fix gave C1 a strip that measured RAW columns, so a fold sitting in
+   * a list item whose CONTENT COLUMN is 4 or 5 (a marker plus its spaces) had its
+   * continuation indent read as indented code: `innermostContent` bailed at 4+
+   * columns and never reached the deeper `>`-quoted opener, which stayed hidden
+   * with `malformed: []`. The independent clean-room verify found it, at exactly
+   * that 4-5-space geometry. The real fix strips the fold's own containers through
+   * the parser's `restOfLine` (which knows the item's true content column) and only
+   * then opens DEEPER containers — one authority for "where does content start"
+   * (ARCH-010). This stratum is the regression gate: the fold opens on a list-item
+   * CONTINUATION line at content columns 2-6 (markers of width 1-3 x 1-4 trailing
+   * spaces, plus a tab), and a reserved opener sits one quote level deeper, under
+   * every line-ending regime. HIDE (the opener promoted) and NO-FIRE (a deeper
+   * fence indented into code stays folded, silent) both present. */
+  {
+    // [markerId, marker, padSpaces] -> content column = marker.length + pad (or a
+    // tab, which advances to the next 4-column stop). Only 1-4 trailing spaces —
+    // 5+ would make the item's own content indented code (a different stratum).
+    const LIST_MARKERS = [
+      ['dash', '-'], ['star', '*'], ['plus', '+'], ['ord1', '1.'], ['ord2', '10.'], ['ordp', '3)'],
+    ];
+    const B4 = '`'.repeat(4), B3 = '`'.repeat(3);
+    for (const [mid, marker] of LIST_MARKERS) {
+      for (const pad of [1, 2, 3, 4, 'tab']) {
+        const gap = pad === 'tab' ? '\t' : ' '.repeat(pad);
+        // The continuation indent that keeps a line inside the item: the marker's
+        // width plus its trailing whitespace, expanded to columns (a tab -> next
+        // 4-stop). Continuation lines are pure indentation of that width.
+        const col = indentWidth(marker + gap);
+        const P = ' '.repeat(col);
+        for (const eol of ['lf', 'crlf', 'cr']) {
+          const seq = { lf: '\n', crlf: '\r\n', cr: '\r' }[eol];
+          {
+            // HIDE — the fold opens on the item's continuation line; a reserved
+            // opener sits one quote level deeper. It must be promoted, not hidden.
+            const narr = T(), vis = T();
+            const lines = [
+              `${marker}${gap}item`,
+              `${P}${B4}orchard-notes`, `${P}${narr}`,
+              `${P}> ${B4}orchard-answer`, `${P}> ${vis}`, `${P}${B4}`,
+            ];
+            cases.push({
+              id: `listcol/hide/${mid}/${pad}/${eol}`,
+              shape: 'listcol',
+              eol,
+              text: lines.join(seq),
+              tokens: [{ tok: narr, mustBeVisible: false }, { tok: vis, mustBeVisible: true }],
+              wellFormed: false,
+              expected: null,
+            });
+          }
+          {
+            // NO-FIRE — a deeper fence indented 4+ columns past the inner quote is
+            // indented code, not an opener; the fold stays whole and SILENT. A
+            // raw-column strip that ignored the list's content column would either
+            // wrongly promote it (over-fire) or, at width 4-5, wrongly hide the HIDE
+            // case above — this pins that neither happens.
+            const narr = T(), example = T();
+            const body = [`${P}${narr}`, `${P}> ${' '.repeat(4)}${B3}orchard-answer`,
+              `${P}> ${' '.repeat(4)}${example}`, `${P}> ${' '.repeat(4)}${B3}`];
+            const lines = [`${marker}${gap}item`, `${P}${B4}orchard-notes`, ...body, `${P}${B4}`];
+            cases.push({
+              id: `listcol/nofire-icode/${mid}/${pad}/${eol}`,
+              shape: 'listcol',
+              eol,
+              text: lines.join(seq),
+              tokens: [{ tok: narr, mustBeVisible: false }, { tok: example, mustBeVisible: false }],
+              wellFormed: true,
+              expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+              expectedFlags: [],
+            });
+          }
+        }
+      }
+    }
+  }
+
+  /* ── A LIST OPENED WITHIN THE FOLD BODY, OPENER ON A CONTINUATION LINE ──────
+   * THE ROUND-3 REGRESSION (BUG-201). The round-2 fix walked the fold's OWN list
+   * stack, but a list opened on a PRIOR body line — with its marker NOT repeated
+   * and the reserved opener sitting on a CONTINUATION line at the item's content
+   * column — was invisible to a per-line strip: the continuation indent read as
+   * indented code and `openerOf` never saw the fence, so the opener stayed folded
+   * with `malformed: []` (240/336 cases in the clean-room verify). The real fix
+   * stops estimating and runs the parser's block-structure state machine over the
+   * fold body, so a container opened on one line is carried onto the next.
+   *
+   * The list opens on `${marker} item` INSIDE the fold body; the reserved opener is
+   * on the following continuation line at the content column (marker not repeated).
+   * HIDE (opener promoted) and NO-FIRE (a genuinely indented-code fence 4+ columns
+   * past the content column stays folded, silent) both present, x marker forms x
+   * content columns x tab/space continuation x LF/CRLF/CR x bare and quote-wrapped. */
+  {
+    const B4 = '`'.repeat(4), B3 = '`'.repeat(3);
+    const LIST_MARKERS = [
+      ['dash', '-'], ['star', '*'], ['plus', '+'], ['ord1', '1.'], ['ord2', '10.'], ['ordp', '3)'],
+    ];
+    for (const [mid, marker] of LIST_MARKERS) {
+      for (const pad of [1, 2, 3, 'tab']) {
+        const gap = pad === 'tab' ? '\t' : ' '.repeat(pad);
+        for (const [wid, W] of [['bare', ''], ['quote', '> ']]) {
+          // The item's content column RELATIVE to its container: expand the tab
+          // against the FULL prefix (a tab inside `> ` lands on a different stop
+          // than at column 0), then subtract the wrapper's own width.
+          const col = indentWidth(W + marker + gap) - indentWidth(W);
+          const P = ' '.repeat(col);
+          for (const eol of ['lf', 'crlf', 'cr']) {
+            const seq = { lf: '\n', crlf: '\r\n', cr: '\r' }[eol];
+            {
+              // HIDE — a list opens on the FIRST body line (so any marker opens it,
+              // even an ordered one not starting at 1, which could not interrupt a
+              // paragraph); the reserved opener is on the item's CONTINUATION line,
+              // marker NOT repeated. The item's own content (`narr`) is folded.
+              const narr = T(), vis = T();
+              const lines = [
+                `${W}${B4}orchard-notes`,
+                `${W}${marker}${gap}${narr}`,
+                `${W}${P}${B4}orchard-ask`, `${W}${P}${vis}`, `${W}${P}${B4}`,
+                `${W}${B4}`,
+              ];
+              cases.push({
+                id: `listcont/hide/${mid}/${pad}/${wid}/${eol}`,
+                shape: 'listcont',
+                eol,
+                text: lines.join(seq),
+                tokens: [{ tok: narr, mustBeVisible: false }, { tok: vis, mustBeVisible: true }],
+                wellFormed: false,
+                expected: null,
+              });
+            }
+            {
+              // NO-FIRE — a fence 4+ columns past the item's content column is
+              // indented code, not an opener; the fold stays whole and SILENT.
+              const narr = T(), example = T();
+              const body = [`${W}${marker}${gap}${narr}`,
+                `${W}${P}${' '.repeat(4)}${B3}orchard-ask`, `${W}${P}${' '.repeat(4)}${example}`,
+                `${W}${P}${' '.repeat(4)}${B3}`];
+              const lines = [`${W}${B4}orchard-notes`, ...body, `${W}${B4}`];
+              cases.push({
+                id: `listcont/nofire-icode/${mid}/${pad}/${wid}/${eol}`,
+                shape: 'listcont',
+                eol,
+                text: lines.join(seq),
+                tokens: [{ tok: narr, mustBeVisible: false }, { tok: example, mustBeVisible: false }],
+                wellFormed: true,
+                expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+                expectedFlags: [],
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /* ── A PAIRED INNER FENCE IN A NESTED LIST — C1/C2 MUST NOT DISAGREE ────────
+   * THE ROUND-4 SEAM (BUG-201). Once C1 tracked containers opened inside the fold
+   * body but C2's fence pairing still read a separate fold-stack view, the two
+   * disagreed about which container a line was in: a WELL-FORMED paired inner code
+   * fence in a nested list (`- ```js … ``` `) was seen by C2 as a bare fence at the
+   * fold's own depth, flagged `unpaired-fence-in-fold`, and the fold was truncated —
+   * EJECTING visible trailing content. The fix derives C1 and C2 from ONE pass of
+   * the parser over the body, so they read the identical (container, fence) state.
+   *
+   * EJECT direction (well-formed, must be SILENT, nothing ejected): a paired inner
+   * code fence inside a nested list, with trailing folded content after it, across
+   * fence characters × lengths × info strings × nesting (list, list-in-quote,
+   * list-in-list) × LF/CRLF/CR. HIDE direction (must FIRE): the same nesting but the
+   * inner fence is a reserved `orchard-*` opener, which must still be promoted. */
+  {
+    const nsp = (n) => ' '.repeat(n);
+    // [id, wrapper prefix W, the container chain that OPENS on the first body line,
+    //  content column of the innermost item RELATIVE to the fold's own depth].
+    const NESTS = [
+      ['list', '', '- ', 2],
+      ['list-in-quote', '> ', '- ', 2],
+      ['list-in-list', '', '- - ', 4],
+      ['ordered', '', '1. ', 3],
+      ['ordered-wide', '', '10. ', 4],
+    ];
+    for (const [nid, W, chain, col] of NESTS) {
+      const P = nsp(col);                          // innermost item content column
+      for (const fch of ['`', '~']) {
+        for (const flen of [3, 4]) {
+          const F = fch.repeat(flen);
+          for (const info of ['', 'js', 'markdown']) {
+            for (const eol of ['lf', 'crlf', 'cr']) {
+              const seq = { lf: '\n', crlf: '\r\n', cr: '\r' }[eol];
+              {
+                // EJECT — a PAIRED plain code fence in the nested list, then folded
+                // trailing content. Well-formed: one notes block, silent, no eject.
+                const code = T(), tail = T();
+                const body = [
+                  `${W}${chain}${F}${info}`,
+                  `${W}${P}${code}`,
+                  `${W}${P}${F}`,
+                  `${W}${tail}`,
+                ];
+                cases.push({
+                  id: `pairfence/eject/${nid}/${CHAR_TAG[fch]}${flen}/${info || 'bare'}/${eol}`,
+                  shape: 'pairfence',
+                  eol,
+                  text: [`${W}\`\`\`\`\`orchard-notes`, ...body, `${W}\`\`\`\`\``].join(seq),
+                  tokens: [{ tok: code, mustBeVisible: false }, { tok: tail, mustBeVisible: false }],
+                  wellFormed: true,
+                  expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+                  expectedFlags: [],
+                });
+              }
+              {
+                // HIDE — the SAME nesting but the inner fence is a reserved opener.
+                // It must be promoted (fold cut, reported), never folded away.
+                const vis = T();
+                const body = [
+                  `${W}${chain}${F}orchard-ask`,
+                  `${W}${P}${vis}`,
+                  `${W}${P}${F}`,
+                ];
+                cases.push({
+                  id: `pairfence/hide/${nid}/${CHAR_TAG[fch]}${flen}/${info || 'bare'}/${eol}`,
+                  shape: 'pairfence',
+                  eol,
+                  text: [`${W}\`\`\`\`\`orchard-notes`, ...body, `${W}\`\`\`\`\``].join(seq),
+                  tokens: [{ tok: vis, mustBeVisible: true }],
+                  wellFormed: false,
+                  expected: null,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /* ── TWO FENCE EVENTS IN ONE STEP — A CONTAINER BOUNDARY ───────────────────
+   * THE ROUND-5 SEAM (BUG-201). C2 inferred fence open/close by DIFFING successive
+   * `advanceLineState` states, and a diff cannot see two events in one step: at a
+   * container boundary the quoted/listed inner fence CLOSES (its container exits)
+   * AND a fold-depth fence OPENS on the same line, so the state goes fence→fence,
+   * the boolean `!prevFence && nowFence` open-branch never fired, the fold-depth
+   * fence was missed, and its trailing content stayed folded. The fix has the pass
+   * emit explicit fence EVENTS, so a close+open on one line is fully visible.
+   *
+   * The inner fence opens inside a container (quote/list, at depth 1-2), its content
+   * follows, then a line at the FOLD's own depth exits the container and opens a
+   * fold-depth fence. HIDE: that fold-depth fence is UNPAIRED, so the token after it
+   * must be promoted VISIBLE. EJECT: it PAIRS, so the whole thing is one silent fold
+   * and nothing is ejected. Inner and boundary fence characters vary independently. */
+  {
+    const F3 = (ch) => ch.repeat(3);
+    // [id, container chain that opens the inner fence, continuation prefix for its content].
+    const BOUNDARIES = [
+      ['q1', '> ', '> '],
+      ['list1', '- ', '  '],
+      ['q2', '> > ', '> > '],
+      ['list2', '- - ', '    '],
+      ['list-in-q', '> - ', '>   '],
+    ];
+    for (const [bid, chain, cP] of BOUNDARIES) {
+      for (const ich of ['`', '~']) {
+        for (const fch of ['`', '~']) {
+          for (const eol of ['lf', 'crlf', 'cr']) {
+            const seq = { lf: '\n', crlf: '\r\n', cr: '\r' }[eol];
+            const IF = F3(ich), FF = F3(fch);
+            {
+              // HIDE — the boundary opens an UNPAIRED fold-depth fence. The token
+              // after it must be promoted, not folded.
+              const vis = T();
+              const lines = [
+                '`````orchard-notes',
+                `${chain}${IF}`, `${cP}code`,   // inner fence in the container
+                `${FF}`,                         // boundary: exit container + open fold-depth fence
+                `${vis}`,                        // inside the unpaired fold-depth fence
+                '`````',
+              ];
+              cases.push({
+                id: `boundary/hide/${bid}/${CHAR_TAG[ich]}${CHAR_TAG[fch]}/${eol}`,
+                shape: 'boundary',
+                eol,
+                text: lines.join(seq),
+                tokens: [{ tok: vis, mustBeVisible: true }],
+                wellFormed: false,
+                expected: null,
+              });
+            }
+            {
+              // EJECT — the boundary fold-depth fence PAIRS. One silent fold, no
+              // eject. (Same-character close only; a cross-character run cannot
+              // close it, which would make it the HIDE case instead.)
+              const code = T(), tail = T();
+              const body = [
+                `${chain}${IF}`, `${cP}${code}`,
+                `${FF}`, 'x', `${FF}`,           // fold-depth fence opens AND closes
+                `${tail}`,
+              ];
+              cases.push({
+                id: `boundary/eject/${bid}/${CHAR_TAG[ich]}${CHAR_TAG[fch]}/${eol}`,
+                shape: 'boundary',
+                eol,
+                text: ['`````orchard-notes', ...body, '`````'].join(seq),
+                tokens: [{ tok: code, mustBeVisible: false }, { tok: tail, mustBeVisible: false }],
+                wellFormed: true,
+                expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+                expectedFlags: [],
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /* ── A RESERVED OPENER BEHIND A CONTAINER MARKER, INSIDE AN OPEN INNER FENCE ─
+   * THE ROUND-6 C1 HIDING CASE (BUG-201). A `> ```orchard-ask` that sits behind a
+   * blockquote (or list) marker AND inside a PAIRED inner code fence stayed folded:
+   * inside the fence the `>`/`-` is literal code, so the parser's REAL state opens
+   * no container, and C1's fallback stripped only the parser's recognised
+   * containers — the marker on the line was never removed and `openerOf` never saw
+   * the opener. Remove EITHER wrapper (the marker, or the inner fence) and it
+   * promoted. The fix has `advanceLineState` compute ONE `content` field (every
+   * container marker on the line consumed, as-if-live) on every return path, and C1
+   * reads only that — so the opener is seen through both wrappers (fence-depth-free,
+   * BUG-108).
+   *
+   * HIDE: a reserved opener behind a container marker, inside a paired inner fence
+   * (both fence chars × info strings × quote/list/nested-quote/list-in-quote), must
+   * be promoted. NO-FIRE (the over-fire guard): a NON-reserved fence (`> ```js`) in
+   * the same position must NOT fire — content-as-if-live may only promote a reserved
+   * name — so the fold stays whole and silent. */
+  {
+    const MARKERS = [['q', '> '], ['list', '- '], ['q2', '> > '], ['list-in-q', '> - ']];
+    for (const [mid, marker] of MARKERS) {
+      for (const ich of ['`', '~']) {
+        for (const ilen of [3, 4]) {
+          const IF = ich.repeat(ilen);
+          for (const info of ['', 'markdown', 'js']) {
+            for (const rch of ['`', '~']) {
+              const RF = rch.repeat(3);
+              for (const eol of ['lf', 'crlf', 'cr']) {
+                const seq = { lf: '\n', crlf: '\r\n', cr: '\r' }[eol];
+                {
+                  // HIDE — reserved opener behind the marker, inside the inner fence.
+                  const vis = T();
+                  const lines = [
+                    '`````orchard-notes',
+                    `${IF}${info}`,                       // inner fence opens (fold depth)
+                    `${marker}${RF}orchard-ask`,          // reserved opener, behind a marker, as code
+                    `${vis}`,
+                    `${IF}`,                              // inner fence closes (paired)
+                    '`````',
+                  ];
+                  cases.push({
+                    id: `infence/hide/${mid}/${CHAR_TAG[ich]}${ilen}/${info || 'bare'}/${CHAR_TAG[rch]}/${eol}`,
+                    shape: 'infence',
+                    eol,
+                    text: lines.join(seq),
+                    tokens: [{ tok: vis, mustBeVisible: true }],
+                    wellFormed: false,
+                    expected: null,
+                  });
+                }
+                {
+                  // NO-FIRE — a NON-reserved fence in the same spot. Content-as-if-
+                  // live must not promote it; the fold is one silent whole.
+                  const codeT = T();
+                  const body = [`${IF}${info}`, `${marker}${RF}js`, `${codeT}`, `${IF}`];
+                  cases.push({
+                    id: `infence/nofire/${mid}/${CHAR_TAG[ich]}${ilen}/${info || 'bare'}/${CHAR_TAG[rch]}/${eol}`,
+                    shape: 'infence',
+                    eol,
+                    text: ['`````orchard-notes', ...body, '`````'].join(seq),
+                    tokens: [{ tok: codeT, mustBeVisible: false }],
+                    wellFormed: true,
+                    expected: [{ name: 'orchard-notes', content: body.join('\n') }],
+                    expectedFlags: [],
+                  });
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   /* ── CONTAINER CONTEXT 2: LIST ITEMS ──────────────────────────────────────
    * The other three-round carry-over, and the harder one, because a fence inside a
    * list item is PREFIXED by the item's content indent and its extent is easy to
@@ -1976,6 +2552,50 @@ export function reportedDefectCases() {
       tokens: [
         { tok: 'TILDE-NARRATION-2', mustBeVisible: false },
         { tok: 'TILDE-FOLD-DECISION', mustBeVisible: true },
+      ],
+      wellFormed: false,
+      expected: null,
+    },
+    {
+      // ROUND 13/14 — the clean-room input, character for character. The C1 fold
+      // guard, BLIND INSIDE A BLOCK QUOTE. `foldUncertainty` ran `openerOf` on the
+      // raw `> `-prefixed line, where there is no reserved opener at column 0, so a
+      // quoted `orchard-ask` authored INSIDE a quoted `orchard-narration` fold was
+      // never seen — the ask rendered in a CLOSED <details> with `malformed: []`.
+      // The parser everywhere else reads the container-STRIPPED line (`restOfLine`);
+      // the guard did not, which is rounds 8/9's family through a quote wrapper.
+      id: 'reported/round13-blockquote-c1-hides-an-ask',
+      shape: 'reported',
+      eol: 'lf',
+      text: ['> ````orchard-narration', '> BQ13-NARR', '> ````orchard-ask',
+        '> BQ13-ASK-VISIBLE', '> ````'].join('\n'),
+      tokens: [
+        { tok: 'BQ13-NARR', mustBeVisible: false },
+        { tok: 'BQ13-ASK-VISIBLE', mustBeVisible: true },
+      ],
+      wellFormed: false,
+      expected: null,
+    },
+    {
+      // ...and C2 in the same wrapper: an unpaired inner fence inside a quoted
+      // fold. The guard's `isClosingFence` ran on the raw line too, so it never
+      // saw the inner fence open, the fold's true end was in doubt, and
+      // `BQ14-TAIL-VISIBLE` stayed inside the closed fold with no
+      // `unpaired-fence-in-fold` report. The verifier's report used
+      // `orchard-outcome`; the guard is name-blind (it runs for every
+      // COLLAPSED_BLOCKS name), so this uses `orchard-narration` — the corpus's
+      // non-preview fold, whose body is graded as fully hidden. A PREVIEW fold
+      // (outcome/finding/judgment) shows its first body line in the <summary>, so
+      // that line is not hidden, which the render model deliberately does not
+      // exercise here; the C2 defect is identical either way.
+      id: 'reported/round14-blockquote-c2-keeps-content-folded',
+      shape: 'reported',
+      eol: 'lf',
+      text: ['> ````orchard-narration', '> BQ14-NARR-BODY', '> ```',
+        '> BQ14-TAIL-VISIBLE', '> ````'].join('\n'),
+      tokens: [
+        { tok: 'BQ14-NARR-BODY', mustBeVisible: false },
+        { tok: 'BQ14-TAIL-VISIBLE', mustBeVisible: true },
       ],
       wellFormed: false,
       expected: null,

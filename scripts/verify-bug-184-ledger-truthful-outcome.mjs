@@ -19,7 +19,7 @@
  *     unknown), and a late/duplicate confirm can never overwrite a terminal record.
  *
  * Legs:
- *   [must-FAIL] the PRE-FIX modules (obtained read-only via `git show HEAD:…`):
+ *   [must-FAIL] the PRE-FIX modules (read-only via `git show PRE_FIX_REV:…`, pinned):
  *     a decided-but-never-executed commit records with NO `outcome` field and
  *     renders `gate=pass` — the false-proof. The post-fix modules record
  *     'permitted' for the identical decide and only reach 'executed' on confirm.
@@ -79,13 +79,20 @@ function renderRow(w) {
   return `${w.offender}  ${outcome}  gate=${gate}`;
 }
 
+/** BUG-184 pre-fix baseline: parent of a35e754 (the commit that landed the fix). */
+const PRE_FIX_REV = 'b11e71f85711';
+
 async function preFixLeg() {
   console.log('[must-FAIL] the PRE-FIX ledger records gate=pass for a commit that never executed');
   // Pull the pre-fix modules read-only. Rewrite the grant module's store import to
   // the pre-fix store copy so the pair is self-consistent (git-write-policy.mjs is
   // unchanged → the real one resolves correctly from lib/).
-  const preStore = execFileSync('git', ['show', 'HEAD:scripts/lib/git-grant-store.mjs'], { encoding: 'utf8' });
-  let preGrant = execFileSync('git', ['show', 'HEAD:scripts/lib/git-grant.mjs'], { encoding: 'utf8' });
+  // Pinned, not HEAD: committing the fix made HEAD the fixed state, so a HEAD
+  // baseline can never fail again (CONVENTIONS: a must-FAIL proof must not be
+  // anchored to a moving baseline). PRE_FIX_REV is the parent of a35e754, the
+  // BUG-184 commit; the read fails loudly if history ever loses it.
+  const preStore = execFileSync('git', ['show', `${PRE_FIX_REV}:scripts/lib/git-grant-store.mjs`], { encoding: 'utf8' });
+  let preGrant = execFileSync('git', ['show', `${PRE_FIX_REV}:scripts/lib/git-grant.mjs`], { encoding: 'utf8' });
   preGrant = preGrant.replace("from './git-grant-store.mjs'", "from './.bug184-prefix-store.mjs'");
   const storePath = path.join(LIBDIR, '.bug184-prefix-store.mjs');
   const grantPath = path.join(LIBDIR, '.bug184-prefix-grant.mjs');

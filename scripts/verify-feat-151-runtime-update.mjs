@@ -72,20 +72,17 @@ for (const bad of ['latest', '^0.3.0', '../evil', '0.3', 'file:./x', '0.3.281 &&
   '01.2.3', '1.2.3-01', '1.2.3-a..b'])
   ok(`EXACT_SEMVER rejects ${JSON.stringify(bad)}`, !rt.EXACT_SEMVER.test(bad));
 
-// 2. finding #9 — container-only pin never enters host provisioning
+// 2/3. FEAT-157 SUPERSEDES the container CLI pin. The Claude CLI left the base image and provision.json: a
+// container runs the host SDK's own boot-proven CLI as a one-file layer (container-manager.ts
+// ensureRuntimeImage), so there is no pin to keep in sync and no writer that could freeze it behind the host.
+// (These replaced finding #9's "claude-code is a CONTAINER tool" and the pin-writer rejections, which would
+// now pass vacuously: calling a function that no longer exists throws too.)
 const hostNames = prov.manifestToolsFor('host').map((t) => t.name);
 const contNames = prov.manifestToolsFor('container').map((t) => t.name);
-ok('claude-code is a CONTAINER tool', contNames.includes('claude-code'));
-ok('claude-code is EXCLUDED from host provisioning', !hostNames.includes('claude-code'), `host set = ${hostNames.join(',')}`);
+ok('FEAT-157: claude-code is in NO provision.json scope (the container CLI follows the host SDK)', !contNames.includes('claude-code') && !hostNames.includes('claude-code'), `host=${hostNames.join(',')} container=${contNames.join(',')}`);
+ok('FEAT-157: no container-CLI pin reader/writer exists', typeof prov.writeClaudeCodePin === 'undefined' && typeof prov.claudeCodePin === 'undefined', `write=${typeof prov.writeClaudeCodePin} read=${typeof prov.claudeCodePin}`);
 ok('serena/playwright still apply to host', ['serena', 'playwright'].every((n) => hostNames.includes(n)));
-
-// 3. pin-writer REJECTS a non-semver without writing (validation before disk)
-let threw = false;
-try { prov.writeClaudeCodePin('@evil/pkg@1.0.0'); } catch { threw = true; }
-ok('writeClaudeCodePin rejects a package-spec', threw);
-threw = false;
-try { prov.writeClaudeCodePin('latest'); } catch { threw = true; }
-ok('writeClaudeCodePin rejects a dist-tag', threw);
+ok('serena/playwright still apply to containers', ['serena', 'playwright'].every((n) => contNames.includes(n)));
 
 // 4. registry read is best-effort — a fetch failure yields {error}, never throws
 const realFetch = globalThis.fetch;

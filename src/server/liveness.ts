@@ -132,6 +132,17 @@ export interface Liveness {
   running: boolean;
   /** THE DECISION — may this claim keep standing? (what callers act on) */
   live: boolean;
+  /**
+   * THE USER'S "running" (FEAT-154) — a MAIN turn in flight (`running`) OR a live
+   * background SUBAGENT still working (round 6: agents only — a background shell
+   * such as a dev server or a poll loop does not count). The session list's light-blue
+   * "running" marker reads THIS single owner-declared fact, so a session whose
+   * main turn ended while its subagents keep working still reads as running,
+   * while an idle-alive bridge with NO live lane does not (the round-3 guarantee).
+   * Optional because only the in-memory bridge path can see live lanes today;
+   * absent ⇒ the reader falls back to `running`.
+   */
+  working?: boolean;
   kind: LivenessKind;
   /** Plain words, safe to show a user; ends up in refusals and reaper events. */
   reason: string;
@@ -294,6 +305,14 @@ export interface BridgeLike {
    * "alive process ⇒ running" answer unchanged.
    */
   hasLiveBackgroundLane?(): boolean;
+  /**
+   * FEAT-154 (round 6) — a background AGENT lane (a subagent, not a shell) is
+   * alive right now. Declared by the lane's owner from the kind it records per
+   * lane. The ONLY lane fact `working` reads: a background shell (dev server,
+   * poll loop) keeps the process alive but is not "an agent working".
+   * Absent ⇒ no lane counts toward `working`.
+   */
+  hasLiveBackgroundAgent?(): boolean;
   hasMainThreadWork?(): boolean;
   lastMainFrameAt?: number | null;
   /**
@@ -613,6 +632,28 @@ function mainTurnIdleBehindLane(session: BridgeLike, now: number): boolean {
 }
 
 export function livenessOfBridge(session: BridgeLike, now = Date.now()): Liveness {
+  const v = livenessOfBridgeCore(session, now);
+  // FEAT-154 (round 5) — stamp the owner-declared "working" fact. It is the
+  // user's notion of running: a MAIN turn in flight OR a live subagent/background
+  // lane. Computed HERE (the authority), once, so the list never re-derives it.
+  //   - `v.live` gates it: a dead / closed / frameless verdict is `live:false`
+  //     and can never be "working" (the process is gone or its claim refused),
+  //     so a stale bridge with leftover lane records is not resurrected.
+  //   - a live-but-idle bridge (main turn ended) with a running background lane
+  //     IS working (the reported 4ea3d0d2 case); with NO live lane it is NOT
+  //     (identical to round 3 — an idle-alive bridge stays not-running).
+  //
+  // FEAT-154 (round 6) — only a live background AGENT counts, never a background
+  // shell. Round 5 read `hasLiveBackgroundLane()`, which includes `local_bash`
+  // lanes, so a session kept alive only by a dev server or by never-ending poll
+  // loops read "working" indefinitely (reported: 7f7e39a1, 5 hung `until grep`
+  // pollers, 36h). Those lanes are shown in the running strip instead.
+  const hasLiveAgent = typeof session.hasLiveBackgroundAgent === 'function' && session.hasLiveBackgroundAgent();
+  v.working = v.running || (v.live && hasLiveAgent);
+  return v;
+}
+
+function livenessOfBridgeCore(session: BridgeLike, now = Date.now()): Liveness {
   const probe = session.processProbe();
   /*
    * FEAT-057 — fill the `ended` slot from EVIDENCE, or say unknown.
@@ -815,6 +856,7 @@ export function livenessWire(v: Liveness) {
   return {
     live: v.live,
     running: v.running,
+    ...(typeof v.working === 'boolean' ? { working: v.working } : {}),
     state: v.state,
     kind: v.kind,
     reason: v.reason,

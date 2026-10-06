@@ -111,36 +111,14 @@ export function playwrightPin(): ToolPin {
   return pinFor('playwright');
 }
 
-/** FEAT-151 — the container CLI pin (claude-code). Container isolation only. */
-export function claudeCodePin(): ToolPin {
-  return pinFor('claude-code');
-}
-
-/**
- * FEAT-151 finding #5 — the on-demand container update WRITES the pin. The
- * existing rebuild installs whatever provision.json already says, so an update
- * that only "reuses rebuild" changes nothing: the target version must be written
- * into provision.json FIRST (which changes provisionHash() → a new image tag →
- * the drift check sees it), and only then is a rebuild meaningful.
- *
- * The version is validated as an exact semver by the caller (runtime route); the
- * name is fixed (`claude-code`) so this can never repoint the pin at another
- * package. Writes atomically, preserving the manifest's other tools verbatim.
- * Returns { changed } so a no-op (already at that version) is visible.
+/*
+ * FEAT-157 — there is no container CLI pin here any more. The Claude CLI left
+ * the base image: a container runs the host SDK's own boot-proven bundled
+ * binary, added as a one-file layer on top of whatever the project runs on
+ * (container-manager.ts `ensureRuntimeImage`). The previous `claude-code` entry
+ * in provision.json (FEAT-151) was a second place able to hold a different
+ * answer from the SDK it had to match, so it is gone rather than kept in sync.
  */
-export function writeClaudeCodePin(version: string): { changed: boolean; previous: string } {
-  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version)) {
-    throw new Error(`invalid claude-code version ${JSON.stringify(version)} — an exact semver is required`);
-  }
-  const manifest = readProvisionManifest();
-  const pin = manifest.tools['claude-code'];
-  if (!pin) throw new Error('provision.json has no claude-code tool to pin');
-  const previous = pin.version;
-  if (previous === version) return { changed: false, previous };
-  pin.version = version;
-  writeAtomic(provisionManifestPath(), JSON.stringify(manifest, null, 2) + '\n');
-  return { changed: true, previous };
-}
 
 /* ------------------------------------------------------------------- hash */
 
@@ -159,14 +137,23 @@ export function writeClaudeCodePin(version: string): { changed: boolean; previou
  * unsound cache is gone rather than made "less wrong".
  */
 
-/** Short content hash of everything that defines the built artifact. */
+/** Short content hash of everything that defines the built artifact (the working-tree base). */
 export function provisionHash(): string {
-  const files = [dockerfilePath(), provisionManifestPath()];
+  return recipeHash(path.dirname(dockerfilePath()));
+}
+
+/**
+ * FEAT-157 — the same content hash for ANY base recipe directory (a release
+ * snapshot under `container/releases/v{N}/`, or the working tree). Identical
+ * bytes give the identical hash, so a release's recorded `hash` can be checked
+ * against its snapshot and against the tree.
+ */
+export function recipeHash(dir: string): string {
   const h = crypto.createHash('sha256');
-  for (const f of files) {
-    h.update(path.basename(f));
+  for (const f of ['Dockerfile', 'provision.json']) {
+    h.update(f);
     h.update('\0');
-    h.update(fs.readFileSync(f));
+    h.update(fs.readFileSync(path.join(dir, f)));
     h.update('\0');
   }
   return h.digest('hex').slice(0, 12);

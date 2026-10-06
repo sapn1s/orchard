@@ -238,13 +238,13 @@ async function main() {
   const E2 = path.join(scratch, 'onboard-without-flag');
   fs.mkdirSync(E1); fs.mkdirSync(E2);
   r = sh(process.execPath, [ONBOARD, E1, '--no-board', '--deploy-context'], ROOT);
-  const stubPath = path.join(E1, 'docs', 'DEPLOY-CONTEXT.md');
+  const stubPath = path.join(E1, '.orchard', 'DEPLOY-CONTEXT.md'); // FEAT-106: stub lives under .orchard/
   check('stub created with flag', r.code === 0 && fs.existsSync(stubPath) && fs.readFileSync(stubPath, 'utf8').includes('gatekeeper'), r.out.split('\n').find((l) => l.includes('DEPLOY-CONTEXT')) ?? '(no report line)');
   const before = fs.readFileSync(stubPath, 'utf8');
   r = sh(process.execPath, [ONBOARD, E1, '--no-board', '--deploy-context'], ROOT);
   check('re-run idempotent (exists, byte-untouched)', r.code === 0 && /DEPLOY-CONTEXT.*exists/.test(r.out) && fs.readFileSync(stubPath, 'utf8') === before, r.out.split('\n').find((l) => l.includes('DEPLOY-CONTEXT')) ?? '(no report line)');
   r = sh(process.execPath, [ONBOARD, E2, '--no-board'], ROOT);
-  check('without flag: no stub (opt-in)', r.code === 0 && !fs.existsSync(path.join(E2, 'docs', 'DEPLOY-CONTEXT.md')), 'stub absent');
+  check('without flag: no stub (opt-in)', r.code === 0 && !fs.existsSync(path.join(E2, '.orchard', 'DEPLOY-CONTEXT.md')), 'stub absent');
 
   /* ================= optional LIVE run (one real cheap dispatch) ========= */
   if (process.env.GATEKEEPER_LIVE === '1') {

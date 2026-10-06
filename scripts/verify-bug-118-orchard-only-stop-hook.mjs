@@ -828,15 +828,16 @@ const main = async () => {
     const target = path.join(SCRATCH, 'stale-project');
     fs.mkdirSync(target, { recursive: true });
     onboard(target, { noBoard: true });
-    const hookDest = path.join(target, 'scripts', 'hooks', 'response-format-gate.mjs');
+    const hookDest = path.join(target, '.orchard', 'hooks', 'response-format-gate.mjs'); // FEAT-106: hook lives under .orchard/
     // Make it look like a project onboarded before the fix.
     fs.writeFileSync(hookDest, fs.readFileSync(pre.path, 'utf8'));
-    // And give it a file of its OWN at a METHOD_FILES path, to prove --force-hook
-    // does not touch anything but the hook. `scripts/gate.mjs` is the realistic
-    // collision: plenty of repos have their own gate wrapper, and onboard's
-    // never-clobber contract is what protects it.
+    // And give it a file of its OWN at a legacy scripts/ path, to prove the hook
+    // re-sync touches nothing outside `.orchard/`. FEAT-106: onboard now writes
+    // ALL its files under `.orchard/` (Orchard's namespace, like `.claude/`), so
+    // a target's own `scripts/gate.mjs` is never even a candidate for a clobber.
     const ownGate = path.join(target, 'scripts', 'gate.mjs');
     const OWN_GATE = '// this project ships its own gate wrapper\n';
+    fs.mkdirSync(path.dirname(ownGate), { recursive: true });
     fs.writeFileSync(ownGate, OWN_GATE);
 
     /*
@@ -889,7 +890,7 @@ const main = async () => {
     const proj = path.join(SCRATCH, 'launch-delivery');
     fs.mkdirSync(proj, { recursive: true });
     onboard(proj, { noBoard: true });
-    const dest = path.join(proj, 'scripts', 'hooks', 'response-format-gate.mjs');
+    const dest = path.join(proj, '.orchard', 'hooks', 'response-format-gate.mjs'); // FEAT-106
 
     const fresh = ensureCurrentStopHook(proj, { warn });
     check('F1 a project whose hook is already current: nothing done, nothing said',
@@ -913,7 +914,7 @@ const main = async () => {
     const ro = path.join(SCRATCH, 'launch-readonly');
     fs.mkdirSync(ro, { recursive: true });
     onboard(ro, { noBoard: true });
-    const roDest = path.join(ro, 'scripts', 'hooks', 'response-format-gate.mjs');
+    const roDest = path.join(ro, '.orchard', 'hooks', 'response-format-gate.mjs'); // FEAT-106
     fs.writeFileSync(roDest, fs.readFileSync(pre.path, 'utf8'));
     fs.chmodSync(roDest, 0o444);
     fs.chmodSync(path.dirname(roDest), 0o555);
@@ -962,7 +963,7 @@ const main = async () => {
     const live = path.join(SCRATCH, 'launch-live');
     fs.mkdirSync(live, { recursive: true });
     onboard(live, { noBoard: true });
-    const liveDest = path.join(live, 'scripts', 'hooks', 'response-format-gate.mjs');
+    const liveDest = path.join(live, '.orchard', 'hooks', 'response-format-gate.mjs'); // FEAT-106
     fs.writeFileSync(liveDest, fs.readFileSync(pre.path, 'utf8'));
     if (ClaudeRuntime) {
       const dir = fs.mkdtempSync(path.join(SCRATCH, 'spawn-live-'));
@@ -1078,12 +1079,12 @@ const main = async () => {
     const stale = path.join(SCRATCH, 'stale-closure');
     fs.mkdirSync(stale, { recursive: true });
     onboard(stale, { noBoard: true });
-    const staleHook = path.join(stale, 'scripts', 'hooks', 'response-format-gate.mjs');
+    const staleHook = path.join(stale, '.orchard', 'hooks', 'response-format-gate.mjs'); // FEAT-106
     const staleData = path.join(SCRATCH, 'stale-closure-data');
     const staleLog = () => {
       try { return fs.readFileSync(path.join(staleData, 'logs', 'stop-hook-advisory.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)); } catch { return []; }
     };
-    const digestCopy = path.join(stale, 'public', 'lib', 'digest.js');
+    const digestCopy = path.join(stale, '.orchard', 'lib', 'digest.js'); // FEAT-106: flattened lib
     // An OLD copy that predates parseDigest: loads fine, exports the wrong thing.
     fs.writeFileSync(digestCopy, 'export function renderDigest() { return null; }\n');
     const ownPayloadStale = { ...barePayload(tpBad), session_id: ORCHARD_DECLARED_ID, cwd: stale };

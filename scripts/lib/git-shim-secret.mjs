@@ -23,9 +23,11 @@
  * ── RESIDUAL, STATED HONESTLY ────────────────────────────────────────────────
  * A same-uid agent can READ the generated shim file (0755, in the OS temp dir)
  * and extract this secret. That does NOT let it self-grant: possessing the secret
- * only lets it call the real decide route, which still runs the SAME
- * evaluateGitWrite (peekGrant + leak gate + single-use consume) — it cannot mint
- * a grant. The redirection defence is the BAKED host URL (the shim no longer
+ * only lets it call the real decide route, which still runs the SAME decision
+ * layer (git-grant.mjs: claimGrant/settleClaim + leak gate) — it cannot mint
+ * a grant. With a session's baked windowKey too (BUG-231) it can at most redeem a
+ * write slot that session's ONE hook decision already approved (bounded, still
+ * gated); it can never widen that decision. The redirection defence is the BAKED host URL (the shim no longer
  * reads it from env), not the secret; the secret keeps NON-session processes off
  * the route. An agent that instead REWRITES the shim file, prepends its own PATH,
  * or calls git by absolute path bypasses the shim entirely — the pre-existing

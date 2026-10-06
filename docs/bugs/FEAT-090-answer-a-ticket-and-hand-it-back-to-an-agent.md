@@ -13,7 +13,7 @@
   "owner": "you",
   "work_state": "open",
   "human_action": "review",
-  "updated": "2026-08-18",
+  "updated": "2026-10-02",
   "decision": null,
   "decision_history": [
     {
@@ -83,6 +83,18 @@
       "verdict": "broken",
       "verdict_on": "2026-08-18",
       "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "16d474b4-dc80-49c3-8fb2-069179569923",
+      "verdict": "broken",
+      "verdict_on": "2026-10-02",
+      "recorded_at": "2026-10-02T01:17:47.171Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "mechanism only (functional answer/handoff; visual review still owed by user): answerEntries carryover loses the chosen option for a decision answer carrying a Question line"
     }
   ],
   "verification_class": "fix",
@@ -562,3 +574,97 @@ to be missing padding". Lane: `public/lib/decide.js`, `public/styles.css`, the a
   never edit or drop the append-only decision record, and must not silently drop the ticket off a lane). A second
   fresh-context pass over the follow-up append + lane-safety, on a realistic multi-follow-up / agent-interleaved
   ticket, is the right closing check.
+
+### 2026-09-29 — visual review (wide + narrow captures FOR THE USER — NOT a close)
+
+Unbiased visual review of the Decide card at a wide and a narrow width, by a reviewer who did not build it.
+This entry leaves screenshots for the USER to judge reachability/readability; the Status header is unchanged.
+
+**Running-build check.** Booted a SCRATCH server (isolated `CLAUDE_STATION_DATA` + `CLAUDE_PROJECTS_DIR` via
+`station-boot.mjs isolatedServerEnv`, free ephemeral port, scratch dirs via `scratch.mjs mkdtempScratch`; the
+live :4317 service and its hosts were never touched) directly from the CURRENT working tree
+(`src/server/index.ts`, tree clean on `main`), so the surface shown IS the current code — no deploy lag.
+Seeded a REALISTIC board: all 26 real decision tickets currently on the board, each restored to its
+unanswered reading state (answer/follow-up log stripped), driven through the ticket detail view. Focus ticket
+for capture: the REAL **ARCH-013** — a 4-option, paragraph-length decision carrying `Recommended: C`, so the
+RECOMMENDED annotation and option-wrap behaviour are exercised (not a one-line fixture).
+
+**Screenshots (gitignored assets, LOOKED at each):**
+- `docs/bugs/assets/FEAT-090-visual-1440-2026-09-29.png` — wide (1440×900)
+- `docs/bugs/assets/FEAT-090-visual-640-2026-09-29.png` — narrow (640×900), pinned action bar
+- `docs/bugs/assets/FEAT-090-visual-640-sheet-2026-09-29.png` — narrow, bottom sheet opened via "Answer"
+
+**Wide (1440).** The Decide card sits in a sticky right column beside the ticket body: `DECISION NEEDED`
+heading, the question, a `Recommends C` line, the Decide / Ask a question / Counter segmented selector, then
+`YOUR CHOICE` with option rows A/B/C each showing GAINS / COSTS / "Why this isn't obviously best", and a
+`RECOMMENDED` tag on option C. "Record answer" is pinned at the bottom of the card's own scroll region and is
+in view at the landing WITHOUT scrolling the page (the BUG-107/readability-round reachability fix). Layout is
+clean and readable — option text is at a real reading measure, not a ribbon. Nothing broken or cramped.
+
+**Narrow (640).** Below the breakpoint the card is a pinned bottom action bar — `Recommends C` on the left,
+`Answer` on the right, sitting above the fold. Tapping `Answer` opens a full-width bottom sheet with the same
+content (DECISION NEEDED + close X, question, Recommends C, segmented selector, full-width option rows with
+complete GAINS/COSTS text, RECOMMENDED on C); the sheet body scrolls. Options are readable at full width — the
+narrow layout is a real sheet, not a shrunk desktop column. Nothing broken.
+
+**For the USER to decide (this is not a close):**
+- Wide: because the card scrolls internally, option C is partially below the card's fold at the initial
+  landing (Record answer is pinned and visible). Judge whether options being partly below the fold at landing
+  is acceptable, or whether the whole option list should be visible before scrolling.
+- Narrow: confirm the pinned-bar → bottom-sheet flow reads well on a real phone; the capture is a 640px
+  desktop viewport, not a device.
+- Whether these two captures satisfy success criterion 6 ("Screenshots at both widths are judged by someone
+  who did not build it") and criterion 5 (reply reachable at wide + narrow), and if so, flip the Status /
+  close the ticket. Independent clean-room verification of the answer/handoff mechanism remains warranted per
+  the prior entries (this pass is visual only).
+
+### 2026-10-02 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 16d474b4-dc80-49c3-8fb2-069179569923 — VERDICT: BROKEN — mechanism only (functional answer/handoff; visual review still owed by user): answerEntries carryover loses the chosen option for a decision answer carrying a Question line. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-02 — independent clean-room verification of the ANSWER/HANDOFF MECHANISM (BROKEN) — mechanism only, NOT the visual review
+
+Independent clean-room pass flagged as warranted by the 2026-09-29 visual-review entry. **This covers only the
+FUNCTIONAL answer/handoff mechanism; the visual/reachability review at wide + narrow widths remains owed by the
+user, and the Status/work_state is deliberately LEFT UNCHANGED (OPEN).**
+
+- **Harness / tree:** `scripts/independent-verify.mjs --working-tree` (FEAT-134) against the current dirty tree.
+  Chose working-tree over `--range` because the original FEAT-090 commits were collapsed into the initial public
+  release (no single commit carries the mechanism diff), and the live tree carries an uncommitted ARCH-006
+  change (`normalizeLineEndings`) that now sits inside the answer composer path — so the working tree is the
+  user's real running mechanism. `src/server/seed-sources.mjs` is present, so no carrier-tree/option-b was needed.
+- **Provider:** anthropic, grey account — SAME-PROVIDER fallback (the two prior passes were anthropic + openai).
+- **Requirement attacked:** `/tmp/req-FEAT-090.txt` — the 7 mechanism properties (append-only/attributed/timed
+  answer; derived answered-awaiting lane; lane clearing; handoff without dispatch; ownership by reply kind;
+  409 staleness safety; parser strictness), with the uncovered directions named (unanswered lane, late answer,
+  partial/missing carryover, concurrent answers, follow-up).
+- **FIXER-TEST re-run:** `node scripts/verify-feat-090-answer-handoff.mjs --no-ui` → 23/24 (the one failure is the
+  Part B fake-codex live-session PRECONDITION, started=false; the mechanism assertion before==after still held).
+
+**VERDICT: BROKEN (contract VALID — manifest-backed adversarial runs).** The verifier found a real carryover
+defect via an adversarial case the fixer fixtures never exercised (the "handoff with partial carryover"
+direction): `answerEntries()` in `src/server/board.ts` takes the FIRST body line of an answer entry when it has
+no `- **Answer:**` line, so a ticket-view DECISION answer that also carries a `- **Question:**` line records
+`item.answer` as `**Question:** which way` instead of the chosen `B — beta way`. Consequently
+`boardAnswerBriefing()` and `boardStateSection()` tell the next agent `chose: **Question:** which way` — the
+handoff LOSES the actual choice, breaking success criterion 3/4 and requirement 2 (the answered lane must carry
+the chosen answer). Adversarial run `e06229931c09` (`node scratch-adv.mjs carry`, exit 1, 3 FAIL).
+
+**Mechanism properties that HELD under independent attack** (all manifest-backed, exit 0): unanswered decision
+stays in needs-you; a LATE answer after prior agent activity derives answered-awaiting from the last answer
+entry and a later agent note clears it; a follow-up keeps awaiting and preserves the original choice;
+append-only preserved; a partial (empty-label) answer still lands answered-awaiting keeping the chosen key;
+CONCURRENT answers — second writer on a now-stale rev rejected 409, first answer byte-identical, missing rev
+refused 400; parser strictness (single option/7-char key/bogus-Recommended/prose-bullets/no-decision all →
+null or dropped); a COUNTER reply flips owner to 🤖, not ready-for-work.
+
+**UNTESTED (verifier's own list):** the no-dispatch property against a REAL live session (the fake codex never
+started in the fixer run, so its 0-vs-0 turn check proves nothing); whether the per-session briefing is actually
+attached to the user's next message in the running server (only `boardAnswerBriefing` was called directly); a
+true two-process race between `assertFresh` and `appendFileSync` (the concurrent case ran sequentially in one
+process).
+
+**Handoff to the next fixer:** fix `answerEntries()` carryover so a decision answer carrying a `**Question:**`
+line reports the `**Chose:** <key> — <label>` text (not the first body line) in the lane item, briefing and
+launch snapshot; add the ticket-view decision+question shape to `verify-feat-090-answer-handoff.mjs` / the
+answered-lane suite (currently only free-text `Answer:` carryover is covered). The visual review remains owed by
+the user independently of this mechanism fix.

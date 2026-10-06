@@ -26,10 +26,10 @@
  *  - The store is BOUNDED (`MAX_RECORDS`), oldest-first pruned, and written
  *    atomically, so a crash mid-write cannot truncate it.
  */
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
+import { quarantine, readCapped } from './store-io.ts';
 
 /**
  * Why a thing ended. Same vocabulary as `liveness.ts`'s `LivenessEnd` — the
@@ -119,18 +119,56 @@ export function resetsAtMs(v: number | null | undefined): number | null {
 const MAX_RECORDS = 200;
 /** How many individual deaths a single briefing may name before it counts. */
 const BRIEF_MAX_ITEMS = 6;
+/** Largest outcomes store, in bytes, a read will accept before treating the file
+ *  as unreadable (bounds a hostile/corrupt file; the store is MAX_RECORDS-bounded
+ *  in normal use and stays far under this). */
+const MAX_STORE_BYTES = 16 * 1024 * 1024;
 
 function storeFile(): string {
   return path.join(dataDir(), 'agent-outcomes.json');
 }
 
-function readAll(): AgentOutcome[] {
+interface StoreRead {
+  records: AgentOutcome[];
+  /** false = present but could not be read as a record array (torn / mid-write /
+   *  corrupt / wrong shape). An append writer must NOT clobber it. */
+  ok: boolean;
+}
+
+/**
+ * BUG-202 — read the store, distinguishing "no file yet" (ENOENT — genuinely
+ * empty, safe to create) from "present but unreadable" (torn / corrupt / wrong
+ * shape). This is the DATA-LOSS distinction the old `readAll` collapsed: it
+ * returned `[]` for BOTH, so an append writer (`record`) then wrote over a
+ * corrupt file as if it were empty and WIPED every prior death record (the same
+ * shape FEAT-126 fixed in requests.ts). `ok:false` means "do not clobber —
+ * quarantine first".
+ */
+function readStore(): StoreRead {
+  // Bounded read on the fd (store-io.readCapped) — no stat→read TOCTOU; a file
+  // over the cap is refused without being read into memory.
+  const res = readCapped(storeFile(), MAX_STORE_BYTES);
+  if (res.kind === 'absent') return { records: [], ok: true };
+  if (res.kind !== 'ok') return { records: [], ok: false }; // toobig | error — present but unreadable
   try {
-    const parsed = JSON.parse(fs.readFileSync(storeFile(), 'utf8'));
-    return Array.isArray(parsed) ? (parsed as AgentOutcome[]) : [];
+    const parsed = JSON.parse(res.data);
+    if (Array.isArray(parsed)) return { records: parsed as AgentOutcome[], ok: true };
+    return { records: [], ok: false }; // valid JSON but not our shape — corrupt, never clobber
   } catch {
-    return []; // no store yet, or unreadable — an empty ledger, never an error
+    return { records: [], ok: false }; // torn / partial / non-JSON — never clobber
   }
+}
+
+/**
+ * Records only. Read-side callers (`list`, `outcomeLine` feeders) and the
+ * mutating writers (`attachProviderError`, `dismiss`, `takeBriefing`) degrade to
+ * an empty ledger on an unreadable file exactly as before. Those mutating
+ * writers are clobber-safe by construction: each `writeAll`s only when it
+ * matched at least one record, and a corrupt store yields none. Only the
+ * unconditional-append writer (`record`) needs the quarantine guard.
+ */
+function readAll(): AgentOutcome[] {
+  return readStore().records;
 }
 
 function writeAll(records: AgentOutcome[]): void {
@@ -175,7 +213,11 @@ export function record(input: RecordInput): AgentOutcome | null {
   if (!isDeath(input.kind)) return null;
   const at = input.at ?? Date.now();
   const key = input.sdkSessionId || input.stationSessionId || 'unknown-session';
-  const all = readAll();
+  // BUG-202 — never overwrite a present-but-unreadable store as if it were
+  // empty. Read tolerantly (an unreadable store dedups against nothing), and if
+  // it is corrupt, preserve its bytes (quarantine) before writing fresh below.
+  const read = readStore();
+  const all = read.ok ? read.records : [];
   if (input.agentId !== 'main' && all.some((o) => sessionKeyOf(o) === key && o.agentId === input.agentId)) {
     return null; // already recorded — the first, most specific observation stands
   }
@@ -213,6 +255,7 @@ export function record(input: RecordInput): AgentOutcome | null {
     dismissedAt: null,
     briefedAt: null,
   };
+  if (!read.ok) quarantine(storeFile(), 'agent-outcomes'); // preserve corrupt bytes, then start fresh
   all.push(rec);
   writeAll(all);
   return rec;

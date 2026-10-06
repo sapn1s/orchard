@@ -198,35 +198,46 @@ async function main() {
       mainYou() === beforeYou, `you-count before=${beforeYou} after=${mainYou()}`);
     check('the composer released IMMEDIATELY (send mode, no 4s watchdog)',
       q('#go')?.dataset?.mode === 'send', `#go data-mode=${JSON.stringify(q('#go')?.dataset?.mode)}`);
-    check('the self-retry loop is ARMED while the drain-wait row is queued',
-      !!st?.drainWaitTimer, `state.drainWaitTimer=${String(st?.drainWaitTimer != null && !!st.drainWaitTimer)}`);
-
-    // ---- BUG-045: the retry actually FIRES by itself (FAILS pre-fix). The
-    // dummy broker is still alive, so the server refuses the retry again.
-    // `drainWaitLastTry` is stamped ONLY when a self-retry launches a real
-    // `start` (attemptDrainRetry) — a deterministic signal, unlike #fine which
-    // other tickers can overwrite between polls.
-    const retried = await waitFor('an automatic self-retry round-trip',
-      () => (st?.drainWaitLastTry ?? 0) > 0 && st?.drainWaitAttempt == null, 12000);
-    check('the queued message RETRIES ITSELF against the still-draining survivor (no Enter pressed)',
-      retried, `drainWaitLastTry=${st?.drainWaitLastTry ?? null} #fine=${JSON.stringify((q('#fine')?.textContent ?? '').slice(0, 140))}`);
+    /*
+     * BUG-217 round 5: "it sends itself" is now kept by the SERVER — the row is in
+     * the session's server outbox, which re-judges the session every few seconds
+     * and delivers the moment the drain settles (no tab retry loop, which is what
+     * a reload or a closed tab used to lose). Same user-facing property, asserted
+     * on the server's own declaration.
+     */
+    const held = await waitFor('the server outbox to hold it (draining)',
+      () => st?.outbox?.rows?.some((r) => r.text === TESTMSG && r.state === 'queued') && st?.outbox?.hold?.kind === 'draining', 8000);
+    check('the message is held by the SERVER outbox, which says why it waits (draining) and will send it itself',
+      held, `outbox=${JSON.stringify({ rows: st?.outbox?.rows?.map((r) => [r.text.slice(0, 20), r.state]), hold: st?.outbox?.hold?.kind })}`);
+    await sleep(7000); // two server re-checks against the still-draining survivor
+    check('the queued message is still waiting against the still-draining survivor — re-judged by the server, never sent into it',
+      st?.outbox?.rows?.filter((r) => r.text === TESTMSG).length === 1 && st?.outbox?.hold?.kind === 'draining',
+      `outbox=${JSON.stringify({ rows: st?.outbox?.rows?.map((r) => [r.text.slice(0, 20), r.state]), hold: st?.outbox?.hold?.kind })}`);
     check('the re-refused retry kept exactly ONE queue row (no duplicate, no loss)',
       qa('#queueBox .qrow').length === 1 && q('#queueBox .qedit')?.value === TESTMSG,
       `rows=${qa('#queueBox .qrow').length} rowText=${JSON.stringify(q('#queueBox .qedit')?.value ?? null)}`);
 
     // ---- BUG-045: the queued row stays EDITABLE and CANCELABLE ----
+    // BUG-217 round 5: Edit → change the words → Done saves them on the server row (what would be sent).
+    qa('#queueBox .qracts button').find((b) => b.textContent === 'Edit')?.click();
     const ta = q('#queueBox .qedit');
     if (ta) {
       ta.value = `${TESTMSG} (edited)`;
       ta.dispatchEvent(new win.Event('input', { bubbles: true }));
     }
+    qa('#queueBox .qracts button').find((b) => b.textContent === 'Done')?.click();
+    await waitFor('the edit to reach the server row', () => st?.queue?.[0]?.text === `${TESTMSG} (edited)`, 5000);
     check('the queued row is editable (edit reaches the item that would be sent)',
       st?.queue?.[0]?.text === `${TESTMSG} (edited)`,
       `item.text=${JSON.stringify(st?.queue?.[0]?.text ?? null)}`);
     qa('#queueBox .mini.x').find((b) => b.textContent === 'Discard')?.click();
+    await waitFor('the discard to reach the server', () => (st?.queue?.length ?? -1) === 0, 5000);
+    // BUG-217 r2: Discard is undoable for a few seconds, so the dock may still
+    // show ONLY the "Discarded … Undo" line — but no row.
     check('the queued row is cancelable (Discard empties the queue)',
-      (st?.queue?.length ?? -1) === 0 && q('#queueBox')?.hidden === true,
-      `queue.length=${st?.queue?.length} boxHidden=${q('#queueBox')?.hidden}`);
+      (st?.queue?.length ?? -1) === 0 && qa('#queueBox .qrow').length === 0
+        && (q('#queueBox')?.hidden === true || !!q('#queueBox .q-undo')),
+      `queue.length=${st?.queue?.length} rows=${qa('#queueBox .qrow').length} boxHidden=${q('#queueBox')?.hidden} undo=${!!q('#queueBox .q-undo')}`);
 
     // ---- BUG-029 anti-regression: a NON-retryable pre-ack refusal still
     // returns the text to the composer (and never queues). Driven through the

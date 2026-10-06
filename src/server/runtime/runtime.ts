@@ -224,6 +224,13 @@ export interface RuntimeStartConfig {
   cwd: string;
   /** Launch-scoped environment additions inherited by tools and subprocesses. */
   env?: Record<string, string>;
+  /**
+   * BUG-223 — the Docker daemon this session's children reach (DOCKER_HOST at
+   * the FEAT-158 sandbox, from scripts/lib/lane-docker.mjs). Separate from `env`
+   * because EVERY runtime must apply it (the codex runtime does not consume
+   * `env`); merged over the inherited process env, never into the server's own.
+   */
+  dockerEnv?: Record<string, string>;
   firstPrompt: string;
   permissionMode: string;
   /** Called for every tool the engine wants to run; resolves to allow/deny. */
@@ -256,6 +263,13 @@ export interface RuntimeStartConfig {
    */
   gitGrantKey?: string;
   gitRepoPath?: string;
+  /**
+   * BUG-231 — declared by the bridge (the owner of isolation): true only when the
+   * CLI runs on THIS host with the session env, so the session's git shim is on the
+   * Bash tool's PATH (`direct`). Unset/false (a container) → the PreToolUse hook
+   * never leaves the leak gate or the grant spend to the shim.
+   */
+  gitShimReachesCli?: boolean;
   sessionLabel?: string;
   /**
    * FEAT-129 — the harness's own running-set, as agent_ids of the lanes that are
@@ -323,6 +337,12 @@ export interface AgentRuntime {
   send(text: string): void;
   /** Interrupt the in-flight turn. */
   interrupt(): Promise<void>;
+  /**
+   * OPTIONAL (FEAT-154 round 6): stop ONE running task by its engine task id
+   * (Claude: the `stop_task` control request). Absent ⇒ the engine cannot stop a
+   * single task, and the caller must say so rather than fake it.
+   */
+  stopTask?(taskId: string): Promise<void>;
   /** Switch the live permission mode; throws with the engine's reason if refused. */
   setPermissionMode(mode: string): Promise<void>;
   /**

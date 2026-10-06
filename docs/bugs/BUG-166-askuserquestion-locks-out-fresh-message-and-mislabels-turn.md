@@ -1,6 +1,6 @@
 # BUG-166 — an AskUserQuestion prompt locks the user out of sending a fresh message, and mislabels their reply as "main turn working"
 
-- **Status:** OPEN
+- **Status:** DONE
 - **Severity:** medium
 - **Area:** composer / bridge / turn-labelling (AskUserQuestion handling)
 - **Reported:** 2026-09-05 by the user (relayed via ARCH-016 build lane — file only, do not fix in that lane)
@@ -152,3 +152,8 @@ third surfaces, file an ARCH. For now: no ARCH — treat as a scoped `fix`.
 - **Verdict: PASS.** No code modified. Anti-regressions named and green.
 - **Verified-by:** independent verify lane (round 2, class=verify), clean-room, ticket
   excluded from own generation.
+
+### 2026-09-29 — closing (verifying, round 1)
+- **Closed as DONE (obsolete: fixed + independently verified; only the status flip remained).**
+- **Recheck (current tree):** fix present at commit 7d652c6 ("BUG-166: a pending question is the owner of 'waiting on you'"). `public/app.js` carries `decisionsByRequest` as the owner (`:211`), `awaitingUserDecision()` (`:9210`), `settleDecisionOwner()` (`:9249`), and `computeSessState()` returns `'awaiting'` gated on `state.busy` (`:10462`). Cites the 2026-09-23 round-2 independent verify: PASS (fixer suite 10/10, adversarial 5/5, BUG-150 regressions 16/16 + 25/25). Round 2 also answered the server-residual: no server change required for the user-visible symptom.
+- **Symptom of a deeper design flaw?** no — the prior log noted this is the 2nd instance of "an in-flight state gates the composer"; still below the "third → file ARCH" threshold. No ARCH filed.

@@ -244,3 +244,9 @@ Host: Arch Linux, kernel 7.1.5-arch1-2, btrfs subvol root
   - `npm run gate` → PASS (exit 0).
 - **Independent verify:** a final clean-room re-run over the exit-path-orphan arm (h) and the forbidden-mode rejection (i) is warranted per the round-3 skeptic note.
 - **Still open / handoff:** unchanged — switch back to the stable channel once codex ≥ 0.158.0 ships stable; the preflight keeps catching a reinstalled 0.157.1.
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0e313-3920-75d2-b9b4-f7aa73de5cdc (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 194, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0e320-8ce9-72b1-8bed-5929df1d4e54 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 230, whose shape the shared reader cannot parse)

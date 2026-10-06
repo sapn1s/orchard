@@ -33,6 +33,9 @@ import * as hist from '../lib/session-history.ts';
 import { LIVE_WINDOW_MS, transcriptLiveness } from './liveness.ts';
 import { blocksOf, isMainThreadEntry, toMessage, type BuildOptions } from './jsonl.ts';
 import { providerRoots, resolveOrchardSessionFile } from './orchard-transcripts.ts';
+// FEAT-154 round 9: a transcript's fresh mtime is evidence of a running turn only when an ENGINE wrote it;
+// Orchard's own writes (mirror, import, rename/pin, fork copy) are declared in own-writes.ts and read here.
+import { lastEngineWriteMs } from './own-writes.ts';
 import { countMessages } from './transcript.ts';
 
 /**
@@ -387,15 +390,17 @@ export function liveSessions(windowMs = LIVE_WINDOW_MS, root = hist.defaultRoot(
       for (const f of fs.readdirSync(dirPath)) {
         if (!f.endsWith('.jsonl')) continue;
         let st: fs.Stats;
+        const fp = path.join(dirPath, f);
         try {
-          st = fs.statSync(path.join(dirPath, f));
+          st = fs.statSync(fp);
         } catch {
           continue;
         }
         // ARCH-001: even the LISTING asks the authority whether the file
         // counts as being written right now, so the window cannot be applied
-        // one way here and another way anywhere else.
-        const v = transcriptLiveness({ lastWriteMs: st.mtimeMs, windowMs }, now);
+        // one way here and another way anywhere else. FEAT-154 r9: the input is
+        // the last ENGINE write, not the raw mtime (own-writes.ts).
+        const v = transcriptLiveness({ lastWriteMs: lastEngineWriteMs(fp, st), windowMs }, now);
         if (v.state !== 'alive') continue;
         out.push({
           sessionId: f.slice(0, -6),
@@ -417,6 +422,9 @@ export function liveSessions(windowMs = LIVE_WINDOW_MS, root = hist.defaultRoot(
  * FEAT-037 P2b: live detection over the Orchard-owned transcript store — the
  * same mtime-window scan (`liveSessions` pointed at each provider root), so a
  * codex session being appended to RIGHT NOW badges exactly like a Claude one.
+ * Every root is scanned; Orchard's own copies into them (the Claude mirror, a
+ * native-Codex import) are told apart by the own-writes declaration inside
+ * `liveSessions`, not by which directory they sit in (FEAT-154 round 9).
  */
 export function orchardLiveSessions(windowMs = LIVE_WINDOW_MS): (LiveSessionInfo & { provider: string })[] {
   const out: (LiveSessionInfo & { provider: string })[] = [];
@@ -438,7 +446,7 @@ export function sessionFileFacts(dir: string, sessionId: string, now = Date.now(
   if (!f) return null;
   try {
     const st = fs.statSync(f);
-    const v = transcriptLiveness({ lastWriteMs: st.mtimeMs }, now);
+    const v = transcriptLiveness({ lastWriteMs: lastEngineWriteMs(f, st) }, now);
     return { dir, lastWriteAt: new Date(st.mtimeMs).toISOString(), ageMs: v.evidence.ageMs ?? 0, fileBytes: st.size };
   } catch {
     return null;
@@ -460,6 +468,6 @@ export function isSessionLive(dir: string, sessionId: string, windowMs = LIVE_WI
   const f = resolveAnySessionFile(dir, sessionId);
   if (!f) return false;
   let lastWriteMs: number | null = null;
-  try { lastWriteMs = fs.statSync(f).mtimeMs; } catch { return false; }
+  try { lastWriteMs = lastEngineWriteMs(f, fs.statSync(f)); } catch { return false; }
   return transcriptLiveness({ lastWriteMs, windowMs }).state === 'alive';
 }

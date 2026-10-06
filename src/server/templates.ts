@@ -12,10 +12,19 @@ import type { InstructionRef } from './registry.ts';
 // FEAT-106 — resolve the local-conventions doc wherever the project keeps it
 // (legacy `docs/CONVENTIONS.md` or consolidated `.orchard/CONVENTIONS.md`).
 import { resolveConventionsFile } from '../../scripts/lib/board-path.mjs';
+// BUG-146 — the onboard scaffold text, owned in one place, so "is this doc still
+// an unedited stub?" is an exact-match against what onboard writes, not a guess.
+import { isUneditedConventionsStub } from '../../scripts/lib/conventions-stub.mjs';
+// BUG-146 (round 3) — ARCH-006's single line-ending normaliser (CRLF/CR → LF),
+// owned by board.ts; reused (no cycle: board.ts does not import this module) so
+// the loud-stop boundary search finds paragraph breaks in a CRLF doc too.
+import { normalizeLineEndings } from './board.ts';
 // BUG-182 — the doc paths seedTemplates() needs at boot are declared ONCE, in
 // seed-sources.mjs, and read from there by both this file and the clean room
 // (scripts/independent-verify.mjs). Never write such a path literal here.
 import { READ_THROUGH_SEED_IDS, seedSourceRelPath } from './seed-sources.mjs';
+// FEAT-157 — the container guide is GENERATED from the tables the enforcing code reads.
+import { RESERVED_ENV_RULES, LOCKDOWN_RULES, BUILD_RULES, IMAGE_ENV_ALLOWED } from './container-manager.ts';
 
 export type TemplateMode = 'append' | 'replace';
 
@@ -314,22 +323,32 @@ export const LOCAL_CONVENTIONS_RELPATH = path.join('docs', 'CONVENTIONS.md');
  * i.e. shared WA + project-local conventions first (composed together,
  * universal then local), live board state layered last by the caller.
  *
- * TRUNCATION (fixed here after a real, expensive failure): the cap used to cut
- * mid-word and end with a bare `…`, which is the worst of both worlds — a
- * project whose doc outgrew the cap silently lost its tail, the SESSION had no
- * way to know content was missing, and the project author had no signal at all.
- * On a live-money project that meant a half-delivered safety rule read as a
- * whole one. Three changes, all universal:
- *   1. The cap is 6000, not 4000 — the same call already made for
- *      `responseFormatSection()`: a mid-sentence ellipsis in a RULES document is
- *      worse than the tokens it saves. This is the project's own operating
- *      rules; it earns the same headroom the response-format core gets.
- *   2. Truncation lands on a MARKDOWN BOUNDARY (the last blank line before the
- *      limit), so a rule is delivered whole or not at all — never half.
- *   3. Truncation is LOUD: an explicit notice states how many characters were
- *      dropped and names the file to read, so the omission is a known unknown.
+ * BUG-146 — two silent failures fixed here:
+ *   (half 2) an UNEDITED onboard scaffold is treated as ABSENT (returns null),
+ *     detected by exact match against the shared stub owner, so an empty opt-in
+ *     costs zero tokens instead of ~244/turn to say the file exists.
+ *   (half 1) MARKED-REGION injection: when the doc delimits an agent-facing
+ *     core with `<!-- conventions-inject:start/end -->` (the same shape
+ *     routingSection()/responseFormatSection() use), only that region is
+ *     injected — the author declares what reaches a session, and the doc's
+ *     background/history/evidence stays in the file, uninjected. A doc WITHOUT
+ *     markers degrades to the capped full body, never to silence. The marked
+ *     region gets a wide cap (delivered whole, like the sibling cores); the
+ *     unmarked legacy path keeps the 6000 default.
+ *
+ * TRUNCATION (only when even the chosen body outgrows the cap): it lands on a
+ * MARKDOWN BOUNDARY (last blank line before the limit) so a rule is delivered
+ * whole or not at all — never half — and it is LOUD: an explicit notice states
+ * how many characters were dropped and names the file to read. Earlier this cap
+ * cut mid-word and ended with a bare `…`, silently, which on a live-money
+ * project meant a half-delivered safety rule read as a whole one.
  * Unchanged for every doc that fits (the common case): byte-identical output.
  */
+// BUG-146 — the author-curated agent-facing region, delimited exactly like
+// ROUTING.md's `routing-inject` and RESPONSE_FORMAT.md's `response-format-inject`.
+const CONVENTIONS_INJECT_RE =
+  /<!--\s*conventions-inject:start\s*-->([\s\S]*?)<!--\s*conventions-inject:end\s*-->/;
+
 export function localConventionsSection(hostPath: string, opts?: { maxChars?: number }): string | null {
   // FEAT-106 — resolved, not the bare legacy relpath: a migrated project's doc
   // lives under `.orchard/`. `convRel` names it host-relative for the footer.
@@ -341,14 +360,55 @@ export function localConventionsSection(hostPath: string, opts?: { maxChars?: nu
   } catch {
     return null;
   }
-  const body = raw.trim();
+  if (!raw.trim()) return null;
+  // BUG-146 (half 2): an UNEDITED onboard scaffold carries no rules — injecting
+  // it spends ~244 tokens every turn to say the file exists. Detect it by exact
+  // match against the text onboard writes (both read one shared owner,
+  // scripts/lib/conventions-stub.mjs), never a length heuristic. A project that
+  // has added even one real rule differs and is NOT treated as a stub.
+  if (isUneditedConventionsStub(raw)) return null;
+
+  // BUG-146 (half 1): prefer the author-curated agent-facing region between the
+  // `conventions-inject` markers — the same mechanism routingSection()/
+  // responseFormatSection() use, so the AUTHOR declares which part reaches a
+  // session while background/history/evidence stays in the file, uninjected. A
+  // doc WITHOUT markers degrades to the capped full body (today's behaviour),
+  // never to silence.
+  const marked = CONVENTIONS_INJECT_RE.exec(raw);
+  const usingRegion = !!marked;
+  // LF-normalise before anything measures or cuts it (BUG-146 round 3, ARCH-006):
+  // a CRLF doc otherwise has no `\n\n` paragraph break for the loud-stop boundary
+  // search to find, so an over-cap CRLF region hard-sliced mid-rule. For an
+  // LF/ASCII doc (the common case) this is a no-op, so output stays byte-identical.
+  const body = normalizeLineEndings(usingRegion ? marked![1]! : raw).trim();
   if (!body) return null;
 
-  const maxChars = Math.max(200, opts?.maxChars ?? 6000);
+  // The curated region is delivered WHOLE (user decision, 2026-09-29, recorded
+  // on BUG-146): the author already excluded the background by placing the
+  // `conventions-inject` markers, so every agent-facing rule they kept inside
+  // the region reaches the session. The cap on this path is therefore NOT a
+  // budget knob — it is a generous (64 KiB) safety stop against a runaway doc
+  // only, chosen so it cannot bite any realistic conventions file (this repo's
+  // region is ~26k). Should it ever fire, it truncates LOUDLY on a markdown
+  // boundary with a visible notice (below), never silently mid-rule. The
+  // earlier 26000 value SILENTLY cut this repo's region at the last section
+  // (the "separate process, not a subagent" rule), contradicting that decision.
+  // The unmarked legacy path keeps the tighter 6000 default it always had.
+  //
+  // UNIT (BUG-146 round 3): the cap is measured in CHARACTERS (UTF-16 string
+  // length) — the SAME unit as every other size this function compares
+  // (`full.length`, `body.length`, the notice). It is deliberately NOT bytes: a
+  // mixed char/byte comparison was the round-2 inconsistency. 65,536 chars is a
+  // generous ceiling; a multibyte region whose BYTES exceed it but whose CHARS
+  // do not is still delivered whole, which is the safe direction.
+  const maxChars = Math.max(200, opts?.maxChars ?? (usingRegion ? 65536 : 6000));
   const header = [
     '# Project Conventions (local)',
     '',
-    `_Auto-injected at launch from ${convRel} (read-only). Project-specific rules ` +
+    `_Auto-injected at launch from ${convRel} (read-only)` +
+      (usingRegion
+        ? ` — the agent-facing rules region only; background, history and evidence stay in the file (read \`${convRel}\` in full for those). `
+        : '. Project-specific rules ') +
       'only — anything universal belongs in the shared Working Agreement instead (see WA §L / ' +
       '`scripts/check-scope.mjs`).',
     '',
@@ -358,8 +418,11 @@ export function localConventionsSection(hostPath: string, opts?: { maxChars?: nu
   if (full.length <= maxChars) return full;
 
   // Over the cap. Reserve room for the notice, then cut the BODY at the last
-  // markdown boundary (blank line) that fits, falling back to a hard slice only
-  // when a single block is itself bigger than the budget.
+  // safe boundary that fits: a paragraph break first, then a line break, then a
+  // word break — only an unbroken single token is ever hard-sliced (BUG-146
+  // round 3: a doc with no blank line used to hard-slice mid-word before this
+  // cascade). `body` is already LF-normalised above, so `\n\n`/`\n` are found in
+  // CRLF docs too.
   const notice = (dropped: number) =>
     `\n\n---\n\n⚠ **TRUNCATED — ${dropped} of ${body.length} characters of ${convRel} are NOT in this ` +
     `prompt.** Only the top of the file is injected. The omitted tail may contain rules that apply to ` +
@@ -371,8 +434,17 @@ export function localConventionsSection(hostPath: string, opts?: { maxChars?: nu
   const cut = (b: number) => {
     if (b <= 0) return '';
     const slice = body.slice(0, b);
-    const brk = slice.lastIndexOf('\n\n');
-    return (brk > b * 0.5 ? slice.slice(0, brk) : slice).trimEnd();
+    // Cascade: paragraph break → line break → word break. Each is only used if
+    // it keeps more than half the budget, so we never throw away most of the
+    // content chasing a boundary; past that, fall through to a finer boundary
+    // and finally to a hard slice (a single unbroken token).
+    const para = slice.lastIndexOf('\n\n');
+    if (para > b * 0.5) return slice.slice(0, para).trimEnd();
+    const line = slice.lastIndexOf('\n');
+    if (line > b * 0.5) return slice.slice(0, line).trimEnd();
+    const word = slice.lastIndexOf(' ');
+    if (word > b * 0.5) return slice.slice(0, word).trimEnd();
+    return slice.trimEnd();
   };
   let kept = cut(budget);
   budget = maxChars - header.length - notice(body.length - kept.length).length;
@@ -401,6 +473,53 @@ export function localConventionsSection(hostPath: string, opts?: { maxChars?: nu
 export const ROUTING_MIRROR_RELPATH = path.join('docs', 'prompts', 'ROUTING.md');
 
 const ROUTING_INJECT_RE = /<!--\s*routing-inject:start\s*-->([\s\S]*?)<!--\s*routing-inject:end\s*-->/;
+
+/**
+ * FEAT-157 — the guide a container project's agent gets about its image: what it
+ * owns (its Dockerfile), what Orchard owns (the base release and the Claude CLI
+ * layer), and the rules, GENERATED from the tables the enforcing code itself
+ * reads (`BUILD_RULES` → the build argv, `LOCKDOWN_RULES` → `docker create`,
+ * `RESERVED_ENV_RULES` → the env checks). Nothing here restates a rule: adding a
+ * row to a table changes the enforcement and this text together.
+ *
+ * STATIC on purpose: it rides in the system prompt, which must stay byte-stable
+ * across a session's resumes (FEAT-113). What is volatile — which base the
+ * container runs and any pending release — is told on the first turn and when it
+ * changes (`container-manager.ts` `baseBriefingFor`).
+ */
+export function containerBuildSection(opts: { imageSource: 'station' | 'dockerfile' | 'custom'; answerCmd?: string | null }): string {
+  const envRules = RESERVED_ENV_RULES.map((r) => {
+    const names = [...(r.exact ?? []).map((k) => `\`${k}\``), ...(r.prefixes ?? []).map((p) => `\`${p}*\``)];
+    return `  - ${names.join(', ')} — ${r.guide}`;
+  });
+  const lock = LOCKDOWN_RULES.map((r) => `  - \`${r.overrides}\` — ${r.effect}`);
+  const build = BUILD_RULES.map((r) => `  - ${r.guide}`);
+  const src = opts.imageSource === 'dockerfile'
+    ? 'This project builds its image from its own Dockerfile (`settings.container.dockerfile`), on top of its pinned Orchard base.'
+    : opts.imageSource === 'custom'
+      ? 'This project runs a prebuilt image (`settings.container.image`) that Orchard does not build: base releases are not applied to it and it gets no CLI layer.'
+      : 'This project runs Orchard\'s base image directly (no project Dockerfile).';
+  return [
+    '## Your container image (Orchard)',
+    '',
+    `${src} Orchard owns the base (numbered releases; this project is pinned to one and is told about newer ones) and the Claude CLI: the CLI is a thin layer Orchard adds on top of whatever the project runs, matching this host's SDK.`,
+    '',
+    '**Never install or pin the Claude CLI in an image.** Orchard layers the version this host needs on top of your image; one you install is shadowed by it.',
+    '',
+    '**Building a project Dockerfile:**',
+    ...build,
+    '',
+    '**Ignored at run time** (Orchard sets these when it creates the container; the image does not decide them):',
+    ...lock,
+    '',
+    `**Reserved environment names** — never set these in \`container.env\`, nor with \`ENV\` in an image (an image may set ${IMAGE_ENV_ALLOWED.map((k) => `\`${k}\``).join(' and ')}):`,
+    ...envRules,
+    '',
+    '**Not in the Dockerfile:** GPU, memory, environment, mounts and service sidecars are project settings (`container.gpu`, `container.memoryMb`, `container.env`, `mounts`, `services`).',
+    '',
+    `**Base updates:** a new release, and which base this container runs, are told to you as a \`[station]\` note on your first turn and when they change. The user answers on the Needs-You rail (Adopt / Defer / Skip; a security release cannot be skipped and is applied at the next launch with no live session).${opts.answerCmd ? ` If the user tells you to act on one: \`${opts.answerCmd} base status\`, then \`${opts.answerCmd} base adopt|defer|skip --rev <rev>\` (this project's own notice only).` : ''}`,
+  ].join('\n');
+}
 
 export function routingSection(opts?: { filePath?: string; maxChars?: number }): string | null {
   const file = opts?.filePath ?? path.join(projectRoot(), ROUTING_MIRROR_RELPATH);

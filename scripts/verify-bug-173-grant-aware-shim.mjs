@@ -27,7 +27,7 @@
  *   - /api/git-shim/decide REQUIRES the secret; a caller without it is refused.
  *
  * Legs:
- *   [must-FAIL] the PRE-FIX shim (git show HEAD:…) refuses `git add` even with a
+ *   [must-FAIL] the PRE-FIX shim (git show PRE_FIX_REV:…, pinned) refuses `git add` even with a
  *     live grant + reachable host — no call-time consult exists. Same scenario
  *     post-fix is honoured.
  *   [scope]  project-scoped contract: session A allowed; a DIFFERENT session in
@@ -218,10 +218,17 @@ function realLeakGate(repoDir) {
 const PROJECT = 'proj-A';
 const OTHER = 'proj-B';
 
+/** BUG-173 pre-fix baseline: parent of ca672b9 (the commit that landed the fix). */
+const PRE_FIX_REV = 'dc1f4ea0f3d2';
+
 async function main() {
   // ── [must-FAIL] the PRE-FIX shim, obtained read-only via git show ───────────
   console.log('[must-FAIL] pre-fix shim refuses `git add` even with a live grant + reachable host');
-  const preSrc = execFileSync('git', ['show', 'HEAD:scripts/lib/git-shim.mjs'], { encoding: 'utf8' });
+  // Pinned, not HEAD: once the fix was committed HEAD BECAME the fixed state and
+  // this leg could never fail again (CONVENTIONS: a must-FAIL proof must not be
+  // anchored to a moving baseline). PRE_FIX_REV is the parent of ca672b9, the
+  // commit that landed BUG-173; the read fails loudly if history ever loses it.
+  const preSrc = execFileSync('git', ['show', `${PRE_FIX_REV}:scripts/lib/git-shim.mjs`], { encoding: 'utf8' });
   const prePath = path.join(LIBDIR, '.bug173-prefix-shim.mjs'); // in lib/ so its `./git-write-policy.mjs` import resolves
   fs.writeFileSync(prePath, preSrc);
   try {

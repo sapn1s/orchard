@@ -60,8 +60,11 @@
  *       visible waiting row naming the older host; it retires; the row
  *       resumes the session on a fresh CLI exactly once.
  *   B3  brave: a retry whose socket dies right after `start` (the server
- *       delivers, the ack is lost) → the row ends DEAD ("never confirmed"),
- *       never re-sent; the CLI has it exactly once.
+ *       delivers, the ack is lost) → never re-sent; the CLI has it exactly
+ *       once. BUG-217 round 3: the tab now ASKS the server's ledger (by row id)
+ *       instead of guessing, so the row leaves the dock (the server recorded it
+ *       delivered) — or, where the server could not confirm, ends DEAD ("never
+ *       confirmed"). Never pending, never resent.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -721,8 +724,10 @@ async function armB2() {
   await page.screenshot({ path: path.join(SHOTS, 'BUG-191-b2-batch-refused-recovered.png') });
   const order = dock ? dock.indexOf(m1) < dock.indexOf(m2) : false;
   const bubbles = (await bubblesWith(page, m1)) + (await bubblesWith(page, m2));
-  k.check('B2 PRECONDITION: responder-only; the tab held both rows during the turn and flushed them as one `send` (with a sendId) at the boundary',
-    x?.adoptState === 'responder-only' && queuedBefore.includes(m1) && queuedBefore.includes(m2) && !!sentSend && /"sendId":"s-/.test(sentSend ?? ''),
+  // BUG-217 round 5: queued rows are the SERVER outbox's — it holds them and is refused by the gate itself, so the
+  // tab never flushes a `send` of its own at the boundary (that flush was the round-1…4 mechanism this precondition named).
+  k.check('B2 PRECONDITION: responder-only; both rows were queued during the turn, and the tab sent no `send` of its own at the boundary (the server outbox holds them)',
+    x?.adoptState === 'responder-only' && queuedBefore.includes(m1) && queuedBefore.includes(m2) && !sentSend,
     { adoptState: x?.adoptState ?? null, queuedBefore: queuedBefore.includes(m1) && queuedBefore.includes(m2), send: (sentSend ?? '').slice(0, 80) });
   k.check('B2 the refused batch comes back as BOTH rows, in their original order, as waiting rows — its bubble gone, nothing delivered',
     !!dock && order && bubbles === 0 && deliveries(d.w, m1).length === 0 && deliveries(d.w, m2).length === 0,
@@ -746,13 +751,14 @@ async function armB3() {
   // The next retry's socket is cut the instant its `start` leaves: the server delivers, the ack goes nowhere.
   await page.evaluate((m) => { window.__b191.closeNextStartMatching = m; }, marker);
   const got = await waitFor(() => (deliveries(d.w, marker).length >= 1 ? true : null), 40_000, 500);
-  const dead = await waitFor(async () => { const t = await dockText(page); return /never confirmed|check the transcript/.test(t) && t.includes(marker) ? t : null; }, 25_000, 500);
+  const dead = await waitFor(async () => { const t = await dockText(page); return (/never confirmed|check the transcript/.test(t) && t.includes(marker)) || !t.includes(marker) ? (t || '(dock empty)') : null; }, 25_000, 500);
   await sleep(12_000); // two retry periods: nothing may resend it
   await page.screenshot({ path: path.join(SHOTS, 'BUG-191-b3-lost-ack-kept-dead.png') });
   const starts = await page.evaluate((m) => window.__b191.sockets.flatMap((s) => s.sent).filter((s) => s.includes('"type":"start"') && s.includes(m)).length, marker);
   k.check('B3 PRECONDITION: queued during the pending adoption; the adoption settles responder-only (broker still takes input)', !!pend && !!queued && x?.adoptState === 'responder-only', { pending: !!pend, queued: !!queued, adoptState: x?.adoptState ?? null });
-  k.check('B3 a retry whose ack was lost with its socket ends DEAD ("never confirmed"), is never resent, and the CLI has it EXACTLY ONCE',
-    !!got && !!dead && deliveries(d.w, marker).length === 1,
+  const finalDock = await dockText(page);
+  k.check('B3 a retry whose ack was lost with its socket is settled by the server\'s answer — gone (delivered) or DEAD ("never confirmed"), never pending — is never resent, and the CLI has it EXACTLY ONCE',
+    !!got && !!dead && deliveries(d.w, marker).length === 1 && (!finalDock.includes(marker) || /never confirmed|check the transcript/.test(finalDock)),
     { deliveries: deliveries(d.w, marker).length, deadRow: !!dead, startsSent: starts, dock: (await dockText(page)).slice(0, 300) });
   await page.close();
   fakeCmd(d.w, d.cli, { op: 'lane_end', id: 'LD' });

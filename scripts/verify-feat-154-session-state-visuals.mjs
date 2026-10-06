@@ -145,7 +145,9 @@ window.__f154 = (() => {
       // present only on transcript mtime). An alive-but-idle DETACHED bridge is
       // present here with running===false; sessionRow must read that, not mere
       // presence. Scenarios pass it as sc.liveness.running (the wire shape).
-      ...(sc.liveness && typeof sc.liveness.running === 'boolean' ? { running: sc.liveness.running } : {}) });
+      ...(sc.liveness && typeof sc.liveness.running === 'boolean' ? { running: sc.liveness.running } : {}),
+      // round 5: the authority's "working" fact (main turn OR live subagent/lane).
+      ...(sc.liveness && typeof sc.liveness.working === 'boolean' ? { working: sc.liveness.working } : {}) });
     // A real SESSION death is a row:'main' outcome (outcomes.ts owns \`row\`).
     if (sc.died) st.outcomes = [{ id: 'o1', sdkSessionId: id, at: now - 60000, row: 'main', kind: sc.diedKind || 'unknown' }];
     // round 3 bug B: LANE deaths only — failed/killed \`row:'tool'\` (and an
@@ -264,7 +266,54 @@ window.__f154 = (() => {
       };
     } finally { window.fetch = realFetch; }
   }
-  return { build, token, pulseName, pipeline, setTheme: (t) => { document.documentElement.dataset.theme = t; } };
+  // round 6/7 — drive the REAL running strip from a server snapshot (real onEvent →
+  // applySnapshot → renderStrip). Round 7: the stop control goes over HTTP,
+  // addressed by (session, task), so fetch is shimmed ONLY for the stop route —
+  // it records the URL and answers with the scripted server reply. The socket is
+  // set to NULL (a tab that VIEWS the session but does not drive it — the
+  // adopted-after-restart case): a stop that still depended on the socket would
+  // send nothing. confirm() is auto-accepted.
+  async function strip(running, opts = {}) {
+    st.openProjectId = null;                         // the dock is not foreign
+    const sent = [];
+    const wsSent = [];
+    const realWs = st.ws, realConfirm = window.confirm, realFetch = window.fetch;
+    st.ws = opts.withSocket ? { readyState: WebSocket.OPEN, send: (x) => wsSent.push(JSON.parse(x)) } : null;
+    window.confirm = () => true;
+    window.fetch = (url, init) => {
+      const u = String(url && url.url ? url.url : url);
+      if (/\\/api\\/sessions\\/[^/]+\\/running\\/[^/]+\\/stop$/.test(u)) {
+        sent.push({ url: u, method: init?.method ?? 'GET', ctype: init?.headers?.['content-type'] ?? null });
+        const reply = opts.reply ?? { status: 200, body: { ok: true } };
+        return Promise.resolve(new Response(JSON.stringify(reply.body), { status: reply.status, headers: { 'content-type': 'application/json' } }));
+      }
+      if (/\\/api\\/sessions\\/[^/]+\\/running$/.test(u)) {
+        return Promise.resolve(new Response(JSON.stringify({ snapshot: st.snap }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      }
+      return realFetch(url, init);
+    };
+    try {
+      S.onEvent({ t: 'running-snapshot', snapshot: { v: 1, at: Date.now(), stationSessionId: opts.station ?? 'cs-viewed', sdkSessionId: opts.sdk ?? 's-viewed',
+        turn: { running: false, since: null, state: 'alive', kind: 'idle', reason: 'no turn is running' },
+        running, ended: [], source: 'bridge' } });
+      const rowsEl = document.getElementById('stripRows');
+      const kids = [...rowsEl.children];
+      const rows = kids.map((k) => {
+        const lag = k.classList.contains('lag') ? k : k.querySelector('.lag');
+        return { ty: lag?.querySelector('.ty')?.textContent ?? null, de: lag?.querySelector('.de')?.textContent ?? null,
+          el: lag?.querySelector('.el')?.textContent ?? null, stop: !!k.querySelector('.lag-stop'), key: lag?.dataset.thread ?? null };
+      });
+      const firstStop = rowsEl.querySelector('.lag-stop');
+      if (firstStop) firstStop.click();
+      await new Promise((r) => setTimeout(r, 150));
+      const fine = document.getElementById('fine');
+      return { hidden: document.getElementById('strip')?.hidden ?? null, n: kids.length, rows, sent, wsSent,
+        stopDisabledAfter: firstStop ? firstStop.disabled : null,
+        said: fine?.textContent ?? '', saidErr: fine?.classList.contains('err') ?? false,
+        sum: document.getElementById('stripSum')?.textContent ?? null };
+    } finally { st.ws = realWs; window.confirm = realConfirm; window.fetch = realFetch; }
+  }
+  return { build, token, pulseName, pipeline, strip, setTheme: (t) => { document.documentElement.dataset.theme = t; } };
 })();
 `;
 
@@ -370,6 +419,67 @@ async function main() {
   const mainDeath = await build({ died: true, activityAgoMs: 30 * 60000 });
   check('BUG B control: a row:"main" SESSION death still renders the .stopped triangle (genuine deaths not muted)',
     mainDeath.lifecycle === 'stopped' && mainDeath.has.stopped, mainDeath);
+
+  console.log('\n=== (g3) round 5 — a session whose main turn ended but a SUBAGENT still runs is RUNNING (light blue) ===');
+  // REAL 4ea3d0d2 shape: liveness verdict running=false, kind=idle, but the
+  // authority declares working=true (a live background subagent). "this dashboard
+  // drives it" so the marker is the hollow-ring running variant (.alive.here).
+  const subagentRunning = await build({ live: true, here: true, liveness: { running: false, working: true, kind: 'idle', state: 'alive' }, activityAgoMs: 2 * 60000, seenAgoMs: 60000 });
+  check('BUG (round 5): main turn ended (running=false) but a live subagent (working=true) ⇒ RUNNING marker (.alive), not finished',
+    subagentRunning.lifecycle === 'running' && subagentRunning.has.alive && !subagentRunning.has.settledHollow && !subagentRunning.has.unread
+    && /running now/.test(subagentRunning.sr || ''), subagentRunning);
+  check('BUG (round 5) must-FAIL sentinel: the per-bridge running verdict IS false here — reading only `running` (round 3) would show finished; `working` diverges',
+    subagentRunning.lifecycle === 'running', { lifecycle: subagentRunning.lifecycle });
+  // Control: main turn ended, NO live subagent (working=false) → NOT running.
+  const noSubagent = await build({ live: true, liveness: { running: false, working: false, kind: 'idle', state: 'alive' }, activityAgoMs: 20 * 3600000, seenAgoMs: 60000 });
+  check('round 5 control: idle-alive with working=false ⇒ NOT running (round-3 guarantee intact)',
+    noSubagent.lifecycle !== 'running' && !noSubagent.has.alive, noSubagent);
+
+  console.log('\n=== (g4) round 6 — background COMMANDS are listed in the strip, labelled plainly, and stoppable ===');
+  // REAL 7f7e39a1 shape, as the round-6 server publishes it for an adopted bridge:
+  // five level-only local_bash lanes (the real task ids + the broker's declared
+  // start times), no agent, no main turn.
+  const T = (iso) => Date.parse(iso);
+  const pollers = [
+    ['b5tblidkz', '2026-09-27T21:06:27.297Z'], ['bdyk8xzib', '2026-09-27T21:20:59.149Z'], ['b0s9i9e1l', '2026-09-27T21:28:07.167Z'],
+    ['b0tfqhu9g', '2026-09-27T21:35:07.908Z'], ['bipc0pi2p', '2026-09-27T22:07:57.033Z'],
+  ].map(([id, since]) => ({ id, row: 'tool', label: 'background command', description: '', startedAt: T(since), lastTool: null, toolUses: 0, totalTokens: 0, state: 'running', background: true }));
+  const strip5 = JSON.parse(await cdp.eval(`(async () => JSON.stringify(await window.__f154.strip(${JSON.stringify(pollers)})))()`));
+  check('round 6 (7f7e39a1 shape): the strip SHOWS all 5 background commands, labelled "background command", each with an age and a stop control',
+    strip5.hidden === false && strip5.n === 5 && strip5.rows.every((r) => r.ty === 'background command' && r.stop && r.el && r.el !== '—'), strip5);
+  if (process.env.F154_SHOT) {
+    // Optional: a real-page screenshot of the strip in this state, for the visual review.
+    await cdp.eval(`window.__f154.strip(${JSON.stringify(pollers.map((r, i) => ({ ...r, description: i === 4 ? 'until grep -q "adversarial:.*passed" /tmp/adv-r3.txt; do sleep 5; done' : '' })))}) && true`);
+    const rect = JSON.parse(await cdp.eval(`JSON.stringify(document.getElementById('strip').getBoundingClientRect())`));
+    for (const theme of ['light', 'dark']) {
+      await cdp.eval(`window.__f154.setTheme(${JSON.stringify(theme)})`);
+      await sleep(200);
+      const shot = await cdp.send('Page.captureScreenshot', { format: 'png', clip: { x: rect.x, y: rect.y, width: Math.max(rect.width, 600), height: Math.max(rect.height, 180), scale: 1 } });
+      fs.writeFileSync(`${process.env.F154_SHOT}-${theme}.png`, Buffer.from(shot.data, 'base64'));
+    }
+    await cdp.eval(`window.__f154.setTheme('light')`);
+  }
+  check('round 7 (MUST-FAIL on round 6: nothing sent — no socket): in a VIEWED, not-driven session, stop POSTs /api/sessions/<THIS session>/running/b5tblidkz/stop as JSON',
+    strip5.sent.length === 1 && strip5.sent[0].method === 'POST' && strip5.sent[0].ctype === 'application/json'
+      && /\/api\/sessions\/cs-viewed\/running\/b5tblidkz\/stop$/.test(strip5.sent[0].url) && strip5.wsSent.length === 0, { sent: strip5.sent, wsSent: strip5.wsSent, said: strip5.said });
+  // Round 7 [medium]: the stop is addressed to the session the STRIP shows, even when
+  // this tab's socket is attached to a DIFFERENT session.
+  const other = JSON.parse(await cdp.eval(`(async () => JSON.stringify(await window.__f154.strip(${JSON.stringify(pollers.slice(0, 1))}, { withSocket: true, station: 'cs-other-session', sdk: 'sdk-other' })))()`));
+  check('round 7 (MUST-FAIL on round 6: routed to the socket\'s own session): the stop names the strip\'s session id, never the socket\'s',
+    other.sent.length === 1 && /\/api\/sessions\/cs-other-session\/running\/b5tblidkz\/stop$/.test(other.sent[0].url) && other.wsSent.length === 0, { sent: other.sent, wsSent: other.wsSent });
+  // Round 7: the owning bridge is GONE — the server answers 404 no-bridge; the UI says so plainly.
+  const gone = JSON.parse(await cdp.eval(`(async () => JSON.stringify(await window.__f154.strip(${JSON.stringify(pollers.slice(0, 1))}, { reply: { status: 404, body: { ok: false, reason: 'no-bridge', error: 'this server is not driving that session any more' } } })))()`));
+  check('round 7: bridge gone ⇒ the UI says PLAINLY it could not stop it (error line), and the stop button is usable again — not a silent no-op',
+    gone.sent.length === 1 && gone.saidErr === true && /no longer driving that session/.test(gone.said) && gone.stopDisabledAfter === false, { said: gone.said, err: gone.saidErr, disabled: gone.stopDisabledAfter });
+  // A row-backed background bash (a lane born under THIS server) carries the engine's
+  // label local_bash — the strip still names it plainly and offers stop.
+  const bornHere = JSON.parse(await cdp.eval(`(async () => JSON.stringify(await window.__f154.strip(${JSON.stringify([{ id: 'bgj7hkeu4', row: 'tool', label: 'local_bash', description: 'npm run dev', startedAt: Date.now() - 3600000, lastTool: null, toolUses: 0, totalTokens: 0, state: 'running', background: true }])})))()`));
+  check('round 6 (4846de18 shape): a background local_bash row reads "background command" with its description and a stop control',
+    bornHere.n === 1 && bornHere.rows[0].ty === 'background command' && bornHere.rows[0].de === 'npm run dev' && bornHere.rows[0].stop, bornHere);
+  // Control: a live background SUBAGENT row is an agent row — no stop control, its own label.
+  const agentRow = JSON.parse(await cdp.eval(`(async () => JSON.stringify(await window.__f154.strip(${JSON.stringify([{ id: 'adaae79e33aa0356d', row: 'agent', label: 'worker', description: 'verify FEAT-155', startedAt: Date.now() - 60000, lastTool: 'Bash', toolUses: 3, totalTokens: 0, state: 'running', background: true }])})))()`));
+  check('round 6 control: a background SUBAGENT row keeps its agent label and gets NO shell stop control',
+    agentRow.n === 1 && agentRow.rows[0].ty === 'worker' && !agentRow.rows[0].stop && agentRow.sent.length === 0 && agentRow.wsSent.length === 0, agentRow);
 
   console.log('\n=== (g2) round 4 — REAL PIPELINE: api.liveBridges() → refreshLive → sessionRow lights waiting-on-you ===');
   const pipeline = async (id, awaiting) =>

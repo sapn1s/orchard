@@ -19,7 +19,9 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import WebSocket from 'ws';
-import { findNeighborProject, homeEncoded } from './lib/neighbor-project.mjs';
+import { findNeighborProject, homeEncoded, encodeStoreDir } from './lib/neighbor-project.mjs';
+import { isolatedStoreEnv } from './lib/station-boot.mjs';
+import { listSubagents } from '../src/server/subagents.ts';
 
 /* Never a fixed port: two suites defaulting to the same number collide the
    moment both run (observed: verify-ui + verify-sessions on 4319). The OS
@@ -37,6 +39,28 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-station-verify-'));
 const OFFLINE = process.argv.includes('--offline');
 const SENTINEL = 'ZEBRA-7741';
+
+/*
+ * BUG-161 — the CLI transcript store is isolated to scratch, not left on the
+ * user's real ~/.claude/projects. Every session this suite drives used to write
+ * its transcript into the real store (isolating only CLAUDE_STATION_DATA leaves
+ * the CLI writer pointed at ~/.claude); the runtime guard now REFUSES that. So
+ * we redirect BOTH knobs at a scratch config dir (under DATA, cleaned with it):
+ *   - CLAUDE_CONFIG_DIR   → where the CLI child WRITES its transcripts
+ *   - CLAUDE_PROJECTS_DIR → where Orchard's reader + fork.ts READ them
+ * isolatedStoreEnv() sets both and SYMLINKS the real credentials so OAuth still
+ * resolves (a symlink, not a copy — no secret bytes are written to scratch).
+ * The handful of REAL sessions the suite needs as fixtures (a neighbor project's
+ * history, a Bash-tool_use session, a subagent-bearing session, a Windows-origin
+ * session, cross-dir duplicate ids) are COPIED from the real store into this
+ * scratch store by seedFixtures() before the server boots — a read of the real
+ * store, never a write to it.
+ */
+const CONFIG_DIR = path.join(DATA, 'claude-config');
+const STORE_ENV = isolatedStoreEnv(CONFIG_DIR, { alsoReader: true });
+const SESS_STORE = path.join(CONFIG_DIR, 'projects');
+/** The user's REAL store — READ ONLY here, as the source seedFixtures() copies from. */
+const REAL_STORE = path.join(os.homedir(), '.claude', 'projects');
 
 let pass = 0;
 let fail = 0;
@@ -195,9 +219,19 @@ class Driver {
   }
 
   async start(body: Record<string, unknown>, timeoutMs = 240_000): Promise<Turn> {
-    this.cur = newTurn();
-    this.ws.send(JSON.stringify({ type: 'start', ...body }));
-    return this.#wait(timeoutMs);
+    // A direct (host) session is refused with a TRANSIENT `runtime-check-pending`
+    // error while the server's async bundled-runtime boot check is still running
+    // (BUG-190). That refusal lands BEFORE any model call, so retrying it is free.
+    // The offline-able sections 1-2d usually give the check enough time, but a
+    // fast machine can still race it on the first live start — so retry here.
+    for (let attempt = 0; attempt < 15; attempt++) {
+      this.cur = newTurn();
+      this.ws.send(JSON.stringify({ type: 'start', ...body }));
+      const turn = await this.#wait(timeoutMs);
+      if (!turn.errors.some((e: any) => e.code === 'runtime-check-pending')) return turn;
+      await sleep(2000);
+    }
+    return this.cur;
   }
 
   async send(prompt: string, timeoutMs = 240_000): Promise<Turn> {
@@ -227,15 +261,193 @@ function newTurn(): Turn {
   };
 }
 
+/* ---------------------------------------------------------- seed fixtures */
+
+/**
+ * BUG-161 — copy the handful of REAL sessions the suite needs into the scratch
+ * store, so the run reads its own scratch store rather than the user's real one.
+ *
+ * Selection here MIRRORS each section's own discovery logic, run against the
+ * REAL store; only the selected artifact is copied (byte-identical, mtime
+ * preserved), so a section that re-discovers against the scratch store finds
+ * exactly what it would have found against the real store. This is a READ of the
+ * real store and a WRITE to scratch — the real store is never modified.
+ *
+ * BEST-EFFORT, never fatal: seeding only RELOCATES fixtures that exist in the
+ * real store; it does not decide pass/fail. A fixture the real store lacks is
+ * simply not seeded, and the owning section then fails at its OWN precondition
+ * exactly as it did before this change (e.g. this machine has no Windows-origin
+ * session, so HEAD's section 8 also fails there). Throwing here instead would
+ * abort the whole run at seed time and rob sections 3-7 — the ones that actually
+ * run and previously leaked — of their chance to run. Section 8/8b fixtures
+ * (Windows-origin + duplicate ids) are live-only, so they are skipped entirely
+ * under --offline.
+ */
+function seedFile(encodedDir: string, srcFile: string): string {
+  const destDir = path.join(SESS_STORE, encodedDir);
+  fs.mkdirSync(destDir, { recursive: true });
+  const dest = path.join(destDir, path.basename(srcFile));
+  fs.copyFileSync(srcFile, dest);
+  const st = fs.statSync(srcFile); // preserve mtime (section 8 asserts the source is untouched)
+  fs.utimesSync(dest, st.atime, st.mtime);
+  return dest;
+}
+
+function seedFixtures(): void {
+  const seeded: string[] = [];
+
+  // A. section 1 — the neighbor project's newest renderable session.
+  const neighbor = findNeighborProject({ excludePath: ROOT });
+  const nEnc = encodeStoreDir(neighbor);
+  const nDir = path.join(REAL_STORE, nEnc);
+  const nFile = fs.readdirSync(nDir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .map((f) => ({ f, p: path.join(nDir, f), st: fs.statSync(path.join(nDir, f)) }))
+    .filter((x) => x.st.size > 1000)
+    .sort((a, b) => b.st.mtimeMs - a.st.mtimeMs)
+    .find((x) => { const c = fs.readFileSync(x.p, 'utf8'); return c.includes('"text"') && c.includes('"role":"assistant"'); });
+  if (nFile) { seedFile(nEnc, nFile.p); seeded.push(`neighbor ${nEnc}/${nFile.f}`); }
+  else console.log(`  - (skipped) no renderable session under neighbor ${nDir} — section 1 will fail its own check here`);
+
+  // B. section 1a — a session with Bash tool_use blocks near its tail.
+  const bd = process.env.STATION_VERIFY_TOOLUSE_DIR ?? homeEncoded();
+  const bDir = path.join(REAL_STORE, bd);
+  const pinnedS = process.env.STATION_VERIFY_TOOLUSE_SESSION;
+  const bFile = pinnedS
+    ? `${pinnedS}.jsonl`
+    : fs.readdirSync(bDir)
+      .filter((f) => f.endsWith('.jsonl'))
+      .map((f) => ({ f, st: fs.statSync(path.join(bDir, f)) }))
+      .filter((x) => x.st.size > 50_000 && x.st.size < 5_000_000)
+      .sort((a, b) => b.st.mtimeMs - a.st.mtimeMs)
+      .find((x) => {
+        const lines = fs.readFileSync(path.join(bDir, x.f), 'utf8').trimEnd().split('\n');
+        const tailText = lines.slice(-60).join('\n');
+        return tailText.includes('"type":"tool_use"') && tailText.includes('"name":"Bash"');
+      })?.f;
+  if (bFile) { seedFile(bd, path.join(bDir, bFile)); seeded.push(`bash-tooluse ${bd}/${bFile}`); }
+  else console.log(`  - (skipped) no Bash-tool_use session under ${bDir} — section 1a will fail its own precondition here`);
+
+  // C. section 2d — a session that carries subagent transcripts (a subdir tree).
+  // The pagination check (offset=5, limit=5) needs subagents[0] to have >= 6
+  // RENDERABLE messages. Pick a SINGLE-agent session so `subagents[0]` is that
+  // agent regardless of the copied dir's readdir order (a multi-agent session's
+  // first-by-readdir agent can differ between the real dir and the scratch copy,
+  // and the plain "has any subagents" pick lands on a 3-message agent here). We
+  // grade candidates through the real listSubagents() logic against the REAL
+  // store, so "renderable message count" is the SAME number the route returns —
+  // not a re-derived approximation.
+  let subFound: { dir: string; session: string } | null = null;
+  let subFallback: { dir: string; session: string } | null = null;
+  outer: for (const de of fs.readdirSync(REAL_STORE, { withFileTypes: true })) {
+    if (!de.isDirectory()) continue;
+    let children: fs.Dirent[];
+    try { children = fs.readdirSync(path.join(REAL_STORE, de.name), { withFileTypes: true }); } catch { continue; }
+    for (const child of children) {
+      if (!child.isDirectory()) continue;
+      const subs = path.join(REAL_STORE, de.name, child.name, 'subagents');
+      if (!(fs.existsSync(subs) && fs.readdirSync(subs).some((f) => /^agent-.*\.jsonl$/.test(f)))) continue;
+      subFallback ??= { dir: de.name, session: child.name };
+      let list;
+      try { list = listSubagents(de.name, child.name, { root: REAL_STORE }); } catch { continue; }
+      if (list.length === 1 && list[0].messageCount >= 6) { subFound = { dir: de.name, session: child.name }; break outer; }
+    }
+  }
+  // Fall back to any subagent-bearing session rather than failing: a store with
+  // only tiny agent transcripts still exercises every 2d check except pagination.
+  subFound ??= subFallback;
+  if (subFound) {
+    fs.cpSync(
+      path.join(REAL_STORE, subFound.dir, subFound.session),
+      path.join(SESS_STORE, subFound.dir, subFound.session),
+      { recursive: true, preserveTimestamps: true },
+    );
+    seeded.push(`subagents ${subFound.dir}/${subFound.session}`);
+  } else {
+    console.log('  - (skipped) no session with subagent transcripts — section 2d will fail its own precondition here');
+  }
+
+  if (!OFFLINE) {
+    // D. section 8 — a Windows-origin session (dual-boot encoded dir).
+    const winDir = process.env.STATION_VERIFY_WIN_DIR
+      ?? fs.readdirSync(REAL_STORE).sort().find((d) => {
+        if (!/^[A-Za-z]--Users-/.test(d)) return false;
+        try { return fs.readdirSync(path.join(REAL_STORE, d)).some((f) => f.endsWith('.jsonl')); } catch { return false; }
+      }) ?? '';
+    const winId = winDir
+      ? (process.env.STATION_VERIFY_WIN_ID
+        ?? fs.readdirSync(path.join(REAL_STORE, winDir))
+          .filter((f) => f.endsWith('.jsonl'))
+          .map((f) => ({ f, size: fs.statSync(path.join(REAL_STORE, winDir, f)).size }))
+          .filter((x) => x.size > 10_000)
+          .sort((a, b) => a.size - b.size)[0]?.f.slice(0, -6) ?? '')
+      : '';
+    if (winDir && winId) {
+      seedFile(winDir, path.join(REAL_STORE, winDir, `${winId}.jsonl`));
+      seeded.push(`windows ${winDir}/${winId}.jsonl`);
+    } else {
+      console.log('  - (skipped) no Windows-origin session in the real store — section 8 will fail its own precondition here');
+    }
+
+    // E. section 8b — cross-dir duplicate session ids (byte-identical + divergent).
+    const idDirs = new Map<string, string[]>();
+    for (const de of fs.readdirSync(REAL_STORE, { withFileTypes: true })) {
+      if (!de.isDirectory()) continue;
+      let files: string[];
+      try { files = fs.readdirSync(path.join(REAL_STORE, de.name)); } catch { continue; }
+      for (const f of files) {
+        if (!f.endsWith('.jsonl')) continue;
+        const id = f.slice(0, -6);
+        idDirs.set(id, [...(idDirs.get(id) ?? []), de.name]);
+      }
+    }
+    const hashOf = (p: string) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
+    let identicalId: string | null = null;
+    // Pass 1: an id whose copies in >=2 dirs are byte-identical (the scan-resolve case).
+    for (const [id, dirs] of idDirs) {
+      if (dirs.length < 2) continue;
+      const byHash = new Map<string, string[]>();
+      for (const d of dirs) {
+        const h = hashOf(path.join(REAL_STORE, d, `${id}.jsonl`));
+        byHash.set(h, [...(byHash.get(h) ?? []), d]);
+      }
+      const group = [...byHash.entries()].find(([, ds]) => ds.length >= 2);
+      if (group) {
+        for (const d of group[1].slice(0, 2)) seedFile(d, path.join(REAL_STORE, d, `${id}.jsonl`));
+        identicalId = id;
+        seeded.push(`dup-identical ${id} in [${group[1].slice(0, 2).join(', ')}]`);
+        break;
+      }
+    }
+    if (!identicalId) console.log('  - (skipped) no byte-identical cross-dir duplicate id — section 8b will fail its own precondition here');
+    // Pass 2 (best-effort): a DIFFERENT id whose copies diverge (the refuse-to-guess case).
+    for (const [id, dirs] of idDirs) {
+      if (id === identicalId || dirs.length < 2) continue;
+      const byHash = new Map<string, string>();
+      for (const d of dirs) byHash.set(hashOf(path.join(REAL_STORE, d, `${id}.jsonl`)), d);
+      if (byHash.size >= 2) {
+        for (const d of [...byHash.values()].slice(0, 2)) seedFile(d, path.join(REAL_STORE, d, `${id}.jsonl`));
+        seeded.push(`dup-divergent ${id} in [${[...byHash.values()].slice(0, 2).join(', ')}]`);
+        break;
+      }
+    }
+  }
+
+  console.log(`seeded ${seeded.length} real fixture(s) into scratch store ${SESS_STORE}:`);
+  for (const s of seeded) console.log(`  - ${s}`);
+}
+
 /* ------------------------------------------------------------------- main */
 
 let server: ChildProcess | null = null;
 
 async function main(): Promise<void> {
   console.log(`data dir: ${DATA}`);
+  console.log(`scratch transcript store: ${SESS_STORE} (real ~/.claude/projects is read-only, for seeding)`);
+  seedFixtures();
   server = spawn(process.execPath, [path.join(ROOT, 'src', 'server', 'index.ts')], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), CLAUDE_STATION_DATA: DATA },
+    env: { ...process.env, ...STORE_ENV, PORT: String(PORT), CLAUDE_STATION_DATA: DATA },
     stdio: ['ignore', 'pipe', 'pipe'],
     // Own process group: the server spawns `claude` children, and SIGTERM to the
     // parent pid alone leaves them running after the harness exits.
@@ -268,9 +480,18 @@ async function main(): Promise<void> {
   // A real machine-local project with recorded sessions (discovered, not
   // hardcoded — pin with STATION_VERIFY_PROJECT), and this project itself.
   const neighbor = findNeighborProject({ excludePath: ROOT });
+  // BUG-161 — isolation: 'direct' is LOAD-BEARING for the store isolation, not a
+  // detail. The store-redirect knob CLAUDE_CONFIG_DIR only governs a DIRECT (host)
+  // CLI spawn; a container/sandbox session ignores it and writes to the real
+  // ~/.claude/projects (a sandbox runs with the real HOME and a remapped cwd, so
+  // its transcript lands at ~/.claude/projects/-workspace-<name> — proven live).
+  // The machine default is now `container` (registry.NEW_PROJECT_DEFAULT_ISOLATION),
+  // so a project created without this field silently regressed these sessions from
+  // direct to sandbox and re-opened the exact leak this ticket closes. Direct is
+  // also what the suite historically ran (the sessions it drives are host CLI runs).
   const targets = [
-    { hostPath: neighbor, name: path.basename(neighbor) },
-    { hostPath: ROOT, name: 'Claude Station' },
+    { hostPath: neighbor, name: path.basename(neighbor), isolation: 'direct' as const },
+    { hostPath: ROOT, name: 'Claude Station', isolation: 'direct' as const },
   ];
   const created: any[] = [];
   for (const t of targets) {
@@ -308,7 +529,7 @@ async function main(): Promise<void> {
      * pin with STATION_VERIFY_TOOLUSE_DIR / STATION_VERIFY_TOOLUSE_SESSION.
      */
     const D = process.env.STATION_VERIFY_TOOLUSE_DIR ?? homeEncoded();
-    const dDir = path.join(os.homedir(), '.claude', 'projects', D);
+    const dDir = path.join(SESS_STORE, D);
     const S = process.env.STATION_VERIFY_TOOLUSE_SESSION ?? fs.readdirSync(dDir)
       .filter((f) => f.endsWith('.jsonl'))
       .map((f) => ({ f, st: fs.statSync(path.join(dDir, f)) }))
@@ -320,7 +541,7 @@ async function main(): Promise<void> {
         return tailText.includes('"type":"tool_use"') && tailText.includes('"name":"Bash"');
       })?.f.slice(0, -6);
     if (!S) throw new Error(`precondition failed: no session with Bash tool calls in its tail found under ${dDir}`);
-    const rawFile = path.join(os.homedir(), '.claude', 'projects', D, `${S}.jsonl`);
+    const rawFile = path.join(SESS_STORE, D, `${S}.jsonl`);
     if (!fs.existsSync(rawFile)) throw new Error(`precondition failed: ${rawFile} missing`);
     const t = await get(`/api/transcript/${D}/${S}?tail=30`);
     const tus = t.messages.flatMap((m: any) => m.blocks).filter((b: any) => b.type === 'tool_use');
@@ -509,7 +730,7 @@ async function main(): Promise<void> {
    * containing a session with subagent transcripts these checks fail loudly
    * rather than passing on an empty list.
    */
-  const STORE_ROOT = path.join(os.homedir(), '.claude', 'projects');
+  const STORE_ROOT = SESS_STORE;
   let subDir: string | null = null;
   let subSession: string | null = null;
   for (const de of fs.readdirSync(STORE_ROOT, { withFileTypes: true })) {
@@ -941,23 +1162,11 @@ async function main(): Promise<void> {
 
 /* ------------------------------------------- section 8: cross-OS forking */
 
-const STORE = path.join(os.homedir(), '.claude', 'projects');
-/*
- * A REAL Windows-recorded session to fork (dual-boot store dirs look like
- * `C--Users-<user>-...`). Discovered rather than hardcoded (FEAT-049); pin
- * with STATION_VERIFY_WIN_DIR / STATION_VERIFY_WIN_ID.
- */
-const WIN_DIR = process.env.STATION_VERIFY_WIN_DIR
-  ?? fs.readdirSync(STORE).sort().find((d) => {
-    if (!/^[A-Za-z]--Users-/.test(d)) return false;
-    try { return fs.readdirSync(path.join(STORE, d)).some((f) => f.endsWith('.jsonl')); } catch { return false; }
-  }) ?? '';
-const WIN_ID = process.env.STATION_VERIFY_WIN_ID
-  ?? (WIN_DIR ? fs.readdirSync(path.join(STORE, WIN_DIR))
-    .filter((f) => f.endsWith('.jsonl'))
-    .map((f) => ({ f, size: fs.statSync(path.join(STORE, WIN_DIR, f)).size }))
-    .filter((x) => x.size > 10_000)
-    .sort((a, b) => a.size - b.size)[0]?.f.slice(0, -6) ?? '' : '');
+// BUG-161 — the fork sections read the SAME scratch store the CLI writes to
+// (seeded from the real store by seedFixtures). Resolution is LAZY, inside
+// forkChecks(): the scratch store is empty at module-load and only populated
+// once seedFixtures() has run.
+const STORE = SESS_STORE;
 const forkCleanup: string[] = [];
 
 function sha256(f: string): string {
@@ -965,6 +1174,22 @@ function sha256(f: string): string {
 }
 
 async function forkChecks(): Promise<void> {
+  /*
+   * A REAL Windows-recorded session to fork (dual-boot store dirs look like
+   * `C--Users-<user>-...`). Discovered rather than hardcoded (FEAT-049); pin
+   * with STATION_VERIFY_WIN_DIR / STATION_VERIFY_WIN_ID.
+   */
+  const WIN_DIR = process.env.STATION_VERIFY_WIN_DIR
+    ?? fs.readdirSync(STORE).sort().find((d) => {
+      if (!/^[A-Za-z]--Users-/.test(d)) return false;
+      try { return fs.readdirSync(path.join(STORE, d)).some((f) => f.endsWith('.jsonl')); } catch { return false; }
+    }) ?? '';
+  const WIN_ID = process.env.STATION_VERIFY_WIN_ID
+    ?? (WIN_DIR ? fs.readdirSync(path.join(STORE, WIN_DIR))
+      .filter((f) => f.endsWith('.jsonl'))
+      .map((f) => ({ f, size: fs.statSync(path.join(STORE, WIN_DIR, f)).size }))
+      .filter((x) => x.size > 10_000)
+      .sort((a, b) => a.size - b.size)[0]?.f.slice(0, -6) ?? '' : '');
   const src = path.join(STORE, WIN_DIR, `${WIN_ID}.jsonl`);
   if (!fs.existsSync(src)) throw new Error(`precondition failed: no Windows-origin session at ${src}`);
   const before = fs.statSync(src);
@@ -982,7 +1207,7 @@ async function forkChecks(): Promise<void> {
   fs.mkdirSync(target, { recursive: true });
   const targetEnc = target.replace(/[^a-zA-Z0-9]/g, '-');
   forkCleanup.push(path.join(STORE, targetEnc));
-  const proj = (await post('/api/projects', { hostPath: target, name: 'Fork Target' })).project;
+  const proj = (await post('/api/projects', { hostPath: target, name: 'Fork Target', isolation: 'direct' })).project;
 
   /*
    * The subject matter here is incidental — the check only needs a fact that
@@ -1199,13 +1424,13 @@ main()
       console.log(`(scratch data dir removed: ${DATA})`);
     }
     /*
-     * NOT hermetic, and deliberately so: sections 3-7 run the real agent in this
-     * repo, so the CLI writes transcripts into the user's live
-     * ~/.claude/projects/<encoded repo path>. Those are genuine
-     * sessions of this project and are LEFT ALONE — deleting the user's history
-     * to tidy a test run would be worse than the mess. Section 8's fork target
-     * IS synthetic and is removed above.
+     * BUG-161 — now HERMETIC for the transcript store too. The CLI child wrote
+     * its transcripts under CONFIG_DIR (= DATA/claude-config, via CLAUDE_CONFIG_DIR),
+     * which lives inside DATA and is therefore removed with it above. The user's
+     * real ~/.claude/projects was only ever READ (seedFixtures copied fixtures
+     * out of it) and is left untouched. Before this fix, sections 3-10 wrote
+     * their probe sessions straight into the real store.
      */
-    console.log(`(note: live-model sections wrote real transcripts into ~/.claude/projects/${ROOT.replace(/[^a-zA-Z0-9]/g, '-')} — kept, they are real sessions of this project)`);
+    console.log(`(note: live-model sections wrote transcripts into the SCRATCH store ${SESS_STORE}, removed with the data dir — the real ~/.claude/projects was read-only)`);
     process.exit(fail ? 1 : 0);
   });

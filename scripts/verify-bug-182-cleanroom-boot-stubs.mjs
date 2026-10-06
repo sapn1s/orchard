@@ -42,7 +42,7 @@ import * as net from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CONTAMINATION, seedBootStubs, declaredBootDocs } from './independent-verify.mjs';
+import { stripCleanroom, declaredProseRoots, seedBootStubs, declaredBootDocs } from './independent-verify.mjs';
 import { seedSourceRelPaths } from '../src/server/seed-sources.mjs';
 import { assertIsolatedEnv } from './lib/station-boot.mjs';
 // Rooms are a reflinked ~374 MB node_modules copy — expensive scratch, and the
@@ -109,7 +109,7 @@ async function freePort() {
  * would be the wrong subject), minus `.git`, plus a reflinked `node_modules`,
  * with the contamination surface stripped exactly as `buildCleanroom` strips it.
  */
-function makeRoom(label) {
+async function makeRoom(label) {
   const dir = tmp(`bug182-room-${label}-`);
   const r = spawnSync('sh', ['-c',
     `tar -cf - --exclude=./.git --exclude=./node_modules -C ${JSON.stringify(ROOT)} . | tar -x -C ${JSON.stringify(dir)}`],
@@ -117,11 +117,11 @@ function makeRoom(label) {
   if ((r.status ?? 1) !== 0) throw new Error(`could not copy the tree into a room: ${r.stderr}`);
   const cp = spawnSync('cp', ['-a', '--reflink=auto', path.join(ROOT, 'node_modules'), path.join(dir, 'node_modules')], { encoding: 'utf8' });
   if ((cp.status ?? 1) !== 0) throw new Error(`could not provision node_modules: ${cp.stderr}`);
-  const stripped = [];
-  for (const rel of CONTAMINATION) {
-    const p = path.join(dir, rel);
-    if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); stripped.push(rel); }
-  }
+  // BUG-120: strip exactly as buildCleanroom does — the room's own declared
+  // prose roots plus the universal ambient surface — through the shipped strip
+  // function, not a re-implementation of it.
+  const proseRoots = await declaredProseRoots(dir);
+  const stripped = stripCleanroom(dir, { proseRoots, allowed: [] });
   return { dir, stripped };
 }
 
@@ -203,10 +203,10 @@ async function main() {
   }
 
   console.log('\n(1) MUST-FAIL — the synthesized pre-fix stub list cannot boot the room');
-  const room1 = makeRoom('a');
+  const room1 = await makeRoom('a');
   {
-    check('(setup) the room really is stripped — docs/prompts is gone',
-      !fs.existsSync(path.join(room1.dir, 'docs', 'prompts')) && room1.stripped.includes('docs/prompts'),
+    check('(setup) the room really is stripped — docs/prompts is gone (the whole docs prose root is removed)',
+      !fs.existsSync(path.join(room1.dir, 'docs', 'prompts')) && (room1.stripped.includes('docs') || room1.stripped.includes('docs/prompts')),
       `stripped: ${room1.stripped.join(', ')}`);
     writeStubs(room1.dir, STALE_BOOT_STUBS_2026_09_18);
     const boot = await bootServer(room1.dir);
@@ -242,7 +242,7 @@ async function main() {
   console.log('\n(3) THE CLASS — a NEW seedTemplates doc is picked up with NO edit to independent-verify.mjs');
   const ivHashBefore = sha(IV);
   {
-    const room2 = makeRoom('b');
+    const room2 = await makeRoom('b');
     const NEW_DOC = 'docs/prompts/WORKING_AGREEMENT.v5.md';
     // Grow the OWNER, as a future change would: declare the path, add the seed.
     const declFile = path.join(room2.dir, 'src', 'server', 'seed-sources.mjs');
@@ -277,7 +277,7 @@ async function main() {
   console.log('\n(4) LOUD — a stub gap names the path, never a health timeout');
   {
     // (a) the declaration is gone while the seeder is still there.
-    const room3 = makeRoom('c');
+    const room3 = await makeRoom('c');
     fs.rmSync(path.join(room3.dir, 'src', 'server', 'seed-sources.mjs'), { force: true });
     const r = seedInChild(room3.dir);
     check('a missing declaration (with templates.ts present) REFUSES, naming the declaration file',
@@ -286,7 +286,7 @@ async function main() {
     fs.rmSync(room3.dir, { recursive: true, force: true });
 
     // (b) a declared path that cannot be written — the gap is named, not timed out.
-    const room4 = makeRoom('d');
+    const room4 = await makeRoom('d');
     const blocked = path.join(room4.dir, 'docs', 'prompts');
     fs.mkdirSync(path.dirname(blocked), { recursive: true });
     fs.writeFileSync(blocked, 'not a directory\n'); // every declared doc lives under here

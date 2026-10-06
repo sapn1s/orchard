@@ -101,3 +101,44 @@ guarantee preserved exactly, and without any write to the real repo state.
 - **Symptom of a deeper design flaw?** (deferred to close) — leaning no: the
   commit-only assumption was a default, and this adds the missing mode without
   weakening the clean-room invariant.
+
+### 2026-09-29 — clean-room verification (BROKEN)
+- **Requirement (plain terms):** a `--working-tree` mode that snapshots the
+  current tree (tracked edits + untracked-not-ignored, excluding gitignored),
+  verifies THAT with the clean-room strip + guard preserved, leaves the real repo
+  byte-identical (no new commit/ref, HEAD/index/worktree unchanged), rejects
+  `--range`+`--working-tree` together, and records the durable **TREE sha**
+  described as gc-safe. Requirement written to a temp file, not the fixer's prose.
+- **Strategy: CARRIER-TREE.** The fix commit `dc1f4ea` predates
+  `src/server/seed-sources.mjs` (added in `ca672b9`), so a committed-range clean
+  room refuses to boot ("cannot determine its boot stubs"). Built the room from a
+  later bootable carrier revision `b11e71f` that already carries seed-sources AND
+  the shipped FEAT-134 code, and told the verifier the bundled diff is NOT the
+  change under test — attack the actual source files directly.
+- **Command (tilde form):**
+  `node scripts/independent-verify.mjs --repo ~/projects/orchard --range 3481e76..b11e71f --requirement @<req-file> --timeout-min 22 --verdict-out <verdict-file>`
+- **Verdict: BROKEN — VALID** (executed-evidence contract satisfied: fixer check
+  re-run, two adversarial cases with manifests, an explicit could-not-test list).
+- **FINDING (real defect in the ticket's central design claim):** the "durable
+  id is the TREE sha, gc-safe, the record cannot rot to a pruned commit" rationale
+  is FALSE. The snapshot commit is dangling (no ref), so `git gc --prune=now`
+  prunes the commit AND the tree it references; afterward the displayed/recorded
+  TREE sha fails `git cat-file` lookup (exit 128). A dangling tree is exactly as
+  gc-collectable as a dangling commit — reachability from a ref is what keeps
+  either alive, and neither has one. The verifier's `--gc` probe (a WHY-UNCOVERED
+  case the fixer never ran) reproduced this; the fixer's own checks and the
+  isolation properties (untracked included / ignored excluded / strip fires /
+  index-HEAD-refs-reflog-worktree unchanged / conflicting options rejected / id
+  is the tree not the commit) all PASSED.
+- **Could-not-test (verifier):** the clean room is an exported tree with no
+  `.git`, so the feature was exercised in disposable repos with controlled
+  fixtures rather than the live dirty tree; live provider dispatch + persisted
+  verdict-output path were not exercised (CLI checks used `--print-prompt`).
+- **Verified-by:** dispatch openai run 01a0ec09-60c9-71e0-9d37-0fc2927bee6b
+  (clean-room, carrier-tree, `scripts/independent-verify.mjs`) — VERDICT: BROKEN
+- **Status:** stays OPEN. Handoff: decide whether gc-safety is actually required
+  here (both snapshot consumers use the tree immediately within the same run, and
+  default `git gc` keeps unreachable objects for a 2-week grace — only
+  `--prune=now` bites), and if so anchor the snapshot to a real ref (or document
+  the tree sha as advisory-within-run, not gc-durable, correcting the ticket's
+  rationale).

@@ -258,3 +258,105 @@
   delivered exactly once, never into a running turn) that round-1's verify lane
   captured 9/0 post-fix / 4/2 must-FAIL pre-fix but that this sandbox cannot
   reproduce. No code was changed this pass.
+
+### 2026-09-29 — fix lane (round 2, class=fix) — ROOT-CAUSED + reproduced; BLOCKED-ON-FILES (no code changed)
+- **Reproduced the container-default route loss at the API layer (no docker
+  needed — the loss is upstream of any turn producing content).** Harness
+  `/tmp/bug160-repro.mjs`: fully-isolated scratch server (free port, scratch
+  `CLAUDE_STATION_DATA` + `CLAUDE_PROJECTS_DIR`), a real `POST /api/projects`
+  with `isolation:container`, then I simulated exactly what the in-container CLI
+  writes — a transcript under `-workspace-<id>` (cwd `/workspace/<id>`) — and
+  asked `GET /api/projects/:id/sessions`. **6/6:** the session IS listed;
+  project-level `encodedDir` = the HOST path (`-tmp-…`); per-session `encodedDir`
+  = the CONTAINER store dir (`-workspace-<id>`); the two DIFFER; replaying
+  `applyRoute`'s match (`route.dir === x.encodedDir`) with the dir the reload
+  URL carries finds NOTHING → session lost, `reattachDriving` never fires. A
+  CONTROL direct project shows no mismatch (project `encodedDir` == session
+  `encodedDir`) — the bug is container-only. This confirms the round-1
+  independent verdict (run 8a4566dd, BROKEN VALID) against my own command.
+- **Root cause (two producers of one fact — the ARCH-010 violation).** The
+  session's store-dir identity is produced in two path spaces:
+  1. **Fresh-start client fallback** — `public/app.js:11173`
+     `if (!state.current.encodedDir) state.current.encodedDir =
+     state.sessions.get(projectId)?.encodedDir` copies the PROJECT-level
+     `encodedDir`, which the server sets to `hist.encodeCwd(p.hostPath)` — the
+     HOST path (`src/server/index.ts:1532`). `currentRoute()` (`app.js:16765`)
+     then writes the URL `dir` from `state.current.encodedDir`, so a
+     freshly-started session's URL carries the HOST dir.
+  2. **Sessions API per-row** — each session's `encodedDir` is its REAL store dir
+     (`src/server/index.ts:1549`, `s.encodedDir`), which for a container session
+     is `containerStoreDirName(p)` = `-workspace-<id>` (merged in at
+     `index.ts:326/332`).
+  On reload `applyRoute` (`app.js:16818-16820`) matches `route.dir` (host)
+  against each row's `encodedDir` (container) → no match → the session-not-found
+  branch rewrites the hash to the bare project route; `openSession`'s
+  `drivenByDashboard` branch never runs, so the round-1 `reattachDriving` fix is
+  dead on arrival. (A session OPENED from the sidebar is unaffected: `openSession`
+  sets `state.current.encodedDir = sess.encodedDir` = the container dir. Only the
+  fresh-start-then-reload path — the user's constant action — is stranded.)
+- **Invariant / fix shape (ARCH-010 — the owner already declares it ONCE).**
+  `AgentBridge` already has the single declared source: `get storeEncodedDir()`
+  (`src/server/agent-bridge.ts:625-628`) = `this.#containerStoreDir ??
+  encodeCwd(this.cwd)` — the host store dir the transcript actually lands in
+  (`containerStoreDirName` for container, encoded cwd for direct), with a comment
+  saying "Read this; do not re-encode `cwd`." It is simply NOT sent in the
+  `session-init` frame, so the client is forced to reconstruct it from the wrong
+  (host-project) path space. The fix is to SEND the declared value and READ it —
+  no new derivation, no second source.
+- **Exact hunks (3 files, all carrying OTHER lanes' uncommitted edits → NOT
+  edited by this lane):**
+  - **`src/server/agent-bridge.ts`** — in the `session-init` emit (~line 4927),
+    add one field: `encodedDir: this.storeEncodedDir,` (the already-declared
+    owner accessor). Container store dir is set at launch (line 1463) well before
+    this frame, so it is populated.
+  - **`src/server/events.ts:174`** — add `encodedDir: string;` to the
+    `session-init` frame union member.
+  - **`public/app.js:11173`** — read the declared value first:
+    `if (!state.current.encodedDir) state.current.encodedDir = e.encodedDir ??
+    state.sessions.get(state.current.projectId)?.encodedDir ?? null;`
+  Why it is exactly right and regression-free: for a container session
+  `storeEncodedDir === containerStoreDirName(p)` === the value the sessions list
+  reports per row (index.ts:326), so the URL dir now MATCHES on reload; for a
+  direct session `storeEncodedDir === encodeCwd(hostPath)` === the host encoding
+  === today's value, so nothing changes. `index.ts` needs NO change — the
+  sessions API is already correct; the defect is purely the client's first-turn
+  reconstruction.
+- **Blocked-on-files:** `src/server/agent-bridge.ts`, `src/server/events.ts` and
+  `public/app.js` all have concurrent uncommitted edits from other lanes
+  (`git status`); this lane made NO code change per the collision rule. The three
+  hunks above are disjoint from the reattach/queue code round 1 touched and from
+  the store-isolation / session-reorder lanes' hunks noted in the round-1 verify
+  entry.
+- **regressed-from:** FEAT-131 (container became the DEFAULT isolation, exposing
+  the client's host-path reconstruction that direct sessions never tripped).
+- **High-stakes (session-lifecycle + contested reattach/route code): once the 3
+  hunks land, an independent clean-room pass is WARRANTED** — confirm REQ1/REQ2
+  under container isolation (reload restores the session and `reattachDriving`
+  fires) and the still-untested REQ3 (a genuine second tab → live-elsewhere)
+  under container isolation, per the round-1 verify handoff.
+
+### 2026-09-29 — independent clean-room verify (round 1, class=verify) — VERDICT: BROKEN (VALID)
+- **Requirement handed to the verifier (plain terms, no fixer prose):** after a sole tab reloads its own still-running bridge-backed session, (1) it reads as DRIVING (isDriving true, no "not driving" chip) via an automatic promptless reattach, not a passive follow; (2) a message queued before the reload is restored AND delivered exactly once at the next turn boundary, never into a running turn, never dropped; (3) a genuine second tab is still refused live-elsewhere and follows read-only; (4) a promptless reattach with no surviving bridge is refused `nothing-to-reattach`, never spawned as an empty resume turn.
+- **Strategy: CARRIER-TREE.** The BUG-160 fix commit `8016442` predates `src/server/seed-sources.mjs` (added `ca672b9`), so a clean room at that revision REFUSES to boot. Used bootable `b11e71f` as `--range` head — it carries `seed-sources.mjs` and the full shipped BUG-160 code (`reattachDriving` ×4 in `public/app.js`, `nothing-to-reattach` in `index.ts`/`events.ts`, all verified present at `b11e71f`) — and told the verifier the shown diff is a boot carrier, NOT the change under test: attack `public/app.js`/`index.ts`/`events.ts` and the reload/reattach/queue behaviour directly and re-run `scripts/verify-reload-live.mjs`.
+- **Command (tilde form):** `CLAUDE_CONFIG_DIR=<grey-account> node scripts/independent-verify.mjs --repo ~/projects/orchard --range b11e71f --requirement @<req> --run "node scripts/verify-reload-live.mjs" --test-file scripts/verify-reload-live.mjs --author-provider anthropic --provider anthropic --timeout-min 20 --verdict-out <verdict>`
+- **Verdict: BROKEN, VALID** (`--check-only` re-confirms VALID; harness-composed, exit 1). This pass ISOLATES the real cause the two prior lanes could only call "environmental / no model output":
+  - **FINDING (root cause — container-default route loss, upstream of the reattach fix):** under the now-DEFAULT container isolation, reloading a still-running session LOSES it before `reattachDriving` can fire. The URL's `dir=` carries the HOST-encoded path (`-tmp-cs-adv-proj-…`) but `/api/projects/:id/sessions` reports `encodedDir` as the CONTAINER path (`-workspace-<project>`). `applyRoute` (`public/app.js:15163-15183`) matches on `encodedDir`, finds nothing, and rewrites the hash to the bare project route; `openSession`'s `drivenByDashboard` branch (`public/app.js:5518-5562`) never runs, so `reattachDriving` never fires. Result after reload: `sid:null, driving:false, following:false`, and the still-live `detached-running` bridge is orphaned (cited runs `3200d6f4324a`, `46fe7382678d`). This is NOT a "no model output" artifact — the REQ1 route/DOM failure is independent of any turn producing content.
+  - **FINDING (REQ1 unmet):** the fixer's own `verify-reload-live.mjs` (run `ce05c7add90d`, exit 1, 1/2) reproduces it directly — after reload `sid:null, busy:false, driving:false, goMode:"send"` and the running turn's answer never reached the reloaded tab.
+  - **FINDING (REQ2 unmet — silent drop):** a message queued mid-turn through the real composer before reload is neither restored (queue `[]` after reload) nor delivered — no reply arrived, transcript holds zero user messages with the marker (runs `7b890189af48`, `033394dbda5c`, run twice to rule out a flake). REQ2's "NOT injected into the running turn" half PASSED (nothing was delivered at all, because the session was lost).
+  - **REQ4 HOLDS:** promptless resume with no surviving bridge (absent / empty / whitespace prompt) all returned `nothing-to-reattach` with no ack, no session-init, no bridge spawned (run `eaca55d96e7a`, 3/0). That half of the fix is confirmed sound.
+- **Could-not-test (verifier's list, carried forward):** REQ3 (a genuine second tab → live-elsewhere) — unreachable because the container-default URL restore fails before any reattach; REQ1/REQ2 under HOST (non-container) isolation, where `dir=` and `encodedDir` might match (the verifier did not flip project isolation); the relayed/CLI-written read-only case; the exactly-once race when the turn ends between the liveRec fetch and the reattach ack.
+- **Status: STAYS OPEN.** BROKEN via a genuine clean room → not VERIFIED. Note the round-1 direct-isolation verify (9/0 post-fix) was not wrong for its runtime — the DEFAULT changed to container (FEAT-131) after it, and the reattach fix is dead-on-arrival there because the route restore fails first. Handoff for round 2: fix the URL `dir=` vs listed `encodedDir` mismatch so `applyRoute` restores a container session on reload (that is upstream of, and a precondition for, `reattachDriving`); then re-verify REQ1/REQ2 AND the still-untested REQ3 under container isolation. **regressed-from:** FEAT-131 (container became the default and broke the direct-session-assuming reload/route path). High-stakes (session-lifecycle + contested reattach/queue/route code) — round 2 again warrants an independent pass.
+- **Verified-by:** dispatch anthropic run 8a4566dd-246a-4c81-bde7-f05f1a6acda9 (clean-room, `scripts/independent-verify.mjs`; grey account, SAME-provider fallback — decorrelation reduced; carrier-tree head `b11e71f`) — VERDICT: BROKEN
+
+### 2026-09-30 — BUG-217 fix lane (cross-reference, no BUG-160 status change)
+- A live strand on 2026-09-30 (session ce054915, direct isolation) read exactly like
+  this ticket's symptom, but its root is distinct: the bridge had already CLOSED
+  (journal 02:33:01), so there was nothing for `reattachDriving` to take over, and this
+  ticket's criterion 5 (refuse a promptless resume) left that state with no owner.
+  Filed and fixed as BUG-217 (client: `flushQueue` → `driveQueue` resumes the session
+  with the queued row). It touches this ticket's code paths: the reattach ack still
+  owns delivery at its boundary; `handleLiveElsewhere` now keeps a carried queue row
+  pending instead of minting a dead copy; the dock wording changed.
+- Not addressed there, and still open here: the container-default `dir=` mismatch that
+  loses the session on reload (round-2 finding) — it also blocks the real-model queue
+  suites (`verify-bug-129`, `verify-bug-153`, `verify-reload-live`) at the reload.

@@ -306,3 +306,12 @@ conversations.
 - **Still open / handoff:** independent clean-room re-verify still warranted
   (regression-prone `app.js`; list-visibility class). Untested live: a
   concurrently-RUNNING folded lane absent on :4317 (none was live at verify time).
+
+### 2026-09-29 — pointer from FEAT-154 round 8 (not a BUG-193 defect)
+- A user report that session `6927511d` was missing from the nav list after a restart was checked
+  against this ticket's fold. **The fold was not the cause.** The row reads `foldByDefault:false`,
+  and its provenance is `{startedBy:'user', source:'agent-bridge'}` (it is the user's own dashboard
+  session). A real `visibleSessions` reconstruction shows it at seat 5–6 of the 6-seat BUG-085
+  budget, so it is visible at the bottom. A hidden state could not be reproduced. The "blue after
+  opening" half was a real defect, fixed there (FEAT-144 mirror counted as a live writer). Details
+  are in FEAT-154's round-8 entry. BUG-193's folds hold: `verify-bug-193-list-fold` 31/31.

@@ -46,8 +46,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import * as hist from '../lib/session-history.ts';
-import { containerWorkdir, encodeCwdForStore } from './container-manager.ts';
+import { containerStoreDirName, encodeCwdForStore } from './container-manager.ts';
 import { resolveOrchardSessionFile } from './orchard-transcripts.ts';
+import { asOrchardWrite } from './own-writes.ts';
 import { pastPathsOf, type Project } from './registry.ts';
 
 export class ForkError extends Error {
@@ -75,8 +76,9 @@ export interface ForkPlan {
 
 /** The store dir the CLI will actually look in for this project's sessions. */
 export function targetEncodedDirFor(project: Project): string {
-  const cwd = project.isolation === 'container' ? containerWorkdir(project.id) : project.hostPath;
-  return encodeCwdForStore(cwd);
+  // FEAT-155 — a container project's store is DECLARED by container-manager and
+  // does not follow the in-container cwd (which may be a shared bare /workspace).
+  return project.isolation === 'container' ? containerStoreDirName(project) : encodeCwdForStore(project.hostPath);
 }
 
 function storeRoot(): string {
@@ -182,7 +184,8 @@ export function planFork(
   const stagedId = crypto.randomUUID();
   const stagedFile = path.join(targetDir, `${stagedId}.jsonl`);
   // COPYFILE_EXCL: never clobber an existing transcript, even on a uuid collision.
-  fs.copyFileSync(sourceFile, stagedFile, fs.constants.COPYFILE_EXCL);
+  // FEAT-154 r9: a staged copy is ORCHARD's write, not a turn — declared (own-writes.ts).
+  asOrchardWrite(stagedFile, () => fs.copyFileSync(sourceFile, stagedFile, fs.constants.COPYFILE_EXCL));
   const staged = fs.statSync(stagedFile).size;
   if (staged !== bytes) {
     try {
@@ -208,7 +211,15 @@ export function planFork(
  */
 export interface UnresumableReason {
   message: string;
-  fork?: { resumeEncodedDir: string; cause: 'isolation-changed' | 'cross-os' | 'path-changed' };
+  /**
+   * `toContainer` (isolation-changed only) names the DIRECTION of the mismatch so
+   * the UI copy is right both ways: true = the project is now a container and the
+   * session was recorded before it (direct→container, the classic case); false =
+   * the session ran in a container but the project now runs direct on the host
+   * (container→direct). Without it the bar hard-codes "into the container" and
+   * tells a container→direct user the opposite of the truth (BUG-090 follow-up).
+   */
+  fork?: { resumeEncodedDir: string; cause: 'isolation-changed' | 'cross-os' | 'path-changed'; toContainer?: boolean };
 }
 
 /**
@@ -258,7 +269,7 @@ export function explainUnresumable(project: Project, resumeSessionId: string): U
    * container encoding on either side; anything else (a Windows-origin dir on a
    * dual-boot machine, say) is cross-OS.
    */
-  const containerDir = encodeCwdForStore(containerWorkdir(project.id));
+  const containerDir = containerStoreDirName(project);
   /*
    * BUG-138 — a THIRD cause, and the one that used to be mislabelled: the
    * project was repointed after its directory was renamed, so its older
@@ -282,7 +293,9 @@ export function explainUnresumable(project: Project, resumeSessionId: string): U
         ? ` — it ran before this project's directory was renamed to ${project.hostPath}. The transcript is intact and still listed here; the CLI just cannot continue a conversation in a directory that no longer exists under that name. `
         : '. ') +
       `Fork it instead (start with fork:true and resumeEncodedDir), which branches it into this project without touching the original.`,
-    fork: { resumeEncodedDir: src, cause },
+    // toContainer only carries meaning for isolation-changed; the direction is the
+    // project's CURRENT isolation (the target it will fork INTO).
+    fork: { resumeEncodedDir: src, cause, ...(cause === 'isolation-changed' ? { toContainer: project.isolation === 'container' } : {}) },
   };
 }
 

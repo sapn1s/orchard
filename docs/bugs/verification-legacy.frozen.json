@@ -1,0 +1,3232 @@
+{
+  "schema": "orchard-verification-legacy-freeze/1",
+  "frozen_on": "2026-09-30",
+  "note": "Frozen output of the legacy `Verified-by:` prose reader (BUG-225). Read-only: pinned by sha256 in scripts/lib/verification-source.mjs. New verifications are typed entries written by `board-tool verified`.",
+  "tickets": {
+    "ARCH-003": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01515-943f-7253-93a2-72f8fa95076c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6ae5ffba2d4a1d1932e60f3cee9c7b30c6b2374b342ed8f382f9d8c08beed4c0"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01527-1b92-7923-aebf-0b1ea6b43b2e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "9f79e461a58ae9af249254d6734fe29d250cf6f7446b111b1a673cd5a33bad55"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0153b-00bf-7b21-999a-410883e595ea",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "7e99cc7b43517de55847860c7d597d4f4e5835c16afa1f40378d8cccdf02807b"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0154b-31fd-7e22-be9b-9257c0dc8509",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "b3ffc3d5f861277e6577d27a772841199baa178df0498b4e2b5a984ca6bf6d9a"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01563-cd26-79a1-b9e4-d589ccafb49a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e2e983e096c342cbf708ddeafe0531756c6197fb8136414ea5ef85dbfbf298b5"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01599-b39a-7e33-b0a9-574d588b8635",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f9263476cf5e775254e462edd5d0725fde78b6ae8b24b7b85d1bb7a3c85e885d"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0165e-1d9e-73d2-93e0-fc860342f105",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "c157bd77f26289b308c56641bb7973b7872522bd508d2d12a5c7202b0cee4873"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016a0-54e8-7b20-8f88-6b56a3a9d341",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "3c6db74f7dfc5d4b5a390fcd9f8afccc3707f65e293d6527ed8c514a9f3d6e8c"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "dce68243-f0cd-4f7d-878b-a29da031be01",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6dd87c4cacff53f1c5a0442fdc8495790bf1b62e62523227fbbe665e4fe553a0"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "755fa631-75fc-49f1-b575-c5e965fce367",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "53a7b8710a8a69aa4b91a1a441d071e798b819dd48689fd0d1abf5e217784df0"
+        }
+      ],
+      "prose_lines": [
+        "6ae5ffba2d4a1d1932e60f3cee9c7b30c6b2374b342ed8f382f9d8c08beed4c0",
+        "9f79e461a58ae9af249254d6734fe29d250cf6f7446b111b1a673cd5a33bad55",
+        "21d301b912ff62a2337ab86869763be39d729fc1c36440ff9aa7894d5dd52580",
+        "7e99cc7b43517de55847860c7d597d4f4e5835c16afa1f40378d8cccdf02807b",
+        "b3ffc3d5f861277e6577d27a772841199baa178df0498b4e2b5a984ca6bf6d9a",
+        "e2e983e096c342cbf708ddeafe0531756c6197fb8136414ea5ef85dbfbf298b5",
+        "f9263476cf5e775254e462edd5d0725fde78b6ae8b24b7b85d1bb7a3c85e885d",
+        "c157bd77f26289b308c56641bb7973b7872522bd508d2d12a5c7202b0cee4873",
+        "3c6db74f7dfc5d4b5a390fcd9f8afccc3707f65e293d6527ed8c514a9f3d6e8c",
+        "6dd87c4cacff53f1c5a0442fdc8495790bf1b62e62523227fbbe665e4fe553a0",
+        "53a7b8710a8a69aa4b91a1a441d071e798b819dd48689fd0d1abf5e217784df0"
+      ]
+    },
+    "ARCH-004": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019a4-bda2-7101-935b-80e381544e05",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f6610babefe08c532a26466eee7b536b6bb12ec4118c6b51fd6eebb7d709ed76"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019c1-70fd-7100-a0b1-a5c8874c6c2f",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "517daa997f6ac5f1060d60de9c5a6c7804e242e2641e1ef12bc41de44328d996"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019d8-d91f-7c13-bbaf-29c4497d9455",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "2e0182ce326ca3c1a7740e350e24588d00b854177e2a2f59d9f125a5e1f0d3e2"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019f8-d059-74c3-9f60-a31a1cfcf9e6",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "005eb69ce162bc0cfb1d7b34beb7c9a66f26122b78a20665447e0dd94981fc63"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01a13-3561-7b80-80a7-e9f5504aca7c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "dbd005bf581e9660c660a0dfbdf09f48e9b158fb11757ebd2369456751633760"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01a30-e639-7300-9c29-78aa480976ac",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "5ca169a639d3ecd6f2071ab23f38c55940d3f6c0f46ede47b77134343f1a4424"
+        }
+      ],
+      "prose_lines": [
+        "f6610babefe08c532a26466eee7b536b6bb12ec4118c6b51fd6eebb7d709ed76",
+        "517daa997f6ac5f1060d60de9c5a6c7804e242e2641e1ef12bc41de44328d996",
+        "d11af9b5222b6e26eb879dcb9b2baf66101ac05475b8b3a08dda0d4cd27811d2",
+        "2e0182ce326ca3c1a7740e350e24588d00b854177e2a2f59d9f125a5e1f0d3e2",
+        "005eb69ce162bc0cfb1d7b34beb7c9a66f26122b78a20665447e0dd94981fc63",
+        "dbd005bf581e9660c660a0dfbdf09f48e9b158fb11757ebd2369456751633760",
+        "5ca169a639d3ecd6f2071ab23f38c55940d3f6c0f46ede47b77134343f1a4424",
+        "b5e48cf5dc23f5b7cda8bcedbb4cdd21a53e928b77db78c4e6aeaa2410011ad6",
+        "9ddb63ffc1f58494dbde7eb09d6b056106b9c74f7ea793e80d04d5a7a73a1c52"
+      ]
+    },
+    "ARCH-006": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "ea4f1e87-01f8-4544-a104-79f5b9c1956b",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "742b62a2d5019b08f3150e30daaf3c25130f56813c6796201f3996e3826bb54d"
+        }
+      ],
+      "prose_lines": [
+        "742b62a2d5019b08f3150e30daaf3c25130f56813c6796201f3996e3826bb54d"
+      ]
+    },
+    "ARCH-007": {
+      "records": [],
+      "prose_lines": [
+        "3357049fe2a2a963ed235b3efb4dc250aa614e105b1207a42dfa544fa919e5e7",
+        "daae1ae385356b8f2e52c2a45c6c65a300cf733ef90aca08660555db9bc1487c",
+        "b97e9b61ac50435374c003c79ac65dfeffd087b9da193f1b9bbb69253fdb83a0"
+      ]
+    },
+    "ARCH-009": {
+      "records": [],
+      "prose_lines": [
+        "601e919f7ffe488e681e72e875c146530788f1bb1f3ac89a43af3c6de803b099",
+        "8a3fac3627358c8fcfe8cdee5f680272dff925767cdd5129fc9aebf83b608d9e"
+      ]
+    },
+    "ARCH-013": {
+      "records": [],
+      "prose_lines": [
+        "6d5ed9ced6c27015a26154cde1fa566ce7ce94a5ac83072b8a313486d2fb2335",
+        "755574a083df9dce8b847472011e24272d935432195bc2d775f24f0bb9a29fbb"
+      ]
+    },
+    "ARCH-016": {
+      "records": [],
+      "prose_lines": [
+        "b12b7b2550a0b6b7ffec73a957527ac709961c53a8151e76dd2c3b2e0bdc3641"
+      ]
+    },
+    "ARCH-017": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0cb34-09ee-7521-b940-aa0cf4fb90a2",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "556815ca55627e689aedb3ef35a2fd81ed2de1755ea3d221ed6c30c198f2a81d"
+        }
+      ],
+      "prose_lines": [
+        "1f5def00457bad2186f2fe46ca5d8a4c063609c829025cfc72bc6bd2075350e8",
+        "b3586a114fa908be5119ccf6e5644f2fa798366e64afcfdc0f1470a45ceaf74d",
+        "218f9d31bc302755d2f95c06afcd51fb5c3f09884c223b420c630c7ddb4fb4b4",
+        "12902f1f99fda960d8e2b8501d254f6daca1db2dc5b6380f1065a96f2b7f2f2e",
+        "556815ca55627e689aedb3ef35a2fd81ed2de1755ea3d221ed6c30c198f2a81d"
+      ]
+    },
+    "ARCH-020": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "ae9775f9-b558-467b-841d-35fee15531ff",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": "40242f82-…",
+          "line_sha256": "1e539ada26d089bf4d6976419590bcb1fc97b66d661cadc5445d8b4f47bf90af"
+        }
+      ],
+      "prose_lines": [
+        "37092aae9526ec4896372b66b6dcc5eedcdf716cde48f95e65814ebdc2c0c4a7",
+        "1e539ada26d089bf4d6976419590bcb1fc97b66d661cadc5445d8b4f47bf90af"
+      ]
+    },
+    "BUG-071": {
+      "records": [],
+      "prose_lines": [
+        "913398d2ac31d7cd05e07e4c31b115b29e870b2b3ef473dc199d545dd267d71a"
+      ]
+    },
+    "BUG-072": {
+      "records": [],
+      "prose_lines": [
+        "6aa3e4ef74e6b175386b480587d09862b7b2f8fa4d815d994cd4f2124bee60c7"
+      ]
+    },
+    "BUG-091": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "466d25a9-7400-4906-9e14-0aadbdc31235",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-14",
+          "harness": null,
+          "line_sha256": "d93dbffd46b2ad4dd7c60aa6eafb1b6ed821d447169f039ef12a831f89cbee0c"
+        }
+      ],
+      "prose_lines": [
+        "d93dbffd46b2ad4dd7c60aa6eafb1b6ed821d447169f039ef12a831f89cbee0c"
+      ]
+    },
+    "BUG-095": {
+      "records": [],
+      "prose_lines": [
+        "c5c1cb6437d47524f71d46a910a98ea2549258ccb70a2a2e040fe8bf76c537ed"
+      ]
+    },
+    "BUG-100": {
+      "records": [],
+      "prose_lines": [
+        "5556a2c237d41a4488e9da622cd4627d5177afe9e42dfe358ab89eb49b5b92b3"
+      ]
+    },
+    "BUG-104": {
+      "records": [],
+      "prose_lines": [
+        "50213078c5bd57a90c8d1271a85c43ec06d9af584aba5147b7692d7a6a643209",
+        "b5c2c680cabb08b8333125f83f45c3a350d3146744d6d01031fe35fb254429ea"
+      ]
+    },
+    "BUG-105": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a015a7-c2a0-7603-82bc-2d08f9af0f15",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "198313e51511f7e93a3d8eb3eb9866fbdf976f44e7092696b3b2d163c28fe2c9"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0163c-ad70-7fc1-972f-c787815d4085",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f70e2ae0621fb5cc4f48e2ab45653e918236d9f020243ce696de9900e2c81a36"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01679-55fd-7070-bf2a-ba34c56f6750",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d353b9776e9b2f5940d5f4a8990cbb5946c03e44d0ba19f3ea3d157e85e15eb5"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016a8-d945-7a12-bd9b-210573f60769",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a437baa3e3d5fd4110f2df581c4f20f738ce22e3cdda90c5cb360496111331ed"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016ce-844f-7a11-b2c9-00a617973683",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "72bae35a0e01d07c81206b79dfe6808a42a3900ad1dab03dae9d42b8a4f47880"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "28c7b7da-927e-4c29-9850-9b62d84d8f5a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6b6d22dc31c5c8b23053f20c13c2491ff80a1bd2a7f88299ff952d2bc3326984"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01738-b7a7-75a3-9278-8d153c0df8ca",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "b292760cf51c42781987a561371724b08fe9c5ed6c6357757a18d16a61949867"
+        }
+      ],
+      "prose_lines": [
+        "198313e51511f7e93a3d8eb3eb9866fbdf976f44e7092696b3b2d163c28fe2c9",
+        "f70e2ae0621fb5cc4f48e2ab45653e918236d9f020243ce696de9900e2c81a36",
+        "d353b9776e9b2f5940d5f4a8990cbb5946c03e44d0ba19f3ea3d157e85e15eb5",
+        "a437baa3e3d5fd4110f2df581c4f20f738ce22e3cdda90c5cb360496111331ed",
+        "72bae35a0e01d07c81206b79dfe6808a42a3900ad1dab03dae9d42b8a4f47880",
+        "6b6d22dc31c5c8b23053f20c13c2491ff80a1bd2a7f88299ff952d2bc3326984",
+        "b292760cf51c42781987a561371724b08fe9c5ed6c6357757a18d16a61949867"
+      ]
+    },
+    "BUG-106": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01620-b941-7662-b99b-84edb0f50475",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6138ccdadd6b101578b0068de08bb825abe3ba0894bac33d93bbf0a05064cd60"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0164a-53e6-7942-b054-6943a596576a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "5822d1340a6e65becc272ceddceafbc99dd41f7f9d986c530bda110f6dfd4832"
+        }
+      ],
+      "prose_lines": [
+        "1cd445248dc87a25b28597230477745a8beee9ec90348dc10f59f1800f472582",
+        "6138ccdadd6b101578b0068de08bb825abe3ba0894bac33d93bbf0a05064cd60",
+        "5822d1340a6e65becc272ceddceafbc99dd41f7f9d986c530bda110f6dfd4832"
+      ]
+    },
+    "BUG-107": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01633-9b3e-7302-ba61-efe7a13bed26",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a77cd7b53d6811180f4e4315672669e05b2a96b26514240a104d115624662b8e"
+        }
+      ],
+      "prose_lines": [
+        "a77cd7b53d6811180f4e4315672669e05b2a96b26514240a104d115624662b8e",
+        "df920e74d63b06d0d670aa083a2a7548da5935a6aa8c36db118872fc4ab86a92"
+      ]
+    },
+    "BUG-108": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01650-9acd-7762-ac71-021a9032f697",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "c3193d5edeb39c77ad60903130c4435a2409666f95570d98f4e8a9350932859e"
+        }
+      ],
+      "prose_lines": [
+        "62d4efcccddee671abb14eb0ddeba626ea07cca8e8483d6f9ce9b3ba3ec53a66",
+        "c3193d5edeb39c77ad60903130c4435a2409666f95570d98f4e8a9350932859e"
+      ]
+    },
+    "BUG-109": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016a6-a330-7e91-914d-71a46a0d3177",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "22074532d9c420851f0a0dead0fbaae38913d0936b2f570944fe9836a1ab1c94"
+        }
+      ],
+      "prose_lines": [
+        "ba1ce68c3bd0e27864b72d200aad0adffdf7968f105b0b153b8f76bdf835eb97",
+        "22074532d9c420851f0a0dead0fbaae38913d0936b2f570944fe9836a1ab1c94"
+      ]
+    },
+    "BUG-110": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016b7-064c-7931-8c10-79fee08594ba",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "79232c8bce8c7d9acd91aa739d314aade59fe617dedd2d2e1a12ec532d131d58"
+        }
+      ],
+      "prose_lines": [
+        "79232c8bce8c7d9acd91aa739d314aade59fe617dedd2d2e1a12ec532d131d58",
+        "3e0082050db84abca520a9109dec77b9268e9fb442329c2ceeb597683b980001"
+      ]
+    },
+    "BUG-112": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "8f3a5932-8e91-4023-8578-1fe4cb23002b",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-19",
+          "harness": null,
+          "line_sha256": "f7e4749dd3a4b3d6190522070ff9f6afe441c00e950a9d529aa5f7aa1c53fda2"
+        }
+      ],
+      "prose_lines": [
+        "f7e4749dd3a4b3d6190522070ff9f6afe441c00e950a9d529aa5f7aa1c53fda2"
+      ]
+    },
+    "BUG-116": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01982-32d1-7630-a313-bf8689faf8d3",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "8902f0aed724822e3228ff74f62ae23b9a3f91f992ef9fd0c7fcf620d3e73344"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01997-26e1-78b2-88b3-68aaa967cada",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "c688d69badd2d40d870ccef44bd43a8006d13ba5e40e4468a20729d3eb5a4561"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019b3-1d28-7371-91e0-557ebda5515b",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6781140b787296c3b262365be920308bd7d60a9a630079bcc3f685e6bcfbc6d2"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019c8-a9c0-7ae0-b4aa-dee6ee726ee8",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e328434fab433c009040da4552bc86a0519da6a9f63c2201409f66f1c607f792"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "1862ee23-6d42-4882-abf8-97efbc5ca6e5",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "ff3711c51c89106a27745e51c06fa1a700ae171ca6b2c72f31f6710ab10bf5c1"
+        }
+      ],
+      "prose_lines": [
+        "8902f0aed724822e3228ff74f62ae23b9a3f91f992ef9fd0c7fcf620d3e73344",
+        "c688d69badd2d40d870ccef44bd43a8006d13ba5e40e4468a20729d3eb5a4561",
+        "6781140b787296c3b262365be920308bd7d60a9a630079bcc3f685e6bcfbc6d2",
+        "e328434fab433c009040da4552bc86a0519da6a9f63c2201409f66f1c607f792",
+        "ff3711c51c89106a27745e51c06fa1a700ae171ca6b2c72f31f6710ab10bf5c1"
+      ]
+    },
+    "BUG-118": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a019e5-b4b7-7461-b6da-33a9c35be47b",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "dd3a1ef09cffe1423df1b32baddcf106a9c2d7c2f45368df2e5611f881da4984"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01a02-709b-7240-8ece-246f54e85532",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d786591e34ed4cd36f7d6e65fc4694465e9f4276d11163d867e459f8252a91fc"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01a13-0692-7b22-8ebe-31396d6743dd",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e258758ec4110e96254339e1ea13c102d47d41558435a9fdaf43138b7dd8f786"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01a17-381a-7c10-b32b-41ceccdcf7a5",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d881d06f12d927337ca153cb5c505b7ba199854fa846ce25ff12c18f404f1bd0"
+        }
+      ],
+      "prose_lines": [
+        "dd3a1ef09cffe1423df1b32baddcf106a9c2d7c2f45368df2e5611f881da4984",
+        "d786591e34ed4cd36f7d6e65fc4694465e9f4276d11163d867e459f8252a91fc",
+        "e258758ec4110e96254339e1ea13c102d47d41558435a9fdaf43138b7dd8f786",
+        "d881d06f12d927337ca153cb5c505b7ba199854fa846ce25ff12c18f404f1bd0"
+      ]
+    },
+    "BUG-119": {
+      "records": [],
+      "prose_lines": [
+        "f23832ff402ffcc5413ba73100a565bf6f063ffa082ba4cdc5894f2de83e5afd",
+        "8f3ed223e76f41928273592d9786137e54826e242a206eb5c7962c8fb3e803d1",
+        "09aea10a72a2f61dc412f0bcc6695459c51bb01b5b984609a56888b2621024ce",
+        "c066b79bf1ab7bdae8e8a6f136ae28a3613d11e60e42199783947bd996a54116",
+        "4c031171d6b52f27a49a5f0a1192da2118fa77624e2e70c97e321a282b270cb9",
+        "d65a5a28e156cd8432c379b24d81fc0de01ddba6de02213dfd46a964e5aae006",
+        "0d00efa38890fd7fc389aa77741eff1d4932a5eda2e5dc0af3516446978b4e45"
+      ]
+    },
+    "BUG-120": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ea7a-c6d5-7fe0-bbfd-2e659cdf8bc0",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "b3bac6d0fad6055a0c2752f50b53c197dfd6b942f83fe9869d9c7d26b45c2243"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ec1b-595f-7961-8944-b8e2cc5e7c28",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "40ca26eddfd42ddc877a7e95d2ef2bff135421b212b23c6debb0bdd19e78c0aa"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ee84-111e-7c92-b33b-53e0c1852052",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a290f5795df31a33a9228f4462012363e08844ec9bd3eb302752ec43a4f30592"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f251-a10a-70c2-8886-93b434e87d05",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "7b33ce4cb6ea938121852593ccc887cbacc7af2f62784b30dac7183effb6794b"
+        }
+      ],
+      "prose_lines": [
+        "b3bac6d0fad6055a0c2752f50b53c197dfd6b942f83fe9869d9c7d26b45c2243",
+        "40ca26eddfd42ddc877a7e95d2ef2bff135421b212b23c6debb0bdd19e78c0aa",
+        "a290f5795df31a33a9228f4462012363e08844ec9bd3eb302752ec43a4f30592",
+        "7b33ce4cb6ea938121852593ccc887cbacc7af2f62784b30dac7183effb6794b"
+      ]
+    },
+    "BUG-125": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "78fb3b76-6bc3-41f0-81b0-737328e704cd",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": null,
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "621a07e4993bcee384c9ae37ec6540836d16f188950c4c5a5a7fff36dbb1c2c3"
+        }
+      ],
+      "prose_lines": [
+        "8e86796ff1254669ce1f520a70ddf29f9efa6afa0801e9f434e3b029638a9e9e",
+        "5cc8a615754b4c49bd68805f2491b7153c27e9b5aafeeeecccfbf68bdfa85baa",
+        "621a07e4993bcee384c9ae37ec6540836d16f188950c4c5a5a7fff36dbb1c2c3",
+        "4d212ff9a7cb9bb87ebc77b5dae0ed099143b349de983cf71dd2e157f3cbbf54",
+        "cdc4f480ee0f06c83b1969df77981ba2ab0d8d33e9899aec6f37cb3d6e973b15",
+        "a84854419d60349e9cc8677cb6801cfaf89f65239945ec09f2504beb7191fd22",
+        "f2cb54a247e17826aa17782d83f442818621440f3d5835088e2c5bd61b84cb00",
+        "de16eab7fc041f258e41c289218aad443cd970b5448142a5e2b2d3d8f6e903d6",
+        "edcddb9e0eebadf7907555c93a4dfea6b57f837f451892148203bae1b263727f"
+      ]
+    },
+    "BUG-127": {
+      "records": [],
+      "prose_lines": [
+        "4cbb9ad29b0c7f1fcfa5bf11f17a2de9213b7168280970ce525adcb11bf1ed12"
+      ]
+    },
+    "BUG-128": {
+      "records": [],
+      "prose_lines": [
+        "6e456d825ffbf46caf95dd8317749d457aa8edcd0eb3fdc35f7c4ff15c3839cf"
+      ]
+    },
+    "BUG-129": {
+      "records": [],
+      "prose_lines": [
+        "47db86f5657a5cd1e012dcb1c3c9e62945e4462bb977d5bca2aa5c9510c8c295",
+        "eeb160df4a04b7f36cce49070a1fde735714bab1cfc237ec6d3d0a2bf0ec4670",
+        "19366848f100d8e365199eb0be8b775f7d9d7594a5a97006d9d99145eee989da"
+      ]
+    },
+    "BUG-131": {
+      "records": [],
+      "prose_lines": [
+        "4298311bed7fff48e71112b7b92bd2610c6f4a892270d9acd4158c99ca3b84b5"
+      ]
+    },
+    "BUG-132": {
+      "records": [],
+      "prose_lines": [
+        "6af8dee3fb43573c9150f15b5698cc6eb428c01c2b94de52f0f1904f7a7a7df5"
+      ]
+    },
+    "BUG-138": {
+      "records": [],
+      "prose_lines": [
+        "ee7270e8090b2e21fbdf8255734fe9975d995c9548d37d672ab1da3d08866b5c"
+      ]
+    },
+    "BUG-142": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "8fc1c329-17db-4e4c-94f6-1fe455626c11",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "9c19a93ec696c56c693805c410fbf45ec9dc373731b8de374bd6fd1fd0cb7bac"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "5aa54e8e-995b-44a3-8fc1-6a726dfbf4cc",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f3516a2e9c301784a55166ceef3481a5b4636124f8f0d719cbaff5efb22b0279"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "e0afcc07-b666-4e7d-8d1e-d834bb2ad649",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f3516a2e9c301784a55166ceef3481a5b4636124f8f0d719cbaff5efb22b0279"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "51f611bc-cc24-44b4-b403-073c3b72514d",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "2c0acbcd5745e653d4bb7eab77a300401fbbba98a77d57e13b00fa4d12a2c59d"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "625ee528-94e5-49d9-bafe-c4d858440a45",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "596f85adcd96e53dfa84bdc7316f09830ee399fb927a72fa0e4bdf2dd36d3d3e"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "625ee528-94e5-49d9-bafe-c4d858440a45",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "fb21d7d165ea65834e57af44da41740db2aefe738d76cb584b969a479faf76b3"
+        }
+      ],
+      "prose_lines": [
+        "fbb338cdb7ab94859396a2b19ebe58a5f83a9c0f3990fd4600f81df812a2f844",
+        "9c19a93ec696c56c693805c410fbf45ec9dc373731b8de374bd6fd1fd0cb7bac",
+        "f3516a2e9c301784a55166ceef3481a5b4636124f8f0d719cbaff5efb22b0279",
+        "2c0acbcd5745e653d4bb7eab77a300401fbbba98a77d57e13b00fa4d12a2c59d",
+        "fd44e48d2b8c542a15709245599a331fb5ad914e079d4e82403aa57c174ea120",
+        "596f85adcd96e53dfa84bdc7316f09830ee399fb927a72fa0e4bdf2dd36d3d3e",
+        "fb21d7d165ea65834e57af44da41740db2aefe738d76cb584b969a479faf76b3"
+      ]
+    },
+    "BUG-144": {
+      "records": [],
+      "prose_lines": [
+        "f7b15c82e13b7b4f774d01d67fc2756264990a5ed8a2032cfae8074bf65267bd"
+      ]
+    },
+    "BUG-150": {
+      "records": [],
+      "prose_lines": [
+        "6a90758ad6c67b7d3504cb3320a2673319f76e87e5383401ca99b2c3472bcb94",
+        "d990dede9a9235802fd20c2a0575e0aebc7d3b1fdd2c7cf5adc864d4e30b2c9a"
+      ]
+    },
+    "BUG-153": {
+      "records": [],
+      "prose_lines": [
+        "760fc3d66d1ebbce94102a6b8ca70252acaa86062002fae1f134315eb453ad0b"
+      ]
+    },
+    "BUG-155": {
+      "records": [],
+      "prose_lines": [
+        "fdce61b03c8ca038a030af974ab8d9e61e9affdf72130bf4ec20d7bd9bf6e458",
+        "2ff768221ff0b17e043067cf434f075f39a5d2c383524a36060f42efa6ceffa3"
+      ]
+    },
+    "BUG-156": {
+      "records": [],
+      "prose_lines": [
+        "b8aa0be05902a8b210d04c0c61efb92678cdc4fb4731f57ba86dec8d2635f19f"
+      ]
+    },
+    "BUG-157": {
+      "records": [],
+      "prose_lines": [
+        "efdbeb2c8f28d8b58c67ff0e4ca161ce685de5cda90c98b46159a914df40dba3",
+        "65646b3e1f275537bbd5f4ec604f354fdafc6a366b2e429645239e83a758d45e",
+        "a08acf1088800188ebfd8f8ddd5e994f2141d21dfcbea35a11fea1e55f7afa86",
+        "6e38d308b45101471c52541cf2c5f056bce9f194541badb65efaacde7e4037f3"
+      ]
+    },
+    "BUG-159": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "0a58170e-900a-4197-890f-e2dbd8630f4a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "5e9b15ffc745abe1b0fa5c38b042504a2ee7e57ceb180eb0864b71c70d08cd58"
+        }
+      ],
+      "prose_lines": [
+        "5e9b15ffc745abe1b0fa5c38b042504a2ee7e57ceb180eb0864b71c70d08cd58"
+      ]
+    },
+    "BUG-160": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "8a4566dd-246a-4c81-bde7-f05f1a6acda9",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a2ef55d546fc19091810c0cbc2e6386a6519e862fd59fab247f22505dc9882e2"
+        }
+      ],
+      "prose_lines": [
+        "a2ef55d546fc19091810c0cbc2e6386a6519e862fd59fab247f22505dc9882e2"
+      ]
+    },
+    "BUG-161": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "06590a2f-56f8-4cac-a621-a6c260f6b3f4",
+          "verdict": "invalid",
+          "raw_verdict": "invalid",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "3d01ab57687a5c61fd405e5b54cbce591a431fea4176cb0a398ab48684c7ebfb"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "af08b35a-f28d-4920-aba8-16ba399cc86e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e9394f67e5a3f5e8475f12cf8d58d8421064d3aec98ff53a0774223051361b8f"
+        }
+      ],
+      "prose_lines": [
+        "3d01ab57687a5c61fd405e5b54cbce591a431fea4176cb0a398ab48684c7ebfb",
+        "e9394f67e5a3f5e8475f12cf8d58d8421064d3aec98ff53a0774223051361b8f"
+      ]
+    },
+    "BUG-162": {
+      "records": [],
+      "prose_lines": [
+        "a4f953962f73cb0a7ee9de4f77e77d283486a7c1b63a71d34b344b39796270a7",
+        "65d036356273495e53a13e1773a1658d77c3b70d17751bd514d9cb6cfc870648"
+      ]
+    },
+    "BUG-166": {
+      "records": [],
+      "prose_lines": [
+        "1424b06e944ec11206ce394852fa0730dce72447eed47f5d3a449402bc4cbadd"
+      ]
+    },
+    "BUG-167": {
+      "records": [],
+      "prose_lines": [
+        "3f6b5359fafbe6371a89b46215099b0516e62662c56a7f4e0a7f0f1debeaa798"
+      ]
+    },
+    "BUG-168": {
+      "records": [],
+      "prose_lines": [
+        "e3ef0a4ffb6033c0ac325d902e353edaa29b3b810a64f049ec86c30e01ff2de7",
+        "37fc4db3647f7621c33ed63168d96dc0f7349dc95f48be20abab4b408f292fd5"
+      ]
+    },
+    "BUG-169": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "b94b2346-7483-40fc-8801-08928d4cf06d",
+          "verdict": "invalid",
+          "raw_verdict": "refuted",
+          "verdict_on": "2026-09-06",
+          "harness": null,
+          "line_sha256": "8c0e2ec76a4e3078fc59aea78ec029a2e65a71eb9460b380c100c4ec95b1986a"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "b94b2346-7483-40fc-8801-08928d4cf06d",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-09-06",
+          "harness": null,
+          "line_sha256": "2f69338636299ac8b1c1442c5c66ac879565d88a8e2c138e7cdd831a1de9ea39"
+        }
+      ],
+      "prose_lines": [
+        "140fb01eddf5f104c884d0d8a7d9f514b4ce41be5a7164eccb3f395e2f602735",
+        "8c0e2ec76a4e3078fc59aea78ec029a2e65a71eb9460b380c100c4ec95b1986a",
+        "2f69338636299ac8b1c1442c5c66ac879565d88a8e2c138e7cdd831a1de9ea39",
+        "635a127115aebafac37cef2c28e3df49fe0e4b9d3198cd3d593bc9bcd75e768d"
+      ]
+    },
+    "BUG-170": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "af0a69931483a1beb",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d0038e3dc69adb478e7df334b73129f6a387070bd60ced06bb4cf7b93e1385cf"
+        }
+      ],
+      "prose_lines": [
+        "277548790c1354e4cce8345e6227f68c3884076cfee7df39f702f1f79a7bf006",
+        "2a75f0f9cef248f29ab570b811763ff9218da8ab94377b1cbc0a49af3567d1e7",
+        "c18a068a94da1fb4710305c5aa3b14548997cdaee859d14190439b2b9597333f",
+        "ec7de308658211e7f16baf2db0d84a30ab7c8c6438996f2f908f4a83290536b8",
+        "d0038e3dc69adb478e7df334b73129f6a387070bd60ced06bb4cf7b93e1385cf"
+      ]
+    },
+    "BUG-171": {
+      "records": [],
+      "prose_lines": [
+        "ce99e24511df8cd69a8d6bed59cc58aa8f9f2ea2b74e212bf4448a4c5434921d"
+      ]
+    },
+    "BUG-172": {
+      "records": [],
+      "prose_lines": [
+        "365f6b00c211ed1a3a52c4105c814d68aebd385dbd0aa2a6264f05b1dabf69cf",
+        "005bb8202d721b2ffdb6e2fd7560549e78da15f837c1b79ffd606ef458f6ad5b",
+        "3a42f7ff4c913e92cfc92946b3a6769bd4dafd3cb688119d0ae29dc0c901bd92"
+      ]
+    },
+    "BUG-173": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "bb1f02d5-364a-4efc-a739-6e3a27642850",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": null,
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "ddc8ade0dfe1e2d8c9d3d9752456e439b69c8dd7e3447c8d31097df9e2572250"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "0b3509de-3c9d-45d1-9e1d-881eb2aa18ea",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-08",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "1a7435c611383d4d781eaa1340078301a311efca1570a171693bc0ab53528b90"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "bb1f02d5-364a-4efc-a739-6e3a27642850",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-08",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "ddc8ade0dfe1e2d8c9d3d9752456e439b69c8dd7e3447c8d31097df9e2572250"
+        }
+      ],
+      "prose_lines": [
+        "ddc8ade0dfe1e2d8c9d3d9752456e439b69c8dd7e3447c8d31097df9e2572250",
+        "1a7435c611383d4d781eaa1340078301a311efca1570a171693bc0ab53528b90"
+      ]
+    },
+    "BUG-175": {
+      "records": [],
+      "prose_lines": [
+        "2c31a2f464a97359b6b0da049a0d5e295441332855a5d54e376e163dca4a803a"
+      ]
+    },
+    "BUG-177": {
+      "records": [],
+      "prose_lines": [
+        "3303b1676911ed0bb99c50b381ed25f9bcafe9e36c69746068ca25d9ca46b51d"
+      ]
+    },
+    "BUG-178": {
+      "records": [],
+      "prose_lines": [
+        "21a1452a766efdfe272a3ec5c9bd8ad30581586132e59299a205fc655c3bbbe7",
+        "e2a7ed6f9af13e2930f3eec8a5c3457de271e4908ef659c528a856e2ccce0ffe",
+        "a1882dfca0433c129c3223871baa99eb8e818e476f05ba505ba484e1f459fcc7",
+        "517043d6fdcfac3a8719c503d1feefd3c9fad0ee9cc26bc9f821c4872c3a2922"
+      ]
+    },
+    "BUG-179": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "ba89cdd6-7b2a-4dd1-aca0-cf50f3903475",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "89cf85f7c9488beaf864f3777f423f134e506e4db74d523941240989d177cfdf"
+        }
+      ],
+      "prose_lines": [
+        "89cf85f7c9488beaf864f3777f423f134e506e4db74d523941240989d177cfdf"
+      ]
+    },
+    "BUG-183": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "2a07f574-4a38-4f9f-be00-68d2384a54a8",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": null,
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "7d649be15021ea8b9bb170b6773bf29e76ec99a7b5afbf312e79489eabcc1a11"
+        }
+      ],
+      "prose_lines": [
+        "7d649be15021ea8b9bb170b6773bf29e76ec99a7b5afbf312e79489eabcc1a11",
+        "67b4fdbe0442914c449e99cfeb33b937ac57b60762b489390470ff3de1a32c64"
+      ]
+    },
+    "BUG-184": {
+      "records": [],
+      "prose_lines": [
+        "471b6bafae2384d5df9f9fbaf01386a886b44255d7bcc3739281ad2240e67dd2",
+        "ba64fd789abfc3044a0db3cd8313a980773c7af186c3aab12fc9506276cdfa7c"
+      ]
+    },
+    "BUG-185": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ec14-e263-7e32-bf37-79707f7141eb",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/dispatch.mjs",
+          "line_sha256": "be7865fbaa10fc1781162af403caf56212b21f0ad116579b3a2f42483d9ad335"
+        }
+      ],
+      "prose_lines": [
+        "4b1740565e444ec9c860f9ad7538d94512d6be72eece0a555f3a739c5d9e1af8",
+        "be7865fbaa10fc1781162af403caf56212b21f0ad116579b3a2f42483d9ad335"
+      ]
+    },
+    "BUG-186": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ea79-9953-7d93-84d9-2daeb1d63da2",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "1fc6493df4ef9f9a5edf098db31bae350e3a4ed86654ce32f7ea2d14cb0b4371"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ec1e-52e9-70b3-98f8-888c19ad4096",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d67aea8e7749ec0a83fb80d445f0cafb534c1826c9a4efdec1cba04d85cde6e4"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ee86-7e17-7133-891a-c1c11c6da5a2",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "5cc6ef5a8d2cc2b78daf73de9fcc23bd03e31a4d6bed7498429c2d362d0fa469"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f253-81b3-7ee1-a381-ea3712b3b393",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "2e2cd16769564bcbd7dce7e7492f91c3cfcf19256707fb7b4ecef20816ad9fd5"
+        }
+      ],
+      "prose_lines": [
+        "8b805fd555f81fde709929ac3dca6ca11891b9a08b762cb424c1ea38187b4d77",
+        "1fc6493df4ef9f9a5edf098db31bae350e3a4ed86654ce32f7ea2d14cb0b4371",
+        "d67aea8e7749ec0a83fb80d445f0cafb534c1826c9a4efdec1cba04d85cde6e4",
+        "5cc6ef5a8d2cc2b78daf73de9fcc23bd03e31a4d6bed7498429c2d362d0fa469",
+        "2e2cd16769564bcbd7dce7e7492f91c3cfcf19256707fb7b4ecef20816ad9fd5"
+      ]
+    },
+    "BUG-187": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-fable-5-1",
+          "run_id": "dc3f692d-ad58-4d06-8fce-b61f0cfa9980",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "648c93e537ecfd79ee39315c4fb44c277ce8b13bd6325ce987c104273c288a85"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-fable-5-1",
+          "run_id": "5b4aaff6-38b0-4498-945c-3cdb32582426",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f532c552d5ba55c6aa1ca0bd62f20b6d8bd6c57825bbfb4fa3423e8024d10819"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e4d9-9575-7fd2-99ad-032fb2ee893e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "3b926f189cb8729c3bc236dad6c3f0d92bdcebd4db3076923b918675e31b15d2"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e69e-a8e9-7000-9b07-40310a031512",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "55b4204ff9b2dba60f6c7c9261b9ce4508ab8f3b9f3a15e14ee6a1d210c8aca8"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-fable-5-1",
+          "run_id": "be533992-fdfc-49c4-81b5-79c6a2f3b9cd",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "85d29d751d0b01a5a3e0cb6f442f4bd01355207efd200b3ed6de79ab4bd29ade"
+        }
+      ],
+      "prose_lines": [
+        "fc904453e187f5a985a34122ab241eef43cc0f2b0cfd9e6381bff977d50a7ce4",
+        "e557c31e069922354807ae97f5c13e527839c0345b5db988f9eccf282aa26b53",
+        "41ba77bf2cd22c98065a2e5eaf720a0ac0a46889fbb1c5cb4c511782d179fc3a",
+        "e8090b3dd7ab23a0d0236fdf7d4af9067bd23aa05ba1cd0695b970e3df42731e",
+        "195c10106cccd93566fb02c30ddb2f8c2c06fb5c51c489b2d4fa29e6c925d5ad",
+        "c8aa11ed2c5bb9e3ca1ee32c731ef31fa893ecec5faf0d920a071f109f04e7cf",
+        "e6974395129c98143bee6243710660a03a58cb9e07da6ea9e7ebeaaee7c5533c",
+        "17765c1a945e2dcaf663e913c660541bd8a7330e8cc862c7023f759965d321d8",
+        "1753d9a2c94841830d3dacc41ae2f5021be5b1f7a65ab0d6ef079dd9f5fa41b9",
+        "cdd75b521d3ff6f025d36fd5a22cf9b1f4856ace90f6403de3b4a7a1c900d5a2",
+        "cc82e008740f93133cdd05b56afcf43a5edd2e9a91d2799d381d6e1fdea04f8b",
+        "7b941d25fea6f0af463097bd8be42bb119ee71ab02a0a54e903fe78bf3a4c54e",
+        "648c93e537ecfd79ee39315c4fb44c277ce8b13bd6325ce987c104273c288a85",
+        "f532c552d5ba55c6aa1ca0bd62f20b6d8bd6c57825bbfb4fa3423e8024d10819",
+        "3b926f189cb8729c3bc236dad6c3f0d92bdcebd4db3076923b918675e31b15d2",
+        "55b4204ff9b2dba60f6c7c9261b9ce4508ab8f3b9f3a15e14ee6a1d210c8aca8",
+        "85d29d751d0b01a5a3e0cb6f442f4bd01355207efd200b3ed6de79ab4bd29ade"
+      ]
+    },
+    "BUG-188": {
+      "records": [],
+      "prose_lines": [
+        "c54441f5a98ba1d40d4a96b8d3e77c441b9423a580a79b50918a17eb03cd0a30",
+        "e2a7ed6f9af13e2930f3eec8a5c3457de271e4908ef659c528a856e2ccce0ffe",
+        "8b23fb16bf383a773c8c69114033e5ffdc7858341ffca4d5e5284f4175074097"
+      ]
+    },
+    "BUG-189": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e313-3920-75d2-b9b4-f7aa73de5cdc",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "aeb189f0739b13229a25e923868e04ca92cc1ed7042eabaa74f8197e7119d21f"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e320-8ce9-72b1-8bed-5929df1d4e54",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "adef9d68c98180b3c9f9a83422cf6b092c01e33a01385093afcd98decf476e9c"
+        }
+      ],
+      "prose_lines": [
+        "a16795a81302cca9a087e274498a6e69ba3b6b0e6526915ff6ac95a395e4f1d3",
+        "51ac8984cfa248f0e04ada593648aef5d12618a8fa607f3fc477e82d2a840d0b",
+        "aeb189f0739b13229a25e923868e04ca92cc1ed7042eabaa74f8197e7119d21f",
+        "adef9d68c98180b3c9f9a83422cf6b092c01e33a01385093afcd98decf476e9c"
+      ]
+    },
+    "BUG-190": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-fable-5-1",
+          "run_id": "82b90645-409f-4af9-a3bc-955000e41414",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-28",
+          "harness": "cleanroom-verify-PREwf2",
+          "line_sha256": "c5ea303dfd397b114d65878bdd0cf03a6dcb30084e2d7ac190547cc8b4247c12"
+        }
+      ],
+      "prose_lines": [
+        "6be7d89fcbf30a4c0512d492cab6bf538521df41305c665be961d2a6657b2f09",
+        "bf58639130913880b3a79fedd789633e0912330544aa5ece237910b0f17dc4b9",
+        "1eb3357c4c1f684ee0b385cbc8ed880e818253002908c539e795a6255b7ed48a",
+        "6273a425203d98afa97afa1d67258ef45547e37d5c050fd8d8bfe1107729f819",
+        "3a0a3100d6e401d7f616664f8a5b8c7779789e29dfa0e87644d61a513929ef9b",
+        "df9bd13da13c373d6317137393639437144ca2c773a1d350e1729e9e4375cd69",
+        "8843c1154f44b2f8b67a27ba0405d3ba6cf3c94c31740e1d4d395e1919126996",
+        "c5ea303dfd397b114d65878bdd0cf03a6dcb30084e2d7ac190547cc8b4247c12"
+      ]
+    },
+    "BUG-191": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e4d9-9575-7fd2-99ad-032fb2ee893e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "fc4c6e2732635caa7f7c7425520ef16d2ab82d5e70fc4642dae241d79b562dde"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e69e-a8e9-7000-9b07-40310a031512",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "71db9e613dbb2cee72324da22629d770aa74e0ac0f9c33237d18662c318040fd"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-fable-5-1",
+          "run_id": "be533992-fdfc-49c4-81b5-79c6a2f3b9cd",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "150002b0602dce91f4493ab08b1ff6951483be77d416cc88c2bef87a9bc06bd3"
+        }
+      ],
+      "prose_lines": [
+        "c8aa11ed2c5bb9e3ca1ee32c731ef31fa893ecec5faf0d920a071f109f04e7cf",
+        "e6974395129c98143bee6243710660a03a58cb9e07da6ea9e7ebeaaee7c5533c",
+        "17765c1a945e2dcaf663e913c660541bd8a7330e8cc862c7023f759965d321d8",
+        "1753d9a2c94841830d3dacc41ae2f5021be5b1f7a65ab0d6ef079dd9f5fa41b9",
+        "cdd75b521d3ff6f025d36fd5a22cf9b1f4856ace90f6403de3b4a7a1c900d5a2",
+        "cc82e008740f93133cdd05b56afcf43a5edd2e9a91d2799d381d6e1fdea04f8b",
+        "7b941d25fea6f0af463097bd8be42bb119ee71ab02a0a54e903fe78bf3a4c54e",
+        "fc4c6e2732635caa7f7c7425520ef16d2ab82d5e70fc4642dae241d79b562dde",
+        "71db9e613dbb2cee72324da22629d770aa74e0ac0f9c33237d18662c318040fd",
+        "150002b0602dce91f4493ab08b1ff6951483be77d416cc88c2bef87a9bc06bd3"
+      ]
+    },
+    "BUG-192": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "opus",
+          "run_id": "768e2b04-edde-46a7-8d20-f54b03c1c79b",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-27",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a4312548a39572b317f5c6c3d23bb7971084f89ea632e0cab84651cb61ced115"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e4d8-4043-7cf2-9c67-5711672ccf6f",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-28",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "362935cc2d71a48c4a623e7bbf732c162d7ba6e03e8713ccdfd3e8b38026654f"
+        }
+      ],
+      "prose_lines": [
+        "a4312548a39572b317f5c6c3d23bb7971084f89ea632e0cab84651cb61ced115",
+        "362935cc2d71a48c4a623e7bbf732c162d7ba6e03e8713ccdfd3e8b38026654f"
+      ]
+    },
+    "BUG-193": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0e824-cea8-7f22-aa78-8a4c1895e1c8",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-28",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "307c33abe4b14faf3d3a79e07469b8849851f40ad4f34f3246b146b481298d66"
+        }
+      ],
+      "prose_lines": [
+        "307c33abe4b14faf3d3a79e07469b8849851f40ad4f34f3246b146b481298d66"
+      ]
+    },
+    "BUG-194": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "7351e2e8-e031-43d4-943d-dbecef2b1659",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-28",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "92160005550de12bc84fb6d0abd5b5266f2ece61b15c3376f10166449bb0b8fb"
+        }
+      ],
+      "prose_lines": [
+        "2f5297b78b5daa31c961e3ff12deda36e5c55263efcfcf6c07e932cf2d48b75d",
+        "92160005550de12bc84fb6d0abd5b5266f2ece61b15c3376f10166449bb0b8fb"
+      ]
+    },
+    "BUG-195": {
+      "records": [],
+      "prose_lines": [
+        "30ba8995c49c0ce9c3704f4d4d1a669e3b3a647923bda44d418a009a3d7c9b78",
+        "8b23fb16bf383a773c8c69114033e5ffdc7858341ffca4d5e5284f4175074097"
+      ]
+    },
+    "BUG-196": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "b5d4823a-6955-4625-b85d-aa005445b6a9",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-IshUmF",
+          "line_sha256": "9d906de561adb26fbfc8c8806c7c53ee3302bbf16383ce32af1361008a704d98"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5",
+          "run_id": "6b0b428c-3937-4326-b253-1dca2ec29bcf",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-S0tZLo",
+          "line_sha256": "c3419d0ed91cf1ada0622502dd8ed944a4f1cda27da35146232590a9b2fbf1df"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5",
+          "run_id": "900d9e94-adc5-4f81-9847-6bda9be240fd",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-HIRIAX",
+          "line_sha256": "5e319e35dc1c8f78848e3191f83d32388eba282f58b1f902f94bcfce8312fa2f"
+        },
+        {
+          "provider": "anthropic",
+          "model": "fable",
+          "run_id": "43181ca6-7bf5-4f1d-8c70-20f446dac770",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-25CZGu",
+          "line_sha256": "27fe919ce2428ceb7859934c8b3d0a13e2f5e9bba0bec17cf4581eb1e3f1ec61"
+        },
+        {
+          "provider": "anthropic",
+          "model": "fable",
+          "run_id": "e0c09c1c-ddac-47b5-a5a9-e51c5247da8a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-UuZKby",
+          "line_sha256": "214d2129beeded086b8a257b1340f490fda05a5bd86abec9f5c5f8724dda09d8"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-sonnet-5",
+          "run_id": "32340bd0-5e4c-4b96-a36e-0981e2bebe39",
+          "verdict": "invalid",
+          "raw_verdict": "invalid",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-ZThoHd",
+          "line_sha256": "16585187bccdbd2a0e071c9421e577ee41568cc4cef770ac02abdfaadd6f8556"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-sonnet-5",
+          "run_id": "8f1cfcb0-1b98-4ffd-87c7-5b36adeb9b9e",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-nDn2qi",
+          "line_sha256": "dad6d62643e01e9c56b8b08a19d88735aff4e677901bafee7be3e2f623ac0079"
+        }
+      ],
+      "prose_lines": [
+        "9d906de561adb26fbfc8c8806c7c53ee3302bbf16383ce32af1361008a704d98",
+        "c3419d0ed91cf1ada0622502dd8ed944a4f1cda27da35146232590a9b2fbf1df",
+        "5e319e35dc1c8f78848e3191f83d32388eba282f58b1f902f94bcfce8312fa2f",
+        "27fe919ce2428ceb7859934c8b3d0a13e2f5e9bba0bec17cf4581eb1e3f1ec61",
+        "214d2129beeded086b8a257b1340f490fda05a5bd86abec9f5c5f8724dda09d8",
+        "0a69a5e8e73e0cf6266702d4074fe63762946dae83145c8c2c4cd625c3deb928",
+        "16585187bccdbd2a0e071c9421e577ee41568cc4cef770ac02abdfaadd6f8556",
+        "dad6d62643e01e9c56b8b08a19d88735aff4e677901bafee7be3e2f623ac0079"
+      ]
+    },
+    "BUG-198": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-sonnet-5",
+          "run_id": "7ed11350-a7a8-41ad-afd8-d3f9def80d04",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-RVwsrD",
+          "line_sha256": "9065edaf684e5172fca61f6f01b2092d24107f0a2777629936d1edd406b99f46"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-sonnet-5",
+          "run_id": "f594b6fd-45de-4a6f-8d1c-1a780288fa5d",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "cleanroom-verify-pPQBXA",
+          "line_sha256": "a495dcff1873a89bc446ec85d86e2485d5fb62fea881cedfbb3df2509a4a40ee"
+        }
+      ],
+      "prose_lines": [
+        "9065edaf684e5172fca61f6f01b2092d24107f0a2777629936d1edd406b99f46",
+        "a495dcff1873a89bc446ec85d86e2485d5fb62fea881cedfbb3df2509a4a40ee"
+      ]
+    },
+    "BUG-201": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ed58-d54b-7b52-a44e-93c19de8b549",
+          "verdict": "invalid",
+          "raw_verdict": "invalid",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "2f38faa72b183fcb623162a080da47576fd777fcc323f5ae521b79793dbcdd2d"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ee7c-04d6-78b1-9c5e-c6eb0982c7c8",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e62803ce204dfa1ad69c203a8b89c21b977149d5a4efd9a7e0c13fa6202244dc"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0efa4-6695-74d0-976b-ef5f88a5d26c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "7ab902d4f368a92a9521029a1a44822a5a015a9fe3fd41ca78ddc93918648e3f"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f0b8-6d57-7c41-81d3-bc29ce3a80aa",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "950e20fe8a4d5875d3216404c1ef709b265758cb4a99e0bf66778bf58b603d4e"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f249-d59e-72e0-867d-57472f402f7f",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "fa26820eeb4f069cd0820fad21c23f7ae9b416efb53099f8d856717945641de8"
+        }
+      ],
+      "prose_lines": [
+        "6632545c4eb13684bbd294326b65c785cf5e4980dd0d01f13f186fc7b3457725",
+        "c00a17e2a260330f7a0c065c6a937369719d7990a82c39661bd1fbc5d1d7e467",
+        "2f38faa72b183fcb623162a080da47576fd777fcc323f5ae521b79793dbcdd2d",
+        "e62803ce204dfa1ad69c203a8b89c21b977149d5a4efd9a7e0c13fa6202244dc",
+        "926bad694d2656b1feb5612ec4a033105bd4f4bcb5be1dc23fd0d31b1ad1015d",
+        "7ab902d4f368a92a9521029a1a44822a5a015a9fe3fd41ca78ddc93918648e3f",
+        "9a3a3e3666b9530be9a2348606f9e878ce6737451756df9ef56bb2e640e1fa9e",
+        "950e20fe8a4d5875d3216404c1ef709b265758cb4a99e0bf66778bf58b603d4e",
+        "3047919819c5b82a23022157e6a04e05e7c8e3c4ad8645c26b6d2aa96b6e86ba",
+        "fa26820eeb4f069cd0820fad21c23f7ae9b416efb53099f8d856717945641de8"
+      ]
+    },
+    "BUG-203": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "5aa54e8e-995b-44a3-8fc1-6a726dfbf4cc",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f3516a2e9c301784a55166ceef3481a5b4636124f8f0d719cbaff5efb22b0279"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "e0afcc07-b666-4e7d-8d1e-d834bb2ad649",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f3516a2e9c301784a55166ceef3481a5b4636124f8f0d719cbaff5efb22b0279"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "51f611bc-cc24-44b4-b403-073c3b72514d",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "2c0acbcd5745e653d4bb7eab77a300401fbbba98a77d57e13b00fa4d12a2c59d"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "625ee528-94e5-49d9-bafe-c4d858440a45",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "596f85adcd96e53dfa84bdc7316f09830ee399fb927a72fa0e4bdf2dd36d3d3e"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "625ee528-94e5-49d9-bafe-c4d858440a45",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "fb21d7d165ea65834e57af44da41740db2aefe738d76cb584b969a479faf76b3"
+        }
+      ],
+      "prose_lines": [
+        "0dbb93f13414ed336315ef0a0374aab036a8aadb33d98e980b99f74218c581b7",
+        "f3516a2e9c301784a55166ceef3481a5b4636124f8f0d719cbaff5efb22b0279",
+        "2c0acbcd5745e653d4bb7eab77a300401fbbba98a77d57e13b00fa4d12a2c59d",
+        "fd44e48d2b8c542a15709245599a331fb5ad914e079d4e82403aa57c174ea120",
+        "596f85adcd96e53dfa84bdc7316f09830ee399fb927a72fa0e4bdf2dd36d3d3e",
+        "fb21d7d165ea65834e57af44da41740db2aefe738d76cb584b969a479faf76b3"
+      ]
+    },
+    "BUG-208": {
+      "records": [],
+      "prose_lines": [
+        "4397953cb6388272d842115daa3876daf4f1f6ca77f0ce36993236e5afa5d4ef"
+      ]
+    },
+    "BUG-214": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "dcfa6307-4530-4bb9-ba79-49506e239d24",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "2a2a0572232eba6b1e82fe8a0429bb554857651bfb47fe93d891c04c17d1a38b"
+        }
+      ],
+      "prose_lines": [
+        "2c1f5391ceaf4e7a497a07435a250df715a0d6395c4d3ad6acf0f29e8885b5e2",
+        "738116a944baf47401dbcc81f9c53eff713987484559a2fd87250f3cea9dbf2d",
+        "d971dfed5c123cf8de40bd135833173b72cedddb0bba5b251f6f83ceab55240a",
+        "cda283e0512ff9f5470e3edb2401e0ec68cb5256b24705af0b3d79b92daf4ebe",
+        "b38f77df29d826f36d6edd4cc3e2a4e6e095fb70e01e466979675250bf784f58",
+        "35c45dc23eaca4f483200ee29012bc1eb3477bb4f0d73d84aa123bdd82cd893b",
+        "2a2a0572232eba6b1e82fe8a0429bb554857651bfb47fe93d891c04c17d1a38b"
+      ]
+    },
+    "BUG-215": {
+      "records": [],
+      "prose_lines": [
+        "388b6a7fea673d97efaebcbabd66a7953a0b0e47a30d0574dabeeb9b6ff807db",
+        "99d8d8bc1523a109b7c83b0070826654f3becd982704c8361dfe7834f10bf692",
+        "c5534b28c78c8dcd889ac1ef8db12ba2de055835773279345a316281fc4726b5"
+      ]
+    },
+    "BUG-216": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "0b0c48bd-c20b-4837-a918-adb66ac56309",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-29",
+          "harness": "a392feeb-…",
+          "line_sha256": "80a09517896ced84b7cba172064b98b4b549e525e6dcf891a2077ad82e010e2e"
+        }
+      ],
+      "prose_lines": [
+        "80a09517896ced84b7cba172064b98b4b549e525e6dcf891a2077ad82e010e2e"
+      ]
+    },
+    "BUG-217": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0efc4-aed1-7092-a678-a3749ee040a1",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "5aae70b3ae1c1a643e37ad4ef34d2ee64928347e0291417305804ae31fd04bc1"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f009-e5c9-7ac0-9df4-8cfb2355664b",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "644a7ea420d994cb8d1474842aa506f6e0c7862c61c0671ed4e4ea2500572a8e"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "cd3cbd03-4989-4c6c-8ac9-5ad140f2fa23",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "eae5b902ad2bc8c473f1f3e488b25c44aa86f77455b60446ee7cea6d8f12d40c"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "1ff0516f-2576-4a41-8084-98e10cff89fc",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "5f44865da6872c1cd128fe1b3ae49ea83466f01afd00b0a252bffca8cba9dd5b"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "8d561915-89ae-4448-ba6b-1f96a4b29354",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "f027e6d82bed5a5dba97203a2e803b2b3ba4bafab43aa52f0e70b80dd1d70770"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "b277112f-af3a-4fdf-ba87-8656c042261d",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "7008b3a8b3d385d2abe11d94c7916aacca18a93be428b4fe561e13016f079ddb"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "2cd45fb3-ed22-4319-9cf1-d7834bc2297e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "c05f14a4c93b225b0372b8930e5b907348b3c824d3d0b5d06a4b7c2789180b2a"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "996b9433-d92a-4f7e-b2a4-9da28fe15b9a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "a905c8ae573e08fd3818ae55daea7a3844e290e4db695f0319b9d9fa10512cd5"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "0da9279f-02f8-4917-9358-e354c5ac0c66",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "0b57138d7a32cb0806277aea6b183198a35417263fde6a59765901b1416d6378"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "f6129491-8551-4023-85b6-d0acfb81b82b",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "bbe35a7603c89afe6f9a970cb60970954cec42a381db5badf59c8380ad68d9fa"
+        }
+      ],
+      "prose_lines": [
+        "5aae70b3ae1c1a643e37ad4ef34d2ee64928347e0291417305804ae31fd04bc1",
+        "644a7ea420d994cb8d1474842aa506f6e0c7862c61c0671ed4e4ea2500572a8e",
+        "eae5b902ad2bc8c473f1f3e488b25c44aa86f77455b60446ee7cea6d8f12d40c",
+        "5f44865da6872c1cd128fe1b3ae49ea83466f01afd00b0a252bffca8cba9dd5b",
+        "f027e6d82bed5a5dba97203a2e803b2b3ba4bafab43aa52f0e70b80dd1d70770",
+        "7008b3a8b3d385d2abe11d94c7916aacca18a93be428b4fe561e13016f079ddb",
+        "c05f14a4c93b225b0372b8930e5b907348b3c824d3d0b5d06a4b7c2789180b2a",
+        "a905c8ae573e08fd3818ae55daea7a3844e290e4db695f0319b9d9fa10512cd5",
+        "0b57138d7a32cb0806277aea6b183198a35417263fde6a59765901b1416d6378",
+        "c6c95606ca82dd331f5835b9272bb68f0ce3e154bd43c30b357b3f99c8de9636",
+        "f5b7585f3e228c10ba74367a87c2e04aab464c4a795ab4e7a2220743213d2e19",
+        "f84f34c0895c8b1279cc105eff1c863435533f526959dae9de5c4e690358ca5c",
+        "bbe35a7603c89afe6f9a970cb60970954cec42a381db5badf59c8380ad68d9fa"
+      ]
+    },
+    "BUG-218": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "17362c57-c2a8-40d6-99b2-d375189f3d75",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "69253688753aac446260d8cf3683df338d897429a2b8c8bac6acb10eef057633"
+        }
+      ],
+      "prose_lines": [
+        "e0367d01ed3558afcc6539a114ebf1c8aab7d23961b651a86d5d576a230f582c",
+        "13fa705e0e9f0ff1220ea88921ca82e16e824f63060d905887dfd51708082525",
+        "2d560d6f16d3ff5f2dff0cb2de98125dffa143208568ff39b19e59cea63f1991",
+        "7be763fcb32c9e2a8cd96dfd72c92fda950618b6a54febe081367757a5e46b5b",
+        "4552d447e80ee8876a60bd884b691a088495c4c71cd8ae4cec1dda0d2086f71e",
+        "69253688753aac446260d8cf3683df338d897429a2b8c8bac6acb10eef057633"
+      ]
+    },
+    "BUG-221": {
+      "records": [],
+      "prose_lines": [
+        "761d99a8634282646d66ecd23e9d24272942f5fbc9494ec070da59da4b148e09"
+      ]
+    },
+    "BUG-225": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "cf5c222f-1ada-49d4-82da-aef4e17be110",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "0435fbb053098bbd7c22b38bc8b03d6539c5eed511817bb30313d554a4410e86"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "d5edf332-bc6a-427d-9606-6aa98dac9998",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e589ce259a5faefe771fdf52627eeb83804c9a44f72c51bd1fc3c0c4d1c252f3"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "de06419b-1a3e-4214-bf29-689d7e4b4762",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "ab5483237d5c1a74bbc572559551958aea96b4a9f2e91c5e2c969c31c60129b8"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "2fa27658-7199-4bc4-9109-cb0515fab079",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "4f9be1dff6201b619bb751f1d74c8b5e108ce10a312b67aa7102a184a638544e"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "9216cb37-aee5-4a7f-a6e2-34056eb0f637",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d6ec08706e04e44d566e88cd19f05fc592a55ce6a759a9d26533901285d2acf0"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "0aea8d9a-c8e6-446c-a02a-d61f492716e7",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "544b544ef1e764e30ba80dd543c390075d7f5e90571be15eebc9e74329fbf0fc"
+        }
+      ],
+      "prose_lines": [
+        "83298b1e8b2ca6e607214e16a9a9d5e42ae3696c94704a3bbfd08e24e9b33bbd",
+        "24a9131b358b007ebabf3772927ffba9b6eeaa646b09084c891ec66a6e2d4b4e",
+        "15cad905d8c0cc6924fa4ea72a5e88ac98875ebbeca66de4350ad7a13ca0c654",
+        "3cb20019941a5b5a79d9a2316c2d537deb92178197989abaf4245c0e3374d296",
+        "8c0021193b57ae9c3ba7de499797bce5e46d9f9daed9b5ba50edfcd3079bec1f",
+        "bef8b7acad17604ff76817a6ce75f9b56a34e1598ac24c2177ef8049ee59f800",
+        "71eeb498a2e082442abeaf8a924d436ac3f93be24553c5be1b67cbbc3e0b3049",
+        "3003fa8497d365571d8577b2173946a1b906e6b3529dd5bbfd29d0ea8b660921",
+        "6a3b217c58b3e6c7e90ab749f2634e27c799087909892b3acaed82f498003a0b",
+        "2b513dbe9f9418b34502d76ad552f2037e50f462418ff5ca9a143e6929c87594",
+        "19cbbe34dff0b8fa33f65470c73d3b6996c1ebe7f42a3085bc802827d56d1623",
+        "21d4d054bf1e6749e151a6543379022b42f4caf9da2d4518b84b7d60c9231742",
+        "16641cd84d4953f368ef4060094573d346aee31554dd71d1d11ac5b4905d79a2",
+        "0435fbb053098bbd7c22b38bc8b03d6539c5eed511817bb30313d554a4410e86",
+        "e589ce259a5faefe771fdf52627eeb83804c9a44f72c51bd1fc3c0c4d1c252f3",
+        "ab5483237d5c1a74bbc572559551958aea96b4a9f2e91c5e2c969c31c60129b8",
+        "4f9be1dff6201b619bb751f1d74c8b5e108ce10a312b67aa7102a184a638544e",
+        "d6ec08706e04e44d566e88cd19f05fc592a55ce6a759a9d26533901285d2acf0",
+        "544b544ef1e764e30ba80dd543c390075d7f5e90571be15eebc9e74329fbf0fc",
+        "3e7e189875e55b9ceaf99af0417d9082a1c54e98735d3a76dfe66d30d529e41c",
+        "27e7e75d2ec8691562dd5ef127f131948de526271ee7c762c4ba67c611a6fd3e",
+        "95c7fce78f0d054dfa01c282635ea7fec9974ba3929397d1e846d7dd585e2c80",
+        "14037fdf715b93f5f4d628b00fe88101814a1a0f58563608b1819e4e7057d1d6"
+      ]
+    },
+    "FEAT-049": {
+      "records": [],
+      "prose_lines": [
+        "442c035c847207068181ca11e12e251b2b7940bc1f3f42ae2aeefd8e2dbe78f4"
+      ]
+    },
+    "FEAT-061": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "91f78b9b-1911-40bc-8763-c97542496da9",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-11",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "017f236feebdef3bc5c8b95f699990ee1a75afbc76b1f5596b9731f4b5643589"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "5288429d-c0b8-4e5c-a262-c4db3c3b2722",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-11",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a6f9bcc10f0a162fd7c521e84d996425a1c2232ef736ce6f2f49eb79d280a106"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "0322f40e-2a52-440b-b106-6e84efff3a6a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-11",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "9681311f7b402845833b159499b218b1d1ef1664565a9e10eb28b4e02644f995"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "791c0681-dc9d-4e04-8d5d-fb607eb448ac",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-08-11",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6f8f7d0da8f5441bb61e2a9e9b67abd1f04bb875b3ecb4640f7891579522fe32"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "e4a9d6c9-1e5f-42c3-ab99-23ece2c7949c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-12",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d60efe43d6727f109b98a8b81b2893e9e1c071c02cdf4a4c72a8d10e1c27cf4f"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "1ab8fc96-609f-47a3-b80b-ac41db0dba54",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-12",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "383daceb6c367491aedaf615c8910e05d598b3832399fb93c964ae68b0dfb4be"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "b281aae3-f037-4c40-9ce5-43209138bbc8",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-12",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "3470f615456f0a5590904da2554e08a139a2c405d1b9675febf09f1cf9def4fd"
+        }
+      ],
+      "prose_lines": [
+        "04cec41badfc97240bebd24a8b56f2676d055f10124aa4eb34f35a4d052cf8d4",
+        "b1560a46709d35c41c505e68cedc32c47845528e6e5d7b2d6eb943272f1979ce",
+        "f5c6e4ac3123bc94405ee7f17b5d72bd7c64072ce19673eb61bb5d2029f2f96c",
+        "34fd9ba2fd2bf01d9c9155a2d5a4262f051fb6237ce8693eefd90040a57c6fe0",
+        "f1ff75759c4a5a774a844aae43acc49f7be2defbd3bfaef28bd7b1da95195cb2",
+        "18af49bbd732679956e7871eac46d641ceeb949a9e987dc93f4f17ada46fdf57",
+        "e3361000dbb57365ac03ad225eca300f39d642536952599be586dff90ec0e906",
+        "017f236feebdef3bc5c8b95f699990ee1a75afbc76b1f5596b9731f4b5643589",
+        "fa316390c1e1c51462bfe053c96cad96c32dc44d053730de9e4dba0c7dbc4115",
+        "a6f9bcc10f0a162fd7c521e84d996425a1c2232ef736ce6f2f49eb79d280a106",
+        "1a40aab3ee0cf7b8ce7bc7ca1b81367734ea6b687ac80accc66236567ef86799",
+        "9681311f7b402845833b159499b218b1d1ef1664565a9e10eb28b4e02644f995",
+        "73cdb22d072541eb6a3f2e27eb4ae844e50d73590a9602fb02c7366515744739",
+        "f40c452fca5d061ccef449624286b53ffb538955ad48a51dd788152cac370e27",
+        "6f8f7d0da8f5441bb61e2a9e9b67abd1f04bb875b3ecb4640f7891579522fe32",
+        "213405e123d8c8fed6651b0367cd45f977f34675154d4df6bbdc95249988b189",
+        "d60efe43d6727f109b98a8b81b2893e9e1c071c02cdf4a4c72a8d10e1c27cf4f",
+        "383daceb6c367491aedaf615c8910e05d598b3832399fb93c964ae68b0dfb4be",
+        "3dc9b72ab91dc5fcb6463c39c7c7a410d9c9a055bd1924d8e75ef3e3bf775e74",
+        "1f92ae97cf9872557c44ac858533fa5dbf84cd92c308b6bd6167693ebdc4edfb",
+        "3470f615456f0a5590904da2554e08a139a2c405d1b9675febf09f1cf9def4fd",
+        "ea1ae1bf54aef33c1a69d98c864c71aadad4bd425187c3178c20ffd35a613bff"
+      ]
+    },
+    "FEAT-062": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "f5f8de18-32d8-45cc-8996-1135a85c3b74",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-11",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "9b919385fd41b39d1d498b92dd0bdd96c37a2e42ca963f57640b12926f71b85a"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "9e477a62-be6d-4695-8981-88d95466d2fc",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-11",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "9609792c32aa8ed3b3d22c20efaa40c1db8832e370c0375fbcf592da3638bb45"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "87b38f59-732f-4f1b-9aec-56b6be262624",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-12",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "1c6faac6173739d2c1b2361e510495027641173271b68a9d230c523d33452113"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "175cf18f-f72c-41ae-9614-fa638fa07775",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-12",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "242f116af92761ba5771e2e5e7dff3cfd5f481d8c0505e098615bc5fbf689ef5"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "78fb3b76-6bc3-41f0-81b0-737328e704cd",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-12",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "621a07e4993bcee384c9ae37ec6540836d16f188950c4c5a5a7fff36dbb1c2c3"
+        },
+        {
+          "provider": "anthropic",
+          "model": "sonnet",
+          "run_id": "78fb3b76-6bc3-41f0-81b0-737328e704cd",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-20",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "1af061da79fdaf0deb670259184981e44d6b07f5220fe8a0d7a0ac52d4ace94e"
+        }
+      ],
+      "prose_lines": [
+        "b1d611c0f1d73809ea0f70d53be095545916f804e81bf393b95d161f15c422f2",
+        "e11f5d3e374c585b742cdf87f566589a5c5594b26350da3f0de91245cc99c168",
+        "9b919385fd41b39d1d498b92dd0bdd96c37a2e42ca963f57640b12926f71b85a",
+        "409a9b9924058cf740acaba97a63b08660f908ea305d4ffd60a4b2832d5a6314",
+        "9609792c32aa8ed3b3d22c20efaa40c1db8832e370c0375fbcf592da3638bb45",
+        "8f8a05b8c11c7720cc65f49fcc545d258a9e88a0023d2f361dd9a858702fa240",
+        "1c6faac6173739d2c1b2361e510495027641173271b68a9d230c523d33452113",
+        "242f116af92761ba5771e2e5e7dff3cfd5f481d8c0505e098615bc5fbf689ef5",
+        "621a07e4993bcee384c9ae37ec6540836d16f188950c4c5a5a7fff36dbb1c2c3",
+        "7523891be280489a6718c33e56e399415d369b0ca84da2f2149852391358fe16",
+        "1af061da79fdaf0deb670259184981e44d6b07f5220fe8a0d7a0ac52d4ace94e"
+      ]
+    },
+    "FEAT-063": {
+      "records": [],
+      "prose_lines": [
+        "c9427fe2f65a1a96d2752ab9279fda6da3c9ffe6dabc2b2b5fabc321c44d50d2",
+        "606d8eb0d003c4d79787a18dad4f30e2056c5d897f1348f50b090eef3be62fd9"
+      ]
+    },
+    "FEAT-081": {
+      "records": [],
+      "prose_lines": [
+        "6726476c6524adf2adb898a50f97d179fd0eb8c9aec41b121134d5c1c861ff6e"
+      ]
+    },
+    "FEAT-082": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01b6c-0f4a-73d2-8a6b-8c5b97af8e6b",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "97b36319a04e42c14069e5e049fc72bfc3d03bd55988ace9e53e9013549aa729"
+        }
+      ],
+      "prose_lines": [
+        "97b36319a04e42c14069e5e049fc72bfc3d03bd55988ace9e53e9013549aa729"
+      ]
+    },
+    "FEAT-087": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01bcc-bb73-70d2-aea5-9978d08744e5",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-20",
+          "harness": null,
+          "line_sha256": "235aca271987431f890973b4eef9e6ca13693a22e731a354587b7d95c965e41e"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01bb0-4090-74a3-a680-2b9c52a3d8c1",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-20",
+          "harness": null,
+          "line_sha256": "d37e5880b6878bfd9197ae1faa2acf645dc4d34cba20cf7f38e3bbe1abc0f138"
+        }
+      ],
+      "prose_lines": [
+        "235aca271987431f890973b4eef9e6ca13693a22e731a354587b7d95c965e41e",
+        "d37e5880b6878bfd9197ae1faa2acf645dc4d34cba20cf7f38e3bbe1abc0f138"
+      ]
+    },
+    "FEAT-089": {
+      "records": [],
+      "prose_lines": [
+        "95ef04eddbfa6fe666bf7a81125bc50d9671d9577df243e8cdbf4fdbd2bc2d30"
+      ]
+    },
+    "FEAT-090": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "4798ed4a-5693-4a15-be17-75b6bc7c8d38",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "1637f4350309439f168dd427a7ceec08fcd2bbcb149510cdd08b91bd59a5b3a7"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a014f0-a22e-7873-bc02-a1f8e7ba22e0",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "70eaebada6ff08de2e0e0fdd8d661a26464dea6c86af43ff845c1c8281fa6632"
+        }
+      ],
+      "prose_lines": [
+        "1637f4350309439f168dd427a7ceec08fcd2bbcb149510cdd08b91bd59a5b3a7",
+        "70eaebada6ff08de2e0e0fdd8d661a26464dea6c86af43ff845c1c8281fa6632"
+      ]
+    },
+    "FEAT-091": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0165f-d558-7a32-8c4b-46ddab42d27f",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f96f38080890c88b25fa65c28cb6a37ee85bccfe1d27b17fb2bee43abcc723d3"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01671-5827-7eb1-9727-00eb555562be",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "d69d2b76a9d167f96b120c0a4e5a050ff20062763a524949c23d55cd313d8d7a"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0168c-8f17-78a3-a991-2012c3ccea35",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "cc6f761bf9811772696faabc0cf3c2bc78c796c30852a3550ca7e9cc1030fa31"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0169e-4e37-7872-8204-144fd1d5f499",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e1d8733033d2ca626d732461a0aeb17136ab3968726b93db41aa97449653d5eb"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016b1-a697-7f32-81d6-a932cc21487d",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a316f78cc8d681424fdf60e777b895e331505b936b9909ae6d3c5206b13b4137"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016c4-642a-7ae3-8949-589461cfb0c5",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "b73d669c8525a97474cff87f887fa2e3df0f11299c7afd590e00e7a3cf552848"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016d5-89bf-7161-ae59-febc1429d1f0",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "64cdd50e2920e3da7975da75fbb3d45e12596aec1c765b20832c844450fc8c33"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a016e8-b5d4-7ff1-8bc3-8c14e3374927",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "8eb0ba8940845ae159fada41ff2f4af324ad8554f4412b04f3de54c0d0af5368"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01701-b0cc-7523-8a3a-aad2052c12fc",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "74b85244418a84b7c2a18e2705d4b7183ee9223164be38960ca6674e18a7014b"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01734-3ca0-7743-9ec2-080eac4c506c",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "c6c5d553c6a9dbdc5cd5e780757987093108d5ed0c90614e973b076c605da98f"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a01738-f736-7b83-b614-f4dd839d7b3c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6570743fa0d4250bc24bc5f557663faaa8881865ccaa1318fb208735129d8c3d"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "9ee724de-f3b0-46a6-b9bb-38a5cb8aa5b8",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "1c5b3a3d6d544e638815b460eeb0bba3cdf815ebe4abf24fc59fa6596b62de83"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "bf1737c7-fe35-457c-a620-7c815373630a",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "654748edb1241fa4ce5329fcd6e6876928a88ae0d703e80b55870c1fe2ffdc02"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "7c1e3870-d90a-41e3-a3f9-21e3631dd0f2",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "40e471e0323a2bd5fc3f11550e701457feb0df6484763f7c48e91e5049313038"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ed58-d54b-7b52-a44e-93c19de8b549",
+          "verdict": "invalid",
+          "raw_verdict": "invalid",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "2f38faa72b183fcb623162a080da47576fd777fcc323f5ae521b79793dbcdd2d"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ee7c-04d6-78b1-9c5e-c6eb0982c7c8",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e62803ce204dfa1ad69c203a8b89c21b977149d5a4efd9a7e0c13fa6202244dc"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0efa4-6695-74d0-976b-ef5f88a5d26c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "7ab902d4f368a92a9521029a1a44822a5a015a9fe3fd41ca78ddc93918648e3f"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f0b8-6d57-7c41-81d3-bc29ce3a80aa",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "950e20fe8a4d5875d3216404c1ef709b265758cb4a99e0bf66778bf58b603d4e"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f249-d59e-72e0-867d-57472f402f7f",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "fa26820eeb4f069cd0820fad21c23f7ae9b416efb53099f8d856717945641de8"
+        }
+      ],
+      "prose_lines": [
+        "fedc1a00225785c6086dfe24fa10894b1ae6e30e58a984c156fc52439b1973d5",
+        "a0f93c206c6eb4c39b1834372d6a048793732bc1f91f952bf068ab3b8330dbc3",
+        "f96f38080890c88b25fa65c28cb6a37ee85bccfe1d27b17fb2bee43abcc723d3",
+        "764741c6aaf1fb169e14336ff542436cb471d37d757b777387a6b5f34cadfd48",
+        "d69d2b76a9d167f96b120c0a4e5a050ff20062763a524949c23d55cd313d8d7a",
+        "cc6f761bf9811772696faabc0cf3c2bc78c796c30852a3550ca7e9cc1030fa31",
+        "e1d8733033d2ca626d732461a0aeb17136ab3968726b93db41aa97449653d5eb",
+        "a316f78cc8d681424fdf60e777b895e331505b936b9909ae6d3c5206b13b4137",
+        "b73d669c8525a97474cff87f887fa2e3df0f11299c7afd590e00e7a3cf552848",
+        "64cdd50e2920e3da7975da75fbb3d45e12596aec1c765b20832c844450fc8c33",
+        "8eb0ba8940845ae159fada41ff2f4af324ad8554f4412b04f3de54c0d0af5368",
+        "fe16be2c7141b91ca212ae7157376272ee9afcde58b09624b9b13ec0a0007da5",
+        "74b85244418a84b7c2a18e2705d4b7183ee9223164be38960ca6674e18a7014b",
+        "8534760b97b222b7d0f19b25b7f7fc7d7841342894ed80fd66cf72b061ca0b0f",
+        "c6c5d553c6a9dbdc5cd5e780757987093108d5ed0c90614e973b076c605da98f",
+        "6570743fa0d4250bc24bc5f557663faaa8881865ccaa1318fb208735129d8c3d",
+        "474b85f6f7ab1f16e9bcf141c14a4b1345c5c29368c90b0cb41d304c7f43d9d4",
+        "1c5b3a3d6d544e638815b460eeb0bba3cdf815ebe4abf24fc59fa6596b62de83",
+        "39807890559340598ad307eb9d3c4bd54f60d15dc2ce989fe270982ac1411f73",
+        "654748edb1241fa4ce5329fcd6e6876928a88ae0d703e80b55870c1fe2ffdc02",
+        "40e471e0323a2bd5fc3f11550e701457feb0df6484763f7c48e91e5049313038",
+        "d4d345788049b04a05872119a9f4132bb302ac1c754839fde32dfaf70fd26965",
+        "2f38faa72b183fcb623162a080da47576fd777fcc323f5ae521b79793dbcdd2d",
+        "e62803ce204dfa1ad69c203a8b89c21b977149d5a4efd9a7e0c13fa6202244dc",
+        "9a3a3e3666b9530be9a2348606f9e878ce6737451756df9ef56bb2e640e1fa9e",
+        "7ab902d4f368a92a9521029a1a44822a5a015a9fe3fd41ca78ddc93918648e3f",
+        "950e20fe8a4d5875d3216404c1ef709b265758cb4a99e0bf66778bf58b603d4e",
+        "926bad694d2656b1feb5612ec4a033105bd4f4bcb5be1dc23fd0d31b1ad1015d",
+        "fa26820eeb4f069cd0820fad21c23f7ae9b416efb53099f8d856717945641de8"
+      ]
+    },
+    "FEAT-094": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "45e67009-d3dc-4945-bef8-38eed961469e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-08-20",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "76a0e60fe77c353046331b5907cc7c3b7c699391f9d08054870eccca6b3bf532"
+        }
+      ],
+      "prose_lines": [
+        "99471861149eeb5d5c69ab46f7f4c4072fa091fc80e2add6b39ef38efec10181",
+        "76a0e60fe77c353046331b5907cc7c3b7c699391f9d08054870eccca6b3bf532"
+      ]
+    },
+    "FEAT-096": {
+      "records": [],
+      "prose_lines": [
+        "47b76281844f302ec5e8b7d272043bdd6fea6cf24e16e96a6b935a48578a1034"
+      ]
+    },
+    "FEAT-102": {
+      "records": [],
+      "prose_lines": [
+        "88869fa057fe0d8d2d3083445e81f44f2f35c534e36019f629446f63b71ef809"
+      ]
+    },
+    "FEAT-106": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ec00-7ab9-7da2-a286-5c69bbeddf93",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a4767cf0d5f0e4440080b9ec9589affb225cbfc018369192bc9118d8d3ef4ad8"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ed53-3c8f-7480-b2bb-aad5a7318629",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f3d924a8fe1f288093de95402cf1f6c25f167e41be084199f8b3aff551e49645"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "b0e62aed-e1ef-4a65-96a1-293729c6ba16",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-09-29",
+          "harness": null,
+          "line_sha256": "bedf4e261514ce23e283f4925e6cc69d381b21405b3782ae68b75c571439cfdd"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ee91-aa36-7760-85a4-f856ffac17a1",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "a1970f8dec315727734686ef5b7afd7040165718f61f606cd11b737b6b071d16"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0f251-8ae5-7c81-937d-d77adc313a70",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "fcef3260f2660b1b66818f2da1e97586b0810e319f57b042ce021169fd323d5c"
+        }
+      ],
+      "prose_lines": [
+        "a4767cf0d5f0e4440080b9ec9589affb225cbfc018369192bc9118d8d3ef4ad8",
+        "f3d924a8fe1f288093de95402cf1f6c25f167e41be084199f8b3aff551e49645",
+        "6b2f0bd9215b68f3ea58b2699a5e82accd315d3bbffb198f6a60fb56f51b274e",
+        "bedf4e261514ce23e283f4925e6cc69d381b21405b3782ae68b75c571439cfdd",
+        "a1970f8dec315727734686ef5b7afd7040165718f61f606cd11b737b6b071d16",
+        "fcef3260f2660b1b66818f2da1e97586b0810e319f57b042ce021169fd323d5c"
+      ]
+    },
+    "FEAT-108": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ec10-59da-77d2-8be3-d9f41fb626c0",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "f06ad21e99e4aa57ed2343833ca691c2dbbd4e4fbc131d4a8ed42a14e54a9065"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ed5f-ef63-7330-8c01-951c26256482",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "8e742db92783f1f3260c13fc79cef6d5c7e14abd6a7439dcabc4a5694362820f"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ee8c-6bc6-7722-88df-58cda25facc4",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "6bba2668e7d04670bb0f51246e7a9288affb339868b52be998edf2ee57ad21c1"
+        }
+      ],
+      "prose_lines": [
+        "7c73c9b611f957ea86ee7fe3a45f3526c9c27ccccdff147c6ff4e6e946a794db",
+        "f06ad21e99e4aa57ed2343833ca691c2dbbd4e4fbc131d4a8ed42a14e54a9065",
+        "d4d69aceae659172663786702797eeb817d5d570c45b3f929aa0ad37604c3b51",
+        "8e742db92783f1f3260c13fc79cef6d5c7e14abd6a7439dcabc4a5694362820f",
+        "6bba2668e7d04670bb0f51246e7a9288affb339868b52be998edf2ee57ad21c1"
+      ]
+    },
+    "FEAT-115": {
+      "records": [],
+      "prose_lines": [
+        "79af692f7056f5c7e8934367173bc0c91d5c355e43d8724cd7ce66e92ce8729d"
+      ]
+    },
+    "FEAT-125": {
+      "records": [],
+      "prose_lines": [
+        "7cda008f8dfe5fd30ad34b8a30dbbe2dd9545849feae979d0374012ff017d73a"
+      ]
+    },
+    "FEAT-126": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "25cdb5ae-e435-476a-9b31-0e758ad26bb5",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "7041c316f8c231e4621d2abe6f2add903681b9a0d9816fe429e36cd840be508f"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "2cfc221a-a1e5-436d-9f00-c8f732b37090",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "3c0389902e8e3ee9bf8de02018ddd5e709fac3ab301e4f40603a25838504f467"
+        }
+      ],
+      "prose_lines": [
+        "7041c316f8c231e4621d2abe6f2add903681b9a0d9816fe429e36cd840be508f",
+        "3c0389902e8e3ee9bf8de02018ddd5e709fac3ab301e4f40603a25838504f467"
+      ]
+    },
+    "FEAT-127": {
+      "records": [],
+      "prose_lines": [
+        "b717ef02cf2fe873a691df05f9c503c6a4a0ce2efaddd285c660f9c916e2b6c4"
+      ]
+    },
+    "FEAT-128": {
+      "records": [],
+      "prose_lines": [
+        "6195611170cfb79b01f280360b6e441383086dc0b33693185eb6e5321731e2ac"
+      ]
+    },
+    "FEAT-130": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a07918-d020-7ae2-9866-c706f5b3f131",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-07",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "4d560f1879b05a49130a6ec85adc47b1b77e6c65d931e9bd91eb1861d3c5d26b"
+        }
+      ],
+      "prose_lines": [
+        "4d560f1879b05a49130a6ec85adc47b1b77e6c65d931e9bd91eb1861d3c5d26b",
+        "91c5dda8214015078c92b617b290d80f5017e2cc5fba36f680cdbf5dd3f01fc2",
+        "d3f352c44307cb7729e228cea54fab0f336a7b2ffd9545b657afff34bfc1400a",
+        "b6f251bbac4e311b82402501668d514f3164ad2589f47b9634787b3994f25976",
+        "c9305dc369a706e462b018b6300c36949be0dec52a37280e0e6b1240c6c6764b",
+        "5dea8c1e3badfef1b1b32bfe82e2c3da4673f65777e167e3aa8fb6b63adea7ca"
+      ]
+    },
+    "FEAT-131": {
+      "records": [],
+      "prose_lines": [
+        "61b0431693fd468641747aca96514fef79c7cc5d69043dbc428e2bdfa4e70c4b",
+        "be408f59143ee2a9c2ab9b633ecefb519eee277a9456d97a680c172600aa4f4e",
+        "816458f3ae9503559dc70f0ddd502d8d3d18a0784ed723c7a256d8af7b6d858d"
+      ]
+    },
+    "FEAT-132": {
+      "records": [],
+      "prose_lines": [
+        "eeb28ff5b069fa11317f8ea30b0098b0abd5dc6914d7ab4a9a8e4b785487edf8",
+        "d8a7ca8d1a90a5c246abf7b08acbf1929e5385cef5867bea5f86ebefdaa316d4"
+      ]
+    },
+    "FEAT-133": {
+      "records": [],
+      "prose_lines": [
+        "726ddc68e14cec86a55fe11fc1247d2edfd76abe5a73b62a257c7b5c8a25c5ec"
+      ]
+    },
+    "FEAT-134": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ec09-60c9-71e0-9d37-0fc2927bee6b",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "ff329893d4101b26a4887781ea484767a02207b00018efc84467a3374211c4b8"
+        }
+      ],
+      "prose_lines": [
+        "cfcad6ea5668512b8598d7ee6ac15d7e2ff8da7a6ea147a4e4792628b373aeab",
+        "ff329893d4101b26a4887781ea484767a02207b00018efc84467a3374211c4b8"
+      ]
+    },
+    "FEAT-135": {
+      "records": [],
+      "prose_lines": [
+        "3303b1676911ed0bb99c50b381ed25f9bcafe9e36c69746068ca25d9ca46b51d",
+        "7aaafa4a30a1e51d9102d1fd1016b49a11c147a96494a4c36227dca143c93e06",
+        "e2a7ed6f9af13e2930f3eec8a5c3457de271e4908ef659c528a856e2ccce0ffe"
+      ]
+    },
+    "FEAT-139": {
+      "records": [],
+      "prose_lines": [
+        "71f1fe03e09d6aeca64485cbb48a67a3245c54e9cbde4e03caacc54090c4ad54",
+        "754cf7bcbe8b0a9401d0931f674304e5f8c27a44feb7ddf42ddcd1192f9d9104",
+        "719d6c5aed943c2f1744c9ea017cc6224a369f720e80de3daf8fe36fe045e701",
+        "0e62bde47d7d283f96a2f616b498e24bc1bdca07a4cbf32352edf39f31b73583",
+        "bbab40fc5eec224ec3fe4cf67aa3afeb41c3d3061dffbf3b2a548da87ca3c36d",
+        "371a8dd27f715bb7109ac952b02ef03096e23f54f15cb27f1e2f49e365f1e4b2",
+        "8aee13dea343e69aa5825f1b34075bff1d7e0c84905302708b1fa4868d0ba964",
+        "61fc11934f1fb8b537a0fbf7ee848344a39646585da7b51ec431d5430cdeb891",
+        "e98c6df11992a3e78028e9308816f4b369facb32d9c7e6169b325f1c6a1fe177",
+        "bdac0d368b139055bdca5e42f2be626c396febc181f84191f1aabcd8d94288eb",
+        "1ef0bbf27393f28035833051ae51c42944a3a8b9c02f7bc0d68ee9614cc0b001",
+        "41f7144d13f3e3936392f5ec3b3a24d08198429b9f08bd0caac25c4aab401c58",
+        "e45b2c2a5c624706ccbd4c5102732bd50639845a03bff99d5e8e087b1d5395d3"
+      ]
+    },
+    "FEAT-140": {
+      "records": [],
+      "prose_lines": [
+        "2c7a33010970330a824ee600d2aca3d3440b3759696271aaaaeae947968d0374"
+      ]
+    },
+    "FEAT-142": {
+      "records": [],
+      "prose_lines": [
+        "eedfea805666bd5662750c4151f96157313b616cc1d2da941b0d20ddeb391d4c"
+      ]
+    },
+    "FEAT-143": {
+      "records": [],
+      "prose_lines": [
+        "6fd00bd7884caef1c2494c2bf6479895cbde8660316ce5f044ba1bc7987e83bd"
+      ]
+    },
+    "FEAT-144": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0a739-542c-7a81-a856-a8e60b435c11",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-16",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "07161ce5551925ef9ac485bdef706df4d527ee6ffd545a6d96b33d0aa69c534a"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "97800f97-5b3d-492a-acd8-33dfb82b0e2e",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-16",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "0cbf2e0ce5748539fbc85df74029679c06c4ebc3e74d6a41cd1c3425c81fdcb1"
+        }
+      ],
+      "prose_lines": [
+        "e136e98b8de848e909c79775ca111138f6aeea1c3927b577e4c7deccfa36f967",
+        "07161ce5551925ef9ac485bdef706df4d527ee6ffd545a6d96b33d0aa69c534a",
+        "0b40ca4315f16ab22df2978108a5365e36cdef7f3eff0b0e0adc6f975a2c0d91",
+        "3670e2007461ca2ddda4fbcd2ae0f1c422c141bb732ed45998e98728e1004352",
+        "c96372baee3125b129a9120ca51792652b691474bf4e74a09b6dd11cb8653da7",
+        "0cbf2e0ce5748539fbc85df74029679c06c4ebc3e74d6a41cd1c3425c81fdcb1"
+      ]
+    },
+    "FEAT-145": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "3e2d3330-78a2-422b-8499-cff50288ea69",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "23ca94f783dd3f7ff75dc27488d46cc5de46f009610537ca85ba82946bd38711"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "11a7fabe-2584-49d7-86ce-3a307a31e3a9",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "37a1792426f89e1205f4ec540f52a40c481e8de148c5cd337ba02d8a21663c3d"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "661f619e-d768-4b33-a008-6f18b61be8d1",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "bed389f902debbcc0c25e73d1b2369f103168242c4ce42ca3bc233b3fd0ea34f"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "fdb40678-ee14-41bc-8a56-9360132afec2",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-18",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e9867652d566dcbd2d37bbb86196d739cb7a88e422de75d8ce8b9666d25a453c"
+        }
+      ],
+      "prose_lines": [
+        "23ca94f783dd3f7ff75dc27488d46cc5de46f009610537ca85ba82946bd38711",
+        "37a1792426f89e1205f4ec540f52a40c481e8de148c5cd337ba02d8a21663c3d",
+        "bed389f902debbcc0c25e73d1b2369f103168242c4ce42ca3bc233b3fd0ea34f",
+        "e9867652d566dcbd2d37bbb86196d739cb7a88e422de75d8ce8b9666d25a453c"
+      ]
+    },
+    "FEAT-146": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "ef020037-e216-4a21-b0dd-d71e35b5a585",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-19",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "b48ceda1ee12602361d0c1c5c308676c6c412639e9c1872ea26ee256c8633bec"
+        }
+      ],
+      "prose_lines": [
+        "b48ceda1ee12602361d0c1c5c308676c6c412639e9c1872ea26ee256c8633bec"
+      ]
+    },
+    "FEAT-147": {
+      "records": [],
+      "prose_lines": [
+        "6e18047843bd912e3d6f73c1bf5de307049c00b37dc0f33827a282d627eaee05"
+      ]
+    },
+    "FEAT-149": {
+      "records": [],
+      "prose_lines": [
+        "f2e3508d37ed1d0ae944e6c6bd48da99e6cefd1d36718ed7aeceeb1cf1feaa71",
+        "671e57d34f950d2cb43a7534c295c0dfea0b345d54c2d667a87a53d4325bea46",
+        "8ca19b518f2ac079b06fcfc5f73705b6badfbe9544859912b82512b2385641fe"
+      ]
+    },
+    "FEAT-150": {
+      "records": [],
+      "prose_lines": [
+        "2bef02c6de46453a4608927555f32cd483b2167e9c4e06f2e32c2faa5996d1a2"
+      ]
+    },
+    "FEAT-151": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d2ef-8eb3-70f1-88f9-03da61b21473",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "cb14f170eb364626de69cd0559ee45704fea4f1fb6306c1982b6994ac15a722c"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d305-86d4-79d3-b241-011482c8ee94",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "64aede11e50b6381e229480a2788e29022655b174a07948e32715607b521a584"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d31b-4738-7553-9c6a-51d186adb473",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "21f89bcdde2fae33abfd89c628aaf28f561fc8d744828c2dea9754572f73897a"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "86cbbfd2-99ce-4b6a-be20-16545b0e6448",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "560b6fcbdad476cfda606e7571267aa6380ff1ba1ce32af56101ec1a39572d5c"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "12676d1d-6e9e-418b-a1e2-a7176966dce2",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "e238325ffdfb18098bf96ffff252ff563cb820db9a9a07a7dc79decd43c5d1c7"
+        }
+      ],
+      "prose_lines": [
+        "0d3162af3277a690d0ce6fbb014584671a1dbc1d93c3c477116115e70123318c",
+        "cb14f170eb364626de69cd0559ee45704fea4f1fb6306c1982b6994ac15a722c",
+        "4f94324e85e65a3b0e37f5a0dd6de3de7bfdd9254158c8e0d74253110363865a",
+        "64aede11e50b6381e229480a2788e29022655b174a07948e32715607b521a584",
+        "21f89bcdde2fae33abfd89c628aaf28f561fc8d744828c2dea9754572f73897a",
+        "d16cf8294866eac60d3d1144b2642f7e29acd531802dad654b0ca52ecc132374",
+        "93012ec5c287e957d89f64b746c1f8ff7dcd40913af737122d272e6e5bc01175",
+        "560b6fcbdad476cfda606e7571267aa6380ff1ba1ce32af56101ec1a39572d5c",
+        "40cdea795f1b27a1ff8aac16e7e1bfc1d065054096252d90e68a416df8da62d6",
+        "e238325ffdfb18098bf96ffff252ff563cb820db9a9a07a7dc79decd43c5d1c7"
+      ]
+    },
+    "FEAT-152": {
+      "records": [
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d30d-eb59-7950-a869-49ca99b32c01",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "b69511a7ab22bb978f9b8aaee439c55545dea517872396408cfff5d4a9026046"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d31d-4401-7e43-834b-81c325cd0c31",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "13736b5ae709dbbb0d5558395b1a9cdb3c6def3a095827ececba12a9c3939250"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d335-f008-7cb3-85f2-b3dc667ddad7",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs --working-tree",
+          "line_sha256": "af1bf2c5c541f2120ddb4c70ac4a31f7e386acf5fbdc8201155f2db9fcaa61a6"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d34c-7ccd-71b3-9488-d2bd9793bd80",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "beba830e87ffbaa5158c257446f2c3aed2385caeccc4d06ff074ffcdb4281416"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0d3a2-70be-7643-9b72-cb3574c6cee4",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-24",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "92192bfa05a0bda83bd49ba67045509a433e5604a488af42c7274ca0df9572da"
+        }
+      ],
+      "prose_lines": [
+        "ff577e33abed27e97d37477e4525433d4b47e5d05bc392b806a2e773508fd5ec",
+        "43557616654cfea64d299914174604b5a937fa9c2f263f14194e6b6b069be8da",
+        "b69511a7ab22bb978f9b8aaee439c55545dea517872396408cfff5d4a9026046",
+        "de31829a2172071d730ed06be19e11568e2499af53a686b76070aaf903ac3cce",
+        "577ae4b5ef4277ddaae17dc188910c83e3de9d78bd0ac58a96f25eca91a48c07",
+        "13736b5ae709dbbb0d5558395b1a9cdb3c6def3a095827ececba12a9c3939250",
+        "11bd1d67134ba74553f8ada37c1aeeded545d5dd6912196f70a24da73c315ed1",
+        "15e95b046141e02621fd98230f3949c25dcd8e2e711faf0f28bde411487b1d39",
+        "af1bf2c5c541f2120ddb4c70ac4a31f7e386acf5fbdc8201155f2db9fcaa61a6",
+        "5fdfd6f83f6a0fab2e2a48aa716d102c88a215cf65105aac0013183f0a865913",
+        "dfd6bc40208585fdab057e562788658cb6f67e14d28bf3fee3f982a950d6ac9e",
+        "beba830e87ffbaa5158c257446f2c3aed2385caeccc4d06ff074ffcdb4281416",
+        "e7d407cd41895e27b55cc8fdc50133c3f4cce315ff29b557c2e408085147a097",
+        "5c811d741fce9e00c2101d5dd3b90c690d7315bc76218a009ff4d0309583c852",
+        "92192bfa05a0bda83bd49ba67045509a433e5604a488af42c7274ca0df9572da"
+      ]
+    },
+    "FEAT-153": {
+      "records": [],
+      "prose_lines": [
+        "0eb95ca808af5c33caa8943b266551e80eeff27b394af6b90124800d6ca25182",
+        "b932cf2d43eb5792cea19efcd442221633de51952d27d7c7cce6bbd0a20b0df9",
+        "808a8691ad3eabe47ab6563f54b87f5e8d8fde5d70a3e4210d4260f21e1b415d",
+        "39c621e9272fa70023d8af04bf4a18db37d3feedd3b17e55d7f680ef5cf56f2e",
+        "c82cfc71a68b3430b429aa1af5d1a311ce87e44d41aaf29dd5140b19e9eed91e",
+        "d2b98294837614da87eff4a154bcac2a2a279b3cf7c4b29da8ceaad04ab97468",
+        "bd5f78143adf6018270cd32caec83b1584ea37d551ef84b8ea6ea3c0043baa06",
+        "bd5c0a725fda8ea9a826a5a1e74842ef17b7657366bc4a95f4183bc1cac1c3d4",
+        "c02447a3a56376e77e47458b6432c86fadff46fb54cbe331cdf1f611257119fd",
+        "f00cd4255378df09f9ce38056ed0b0d6799a4be58dc45c4511cfca1de322f81c",
+        "124bda8cc52557502d56096add6089364097834a29d041ef3c4e059a58595bcc",
+        "0c27aaea2129e2da9590952238339ee054bede2ee1295544bc473120f136902d",
+        "d4eb90e8105a4e1c82437cf971c5894651c76fc90f9978ce51819840023bbb42"
+      ]
+    },
+    "FEAT-154": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "bfaa5172-3bbe-4851-a83f-3fa88611e491",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-28",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "edffbfe0dc39378d34f215f9513ac87db7b534e01b582c4f8fa18d1ca6b92726"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "234fa2ac-582f-469c-b795-25213d933f21",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "edffbfe0dc39378d34f215f9513ac87db7b534e01b582c4f8fa18d1ca6b92726"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "f195fc23-0a08-4f41-aa5b-2b0e76327f05",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "0f42b725aecbffe6297636152d046c76a5f96a284d3de6f48645ffbfff6121b1"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "c6633ec7-6f03-4d63-87cb-ac5a616e84b3",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": "scripts/independent-verify.mjs",
+          "line_sha256": "8046dc19239a7d86159a60abe54a2fb23c262cab891e49d540bd45588be5ab04"
+        }
+      ],
+      "prose_lines": [
+        "fec280da4266d8eeca72564aa4ec51a55d3168a5785332423a5334d60c6905c8",
+        "edffbfe0dc39378d34f215f9513ac87db7b534e01b582c4f8fa18d1ca6b92726",
+        "0f42b725aecbffe6297636152d046c76a5f96a284d3de6f48645ffbfff6121b1",
+        "8046dc19239a7d86159a60abe54a2fb23c262cab891e49d540bd45588be5ab04"
+      ]
+    },
+    "FEAT-155": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "08cef3b3-09cf-40c1-8d0d-b46530366b41",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": null,
+          "harness": "scripts/dispatch.mjs --cwd",
+          "line_sha256": "d890d19eb4af1e6e3fc72a8857bb5a69969d6434c3811ce26737ea4e290a2a72"
+        },
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "bc04f563-cd33-4ee0-a854-10a30e2c5cd5",
+          "verdict": "invalid",
+          "raw_verdict": null,
+          "verdict_on": "2026-09-29",
+          "harness": null,
+          "line_sha256": "3fd301831a6a6bee27b096fb991eb16b98ef3a7c136c28568a6e22092126a23f"
+        }
+      ],
+      "prose_lines": [
+        "d890d19eb4af1e6e3fc72a8857bb5a69969d6434c3811ce26737ea4e290a2a72",
+        "51c690f21b44e5c99c87789b6f6c82b1d58d3812dda1281f9a985c660eef6622",
+        "3fd301831a6a6bee27b096fb991eb16b98ef3a7c136c28568a6e22092126a23f",
+        "0e8b4411cd3df254198172feb42a4f062d21e9b4f204ddfa1ff213877b6a2130",
+        "7761419e8cde7845a4d48065016671e744cdd6319230b1952af0c3183987964b",
+        "6f6e86243191dec402a9e6e8da0841ecdd8979616665f98d479ba2fafdb184d1",
+        "17b123f41261b61674dc212ab7ffd0dcdb68c8b3dbdb30e6d62b7a385be7f9c2"
+      ]
+    },
+    "FEAT-156": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": null,
+          "run_id": "5dbd7d8d-c79a-4fe8-b95c-66e30242f61b",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-29",
+          "harness": null,
+          "line_sha256": "8f8fbecf9441b6d5e8a26b7661709fc9eb85649f5d611d0d74e6bd9b28da295f"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ed77-316d-7040-8541-ab7abaa52b6e",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": null,
+          "line_sha256": "57045cf21d3dbff2ebea046d521245f9623a547e7c81b4645ca786b733a96d45"
+        },
+        {
+          "provider": "openai",
+          "model": null,
+          "run_id": "01a0ed84-4a79-7822-997d-58f98296c34c",
+          "verdict": "broken",
+          "raw_verdict": "broken",
+          "verdict_on": "2026-09-29",
+          "harness": null,
+          "line_sha256": "6c0d4e3524d348d843ddd3bad983355b7bbcb34ca1de5849d300049d4de1a03e"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "a97be22c-704c-4d8d-8553-d5adc6e79aa1",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-29",
+          "harness": null,
+          "line_sha256": "7e7d247e805fae1a2ffa7806b74c94d9ed6a846d2d990c46f7e19b885685f047"
+        }
+      ],
+      "prose_lines": [
+        "977df370dff149335d581b7bff189ea471c0776c33914db6c449d23084a4087c",
+        "fc3845b26b48d226ec23c1ac0548aa7096afb50e6a879969bd0cc8f224fd878a",
+        "5dd74d47318fb69c1a44d610143bcf6491d8bf4d3f98c3b123b2cce77424756e",
+        "09f60dab3adf8d5f4a5568c6020118a584351974a59a1291073e1170e04b5259",
+        "8f8fbecf9441b6d5e8a26b7661709fc9eb85649f5d611d0d74e6bd9b28da295f",
+        "57045cf21d3dbff2ebea046d521245f9623a547e7c81b4645ca786b733a96d45",
+        "6c0d4e3524d348d843ddd3bad983355b7bbcb34ca1de5849d300049d4de1a03e",
+        "9645e6ee4179051241def35fe57d06035580c787bccc8e07c4cc92890392b591",
+        "8f927c7b2314948eabf3fe0e698b4411421602f8fc958a0ac6a318513aa1e7f5",
+        "7e7d247e805fae1a2ffa7806b74c94d9ed6a846d2d990c46f7e19b885685f047"
+      ]
+    },
+    "FEAT-157": {
+      "records": [],
+      "prose_lines": [
+        "f8548e81e3ee82d18cd50cc13fd71030ec13d58e1079de1ee4e3db67d1567e2f",
+        "a4bfb87eb85d7cb8f2b844bb9fb3428a6b5860d9c6088e845b6ed7a064c68ded",
+        "13ba3191f1a0d6663f5b2ef8f9a6f22fe809e9f2600d90fc1bbce848c654414f"
+      ]
+    },
+    "FEAT-158": {
+      "records": [
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "6c21946d-4c75-46dc-b60e-7f45534143f4",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": "scripts/lib/docker-sandbox.mjs",
+          "line_sha256": "035944da9e55684232008ac032341ab58ed719e56a15f19004864d65f43e1d8f"
+        },
+        {
+          "provider": "anthropic",
+          "model": "claude-opus-5-5",
+          "run_id": "0a2689b7-0bf0-4ab0-834b-70d3b8d8fc35",
+          "verdict": "holds",
+          "raw_verdict": "holds",
+          "verdict_on": "2026-09-30",
+          "harness": null,
+          "line_sha256": "52e1f15c6f48bd8265089c4b1bc2aec03f2bdbe172b974c1a36006d9d8e517b0"
+        }
+      ],
+      "prose_lines": [
+        "7b8e2b408e774fcc72bf4ec99eefb7475010068df5ab4fa371cfee501a9f625d",
+        "035944da9e55684232008ac032341ab58ed719e56a15f19004864d65f43e1d8f",
+        "bbf8d9ca20a5e4f880ccc89a0bb6a488259cb93c7d9bb0b99a2849ce61bef905",
+        "52e1f15c6f48bd8265089c4b1bc2aec03f2bdbe172b974c1a36006d9d8e517b0",
+        "cc8df67172b3834e33332b5e96afb49d410556e019a04e437abe7d32fc43eed0"
+      ]
+    }
+  },
+  "rederived": {
+    "on": "2026-09-30",
+    "by": "BUG-225 round 4",
+    "why": "fixed legacy reader: VERDICT token under emphasis, one verdict word in the run parenthetical, label annotation/emphasis; restricted to lines known to the previous snapshot",
+    "previous_sha256": "767b3380f50f534844d0df16010908522dad136084214219bd7490dca4df96fc"
+  }
+}

@@ -1,6 +1,7 @@
 # BUG-183 — three CSS custom properties are referenced but never defined, leaving the Add-account flow with no focus ring
 
-- **Status:** OPEN
+- **Status:** VERIFIED
+- **Verified-by:** dispatch anthropic run 2a07f574-4a38-4f9f-be00-68d2384a54a8 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: HOLDS (same-provider fallback, grey Anthropic account; OpenAI window exhausted)
 - **Severity:** medium (a shipped flow becomes keyboard-unusable; not a crash)
 - **Area:** styles / drawer
 - **Reported:** 2026-09-18 by user (found auditing settings for FEAT-146)
@@ -360,3 +361,11 @@ var(--ink-2); outline-offset: 2px; border-radius: 5px; }`) applies instead.
 - **Verdict: DONE against its own acceptance criteria.** The verify lane's REFUTE
   gap (suite reddens on HEAD) is closed. Independent clean-room verify not
   required — low-risk test-only change, no product code moved.
+
+### 2026-09-29 — clean-room verify DRIVER (round 1, class=verify) — VERDICT: HOLDS (VALID)
+- **What was verified:** the ticket's requirement — `public/styles.css` DEFINES `--warn`/`--focus`/`--danger` on all four theme paths (`--warn` adapts light≠dark), and `.gsel`/`.gtext`/`.gbtn`, `.modelfree-set` and the add-account inputs reference only tokens that exist and show a visible focus ring on an opaque background in both themes. Verified against the committed tree at `b11e71f` (contains the CSS fix from `ca672b9` AND the de-staled suite from `b11e71f`; bootable — post-dates `seed-sources.mjs`).
+- **Command (same-provider fallback, grey Anthropic account; OpenAI window exhausted):**
+  `CLAUDE_CONFIG_DIR=<grey account> node scripts/independent-verify.mjs --repo ~/projects/orchard --range ca672b9~1..b11e71f --requirement @<req-file> --run "node scripts/verify-bug-183-css-tokens.mjs" --test-file scripts/verify-bug-183-css-tokens.mjs --provider anthropic --timeout-min 18 --max-diff-bytes 120000`
+- **Verdict: HOLDS — VERDICT-CONTRACT: VALID** (exit 0). The clean-room verifier (a) re-ran the fixer's suite → `ALL PASS`, exit 0; (b) ran the non-vacuity twin `--pre-fix` → every section (sweep, parity, tokens, rings, backgrounds) bites, so the suite is not vacuous; (c) built its OWN adversarial harness the fixer's fixture does not cover — the real `.smodal > .smodal-box` wrapper, `.gcustom.joined` rows, `.acctlogin`, the `.modelfree-row` input sibling, measured on ALL FOUR theme paths INCLUDING attribute-less `system-dark`, checking ring + opaque background on every control (`.modelfree-set` included), that each token resolves without falling back, that `--warn` matches on both light paths / both dark paths but differs light↔dark, and that NO legacy token (`--ink-1`/`--bg-2`/`--line-1`/`--line-2`/`--accent`) is used anywhere → `ADVERSARIAL PASS`.
+- **Verifier's could-not-test (handoff for the closer):** the real `drawer.js` DOM inside a booted Orchard server (controls were hand-built to match `drawer.js`; a live-only rule could still remove a ring); real keyboard-Tab `:focus-visible` (forced over CDP, not reached by pressing Tab), so drawn ring thickness unmeasured; whether the global `:focus-visible` ring clears 3:1 against the control's own fill vs the parent ground. None of these is a defect found — all are scope the clean room could not reach.
+- **Status set to VERIFIED** (VALID + HOLDS). Verified-by line added to the header.

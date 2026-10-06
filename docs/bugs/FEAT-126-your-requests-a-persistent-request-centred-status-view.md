@@ -1,6 +1,6 @@
 # FEAT-126 — "Your requests": a persistent, request-centred status view
 
-- **Status:** OPEN — design approved by the user; this ticket is the build spec. plan+review round 1 (finding). No product code written this round. Recommended path: the request↔work binding is a DECLARED fact owned by the orchestrator (Dispatch `request=` key + an `orchard-request` block), never derived from chat; the surface holds only that binding and JOINS every status live from the board / liveness / outcomes so it cannot go stale.
+- **Status:** OPEN (priority — data-loss) — round-3/4 fixes CONFIRMED to hold (run 2cfc221a); the round-5 wrong-shape fix's declared cases + 2 of 3 not-enumerated variants CONFIRMED to hold (clean-room verify 2026-09-30, run 8e8e3761, VERDICT BROKEN VALID), BUT THREE NEW data-loss/integrity defects remain in `src/server/requests.ts`: (1) quarantine renames onto `<file>.corrupt-<ms>` with no existence check → a same-name pre-existing quarantine file is silently overwritten; (2) two quarantines in the same millisecond destroy the first corrupt evidence; (3) the 4 MB guard is stat-then-unbounded-read (TOCTOU) → a file that grows past 4 MB between stat and read is fully read/parsed, bypassing the guard. NOT VERIFIED; handoff in the latest Activity-log entry. Finding 3b (`board.ts` `doneIds`) still open/off-limits. — design approved by the user; this ticket is the build spec. plan+review round 1 (finding). No product code written this round. Recommended path: the request↔work binding is a DECLARED fact owned by the orchestrator (Dispatch `request=` key + an `orchard-request` block), never derived from chat; the surface holds only that binding and JOINS every status live from the board / liveness / outcomes so it cannot go stale.
 - **Severity:** high (this is the dominant defect an independent OpenAI review found in the session: the absence of a persistent state surface separate from the chat stream)
 - **Area:** Web UI — the right-hand rail (`public/app.js` renderRail / renderRailSummary, `public/styles.css`) · server store (new `requests.ts`, `src/server/index.ts` board endpoint) · dispatch grammar (`scripts/lib/cost-model.mjs`) · injected declaration surface (`docs/prompts/RESPONSE_FORMAT.md`)
 - **Reported:** 2026-09-05 by user (via an independent OpenAI review of this session)
@@ -445,3 +445,522 @@ end-to-end proof. `npm run gate` PASS (leak + check-nul + typecheck, exit 0).
   `docs/prompts/RESPONSE_FORMAT.md`, `scripts/verify-feat-126-requests-store.mjs`,
   `scripts/lib/cost-model.d.mts` (new), `scripts/verify-feat-126-e2e.mjs` (new),
   `feat126-r2-requests-{light,dark}.png` (new), and this ticket.
+
+### 2026-09-29 — clean-room independent verify (round 1, verifying) — VERDICT: BROKEN (VALID)
+
+- **Requirement verified:** the request↔work binding is a DECLARED fact (fence-inert;
+  a QUOTED declaration declares nothing; two DISAGREEING declarations yield a gap, never
+  a guess); the store holds ONLY the binding with NO status; every status cell is JOINED
+  LIVE from the board / running snapshot / outcomes with execution and completion as two
+  independent channels (0 running + open ticket is NEVER done); per-lane attribution
+  lights only the request a live lane is declared to; honest degradation; and a torn/
+  partial store read yields the last intact ledger or empty, never a throw/wrong value.
+  Full text: `/tmp/req-FEAT-126.txt`.
+- **Command (exact):** `CLAUDE_CONFIG_DIR=<grey account 5a23b2f0…> node
+  scripts/independent-verify.mjs --repo ~/projects/orchard --range 561ad6b
+  --requirement @/tmp/req-FEAT-126.txt --run "node scripts/verify-feat-126-requests-store.mjs
+  && node scripts/verify-feat-126-e2e.mjs" --test-file scripts/verify-feat-126-requests-store.mjs
+  --test-file scripts/verify-feat-126-e2e.mjs --provider anthropic --timeout-min 8
+  --max-diff-bytes 120000`. Range note: the FEAT-126 commit 131cce8 could NOT be a
+  clean-room head — the current BUG-182 boot-stub guard requires `src/server/seed-sources.mjs`,
+  which was extracted from `templates.ts` only later (ca672b9), so a room built from the
+  pre-consolidation 131cce8 tree refuses to boot. `561ad6b` is the earliest bootable tree
+  that carries BOTH the FEAT-126 core AND the FEAT-153 `rqSig` fix (present in that commit's
+  `public/app.js`, confirmed); `requests.ts` / `requests-view.js` are byte-identical to
+  131cce8, so the exported FEAT-126 code is the shipping code. The 1.3 MB diff truncated to
+  120 KB is CONTEXT only — the verdict is driven by re-running the fixer tests and
+  adversarial cases against the exported tree.
+- **Verdict: BROKEN, contract VALID.** Fixer store suite re-run 26/26 (manifest
+  fae4bec5375d). Adversarial case `fence-attrs-conflict-olddone-sibling-unk` (manifest
+  155840e59439) surfaced SIX defects, several of them the ticket's OWN named falsifiers:
+  - **FINDING (keystone / fence-inert):** an `orchard-request` quoted inside a multi-token
+    info-string fence (```` ```markdown title=… ````) still DECLARES — `FENCE_OPEN_RE` in
+    `requests.ts extractRequestBlocks` accepts only a single-token info string, so the outer
+    fence never "opens" and the inner block is parsed top-level (REQ-999 lands in the store).
+  - **FINDING (keystone / conflict→gap):** two DISAGREEING `orchard-request` blocks for one
+    id in one turn produce a GUESS not a gap — `observeAssistantText` upserts both, last-wins
+    ("Title two", [FEAT-2]). Violates "a guess is not a fact".
+  - **FINDING (falsifier: view disagrees with the board):** `indexBoardTickets` reads only
+    `board.doneToday`, and `readBoard` puts a Done row there only if the file changed in the
+    last 24h — so a ticket verified 3 days ago renders `open · 1 missing` (state missing),
+    not done. Answered-awaiting tickets are also never indexed.
+  - **FINDING (falsifier: sibling attribution):** a lane declared to REQ-8 lights REQ-7 as
+    running — the coarse fallback in `executionOf` gates REQ-7's 🤖 owner cell on session-wide
+    liveness, which the REQ-8 lane supplies.
+  - **FINDING (unconfirmed motion):** with `snap=null`, `executionOf` returns `running` for
+    any 🤖 ticket, claiming motion no snapshot confirms (the rqSig gate discriminates snap
+    shape but this join path still asserts running on unknown liveness).
+  - **FINDING (DATA-LOSS, concurrent write):** a write that lands on a torn read WIPES the
+    store — `readAll` returns `[]` on a truncated file and `upsert` then writes `[newRecord]`
+    over it, erasing every other session's bindings (sess-G 3 → 0).
+- **Could-not-test (verifier):** the e2e chain (`verify-feat-126-e2e.mjs`) aborted with
+  "no start ack" — the scratch server refused the session start with `runtime-check-pending`
+  (the test starts a session before the boot runtime check completes); an ENVIRONMENT/harness
+  timing issue in the room, not a product defect, but the e2e chain was not re-proven this
+  pass. The rail DOM (`renderRailRequests` and whether the rqSig gate repaints on board
+  change) was NOT rendered in a real browser (no headless browser in the clean room), so the
+  rqSig fix's runtime behaviour is unverified here — only `executionOf`'s code path was read.
+  The outcomes-ledger "deaths" channel is joined nowhere in `requests-view.js`. A true
+  two-process concurrent writer of `requests.json` was not simulated (only single-process
+  torn-read-then-write).
+- **Status:** left OPEN — six valid defects are the handoff. The keystone strictnesses
+  (fence-inert, conflict→gap) and the board-agreement invariant are breached, plus a
+  cross-session data-loss on torn-read-then-write. NOT VERIFIED.
+- **Verified-by:** dispatch anthropic run 25cdb5ae-e435-476a-9b31-0e758ad26bb5 (clean-room,
+  `scripts/independent-verify.mjs`) — VERDICT: BROKEN. Same-provider fallback, grey account;
+  OpenAI window exhausted and Default and the personal account parked — decorrelation reduced
+  (author-provider anthropic), noted per VERIFY.md #5.
+
+### 2026-09-29 — fix lane (fixing, round 3, class=plan+review) — DATA-LOSS defect only
+
+Scope was the round-1 verifier's DATA-LOSS finding (cross-session wipe in the
+store's write path). The other five findings (fence-inert, conflict→gap, board
+staleness via `doneToday`, sibling attribution, unconfirmed-motion) were NOT in
+this charter and remain OPEN — untouched, still the handoff for a later round.
+
+- **Reproduced FIRST (both, against the current tree).** A standalone repro drove
+  the REAL `src/server/requests.ts`: (A) six OS processes, each the server for its
+  own session, writing the shared store at once — 2–3 of 6 sessions fully wiped,
+  30–39 records dropped; (B) the verifier's torn-store case, cross-session — a
+  brand-new session opening a request while the store is torn wiped both prior
+  sessions (G 3→0, H 2→0).
+
+- **Invariant (one testable sentence):** an upsert for one session must never
+  remove or overwrite another session's bindings, even when the store is being
+  written concurrently or is transiently unreadable.
+
+- **Root cause.** The store was ONE shared `requests.json` mutated read-all →
+  write-all. `readAll()` returned `[]` for BOTH "no store yet" AND "couldn't read
+  it right now" (torn/partial), and `upsert` then rewrote the WHOLE array — so a
+  concurrent write from a stale read (lost update), or any write following a torn
+  read, clobbered every other session. The read path documented tolerating torn
+  reads; the write path turned that tolerance into a total wipe.
+
+- **Fix (design, not a guard; confined to `requests.ts`).** ONE FILE PER SESSION,
+  `dataDir()/requests/<enc(sessionId)>.json`, each holding only that session's
+  records. A write for session A can only ever open A's file, so disturbing
+  session B is STRUCTURALLY impossible (ARCH-010 — no shared array to clobber, no
+  second place to hold a different answer). Each session has one writer, so its
+  own file is never torn by a concurrent write of itself. Belt-and-braces for the
+  torn half: `readSession` distinguishes "no file (ENOENT → genuinely empty, safe
+  to create)" from "present but unreadable (torn/corrupt)", and `upsert` REFUSES
+  to write over an unreadable file (returns null — a gap that re-emits and
+  self-heals, never a clobber). Public API unchanged (`listForSession`,
+  `observeAssistantText`, `upsert`), so `index.ts` and `agent-bridge.ts` need no
+  edit — verified those two carry OTHER sessions' uncommitted work and were NOT
+  touched. No live `requests.json` exists on this machine, so no migration; a
+  legacy shared file (if any) is simply ignored by the per-session reader.
+
+- **Verification.** `scripts/verify-feat-126-requests-store.mjs` 28/28 (26 prior +
+  2 new: a real multi-process concurrent-writers test and a deterministic
+  cross-session torn-store test; layout-dependent assertions updated to the
+  per-session path). MUST-FAIL proven, anchored to the committed pre-fix tree
+  (`a977e76`): running the suite against `git show HEAD:src/server/requests.ts`
+  reddens both new DATA-LOSS tests (torn-store wipe; concurrent counts
+  `[0,6,0,0,3,1]` — 3 sessions lost data); reverting to the fix → 28/28. Command
+  for the standalone repro: `REQ_FILE=<prefix copy> node /tmp/repro-feat126-dataloss.mjs`
+  fails 2/2 on pre-fix, passes 2/2 on the fix. Anti-regression: `verify-feat-153-board-grid.mjs`
+  35/35 (exercises `observeAssistantText` through the real app path). `npm run gate`
+  and `npm run board:check` run below.
+
+- **Could-not-run (honest).** `verify-feat-126-e2e.mjs` FATALs at `startSession`
+  with "no start ack" — the SAME environment/harness timing issue (scratch server
+  `runtime-check-pending`) the round-1 verifier hit; it aborts BEFORE any store
+  interaction, so it is unrelated to this change, not a regression. The rail DOM
+  was not re-rendered in a browser this lane (data-store fix only; no
+  `requests-view.js` change).
+
+- **Skeptic flag / high-stakes.** DATA-LOSS + a concurrently-written store — an
+  independent clean-room re-verify is warranted before VERIFIED (this lane's
+  self-authored suite is not the last word). arch-watch: `decisions.ts` and
+  `outcomes.ts` carry the SAME read-all/write-all-one-shared-file shape and the
+  same latent defect (lower-frequency); flagged in the `requests.ts` header, not
+  fixed here.
+
+- **Left unstaged for the user** (no git writes): `src/server/requests.ts`,
+  `scripts/verify-feat-126-requests-store.mjs`, and this ticket. Ticket left OPEN;
+  NOT marked VERIFIED.
+
+- **Symptom of a deeper design flaw?** yes → the shared-single-file read-all/
+  write-all store pattern (also in `decisions.ts`/`outcomes.ts`) is the recurring
+  shape; noted for arch-watch rather than filed this lane (scope was the FEAT-126
+  data-loss defect).
+
+### 2026-09-29 — fix lane (fixing, round 4, class=plan+review) — the other five r1 findings
+
+Continued in-lane on the round-1 verifier's OTHER five findings (the data-loss
+one was round 3). Each reproduced first (`/tmp/repro-feat126-r4.mjs`, 6/6 fail on
+current tree), then fixed where confined to files carrying no other session's
+uncommitted edits. Re-checked `git status`: OFF-LIMITS this lane = `public/app.js`,
+`src/server/index.ts`, `src/server/agent-bridge.ts`, AND `src/server/board.ts`
+(all carry other sessions' work). Editable: `src/server/requests.ts`,
+`public/lib/requests-view.js`, and the (clean) verify scripts.
+
+| # | finding | outcome |
+|---|---|---|
+| 1 | fence-inert: an `orchard-request` quoted inside a MULTI-token info-string fence (```` ```markdown title=… ````) still declared | **fixed** — `requests.ts` |
+| 2 | conflict→gap: two DISAGREEING blocks for one id in one turn were a last-wins guess | **fixed** — `requests.ts` |
+| 3a | answered-awaiting tickets were never indexed → read `missing` | **fixed** — `requests-view.js` |
+| 3b | a ticket Done >24h ago is absent from the board payload → reads `missing` | **needs `board.ts`** (off-limits) — hunk below |
+| 4 | sibling attribution: a lane declared to REQ-8 lit REQ-7 as running | **fixed** — `requests-view.js` |
+| 5 | unconfirmed motion: `snap=null` + a 🤖 ticket read running | **fixed** — `requests-view.js` |
+
+- **Finding 1.** `FENCE_OPEN_RE` anchored `[ \t]*$` right after a single info
+  token, so a multi-token info string did not match and the fence never opened —
+  its body leaked as top-level. Now the regex captures the whole info string and
+  keys on its FIRST token; every fence's body stays inert, a real single-token
+  `orchard-request` still opens.
+- **Finding 2.** `parseRequestsFromText` now resolves per id WITHIN one turn:
+  identical repeats collapse to one; two declarations that disagree (title/source/
+  tickets-as-a-set) drop that id entirely — a gap, not a guess. Cross-turn
+  latest-wins is untouched (that is separate `observeAssistantText` calls).
+- **Findings 3a/4/5** all in `requests-view.js`. 3a: `indexBoardTickets` now also
+  indexes `board.answeredAwaiting` (state `answered`; not `done`, so completion is
+  unchanged, but it is no longer `missing`). 4+5: the coarse execution fallback now
+  reads liveness from UNATTRIBUTED lanes only (`coarseLiveness`), so a sibling's
+  attributed lane cannot light an unrelated request (4); and it returns `idle` when
+  there is NO snapshot (`known:false`) rather than asserting running on unknown
+  liveness (5).
+
+- **Finding 3b — EXACT hunk needed (left for the orchestrator; `board.ts` off-limits).**
+  The board payload's only Done list is `doneToday`, gated to 24h in `readBoard`
+  (`board.ts:723-729`), so a ticket verified days ago is in no list and the join
+  reports it `missing`. Fix has two parts:
+  1. `src/server/board.ts` — add `doneIds: string[]` to the `Board` interface
+     (near `doneToday` at :166) and to both the empty and populated literals
+     (:650, :659); in the Done branch (:723-730) push `id` to `board.doneIds`
+     UNCONDITIONALLY (before/around the `if (recent)` that gates `doneToday`).
+  2. `public/lib/requests-view.js` — in `indexBoardTickets`, after the
+     `add(board?.doneToday, 'done')` line, add:
+     `for (const id of board?.doneIds ?? []) if (id && !map.has(id)) map.set(id, { state: 'done', item: { id } });`
+     (A comment already marks this spot.) I did NOT add the client half now — it
+     would be dead code until the payload carries the field.
+
+- **Verification.** `scripts/verify-feat-126-requests-store.mjs` now 33/33 (28 +
+  5 new FINDING tests for 1, 2, 3a, 4, 5). MUST-FAIL proven, anchored to the
+  committed pre-fix tree: running the suite against `git show HEAD:` copies of BOTH
+  `requests.ts` and `requests-view.js` reddens all five FINDING tests (9 failed
+  total incl. the round-3 data-loss/layout tests); restoring the fix → 33/33. The
+  standalone `/tmp/repro-feat126-r4.mjs` goes 6-fail → all-pass. Anti-regression:
+  `verify-feat-153-board-grid.mjs` 35/35.
+- **Regressed-from FEAT-153 (r5).** Finding 5's correct fix (no motion on unknown
+  liveness) invalidated FEAT-153 board-grid check `(z)`, which had asserted
+  `snap=null` → "1 running" as its observable — i.e. it encoded the exact
+  unconfirmed-motion behaviour the r1 verify flagged. I updated `(z)` to encode the
+  corrected behaviour and re-prove its real guarantee (the exec badge repaints
+  across liveness changes: null→idle → confirmed-lane→running → empty-poll→idle).
+  The rqSig repaint mechanism in `app.js` was NOT touched.
+- **Could-not-run.** `verify-feat-126-e2e.mjs` still FATALs at `startSession`
+  ("no start ack") — the same pre-existing environment/harness `runtime-check-pending`
+  timing (round-1 verify + round-3 saw it); aborts before any store/parse access,
+  not a regression.
+- **Skeptic flag.** Findings touch the declaration recogniser (fence grammar +
+  conflict resolution) and the execution-attribution join — an independent
+  clean-room re-verify is warranted before VERIFIED. Ticket stays OPEN.
+- **Left unstaged for the user** (no git writes): `src/server/requests.ts`,
+  `public/lib/requests-view.js`, `scripts/verify-feat-126-requests-store.mjs`,
+  `scripts/verify-feat-153-board-grid.mjs`, and this ticket. NOT marked VERIFIED.
+
+### 2026-09-30 — clean-room independent verify (round 3/4 fixes, verifying) — VERDICT: BROKEN (VALID)
+
+Verified the UNCOMMITTED round-3 (per-session store, data-loss) + round-4 (the
+other four r1 findings: fence-inert multi-token, conflict→gap, 3a answered-awaiting,
+sibling attribution, unconfirmed motion) fixes via `scripts/independent-verify.mjs`
+`--working-tree`. Requirement framed as confirming a software fix (`/tmp/req-FEAT-126.txt`):
+cross-session loss under concurrency; a torn/unreadable per-session file (cut at
+many offsets); session ids that encode to colliding or path-traversing filenames;
+upgrade from a legacy shared `requests.json`; the recogniser changes (multi-token
+info-string fences; conflict→gap) with near-miss/nested/escaped fences; and an
+INDEPENDENT judgement of the round-4 change to FEAT-153 check `(z)`. Finding 3b
+(needs `board.ts`, off-limits) was explicitly excluded and NOT counted.
+
+- **Command (exact):** `CLAUDE_CONFIG_DIR=<second anthropic acct, not the fixer> node scripts/independent-verify.mjs
+  --repo ~/projects/orchard --working-tree --requirement @/tmp/req-FEAT-126.txt
+  --run "node scripts/verify-feat-126-requests-store.mjs && node scripts/verify-feat-153-board-grid.mjs"
+  --test-file scripts/verify-feat-126-requests-store.mjs --test-file scripts/verify-feat-153-board-grid.mjs
+  --provider anthropic --timeout-min 22 --verdict-out /tmp/verdict-FEAT-126.txt`. Exit 1
+  (BROKEN, contract VALID).
+
+- **Everything the round-3/4 charter targeted HOLDS.** Fixer suite re-run 33/33 +
+  board-grid 35/35 (manifest d7422207d531, exit 0). Adversarial
+  `concurrent-8proc-traversal-ids-truncate` (manifest 81ab77225611, exit 0) confirmed
+  the fixes independently, on cases the fixer's fixtures do not cover:
+  - **A (concurrency):** 8 concurrent OS-process writers each retained all 25 of their
+    own records `[25×8]` — no cross-session drop. Round-3 data-loss fix HOLDS.
+  - **B (torn read):** 1898 cut offsets of a unicode-heavy store — read never
+    threw/wrong, write DECLINED, the torn file was left byte-for-byte unchanged, the
+    sibling session file untouched, the restored intact file read all 6.
+  - **C (id→filename):** 19 awkward ids (`../`, `/abs/path`, `a/b`, `..`, `.`, `C:\x`,
+    NUL, `é`, `x.json`, …) each read exactly their own record; every file stayed INSIDE
+    the store dir; no escape file; 19 distinct ids → 19 distinct files.
+  - **D (legacy upgrade):** a live session keeps its per-session data with a legacy
+    `requests.json` present; no legacy record mis-attributed; a torn legacy file does
+    not crash reads/writes.
+  - **E (recogniser fences):** multi-token ```` ```markdown title=note ````, `~~~ md a=b`,
+    4-backtick outer, nested, and near-miss (`orchard-request-v2`, `orchard-requests`,
+    `orchard-request{`) + escaped all stayed INERT; single-token/tilde/4-backtick real
+    blocks still declare. Round-4 finding-1 fix HOLDS.
+  - **F (conflict→gap):** differing title/source/ticket-set → gap; A,B,A → gap (no
+    re-resolve); identical repeat collapses to one; a conflict on one id leaves the
+    sibling intact; the store keeps its prior binding (no last-wins guess). Round-4
+    finding-2 fix HOLDS.
+  - **FEAT-153 (z) judged INDEPENDENTLY:** at-least-as-strong, NOT weakened — the
+    rewritten check asserts idle→running→idle in order, so a badge that stopped
+    repainting across liveness changes would still fail at the running or idle step.
+    (Verifier could not `git show` the old (z) in the clean room — no `.git`; judged
+    from the new assertion's structure. A reviewer with the diff should confirm.)
+
+- **NEW valid defect → VERDICT BROKEN (data-loss-adjacent; NOT a round-3/4 regression,
+  a pre-existing gap the per-session rework did not close).** Adversarial
+  `corrupt-wrong-shape-session-file` (manifest fdae12babe90, exit 1): the round-3 torn
+  handling only distinguishes ENOENT vs unparseable; it does NOT validate the SHAPE of a
+  file that IS valid JSON. So a session file that is well-formed JSON of the wrong shape
+  (`[null,…]`, `[1]`, `[{}]`, `["x"]`, records missing `createdAt`) is treated as readable
+  and:
+  - `listForSession` THROWS `TypeError: …reading 'localeCompare'` when ≥2 entries lack
+    `createdAt`, and returns junk (`1`, `{}`, `"x"`) as records otherwise
+    (`src/server/requests.ts` ~:126 readSession accept-any-array, ~:334 sort).
+  - `upsert`/`observeAssistantText` THROW `TypeError: …reading 'id'` on a `null` entry
+    (~:281).
+  - `upsert` OVERWRITES (clobbers) a wrong-shape file such as `[{}]` / `[1]` instead of
+    declining (~:302) — the same "never clobber a corrupt file" guarantee round-3 aimed
+    at, breached for the valid-JSON-wrong-shape case (round-3 only proved it for
+    cut-prefix corruption). Harm class: data-loss + throw on read.
+
+- **Could-not-test (verifier, honest):** case-insensitive-FS filename collisions (Linux
+  room only); two processes writing the SAME session id at once (design assumes one writer
+  per session; requirement covered cross-session only); ENAMETOOLONG session ids (reads
+  return empty / writes decline → silent drop, untested); the FEAT-153 (z) old-vs-new diff
+  (no `.git` in room). Rail DOM not rendered (no headless browser in the clean room).
+
+- **Status:** left OPEN. All round-3/4 targeted fixes are independently CONFIRMED to hold;
+  the ticket is not VERIFIED because a NEW data-loss-adjacent defect (valid-JSON-wrong-shape
+  session file → throw on read + clobber on write) remains. HANDOFF: extend `readSession`
+  in `src/server/requests.ts` to validate array-of-well-formed-records (each an object with
+  a string `id`; treat a wrong-shape-but-parseable file as UNREADABLE, so `upsert` declines
+  rather than clobbers and `listForSession` returns empty rather than throwing) — the same
+  ENOENT-vs-unreadable discipline round-3 introduced, extended from "parses" to "parses AND
+  is the right shape". Finding 3b (`board.ts` `doneIds`) still open, still off-limits here.
+- **Verified-by:** dispatch anthropic run 2cfc221a-a1e5-436d-9f00-c8f732b37090 (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`) — VERDICT: BROKEN (contract VALID).
+  Same-provider fallback, a SECOND anthropic account (DIFFERENT from the fixer's; primary near
+  cap, openai parked) — decorrelation reduced (author-provider anthropic), noted per
+  VERIFY.md #5.
+
+### 2026-09-30 — fix lane (fixing, round 5, class=fix) — wrong-shape session file
+
+Fixed the round-5 verify's one new defect (run 2cfc221a): a session file that is
+valid JSON of the WRONG SHAPE slipped past `readSession`'s parse-only check, so a
+read THREW (sorting a row with no `createdAt`) and a write CLOBBERED it. Round-3/4
+fixes were all independently confirmed to hold; this is the last open code defect
+(3b — `board.ts doneIds` — is still off-limits here). Re-checked `git status`:
+`requests.ts` carries only my own round-3/4/5 edits (no other session); editable.
+`decisions.ts`/`outcomes.ts` are OTHER sessions' work (BUG-202) — left untouched,
+convention matched.
+
+- **Root cause.** `readSession` returned `ok:true` for ANY `Array.isArray(parsed)`,
+  so an array of malformed rows became "records": `listForSession`'s
+  `.sort((a,b)=>a.createdAt.localeCompare…)` threw on a row lacking `createdAt`,
+  and `upsert` merged/overwrote the file — the "never clobber a corrupt file"
+  guarantee (round-3) breached for the valid-JSON-wrong-shape case it never proved.
+
+- **Fix (confined to `requests.ts`).** `readSession` now validates the FULL shape:
+  the top level must be an array and EVERY element a well-formed `RequestRecord`
+  (`isRequestRecord` — object, non-empty string `id`/`stationSessionId`, string
+  `title`, string|null `projectId`/`source`, string[] `tickets`, string
+  `createdAt`/`updatedAt`; unknown extra fields tolerated for forward-compat). One
+  bad row ⇒ the WHOLE file is `ok:false` (corrupt). A size guard
+  (`statSync` before read, `MAX_SESSION_FILE_BYTES = 4 MB`) refuses a "huge file"
+  WITHOUT reading it (no OOM/stall). A wrong-shape file is now treated exactly like
+  torn/unreadable: `listForSession` returns empty and NEVER throws.
+- **Quarantine + self-heal (BUG-202 convention).** `upsert` no longer refuses-and-
+  returns-null on `!ok`; it QUARANTINES the corrupt bytes (`renameSync` to
+  `<file>.corrupt-<ts>`, one-shot, preserves bytes) then writes fresh. Because
+  requests re-emit latest-wins, the session self-heals — unlike pure-refuse, a
+  persistently wrong-shape file no longer blocks the session forever. Matches
+  `decisions.ts`/`outcomes.ts` `quarantineCorruptStore`. `upsert` now always
+  returns a `RequestRecord` (never null); `observeAssistantText` simplified.
+
+- **Verification.** `scripts/verify-feat-126-requests-store.mjs` now 39/39 (33 +
+  6 WRONG-SHAPE cases: array-instead-of-object, top-level object, missing field,
+  wrong field types, null, huge >4 MB — each asserts read empty+no-throw, write
+  quarantines+self-heals with bytes preserved verbatim, and the sibling session
+  survives). The 33 prior tests stay green. MUST-FAIL proven against a synthesized
+  pre-round-5 baseline (readSession reverted to parse-only, no size guard):
+  `REQ_FILE=<baseline> node /tmp/repro-feat126-r5.mjs` reddens every shape case
+  (garbage records returned / clobbered / huge threw); the fix passes all 18
+  checks. Anti-regression: `verify-feat-153-board-grid.mjs` 35/35 (still exercises
+  `observeAssistantText`). `npm run gate` + `board:check` run below.
+- **Could-not-run.** `verify-feat-126-e2e.mjs` still FATALs pre-store at
+  `startSession` ("no start ack") — the same pre-existing environment/harness
+  timing seen since round 1; unrelated to this change.
+- **Skeptic flag.** Data-loss-adjacent store change — an independent clean-room
+  re-verify is warranted before VERIFIED. Ticket stays OPEN (3b still needs
+  `board.ts`).
+- **Left unstaged for the user** (no git writes): `src/server/requests.ts`,
+  `scripts/verify-feat-126-requests-store.mjs`, and this ticket. NOT VERIFIED.
+
+### 2026-09-30 — clean-room independent verify (round 5, verifying) — VERDICT: BROKEN (VALID)
+
+Verified the UNCOMMITTED round-5 wrong-shape/quarantine fix in `src/server/requests.ts`
+(full-shape validation, a 4 MB size guard, wrong-shape files quarantined not clobbered)
+via `scripts/independent-verify.mjs --working-tree`. Requirement framed as confirming a
+software fix (`/tmp/req-FEAT-126-r5.txt`): the round-5 validation correctly handles
+wrong-shape variants the fixer did NOT enumerate — extra fields on a record, valid-but-
+duplicated rows, a file that GROWS past 4 MB between the stat and the read, a quarantine-
+name COLLISION — and that quarantined bytes are preserved VERBATIM (never clobbered/
+truncated). SCOPE was round 5 only; rounds 3/4 were already confirmed by run 2cfc221a and
+were not re-litigated. Finding 3b (`board.ts` `doneIds`, off-limits) excluded.
+
+- **Command (exact):** `CLAUDE_CONFIG_DIR=<the grey account> node
+  scripts/independent-verify.mjs --repo ~/projects/orchard --working-tree
+  --requirement @/tmp/req-FEAT-126-r5.txt --run "node scripts/verify-feat-126-requests-store.mjs"
+  --test-file scripts/verify-feat-126-requests-store.mjs --provider anthropic --timeout-min 22
+  --verdict-out /tmp/verdict-FEAT-126-r5.txt`. Exit 1 (BROKEN, contract VALID). Manifest:
+  5 recorded runs.
+
+- **The fixer suite re-run HOLDS: 39/39** (manifest 3b293af12bb0, exit 0) — every declared
+  wrong-shape case (array-instead-of-object, top-level object, missing field, wrong types,
+  null, >4 MB) reads empty + no-throw, quarantines + self-heals, sibling session survives.
+
+- **Two of the three not-enumerated variants HOLD** (adversarial run 8054f8472a3a, exit 0):
+  extra-field records are accepted intact (forward-compat, not quarantined) while a record
+  missing a REQUIRED field but carrying extras is still corrupt; duplicate ids read without
+  throw and upsert is deterministic with no rows destroyed; and quarantined bytes are
+  byte-for-byte verbatim across 15 corrupt kinds (invalid UTF-8, BOM, NUL, UTF-16, empty,
+  4 MB+1, oversized-valid 5.6 MB), with the sibling session's file untouched.
+
+- **THREE NEW valid defects → VERDICT BROKEN (data-loss / data-integrity):**
+  - **FINDING (quarantine-name COLLISION → silent overwrite):** `quarantineCorruptSession`
+    (`src/server/requests.ts` ~:192-194) renames onto `<file>.corrupt-<ms timestamp>` with
+    NO existence check, so a pre-existing quarantine file of that name is silently
+    overwritten (adversarial `quarantine-name-collision`, run bad3f33c16a3, exit 1: 20,000
+    pre-existing quarantine files → count stayed 20,000, one file's earlier bytes replaced).
+  - **FINDING (same-ms double quarantine → first evidence destroyed):** two quarantines of
+    the same session within one millisecond leave a single `.corrupt-` file holding only the
+    SECOND corrupt bytes; the first quarantined bytes are destroyed with no throw and no
+    warning (same run).
+  - **FINDING (4 MB guard TOCTOU / unbounded read):** the size guard (`readSession`
+    ~:155-163) is stat-then-`readFileSync` with NO length cap on what was actually read; a
+    file 182 B at `statSync` and 7,537,781 B at read was fully read, parsed and returned as
+    40,000 records instead of being treated as unreadable, and the following upsert rewrote
+    it as a 10.2 MB live file with no quarantine (adversarial `grow-past-4mb-between-stat-
+    and-read`, run 2030b9988674, exit 1). No rows were lost in that specific case, but the
+    guard is bypassed and the OOM/stall protection it exists for does not hold under a
+    concurrent grow.
+
+- **Could-not-test (verifier, honest):** a genuinely concurrent second-process writer during
+  the stat→read window (forced deterministically by hooking `statSync` in one process); a
+  same-ms collision on the real clock (frozen `Date`); quarantine when the `rename` itself
+  fails (EACCES / read-only dir / path-is-a-directory) — the throw path in
+  `quarantineCorruptSession` and whether it strands the session is unverified; memory/stall
+  behaviour when the file grows to hundreds of MB/GB (only a 7.5 MB grow exercised, 46 ms).
+
+- **Status:** left OPEN (priority — data-loss). The round-5 fix's declared cases and two of
+  the three not-enumerated variants HOLD, but three NEW data-loss/integrity defects remain
+  (quarantine-name collision + same-ms double quarantine destroy earlier corrupt evidence;
+  the 4 MB guard is TOCTOU-bypassable). NOT VERIFIED. HANDOFF: in `src/server/requests.ts`,
+  (1) make quarantine collision-safe — never rename onto an existing name (append a counter/
+  random suffix, or O_EXCL create), so no earlier quarantined bytes are ever overwritten;
+  (2) cap the actual read — either re-check length after `readFileSync` against
+  `MAX_SESSION_FILE_BYTES` and treat an over-cap read as unreadable, or read at most N bytes,
+  so a file that grows across the stat→read window is refused rather than parsed. Finding 3b
+  (`board.ts` `doneIds`) still open, still off-limits here.
+- **Verified-by:** dispatch anthropic run 8e8e3761-1562-429e-922e-157f12c6e29d (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`) — VERDICT: BROKEN (contract VALID).
+  Same-provider fallback, the grey account (openai window parked; author-provider anthropic,
+  decorrelation reduced) — noted per VERIFY.md #5.
+
+### 2026-09-30 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 8e8e3761-1562-429e-922e-157f12c6e29d — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-09-30 — fix lane (fixing, round 6, class=fix) — quarantine/read defects → shared store-io.ts
+
+Fixed the round-6 verify's three new defects (run 8e8e3761) and, per ARCH-010,
+consolidated the quarantine + capped-read logic that requests.ts / decisions.ts /
+outcomes.ts had each grown separately into ONE owner, `src/server/store-io.ts`.
+Re-checked `git status` first: `requests.ts` carried only my own r3–r5 edits;
+`decisions.ts`/`outcomes.ts` were dirty only with BUG-202's hunks (confirmed via
+`git diff`) — this round (ticket=FEAT-126,BUG-202) is authorized to edit them.
+
+- **The three defects (all three stores shared the shape):** (1) quarantine renamed
+  onto `<file>.corrupt-<ts>` with no existence check → overwrote an earlier
+  quarantine; (2) two quarantines in one millisecond destroyed the first; (3) the
+  size guard was `statSync`-then-unbounded-`readFileSync`, bypassed by a file that
+  grows across the stat→read window.
+- **Fix — `src/server/store-io.ts` (single owner, ARCH-010):**
+  `quarantine(file, label)` reserves a unique name atomically with `O_EXCL`
+  (`Date.now()`+6 random bytes, retry on collision) then moves the bytes onto it —
+  no earlier quarantine is ever overwritten, even same-ms or cross-process.
+  `readCapped(file, max)` reads bounded by the fd (≤ `max+1` bytes), with NO
+  separate stat, so there is no TOCTOU and an over-cap file is `toobig` (refused),
+  never read unbounded. `requests.ts` now imports both; its private
+  `quarantineCorruptSession` and `statSync`+`readFileSync` guard were DELETED (the
+  now-unused `fs` import too). `decisions.ts`/`outcomes.ts` routed through the same
+  helper (see BUG-202's round-6 entry).
+- **Verified.** `scripts/verify-store-io.mjs` NEW 7/7 (inline pre-fix sims are the
+  must-FAIL for each defect; helper passes). FEAT-126 store suite 41/41 (39 prior +
+  2 new SHARED QUARANTINE tests: two same-ms quarantines both preserved; an
+  oversized VALID-records file refused fd-bounded + quarantined + self-heals).
+  MUST-FAIL proven by swapping `store-io.ts` for a pre-round-6 baseline
+  (`Date.now`-only name + unbounded read): both new FEAT-126 tests and all 4 new
+  BUG-202 tests redden; restore → all green. Anti-regression:
+  `verify-bug-202-store-dataloss.mjs` 15/15, `verify-feat-153-board-grid` 35/35,
+  `tsc` 0, `npm run gate` PASS.
+- **Could-not-run.** `verify-feat-126-e2e.mjs` still FATALs pre-store at
+  `startSession` ("no start ack") — the same pre-existing environment/harness
+  timing since round 1; unrelated to this change.
+- **Skeptic flag.** Data-loss; a shared helper now under three stores. Independent
+  clean-room re-verify warranted before VERIFIED. Finding 3b (`board.ts doneIds`)
+  still open, still off-limits here. Ticket stays OPEN.
+- **Left unstaged (no git writes):** `src/server/store-io.ts` (new),
+  `src/server/requests.ts`, `src/server/decisions.ts`, `src/server/outcomes.ts`,
+  `scripts/verify-feat-126-requests-store.mjs`, `scripts/verify-store-io.mjs` (new),
+  `scripts/verify-bug-202-store-dataloss.mjs`, and both tickets. NOT VERIFIED.
+
+### 2026-10-01 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run ccde50b4-34c6-4152-bdf5-d703f9b80475 — VERDICT: HOLDS — clean-room independent-verify --working-tree; same-provider fallback, a second anthropic account (not the fixer's); openai window exhausted. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-01 — clean-room independent verify (round 6 store-io, verifying) — VERDICT: HOLDS (VALID); ticket STAYS OPEN (3b)
+
+Verified the UNCOMMITTED round-6 fix (the three quarantine/read defects run
+8e8e3761 found, now consolidated into the shared `src/server/store-io.ts`)
+TOGETHER with BUG-202 — both stores route through the same new module — via
+`scripts/independent-verify.mjs --working-tree`. SCOPE was the round-6 data-loss
+module only; the recogniser/attribution fixes of rounds 3–5 were already confirmed
+(runs 2cfc221a, 8e8e3761) and were not re-litigated. Finding 3b (`board.ts`
+`doneIds`, off-limits) was NOT in scope and remains open.
+
+- **Command (exact):** as recorded in the BUG-202 entry of the same date (one
+  combined run), `--run "node scripts/verify-store-io.mjs && node
+  scripts/verify-feat-126-requests-store.mjs && node
+  scripts/verify-bug-202-store-dataloss.mjs"`, requirement
+  `@/tmp/req-FEAT-126-BUG-202.txt`, `--provider anthropic --timeout-min 22`,
+  verdict `/tmp/verdict-FEAT-126-BUG-202.txt`. Exit 0 (HOLDS, contract VALID).
+- **Everything the round-6 charter targeted HOLDS.** FEAT-126 store suite re-run
+  41/41 + `verify-store-io.mjs` 7/7 + `verify-bug-202-store-dataloss.mjs` 15/15
+  (manifest cfedf63ead7c, exit 0). Adversarial cases (not covered by the fixtures)
+  all held: O_EXCL quarantine leaves no stray 0-byte placeholder and preserves
+  bytes untouched when the move itself throws (EXDEV); a requests session file at
+  exactly 4 MiB is kept and 4 MiB+1 is quarantined with bytes intact; a realistic
+  store truncated at 60 offsets never admits a partial record; and all three stores
+  (requests/decisions/outcomes) route through `store-io.ts` with no private
+  read/rename copy. The round-6 quarantine-collision, same-ms-collapse, and
+  TOCTOU-unbounded-read defects are independently confirmed fixed.
+- **Verifier UNTESTED (honest):** a true crash between O_EXCL create and rename (not
+  a real process kill); network/FUSE atomicity of O_EXCL/rename; the live HTTP/WS
+  routes (direct module imports only); the rail DOM was not rendered (no headless
+  browser in the clean room).
+- **Status:** left OPEN. The round-6 store-io data-loss defects are independently
+  CONFIRMED to hold, so the data-loss risk flagged across rounds 3–6 is closed for
+  the three stores. The ticket is NOT marked VERIFIED because finding 3b
+  (`src/server/board.ts` `doneIds` — a ticket Done >24h ago reads `missing` in the
+  request row) remains open and was off-limits to the fix lanes; the exact hunk is
+  in the round-4 Activity entry. HANDOFF for the orchestrator: land 3b (board.ts +
+  the one requests-view.js line), then a final verify can take FEAT-126 to VERIFIED.
+- **Verified-by:** dispatch anthropic run ccde50b4-34c6-4152-bdf5-d703f9b80475
+  (clean-room, `scripts/independent-verify.mjs`, `--working-tree`) — VERDICT: HOLDS
+  (contract VALID). Same-provider fallback, a second anthropic account (different
+  from the fixer's); openai window exhausted — decorrelation reduced (author-provider
+  anthropic), noted per VERIFY.md #5. (Proof is the typed entry in the board ledger;
+  this line is a pointer, not the proof.)

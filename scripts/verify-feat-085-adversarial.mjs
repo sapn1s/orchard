@@ -138,7 +138,19 @@ function asst(text, extra = {}) {
  * fail-open transcript fallback is exercised (and never blocks). `extra` wins. */
 function finalAssistantText(transcriptPath) {
   let raw;
-  try { raw = fs.readFileSync(transcriptPath, 'utf8'); } catch { return ''; }
+  try {
+    // BUG-204 (regressed-from BUG-192): only read a REGULAR file. A FIFO/socket/
+    // device would block this synchronous readFileSync forever (no writer ever
+    // sends EOF) and wedge the whole harness main thread BEFORE the hook is even
+    // spawned — the 6s cap guards only the hook child, not this read. Section J
+    // deliberately hands a never-closing FIFO to the HOOK to probe whether the hook
+    // wedges; the harness must not read it itself. statSync() does not block on a
+    // FIFO (it only fetches metadata), so it is safe to gate on. Non-regular,
+    // absent, or unreadable → '' → last_assistant_message left unset → the fail-open
+    // transcript fallback is exercised (BUG-192's real-file path is unchanged).
+    if (!fs.statSync(transcriptPath).isFile()) return '';
+    raw = fs.readFileSync(transcriptPath, 'utf8');
+  } catch { return ''; }
   const lines = raw.split('\n');
   const isMain = (ev) => ev && ev.type === 'assistant' && ev.isSidechain !== true && Array.isArray(ev?.message?.content);
   const textOf = (content) => content.filter((c) => c && c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('');

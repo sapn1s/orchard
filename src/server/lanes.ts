@@ -66,8 +66,9 @@
  *  - ONE WRITER BY CONSTRUCTION (round 3 — this replaced round 2's hand-rolled
  *    `withLock()`, which a second verifier broke three more ways; see the long
  *    note above `claimWriter()`). The writer claim is arbitrated by the kernel
- *    via a unix socket named for the data dir; a process that does not hold it
- *    THROWS `not-writer` instead of writing unserialised.
+ *    via a flock on a file in the data dir (round 3 to BUG-217 round 7 used a
+ *    unix socket named for the dir; see the round-8 note); a process that does
+ *    not hold it THROWS `not-writer` instead of writing unserialised.
  *  - `settle()` THROWS `record-missing` instead of returning null, and it
  *    checks the record BEFORE writing the result file, so a lost record can
  *    neither pass silently nor leave an orphaned result directory.
@@ -79,7 +80,8 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
-import * as net from 'node:net';
+import * as os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
@@ -385,6 +387,11 @@ export function laneDir(id: string): string {
  *
  * Reads stay lock-free and unclaimed: `writeAtomic`'s rename means a reader
  * either sees the whole previous file or the whole new one.
+ *
+ * (BUG-217 round 8: the socket described above is gone. It was keyed on a NAME, and a bind mount or a
+ * second network namespace reaches the same dir under a different name. The claim is now a kernel flock
+ * on a file inside the data dir, which follows the inode; see the note below. What this paragraph argues
+ * still holds: nothing on disk decides who holds it (the file's contents only NAME the holder), the kernel frees the lock on death, nothing spins.)
  */
 
 function pidAlive(pid: number): boolean {
@@ -399,116 +406,271 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-let writerClaim: net.Server | null = null;
-let claimedFor: string | null = null;
+/**
+ * BUG-217 rounds 8–9 (and BUG-220) — THE LOCK IS ON THE DATA DIRECTORY ITSELF.
+ *
+ * Round 7 made this claim the data dir's single-server lock, as an abstract unix socket named from the dir's
+ * realpath; a bind mount (another name) and another network namespace (abstract sockets are per-netns) both got
+ * a second lock. Round 8 moved it to a kernel flock on a FILE inside the dir, which a verifier then broke three
+ * ways (CLI ×2 each): unlink the file while it is held, rename a fresh file over it, or move the whole dir away
+ * and copy it back. In each, a second server O_CREATed a new inode and locked that — the held lock was on a
+ * file nobody reached any more, and nothing told the holder.
+ *
+ * Round 9: the flock is taken on the DATA DIRECTORY'S OWN inode (opened read-only; Linux flock works on a
+ * directory fd). A directory with contents cannot be unlinked, and a rename keeps its inode, so every route to
+ * it — symlink, relative path, bind mount, another mount/net/pid/user namespace, a rename — contends for the one
+ * lock. There is no file to delete or replace: `.orchard-server.holder` beside it only NAMES the holder for a
+ * refusal message and decides nothing. The kernel drops the lock when the process dies, `kill -9` included.
+ *
+ * What a directory lock cannot prevent is a NEW directory appearing at the path (the dir moved away and a copy
+ * put back). So the holder also FAILS CLOSED on drift: `isWriter()` — which every outbox transition that can
+ * lead to delivery passes, and which the outbox re-asks between saving `sending` and handing over — compares the
+ * locked fd's (dev, ino) with the path's. On a mismatch (or a path that no longer resolves) the claim is LOST for
+ * good: `isWriter()` is false from then on, the `onWriterLost` listeners run once (the outbox marks its in-flight
+ * rows uncertain in the dir it actually holds; the server logs and exits), and nothing here writes again. The
+ * outbox reaches its files THROUGH the held fd (`writerDataDir()`, `/proc/self/fd/<n>`), so a write that races a
+ * move lands in the directory this process owns, never in the copy at the path.
+ *
+ * HOW, with no native addon: Node has no flock(). This process opens the dir (libuv opens with O_CLOEXEC, so no
+ * child the server spawns inherits the descriptor) and runs util-linux `flock -xn 3` with that descriptor as the
+ * child's fd 3. The child locks the SHARED open file description and exits; the lock stays held because this
+ * process keeps its descriptor. Any other open of the dir — from any path, any namespace, or this process —
+ * gets EWOULDBLOCK (flock exits 1).
+ *
+ * WHAT IT CANNOT COVER. Two different KERNELS sharing the dir: two hosts over NFS/SMB, or a VM guest and its
+ * host over 9p/virtiofs, where flock is emulated or local to one side. The claim refuses a data dir on a known
+ * network filesystem (statfs magic) unless CLAUDE_STATION_DATA_ALLOW_NETWORK_FS=1 says one host only. FUSE is
+ * not refused. Restoring an OLDER copy of the dir while a server runs rolls its journal back — the holder stops
+ * at its next transition, but the copy's server believes the copy (tampering with the dir's contents is outside
+ * this lock's threat model; see BUG-217 round 9). `flock` (util-linux) must be on PATH, or the server refuses.
+ */
+export const DATA_DIR_HOLDER_FILE = '.orchard-server.holder';
 
-/** The kernel-visible name of the writer claim for a given data dir. */
+let lockFd: number | null = null;
+let claimedFor: string | null = null;
+let lockedId: { dev: number; ino: number } | null = null;
+let viaProc: string | null = null;
+let lost: string | null = null;
+const lostListeners: Array<(why: string) => void> = [];
+
+/** What the claim locks: the data directory itself (its resolved path; the lock is on its inode). */
 export function writerClaimName(dir: string = dataDir()): string {
-  const key = createHash('sha256').update(path.resolve(dir)).digest('hex').slice(0, 16);
-  // Linux abstract socket: no filesystem entry, freed by the kernel on death.
-  if (process.platform === 'linux') return `\0orchard-lanes-${key}`;
-  return path.join(dir, `.lanes-writer-${key}.sock`);
+  return path.resolve(dir);
+}
+/** The sidecar that NAMES the holder (for a refusal message). Not the lock: deleting it only loses the name. */
+export function holderFile(dir: string = dataDir()): string {
+  return path.join(path.resolve(dir), DATA_DIR_HOLDER_FILE);
 }
 
 export interface WriterClaim { ok: boolean; name: string; reason?: string }
 
 /**
- * Take (or confirm) this process's claim to be the ledger's only writer.
- *
- * ROUND 3, SECOND PASS — THIS FUNCTION IS ASYNC, AND THAT IS THE WHOLE POINT.
- * The first round-3 draft called `srv.listen(name)` inside a `try` and treated
- * a missing throw as success. `listen()` does not throw for EADDRINUSE: it
- * EMITS the error on the next tick, and the draft's own "never crash the owner"
- * error handler swallowed it. Measured, two processes, one data dir:
- *   A claim: {"ok":true,…} isWriter: true   A wrote OK
- *   B claim: {"ok":true,…} isWriter: true   B wrote OK
- * i.e. the single-writer guarantee was VACUOUS — every unserialised-write
- * failure it was built to end was still live. Awaiting the listen settles it
- * against the kernel in ~1 ms (measured: B gets EADDRINUSE after 1 ms).
- *
- * So claiming is an explicit, awaited STARTUP act (`dispatch-broker.start()`,
- * the server's boot path, a test's own setup) and mutation time is a cheap
- * synchronous CHECK (`assertWriter()`). A process that never claimed does not
- * write; it throws. Idempotent, and re-taken if the data dir changes under a
- * test. Failure is a FACT to report, never something to retry into: another
- * live process already owns this data dir's ledger.
+ * Who holds the lock, as the holder wrote it. `pid` is as the holder's OWN pid namespace sees it; compare
+ * `pidNs`/`bootId`/`hostname` with `selfNamespaces()` before signalling it.
  */
+export interface ClaimIdentity {
+  pid: number; port: number | null; dataDir: string; startedAt: string;
+  hostname?: string | null; bootId?: string | null; pidNs?: string | null; netNs?: string | null;
+}
+let claimIdentity: ClaimIdentity | null = null;
+
+const nsOf = (kind: string): string | null => { try { return fs.readlinkSync(`/proc/self/ns/${kind}`); } catch { return null; } };
+/** This process's host, boot and namespaces — what a holder's record is compared with. */
+export function selfNamespaces(): { hostname: string; bootId: string | null; pidNs: string | null; netNs: string | null } {
+  return { hostname: os.hostname(), bootId: bootId(), pidNs: nsOf('pid'), netNs: nsOf('net') };
+}
+
+/** statfs f_type magics where flock does not reach every kernel that can mount the dir. */
+const NETWORK_FS: Record<number, string> = {
+  0x6969: 'nfs', 0x517b: 'smb', 0xff534d42: 'cifs', 0xfe534d42: 'smb2', 0x00c36400: 'ceph',
+  0x5346414f: 'afs', 0x73757245: 'coda', 0x01021997: '9p', 0x6a656a63: 'virtiofs',
+};
+/** The network filesystem a dir sits on, or null (local, or unknown). */
+export function networkFsOf(dir: string): string | null {
+  try { return NETWORK_FS[Number(fs.statfsSync(dir).type) >>> 0] ?? null; } catch { return null; }
+}
+
+/** Write the holder record into the dir this process holds (through the fd), whole or not at all. */
+function writeIdentity(): void {
+  const me = claimIdentity ?? { pid: process.pid, port: null, dataDir: path.resolve(dataDir()), startedAt: new Date().toISOString() };
+  const body = `${JSON.stringify({ ...me, ...selfNamespaces() })}\n`;
+  const file = path.join(writerDataDir(), DATA_DIR_HOLDER_FILE);
+  const tmp = `${file}.tmp-${process.pid}`;
+  try { fs.writeFileSync(tmp, body, { mode: 0o600 }); fs.renameSync(tmp, file); } catch { try { fs.unlinkSync(tmp); } catch { /* never made */ } /* the lock holds either way; only the name is lost */ }
+}
+
 /**
- * EADDRINUSE means two very different things, and only one of them is a
- * correctly working system. ROUND 4, closing the attack round 3 flagged and
- * could not exercise (it is not reachable on Linux at all):
- *
- * - **Linux (abstract namespace)**: the name exists only while a process holds
- *   it, so EADDRINUSE always means a LIVE writer. Nothing to diagnose.
- * - **Off Linux (filesystem socket)**: the inode OUTLIVES the process. After a
- *   SIGKILL the successor is refused EADDRINUSE **forever** and the ledger
- *   becomes permanently unwritable with every held result still on disk.
- *   Measured on this host with `process.platform` faked before the import
- *   (`scripts/scratch-a17-r4-fssock-wedge.mjs` — real socket, real SIGKILL,
- *   real EADDRINUSE): `claim {ok:false,reason:"EADDRINUSE"}`, `wrote:
- *   "not-writer"`, 1 undelivered result stranded, socket file still on disk;
- *   the Linux leg of the same script recovers.
- *
- * This probes the address — a connect that is REFUSED proves no listener — and
- * reports which case it is. It deliberately does NOT unlink and retry.
- * Auto-recovery was considered and rejected with a reason: two successors
- * probing at once both see "stale", and the second one's unlink deletes the
- * FIRST one's live socket, producing exactly the two-simultaneous-writers
- * failure this whole mechanism exists to make impossible (and the one that was
- * found vacuous in round 3). There is no way to unlink-if-still-this-inode from
- * Node, so the honest move is to name the condition and let a human remove the
- * file, not to guess under a race. Diagnosis cannot create a second writer.
+ * Take (or confirm) this process's claim on the data dir. Awaited at startup (the server's boot, the
+ * dispatch broker, a test's setup); mutation time is the cheap synchronous `isWriter()`/`assertWriter()`.
+ * Idempotent, and re-taken if CLAUDE_STATION_DATA changes under a test. Never waits: `reason: 'held'` means
+ * another live process holds it (`claimDataDir` is the bounded wait). A LOST claim is never re-taken here:
+ * the process that lost its directory must exit, not adopt whatever now sits at the path.
  */
-async function diagnoseInUse(name: string): Promise<{ reason: string }> {
-  if (name.startsWith('\0')) return { reason: 'EADDRINUSE' }; // abstract: always a live holder
-  const live = await new Promise<boolean>((resolve) => {
-    const probe = net.createConnection(name);
-    const settle = (v: boolean) => { try { probe.destroy(); } catch { /* already gone */ } resolve(v); };
-    probe.once('connect', () => settle(true));
-    probe.once('error', (e) => settle((e as NodeJS.ErrnoException).code !== 'ECONNREFUSED' && (e as NodeJS.ErrnoException).code !== 'ENOENT'));
-    setTimeout(() => settle(true), 2000).unref?.();
-  });
-  return live
-    ? { reason: 'EADDRINUSE' }
-    : { reason: `EADDRINUSE-stale-socket: ${name} exists but nothing is listening on it, so a previous writer was killed without unlinking it (this cannot happen on Linux, which uses the abstract namespace). The ledger is UNWRITABLE until that file is removed; held results are untouched on disk. Remove ${name} by hand once no Orchard server is running against this data dir.` };
-}
-
-export async function claimWriter(): Promise<WriterClaim> {
+export async function claimWriter(identity?: { port?: number | null }): Promise<WriterClaim> {
   const name = writerClaimName();
-  if (writerClaim && claimedFor === name) return { ok: true, name };
-  if (writerClaim) { try { writerClaim.close(); } catch { /* replaced below */ } writerClaim = null; claimedFor = null; }
-  const srv = net.createServer();
-  const outcome = await new Promise<WriterClaim>((resolve) => {
-    srv.once('error', (e) => resolve({ ok: false, name, reason: (e as NodeJS.ErrnoException).code ?? e.message }));
-    srv.once('listening', () => resolve({ ok: true, name }));
-    try {
-      srv.listen(name);
-    } catch (e) {
-      resolve({ ok: false, name, reason: (e as Error).message });
-    }
-  });
-  if (!outcome.ok) {
-    try { srv.close(); } catch { /* never listened */ }
-    return outcome.reason === 'EADDRINUSE' ? { ...outcome, ...(await diagnoseInUse(name)) } : outcome;
+  if (lost) return { ok: false, name, reason: `lost: ${lost}` };
+  if (identity) claimIdentity = { pid: process.pid, port: identity.port ?? null, dataDir: name, startedAt: new Date().toISOString() };
+  if (lockFd !== null && claimedFor === name) {
+    if (!isWriter()) return { ok: false, name, reason: `lost: ${lost}` };
+    if (identity) writeIdentity();
+    return { ok: true, name };
   }
-  // Only NOW is a later error someone else's problem to log, not ours to read.
-  srv.on('error', () => { /* a peer probing the claim must never crash the owner */ });
-  srv.unref();
-  writerClaim = srv;
-  claimedFor = name;
-  return outcome;
+  releaseWriter();
+  try { ensureDir(name); } catch (e) { return { ok: false, name, reason: `open-failed: ${(e as Error).message}` }; }
+  const netFs = process.env.CLAUDE_STATION_DATA_ALLOW_NETWORK_FS === '1' ? null : networkFsOf(name);
+  if (netFs) {
+    return { ok: false, name, reason: `network-fs: ${name} is on ${netFs}, where a lock taken on one host is not seen by another, so it cannot guarantee one server per data dir. Use a local directory, or set CLAUDE_STATION_DATA_ALLOW_NETWORK_FS=1 if only this host ever runs a server on it.` };
+  }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let fd: number;
+    try {
+      fd = fs.openSync(name, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+    } catch (e) {
+      return { ok: false, name, reason: `open-failed: ${(e as NodeJS.ErrnoException).code ?? ''} ${(e as Error).message}` };
+    }
+    const r = spawnSync('flock', ['-x', '-n', '3'], { stdio: ['ignore', 'ignore', 'pipe', fd], timeout: 10_000 });
+    if (r.status !== 0) {
+      try { fs.closeSync(fd); } catch { /* closed */ }
+      if (r.status === 1) return { ok: false, name, reason: 'held' };
+      const why = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
+        ? 'util-linux `flock` is not on PATH, and the data dir lock is a kernel flock taken through it'
+        : `flock exited ${r.status ?? r.signal}: ${String(r.stderr ?? '').trim() || (r.error as Error | undefined)?.message || 'no output'}`;
+      return { ok: false, name, reason: `flock-failed: ${why}` };
+    }
+    // The directory we locked must still be the one at the path (not swapped between our open and our lock).
+    let id: { dev: number; ino: number } | null = null;
+    try { const a = fs.fstatSync(fd), b = fs.statSync(name); if (a.ino === b.ino && a.dev === b.dev) id = { dev: a.dev, ino: a.ino }; } catch { /* gone: retry */ }
+    if (!id) { try { fs.closeSync(fd); } catch { /* closed */ } continue; }
+    lockFd = fd;
+    claimedFor = name;
+    lockedId = id;
+    // Reach the held dir through the fd where the kernel offers it (Linux /proc), so writes follow the inode.
+    viaProc = null;
+    try { const p = `/proc/self/fd/${fd}`; const s = fs.statSync(p); if (s.ino === id.ino && s.dev === id.dev) viaProc = p; } catch { /* no /proc: the path, checked on every write */ }
+    writeIdentity();
+    return { ok: true, name };
+  }
+  return { ok: false, name, reason: `flock-failed: ${name} was replaced five times while being locked` };
 }
 
-/** Does this process hold the writer claim right now? */
+/**
+ * Who holds the claim for this data dir, as the holder wrote it into the sidecar. null = no readable record
+ * (none yet, deleted, or a holder that has not written it) — "unknown", never "free": only a successful
+ * `claimWriter()` says the claim is free. Reading needs nothing from the holder, so a stopped one is named.
+ */
+export async function claimHolder(name: string = writerClaimName()): Promise<ClaimIdentity | null> {
+  try {
+    const o = JSON.parse(fs.readFileSync(path.join(name, DATA_DIR_HOLDER_FILE), 'utf8').split('\n')[0]);
+    if (!o || !Number.isInteger(o.pid)) return null;
+    const s = (v: unknown) => (typeof v === 'string' ? v : null);
+    return { pid: o.pid, port: Number.isInteger(o.port) ? o.port : null, dataDir: String(o.dataDir ?? ''), startedAt: String(o.startedAt ?? ''),
+      hostname: s(o.hostname), bootId: s(o.bootId), pidNs: s(o.pidNs), netNs: s(o.netNs) };
+  } catch { return null; }
+}
+
+/** The holder in words, for a refusal: pid and port, plus where it runs when that is not here. */
+export function describeHolder(h: ClaimIdentity | null): string {
+  if (!h) return 'a process that has not written who it is';
+  const me = selfNamespaces();
+  const where: string[] = [];
+  if (h.hostname && h.hostname !== me.hostname) where.push(`host ${h.hostname}`);
+  if (h.bootId && me.bootId && h.bootId !== me.bootId) where.push('another boot or kernel');
+  if (h.pidNs && me.pidNs && h.pidNs !== me.pidNs) where.push(`pid namespace ${h.pidNs}, so that pid is as seen inside it`);
+  if (h.netNs && me.netNs && h.netNs !== me.netNs) where.push(`network namespace ${h.netNs}`);
+  return `pid ${h.pid}${h.port != null ? `, port ${h.port}` : ''}${where.length ? ` — in ${where.join('; ')}` : ''}`;
+}
+
+export type DataDirClaim =
+  | { ok: true; name: string; waitedMs: number }
+  | { ok: false; name: string; reason: string; holder: ClaimIdentity | null; waitedMs: number };
+
+/**
+ * The SERVER'S BOOT-TIME LOCK on its data dir: take the claim, or say who has it.
+ *
+ * A restart can overlap (the old process is still closing sessions when the new one starts), so a live
+ * holder is WAITED for, bounded by `waitMs`; the kernel frees the lock the instant the holder exits —
+ * including `kill -9` — so there is no stale lock to break and nothing to guess. A holder still there at the
+ * deadline is another server on this data dir: the caller refuses to start. Any other failure (a network
+ * filesystem, no `flock`) is not a live holder, so it is not waited on.
+ */
+export async function claimDataDir({ port, waitMs, pollMs = 200, onWait }: { port: number | null; waitMs: number; pollMs?: number; onWait?: (holder: ClaimIdentity | null) => void }): Promise<DataDirClaim> {
+  const t0 = Date.now();
+  let told = false;
+  for (;;) {
+    const c = await claimWriter({ port });
+    if (c.ok) return { ok: true, name: c.name, waitedMs: Date.now() - t0 };
+    const live = c.reason === 'held';
+    const holder = live ? await claimHolder(c.name) : null;
+    if (!live || Date.now() - t0 >= waitMs) return { ok: false, name: c.name, reason: c.reason ?? 'unknown', holder, waitedMs: Date.now() - t0 };
+    if (!told) { told = true; onWait?.(holder); }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+}
+
+/**
+ * Called once, synchronously, when this process finds that the path no longer names the directory it holds.
+ * Listeners run in registration order (the outbox marks its in-flight rows uncertain; the server exits).
+ */
+export function onWriterLost(fn: (why: string) => void): void { lostListeners.push(fn); }
+
+/** Why this process lost its claim, or null. Sticky: a lost claim is never regained by this process. */
+export function writerLostReason(): string | null { return lost; }
+
+function loseClaim(why: string): void {
+  if (lost) return;
+  lost = why;
+  console.error(`[orchard] DATA DIR LOST — ${why}. This process holds a lock on a directory the path no longer names, so it stops writing and delivering NOW: anything it was handing over is marked "not confirmed", and it exits rather than carry on as a writer.`);
+  for (const fn of lostListeners) { try { fn(why); } catch (e) { console.error(`[orchard] data dir lost: a listener failed: ${(e as Error).message}`); } }
+}
+
+/**
+ * Does this process hold the claim right now — AND does the path still name the directory it locked? Every
+ * outbox transition that can lead to delivery asks this (two stats; no timer). The first "no" loses the claim
+ * for good (see `loseClaim`).
+ */
 export function isWriter(): boolean {
-  return !!writerClaim && claimedFor === writerClaimName();
+  if (lost || lockFd === null || claimedFor !== writerClaimName() || !lockedId) return false;
+  let now: fs.Stats | null = null;
+  try { now = fs.statSync(claimedFor); } catch (e) { loseClaim(`the data dir ${claimedFor} is gone from its path (${(e as NodeJS.ErrnoException).code ?? (e as Error).message}) — it was moved or deleted while this server held it`); return false; }
+  if (now.ino !== lockedId.ino || now.dev !== lockedId.dev) {
+    loseClaim(`the path ${claimedFor} now names a DIFFERENT directory (inode ${now.dev}:${now.ino}, this server locked ${lockedId.dev}:${lockedId.ino}) — the data dir was moved or replaced while this server held it`);
+    return false;
+  }
+  return true;
 }
 
-/** Give the claim up (tests, and a clean shutdown). */
+/**
+ * Does this process still hold the kernel lock on the directory it claimed (lost or not)? Only the lost-claim
+ * cleanup uses this: it may still write, through `writerDataDir()`, into the directory it holds.
+ */
+export function holdsLock(): boolean { return lockFd !== null && claimedFor === writerClaimName(); }
+
+/**
+ * The data dir as THIS process must write it: the held directory itself (through its fd on Linux), so a write
+ * that races a move lands in the directory this process owns, never a copy now at the path. Not holding the
+ * lock, it is the path (and nothing may write through it).
+ */
+export function writerDataDir(): string {
+  if (holdsLock() && viaProc) return viaProc;
+  return path.resolve(dataDir());
+}
+
+/** Give the claim up (tests, and a clean shutdown). Removes our holder record first, so it names no one. */
 export function releaseWriter(): void {
-  if (writerClaim) { try { writerClaim.close(); } catch { /* already gone */ } }
-  writerClaim = null;
+  if (lockFd !== null) {
+    if (!lost) {
+      try {
+        const f = path.join(writerDataDir(), DATA_DIR_HOLDER_FILE);
+        const o = JSON.parse(fs.readFileSync(f, 'utf8'));
+        if (o?.pid === process.pid) fs.unlinkSync(f);
+      } catch { /* none, or not ours */ }
+    }
+    try { fs.closeSync(lockFd); } catch { /* already gone */ }
+  }
+  lockFd = null;
   claimedFor = null;
+  lockedId = null;
+  viaProc = null;
 }
 
 /**

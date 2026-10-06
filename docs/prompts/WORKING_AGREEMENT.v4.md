@@ -148,6 +148,14 @@ false confidence, the exact thing this agreement exists to prevent.
   returned an identical verdict). So never assert to a lane that its child is dead; have it confirm
   from ground truth, and **when the child is alive, WAIT and harvest — re-running a live child's
   work is the destructive act this rule forbids.**
+- **Destructive verification runs in isolation, never against shared live state.** Any test or
+  verifier that can delete, sweep, or mutate shared state (containers, a daemon, a database, the
+  board) runs against an isolated instance — a separate daemon, DB, or data dir. The charter NAMES
+  the isolated target and FORBIDS the live one; "be careful" is not isolation. Prefer a standing,
+  reusable sandbox over each lane building its own. (Measured: a verifier ran a cleanup endpoint
+  against the shared host docker daemon and removed 44 containers, live projects' included.) An
+  attacker hunting for breakage WILL run the destructive path — that is its job, so the blast
+  radius must be fixed by where it runs, not by its restraint.
 - **Refute, don't just confirm; and generation must not verify itself.** For a high-stakes result,
   a second agent's job is to REFUTE the first, and the *author* of a fix can never be its judge —
   same blind spots, same fixture, same conclusion. Non-vacuity ("the test must FAIL before the
@@ -178,14 +186,32 @@ class**. For those:
   wrong — redesign, or explicitly justify why another guard is right. A recurring bug class is not
   "natural"; it is the tell that root-cause was skipped.
 - **Run an adversarial refute-verify pass** (§C/§I) — a second agent hunts the next variant before
-  the user does. Scope reviewers to narrow areas: several focused passes beat one broad one, and
-  real bugs routinely survive the first review.
+  the user does. Scope reviewers to narrow areas: several focused passes beat one broad one —
+  run them CONCURRENTLY, one per property (§I, "parallel attack") — and real bugs routinely
+  survive the first review.
 - **Use a top-tier model** (§I: model by cost-of-mistake) — don't default to a cheap model on
   subtle logic.
 - **Review the PLAN, not just the finished code.** High-stakes work is dispatched as `plan+review`
   (§I): an independent agent — the other provider by default — critiques the plan before a line is
   built. Reviewing only finished work catches bad execution of a bad plan, the expensive half
   already spent.
+- **Structural before enumerated.** A property is ENUMERATED when it holds only because every
+  case was named: bad INPUTS (a denylist, a lint, pattern checks) — or CODE PATHS, where a separate
+  guard re-checks the property at each call site / entry point (every endpoint that can stop,
+  remove, or recreate a resource carrying its own "is it live?" check). Whoever designs or reviews
+  it — plan reviewer, or the fixer when there is no plan review — must ask whether a structural
+  design makes the property true by construction (one chokepoint every mutation passes through)
+  and choose it unless it is priced out. Enumeration loses by default: it must name every case,
+  the attacker (or the next feature) needs one it missed.
+  **The two-break trigger fires in ANY verify loop, not only at plan review:** when the same
+  property breaks twice through DIFFERENT inputs or entry points, stop the rounds and route to a
+  single-authority redesign (ARCH question if it forks, else `plan+review`) — do not add another
+  guard or harden the list again. This is the root-design rule above, made mechanical. (Measured,
+  twice: a text-denylist Dockerfile isolation broke 8 times in 10 clean-room rounds before
+  structural isolation replaced it; "never recreate or remove a live session's container" broke in
+  8 consecutive rounds, each through a different entry point with its own liveness check — rebuild,
+  stop, remove, project delete, name collision, launch race — plus four sibling tickets of the same
+  class, on a `fix` lane that never had a plan review to catch it.)
 
 Reversible, low-stakes changes stay fast and light — that split is the point.
 
@@ -440,9 +466,28 @@ make. Classify the CHANGE, then spend:
 | **Test-suite-only change** | **Zero** — one class sweep across sibling suites instead, and that sweep is mandatory |
 | **`trivial` or docs-only** | Zero |
 
-**Recorded, not remembered:** the ticket carries a `Verified-by:` line naming the dispatch RUN
-(provider + run id) and the verdict, with fixer id ≠ verifier id. Naming a run is what makes it
-architectural — an in-process subagent has no run id to cite.
+**Parallel attack, not serial rounds.** When a claim has several independent properties, commission
+one attacker PER PROPERTY, concurrently, as one batch (the fan-out shape above) — not serial
+full-scope rounds, each of which re-covers what the last already cleared and waits on it to finish.
+Re-attack only the properties that broke. Serial rounds remain for exactly one job: re-attacking a
+FIX. (Measured: ~6 of ~9 lane-hours in one session went on serial full-scope rounds.) The table
+above sets how many rounds; this sets their shape.
+
+**Every verify charter carries the two-break STOP — the lane applies §N's trigger, not the
+orchestrator's attention.** An orchestrator commissioning round after round does not notice that
+round 5 and round 2 broke the same property by different doors; the verifier, holding the break
+in hand, does. So each verify charter (and each fix-round charter re-attacking a fix) names its
+properties and includes: *"If property X breaks via a different path than a previously reported
+break, STOP — report both paths and 'enumerated property, route to single-authority redesign'
+instead of proposing another guard."* The orchestrator then routes per §N; it does not commission
+round N+1.
+
+**Recorded, not remembered:** the verdict is recorded as a TYPED entry naming the dispatch RUN
+(provider + run id) and the verdict, with fixer id ≠ verifier id, written by the board's one
+verification writer (Orchard: `node scripts/board-tool.mjs verified --id … --provider … --model …
+--run … --verdict HOLDS|BROKEN|INVALID`) — never a pasted prose `Verified-by:` line, which no
+reader counts as proof. Naming a run is what makes it architectural — an in-process subagent has
+no run id to cite.
 
 **Every charter carries a falsifiable hypothesis — the orchestrator's reading, labelled as a
 guess.** State it and require it tested first:
@@ -507,7 +552,8 @@ Beyond "it works":
   rather than making the user infer it.
 - **Security hygiene:** no committed secrets, no weak defaults shipped, least privilege by default,
   explicit opt-in for anything that widens blast radius.
-- **Cleanup:** no stray processes, orphaned containers, or temp files left behind.
+- **Cleanup:** no stray processes, orphaned containers, or temp files left behind — and a cleanup
+  or sweep path is itself destructive: it is tested only against an isolated instance (§C).
 
 ## Boundaries
 

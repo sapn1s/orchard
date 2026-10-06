@@ -147,6 +147,14 @@
                       title="Open this project's settings — model, permissions, isolation, git (Ctrl/⌘ ,)">
                 <span class="g">⚙</span><span>Settings</span>
               </button>
+              <!-- FEAT-168 — the in-session entry point for the CLOSED (done)
+                   label. Shown only when a real on-disk session is open; the
+                   label and .on state toggle between Close and Reopen in
+                   paintCrown. A label action, not a readout — it is a pill. -->
+              <button class="pill board-pill close-sess-pill" id="closeSessBtn" hidden
+                      title="Mark this session closed (done) — it leaves the immediate list and reopens on a new message">
+                <span class="g" id="closeSessG">▢</span><span id="closeSessLbl">Close</span>
+              </button>
               <span class="seal-vdiv" aria-hidden="true"></span>
               <!-- FEAT-045 + this-feat: the provider (engine) selector, promoted
                    from the composer tray into the header so the Anthropic ↔
@@ -194,8 +202,14 @@
                      colour never the SOLE carrier) + the single dirty count.
                      Branch, +/− line totals and ahead/behind move to the tooltip
                      (the full sentence) and the Git panel this chip opens. -->
-                <button class="pill readout git" id="gitBtn" hidden>
-                  <span class="g">⎇</span><span class="git-dot" id="gitDot" aria-hidden="true"></span><span class="n" id="gitN"></span>
+                <!-- FEAT-165 — the face now carries the usual diffstat inline:
+                     file count, green +added, red −removed (the user asked for it
+                     back on the face). The hover detail is #gitPop, a styled
+                     per-file popover, not a native title. FEAT-163 — a non-git
+                     project shows the chip too, in a "no repo" state whose
+                     popover offers to initialise a repository. -->
+                <button class="pill readout git" id="gitBtn" hidden aria-haspopup="dialog" aria-expanded="false">
+                  <span class="g">⎇</span><span class="git-dot" id="gitDot" aria-hidden="true"></span><span class="n" id="gitN"></span><span class="git-stat" id="gitStat" hidden><span class="git-add" id="gitAdd"></span><span class="git-del" id="gitDel"></span></span>
                 </button>
                 <!-- Ambient "running here" for the CURRENT project: ports and
                      count, click opens the Running-here list in settings. -->
@@ -213,8 +227,12 @@
                      hue), the warn/danger tint is a secondary cue, and the
                      percent + window + reset survive in the tooltip + aria-label.
                      Painted by paintUsageChip(). -->
-                <button class="pill readout usage" id="usageBtn" hidden>
+                <button class="pill readout usage" id="usageBtn" hidden
+                        aria-haspopup="dialog" aria-expanded="false">
                   <span class="usage-ring" id="usageRing" aria-hidden="true"></span>
+                  <!-- FEAT-161: live countdown shown ONLY when the binding window is
+                       maxed out and its reset time is known; ticked in place. -->
+                  <span class="usage-countdown" id="usageCountdown" hidden></span>
                 </button>
                 <!-- FEAT-051: the integrations strip — one chip per attached MCP
                      capability (like browser extension icons). Hollow = planned
@@ -252,6 +270,25 @@
           <div class="pop-foot">
             <button id="procPopSettings">Running here <span class="cx">›</span></button>
           </div>
+        </div>
+
+        <!-- FEAT-161: the provider-usage detail popover, anchored to #usageBtn.
+             Replaces the old native `title` tooltip: one block per snapshot
+             (every Claude account, default first, then OpenAI), each window a
+             labelled horizontal filled bar with used %, binding tag and reset
+             time (relative + absolute). Shared .pop chrome; opens on hover and
+             on keyboard focus. Painted by paintUsagePop() in app.js. -->
+        <div class="pop usage-pop" id="usagePop" role="dialog" aria-label="Provider rate-limit windows">
+          <div id="usagePopBody"></div>
+        </div>
+
+        <!-- FEAT-165 / FEAT-163: the git readout's detail popover, anchored to
+             #gitBtn. Branch + upstream, the diffstat, then every changed file with
+             its status letter and +/− counts; for a non-git project, the
+             "Initialize git repository" action behind a confirm. Shared .pop
+             chrome; hover / keyboard focus open it. Painted by paintGitPop(). -->
+        <div class="pop git-pop" id="gitPop" role="dialog" aria-label="Git changes for this project">
+          <div id="gitPopBody"></div>
         </div>
 
         <!-- FEAT-045: provider (engine) for the NEXT session, anchored to the

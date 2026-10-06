@@ -496,16 +496,22 @@ async function main() {
   const browserDirty = Number(git(work, ['status', '--porcelain=v1', '-uall']).split('\n').filter(Boolean).length);
   await cdp.send('Page.navigate', { url: `${BASE}/#/project/${encodeURIComponent(pid)}` });
   await cdp.waitFor('boot', `document.querySelectorAll('#tree button.proj').length > 0`);
-  const chipUp = await cdp.waitFor('git chip for work fixture', `!document.querySelector('#gitBtn').hidden && document.querySelector('#gitN')?.textContent.includes('main') && document.querySelector('#gitN')?.textContent.includes(${JSON.stringify(`${browserDirty} dirty`)})`);
-  const chip = await cdp.eval(`document.querySelector('#gitN')?.textContent`);
-  check('crown chip shows branch and dirty count for the current project',
-    chipUp && /main/.test(chip ?? '') && chip?.includes(`${browserDirty} dirty`), JSON.stringify({ browserDirty, chip }));
-  const crownTotals = await cdp.eval(`({added:document.querySelector('#gitN .git-chip-added')?.textContent,removed:document.querySelector('#gitN .git-chip-removed')?.textContent,addedClass:document.querySelector('#gitN .git-chip-added')?.classList.contains('git-chip-added'),removedClass:document.querySelector('#gitN .git-chip-removed')?.classList.contains('git-chip-removed')})`);
+  // FEAT-165 face: dot + "N files" + inline +added/−removed. The branch and the
+  // exact counts live in the accessible sentence (aria-label) and the popover.
+  const faceFiles = `${browserDirty} ${browserDirty === 1 ? 'file' : 'files'}`;
+  const chipUp = await cdp.waitFor('git chip for work fixture', `!document.querySelector('#gitBtn').hidden && document.querySelector('#gitN')?.textContent === ${JSON.stringify(faceFiles)}`);
+  const chip = await cdp.eval(`({face:document.querySelector('#gitN')?.textContent, aria:document.querySelector('#gitBtn')?.getAttribute('aria-label')})`);
+  check('crown chip shows the dirty file count on its face and the branch + dirty count in its accessible sentence',
+    chipUp && chip?.face === faceFiles && /— main, /.test(chip?.aria ?? '') && (chip?.aria ?? '').includes(`${browserDirty} dirty`), JSON.stringify({ browserDirty, chip }));
+  const crownTotals = await cdp.eval(`({shown:!document.querySelector('#gitStat')?.hidden,added:document.querySelector('#gitAdd')?.textContent,removed:document.querySelector('#gitDel')?.textContent,addedClass:document.querySelector('#gitAdd')?.classList.contains('git-add'),removedClass:document.querySelector('#gitDel')?.classList.contains('git-del'),aria:document.querySelector('#gitBtn')?.getAttribute('aria-label')})`);
   const browserNumstat = git(work, ['diff', '--numstat', 'HEAD', '--']).split('\n').filter(Boolean).reduce((n, line) => { const [a, d] = line.split('\t'); return { added: n.added + Number(a), removed: n.removed + Number(d) }; }, { added: 0, removed: 0 });
   const browserUntracked = independentlyBudgetedUntracked(work);
   if (browserUntracked.included) browserNumstat.added += browserUntracked.lines;
-  check('status line totals match independent numstat and crown renders green +N plus red −N elements',
-    browserUntracked.included && crownTotals.addedClass && crownTotals.removedClass && crownTotals.added === `+${browserNumstat.added}` && crownTotals.removed === `−${browserNumstat.removed}`,
+  // FEAT-165 compaction (the ticket's rule): below 10,000 en-US grouped, else "14.1k";
+  // the accessible sentence carries the EXACT totals.
+  const compact = (n) => (n < 10_000 ? n.toLocaleString('en-US') : `${(n / 1000).toFixed(n < 100_000 ? 1 : 0)}k`);
+  check('status line totals match independent numstat: face renders green +N and red −N (compacted), the sentence is exact',
+    browserUntracked.included && crownTotals.shown && crownTotals.addedClass && crownTotals.removedClass && crownTotals.added === `+${compact(browserNumstat.added)}` && crownTotals.removed === `−${compact(browserNumstat.removed)}` && (crownTotals.aria ?? '').includes(`+${browserNumstat.added}, −${browserNumstat.removed}`),
   { expected: browserNumstat, budget: browserUntracked, rendered: crownTotals });
   const chipTextFixtures = await cdp.eval(`(()=>{
     const fixtures = [
@@ -526,7 +532,8 @@ async function main() {
       return fixtures.map(([label,status])=>{
         state.git.set(pid,{status,at:Date.now(),loading:false});
         paintGitChip();
-        return [label,document.querySelector('#gitN')?.textContent];
+        const stat=document.querySelector('#gitStat');
+        return [label,[document.querySelector('#gitN')?.textContent, stat.hidden ? '' : document.querySelector('#gitAdd')?.textContent+' '+document.querySelector('#gitDel')?.textContent, document.querySelector('#gitBtn')?.getAttribute('aria-label')]];
       });
     } finally {
       // Restore the REAL status so the workbench assertions below still run
@@ -535,14 +542,15 @@ async function main() {
       paintGitChip();
     }
   })()`);
+  // [face, inline stat, accessible sentence] per payload (FEAT-165 face).
   const chipTextExpected = [
-    ['stale server payload', 'main · 2 dirty · ↑334'],
-    ['clean tree', 'main'],
-    ['no upstream', 'topic · 1 dirty · +3 · −2'],
-    ['detached HEAD', 'detached @ abc1234 · 1 dirty · +4 · −1'],
-    ['normal populated payload', 'main · 2 dirty · +7 · −3 · ↑4 · ↓2'],
+    ['stale server payload', ['2 files', '', 'Git — main, 2 dirty, ↑334. Open the Git panel.']],
+    ['clean tree', ['', '', 'Git — main. Open the Git panel.']],
+    ['no upstream', ['1 file', '+3 −2', 'Git — topic, 1 dirty, +3, −2. Open the Git panel.']],
+    ['detached HEAD', ['1 file', '+4 −1', 'Git — detached @ abc1234, 1 dirty, +4, −1. Open the Git panel.']],
+    ['normal populated payload', ['2 files', '+7 −3', 'Git — main, 2 dirty, +7, −3, ↑4, ↓2. Open the Git panel.']],
   ];
-  check('crown chip rendered text is exact for stale, clean, no-upstream, detached and populated payloads',
+  check('crown chip face, inline stat and accessible sentence are exact for stale, clean, no-upstream, detached and populated payloads',
     JSON.stringify(chipTextFixtures) === JSON.stringify(chipTextExpected),
     { expected: chipTextExpected, rendered: chipTextFixtures });
   fs.writeFileSync(path.join(work, 'binary.bin'), Buffer.from([0, 1, 2, 0, 255]));

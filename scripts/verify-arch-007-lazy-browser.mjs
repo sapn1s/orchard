@@ -40,6 +40,7 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ownerKeyFor, removeOwnedContainer, removeOwnedImages, pruneOwnedImages, refuseTakenName } from './lib/owned-docker.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const browser = await import(path.join(ROOT, 'src/server/browser.ts'));
@@ -642,7 +643,7 @@ section('I. real station, real CONTAINER session — the shape the user actually
   if (!check('docker is available for the container proof', dockerOk)) {
     console.log('  (container section SKIPPED — this is the reported shape, so a skip here means the ticket is NOT proven)');
   } else {
-    let cname = null;
+    let cname = null, cOwner = null;
     try {
       await withServer({ CLAUDE_STATION_CLAUDE_BIN: fakeClaude, CLAUDE_STATION_MCP_READY_TIMEOUT_MS: '0' }, async ({ port, api }) => {
         const hostPath = path.join(SCRATCH, 'proj-container');
@@ -652,6 +653,8 @@ section('I. real station, real CONTAINER session — the shape the user actually
         const id = created.body?.project?.id;
         if (!check('container project created', !!id, JSON.stringify(created.body).slice(0, 200))) return;
         cname = `claude-station-${id}`;
+        refuseTakenName(cname); // FEAT-158
+        cOwner = await ownerKeyFor(path.join(SCRATCH, `data-${port}`)); // FEAT-158: remove only what this server owns
         await api(`/api/projects/${id}`, 'PATCH', { browser: { enabled: true, idleMs: 600000 } });
         trackDaemon(STATE, id);
 
@@ -715,7 +718,7 @@ section('I. real station, real CONTAINER session — the shape the user actually
       });
     } finally {
       if (cname) {
-        spawnSync('docker', ['rm', '-f', cname], { encoding: 'utf8', timeout: 60_000 });
+        removeOwnedContainer(cname, cOwner);
       }
     }
   }

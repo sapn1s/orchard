@@ -40,6 +40,7 @@ import { randomUUID } from 'node:crypto';
 
 import * as hist from '../lib/session-history.ts';
 import { dataDir } from '../lib/paths.ts';
+import { asOrchardWrite } from './own-writes.ts';
 // FEAT-144 round 2 — REUSE FEAT-129's file-lock liveness authority (do not invent
 // a second staleness model) for the mirror's critical-section lock: reclaimReason
 // (which itself uses the module's pidAlive ground-truth rung) + the shared TTL
@@ -83,6 +84,29 @@ export function resolveOrchardSessionFile(
     if (filePath) return { filePath, provider };
   }
   return null;
+}
+
+/**
+ * BUG-196 — THE ENGINE A RESUME WILL ACTUALLY RUN ON, owned in one place
+ * (ARCH-010). A session id is meaningful only to the engine that minted it: a
+ * Codex thread id continues only via the Codex runtime, a Claude session file
+ * only via the Claude CLI. So the transcript — the provider directory it lives
+ * under — is the SINGLE owner of "which engine does this session's next turn
+ * use", and both the resume path (agent-bridge P2b) and the UI's per-session
+ * provider indicator must read that same answer rather than re-deriving one from
+ * the project setting or a per-session override, which the resume silently
+ * ignores. A session with no Orchard-owned transcript is a Claude-store session,
+ * whose only resumable engine is Claude ('anthropic') — the same default P2b
+ * applies. `dirCandidates` mirrors the bridge's own resume-dir list (the
+ * resume-encoded dir, the project host dir, a container workdir) so this and the
+ * bridge cannot disagree.
+ */
+export function resumeProviderOf(dirCandidates: string[], sessionId: string): string {
+  for (const d of new Set(dirCandidates)) {
+    const hit = resolveOrchardSessionFile(d, sessionId);
+    if (hit) return hit.provider;
+  }
+  return 'anthropic';
 }
 
 /**
@@ -362,7 +386,8 @@ export function mirrorClaudeStore(
   try {
     // The ENTIRE check-then-act runs under the mirror lock, so two concurrent
     // passes can never both read the same mirror end and both append (defect 2).
-    const locked = withMirrorLock(dst, (): MirrorResult => {
+    // FEAT-154 r9: the mirror is ORCHARD's write, not the engine's — declared, so it is never read as a running turn.
+    const locked = asOrchardWrite(dst, () => withMirrorLock(dst, (): MirrorResult => {
       const srcSize = fs.statSync(src).size;
       let dstSize = 0;
       try { dstSize = fs.statSync(dst).size; } catch { dstSize = 0; }
@@ -405,7 +430,7 @@ export function mirrorClaudeStore(
       // short write / ENOSPC rather than leaving a half-written line.
       appendCompleteLines(dst, dstSize, delta);
       return { status: 'appended', file: dst, bytesAdded: delta.length };
-    });
+    }));
     if (!locked.ran) return { status: 'busy', file: dst, bytesAdded: 0 };
     return locked.result;
   } catch (err) {
@@ -445,6 +470,8 @@ export interface RecorderOptions {
   provider: string;
   /** The session's cwd; encoded exactly like Claude's store keys its dirs. */
   cwd: string;
+  /** FEAT-155 — the store dir, when its owner declares one (container sessions). Defaults to encodeCwd(cwd). */
+  encodedDir?: string;
   /** Non-fatal problem channel (append failure etc.) — reported ONCE. */
   onError?: (message: string) => void;
 }
@@ -478,7 +505,10 @@ export class TranscriptRecorder {
   constructor(opts: RecorderOptions) {
     this.provider = opts.provider;
     this.cwd = opts.cwd;
-    this.encodedDir = hist.encodeCwd(opts.cwd);
+    // FEAT-155 — a container session's store is DECLARED by its owner and handed
+    // in; re-encoding a bare `/workspace` cwd would merge every such project's
+    // transcripts into one host dir.
+    this.encodedDir = opts.encodedDir ?? hist.encodeCwd(opts.cwd);
     this.#onError = opts.onError ?? ((m) => console.warn(`[orchard-transcript] ${m}`));
   }
 

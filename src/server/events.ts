@@ -167,7 +167,11 @@ export interface QuestionAnswer {
 
 export type StationEvent =
   /** Session is live. Carries the real SDK session_id, which is what resume/fork need. */
-  | { t: 'session-init'; sessionId: string; cwd: string; model: string; tools: string[]; permissionMode?: string; slashCommands?: string[] }
+  // BUG-196 — lockedProvider: the engine THIS session dispatches on, declared by
+  // the bridge (this.effective.provider — the same fact the transcript is pinned to
+  // and resumeProviderOf returns on reopen). The client records it so a session made
+  // real by its first turn locks its provider surfaces, without a transcript refetch.
+  | { t: 'session-init'; sessionId: string; cwd: string; model: string; tools: string[]; permissionMode?: string; slashCommands?: string[]; lockedProvider?: string }
   /**
    * Emitted once, before the first SDK message: what this session is really
    * running with. `overridden` is the authoritative answer to "did my session
@@ -261,6 +265,12 @@ export type StationEvent =
    * transcript file-follow (`session-appended`), never on this socket.
    */
   | { t: 'survivor-delivery'; phase: 'turn-done'; sessionId: string; note?: string }
+  /**
+   * BUG-217 round 5 — the server's outbox handed this session a turn made of
+   * queued rows (`ids`). A driving tab paints `text` as the user's bubble and
+   * goes busy; the rows leave every tab's dock as it next reads the outbox.
+   */
+  | { t: 'outbox-turn'; sessionId: string; text: string; ids: string[] }
   | {
       t: 'turn-end';
       subtype: string;
@@ -351,7 +361,9 @@ export type StationEvent =
        */
       // BUG-138 adds 'path-changed': the project's directory was renamed, so
       // this session is recorded against the path it had before.
-      needsFork?: { resumeSessionId: string; resumeEncodedDir: string; cause: 'isolation-changed' | 'cross-os' | 'path-changed' };
+      // `toContainer` (isolation-changed only) names the direction so the fork bar
+      // copy is right both ways — true = direct→container, false = container→direct.
+      needsFork?: { resumeSessionId: string; resumeEncodedDir: string; cause: 'isolation-changed' | 'cross-os' | 'path-changed'; toContainer?: boolean };
       drain?: { backgroundLive: number; backgroundTaskIds: string[];
         backgroundLifetime: 'yes' | 'unknown' | 'no' | null;
         drainHeldSince: string | null; heldForMs: number | null; brokerState: string;
@@ -362,7 +374,7 @@ export type StationEvent =
        * `send` over an attached socket was NOT delivered; `sendId` echoes the
        * client's id for that attempt so the tab recovers exactly its rows.
        */
-      of?: 'send';
+      of?: 'send' | 'start';
       sendId?: string;
       /**
        * BUG-191 — the delivery went out but its acceptance was never confirmed
@@ -391,8 +403,15 @@ export type StationEvent =
        * only because the boot runtime check (or a re-hash) is still running; it
        * clears on its own, so retrying is correct. Never set for a block that
        * needs a restart.
+       *
+       * 'outbox-pending' (BUG-217 round 5): retryable — the session's outbox
+       * holds queued messages (or is delivering them), which go first. Nothing
+       * was sent; the tab hands this prompt to the outbox, behind them.
+       *
+       * 'client-outdated' (BUG-217 round 5): the frame came from a round-3/4
+       * client (it carried `queueIds`). Nothing was sent; the tab must reload.
        */
-      code?: 'live-elsewhere' | 'nothing-to-reattach' | 'runtime-check-pending' }
+      code?: 'live-elsewhere' | 'nothing-to-reattach' | 'runtime-check-pending' | 'outbox-pending' | 'client-outdated' }
   /**
    * A `send` carried `targetAgentId`, and the Agent SDK has no channel for it.
    *
@@ -465,6 +484,7 @@ export type StationEvent =
     }
   /** Bridge lifecycle, not an SDK message. */
   | { t: 'session-closed'; reason: string }
+  /** FEAT-168 — a new message auto-reopened this session's CLOSED label (Orchard's own store). */
   /**
    * BUG-187 B6 — the server's AUTHORITATIVE list of pending approval/question/
    * plan request ids for this session. `complete:false` while an adopted
@@ -554,6 +574,31 @@ export type ClientCommand =
    * `requestId` is echoed on the ack so a slow confirmation is unambiguous.
    */
   | { type: 'set-model'; requestId?: string; model: string | null }
+  /**
+   * FEAT-160 — switch the CLAUDE ACCOUNT of the ALREADY RUNNING session.
+   *
+   * Unlike `set-model`/`set-permission-mode` (SDK control-requests the live CLI
+   * honours in place), the account is a SPAWN-TIME env var (`CLAUDE_CONFIG_DIR`):
+   * the CLI is spawned once inside its survival broker and cannot change it
+   * without a respawn. So this does not reconfigure the CLI — it REAPS the current
+   * (idle) CLI under the old account and hands the client the coordinates to
+   * resume the SAME session id/transcript under the new account via the ordinary
+   * `start{resumeSessionId, overrides:{claudeAccount}}` path (which carries the
+   * BUG-022 double-resume guard). `account`: an account id, or `null`/`'default'`
+   * for the implicit `~/.claude` account. Legal only for a `direct` project (a
+   * container project binds the credential, so account stays project-scope —
+   * FEAT-145); refused while a turn is in flight. `requestId` is echoed on the ack.
+   *
+   * FEAT-160 round 4 — `inherit: true` means the user picked "Project default /
+   * inherit". The client MUST NOT resolve that itself: the full chain is project
+   * setting UNDER the machine-wide default (`applyGlobalDefaults`), and the
+   * machine-default layer lives only on the server. The client omitting it bound
+   * `{account:null}` (~/.claude) on a session actually billing the machine
+   * default, an un-correctable mis-bill. So the client sends the RAW choice and
+   * the server resolves `inherit` exactly as a fresh session would; `account` is
+   * ignored when `inherit` is true.
+   */
+  | { type: 'switch-account'; requestId?: string; account: string | null; inherit?: boolean }
   /**
    * Follow a session file the dashboard did not spawn. Sent when the user opens
    * a session; the server watches from the file's CURRENT end, so it never

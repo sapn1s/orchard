@@ -371,7 +371,7 @@ async function runLeg(cdp, pid, sdkId, fixed) {
     const row = dock.rows.find((x) => x.text.includes('SECOND-TAB-MESSAGE'));
     check('the message is a dock row the user can read', !!row, JSON.stringify(dock.rows.map((x) => x.text)));
     check('and that row SAYS it was not delivered, naming the reason',
-      !!row && row.dead && /NOT delivered/.test(row.status) && /another tab/i.test(row.status),
+      !!row && row.dead && /not sent|NOT delivered/i.test(row.status) && /another tab/i.test(row.status),
       row ? row.status : '(no row)');
     check('no optimistic bubble is left claiming the refused message was delivered',
       bubbles === 0, `${bubbles} "you" bubble(s) carrying the refused text`);
@@ -381,13 +381,14 @@ async function runLeg(cdp, pid, sdkId, fixed) {
     console.log('\n=== 5. the session is alive, so nothing else is mislabelled dead ===');
     const other = dock.rows.find((x) => x.text.includes('ALREADY-QUEUED'));
     check('a message queued before the refusal is still pending, not marked dead by it',
-      !!other && !other.dead && !/NOT delivered/.test(other.status), other ? other.status : '(no row)');
+      !!other && !other.dead && !/not sent —|NOT delivered/i.test(other.status), other ? other.status : '(no row)');
     // Also caught by the screenshot, not by any assertion: the dock announced
     // "1 queued message · delivering…" in a tab that holds no socket and cannot
     // deliver anything. The dock is where a user checks whether their words got
     // out; it must not be the thing that misleads them.
     check('the dock does not promise a delivery this tab cannot make',
-      !/delivering/.test(dock.label) && /not driving the session/.test(dock.label), dock.label);
+      // BUG-217: the plain-words wording names the actual reason.
+      !/delivering/.test(dock.label) && /not driving the session|another tab is driving/.test(dock.label), dock.label);
   }
 
   console.log(`\n=== 6. it is in browser storage, and survives a reload${label} ===`);
@@ -405,7 +406,7 @@ async function runLeg(cdp, pid, sdkId, fixed) {
     const row = afterReload.rows.find((x) => x.text.includes('SECOND-TAB-MESSAGE'));
     check('AFTER A RELOAD the user still has their words, without retyping', back && !!row,
       JSON.stringify(afterReload.rows.map((x) => x.text)));
-    check('and it still says it is unsent', !!row && /unsent|NOT delivered/i.test(row.status),
+    check('and it still says it is unsent', !!row && /unsent|not sent|NOT delivered/i.test(row.status),
       row ? row.status : '(no row)');
 
     console.log('\n=== 7. it is recoverable in one click, and never auto-resent ===');

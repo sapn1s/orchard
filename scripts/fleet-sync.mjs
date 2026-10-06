@@ -37,63 +37,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { onboard } from './onboard.mjs';
+import { onboard, orchardFileManifest, readTargetFile } from './onboard.mjs';
 // FEAT-106 — a project is in scope if it has ANY board layout (legacy docs/bugs
-// OR consolidated .orchard/bugs), and a copied tool is compared wherever it
-// actually lands (`.orchard/<tool>` on a migrated project, `scripts/<tool>`
-// legacy). Report LABELS stay `scripts/<tool>` for now because onboard still
-// emits those — the label/dest rewrite belongs with the onboard cutover.
-import { boardLayout, resolveOrchardDir } from './lib/board-path.mjs';
+// OR consolidated .orchard/bugs). The set of copied files this sweep keeps
+// current, and where each one lands (`.orchard/…`), is derived from onboard's
+// OWN manifest (orchardFileManifest) — the single source of truth. That makes
+// "every copied file is swept" structural rather than an assertion two lists can
+// drift apart on: fleet-sync sweeps exactly what onboard copies, by construction.
+import { boardLayout } from './lib/board-path.mjs';
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
-/**
- * The copied per-repo tools this sweep keeps current. FEAT-056 added
- * arch-watch.mjs (the recurrence detector) on exactly the same terms as
- * board.mjs — copied by onboard, therefore able to drift, therefore swept here.
- * Kept in sync with onboard.mjs's COPIED_TOOLS.
- *
- * The two `lib/` modules are here because they were COPIED but never SWEPT:
- * onboard.mjs put verdict-contract.mjs into every repo and nothing ever
- * updated it again, so the copies were free to rot behind this repo's version
- * while the tools that import them were kept current — the worst combination.
- * ticket-schema.mjs is added with its sweep on day one rather than later.
- * scripts/verify-fleet-sync.mjs asserts SYNCED_TOOLS ⊇ COPIED_TOOLS so this
- * gap cannot reopen silently.
- */
-/*
- * BUG-118 adds the response-format Stop hook to the sweep, for the same reason
- * verdict-contract.mjs was added: it was COPIED into every onboarded repo and
- * never swept, so a hook fix could not reach the copies where the bug lived.
- * It is the only METHOD_FILE eligible — see onboard.mjs's RESYNCABLE_HOOK for
- * why the rest of that list must never be overwritten in a target repo.
- *
- * ROUND 4: this sweep is no longer the only way the hook lands. A sweep is a
- * thing somebody has to remember to run, and the copies that mattered were in
- * projects nobody swept — so ordinary onboarding now re-syncs the hook too, and
- * the launcher repairs it at session start (claude-runtime.ts's
- * ensureCurrentStopHook). `forceHook` below is retained as a no-op alias; it is
- * kept in the call because dropping it would read as a deliberate opt-out.
- *
- * STILL SWEEP-ONLY, and still able to go stale in a target: board.mjs,
- * arch-watch.mjs and the two lib/ modules. Their staleness is LOUD (a human runs
- * them and reads the output), which is why they were not moved onto the
- * always-current path with the hook — see the BUG-118 round-4 note.
- */
-const SYNCED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs', 'lib/board-path.mjs', 'hooks/response-format-gate.mjs'];
-
-/**
- * FEAT-106 — where a copied tool lands in a given project. Consolidated layout
- * puts it under `.orchard/<tool>`; legacy puts it under `scripts/<tool>`. Prefer
- * the consolidated copy if it exists, else the legacy path (returned regardless,
- * so an absent tool still reports "would-create" against the legacy location).
- */
-function toolDestPath(hostPath, tool) {
-  const orchardDest = path.join(resolveOrchardDir(hostPath), tool);
-  if (fs.existsSync(orchardDest)) return orchardDest;
-  return path.join(hostPath, 'scripts', tool);
-}
-const boardSourcePath = path.join(repoRoot, 'scripts', 'board.mjs');
 
 export const DEFAULT_BASE = 'http://127.0.0.1:4317';
 // Hands-off: projects the user has declared off-limits — never write into
@@ -151,34 +105,34 @@ export function planSweep(projects, { exclude = new Set() } = {}) {
 }
 
 /**
- * Execute (or, without `apply`, just PREDICT) the sweep. Dry-run reads the
- * target's copied board.mjs (if any) and compares bytes against this repo's
- * source, without writing anything. `apply` runs the real
- * `onboard(hostPath, { forceBoardTool: true })` core — the SAME idempotent
- * path the CLI/UI onboard action uses, so this sweep does not reimplement
- * the copy/compare logic a second time for the write path.
+ * Execute (or, without `apply`, just PREDICT) the sweep. Both the source bytes
+ * and the destination path of every swept file come from onboard's OWN
+ * manifest (orchardFileManifest), so this sweep can never fall out of step with
+ * what onboard copies, and it always compares a `.orchard/lib/*.js` copy against
+ * its true source (which may be `public/lib/*`, not `scripts/lib/*`). Dry-run
+ * writes nothing; `apply` runs the real `onboard(hostPath, { forceBoardTool:
+ * true })` core — the SAME idempotent path the CLI/UI onboard action uses.
  */
 export function runSweep(plan, { apply = false } = {}) {
-  const sources = new Map(
-    SYNCED_TOOLS.map((t) => [t, fs.readFileSync(path.join(repoRoot, 'scripts', t), 'utf8')]),
-  );
   const results = [];
   for (const item of plan) {
     if (item.action === 'skip') {
       results.push({ ...item, outcome: 'skipped', detail: item.reason });
       continue;
     }
+    const manifest = orchardFileManifest(item.hostPath);
     if (!apply) {
-      // Per-tool prediction; the project's headline outcome is the "worst"
-      // state across the tools (a stale arch-watch is as much drift as a stale
-      // board.mjs), with the per-tool detail kept for the report.
-      const per = SYNCED_TOOLS.map((tool) => {
-        const destPath = toolDestPath(item.hostPath, tool);
-        if (!fs.existsSync(destPath)) return { tool, outcome: 'would-create' };
-        return {
-          tool,
-          outcome: fs.readFileSync(destPath, 'utf8') === sources.get(tool) ? 'identical' : 'would-update',
-        };
+      // Per-file prediction; the project's headline outcome is the "worst"
+      // state across the files, with the per-file detail kept for the report.
+      const per = manifest.map((entry) => {
+        const label = entry.label;
+        if (!fs.existsSync(entry.dest)) return { tool: label, outcome: 'would-create' };
+        // Guarded read of the TARGET copy — a FIFO/dir/oversized file at
+        // `entry.dest` must not block or mislead (round-7 target-read class).
+        const dr = readTargetFile(entry.dest, { encoding: null });
+        let identical = false;
+        if (dr.ok) { try { identical = dr.data.equals(fs.readFileSync(entry.src)); } catch { identical = false; } }
+        return { tool: label, outcome: identical ? 'identical' : 'would-update' };
       });
       const rank = { 'would-create': 2, 'would-update': 1, identical: 0 };
       const outcome = per.slice().sort((a, b) => rank[b.outcome] - rank[a.outcome])[0].outcome;
@@ -191,11 +145,11 @@ export function runSweep(plan, { apply = false } = {}) {
       continue;
     }
     const reports = onboard(item.hostPath, { forceBoardTool: true, forceHook: true });
-    const per = SYNCED_TOOLS.map((tool) => ({
-      tool,
-      outcome: reports.find((r) => r.label === `scripts/${tool}`)?.status ?? 'unknown',
+    const per = manifest.map((entry) => ({
+      tool: entry.label,
+      outcome: reports.find((r) => r.label === entry.label)?.status ?? 'unknown',
     }));
-    const boardReport = reports.find((r) => r.label === 'scripts/board.mjs');
+    const boardReport = reports.find((r) => r.label === '.orchard/board.mjs');
     results.push({
       ...item,
       outcome: boardReport ? boardReport.status : 'unknown',

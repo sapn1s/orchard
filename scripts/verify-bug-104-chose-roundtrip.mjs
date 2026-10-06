@@ -21,7 +21,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { ticketAnswerState, composeAnswerEntry } from '../src/server/board.ts';
+import { legacyProseAnswerState, composeAnswerEntry } from '../src/server/board.ts';
 import { answerTicket, readTicket } from '../src/server/tickets.ts';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -175,14 +175,17 @@ try {
       && emLabel.state?.chose?.label === 'canary — the cheap one + schema guard', emLabel.state?.chose);
 
   console.log('\n=== BACKWARD COMPAT — a previously-answered single-key ticket still reads ===');
-  const legacy = readTicket(host, 'BUG-907').answer;
+  // FEAT-166 r3: a prose answer seeded on disk counts at read time ONLY through the
+  // frozen snapshot (real-board equivalence: verify-feat-166-typed-answer.mjs [0]). Its
+  // grammar is the contract of the frozen prose reader that built that snapshot.
+  const legacy = legacyProseAnswerState(fs.readFileSync(readTicket(host, 'BUG-907').file, 'utf8'));
   check('legacy single-key on disk (seeded before the fix): still reads {key:"B", label:"ship the interim shield"}',
     legacy?.chose?.key === 'B' && legacy?.chose?.label === 'ship the interim shield' && legacy?.note === 'do B now, revisit later',
     legacy?.chose);
 
   // empty-label edge: composeAnswerEntry trimEnds a bodyless label → "Chose: X —"
   const bodyless = composeAnswerEntry({ kind: 'decision', chose: { key: 'A', label: '' }, via: 'ticket view' });
-  const bl = ticketAnswerState(`# X\n## Activity log\n${bodyless}`);
+  const bl = legacyProseAnswerState(`# X\n## Activity log\n${bodyless}`);
   check('empty label ("Chose: A —" after trimEnd): key="A", label="" reads back without error',
     bl?.chose?.key === 'A' && bl?.chose?.label === '', bl?.chose);
 

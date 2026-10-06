@@ -33,7 +33,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 
-import { VERIFIED_BY_RE, joinVerdictContinuation } from './lib/verdict-contract.mjs';
+import { legacyProseVerifications } from './lib/verification-source.mjs';
 import { TICKET_FILE_RE, countActivityEntries, extractTicketBlock } from './lib/ticket-schema.mjs';
 
 /* ───────────────────────────────────────────────────────────── extraction */
@@ -47,24 +47,20 @@ import { TICKET_FILE_RE, countActivityEntries, extractTicketBlock } from './lib/
  * holds by construction.
  */
 export function extractVerifications(text) {
-  const out = [];
-  const lines = String(text || '').split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const m = new RegExp(VERIFIED_BY_RE.source, 'i').exec(lines[i]);
-    if (!m) continue;
-    // The MIRROR half of the same fix: a wrapped verdict was read here as
-    // `none`, so a ticket carrying one wrapped and one unwrapped copy of the
-    // same run id made this checker report `verdict changed none → holds` and
-    // quarantine a ticket that says one consistent thing (`FEAT-062`).
-    const verdict = /VERDICT:\s*([A-Z]+)/i.exec(joinVerdictContinuation(lines, i));
-    out.push({
-      provider: m[1],
-      model: m[2] ?? null,
-      run_id: m[3],
-      verdict: verdict ? verdict[1].toLowerCase() : null,
-    });
-  }
-  return out;
+  // BUG-225: the records come from the ONE shared reader (`extractVerifiedBy`),
+  // which already reads each record as its head line plus wrapped continuation
+  // (`joinVerdictContinuation`) — so a wrapped run id and a wrapped verdict are
+  // read here exactly as board.mjs and board-status read them (`FEAT-062`).
+  // BUG-225 r3: the ONE legacy prose reader (verification-source.mjs) — the
+  // compatibility path for grading ARCHIVED prose originals, never a live proof
+  // decision. `raw_verdict` keeps this function's historical shape: the token as
+  // written (lower-cased), or null when the record names none.
+  return legacyProseVerifications(text).map((r) => ({
+    provider: r.provider,
+    model: r.model,
+    run_id: r.run_id,
+    verdict: r.raw_verdict,
+  }));
 }
 
 const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi;
@@ -187,8 +183,21 @@ export function provenanceCheck(originalText, migratedText, opts = {}) {
       bad(`verification[] entry for run ${e.run_id} claims verdict ${JSON.stringify(e.verdict)}, but the original's Verified-by line says ${JSON.stringify(src.verdict)}`);
     }
   }
+  // One run id can carry SEVERAL records (BUG-142: run 625ee528 recorded once
+  // with VERDICT: BROKEN and again, re-cited, with no verdict). Compare the k-th
+  // original record of a run with the k-th migrated one, not with whichever the
+  // Map kept last — a last-wins Map reported a faithful copy as "verdict changed"
+  // once the shared reader (BUG-225) stopped dropping the wrapped first record.
+  const migListByRun = new Map();
+  for (const v of mig.verifications) {
+    if (!migListByRun.has(v.run_id)) migListByRun.set(v.run_id, []);
+    migListByRun.get(v.run_id).push(v);
+  }
+  const seenByRun = new Map();
   for (const v of orig.verifications) {
-    const got = migByRun.get(v.run_id);
+    const k = seenByRun.get(v.run_id) ?? 0;
+    seenByRun.set(v.run_id, k + 1);
+    const got = migListByRun.get(v.run_id)?.[k] ?? migByRun.get(v.run_id);
     if (!got) { bad(`verification record for run ${v.run_id} (provider ${v.provider}, verdict ${v.verdict ?? 'none'}) is MISSING from the migrated ticket`); continue; }
     if (got.provider !== v.provider) bad(`verification ${v.run_id}: provider changed ${v.provider} → ${got.provider}`);
     if ((got.verdict ?? null) !== (v.verdict ?? null)) bad(`verification ${v.run_id}: verdict changed ${v.verdict ?? 'none'} → ${got.verdict ?? 'none'}`);

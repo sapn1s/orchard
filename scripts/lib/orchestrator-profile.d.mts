@@ -40,9 +40,32 @@ export declare function isDispatchViaShell(command: string): boolean;
 
 export declare const ENFORCE_ALLOWED_TOOLS: string[];
 export declare const ENFORCE_ALLOWED_BASH: string[];
-export declare const ENFORCE_DENIED_GIT_SUBCOMMANDS: string[];
+/** git ALLOW-known-good set (BUG-226 round 4). Default-deny; readers/dumpers are absent. */
+export declare const GIT_ALLOWED_SUBCOMMANDS: string[];
 
 export declare function bashSegmentHead(segment: string): string;
+
+/** Resolve the real git subcommand past leading global options (`-c k=v`, `-C <dir>`, …). */
+export declare function resolveGitSubcommand(words: string[]): string;
+
+/** curl localhost-only guard on the raw (quotes-intact) command. Offender string or null. */
+export declare function curlRawViolation(raw: string): string | null;
+
+/**
+ * The "Still available here" help text, generated from ENFORCE_ALLOWED_TOOLS and
+ * ENFORCE_ALLOWED_BASH so it cannot drift from what `decide()` permits (BUG-226).
+ * One line per array element.
+ */
+export declare function stillAvailableHere(): string[];
+
+/**
+ * The Bash command heads worth advertising, derived by asking `decideBashCommand`
+ * itself so an allowlisted-but-always-refused head (npx) is never named (BUG-226).
+ */
+export declare function allowedBashHeads(): string[];
+
+/** Advertised heads that carry an argument rule (allowed only in read-free forms). */
+export declare function restrictedBashHeads(): string[];
 
 export declare function decideBashCommand(command: string): {
   allow: boolean;

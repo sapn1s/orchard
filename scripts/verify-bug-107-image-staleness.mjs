@@ -25,6 +25,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { ownerKeyFor, removeOwnedContainer } from './lib/owned-docker.mjs';
 
 const argv = process.argv.slice(2);
 const arg = (n) => { const i = argv.indexOf(n); return i >= 0 ? argv[i + 1] : undefined; };
@@ -51,6 +52,15 @@ fs.mkdirSync(WORK, { recursive: true });
 fs.writeFileSync(path.join(WORK, 'hello.ts'), 'export const hello = () => "hi";\n');
 fs.cpSync(path.join(SRC_ROOT, 'src'), path.join(TREE, 'src'), { recursive: true });
 fs.copyFileSync(path.join(SRC_ROOT, 'package.json'), path.join(TREE, 'package.json'));
+// The subject's imports cross the src/ boundary: container-manager.ts → registry.ts
+// → wiring.ts → scripts/lib/board-path.mjs (tools.ts / provisioning.ts likewise).
+// That module lives OUTSIDE src/, so a src-only copy dies on the first import and the
+// failure masquerades as a container-manager regression (BUG-181). Copy the
+// scripts/lib/ closure alongside src/; every scripts/lib/*.mjs imports only its
+// siblings and node builtins (verified), so the directory is self-contained. A module
+// that is STILL missing from this copy is raised as a HARNESS error by importIf()
+// below — never scored as a subject-under-test failure.
+fs.cpSync(path.join(SRC_ROOT, 'scripts', 'lib'), path.join(TREE, 'scripts', 'lib'), { recursive: true });
 fs.symlinkSync(path.join(REPO, 'node_modules'), path.join(TREE, 'node_modules'));
 
 const RUN_ID = `${process.pid}${Date.now() % 100000}`;
@@ -73,9 +83,10 @@ const argv = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(SHIM_LOG)}, argv.join(' ') + '\\n');
 const child = spawn('docker', argv.map((a) => a.split(REAL).join(SCRATCH)), { stdio: ['inherit', 'pipe', 'pipe'] });
 const back = (s) => s.split(SCRATCH).join(REAL);
-child.stdout.on('data', (d) => process.stdout.write(back(String(d))));
+child.stdout.on('data', (d) => process.stdout.write(argv[0] === 'cp' ? d : back(String(d)))); // FEAT-157: docker cp to stdout is a binary tar stream
 child.stderr.on('data', (d) => process.stderr.write(back(String(d))));
-child.on('close', (c) => process.exit(c ?? 1));
+process.stdout.on('error', () => process.exit(1)); // a closed reader (EPIPE) must end the shim, never hang it
+child.on('close', (c) => process.stdout.write('', () => process.exit(c ?? 1))); // flush a piped stdout before exiting
 child.on('error', (e) => { process.stderr.write(String(e.message)); process.exit(127); });
 `);
 fs.chmodSync(SHIM, 0o755);
@@ -98,15 +109,24 @@ const project = {
   name: 'BUG-107 scratch',
   hostPath: WORK,
   isolation: 'container',
-  settings: { tools: { serena: true, playwright: false }, browser: { enabled: false }, mounts: [] },
+  // FEAT-157: only a project pinned to `dev` builds the working-tree definition (a release pin is a frozen
+  // recipe), so the identity-follows-definition property is exercised on a dev pin.
+  settings: { tools: { serena: true, playwright: false }, browser: { enabled: false }, mounts: [], container: { base: { pinned: 'dev', skipped: [], deferred: null } } },
   createdAt: new Date().toISOString(),
 };
 const directProject = { ...project, id: `${PROJECT_ID}-direct`, isolation: 'direct' };
 
+const OWNER = await ownerKeyFor(DATA);
 const created = [];
 function cleanup() {
+  // FEAT-157: this run's CLI-layer images (claude-station-rt, not renamed by the shim) carry this run's owner key.
+  try {
+    const rt = execFileSync('docker', ['images', 'claude-station-rt', '--filter', `label=claude-station.owner=${OWNER}`, '--format', '{{.Repository}}:{{.Tag}}'], { encoding: 'utf8' });
+    for (const name of created) { try { removeOwnedContainer(name, OWNER); } catch { /* gone */ } }
+    for (const t of rt.split('\n').map((x) => x.trim()).filter(Boolean)) { try { execFileSync('docker', ['rmi', t], { stdio: 'pipe' }); } catch { /* in use */ } }
+  } catch { /* docker unavailable */ }
   for (const name of created) {
-    try { execFileSync('docker', ['rm', '-f', name], { stdio: 'pipe' }); } catch { /* gone */ }
+    try { removeOwnedContainer(name, OWNER); } catch { /* gone */ } // FEAT-158: only containers this run's code created
   }
   try {
     const out = execFileSync('docker', ['images', '--format', '{{.Repository}}:{{.Tag}}'], { encoding: 'utf8' });
@@ -119,10 +139,47 @@ function cleanup() {
 
 /* ------------------------------------------------------------ module loads */
 
+/**
+ * A defect in the HARNESS (an incomplete tree copy), never in the subject. Thrown so
+ * it aborts to the top-level catch and is reported distinctly from a product failure —
+ * the whole point of BUG-181: the suite must never confuse "I did not copy it" with
+ * "it is broken".
+ */
+class HarnessError extends Error {}
+
+/**
+ * Raise a HARNESS error when an import failed because a module is MISSING FROM THE
+ * COPY: it resolves to a path inside the scratch TREE, that path is absent, yet the
+ * same file exists in the source tree the copy was taken from. That is a hole in this
+ * harness's copy set, not a subject failure, so it must be loud and distinguishable.
+ * A missing node_modules package or a file genuinely absent from the source too is
+ * left alone — that is a real import error and belongs to whatever is under test.
+ */
+function assertNotCopyGap(err) {
+  const msg = String(err?.message ?? '');
+  if (err?.code !== 'ERR_MODULE_NOT_FOUND' && !/Cannot find module/.test(msg)) return;
+  const m = /Cannot find module '([^']+)'/.exec(msg);
+  if (!m) return;
+  const missing = m[1];
+  if (!missing.startsWith(TREE + path.sep)) return;   // node_modules / a bare specifier
+  if (fs.existsSync(missing)) return;                 // present in the copy after all
+  const relPath = path.relative(TREE, missing);
+  if (fs.existsSync(path.join(SRC_ROOT, relPath))) {
+    const dir = relPath.split(path.sep).slice(0, 2).join(path.sep);
+    throw new HarnessError(
+      `${relPath} exists in the source tree (${SRC_ROOT}) but was not copied into the scratch tree at ${TREE}. `
+      + `The suite's tree copy is INCOMPLETE — add ${dir} to the copy set in this harness. This is NOT a product defect.`);
+  }
+}
+
 const importIf = async (rel) => {
   try { return await import(path.join(TREE, rel) + `?v=${crypto.randomUUID()}`); }
-  catch (err) { return { __err: err }; }
+  catch (err) { assertNotCopyGap(err); return { __err: err }; }
 };
+
+// ARCH-022: in-process manager calls run inside lifecycle operations of a booted authority (no-op on a pre-ARCH-022 tree).
+const { bootAuthority } = await import('./lib/lifecycle-harness.mjs');
+const H = await bootAuthority(TREE);
 
 console.log(`BUG-107 verification\n  tree      : ${SRC_ROOT}\n  scratch   : ${TREE}\n  scratch repo: ${SHIM_REPO}\n`);
 
@@ -208,7 +265,7 @@ try {
     } else {
       const t0 = Date.now();
       const n0 = buildsSoFar();
-      builtImage = await cm.ensureImage(project, { onLog: (s) => process.stdout.write(`    [build] ${String(s).trimEnd().split('\n').slice(-1)[0]}\n`) });
+      builtImage = await H.op(project.id, () => cm.ensureImage(project, { onLog: (s) => process.stdout.write(`    [build] ${String(s).trimEnd().split('\n').slice(-1)[0]}\n`) }));
       const b1 = buildsSoFar() - n0;
       const id1 = execFileSync('docker', ['image', 'inspect', builtImage.replace('claude-station-base', SHIM_REPO), '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
       check('B1 first ensureImage builds the image', b1 === 1 && !!id1,
@@ -217,7 +274,7 @@ try {
       // --- no change -> NO rebuild (a fix that rebuilds every time is a different bug)
       const n1 = buildsSoFar();
       const cmSame = await importIf('src/server/container-manager.ts');
-      const again = await cmSame.ensureImage(project, {});
+      const again = await H.op(project.id, () => cmSame.ensureImage(project, {}));
       const id2 = execFileSync('docker', ['image', 'inspect', again.replace('claude-station-base', SHIM_REPO), '--format', '{{.Id}}'], { encoding: 'utf8' }).trim();
       check('B2 NOTHING changed -> no rebuild, same artifact',
         buildsSoFar() - n1 === 0 && again === builtImage && id2 === id1,
@@ -227,7 +284,7 @@ try {
       const status0 = await cm.ensureContainer(project, {});
       created.push(cm.containerName(project.id));
       check('B3 PRECONDITION: container running on the built image', status0.state === 'running' && !status0.drifted,
-        `state=${status0.state} image=${status0.image} drifted=${!!status0.drifted}`);
+        `state=${status0.state} image=${status0.image} drifted=${!!status0.drifted} reasons=${JSON.stringify(status0.driftReasons ?? [])}`);
 
       const dfBefore = fs.readFileSync(DOCKERFILE, 'utf8');
       fs.writeFileSync(DOCKERFILE, dfBefore.replace('CMD ["sleep", "infinity"]', 'ENV BUG107_DEFINITION_CHANGED=1\nCMD ["sleep", "infinity"]'));
@@ -288,8 +345,8 @@ try {
     } else {
       const plan = tools.serenaMcpServerFor(project);
       const argv2 = ['run', '--rm', '-i', '--network', 'none',
-        '-v', `${WORK}:${cmC.containerWorkdir(project.id)}`,
-        '-w', cmC.containerWorkdir(project.id),
+        '-v', `${WORK}:${cmC.containerWorkdir(project)}`,
+        '-w', cmC.containerWorkdir(project),
         image, plan.command, ...plan.args];
       console.log(`    [mcp] docker ${argv2.slice(0, 8).join(' ')} … ${plan.command} ${plan.args.join(' ')}`);
       toolNames = await mcpToolList(argv2).catch((e) => { mcpErr = String(e.message).slice(0, 300); return []; });
@@ -365,24 +422,31 @@ try {
     skipped('F1 superseded tags are removed after a rebuild', 'no image built');
     skipped('F2 the in-use image is NEVER removed', 'no image built');
   } else {
+    await H.drainImages(); // ARCH-022: the post-ensure prune runs in its own slot, after the ensure
     const tagsNow = execFileSync('docker', ['images', '--format', '{{.Repository}}:{{.Tag}}'], { encoding: 'utf8' })
       .split('\n').map((s) => s.trim()).filter((s) => s.startsWith(`${SHIM_REPO}:`));
-    const currentTag = cmF.imageNameFor(project).replace('claude-station-base', SHIM_REPO);
+    // FEAT-157: the container runs the base plus a one-file CLI layer (claude-station-rt); the base TAG is
+    // the definition's identity, so that is the one that must remain alone in the base repo.
+    const currentTag = (cmF.baseRefFor ? cmF.baseRefFor(project) : cmF.imageNameFor(project)).replace('claude-station-base', SHIM_REPO);
     check('F1 after a definition change + rebuild, the superseded tag is gone and the current one remains',
       tagsNow.includes(currentTag) && tagsNow.length === 1,
       `${SHIM_REPO} tags present: ${JSON.stringify(tagsNow)}; current=${currentTag}`);
 
     // The image the live container runs must survive a prune attempt.
     const inUse = execFileSync('docker', ['inspect', cmF.containerName(project.id), '--format', '{{.Config.Image}}'], { encoding: 'utf8' }).trim();
-    const res = cmF.pruneSupersededImages(cmF.imageNameFor(project));
+    const res = await H.op('#images', () => cmF.pruneSupersededImages(cmF.imageNameFor(project)));
     const stillThere = execFileSync('docker', ['images', '--format', '{{.Repository}}:{{.Tag}}'], { encoding: 'utf8' })
-      .split('\n').map((s) => s.trim()).filter((s) => s.startsWith(`${SHIM_REPO}:`));
+      .split('\n').map((s) => s.trim()).filter((s) => s.startsWith(`${SHIM_REPO}:`) || s.startsWith('claude-station-rt:'));
     check('F2 a prune NEVER removes an image a container is running',
       stillThere.includes(inUse.replace('claude-station-base', SHIM_REPO)) || stillThere.includes(inUse),
       `container runs ${inUse}; after prune tags=${JSON.stringify(stillThere)} removed=${JSON.stringify(res.removed)} kept=${JSON.stringify(res.kept)}`);
   }
 } catch (err) {
-  console.error(`\nHARNESS ERROR: ${err?.stack ?? err}`);
+  if (err instanceof HarnessError) {
+    console.error(`\nHARNESS ERROR (incomplete tree copy): ${err.message}`);
+  } else {
+    console.error(`\nHARNESS ERROR: ${err?.stack ?? err}`);
+  }
   exitCode = 2;
 } finally {
   cleanup();

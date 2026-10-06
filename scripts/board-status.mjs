@@ -26,7 +26,8 @@
  * ARCH-010 COMPLIANCE — it does NOT introduce a second ticket parser. Every fact
  * is read through the ONE shared reader: `readTickets` / `readIndex` from
  * board.mjs (which import scripts/lib/ticket-schema.mjs), `classifyLegacyStatus`
- * from ticket-schema.mjs, and `VERIFIED_BY_RE` from verdict-contract.mjs. This
+ * from ticket-schema.mjs, and the typed verification entries from
+ * verification-source.mjs (via readTickets). This
  * file composes their output; it re-derives nothing.
  *
  * Usage:
@@ -45,7 +46,6 @@ import { execFileSync } from 'node:child_process';
 import { readTickets, readIndex } from './board.mjs';
 import { resolveBoardDir } from './lib/board-path.mjs';
 import { classifyLegacyStatus, TICKET_ID_RE } from './lib/ticket-schema.mjs';
-import { VERIFIED_BY_RE } from './lib/verdict-contract.mjs';
 
 const DEFAULT_ENTRIES = 5;
 const STATUS_CELL_MAX = 200; // one-line status header, truncated for pasteability
@@ -80,15 +80,15 @@ function activityHeaders(text) {
   return heads.reverse(); // newest first
 }
 
-/** Every `Verified-by:` line in the file (the shared reader finds only the first). */
-function allVerifiedBy(text) {
-  const src = String(text ?? '');
-  const re = new RegExp(VERIFIED_BY_RE.source, 'gim');
-  const out = [];
-  for (let m = re.exec(src); m; m = re.exec(src)) {
-    out.push(oneLine(m[0], 160));
-  }
-  return out;
+/**
+ * The ticket's independent-verification evidence — the TYPED entries from the ONE
+ * source (`readTickets` → `ticketVerifications`, BUG-225 r3), one line each. Prose
+ * `Verified-by:` lines are not proof and are not listed as if they were.
+ */
+function verificationLines(t) {
+  return t.verification.entries.map((e) => oneLine(
+    `${String(e.verdict).toUpperCase()} — dispatch ${e.provider}${e.model ? `/${e.model}` : ''} run ${e.run_id}` +
+    `${e.verdict_on ? ` (${e.verdict_on})` : ''}${e.recorded_by ? ` [${e.recorded_by}]` : ''}`, 160));
 }
 
 /**
@@ -162,7 +162,9 @@ function buildTicketReport(dir, id, entries) {
     index_status_cell: openRow ? oneLine(openRow.status) : null,
     worktree: wt.label,
     worktree_dirty: wt.dirty,
-    verified_by: allVerifiedBy(text),
+    verified_by: verificationLines(t),
+    verification_source: t.verification.source,
+    independently_verified: t.verification.verified,
     last_entries: heads.slice(0, entries),
     total_entries: heads.length,
   };
@@ -191,7 +193,8 @@ function printTicketReport(r) {
     (r.severity ? `   sev: ${r.severity}` : ''));
   if (r.index_status_cell) L.push(`  INDEX status:    ${r.index_status_cell}`);
   L.push(`  working tree:    ${r.worktree}`);
-  L.push(`  Verified-by:     ${r.verified_by.length ? '' : 'none'}`);
+  L.push(`  Verified-by:     ${r.independently_verified ? 'YES (a standing HOLDS)' : 'NO'}` +
+    `  [${r.verified_by.length} typed entr${r.verified_by.length === 1 ? 'y' : 'ies'}, source: ${r.verification_source}]`);
   for (const v of r.verified_by) L.push(`    ${v}`);
   L.push(`  activity log:     ${r.total_entries} entr${r.total_entries === 1 ? 'y' : 'ies'}; newest ${r.last_entries.length}:`);
   for (const h of r.last_entries) L.push(`    ${h}`);
@@ -297,4 +300,4 @@ function main() {
 const isMain = process.argv[1] && url.pathToFileURL(process.argv[1]).href === import.meta.url;
 if (isMain) main();
 
-export { buildTicketReport, buildBoardSummary, activityHeaders, allVerifiedBy, normalizeId };
+export { buildTicketReport, buildBoardSummary, activityHeaders, verificationLines, normalizeId };

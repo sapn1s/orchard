@@ -11,6 +11,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { ownerKeyFor, removeOwnedContainer, removeOwnedImages, pruneOwnedImages, refuseTakenName } from './lib/owned-docker.mjs';
 
 /* Never a fixed port: two suites defaulting to the same number collide the
    moment both run (observed: verify-ui + verify-sessions on 4319). The OS
@@ -26,6 +27,8 @@ const PORT = Number(process.env.VERIFY_CONTAINER_PORT ?? await freePort());
 const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-ctest-data-'));
+// FEAT-158: cleanup removes only containers THIS scratch server owns (the name is a fixed slug).
+const OWNER = await ownerKeyFor(DATA);
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-ctest-work-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
@@ -55,6 +58,7 @@ try {
   if (created.status !== 201) throw new Error(`create failed: ${JSON.stringify(created.body)}`);
   const pid = created.body.project.id;
   cname = `claude-station-${pid}`;
+  refuseTakenName(cname); // FEAT-158: never adopt another instance's same-named container
   console.log(`project=${pid} container=${cname} work=${WORK}`);
 
   /* ---------------- #2: a session whose container dies must die loudly ---- */
@@ -69,7 +73,7 @@ try {
   check('PRECONDITION: a container session really started and answered', !!end1 && end1.subtype === 'success', `cwd=${init.cwd} subtype=${end1?.subtype}`);
 
   const before = ev1.length;
-  execFileSync('docker', ['rm', '-f', cname], { stdio: 'pipe' });
+  removeOwnedContainer(cname, OWNER);
   console.log(`  (killed ${cname})`);
   const fatal = await waitEv(ev1.slice(before), e => e.t === 'error' && e.fatal, 60000)
     ?? await waitEv(ev1, e => e.t === 'error' && e.fatal, 30000);
@@ -237,7 +241,7 @@ try {
   fail++;
   console.error(`\nHARNESS ERROR: ${err.stack}`);
 } finally {
-  try { if (cname) execFileSync('docker', ['rm', '-f', cname], { stdio: 'pipe' }); } catch { /* gone */ }
+  try { removeOwnedContainer(cname, OWNER); } catch { /* gone */ }
   try { process.kill(-server.pid, 'SIGTERM'); } catch {}
   await sleep(1500);
   try { process.kill(-server.pid, 'SIGKILL'); } catch {}

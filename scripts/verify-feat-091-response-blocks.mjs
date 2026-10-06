@@ -76,6 +76,7 @@ function check(name, cond, detail) {
 
 const B3 = '```';
 const B4 = '````';
+const B5 = '`````';
 
 async function main() {
   const { parseResponseBlocks, KNOWN_BLOCKS, CATEGORY_BLOCKS, LEGACY_BLOCKS, COLLAPSED_BLOCKS, EXPANDED_BLOCKS, characterise } =
@@ -804,6 +805,78 @@ async function main() {
     check('the CONTAINER-STACK dimension is really generated, with BOTH verdicts populated',
       byShape.container >= 250 && contInert >= 60 && cont.length - contInert >= 60,
       { container: byShape.container, expectInert: contInert, expectLive: cont.length - contInert });
+    // The ROUND-13/14 dimension: the fold guard (C1/C2) exercised INSIDE a
+    // container. Both guards must be populated, or the stratum tests half the
+    // defect — the block-quote pass that surfaced this found C1 AND C2 blind.
+    const bqf = corpus.filter((c) => c.shape === 'bqfold');
+    const bqfC1 = bqf.filter((c) => c.id.includes('/c1/')).length;
+    const bqfC2 = bqf.filter((c) => c.id.includes('/c2/')).length;
+    check('the CONTAINER-WRAPPED FOLD-GUARD dimension is generated, with BOTH C1 and C2 populated',
+      byShape.bqfold >= 20 && bqfC1 >= 10 && bqfC2 >= 10,
+      { bqfold: byShape.bqfold, c1: bqfC1, c2: bqfC2 });
+    // The BUG-201 dimension: C1 at a container depth DEEPER than the fold. Both
+    // directions must be populated — the HIDE cases (a deeper opener promoted) and
+    // the NO-FIRE cases (a deeper `orchard-*` mention that is not a fence) — or the
+    // stratum would test only aggression, or only restraint, but never the boundary
+    // between them, which is the whole point of the maximal strip.
+    const deepf = corpus.filter((c) => c.shape === 'deepfold');
+    const deepHide = deepf.filter((c) => c.id.includes('/hide/')).length;
+    const deepNoFire = deepf.filter((c) => !c.id.includes('/hide/')).length;
+    check('the DEEPER-THAN-FOLD C1 dimension is generated, with BOTH hide and no-fire populated',
+      byShape.deepfold >= 24 && deepHide >= 10 && deepNoFire >= 20,
+      { deepfold: byShape.deepfold, hide: deepHide, nofire: deepNoFire });
+    // The BUG-201 round-1 REGRESSION dimension: a fold inside a list item whose
+    // CONTENT COLUMN is 4-5, where a raw-column strip under-strips the continuation
+    // indent and hides the deeper opener. Both directions and all three line
+    // endings must be populated, or the regression gate tests the wrong geometry.
+    const listcol = corpus.filter((c) => c.shape === 'listcol');
+    const lcHide = listcol.filter((c) => c.id.includes('/hide/')).length;
+    const lcNoFire = listcol.filter((c) => !c.id.includes('/hide/')).length;
+    const lcEols = new Set(listcol.map((c) => c.eol));
+    check('the LIST-CONTENT-COLUMN dimension is generated, both directions, all line endings',
+      byShape.listcol >= 60 && lcHide >= 30 && lcNoFire >= 30 && ['lf', 'crlf', 'cr'].every((e) => lcEols.has(e)),
+      { listcol: byShape.listcol, hide: lcHide, nofire: lcNoFire, eols: [...lcEols] });
+    // The BUG-201 round-3 REGRESSION dimension: a list OPENED WITHIN the fold body,
+    // the reserved opener on a CONTINUATION line (marker not repeated). This is the
+    // shape no per-line strip could see; the parser-based C1 must. Both directions,
+    // all line endings.
+    const listcont = corpus.filter((c) => c.shape === 'listcont');
+    const cHide = listcont.filter((c) => c.id.includes('/hide/')).length;
+    const cNoFire = listcont.filter((c) => !c.id.includes('/hide/')).length;
+    const cEols = new Set(listcont.map((c) => c.eol));
+    check('the LIST-CONTINUATION-OPENER dimension is generated, both directions, all line endings',
+      byShape.listcont >= 100 && cHide >= 50 && cNoFire >= 50 && ['lf', 'crlf', 'cr'].every((e) => cEols.has(e)),
+      { listcont: byShape.listcont, hide: cHide, nofire: cNoFire, eols: [...cEols] });
+    // The BUG-201 round-4 SEAM dimension: a paired inner fence in a nested list.
+    // EJECT (well-formed, must stay silent — C2 must not misread it as a fold-depth
+    // unpaired fence) and HIDE (a reserved opener in the same nesting must fire).
+    const pairf = corpus.filter((c) => c.shape === 'pairfence');
+    const pfEject = pairf.filter((c) => c.id.includes('/eject/')).length;
+    const pfHide = pairf.filter((c) => c.id.includes('/hide/')).length;
+    const pfEols = new Set(pairf.map((c) => c.eol));
+    check('the PAIRED-INNER-FENCE-IN-NESTED-LIST dimension is generated, both directions, all line endings',
+      byShape.pairfence >= 100 && pfEject >= 50 && pfHide >= 50 && ['lf', 'crlf', 'cr'].every((e) => pfEols.has(e)),
+      { pairfence: byShape.pairfence, eject: pfEject, hide: pfHide, eols: [...pfEols] });
+    // The BUG-201 round-5 dimension: TWO fence events in one step at a container
+    // boundary (inner fence closes + fold-depth fence opens). HIDE (the fold-depth
+    // fence unpaired → promote) and EJECT (it pairs → silent). Both fence chars.
+    const bound = corpus.filter((c) => c.shape === 'boundary');
+    const bHide = bound.filter((c) => c.id.includes('/hide/')).length;
+    const bEject = bound.filter((c) => c.id.includes('/eject/')).length;
+    const bEols = new Set(bound.map((c) => c.eol));
+    check('the SAME-LINE-MULTI-TRANSITION dimension is generated, both directions, all line endings',
+      byShape.boundary >= 60 && bHide >= 30 && bEject >= 30 && ['lf', 'crlf', 'cr'].every((e) => bEols.has(e)),
+      { boundary: byShape.boundary, hide: bHide, eject: bEject, eols: [...bEols] });
+    // The BUG-201 round-6 dimension: a reserved opener behind a container marker,
+    // INSIDE an open inner fence. HIDE (promoted through both wrappers) and NO-FIRE
+    // (a non-reserved fence in the same spot must not be promoted).
+    const infence = corpus.filter((c) => c.shape === 'infence');
+    const ifHide = infence.filter((c) => c.id.includes('/hide/')).length;
+    const ifNoFire = infence.filter((c) => c.id.includes('/nofire/')).length;
+    const ifEols = new Set(infence.map((c) => c.eol));
+    check('the OPENER-BEHIND-MARKER-INSIDE-FENCE dimension is generated, both directions, all line endings',
+      byShape.infence >= 100 && ifHide >= 50 && ifNoFire >= 50 && ['lf', 'crlf', 'cr'].every((e) => ifEols.has(e)),
+      { infence: byShape.infence, hide: ifHide, nofire: ifNoFire, eols: [...ifEols] });
   }
 
   /* ── the round-8 reported input, asserted on its own ──────────────────────
@@ -894,6 +967,322 @@ async function main() {
         srch.blocks.length === 0 && srch.fallbackRuns.some((r) => r.text.includes('TOKSRCH'))
         && srch.malformed.some((m) => m.startsWith('inert-html:')),
         { blocks: srch.blocks.map((b) => b.name), malformed: srch.malformed });
+    }
+  }
+
+  /* ── the round-13/14 reported input, asserted on its own ──────────────────
+   * The block-quote-contained fold guard, character for character, plus the
+   * controls. The independent pass found `foldUncertainty`'s C1/C2 reading the
+   * RAW `>`-prefixed line, where `openerOf`/`isClosingFence` see nothing — so an
+   * authored `orchard-ask` inside a quoted `orchard-narration` fold rendered in a
+   * CLOSED <details> with `malformed: []`. The fix routes the guard through the
+   * one container-stripped view the parser already uses (`restOfLine`). Stated
+   * here as well as in the corpus because a reader looking for THE reported defect
+   * should not have to trust a stratum name. */
+  {
+    // C1 — a reserved opener inside a quoted fold. The fold must END at it, the
+    // opener becomes its own VISIBLE block, and it is REPORTED.
+    const c1 = parseResponseBlocks(['> ````orchard-narration', '> C1-NARR',
+      '> ````orchard-ask', '> C1-ASK-VISIBLE', '> ````'].join('\n'));
+    check('round-13: a reserved opener inside a QUOTED fold ends the fold (C1 is not blind behind `>`)',
+      c1.blocks.some((b) => b.name === 'orchard-ask' && b.content.includes('C1-ASK-VISIBLE'))
+      && !c1.blocks.some((b) => b.name === 'orchard-narration' && b.content.includes('C1-ASK-VISIBLE')),
+      { blocks: c1.blocks.map((b) => [b.name, b.content]) });
+    check('round-13: ...and it is REPORTED (ambiguous-fold, reserved-opener-in-fold)',
+      c1.malformed.length === 1 && c1.malformed[0].startsWith('ambiguous-fold:orchard-narration')
+      && c1.malformed[0].includes('reserved-opener-in-fold'), c1.malformed);
+    // C2 — an unpaired inner fence inside a quoted fold. The fold must end at it
+    // and the content after it must be VISIBLE (fallback), reported.
+    const c2 = parseResponseBlocks(['> ````orchard-outcome', '> C2-BODY', '> ```',
+      '> C2-TAIL-VISIBLE', '> ````'].join('\n'));
+    check('round-14: an unpaired inner fence inside a QUOTED fold ends the fold (C2 is not blind behind `>`)',
+      c2.fallbackRuns.some((r) => r.text.includes('C2-TAIL-VISIBLE'))
+      && !c2.blocks.some((b) => b.name === 'orchard-outcome' && b.content.includes('C2-TAIL-VISIBLE')),
+      { blocks: c2.blocks.map((b) => [b.name, b.content]), fallback: c2.fallbackRuns.map((r) => r.text) });
+    check('round-14: ...and it is REPORTED (ambiguous-fold, unpaired-fence-in-fold)',
+      c2.malformed.length === 1 && c2.malformed[0].startsWith('ambiguous-fold:orchard-outcome')
+      && c2.malformed[0].includes('unpaired-fence-in-fold'), c2.malformed);
+    // The container STACK, not one level of it: the same C1 verdict through a
+    // tight quote, a nested quote, a list item, and a list item inside a quote.
+    for (const [what, lead, Q, P] of [
+      ['a tight quote', [], '>', '>'],
+      ['a nested quote (mixed depth)', [], '> > ', '> > '],
+      ['a list item', ['- item'], '  ', '  '],
+      ['a list item inside a quote', ['> - item'], '>   ', '>   '],
+    ]) {
+      const q = parseResponseBlocks([...lead, `${Q}\`\`\`\`orchard-notes`, `${P}CS-NARR`,
+        `${P}\`\`\`\`orchard-answer`, `${P}CS-VISIBLE`, `${P}\`\`\`\``].join('\n'));
+      const visibleBlock = q.blocks.some((b) => b.name === 'orchard-answer' && b.content.includes('CS-VISIBLE'));
+      const notHidden = !q.blocks.some((b) => b.name === 'orchard-notes' && b.content.includes('CS-VISIBLE'));
+      check(`round-13: ${what} -> the reserved opener in the fold is promoted VISIBLE and the fold is reported`,
+        visibleBlock && notHidden && q.malformed.some((m) => m.startsWith('ambiguous-fold:orchard-notes')),
+        { blocks: q.blocks.map((b) => [b.name, b.content]), malformed: q.malformed });
+    }
+    // THE OTHER DIRECTION, so the fix is not "always cut a quoted fold": a quoted
+    // fold whose body is ONLY narration (no reserved opener, no unpaired fence) is
+    // a genuine fold and the parse is SILENT.
+    const live = parseResponseBlocks(['> ````orchard-narration', '> LIVE-NARR-1',
+      '> LIVE-NARR-2', '> ````', 'VISIBLE-TAIL'].join('\n'));
+    check('round-13: ...but a quoted fold with no reserved opener and no unpaired fence stays folded and SILENT',
+      live.blocks.some((b) => b.name === 'orchard-narration'
+        && b.content.includes('LIVE-NARR-1') && b.content.includes('LIVE-NARR-2'))
+      && live.malformed.length === 0
+      && live.fallbackRuns.some((r) => r.text.includes('VISIBLE-TAIL')),
+      { blocks: live.blocks.map((b) => [b.name, b.content]), malformed: live.malformed });
+  }
+
+  /* ── the BUG-201 reported input, asserted on its own ──────────────────────
+   * The round-13/14 fix routed the guard through the fold's OWN container-stripped
+   * view, which strips only the fold's stack — so a reserved opener one quote/list
+   * level DEEPER than the fold kept its inner `>` and hid from `openerOf`. C1 now
+   * reads a MAXIMAL strip (`innermostContent`), which consumes every leading
+   * `>`/list marker; C2 and `findClose` stay on the fold-stack view. Stated here as
+   * well as in the corpus because a reader looking for THE reported defect should
+   * not have to trust a stratum name. */
+  {
+    // THE REPRO, character for character. `VIS` is authored inside an `orchard-ask`
+    // one quote level BELOW the narration fold; it must be promoted VISIBLE (not
+    // hidden in the closed narration <details>) and the deviation REPORTED.
+    const p = parseResponseBlocks(['> ````orchard-narration', '> narr',
+      '> > ````orchard-ask', '> > VIS', '> ````'].join('\n'));
+    const hidden = p.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+    check('BUG-201: a reserved opener ONE quote level DEEPER than the fold is not folded away',
+      !hidden.includes('VIS'), { hidden, blocks: p.blocks.map((b) => [b.name, b.content]) });
+    check('BUG-201: ...VIS reaches the reader (a visible block or fallback), exactly once',
+      [...p.blocks.map((b) => b.content), ...p.fallbackRuns.map((r) => r.text)].join('\n').split('VIS').length - 1 === 1,
+      { blocks: p.blocks.map((b) => b.content), runs: p.fallbackRuns.map((r) => r.text) });
+    check('BUG-201: ...and the deviation is REPORTED (ambiguous-fold, reserved-opener-in-fold), never silent',
+      p.malformed.some((m) => m.startsWith('ambiguous-fold:orchard-narration') && m.includes('reserved-opener-in-fold')),
+      p.malformed);
+    // The DEPTH LADDER: C1 must fire at 2, 3 and 4 levels below the fold.
+    for (const depthPrefix of ['> > ', '> > > ', '> > > > ']) {
+      const q = parseResponseBlocks(['> ' + B4 + 'orchard-notes', '> NARR',
+        depthPrefix + B4 + 'orchard-answer', depthPrefix + 'DEEP-VIS', '> ' + B4].join('\n'));
+      const foldedD = q.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check(`BUG-201: a reserved opener at container depth "${depthPrefix.trim()}" below the fold is promoted, not folded`,
+        !foldedD.includes('DEEP-VIS') && q.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+        { foldedD, malformed: q.malformed });
+    }
+    // THE OVER-FIRE GUARD, the ticket's care item: C1 must NOT fire on an
+    // `orchard-*` word at a deeper container that is not a fence opener. A fence
+    // indented 4+ columns past the deeper container is INDENTED CODE — a naive
+    // "strip all whitespace" probe would wrongly promote it. The fold stays whole
+    // and the parse is SILENT.
+    const icode = parseResponseBlocks(['> ````orchard-notes', '> NARR',
+      '> >     ```orchard-answer', '> >     EXAMPLE', '> >     ```', '> ````'].join('\n'));
+    check('BUG-201: a deeper fence indented into code is NOT promoted (no over-fire), fold stays whole',
+      icode.blocks.length === 1 && icode.blocks[0].name === 'orchard-notes'
+      && icode.blocks[0].content.includes('EXAMPLE') && icode.malformed.length === 0,
+      { blocks: icode.blocks.map((b) => [b.name, b.content]), malformed: icode.malformed });
+    // ...and a bare inline MENTION of a reserved name at a deeper container is
+    // likewise not a fence, so the fold is intact and silent.
+    const inline = parseResponseBlocks(['> ````orchard-notes', '> NARR',
+      '> > orchard-answer is only mentioned here', '> ````'].join('\n'));
+    check('BUG-201: a deeper inline mention of a reserved name does not fire C1 (fold whole, silent)',
+      inline.blocks.length === 1 && inline.blocks[0].name === 'orchard-notes' && inline.malformed.length === 0,
+      { blocks: inline.blocks.map((b) => [b.name, b.content]), malformed: inline.malformed });
+    // The OTHER over-fire direction — a legitimate deeper example the author DID
+    // fold: it stays folded because the guard only fires on a fence SHAPE, and C2
+    // (fold pairing) is unchanged, so a well-formed quoted fold with a deeper
+    // paired inner code fence is still silent.
+    const paired = parseResponseBlocks(['> ````orchard-notes', '> NARR',
+      '> > ```', '> > code', '> > ```', '> ````'].join('\n'));
+    check('BUG-201: C2/findClose unchanged — a deeper PAIRED inner code fence keeps the fold silent',
+      paired.blocks.length === 1 && paired.blocks[0].name === 'orchard-notes' && paired.malformed.length === 0,
+      { blocks: paired.blocks.map((b) => [b.name, b.content]), malformed: paired.malformed });
+
+    // ROUND-1 REGRESSION (the clean-room not-HOLDS): a fold in a LIST ITEM whose
+    // content column needs 4-5 spaces. A raw-column strip read the continuation
+    // indent as indented code and never reached the deeper opener — VIS hidden,
+    // `malformed: []`. The fix strips the fold's containers via the parser's own
+    // `restOfLine` (which knows the item's content column) before opening deeper.
+    for (const [what, marker] of [['dash+3sp (col4)', '-   '], ['ordered 1.+2sp (col4)', '1.  '],
+      ['dash+4sp (col5)', '-    '], ['10.+3sp (col6)', '10.   ']]) {
+      const col = ' '.repeat(marker.length);
+      const q = parseResponseBlocks([marker + 'item',
+        col + B4 + 'orchard-notes', col + 'NARR',
+        col + '> ' + B4 + 'orchard-answer', col + '> DEEP-VIS', col + B4].join('\n'));
+      const folded = q.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check(`BUG-201 round-1: a deeper opener at list content column via "${what}" is promoted, not hidden`,
+        !folded.includes('DEEP-VIS') && q.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+        { folded, malformed: q.malformed });
+    }
+    // ...and the OTHER direction at that same geometry: a deeper fence genuinely
+    // indented into code (4 columns past the inner quote) is NOT promoted — the
+    // strip stops at the content column, not at raw whitespace. Fold whole, silent.
+    const lcCode = parseResponseBlocks(['1.  item', '    ' + B4 + 'orchard-notes', '    NARR',
+      '    > ' + '    ' + B3 + 'orchard-answer', '    > ' + '    EXAMPLE', '    > ' + '    ' + B3, '    ' + B4].join('\n'));
+    check('BUG-201 round-1: a deeper indented-code fence at a 4-column list item is NOT promoted (fold whole, silent)',
+      lcCode.blocks.length === 1 && lcCode.blocks[0].name === 'orchard-notes'
+      && lcCode.blocks[0].content.includes('EXAMPLE') && lcCode.malformed.length === 0,
+      { blocks: lcCode.blocks.map((b) => [b.name, b.content]), malformed: lcCode.malformed });
+
+    // ROUND-3 REGRESSION (the second clean-room not-HOLDS): a list OPENED on a
+    // prior body line, the reserved opener on a CONTINUATION line with the marker
+    // NOT repeated. A per-line strip cannot see the list; the parser-based C1 runs
+    // the real block machine over the fold body, so a container opened on one line
+    // is carried onto the next. Verbatim reported shape + a quote-wrapped variant.
+    for (const [what, wrap] of [['bare', ''], ['quote-wrapped', '> ']]) {
+      const q = parseResponseBlocks([wrap + B4 + 'orchard-notes',
+        wrap + '-   item',
+        wrap + '    ' + B4 + 'orchard-ask', wrap + '    CONT-SECRET', wrap + '    ' + B4,
+        wrap + B4].join('\n'));
+      const folded = q.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check(`BUG-201 round-3: a ${what} list-continuation opener (marker on a prior line) is promoted, not hidden`,
+        !folded.includes('CONT-SECRET') && q.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+        { folded, malformed: q.malformed });
+    }
+    // ...and the CommonMark paragraph-interrupt rule is respected (the parser's, not
+    // an estimate): an ordered marker not starting at 1, AFTER a paragraph line,
+    // does NOT open a list, so a fence indented under it is paragraph/indented-code
+    // content and stays folded — silent, not a false promotion.
+    const noInterrupt = parseResponseBlocks([B4 + 'orchard-notes', 'a paragraph',
+      '10. item', '    ' + B4 + 'orchard-ask', '    STAYS', '    ' + B4, B4].join('\n'));
+    check('BUG-201 round-3: an ordered marker (not 1.) after a paragraph does not open a list — deferring to the parser, fold stays whole/silent',
+      noInterrupt.blocks.length === 1 && noInterrupt.blocks[0].name === 'orchard-notes' && noInterrupt.malformed.length === 0,
+      { blocks: noInterrupt.blocks.map((b) => [b.name, b.content]), malformed: noInterrupt.malformed });
+
+    /* ── ROUND-4 SEAM: C1 AND C2 READ ONE (container, fence) STATE ──────────
+     * The invariant, made observable: for every body line C1 and C2 consult the
+     * IDENTICAL state produced by a single pass, so they cannot disagree about
+     * which container a line is in. Before the fix, C1 knew a line sat inside a
+     * body-opened list while C2's separate fold-stack view read the same line as a
+     * bare fence at the fold's depth — a well-formed PAIRED inner fence in a nested
+     * list was flagged `unpaired-fence-in-fold`, the fold truncated, and visible
+     * trailing content EJECTED. */
+    {
+      // EJECT direction: a paired inner code fence in a nested list, with trailing
+      // content. It must stay ONE silent fold — nothing flagged, NOTHING ejected.
+      const eject = parseResponseBlocks([B5 + 'orchard-notes',
+        '- ' + B3 + 'js', '  code', '  ' + B3, 'TAIL-VISIBLE', B5].join('\n'));
+      check('BUG-201 round-4: a PAIRED inner fence in a nested list is not flagged (C2 does not misread it as a fold-depth fence)',
+        eject.malformed.length === 0, eject.malformed);
+      check('BUG-201 round-4: ...and the trailing content is NOT ejected — one whole fold, no fallback',
+        eject.blocks.length === 1 && eject.blocks[0].name === 'orchard-notes'
+        && eject.blocks[0].content.includes('TAIL-VISIBLE') && eject.fallbackRuns.length === 0,
+        { blocks: eject.blocks.map((b) => [b.name, b.content]), fallback: eject.fallbackRuns.map((r) => r.text) });
+      // THE STRUCTURAL PROOF that both signals read the same container: over the
+      // SAME nesting, C1 must promote a reserved opener (it sees the list) AND C2
+      // must stay silent on a paired plain fence (it sees the same list). If C1 and
+      // C2 used different container views, one of these two would break.
+      const hide = parseResponseBlocks([B5 + 'orchard-notes',
+        '- ' + B3 + 'orchard-ask', '  DECISION', '  ' + B3, B5].join('\n'));
+      const hidFolded = hide.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check('BUG-201 round-4: over the SAME nesting, a reserved opener FIRES (C1 sees the list) — the seam is closed in both directions',
+        !hidFolded.includes('DECISION') && hide.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+        { folded: hidFolded, malformed: hide.malformed });
+      // A GENUINE unpaired fence at the fold's OWN depth must still end the fold.
+      const genuine = parseResponseBlocks([B5 + 'orchard-notes', 'n', B3, 'dangling', B5].join('\n'));
+      check('BUG-201 round-4: a genuine unpaired fence at the FOLD depth still fires C2 (not silenced by the unification)',
+        genuine.malformed.some((m) => m.includes('unpaired-fence-in-fold')), genuine.malformed);
+      // A paired inner fence DEEPER (quote+list mix) is likewise silent + whole.
+      const mix = parseResponseBlocks(['> ' + B5 + 'orchard-notes',
+        '> - ' + B3, '>   x', '>   ' + B3, '> keep', '> ' + B5].join('\n'));
+      check('BUG-201 round-4: a paired inner fence in a list-in-quote is silent and whole (no eject through a wrapper)',
+        mix.malformed.length === 0 && mix.blocks.length === 1 && mix.blocks[0].content.includes('keep')
+        && mix.fallbackRuns.length === 0,
+        { blocks: mix.blocks.map((b) => [b.name, b.content]), malformed: mix.malformed, fb: mix.fallbackRuns.map((r) => r.text) });
+    }
+
+    /* ── ROUND-5: TWO FENCE EVENTS IN ONE STEP (a container boundary) ────────
+     * At a container boundary the quoted/listed inner fence CLOSES and a fold-depth
+     * fence OPENS on the SAME advanceLineState step. C2 now consumes explicit fence
+     * events, so both are seen; the boolean state diff it replaced saw fence→fence
+     * and missed the fold-depth fence, folding its trailing content away. */
+    {
+      // HIDE: the boundary opens an UNPAIRED fold-depth fence — its content must be
+      // promoted. Quote-exit and list-exit variants, plus a depth-2 nested quote.
+      for (const [what, inner] of [['quote-exit', ['> ' + B3, '> code']],
+        ['list-exit', ['- ' + B3, '  code']], ['nested-quote-exit', ['> > ' + B3, '> > code']]]) {
+        const p = parseResponseBlocks([B5 + 'orchard-notes', ...inner, B3, 'MUST-BE-VISIBLE', B5].join('\n'));
+        const folded = p.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+        check(`BUG-201 round-5: ${what} + fold-depth fence open on one step — content promoted, not folded`,
+          !folded.includes('MUST-BE-VISIBLE') && p.malformed.some((m) => m.includes('unpaired-fence-in-fold')),
+          { folded, malformed: p.malformed });
+      }
+      // The tilde/backtick cross: the boundary fence is the OTHER character.
+      const cross = parseResponseBlocks([B5 + 'orchard-notes', '> ' + B3, '> code', '~~~', 'MUST-SEE', B5].join('\n'));
+      const cFolded = cross.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check('BUG-201 round-5: cross-character boundary (backtick inner, tilde fold-depth) still promotes',
+        !cFolded.includes('MUST-SEE') && cross.malformed.length > 0, { folded: cFolded, malformed: cross.malformed });
+      // EJECT: the boundary fold-depth fence PAIRS — one silent fold, nothing ejected.
+      const eject = parseResponseBlocks([B5 + 'orchard-notes', '> ' + B3, '> code', B3, 'x', B3, 'TAIL', B5].join('\n'));
+      check('BUG-201 round-5: a boundary fold-depth fence that PAIRS stays silent and whole (no eject)',
+        eject.malformed.length === 0 && eject.blocks.length === 1
+        && eject.blocks[0].content.includes('TAIL') && eject.fallbackRuns.length === 0,
+        { blocks: eject.blocks.map((b) => [b.name, b.content]), malformed: eject.malformed, fb: eject.fallbackRuns.map((r) => r.text) });
+    }
+
+    /* ── ROUND-6: A RESERVED OPENER BEHIND A MARKER, INSIDE AN OPEN INNER FENCE ─
+     * `advanceLineState` now emits ONE `content` field (every container marker on
+     * the line consumed) on every return path, and C1 reads only it — so a reserved
+     * opener behind a `>`/`-` marker is seen even when the line is literal code
+     * inside a paired inner fence (BUG-108, fence-depth-free). The two-wrapper case
+     * hid before; either wrapper alone promoted. */
+    {
+      // The reported shape and its single-wrapper controls: all THREE must promote.
+      const both = parseResponseBlocks([B5 + 'orchard-notes', '~~~markdown', '> ' + B3 + 'orchard-ask', 'DECISION', '~~~', B5].join('\n'));
+      const noBq = parseResponseBlocks([B5 + 'orchard-notes', '~~~markdown', B3 + 'orchard-ask', 'DECISION', '~~~', B5].join('\n'));
+      const noFence = parseResponseBlocks([B5 + 'orchard-notes', '> narr', '> ' + B3 + 'orchard-ask', '> DECISION', '> ' + B3, B5].join('\n'));
+      for (const [what, p] of [['both wrappers (marker + inner fence)', both],
+        ['inner fence only', noBq], ['blockquote marker only', noFence]]) {
+        const folded = p.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+        check(`BUG-201 round-6: a reserved opener with ${what} is promoted, not folded`,
+          !folded.includes('DECISION') && p.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+          { folded, malformed: p.malformed });
+      }
+      // Deeper marker (list-in-quote / nested quote) inside the fence, both chars.
+      const deep = parseResponseBlocks([B5 + 'orchard-notes', '> ~~~markdown', '> > ' + B3 + 'orchard-ask', '> > DECISION', '> ~~~', B5].join('\n'));
+      const dFolded = deep.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check('BUG-201 round-6: a reserved opener behind a DEEPER marker inside a quoted inner fence is promoted',
+        !dFolded.includes('DECISION') && deep.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+        { folded: dFolded, malformed: deep.malformed });
+      // OVER-FIRE guard: a NON-reserved fence (`> ```js`) behind a marker inside the
+      // inner fence must NOT be promoted — content-as-if-live only promotes reserved.
+      const over = parseResponseBlocks([B5 + 'orchard-notes', '~~~markdown', '> ' + B3 + 'js', 'CODE', '~~~', B5].join('\n'));
+      check('BUG-201 round-6: a NON-reserved fence behind a marker inside the inner fence does NOT fire (no over-fire)',
+        over.malformed.length === 0 && over.blocks.length === 1 && over.blocks[0].content.includes('CODE')
+        && over.fallbackRuns.length === 0,
+        { blocks: over.blocks.map((b) => [b.name, b.content]), malformed: over.malformed });
+    }
+
+    /* ── ROUND-7: `content` IS SET BY CONSTRUCTION, NOT BY A SOURCE CHECK ──────
+     * Round 6 proved "every return sets `content`" with a regex over the source —
+     * which `return(...)` and throw/catch returns evade. Round 7 makes it true by
+     * construction: `advanceLineState` is a one-line wrapper whose ONLY exit runs
+     * `finishContent`, so no path the implementation takes can produce a state
+     * without a fresh `content`. Two things are checked here:
+     *   (a) STRUCTURAL, trivial: the wrapper body is exactly that one line — so it
+     *       cannot grow a second, `finishContent`-skipping exit;
+     *   (b) BEHAVIOURAL: the constructs that evaded the regex (`return(...)`, and a
+     *       throw caught inside the impl) STILL yield content — driven through the
+     *       real parser on the shapes that need content, proving it cannot go stale. */
+    {
+      const src = fs.readFileSync(path.join(ROOT, 'public', 'lib', 'response-blocks.js'), 'utf8');
+      const wrapper = src.match(/function advanceLineState\(prev, rawLine\) \{\s*([\s\S]*?)\s*\}\s*\nfunction advanceLineStateImpl/);
+      const bodyLine = wrapper ? wrapper[1].trim() : '';
+      check('BUG-201 round-7: advanceLineState is a one-line wrapper whose only exit runs finishContent',
+        bodyLine === 'return finishContent(advanceLineStateImpl(prev, rawLine), prev, rawLine);',
+        { bodyLine });
+      // The impl is reachable ONLY through that wrapper (no other call site can skip
+      // finishContent), and finishContent assigns `content` unconditionally. Together
+      // with the one-line wrapper this closes the evasion the regex allowed: whatever
+      // the impl returns — `return(...)`, a value thrown and caught — content is set.
+      const implCalls = (src.match(/advanceLineStateImpl\(/g) || []).length; // 1 def + 1 wrapper call
+      check('BUG-201 round-7: advanceLineStateImpl is called ONLY by the wrapper (no finishContent-skipping caller)',
+        implCalls === 2, { implCalls });
+      check('BUG-201 round-7: finishContent assigns content unconditionally (single owner)',
+        /function finishContent\(st, prev, rawLine\) \{\s*st\.content = lineContent\(prev, rawLine\);\s*return st;\s*\}/.test(src),
+        'finishContent body');
+      // BEHAVIOURAL: whatever the impl does, `content` is attached — so C1 still sees
+      // a reserved opener behind a marker inside a fence (the round-6 shape), which is
+      // the case that DEPENDS on a non-stale content on the phase-0 (leaf-open) path.
+      const infenceReal = parseResponseBlocks([B5 + 'orchard-notes', '~~~markdown',
+        '> ' + B3 + 'orchard-ask', 'DECISION', '~~~', B5].join('\n'));
+      const infFolded = infenceReal.blocks.filter((b) => COLLAPSED_BLOCKS.includes(b.name)).map((b) => b.content).join('\n');
+      check('BUG-201 round-7: content is attached on the phase-0 path by construction — the round-6 opener still promotes',
+        !infFolded.includes('DECISION') && infenceReal.malformed.some((m) => m.startsWith('ambiguous-fold:')),
+        { folded: infFolded, malformed: infenceReal.malformed });
     }
   }
 
@@ -1488,14 +1877,19 @@ async function main() {
   });
   check('onboard.mjs exits 0 on a fresh scratch project', ob.status === 0, { status: ob.status, err: (ob.stderr || '').slice(-400) });
 
-  for (const rel of ['scripts/hooks/response-format-gate.mjs', 'public/lib/response-blocks.js', 'scripts/lib/format-metrics.mjs', 'scripts/lib/readability.mjs', 'public/lib/digest.js']) {
+  // FEAT-106: onboard now consolidates every generated file under `.orchard/`
+  // (the way `.claude/` works) — tools/hook under `.orchard/`, and the flattened
+  // lib closure (both scripts/lib/* AND public/lib/*.js) under `.orchard/lib/`.
+  // The delivered paths move accordingly; the STRENGTH of each check is kept.
+  for (const rel of ['.orchard/hooks/response-format-gate.mjs', '.orchard/lib/response-blocks.js', '.orchard/lib/format-metrics.mjs', '.orchard/lib/readability.mjs', '.orchard/lib/digest.js']) {
     check(`onboarded project has ${rel}`, fs.existsSync(path.join(target, rel)));
   }
   {
-    // FEAT-091 renderer lane relocated the grammar to public/lib/response-blocks.js
-    // (one parser shared by the hook and the browser UI, like public/lib/digest.js).
+    // The grammar's SOURCE is still public/lib/response-blocks.js in this repo
+    // (one parser shared by the hook and the browser UI); onboard flattens the
+    // copy into `.orchard/lib/`. Byte-identity of source→delivered copy is the check.
     const a = fs.readFileSync(path.join(ROOT, 'public/lib/response-blocks.js'), 'utf8');
-    const b = fs.existsSync(path.join(target, 'public/lib/response-blocks.js')) ? fs.readFileSync(path.join(target, 'public/lib/response-blocks.js'), 'utf8') : '';
+    const b = fs.existsSync(path.join(target, '.orchard/lib/response-blocks.js')) ? fs.readFileSync(path.join(target, '.orchard/lib/response-blocks.js'), 'utf8') : '';
     check('the copied grammar is byte-identical to the source', a === b, { same: a === b });
   }
   {
@@ -1508,7 +1902,7 @@ async function main() {
     const tData = path.join(TMP, 'target-data');
     const tTranscript = path.join(TMP, 'target.jsonl');
     fs.writeFileSync(tTranscript, JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: BUSY }] } }) + '\n');
-    const r = spawnSync('node', [path.join(target, 'scripts/hooks/response-format-gate.mjs')], {
+    const r = spawnSync('node', [path.join(target, '.orchard/hooks/response-format-gate.mjs')], {
       input: JSON.stringify({ session_id: SUITE_SESSION_ID, hook_event_name: 'Stop', stop_hook_active: false, transcript_path: tTranscript, cwd: target }),
       encoding: 'utf8', timeout: 15000,
       env: { ...process.env, ORCHARD_SESSION: SUITE_SESSION_ID, CLAUDE_STATION_DATA: tData, ORCHARD_STOP_HOOK_ENFORCE: '', ORCHARD_STOP_HOOK_DISABLED: '' },

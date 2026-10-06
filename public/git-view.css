@@ -13,10 +13,20 @@ html.git-open .window { visibility:hidden }
 .gt-gitwrite { display:flex; align-items:center; gap:6px; padding:3px 4px 3px 8px; border:1px solid var(--hair); border-radius:8px; background:var(--window) }
 .gt-gw-dot { flex:none; width:7px; height:7px; border-radius:50%; background:var(--ink-4) }.gt-gitwrite[data-on="true"] .gt-gw-dot { background:var(--st-done) }
 .gt-gw-state { color:var(--ink-3); font:10px var(--mono); white-space:nowrap }.gt-gitwrite[data-on="true"] .gt-gw-state { color:color-mix(in srgb,var(--st-done) 70%,var(--ink)) }
-.gt-gw-allow,.gt-gw-revoke { flex:none; padding:3px 8px; border-radius:6px; font:600 10px var(--sans); white-space:nowrap }
+.gt-gw-allow,.gt-gw-revoke,.gt-gw-perm { flex:none; padding:3px 8px; border-radius:6px; font:600 10px var(--sans); white-space:nowrap }
 .gt-gw-allow { color:var(--ink-2); border:1px solid var(--hair); background:var(--sunken) }.gt-gw-allow:hover:not(:disabled) { color:var(--ink); border-color:var(--ink-4) }
 .gt-gw-revoke { color:var(--st-high); border:1px solid color-mix(in srgb,var(--st-high) 40%,var(--hair)); background:var(--window) }.gt-gw-revoke:hover:not(:disabled) { color:var(--on-solid); background:var(--st-high) }
-.gt-gw-allow:disabled,.gt-gw-revoke:disabled { opacity:.4; cursor:default }
+.gt-gw-allow:disabled,.gt-gw-revoke:disabled,.gt-gw-perm:disabled { opacity:.4; cursor:default }
+/* FEAT-164 — the PERMANENT grant. Quiet until armed; armed it turns ochre and the
+   state line spells out what it means, so a permanent grant is never one stray click.
+   Granted, the pill carries a solid ring so "permanent" reads differently from a
+   timed grant at a glance, not by colour alone (the label says "permanent" too). */
+.gt-gw-perm { color:var(--ink-3); border:1px dashed var(--hair); background:transparent }.gt-gw-perm:hover:not(:disabled) { color:var(--ink); border-color:var(--ink-4) }
+.gt-gitwrite[data-armed="true"] { border-color:color-mix(in srgb,var(--warn) 55%,var(--hair)); background:color-mix(in srgb,var(--warn) 8%,var(--window)) }
+.gt-gitwrite[data-armed="true"] .gt-gw-state { color:color-mix(in srgb,var(--warn) 75%,var(--ink)) }
+.gt-gitwrite[data-armed="true"] .gt-gw-perm { color:var(--on-solid); background:var(--warn); border:1px solid var(--warn) }
+.gt-gitwrite[data-scope="permanent"] { border-color:color-mix(in srgb,var(--st-done) 50%,var(--hair)) }
+.gt-gitwrite[data-scope="permanent"] .gt-gw-dot { box-shadow:0 0 0 2px color-mix(in srgb,var(--st-done) 30%,transparent) }
 .gt-filters { display:flex; align-items:center; gap:8px; padding:6px 16px; border-bottom:1px solid var(--hair); background:var(--rail) }.gt-all { flex:none; display:flex; align-items:center; gap:6px; color:var(--ink-2); font-size:11px; white-space:nowrap }
 .gt-all input,.gt-file>input { width:16px; height:16px; margin:0; accent-color:var(--st-done); cursor:pointer }.gt-find { flex:1 1 420px; max-width:620px; min-width:100px; padding:4px 9px; font:11.5px var(--mono) }.gt-summary { margin-left:auto; flex:none; color:var(--ink-3); font:10.5px var(--mono); white-space:nowrap }
 .gt-body { flex:1; min-height:0; display:grid; grid-template-columns:minmax(400px,38%) minmax(0,1fr) }.gt-side { min-height:0; display:grid; grid-template-rows:minmax(0,1fr) auto; border-right:1px solid var(--hair); background:var(--rail) }

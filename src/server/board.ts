@@ -14,7 +14,12 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 // ONE definition of the ticket format (plan §3 / §8 step 2): board.ts was the
 // fourth H1 parser and the third INDEX-row splitter.
-import { indexRowCells, parseTicket, parseTitleLine } from '../../scripts/lib/ticket-schema.mjs';
+import { indexRowCells, parseTicket, parseTitleLine, extractTicketBlock, formatTicket } from '../../scripts/lib/ticket-schema.mjs';
+// FEAT-166 r3 — the typed answer stores (record / ledger / frozen legacy snapshot).
+import {
+  activityHeadings, appendLedgerAnswer, canonicalJson, frozenAnswerFor, ledgerAnswersFor, sha256,
+} from '../../scripts/lib/answer-source.mjs';
+import { randomUUID } from 'node:crypto';
 // FEAT-106 — one resolver decides where a project keeps its board, whether that
 // project is on the legacy `docs/bugs` layout or the consolidated `.orchard/`
 // one. boardDir() below is the single door every reader here comes through
@@ -82,6 +87,11 @@ export interface BoardItem {
    */
   answer?: string;
   answeredOn?: string;
+  /**
+   * FEAT-166 r3 — needsYou ticket items: the `decisionKey` of the decision shown, so
+   * the rail's answer can be refused if the decision changed before it was sent.
+   */
+  decisionKey?: string;
   /** Absolute path to the ticket file, for a ticket-kind item (so a status row can link to it). */
   file?: string;
   /**
@@ -128,6 +138,16 @@ export interface BoardItem {
    * the user decides in context. Absent on every other row.
    */
   services?: { services: { name: string; image: string }[]; reason: string } | null;
+  /**
+   * FEAT-157 — present iff this card is Orchard's base-update notice for the
+   * project. DERIVED by the server on every read (base-releases.ts `noticeFor`):
+   * nothing stores it and no route creates it, so an agent cannot raise one. The
+   * rail answers it only through the base-update route (Adopt / Defer / Skip,
+   * each naming the notice `rev`), never the generic answer route.
+   */
+  baseUpdate?: (import('./base-releases.ts').BaseNotice & {
+    entries: { version: number; date: string; class: string; summary: string; adjust: string }[];
+  }) | null;
 }
 export interface Board {
   hasBoard: boolean;
@@ -551,50 +571,137 @@ export function ticketDecision(markdown: string): TicketDecision | null {
 }
 
 /**
- * FEAT-090 — parse the `### YYYY-MM-DD — <author>` entries of a ticket's Activity
- * log and return the LAST user ANSWER entry plus whether ANY dated entry follows
- * it. `null` when the log carries no answer entry at all.
+ * FEAT-090 — the `### YYYY-MM-DD — <author>` entries of a ticket's Activity log.
+ * An answer entry is a heading whose author reads `you (answer…`, `you (follow-up…`
+ * or the legacy `you (via Needs-You rail…`. Detection is ANCHORED to the heading —
+ * never a whole-file substring — so prose that merely mentions the mark is never
+ * mistaken for an answer.
  *
- * An answer entry is a heading whose author reads `you (answer…` or the legacy
- * `you (via Needs-You rail…` (the mark `appendAnswer` stamps). Detection is
- * ANCHORED to the heading — never a whole-file substring — so a ticket whose
- * ordinary PROSE merely mentions the mark is NOT mistaken for answered (the live
- * pre-FEAT-090 bug this replaces).
+ * FEAT-166 r2 — the scan is CODE-FENCE AWARE and carries each entry's bound
+ * decision id. A heading that appears inside a ``` / ~~~ fence (a documentation
+ * example) is not an entry; and an entry's answer state is paired to a decision by
+ * the id in its heading, never by its line position relative to a declaration. The
+ * two break paths this replaces both inferred the pairing from log text — a
+ * follow-up sitting after a re-declaration, and a fenced declaration-shaped line —
+ * and both are unreachable once the pairing is an explicit, scanned-only identity.
  */
 const ENTRY_HEADING_RE = /^###\s+(\d{4}-\d\d-\d\d)\s+—\s+(.*)$/;
-// A follow-up (`you (follow-up …)`) is ALSO an answer entry: it keeps the ticket
-// in the answered-awaiting lane (owner 👤) rather than reading as "an agent acted
-// after the answer" — which is what would drop it off the lane. See FOLLOWUP_STATE.
 const ANSWER_AUTHOR_RE = /^you\s+\((?:answer|follow-?up|via Needs-You rail)/i;
+const YOU_AUTHOR_RE = /^you\s+\(/i;
+const FOLLOWUP_AUTHOR_RE = /^you\s+\(follow-?up/i;
+// The decision-identity envelope in a reply heading's author parenthetical:
+// `you (answer · via ticket view · decision <id>)`. The id is the LAST `· decision
+// <token>)` before the closing paren at end of line — composed by the server, so a
+// note body or a fenced example cannot forge it.
+const ENTRY_DECISION_RE = /·\s*decision\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*\)\s*$/i;
+// A fence opener/closer: ``` or ~~~ (any language tag follows). Toggled while
+// scanning so headings inside documentation examples are never read as entries.
+const FENCE_RE = /^(?:```|~~~)/;
+
+interface ActEntry {
+  date: string;
+  author: string;
+  line: number;
+  /** Sequential index within the parsed (fence-filtered) entry list. */
+  k: number;
+  /** The decision id this entry binds to (reply headings only), or null. */
+  decisionId: string | null;
+  isYou: boolean;
+  isAnswer: boolean;
+  isFollowup: boolean;
+}
+
+/** Every real Activity-log entry heading, in order, skipping fenced examples. */
+function activityEntries(lines: string[]): ActEntry[] {
+  const out: ActEntry[] = [];
+  let fenced = false;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (FENCE_RE.test(t)) { fenced = !fenced; continue; }
+    if (fenced) continue;
+    const m = t.match(ENTRY_HEADING_RE);
+    if (!m) continue;
+    const author = m[2].trim();
+    const idm = author.match(ENTRY_DECISION_RE);
+    out.push({
+      date: m[1], author, line: i, k: out.length,
+      decisionId: idm ? idm[1] : null,
+      isYou: YOU_AUTHOR_RE.test(author),
+      isAnswer: ANSWER_AUTHOR_RE.test(author),
+      isFollowup: FOLLOWUP_AUTHOR_RE.test(author),
+    });
+  }
+  return out;
+}
+
+/**
+ * FEAT-166 r2 — the ticket's CURRENT decision identity: `record.decision.id`, or
+ * null when the decision carries no id (declared before r2, or a prose
+ * `## Decision`) or there is no decision. Read from the record, never
+ * reconstructed (ARCH-010). A reply binds to the current decision when the id in
+ * its heading equals this; `null === null` is the legacy binding, so a ticket
+ * answered before r2 reads exactly as it did before.
+ */
+export function currentDecisionId(markdown: string): string | null {
+  try {
+    const parsed = parseTicket(markdown, { mode: 'auto' });
+    if (parsed.format === 'block' && parsed.record) {
+      const d = (parsed.record as Record<string, unknown>).decision;
+      if (d && typeof d === 'object' && !Array.isArray(d)) {
+        const id = (d as Record<string, unknown>).id;
+        if (typeof id === 'string' && id.trim()) return id.trim();
+      }
+    }
+  } catch { /* unreadable record → legacy (no id) */ }
+  return null;
+}
+
+/** The answer text of one entry: first `- **Answer:**`, else first non-empty body line. */
+function entryAnswerText(lines: string[], start: number, end: number): string {
+  let answer = '';
+  for (let j = start + 1; j < end; j++) {
+    const bt = lines[j].trim();
+    if (!bt) continue;
+    const am = bt.match(/^[-*]\s*\*\*Answer:?\*\*\s*(.*)$/i);
+    if (am) return am[1].trim();
+    if (!answer) answer = bt.replace(/^[-*]\s+/, '').trim();
+  }
+  return answer;
+}
 
 interface AnswerEntry { date: string; author: string; line: number; answer: string; }
 
-function answerEntries(markdown: string): { last: AnswerEntry; followed: boolean } | null {
+/**
+ * FEAT-166 r3 — LEGACY PROSE READER, FROZEN. Never called to decide answered state
+ * at read time: its only caller is `legacyProseAnswerFreeze` (the one-time snapshot
+ * builder behind answers-legacy.frozen.json). The live reader is `boundAnswers`.
+ *
+ * FEAT-090 — the answered-awaiting reader: the LAST user answer entry BOUND to the
+ * current decision, plus whether an agent dated entry follows it. `null` when no
+ * such answer exists.
+ *
+ * FEAT-166 r2 — "bound to the current decision" is by identity: an answer belongs
+ * only when its heading's decision id equals `currentDecisionId` (null === null for
+ * legacy). A matching NON-follow-up anchor is REQUIRED — an orphan follow-up (the
+ * user added context after a re-declared decision, with no fresh answer to it) does
+ * NOT make a ticket answered, and the old answer, bound to the superseded id, is
+ * excluded by construction.
+ */
+function legacyProseLaneCore(markdown: string): { last: AnswerEntry & { k: number }; followed: boolean } | null {
   const lines = markdown.split('\n');
-  const entries: AnswerEntry[] = [];
-  const isAnswer: boolean[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].trim().match(ENTRY_HEADING_RE);
-    if (!m) continue;
-    const author = m[2].trim();
-    // The answer text: the first `- **Answer:** …` line under the heading (else
-    // the first non-empty body line), until the next dated heading.
-    let answer = '';
-    for (let j = i + 1; j < lines.length; j++) {
-      if (ENTRY_HEADING_RE.test(lines[j].trim())) break;
-      const bt = lines[j].trim();
-      if (!bt) continue;
-      const am = bt.match(/^[-*]\s*\*\*Answer:?\*\*\s*(.*)$/i);
-      if (am) { answer = am[1].trim(); break; }
-      if (!answer) answer = bt.replace(/^[-*]\s+/, '').trim();
-    }
-    entries.push({ date: m[1], author, line: i, answer });
-    isAnswer.push(ANSWER_AUTHOR_RE.test(author));
-  }
-  let lastAnswerIdx = -1;
-  for (let i = entries.length - 1; i >= 0; i--) { if (isAnswer[i]) { lastAnswerIdx = i; break; } }
-  if (lastAnswerIdx === -1) return null;
-  return { last: entries[lastAnswerIdx], followed: lastAnswerIdx < entries.length - 1 };
+  const entries = activityEntries(lines);
+  const currentId = currentDecisionId(markdown);
+  const belong = entries.filter((e) => e.isAnswer && e.decisionId === currentId);
+  if (!belong.length) return null;
+  // An answer bound to the current decision is only real with a non-follow-up anchor.
+  if (!belong.some((e) => !e.isFollowup)) return null;
+  const last = belong[belong.length - 1];
+  const end = entries[last.k + 1]?.line ?? lines.length;
+  return {
+    last: { date: last.date, author: last.author, line: last.line, k: last.k, answer: entryAnswerText(lines, last.line, end) },
+    // An agent dated entry after the user's last word on THIS decision → acted.
+    followed: last.k < entries.length - 1,
+  };
 }
 
 /** Read a file's text, or '' if it cannot be read. */
@@ -684,7 +791,7 @@ export function readBoard(hostPath: string): Board {
       if (owner.includes(NEEDS_YOU)) {
         const file = item.file ?? null;
         const md = safeRead(file);
-        const ans = answerEntries(md);
+        const ans = answerEntries(md, file);
         if (ans && !ans.followed) {
           // FEAT-090 — answered, and NOTHING dated appended after it: the human
           // is done deciding but no agent has picked it up. It LEAVES needsYou
@@ -706,6 +813,7 @@ export function readBoard(hostPath: string): Board {
           // read-only attention row instead of an answer box.
           const d = ticketDecision(md);
           if (d) {
+            item.decisionKey = decisionKey(md);
             item.question = d.question;
             if (d.questionFromTitle) item.questionFromTitle = true;
             if (d.options.length) item.options = d.options.map((o) => o.label);
@@ -981,11 +1089,36 @@ export interface AnswerEntryInput {
    * (owner 👤, answered-awaiting). Only meaningful on a `decision` reply.
    */
   followup?: boolean;
+  /**
+   * FEAT-166 r2 — the identity of the decision this reply ANSWERS, read from the
+   * ticket's `decision.id` at write time (`currentDecisionId`). Written into the
+   * entry HEADING — a server-composed envelope ordinary note prose and fenced
+   * examples cannot impersonate — so answer state is BOUND to a decision by
+   * construction, not inferred from Activity-log text order (the two break paths
+   * this replaces). Null/absent when the ticket's decision carries no id (a
+   * decision declared before r2, or a prose `## Decision`): that is the legacy
+   * binding, read identically to today.
+   */
+  decisionId?: string | null;
+}
+
+/**
+ * ARCH-006 (option A, step 1) — the ONE line-ending normaliser for server write
+ * paths. Converts every CR form (CRLF and a bare/lone CR) to LF, so text is
+ * canonical the moment it enters a write path and no downstream reader has to
+ * remember the rule. `/\r\n?/g` collapses `\r\n` first (the optional `\n` is
+ * consumed with it) and a lone `\r` second. This is the owner's single
+ * declaration of "canonical text"; readers read it rather than re-deriving it.
+ * Renderer-level normalisation (e.g. LINE_ENDINGS_RE in response-blocks.js) STAYS
+ * until every source feeding those renderers is converted — see the ticket.
+ */
+export function normalizeLineEndings(text: string | null | undefined): string {
+  return String(text ?? '').replace(/\r\n?/g, '\n');
 }
 
 /** `- **Label:** first` with 2-space-indented continuation lines (append-only safe). */
 function bulletLines(label: string, text: string): string[] {
-  const clean = String(text ?? '').replace(/\r\n/g, '\n').trimEnd();
+  const clean = normalizeLineEndings(text).trimEnd();
   const [first, ...rest] = clean.split('\n');
   return [`- **${label}:** ${first}`, ...rest.map((l) => (l.trim() ? `  ${l}` : ''))];
 }
@@ -1010,8 +1143,16 @@ export function composeAnswerEntry(input: AnswerEntryInput): string {
   const q = String(input.question ?? '').trim();
   const chose = followup ? null : (input.chose && input.chose.key ? input.chose : null);
   const note = String(input.note ?? '').trim();
+  // FEAT-166 r2 — the decision-identity envelope. Rides in the author
+  // parenthetical the server owns, never a body bullet: a body bullet placed
+  // first would become the answered-lane's answer text, and body prose (or a
+  // fenced example) could impersonate it. A reader binds on this id; it is read,
+  // never reconstructed (ARCH-010). Omitted entirely when there is no decision
+  // id (legacy / prose decision), which reads as the legacy binding.
+  const decisionId = String(input.decisionId ?? '').trim();
+  const idSuffix = decisionId ? ` · decision ${decisionId}` : '';
 
-  const lines: string[] = [`### ${date} — you (${word} · via ${via})`];
+  const lines: string[] = [`### ${date} — you (${word} · via ${via}${idSuffix})`];
   if (q && !followup) lines.push(`- **Question:** ${q}`);
   if (chose) {
     lines.push(`- **Chose:** ${chose.key} — ${chose.label}`.trimEnd());
@@ -1070,8 +1211,7 @@ export interface TicketAnswerState {
 // `+`-split recommendation parser both assume no `+`/dash inside a key).
 const CHOSE_LINE_RE = /^[-*]\s*\*\*Chose:?\*\*\s*(.+?)\s+[—–]\s*(.*)$/i;
 const NOTE_LINE_RE = /^[-*]\s*\*\*(?:Note|Answer):?\*\*\s*(.*)$/i;
-const YOU_AUTHOR_RE = /^you\s+\(/i;
-const FOLLOWUP_AUTHOR_RE = /^you\s+\(follow-?up/i;
+// YOU_AUTHOR_RE / FOLLOWUP_AUTHOR_RE are defined with the Activity-log scanner above.
 
 /** The `{chose, note}` carried in one entry's body lines `(start, end)`. */
 function entryBody(lines: string[], start: number, end: number): { chose: { key: string; label: string } | null; note: string } {
@@ -1087,42 +1227,315 @@ function entryBody(lines: string[], start: number, end: number): { chose: { key:
   return { chose, note };
 }
 
-export function ticketAnswerState(markdown: string): TicketAnswerState | null {
+/** FEAT-166 r3 — LEGACY PROSE READER, FROZEN (see legacyProseLaneCore). */
+function legacyProseAnswerCore(markdown: string): { state: TicketAnswerState; lastYouK: number } | null {
   const lines = markdown.split('\n');
-  const entries: { date: string; author: string; line: number }[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].trim().match(ENTRY_HEADING_RE);
-    if (m) entries.push({ date: m[1], author: m[2].trim(), line: i });
-  }
-  const you = entries.map((e, k) => ({ e, k })).filter((x) => YOU_AUTHOR_RE.test(x.e.author));
+  const entries = activityEntries(lines);
+  const currentId = currentDecisionId(markdown);
+  // Only user replies BOUND to the current decision (FEAT-166 r2) — by heading
+  // identity, not line order. `null === null` is the legacy binding.
+  const you = entries.filter((e) => e.isYou && e.decisionId === currentId);
   if (!you.length) return null;
 
-  // The ANCHOR is the last NON-follow-up user reply — the decision/question/counter
-  // actually made. Follow-ups are context appended after it; they must NEVER
-  // overwrite what was decided (the original chose/note stays the record).
-  let anchor = you[you.length - 1];
+  // The ANCHOR is the last NON-follow-up user reply bound to this decision — the
+  // decision/question/counter actually made. An orphan follow-up (only follow-ups
+  // bound to the current decision, no fresh answer to it) is NOT an answer: the
+  // ticket is asking again, so return null and let the Decide card render pending.
+  let anchor: ActEntry | null = null;
   for (let p = you.length - 1; p >= 0; p--) {
-    if (!FOLLOWUP_AUTHOR_RE.test(you[p].e.author)) { anchor = you[p]; break; }
+    if (!you[p].isFollowup) { anchor = you[p]; break; }
   }
-  const kind: ReplyKind = /^you\s+\(question/i.test(anchor.e.author) ? 'question'
-    : /^you\s+\(counter/i.test(anchor.e.author) ? 'counter' : 'decision';
-  const anchorEnd = anchor.k + 1 < entries.length ? entries[anchor.k + 1].line : lines.length;
-  const { chose, note } = entryBody(lines, anchor.e.line, anchorEnd);
+  if (!anchor) return null;
+  const kind: ReplyKind = /^you\s+\(question/i.test(anchor.author) ? 'question'
+    : /^you\s+\(counter/i.test(anchor.author) ? 'counter' : 'decision';
+  const anchorEnd = entries[anchor.k + 1]?.line ?? lines.length;
+  const { chose, note } = entryBody(lines, anchor.line, anchorEnd);
 
-  // Every `you (follow-up …)` entry AFTER the anchor, oldest-first.
+  // Every `you (follow-up …)` entry bound to this decision AFTER the anchor, oldest-first.
   const followups: TicketAnswerFollowup[] = [];
-  for (const { e, k } of you) {
-    if (k <= anchor.k || !FOLLOWUP_AUTHOR_RE.test(e.author)) continue;
-    const fEnd = k + 1 < entries.length ? entries[k + 1].line : lines.length;
+  for (const e of you) {
+    if (e.k <= anchor.k || !e.isFollowup) continue;
+    const fEnd = entries[e.k + 1]?.line ?? lines.length;
     followups.push({ on: e.date, note: entryBody(lines, e.line, fEnd).note });
   }
 
-  // Awaiting: a decision with NO agent (non-user) dated entry after the LAST user
-  // reply. A follow-up is a user entry, so it keeps the ticket awaiting — only an
-  // agent's dated entry after everything means an agent has since acted.
+  // Awaiting: a decision with NO agent (non-user) dated entry after the LAST bound
+  // user reply. A follow-up is a user entry, so it keeps the ticket awaiting — only
+  // an agent's dated entry after everything means an agent has since acted.
   const lastYouK = you[you.length - 1].k;
   const agentActed = lastYouK < entries.length - 1;
-  return { on: anchor.e.date, kind, chose, note, awaiting: kind === 'decision' && !agentActed, followups };
+  return { state: { on: anchor.date, kind, chose, note, awaiting: kind === 'decision' && !agentActed, followups }, lastYouK };
+}
+
+/* ═══════════════ FEAT-166 r3 — the user's answer is a TYPED entry ════════════
+ *
+ * Three clean-room rounds broke "a ticket counts as answered only by a user answer
+ * bound to its CURRENT decision" by three prose paths (r1: a follow-up resurrected
+ * an old answer; r1: a fenced declaration example cleared one; r2: an agent-written
+ * forged `you (answer · … · decision <id>)` heading made a ticket answered). All
+ * three read answered-state OUT OF ACTIVITY-LOG PROSE. So, on the BUG-225 pattern:
+ *
+ *   ONE WRITER  `recordAnswer` — the server's answer route only (tickets.answerTicket
+ *               and the Needs-You rail's appendAnswer). It writes a typed entry into
+ *               the record's `decision.answers[]` (or, with no record decision, the
+ *               board's answer-ledger.json), and appends the familiar Activity-log
+ *               heading as DISPLAY ONLY.
+ *   ONE READER  `boundAnswers` — typed entries bound to the current decision (by
+ *               containment AND `decision_key`), plus the frozen pre-r3 snapshot
+ *               (answers-legacy.frozen.json, hash-pinned) while its decision_key
+ *               still matches. `ticketAnswerState` and `answerEntries` both derive
+ *               from it. No prose heading is ever read to decide "answered".
+ *
+ * The ONE thing Activity-log headings still feed is "has an agent acted since?"
+ * (awaiting → acted): the count of real entry headings after the answer's own
+ * position (`log_k`). Prose can therefore only RETIRE an answer to "acted" (which is
+ * what any agent note was always meant to do, FEAT-090) — never create one.
+ *
+ * OUT OF SCOPE (stated on FEAT-166): a same-uid process deliberately editing the
+ * typed JSON is the FEAT-164 self-grant class.
+ */
+export interface TypedAnswer {
+  answer_id: string;
+  kind: ReplyKind;
+  followup: boolean;
+  chose: { key: string; label: string } | null;
+  note: string;
+  question: string | null;
+  by: 'user';
+  via: string;
+  on: string;
+  recorded_at: string;
+  recorded_by: 'server';
+  /** `decisionKey` of the decision this answer was given to. */
+  decision_key: string;
+  /** Index of this answer's own display heading among the Activity-log headings. */
+  log_k: number;
+  /** sha256 of that display heading's trimmed line (board:check accounting). */
+  heading_sha: string;
+}
+
+interface FrozenAnswer {
+  decision_key: string;
+  state: (Omit<TicketAnswerState, 'awaiting'> & { last_you_k: number }) | null;
+  lane: { answer: string; answeredOn: string; last_k: number } | null;
+  heading_shas?: string[];
+}
+
+/** The record decision object, or null (no record / record decision null). */
+function recordDecision(markdown: string): { record: Record<string, unknown>; decision: Record<string, unknown> } | null {
+  try {
+    const parsed = parseTicket(markdown, { mode: 'auto' });
+    if (parsed.format === 'block' && parsed.record) {
+      const d = (parsed.record as Record<string, unknown>).decision;
+      if (d && typeof d === 'object' && !Array.isArray(d)) return { record: parsed.record as Record<string, unknown>, decision: d as Record<string, unknown> };
+    }
+  } catch { /* unreadable → no record decision */ }
+  return null;
+}
+
+/**
+ * The CURRENT decision's identity for binding: sha256 of the canonical decision —
+ * the record's `decision` object minus its `answers` (id included when present), or
+ * for a legacy prose ticket the parsed `## Decision` (ticketDecision, every field).
+ * `none` when there is no decision. Any change to the decision changes the key, so
+ * an answer given to the old decision stops counting (fails toward "pending").
+ */
+export function decisionKey(markdown: string): string {
+  const rd = recordDecision(markdown);
+  if (rd) {
+    const { answers: _drop, ...rest } = rd.decision;
+    return `rec:${sha256(canonicalJson(rest))}`;
+  }
+  let isBlock = false;
+  try { isBlock = parseTicket(markdown, { mode: 'auto' }).format === 'block'; } catch { /* legacy */ }
+  if (isBlock) return 'none';
+  const d = ticketDecision(markdown);
+  return d ? `prose:${sha256(canonicalJson(d))}` : 'none';
+}
+
+function idOfFile(file: string): string | null {
+  const m = /^([A-Z]+-\d+)(?:-|\.md$)/.exec(path.basename(file));
+  return m ? m[1] : null;
+}
+
+/**
+ * THE ONE READER of a ticket's user answers: the typed entries bound to the CURRENT
+ * decision, plus the frozen pre-r3 record when its decision_key still matches.
+ * `file` locates the board's ledger + frozen snapshot (null → record answers only).
+ */
+export function boundAnswers(markdown: string, file: string | null): { typed: TypedAnswer[]; frozen: FrozenAnswer | null; key: string } {
+  const key = decisionKey(markdown);
+  const rd = recordDecision(markdown);
+  let typed: TypedAnswer[] = [];
+  if (rd) {
+    const arr = rd.decision.answers;
+    typed = Array.isArray(arr) ? (arr as TypedAnswer[]) : [];
+  } else if (file) {
+    const id = idOfFile(file);
+    typed = id ? (ledgerAnswersFor(path.dirname(file), id) as TypedAnswer[]) : [];
+  }
+  typed = typed.filter((a) => a && typeof a === 'object' && a.by === 'user' && a.recorded_by === 'server'
+    && a.decision_key === key && ['decision', 'question', 'counter'].includes(a.kind));
+  let frozen: FrozenAnswer | null = null;
+  if (file) {
+    const id = idOfFile(file);
+    const f = id ? (frozenAnswerFor(path.dirname(file), id) as FrozenAnswer | null) : null;
+    if (f && f.decision_key === key && (f.state || f.lane)) frozen = f;
+  }
+  return { typed, frozen, key };
+}
+
+/** Real Activity-log heading count — the "has anything been appended since" basis. */
+function headingCount(markdown: string): number {
+  return activityHeadings(markdown).length;
+}
+
+/** The answered-lane text of a typed answer: exactly what the FEAT-090 reader showed for its composed entry. */
+function typedLaneText(a: TypedAnswer): string {
+  const lines = composeAnswerEntry({ kind: a.kind, question: a.question, chose: a.chose, note: a.note, via: a.via, followup: a.followup })
+    .split('\n').filter((_, i, all) => i > 0 && i < all.length - 1);
+  // lines[0] is the heading; entryAnswerText scans the body after it.
+  return entryAnswerText(lines, 0, lines.length);
+}
+
+/**
+ * FEAT-090 answered-awaiting lane, from the typed reader: the last user DECISION
+ * reply (answer or follow-up) bound to the current decision, provided a non-follow-up
+ * anchor exists, plus whether anything was appended to the log after it.
+ */
+export function answerEntries(markdown: string, file: string | null): { last: AnswerEntry; followed: boolean } | null {
+  const { typed, frozen } = boundAnswers(markdown, file);
+  const dec = typed.filter((a) => a.kind === 'decision');
+  const hasAnchor = !!frozen?.lane || dec.some((a) => !a.followup);
+  if (!hasAnchor) return null;
+  const n = headingCount(markdown);
+  const lastTyped = dec.length ? dec[dec.length - 1] : null;
+  if (lastTyped) {
+    return {
+      last: { date: lastTyped.on, author: 'you', line: -1, answer: typedLaneText(lastTyped) },
+      followed: lastTyped.log_k < n - 1,
+    };
+  }
+  const lane = frozen!.lane!;
+  return { last: { date: lane.answeredOn, author: 'you', line: -1, answer: lane.answer }, followed: lane.last_k < n - 1 };
+}
+
+/**
+ * FEAT-090 ticket-detail state, from the typed reader: the anchor is the last
+ * NON-follow-up user reply bound to the current decision (typed, else frozen); an
+ * orphan follow-up is not an answer. `awaiting` = a decision with nothing appended
+ * to the Activity log after the last bound user reply.
+ */
+export function ticketAnswerState(markdown: string, file: string | null): TicketAnswerState | null {
+  const { typed, frozen } = boundAnswers(markdown, file);
+  const n = headingCount(markdown);
+  let anchorIdx = -1;
+  for (let i = typed.length - 1; i >= 0; i--) if (!typed[i].followup) { anchorIdx = i; break; }
+  let base: Omit<TicketAnswerState, 'awaiting'>;
+  let lastUserK: number;
+  if (anchorIdx >= 0) {
+    const a = typed[anchorIdx];
+    base = { on: a.on, kind: a.kind, chose: a.chose, note: a.note, followups: [] };
+    lastUserK = a.log_k;
+    for (const f of typed.slice(anchorIdx + 1)) base.followups.push({ on: f.on, note: f.note });
+  } else if (frozen?.state) {
+    const { last_you_k, ...st } = frozen.state;
+    base = { ...st, followups: [...st.followups] };
+    lastUserK = last_you_k;
+    for (const f of typed) base.followups.push({ on: f.on, note: f.note });
+  } else {
+    return null;
+  }
+  for (const t of typed) lastUserK = Math.max(lastUserK, t.log_k);
+  const agentActed = lastUserK < n - 1;
+  const { on, kind, chose, note, followups } = base;
+  return { on, kind, chose, note, awaiting: kind === 'decision' && !agentActed, followups };
+}
+
+/** A stale answer: the decision changed (or the file moved) between read and write. */
+export class StaleAnswerError extends Error {
+  status = 409;
+}
+
+export interface RecordAnswerInput extends Omit<AnswerEntryInput, 'decisionId'> {
+  /**
+   * The decisionKey the user was SHOWN. When given and it no longer matches, the
+   * answer is refused (409) — a submission made for an earlier decision never
+   * binds to a newer one.
+   */
+  expectDecisionKey?: string | null;
+}
+
+/**
+ * THE ONE WRITER of a user answer (FEAT-166 r3). Typed entry first, display heading
+ * appended in the SAME write (record tickets) or right after the ledger write.
+ */
+export function recordAnswer(file: string, input: RecordAnswerInput): { entry: string; typed: TypedAnswer } {
+  const text = fs.readFileSync(file, 'utf8');
+  const key = decisionKey(text);
+  if (input.expectDecisionKey != null && input.expectDecisionKey !== key) {
+    throw new StaleAnswerError('the decision on this ticket changed after you read it — reload and answer the current question');
+  }
+  const entry = composeAnswerEntry({ ...input, decisionId: currentDecisionId(text) });
+  const heading = entry.split('\n')[1] ?? '';
+  const followup = input.kind === 'decision' && input.followup === true;
+  const typed: TypedAnswer = {
+    answer_id: randomUUID(),
+    kind: input.kind,
+    followup,
+    chose: followup ? null : (input.chose && input.chose.key ? { key: input.chose.key, label: input.chose.label } : null),
+    note: String(input.note ?? '').trim(),
+    question: input.question ? String(input.question).trim() || null : null,
+    by: 'user',
+    via: String(input.via ?? 'ticket view').trim() || 'ticket view',
+    on: heading.match(/^###\s+(\d{4}-\d\d-\d\d)/)?.[1] ?? new Date().toISOString().slice(0, 10),
+    recorded_at: new Date().toISOString(),
+    recorded_by: 'server',
+    decision_key: key,
+    log_k: -1,
+    heading_sha: sha256(heading.trim()),
+  };
+  const rd = recordDecision(text);
+  if (rd) {
+    const { body } = extractTicketBlock(text);
+    const probe = formatTicket(rd.record, body) + entry;
+    typed.log_k = headingCount(probe) - 1;
+    const prior = Array.isArray(rd.decision.answers) ? rd.decision.answers : [];
+    const record = { ...rd.record, decision: { ...rd.decision, answers: [...prior, typed] } };
+    const next = formatTicket(record, body) + entry;
+    // As late as possible: nothing else wrote the file since we read it.
+    if (fs.readFileSync(file, 'utf8') !== text) throw new StaleAnswerError('the ticket changed while your answer was being recorded — reload and retry');
+    fs.writeFileSync(file, next);
+  } else {
+    const id = idOfFile(file);
+    if (!id) throw new Error(`not a ticket file: ${file}`);
+    typed.log_k = headingCount(text + entry) - 1;
+    appendLedgerAnswer(path.dirname(file), id, typed);
+    fs.appendFileSync(file, entry);
+  }
+  return { entry, typed };
+}
+
+/**
+ * FEAT-166 r3 — the ONE-TIME freeze builder: the round-2 prose reader's output for
+ * one ticket, in the frozen-snapshot shape. Used only by `scripts/freeze-answers.mjs`.
+ */
+export function legacyProseAnswerFreeze(markdown: string): FrozenAnswer | null {
+  const heads = activityHeadings(markdown).filter((h) => /^you\s+\((?:answer|follow-?up|question|counter|via Needs-You rail)/i.test(h.author));
+  const core = legacyProseAnswerCore(markdown);
+  const lane = legacyProseLaneCore(markdown);
+  if (!core && !lane && !heads.length) return null;
+  return {
+    decision_key: decisionKey(markdown),
+    state: core ? { on: core.state.on, kind: core.state.kind, chose: core.state.chose, note: core.state.note, followups: core.state.followups, last_you_k: core.lastYouK } : null,
+    lane: lane ? { answer: lane.last.answer, answeredOn: lane.last.date, last_k: lane.last.k } : null,
+    heading_shas: heads.map((h) => h.sha),
+  };
+}
+
+/** The pre-r3 state, for the freeze-equivalence proof only. */
+export function legacyProseAnswerState(markdown: string): TicketAnswerState | null {
+  return legacyProseAnswerCore(markdown)?.state ?? null;
 }
 
 /**
@@ -1134,14 +1547,21 @@ export function ticketAnswerState(markdown: string): TicketAnswerState | null {
  * The legacy Needs-You rail path — a free-text (or option-label) DECISION answer.
  * Shares the ONE composer with the ticket-view route so both surfaces write the
  * same append-only, machine-readable grammar.
+ *
+ * FEAT-166 r2 — binds the reply to the ticket's CURRENT decision id so the readers
+ * pair it by identity.
+ *
+ * FEAT-166 r3 — goes through the ONE writer (`recordAnswer`). The rail has no
+ * `rev`, so it carries the `decisionKey` of the question the user was SHOWN
+ * (BoardItem.decisionKey); a mismatch is refused (409), so a form read before a
+ * re-declaration never binds to the newer decision.
  */
-export function appendAnswer(hostPath: string, id: string, answer: string): string {
+export function appendAnswer(hostPath: string, id: string, answer: string, expectDecisionKey?: string | null): string {
   if (!ID_RE.test(id)) throw new Error(`not a ticket id: ${JSON.stringify(id)}`);
   const dir = boardDir(hostPath);
   const file = ticketFile(dir, id);
   if (!file) throw new Error(`no ticket ${id} under ${dir}`);
-  const entry = composeAnswerEntry({ kind: 'decision', note: answer, via: 'Needs-You rail' });
-  fs.appendFileSync(file, entry);
+  recordAnswer(file, { kind: 'decision', note: answer, via: 'Needs-You rail', expectDecisionKey });
   return file;
 }
 

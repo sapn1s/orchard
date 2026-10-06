@@ -214,6 +214,14 @@ export function pinnedOf(s) {
     || (typeof s.pinnedAt === 'string' && s.pinnedAt !== '');
 }
 
+/** FEAT-168 — CLOSED (done), from an explicit server field only. No guessing. */
+export function closedOf(s) {
+  if (!s || typeof s !== 'object') return false;
+  // Round 4: ONLY the server's `closed` field. It is Orchard's own label, not a
+  // transcript tag, so a session whose tag happens to be "closed" is not closed.
+  return s.closed === true;
+}
+
 /** Title set by the user rather than generated. Explicit fields only. */
 export function renamedOf(s) {
   if (!s || typeof s !== 'object') return false;
@@ -254,6 +262,28 @@ export async function setPinned(sessionId, dir, pinned, { force = false } = {}) 
     return api(withDirQ(sessPath(sessionId), dir, extra), {
       method: 'PATCH',
       body: JSON.stringify(dir ? { pinned, dir } : { pinned }),
+    });
+  }
+}
+
+/**
+ * FEAT-168 — close/reopen. Same shape as setPinned: a dedicated `/close`
+ * sub-route (POST close, DELETE reopen), falling back to PATCH {closed} when an
+ * older server has no such route (a 404 is the other contract, not an error).
+ * No force option: the label is Orchard's own store, never the transcript tag.
+ */
+export async function setClosed(sessionId, dir, closed) {
+  const extra = {};
+  try {
+    return await api(withDirQ(`${sessPath(sessionId)}/close`, dir, extra), {
+      method: closed ? 'POST' : 'DELETE',
+      body: JSON.stringify(dir ? { dir, closed } : { closed }),
+    });
+  } catch (err) {
+    if (!(err instanceof ApiError) || !err.missing) throw err;
+    return api(withDirQ(sessPath(sessionId), dir, extra), {
+      method: 'PATCH',
+      body: JSON.stringify(dir ? { closed, dir } : { closed }),
     });
   }
 }
@@ -330,6 +360,19 @@ export const transcript = (encodedDir, sessionId, opts = {}) => {
 export const transcriptTail = (encodedDir, sessionId, opts = {}) =>
   transcript(encodedDir, sessionId, { tail: opts.limit ?? 200 });
 
+/*
+ * BUG-217 round 5 — the SESSION OUTBOX (src/server/outbox.ts). A queued message
+ * is a row the server minted and stored; a tab renders `outboxGet` and asks for
+ * changes by the server's row id. It never decides whether a row is sent.
+ * `outboxCreate` is idempotent by `nonce` (the tab's pending-request id).
+ */
+export const outboxGet = (sessionId) => api(`/api/outbox?session=${encodeURIComponent(sessionId)}`);
+export const outboxCreate = (req) => api('/api/outbox', { method: 'POST', body: JSON.stringify(req) });
+export const outboxEdit = (session, id, text) => api('/api/outbox/edit', { method: 'POST', body: JSON.stringify({ session, id, text }) });
+export const outboxDiscard = (session, id) => api('/api/outbox/discard', { method: 'POST', body: JSON.stringify({ session, id }) });
+export const outboxSend = (session, id, opts = {}) => api('/api/outbox/send', { method: 'POST', body: JSON.stringify({ session, id, ...opts }) });
+export const outboxDismissDamage = (session) => api('/api/outbox/dismiss-damage', { method: 'POST', body: JSON.stringify({ session }) });
+
 /**
  * FEAT-132 — the session-configuration record (what was injected into this
  * session's context at launch). `null` (via `optional`) means NO record: either
@@ -392,7 +435,17 @@ export const runtimeUpdate = (target = 'host', version) =>
     body: JSON.stringify(version ? { target, version } : { target }),
   });
 
-/** Write the container CLI pin (default: the host SDK's bundled CLI version). */
+/**
+ * FEAT-157 — answer a project's Orchard base-update notice (Adopt / Defer / Skip /
+ * Dismiss). `rev` is the notice revision the card showed; a stale one is refused 409.
+ */
+export const baseUpdate = (id, body) =>
+  api(`/api/projects/${encodeURIComponent(id)}/base-update`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+
+/** Retired by FEAT-157 (the container CLI follows the host SDK); kept so an old pane gets the 410 reason. */
 export const runtimeContainerPin = (version) =>
   api('/api/runtime/container-pin', {
     method: 'POST',
@@ -495,10 +548,11 @@ export const board = (id) =>
     .then((r) => r ?? { hasBoard: false, needsYou: [], inflight: [], doneToday: [] });
 
 /** Answer a 👤 board item: appended to the ticket + delivered to any attached session. */
-export const answerBoard = (id, ticketId, answer) =>
+export const answerBoard = (id, ticketId, answer, decisionKey) =>
   api(`/api/projects/${encodeURIComponent(id)}/board/answer`, {
     method: 'POST',
-    body: JSON.stringify({ id: ticketId, answer }),
+    // FEAT-166 r3 — the decision the user was SHOWN; the server refuses a mismatch.
+    body: JSON.stringify({ id: ticketId, answer, ...(decisionKey ? { decisionKey } : {}) }),
   });
 
 /**
@@ -704,6 +758,12 @@ export async function liveSessions() {
           // no bridge liveness block — which itself IS active writing, so the
           // sidebar treats null as running.
           running: typeof x?.liveness?.running === 'boolean' ? x.liveness.running : null,
+          // FEAT-154 (round 5): the authority's "working" fact — a main turn in
+          // flight OR a live subagent/background lane (src/server/liveness.ts). The
+          // sidebar's light-blue marker reads THIS so a session whose main turn
+          // ended while its subagents keep working still shows running. `null` on an
+          // older server / mtime-only entry ⇒ the reader falls back to `running`.
+          working: typeof x?.liveness?.working === 'boolean' ? x.liveness.working : null,
         }))
     .filter((x) => typeof x.sessionId === 'string' && x.sessionId);
 }
@@ -756,6 +816,23 @@ export async function sessionRunning(sessionId) {
   if (r === null) return null;
   const s = r.snapshot ?? r;
   return s && s.v === 1 ? s : null;
+}
+
+/**
+ * FEAT-154 (round 7) — stop ONE running task, addressed by (session, task). The
+ * server routes it to whichever bridge owns the session, attached to this tab or
+ * not. Never throws: resolves `{ ok, reason?, error? }` so the caller can say
+ * plainly what happened (`no-bridge` = the session is not driven any more).
+ */
+export async function stopTask(sessionId, taskId) {
+  try {
+    const r = await api(`/api/sessions/${encodeURIComponent(sessionId)}/running/${encodeURIComponent(taskId)}/stop`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    return { ok: r?.ok === true, reason: r?.reason ?? null, error: r?.error ?? null };
+  } catch (err) {
+    return { ok: false, reason: err?.body?.reason ?? (err?.status === 404 ? 'no-bridge' : 'unreachable'), error: err?.body?.error ?? err?.message ?? String(err) };
+  }
 }
 
 /**
@@ -856,6 +933,19 @@ export const browserAction = (id, action) =>
 
 
 export const containerStatus = (id) => containerCall(`/api/projects/${encodeURIComponent(id)}/container/status`);
+// FEAT-155 round 5 — the project Dockerfile build: state + sanitised log tail.
+// The route's own payload carries a `problem` field (why the wanted image is not
+// in use), so it is unwrapped here rather than through containerCall, whose
+// top-level `{problem}` means "the route refused".
+export const containerBuild = async (id) => {
+  try {
+    const r = await api(`/api/projects/${encodeURIComponent(id)}/container/build`);
+    return { log: typeof r?.log === 'string' ? r.log : '', build: r?.build ?? null, dockerfile: r };
+  } catch (err) {
+    if (err instanceof ApiError && err.missing) return null;
+    return { problem: err.message };
+  }
+};
 export const containerAction = (id, action) =>
   containerCall(`/api/projects/${encodeURIComponent(id)}/container/${action}`, { method: 'POST', body: '{}' });
 

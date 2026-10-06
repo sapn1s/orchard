@@ -18,6 +18,8 @@ import { readSessionConfig } from './session-config.ts';
 import { wiringStatus, coherentWaStack, hasEnabledWaRef } from './wiring.ts';
 import * as cm from './container-manager.ts';
 import * as svc from './service-manager.ts';
+import * as lifecycle from './lifecycle.ts';
+import { boundInstance } from './instance-owner.ts';
 import * as sub from './subagents.ts';
 import * as browser from './browser.ts';
 import * as tx from './transcript.ts';
@@ -26,23 +28,30 @@ import * as ot from './orchard-transcripts.ts';
 import * as cn from './codex-native.ts';
 import * as snaps from './snapshots.ts';
 import * as smut from './session-mutations.ts';
+import * as sessionClosed from './session-closed.ts'; // FEAT-168 — the Orchard-owned CLOSED record + its one derived read (never the transcript tag)
 import * as search from './search.ts';
 import * as mem from './memories.ts';
 import * as gitcli from './git.ts';
 // FEAT-108 round 2 — the runtime, per-project git-write grant store. Host-memory
 // only (see git-grant-store.mjs): the ONLY mutator is these user-driven routes,
 // so an agent cannot plant a grant by writing config or exporting an env var.
-import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink, confirmGitWrite } from '../../scripts/lib/git-grant-store.mjs';
+import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink, confirmGitWrite, setPermanentGrantSource, permanentGrantOf } from '../../scripts/lib/git-grant-store.mjs';
+// FEAT-164 — the PERMANENT grant is a declared project setting; the store reads it
+// from the registry (its one owner) at call time, for the hook and the shim alike.
+// Wired at import so it is in force before the first request or adopted session.
+setPermanentGrantSource(reg.gitWritePermanentOf);
 // BUG-173 — the invocation-layer shim consults the SAME grant authority as the
 // FEAT-108 hook, over loopback, at call time. `evaluateGitWrite` is that one
 // authority; `runLeakGateForRepo` is the one leak gate a granted publish must pass.
-import { evaluateGitWrite } from '../../scripts/lib/git-grant.mjs';
+import { redeemGitWrite } from '../../scripts/lib/git-grant.mjs';
 // BUG-173 round 3 — the decide route authenticates the shim caller with a
 // host-minted per-process secret, so it is not an open localhost endpoint.
 import { isShimSecretValid } from '../../scripts/lib/git-shim-secret.mjs';
 import { runLeakGateForRepo } from './runtime/claude-runtime.ts';
+import { repoContentFingerprint } from './leak-gate-host.ts';
 import * as rt from './runtime/runtime-update.ts';
-import { claudeCodePin, writeClaudeCodePin } from './provisioning.ts';
+// FEAT-157 — base releases + the one target/notice policy (the container CLI pin left provision.json).
+import { applyBaseUpdate, baseRailItem, baseStatusOf, registerBaseOp } from './base-updates.ts';
 import * as procs from './processes.ts';
 import * as board from './board.ts';
 // FEAT-058 — the ticket dashboard's read/write layer over the SAME docs/bugs/
@@ -62,14 +71,15 @@ import * as lanes from './lanes.ts';
 import * as requests from './requests.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
 import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
-import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, knownSlashCommands, knownModels, startZombieReaper, adoptSession, type AgentSession } from './agent-bridge.ts';
-import { readGlobalDefaults, patchGlobalDefaults } from './global-settings.ts';
-import { listAccounts, createAccount, deleteAccount, AccountError } from './claude-accounts.ts';
+import { buildRecord } from './project-dockerfile.ts'; // FEAT-155 round 5
+import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, bridgeForSession, knownSlashCommands, knownModels, startZombieReaper, adoptSession, resumeDirCandidates, type AgentSession } from './agent-bridge.ts'; // BUG-196 round 3: resumeDirCandidates
+import { readGlobalDefaults, patchGlobalDefaults, applyGlobalDefaults } from './global-settings.ts';
+import { listAccounts, createAccount, deleteAccount, resolveLaunchAccountDir, AccountError } from './claude-accounts.ts';
 // FEAT-145 step 3 — the "Add account" login relay (one attempt at a time, over
 // the WebSocket below). It owns the CLI child and its process group.
 import { startClaudeLogin, submitClaudeLoginCode, cancelClaudeLogin, type LoginEvent } from './claude-login.ts';
 import { adoptSurvivingHosts, attachSurvivable, reapHost, survivingHostForSdkSession, survivingHostForSession, scanSurvivingHosts, dropDeadSurvivorHost, type HostStatus } from './survival.ts';
-import { activeDeliveryFor, deliverIntoSurvivor, deliveryEvidenceFor, survivorDeliveryEnabled, type SurvivorDelivery } from './survivor-delivery.ts';
+import { activeDeliveryFor, deliverIntoSurvivor, deliveryEvidenceFor, survivorAdmits, type SurvivorDelivery } from './survivor-delivery.ts';
 /*
  * ARCH-001 — every "is it alive / mid-turn" answer this file publishes or acts
  * on comes from the one authority. No route re-derives it.
@@ -82,6 +92,11 @@ import { detectCodex } from './runtime/codex-runtime.ts';
 // bounded, fail-quiet reader that never blocks the request path.
 import * as providerUsage from './provider-usage.ts';
 import type { ClaudeLoginCommand, ClientCommand, StationEvent } from './events.ts';
+import {
+  startOutbox, stopOutbox, outboxView, outboxExists, createOutboxRow, editOutboxRow, discardOutboxRow, sendOutboxRow, dismissOutboxDamage,
+  outboxHasPending, validSessionId, OutboxError, type ResumeSettings, type OutboxWiring, type Probe, type HandOutcome,
+} from './outbox.ts';
+import { setSessionAccount, getSessionAccount, dropBoundAccountOverride } from './session-accounts.ts'; // FEAT-160 — the switch writes the server-owned session→account binding before it reaps; resumes/enqueues of a bound session drop the client's stale account (it is the server's fact).
 // FEAT-038 UI action: the server route reuses the SAME onboarding core the CLI
 // runs (`node scripts/onboard.mjs`) — imported, not reimplemented, so the button
 // and the command can never diverge. The CLI entry (main()) only runs when the
@@ -280,28 +295,66 @@ function readGuidePage(file: string, name: string): { title: string; body: strin
  * silently missing from the list. So the container dir is looked up EXPLICITLY
  * and merged in, de-duplicated by sessionId.
  */
+/**
+ * FEAT-155 — the store-dir -> address lookup the session-mutation guard reads.
+ * A per-project container store dir (`-workspace-<id>`) has exactly one
+ * address, `/workspace/<id>`, declared by container-manager
+ * (`containerStoreAddressOfDir`, the exact inverse of `containerStoreDirName`),
+ * whether or not the project that wrote it is still registered — a deleted
+ * project's kept history is listed by basename like any other and must stay
+ * renamable/deletable. A session in it may have run at that address or at bare
+ * `/workspace` (workspaceRoot); handing the SDK the address reaches this very dir.
+ */
+const declaredContainerStore: smut.DeclaredStoreLookup = (encodedDir) => {
+  const address = cm.containerStoreAddressOfDir(encodedDir);
+  return address ? { address, recordedCwds: [address, cm.CONTAINER_WORKSPACE] } : null;
+};
+
 function sessionsForProject(p: reg.Project) {
   const encoded = hist.encodeCwd(p.hostPath);
-  const projects = hist.listLogicalProjects();
+  /*
+   * FEAT-155 — a container store whose newest session ran at BARE `/workspace`
+   * records a cwd that names no project; grouped on it, every such store (and
+   * the legacy shared `-workspace`) would land in one "workspace" group. So a
+   * per-project store is grouped on its own ADDRESS (`/workspace/<id>`, the
+   * owner's declaration via `containerStoreAddressOfDir`) — exactly the key it
+   * had before it ever ran at the bare root, so moving, re-registering or
+   * toggling behaves as it always did.
+   */
+  const projects = hist.groupByLogicalProject(hist.listProjectDirs().map((d) => {
+    if ((d.cwd ?? d.cwdGuess) !== cm.CONTAINER_WORKSPACE) return d;
+    const address = cm.containerStoreAddressOfDir(d.encodedDir);
+    return address ? { ...d, cwd: address } : d;
+  }));
   const logical =
     projects.find((lp) => lp.dirs.some((d) => d.encodedDir === encoded)) ??
     projects.find((lp) => lp.key === hist.logicalKeyForCwd(p.hostPath));
 
-  const sessions = logical ? hist.listLogicalProjectSessions(logical) : [];
-  const dirs = logical ? logical.dirs.map((d) => d.encodedDir) : [];
+  /*
+   * FEAT-155 — one exclusion from basename grouping: the legacy shared
+   * `-workspace` dir (bare-root runs from before per-project stores) names no
+   * project and joins none. Everything else groups exactly as before. (An
+   * extra "another live project's store never joins" filter was tried and
+   * refuted: after an id is reused, it hid a re-registered owner's history.)
+   */
+  const containerDir = cm.containerStoreDirName(p);
+  const sharedBareDir = cm.encodeCwdForStore(cm.CONTAINER_WORKSPACE);
+  const groupDirs = logical ? logical.dirs.filter((d) => d.encodedDir !== sharedBareDir || d.encodedDir === encoded) : [];
+  const sessions = logical ? hist.listLogicalProjectSessions({ ...logical, dirs: groupDirs }) : [];
+  const dirs = groupDirs.map((d) => d.encodedDir);
 
-  const containerDir = cm.encodeCwdForStore(cm.containerWorkdir(p.id));
-  if (!dirs.includes(containerDir)) {
+  for (const storeDir of [containerDir]) {
+    if (dirs.includes(storeDir)) continue;
     let extra: ReturnType<typeof hist.listSessions> = [];
     try {
-      extra = hist.listSessions(containerDir);
+      extra = hist.listSessions(storeDir);
     } catch {
       extra = []; // dir absent — the project has simply never run in a container
     }
     if (extra.length) {
       const seen = new Set(sessions.map((s) => s.sessionId));
       for (const s of extra) if (!seen.has(s.sessionId)) sessions.push(s);
-      dirs.push(containerDir);
+      dirs.push(storeDir);
       sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
     }
   }
@@ -783,6 +836,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // updateProject writes through writeAtomic(), so a crash mid-write leaves
       // the previous registry intact rather than a truncated file.
       const project = reg.updateProject(id, patch);
+      // FEAT-155 — a settings change can change the container's drift verdict;
+      // the status cache must not report the pre-PATCH answer for its TTL.
+      cm.invalidate(id);
       if (pathChange && pathChange.from !== pathChange.to) {
         try {
           const after = sessionsForProject(project);
@@ -996,8 +1052,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
      * FEAT-108 round 2 — the runtime git-write grant, per project.
      *   GET    /api/projects/:id/git-write-grant  → { grant, recentWrites }
      *   POST   /api/projects/:id/git-write-grant  → grant one occasion or a window
-     *          body: { scope:'once'|'duration', minutes? }  (default: once)
-     *   DELETE /api/projects/:id/git-write-grant  → revoke
+     *          body: { scope:'once'|'duration'|'permanent', minutes? }  (default: once)
+     *          'permanent' (FEAT-164) writes the declared project setting instead
+     *          of the memory map; it survives restarts until revoked.
+     *   DELETE /api/projects/:id/git-write-grant  → revoke (timed AND permanent)
      * This is a USER action surface: the grant lives only in this host process's
      * memory (git-grant-store.mjs) and is consulted by the runtime's PreToolUse
      * git-write decision, so it lifts the block for a LIVE session with no
@@ -1013,6 +1071,16 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       }
       if (m === 'POST') {
         const body = (await readBody(req)) as Record<string, unknown>;
+        if (body.scope === 'permanent') {
+          // FEAT-164 — an explicit, per-project, PERMANENT opt-in. Written once, to
+          // the registry (the one owner); the store reads it per decision. Still
+          // never lifts the leak gate. Only this user route writes it.
+          reg.setGitWritePermanent(p.id, true, { via: 'dashboard' });
+          const grant = grantView(p.id);
+          console.warn(`[orchard] git-write PERMANENT grant SET for project ${p.id} (${p.name}) — no expiry until revoked; the leak gate still runs on every granted commit/push (FEAT-164).`);
+          sendJson(res, 200, { ok: true, projectId: p.id, grant });
+          return true;
+        }
         const scope = body.scope === 'duration' ? 'duration' : 'once';
         const minutes = Number(body.minutes);
         const ttlMs = Number.isFinite(minutes) && minutes > 0 ? Math.round(minutes * 60_000) : undefined;
@@ -1028,9 +1096,15 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         return true;
       }
       if (m === 'DELETE') {
-        const had = revokeGitWrite(p.id);
-        console.warn(`[orchard] git-write grant REVOKED for project ${p.id} (${p.name}) — ${had ? 'was active' : 'none active'} (FEAT-108).`);
-        sendJson(res, 200, { ok: true, projectId: p.id, revoked: had, grant: null });
+        // One control revokes everything: the timed/single-use grant in memory AND
+        // the permanent project setting (FEAT-164). Clearing the setting takes
+        // effect on a running session's very next git write — nothing caches it.
+        const hadPermanent = !!permanentGrantOf(p.id);
+        if (hadPermanent) reg.setGitWritePermanent(p.id, false, { via: 'dashboard' });
+        const hadTimed = revokeGitWrite(p.id);
+        const had = hadPermanent || hadTimed;
+        console.warn(`[orchard] git-write grant REVOKED for project ${p.id} (${p.name}) — ${had ? `was active (${[hadPermanent && 'permanent', hadTimed && 'timed'].filter(Boolean).join(' + ')})` : 'none active'} (FEAT-108/FEAT-164).`);
+        sendJson(res, 200, { ok: true, projectId: p.id, revoked: had, grant: grantView(p.id) });
         return true;
       }
       return notFound(res, `git-write-grant: no route ${m} ${url.pathname}`);
@@ -1066,6 +1140,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // memory can exist before any transcript does.
       const own = hist.encodeCwd(p.hostPath);
       if (!dirs.includes(own)) dirs.push(own);
+      // FEAT-155 — likewise the project's own DECLARED container store: its
+      // `memory/` exists independently of transcripts (e.g. after every session
+      // was deleted), and sessionsForProject only adds the dir when it lists one.
+      const ownStore = cm.containerStoreDirName(p);
+      if (!dirs.includes(ownStore)) dirs.push(ownStore);
       try {
         if (m === 'GET' && !url.searchParams.get('name')) {
           sendJson(res, 200, { dirs, memories: mem.listMemories(dirs) });
@@ -1090,6 +1169,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         sendJson(res, status, { error: (err as Error).message });
         return true;
       }
+    }
+    /*
+     * FEAT-157 — Orchard base releases for one project.
+     *   GET  /api/projects/:id/base          → { notice, pin, target, observed, releases }
+     *   POST /api/projects/:id/base-update   { action: adopt|defer|skip|dismiss|pin-dev, version?, rev }
+     * The POST is the rail's (the user's). It names the notice revision it was
+     * shown and is refused (409) when that is stale; the security floor and who
+     * may do what are `base-releases.ts` `applyAction`'s. The pin it writes is the
+     * DESIRED base; the container moves at its next launch with no live session.
+     */
+    if (id && rest[2] === 'base' && rest.length === 3 && m === 'GET') {
+      const p = reg.getProject(id);
+      if (!p) return notFound(res, `base: no project ${JSON.stringify(id)}`);
+      sendJson(res, 200, baseStatusOf(p));
+      return true;
+    }
+    if (id && rest[2] === 'base-update' && rest.length === 3 && m === 'POST') {
+      const p = reg.getProject(id);
+      if (!p) return notFound(res, `base-update: no project ${JSON.stringify(id)}`);
+      return handleBaseUpdate(req, res, p, 'user');
     }
     /* board: the opt-in per-project docs/bugs/ surface, read for the Needs-You
        rail. A project without docs/bugs/ returns an empty board, never a 404 —
@@ -1126,6 +1225,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           }));
           if (open.length) {
             b.needsYou = [...open, ...b.needsYou];
+            b.hasBoard = true;
+          }
+          // FEAT-157 — Orchard's base-update notice, DERIVED here from the release
+          // catalog + this project's pin + what its container runs (never stored,
+          // never raised by a session). Leads the rail: it is Orchard asking.
+          const baseItem = baseRailItem(p);
+          if (baseItem) {
+            b.needsYou = [baseItem, ...b.needsYou];
             b.hasBoard = true;
           }
           // FEAT-047/079: WA consolidation needs-human findings (boot +
@@ -1197,6 +1304,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // + derived on every GET: the card is an index over live sections, so
           // it cannot drift from them (BUG-041/074 — an observability surface
           // must not lie). Nothing is stored; the next poll recomputes it.
+          // FEAT-157 (attack round 1, c): the id base:<project> is Orchard's derived notice alone; no other row may carry it.
+          b.needsYou = b.needsYou.filter((x) => !String(x.id).startsWith('base:') || !!x.baseUpdate);
+          if (b.observations) b.observations = b.observations.filter((x) => !String(x.id).startsWith('base:'));
           b.summary = board.boardSummary(b);
           sendJson(res, 200, b);
           return true;
@@ -1232,12 +1342,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           const answer = String(body.answer ?? '');
           if (!ticketId) { sendJson(res, 400, { error: 'answer requires a ticket id' }); return true; }
           if (!answer.trim()) { sendJson(res, 400, { error: 'answer text is empty' }); return true; }
+          // FEAT-157 — a base-update notice is answered ONLY through its own route, which
+          // names the notice revision and enforces the security floor. Never through here.
+          if (ticketId.startsWith('base:')) {
+            sendJson(res, 409, { error: 'a base-update notice is answered with POST /api/projects/:id/base-update { action, version, rev } (the rail\'s Adopt / Defer / Skip), not the generic answer route', code: 'use-base-update' });
+            return true;
+          }
           // FEAT-029: a runtime-raised decision record answers differently from a
           // board ticket — deliver the answer back to the SPECIFIC session that
           // raised it (never a ticket file), then resolve the record so it leaves
           // the rail. If that session is gone, the answer is still recorded.
           const rec = decisions.get(ticketId);
           if (rec && rec.projectId === id) {
+            // FEAT-164 r2 — an approval that MINTS authority (a git-write grant, a
+            // services write) is answered once. Re-answering a resolved record used
+            // to re-run the mint, so replaying one past "Allow" re-issued a grant
+            // the user had since revoked or spent. Refuse, and change nothing.
+            if (rec.resolved && (rec.gitWrite || rec.services)) {
+              sendJson(res, 409, { error: `decision ${ticketId} was already answered; an approval is honoured once`, code: 'already-answered' });
+              return true;
+            }
             // FEAT-108 r3 — a git-write REQUEST is a decision that carries a
             // gitWrite payload. Approving it (answer begins "Allow") is the ONE
             // user action that mints a runtime grant: the request route that
@@ -1306,7 +1430,21 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // not the same act as starting work, and work begins only when the user
           // says go. (A live session genuinely BLOCKED on a reply it asked for is
           // the kind:'decision' branch above — that is a reply, not a dispatch.)
-          const file = board.appendAnswer(p.hostPath, ticketId, answer);
+          // FEAT-166 r3 — the rail carries no rev, so it names the decision it was
+          // SHOWN (BoardItem.decisionKey). Missing or changed → 409: an answer
+          // composed for an earlier decision never binds to a newer one.
+          const shown = typeof body.decisionKey === 'string' ? body.decisionKey : null;
+          if (!shown) {
+            sendJson(res, 409, { error: 'this answer does not name the decision it answers — reload the board and answer the current question' });
+            return true;
+          }
+          let file: string;
+          try {
+            file = board.appendAnswer(p.hostPath, ticketId, answer, shown);
+          } catch (err) {
+            if (err instanceof board.StaleAnswerError) { sendJson(res, 409, { error: err.message }); return true; }
+            throw err;
+          }
           sendJson(res, 200, { ok: true, id: ticketId, file, dispatched: false });
           return true;
         }
@@ -1410,18 +1548,20 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // to stop it. Tear it down here, and refuse while sessions are live.
       const p = reg.getProject(id);
       if (!p) return notFound(res, `no project ${id}`);
-      const live = liveSessionsForProject(id);
-      if (live.length && url.searchParams.get('force') !== '1') {
-        sendJson(res, 409, {
-          error: `project ${id} has ${live.length} live session(s) — close them first, or retry with ?force=1`,
-          liveSessions: live.map((s) => ({ stationSessionId: s.id, sdkSessionId: s.sdkSessionId })),
-        });
-        return true;
-      }
+      /*
+       * ARCH-022: whether sessions hold the project is the lifecycle authority's lease set, decided inside
+       * the delete OPERATION (the project's slot), which also deletes the registry row — so a launch queued
+       * behind it finds no project, and one admitted before it is protected. No guard here decides anything.
+       * ?force=1 = the leases live NOW (captured before their sessions are closed); later ones stay protected.
+       */
+      const force = url.searchParams.get('force') === '1';
+      const forceOver = force ? lifecycle.leasesOf(id).map((l) => l.id) : undefined;
       const closed: string[] = [];
-      for (const s of live) {
-        closed.push(s.id);
-        void s.close('project deleted').catch(() => {});
+      if (force) {
+        for (const s of liveSessionsForProject(id)) {
+          closed.push(s.id);
+          void s.close('project deleted').catch(() => {});
+        }
       }
       // Same reasoning as the container: leaving a Chrome running for a project
       // that no longer exists is an orphan holding a logged-in profile.
@@ -1434,24 +1574,34 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         }
       }
       let container: unknown = null;
-      if (p.isolation === 'container') {
-        try {
-          container = await cm.removeProjectContainer(p);
-        } catch (err) {
-          container = { error: (err as Error).message };
+      let buildState: unknown = null;
+      let deleted = false;
+      try {
+        const r = await cm.deleteProjectResources(p, {
+          container: p.isolation === 'container',
+          current: () => reg.getProject(id),
+          forceOver,
+          commit: () => { deleted = reg.deleteProject(id); },
+        });
+        container = r.container;
+        buildState = r.buildState;
+      } catch (err) {
+        const code = (err as { code?: string }).code;
+        if (code === 'live-sessions' || code === 'project-gone' || code === 'lifecycle-uncertain') {
+          sendJson(res, code === 'project-gone' ? 404 : 409, {
+            error: (err as Error).message, code, deleted: false, closedSessions: closed, browser: browserStop, holders: lifecycle.describe(id).leases,
+          });
+          return true;
         }
-        // FEAT-112: the project is gone, so its service sidecars, network AND
-        // data volumes go with it — this is the one teardown that purges data.
-        try {
-          svc.teardownServices(p.id, { removeVolumes: true });
-        } catch { /* best-effort; the orphan sweep is the backstop */ }
+        throw err;
       }
       // The session history under ~/.claude/projects/-workspace-<id> is the
       // user's own transcript data and is deliberately KEPT — reported, not deleted.
       sendJson(res, 200, {
-        deleted: reg.deleteProject(id),
+        deleted,
         closedSessions: closed,
         container,
+        buildState,
         browser: browserStop,
         keptSessionHistory: p.isolation === 'container' ? cm.containerHistoryDir(p) : null,
         // Same reasoning as the session history: these are restore points for a
@@ -1480,6 +1630,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // then to 'user'. Presentation only: the row, its transcript and its URL
       // are unaffected — the client just folds 'agent' rows out of the default view.
       const provenance = loadProvenanceMap();
+      const isClosed = sessionClosed.closedReader(); // FEAT-168 — one store read per list; the ONE closed read (r6: derived, never written on reopen)
       sendJson(res, 200, {
         projectId: p.id,
         encodedDir: hist.encodeCwd(p.hostPath),
@@ -1532,6 +1683,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // 'unknown' means "not found in the window", not "not present".
           titleMetaSampled: tm.sampled,
           pinned: tm.pinned,
+          closed: isClosed(s.sessionId, s.filePath), // FEAT-168 — closed iff this file's latest input prompt is the one recorded at close (session-closed.ts)
           tag: tm.tag,
           messageCount: s.messageCount,
           statsExact: s.statsExact,
@@ -1910,6 +2062,13 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           sessionId, encodedDir, filePath: file,
           messages: r.messages,
           mode: 'tail',
+          // BUG-196 — the engine this session's next turn WILL resume on, from the
+          // single owner of that fact (resumeProviderOf, the exact resolver
+          // agent-bridge P2b applies). The UI reads this so its per-session
+          // provider indicator shows the real engine and the selector can refuse a
+          // switch the resume would silently ignore — never re-deriving it from the
+          // project setting or a stale per-session override (ARCH-010).
+          lockedProvider: ot.resumeProviderOf([encodedDir], sessionId),
           offset: base,
           before,
           cursorBytes: r.blockStartByte, // feed back as ?beforeBytes for the next page
@@ -1949,6 +2108,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         sessionId, encodedDir, filePath: file,
         messages: t.messages,
         mode: 'page',
+        // BUG-196 — see the tail branch: the transcript-owned resume engine, so
+        // every page of a session carries the same locked-provider fact.
+        lockedProvider: ot.resumeProviderOf([encodedDir], sessionId),
         offset: t.offset,
         total: counted.total,
         totalIsLowerBound: counted.isLowerBound,
@@ -1988,6 +2150,108 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
    * signal the `live` field on the project-sessions response uses, so a badge
    * from either source agrees.
    */
+  /*
+   * BUG-217 round 5 — THE SESSION OUTBOX (src/server/outbox.ts). A queued
+   * message is a row the server mints and persists; a tab only renders it and
+   * asks for edit / discard / send by the server's id.
+   *
+   *   GET  /api/outbox?session=<id>                        → { sessionId, rows, hold, damaged }
+   *   POST /api/outbox { session, dir, project, nonce, text, origin?, initial?, reason?, overrides?, templateIds?, legacyId? }
+   *   POST /api/outbox/edit    { session, id, text }
+   *   POST /api/outbox/discard { session, id }
+   *   POST /api/outbox/send    { session, id, interrupt?, now? }
+   *   POST /api/outbox/dismiss-damage { session }
+   *
+   * A create names a session that must EXIST (a live bridge, or a transcript
+   * under the project's dirs), so a client cannot mint journals for made-up ids.
+   */
+  if (rest[0] === 'outbox') {
+    const outboxFail = (err: unknown): boolean => {
+      if (err instanceof OutboxError) { sendJson(res, err.status, { error: err.message, ...err.extra }); return true; }
+      sendJson(res, 500, { error: (err as Error).message });
+      return true;
+    };
+    if (rest.length === 1 && m === 'GET') {
+      const sid = url.searchParams.get('session') ?? '';
+      if (!validSessionId(sid)) { sendJson(res, 400, { error: 'a valid session id is required' }); return true; }
+      if (!outboxExists(sid)) { sendJson(res, 200, { sessionId: sid, rows: [], hold: null, damaged: null }); return true; }
+      try { sendJson(res, 200, outboxView(sid)); } catch (err) { return outboxFail(err); }
+      return true;
+    }
+    if (m !== 'POST' || rest.length > 2) return notFound(res, 'outbox: unknown route');
+    // Same mutation guard as the provisioning route: no foreign Origin, JSON only.
+    const origin = req.headers.origin as string | undefined;
+    if (origin !== undefined && !originAllowed(origin)) { sendJson(res, 403, { error: `forbidden: Origin "${origin}" not allowed` }); return true; }
+    if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) { sendJson(res, 415, { error: 'application/json required' }); return true; }
+    let body: Record<string, unknown>;
+    try { body = ((await readBody(req, 512 * 1024)) ?? {}) as Record<string, unknown>; } catch (err) { sendJson(res, 400, { error: `invalid JSON body: ${(err as Error).message}` }); return true; }
+    const sid = typeof body.session === 'string' ? body.session : '';
+    if (!validSessionId(sid)) { sendJson(res, 400, { error: 'a valid session id is required' }); return true; }
+    try {
+      if (rest.length === 1) {
+        const projectId = typeof body.project === 'string' ? body.project : '';
+        const project = reg.getProject(projectId);
+        if (!project) return notFound(res, `outbox: no project ${projectId}`);
+        const dir = typeof body.dir === 'string' && body.dir ? body.dir : null;
+        const dirs = [...new Set([...(dir ? [dir] : []), ...resumeDirCandidates(project, dir ?? undefined)])];
+        const exists = liveSessions().some((x) => x.sdkSessionId === sid)
+          || dirs.some((d) => !!(hist.resolveSessionFile(d, sid) ?? ot.resolveOrchardSessionFile(d, sid)));
+        if (!exists) return notFound(res, `outbox: no session ${sid}`);
+        // The tab's session settings, used only if the SERVER must resume the session to deliver. Validated
+        // now, by the same validator a start uses; a resume's engine is the transcript's, so provider is dropped (BUG-196).
+        let overrides: Record<string, unknown> | null = null;
+        if (body.overrides && typeof body.overrides === 'object' && !Array.isArray(body.overrides)) {
+          const { provider: _dropped, ...rest2 } = body.overrides as Record<string, unknown>;
+          // FEAT-160 round 4 — like the resume paths, a bound session's account is
+          // the server's fact: drop a stale client `claudeAccount` here too, so a
+          // tab still naming a DELETED account cannot 400 the enqueue of a session
+          // the server already decides the account for.
+          const stripped = dropBoundAccountOverride(sid, rest2);
+          if (stripped && Object.keys(stripped).length) {
+            try { validateSessionOverrides(stripped, { isolation: project.isolation }); } catch (err) { sendJson(res, 400, { error: `overrides rejected: ${(err as Error).message}` }); return true; }
+            overrides = stripped;
+          }
+        }
+        const templateIds = Array.isArray(body.templateIds) ? body.templateIds.filter((x): x is string => typeof x === 'string').slice(0, 64) : null;
+        let initial = body.initial === 'uncertain' || body.initial === 'failed' ? body.initial : 'queued';
+        let reason = typeof body.reason === 'string' ? body.reason : null;
+        /*
+         * A row an OLDER client kept in the browser. The round-4 ledger's record is
+         * read (read-only, once) so a row it knew was delivered or withdrawn is not
+         * brought back; anything else arrives `uncertain` — it may have gone.
+         */
+        if (typeof body.legacyId === 'string') {
+          let was: unknown = null;
+          try {
+            const f = path.join(dataDir(), 'queue-ledger', `s_${sid}.json`);
+            was = (JSON.parse(fs.readFileSync(f, 'utf8'))?.entries ?? {})[body.legacyId]?.s ?? null;
+          } catch { /* no ledger record */ }
+          if (was === 'delivered' || was === 'discarded') { sendJson(res, 200, { skipped: was, view: outboxExists(sid) ? outboxView(sid) : null }); return true; }
+          initial = 'uncertain';
+          reason = 'kept from before an Orchard update, which cannot tell whether it was already sent — check the conversation, then Send anyway or Discard';
+        }
+        const resume: ResumeSettings = { projectId: project.id, encodedDir: dir, overrides, templateIds };
+        const r = createOutboxRow(sid, {
+          nonce: String(body.nonce ?? ''), text: String(body.text ?? ''),
+          origin: body.origin === 'direct' ? 'direct' : 'queued',
+          initial: initial as 'queued' | 'uncertain' | 'failed', reason, resume,
+          discard: body.discard === true,
+        });
+        sendJson(res, r.created ? 201 : 200, r);
+        return true;
+      }
+      if (!outboxExists(sid)) return notFound(res, `outbox: session ${sid} has no queued messages`);
+      const id = typeof body.id === 'string' ? body.id : '';
+      if (rest[1] === 'edit') { sendJson(res, 200, editOutboxRow(sid, id, body.text)); return true; }
+      if (rest[1] === 'discard') { sendJson(res, 200, discardOutboxRow(sid, id)); return true; }
+      if (rest[1] === 'send') { sendJson(res, 200, sendOutboxRow(sid, id, { interrupt: body.interrupt === true, now: body.now === true })); return true; }
+      if (rest[1] === 'dismiss-damage') { sendJson(res, 200, dismissOutboxDamage(sid)); return true; }
+      return notFound(res, 'outbox: unknown route');
+    } catch (err) {
+      return outboxFail(err);
+    }
+  }
+
   if (rest[0] === 'sessions' && rest[1] === 'live' && m === 'GET') {
     const windowMs = intParam(url.searchParams.get('windowMs'), watcher.LIVE_WINDOW_MS, 1000, 10 * 60 * 1000);
     const t0 = Date.now();
@@ -2098,7 +2362,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (seen.has(sdkId)) continue;
       const v = b.livenessVerdict();
       if (!v.live) continue; // a bridge the authority no longer vouches for is not "live"
-      const f = watcher.sessionFileFacts(hist.encodeCwd(b.cwd), sdkId);
+      const f = watcher.sessionFileFacts(b.storeEncodedDir, sdkId);
       rows.push({
         sessionId: sdkId,
         dir: f?.dir ?? '',
@@ -2314,6 +2578,61 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     return true;
   }
 
+  /*
+   * FEAT-154 (round 7) — STOP ONE running task, addressed by (session, task).
+   *
+   * Routed server-side to whichever bridge OWNS the session — the same dual
+   * lookup (station id or SDK id) as the running-set GET above — whether or not
+   * any socket is attached to it. Round 6 put this on the websocket, where it
+   * could only reach the socket's own attached session: a stop from a tab that
+   * VIEWS a session (the strip is filled by the HTTP poll) but does not drive it —
+   * exactly the adopted-after-restart 7f7e39a1 case — was refused with "no
+   * session on this socket" and never reached the engine.
+   *
+   * Answers are explicit, never a silent no-op: 200 {ok:true} once the engine
+   * accepted `stop_task` (the row leaves when its terminal frame lands); 404
+   * {reason:'no-bridge'} when this server drives no live session for that id
+   * (the bridge is gone); 409 {reason:'not-running'} when the session does not
+   * list that task; 501 when the engine cannot stop one task. Destructive, so the
+   * Origin + JSON content-type guard applies (a foreign page cannot text/plain
+   * POST a stop).
+   */
+  if (rest[0] === 'sessions' && rest[1] && rest[2] === 'running' && rest[3] && rest[4] === 'stop' && rest.length === 5 && m === 'POST') {
+    const origin = req.headers.origin as string | undefined;
+    if (origin !== undefined && !originAllowed(origin)) {
+      sendJson(res, 403, { ok: false, error: `forbidden: Origin "${origin}" not allowed` });
+      return true;
+    }
+    if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
+      sendJson(res, 415, { ok: false, error: 'content-type must be application/json' });
+      return true;
+    }
+    const sid = rest[1];
+    const taskId = rest[3];
+    const s = getSession(sid) ?? liveSessions().find((x) => x.sdkSessionId === sid) ?? null;
+    if (!s || s.closed) {
+      sendJson(res, 404, {
+        ok: false, reason: 'no-bridge', sessionId: sid, taskId,
+        error: 'this server is not driving that session any more, so there is nothing to stop the command through — it may already have ended; reload to refresh the list',
+      });
+      return true;
+    }
+    try {
+      await s.stopTask(taskId);
+    } catch (err) {
+      const msg = (err as Error)?.message ?? String(err);
+      const notRunning = /not running in this session/.test(msg);
+      const cannot = /cannot stop a single task/.test(msg);
+      sendJson(res, notRunning ? 409 : cannot ? 501 : 502, {
+        ok: false, reason: notRunning ? 'not-running' : cannot ? 'unsupported' : 'engine-error', sessionId: sid, taskId, error: msg,
+      });
+      return true;
+    }
+    s.pushRunningSnapshot(true);
+    sendJson(res, 200, { ok: true, sessionId: sid, taskId, stationSessionId: s.id, sdkSessionId: s.sdkSessionId });
+    return true;
+  }
+
   // FEAT-126 — the DECLARED request bindings for a session. Server-owned store,
   // NO status (every status is joined live client-side from board/snapshot). An
   // id this server is not driving is not a 404 — it is an honest empty list.
@@ -2386,6 +2705,29 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
    * card via the board feed and is answered back to THIS session. 400 on an
    * empty question or an unknown/dead session.
    */
+  /*
+   * FEAT-157 — the AGENT's base-update surface (`npm run base -- …`).
+   *   GET  /api/sessions/:sid/base          → the session's OWN project's notice
+   *   POST /api/sessions/:sid/base-update   { action, version?, rev }
+   * The project is the live session's project — never a parameter — so an agent
+   * acts only on its own project's notice. `applyAction` refuses what an agent may
+   * not do (skip a security release, move the pin back, move to dev).
+   */
+  if (rest[0] === 'sessions' && rest[1] && (rest[2] === 'base' || rest[2] === 'base-update') && rest.length === 3) {
+    const sid = rest[1];
+    const target = getSession(sid) ?? liveSessions().find((s) => s.sdkSessionId === sid) ?? null;
+    if (!target || target.closed) {
+      sendJson(res, 400, { error: `base: no live session ${JSON.stringify(sid)}` });
+      return true;
+    }
+    const p = reg.getProject(target.project.id);
+    if (!p) return notFound(res, `base: the session's project ${target.project.id} is no longer registered`);
+    if (rest[2] === 'base' && m === 'GET') { sendJson(res, 200, baseStatusOf(p)); return true; }
+    if (rest[2] === 'base-update' && m === 'POST') return handleBaseUpdate(req, res, p, 'agent');
+    sendJson(res, 405, { error: `method ${m} not allowed here` });
+    return true;
+  }
+
   if (rest[0] === 'sessions' && rest[1] && rest[2] === 'needs-you' && rest.length === 3 && m === 'POST') {
     const sid = rest[1];
     const target =
@@ -2436,7 +2778,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
    * The FEAT-135 PATH shim (scripts/lib/git-shim.mjs) runs in the SESSION
    * subprocess and cannot read the host-memory grant (git-grant-store.mjs). For a
    * classified WRITE it asks here, and this runs the SAME `evaluateGitWrite` the
-   * FEAT-108 hook runs — ONE grant authority (ARCH-010): peekGrant + leak gate on a
+   * FEAT-108 hook runs — ONE grant authority (ARCH-010): the store, asked at the write (claimGrant→useClaim, FEAT-164 r4) + leak gate on a
    * publish + single-use consume. So the shim and the hook can never disagree, an
    * expired/revoked grant re-blocks on the next invocation, and a granted publish
    * still cannot leak. The shim FAILS CLOSED on any non-allow, so a malformed or
@@ -2472,11 +2814,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     const p = reg.getProject(grantKey);
     const repoPath = p?.hostPath ?? null;
-    const decision = evaluateGitWrite({
+    // BUG-231 — `windowKey` is the session's binding, baked into its shim. Inside a Bash
+    // call the PreToolUse hook already decided, this invocation REDEEMS that decision
+    // (no second claim, a publish gated once, at the write). Without a key, or with no
+    // live window for this verb, it decides independently exactly as before.
+    const windowKey = typeof body.windowKey === 'string' && body.windowKey ? body.windowKey : null;
+    const decision = redeemGitWrite({
+      binding: windowKey,
       argv,
       projectKey: grantKey,
       sessionLabel,
       runLeakGate: () => runLeakGateForRepo(repoPath),
+      repoFingerprint: () => repoContentFingerprint(repoPath),
     });
     if (decision.allow && decision.granted) {
       console.warn(`[orchard] git-write PERMITTED via invocation shim (subprocess) for project ${grantKey}: \`${decision.offender}\` — grant honoured (BUG-173, recorded PENDING; the shim confirms the real git outcome, BUG-184).`);
@@ -2677,6 +3026,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     if (rest[2] === 'pin' && rest.length === 3 && (m === 'POST' || m === 'DELETE')) {
       return await handleSessionPin(req, res, url, rest[1], m === 'POST');
     }
+    if (rest[2] === 'close' && rest.length === 3 && (m === 'POST' || m === 'DELETE')) {
+      return await handleSessionClose(req, res, url, rest[1], m === 'POST');
+    }
   }
 
   if (rest[0] === 'sessions' && rest[1] && m === 'GET') {
@@ -2735,29 +3087,44 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   /*
-   * Orphan sweep: containers Claude Station owns whose project is gone from the
-   * registry. GET lists, POST removes. Without this an orphan keeps the OAuth
+   * Orphan sweep: containers THIS instance created whose project is gone from
+   * its registry. GET lists, POST removes. Without this an orphan keeps the OAuth
    * credentials bind-mounted rw with no route able to reach it.
+   *
+   * BUG-216: ownership is the owner label the creator wrote (`instance-owner.ts`),
+   * never "absent from my registry" — every other Orchard server's projects are
+   * absent from this registry too, and a scratch server's POST here once removed
+   * 44 containers across the host, live projects included. Containers and service
+   * infra with NO owner label (made before it existed) come back as `unowned`:
+   * listed for a person to judge, never removed by this route.
    */
   if (rest[0] === 'containers' && rest[1] === 'orphans') {
+    const known = new Set(reg.listProjects().map((p) => p.id));
+    // BUG-214 round 7: a container with a live session is never an orphan, even if its project row is
+    // gone (a session that started while its project was being deleted).
+    for (const s of liveSessions()) known.add(s.project.id);
     let orphans: ReturnType<typeof cm.findOrphanContainers>;
+    let unowned: ReturnType<typeof cm.findUnownedContainers>;
     try {
-      orphans = cm.findOrphanContainers(new Set(reg.listProjects().map((p) => p.id)));
+      orphans = cm.findOrphanContainers(known);
+      unowned = cm.findUnownedContainers(known);
     } catch (err) {
       sendJson(res, 503, { error: `docker unavailable: ${(err as Error).message}` });
       return true;
     }
+    // ARCH-020: a project's own builder (and its cache volume) is an orphan
+    // too once the project is gone; it carries no claude-station=1 label, and is
+    // scoped by the same owner key (`dataKey()` reads `ownerKey()`).
     if (m === 'GET') {
-      sendJson(res, 200, { orphans });
+      sendJson(res, 200, { orphans, unowned, builders: cm.findOrphanProjectBuilders(known) });
       return true;
     }
     if (m === 'POST') {
-      const removed = orphans.map((o) => cm.removeContainerByName(o.name));
-      // FEAT-112: orphan SERVICE CONTAINERS are already in `orphans` (they carry
-      // claude-station=1), but their network + data volumes are not containers —
-      // reap those for any project no longer in the registry too.
-      const infra = svc.reapOrphanServiceInfra(new Set(reg.listProjects().map((p) => p.id)));
-      sendJson(res, 200, { removed, serviceInfra: infra });
+      // ARCH-022: one lifecycle operation PER orphan project, each re-checking under that project's slot
+      // that the registry still does not know it (a project registered meanwhile is never swept). Its
+      // containers, builders and service infra (FEAT-112: network + data volumes) go in that operation.
+      const swept = await cm.sweepOrphans((pid) => !!reg.getProject(pid));
+      sendJson(res, 200, { removed: swept.removed, unowned, builders: swept.builders, serviceInfra: { ...swept.infra, unowned: svc.unownedServiceInfra(known) } });
       return true;
     }
   }
@@ -3007,6 +3374,10 @@ function sessionMutationFail(res: http.ServerResponse, err: unknown): boolean {
     sendJson(res, err.status, { error: err.message, code: err.code, ...err.detail });
     return true;
   }
+  if (err instanceof sessionClosed.SessionCloseError) { // FEAT-168 r6 — a close never stores a guessed watermark
+    sendJson(res, err.status, { error: err.message, code: err.code });
+    return true;
+  }
   sendJson(res, 500, { error: (err as Error).message, code: 'unknown' });
   return true;
 }
@@ -3024,6 +3395,7 @@ function sessionStateOf(t: smut.ResolvedSession, meta: smut.TitleMeta) {
     titleSource: smut.titleSourceOf(meta),
     titleMetaSampled: meta.sampled,
     pinned: meta.pinned,
+    closed: sessionClosed.isSessionClosed(t.sessionId, t.filePath), // FEAT-168 — the same derived read the list uses
     tag: meta.tag,
   };
 }
@@ -3075,7 +3447,7 @@ async function handleSessionMutation(
     }
     let target: smut.ResolvedSession;
     try {
-      target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null));
+      target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredContainerStore);
     } catch (err) {
       return sessionMutationFail(res, err);
     }
@@ -3117,7 +3489,7 @@ async function handleSessionMutation(
   }
   let target: smut.ResolvedSession;
   try {
-    target = smut.resolveSession(sessionId, patch.dir ?? url.searchParams.get('dir'));
+    target = smut.resolveSession(sessionId, patch.dir ?? url.searchParams.get('dir'), declaredContainerStore);
   } catch (err) {
     return sessionMutationFail(res, err);
   }
@@ -3126,8 +3498,12 @@ async function handleSessionMutation(
    * transcript the way a delete can — but a live CLI holds its own view of the
    * title and would keep writing under it. Refuse unless forced, and say so.
    */
+  // FEAT-168: `closed` is Orchard's own label (session-closed.ts) and never
+  // touches the transcript, so it is independent of pin/title. A close-only PATCH has the /close route's contract: closing is a LABEL, so a
+  // live session may be closed (no live refusal). Title/pin keep the live guard.
+  const closeOnly = patch.closed !== undefined && patch.title === undefined && patch.pinned === undefined;
   const live = liveHoldersOf(target, true);
-  if ((live.fileLive || live.bridges.length) && url.searchParams.get('force') !== '1') {
+  if (!closeOnly && (live.fileLive || live.bridges.length) && url.searchParams.get('force') !== '1') {
     sendJson(res, 409, {
       error:
         `session ${sessionId} is live — a rename/pin appends to the file it is currently writing, and the running CLI will not notice the change. ` +
@@ -3144,6 +3520,8 @@ async function handleSessionMutation(
     let meta = smut.readTitleMeta(target.filePath);
     if (patch.title !== undefined) meta = await smut.rename(target, patch.title);
     if (patch.pinned !== undefined) meta = await smut.setPinned(target, patch.pinned, url.searchParams.get('force') === '1');
+    // FEAT-168: Orchard's own store; the transcript is only READ (the close watermark), never written.
+    if (patch.closed !== undefined) sessionClosed.setSessionClosed(target, patch.closed);
     sendJson(res, 200, { session: sessionStateOf(target, meta) });
   } catch (err) {
     return sessionMutationFail(res, err);
@@ -3175,7 +3553,7 @@ async function handleSessionPin(
   }
   let target: smut.ResolvedSession;
   try {
-    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null));
+    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredContainerStore);
   } catch (err) {
     return sessionMutationFail(res, err);
   }
@@ -3194,6 +3572,46 @@ async function handleSessionPin(
   try {
     const meta = await smut.setPinned(target, pinned, url.searchParams.get('force') === '1');
     sendJson(res, 200, { session: sessionStateOf(target, meta) });
+  } catch (err) {
+    return sessionMutationFail(res, err);
+  }
+  return true;
+}
+
+/**
+ * POST   /api/sessions/:sessionId/close  [?dir=]   — mark CLOSED (done)
+ * DELETE /api/sessions/:sessionId/close  [?dir=]   — reopen
+ *
+ * FEAT-168. Shaped like the pin route, but the label is Orchard's OWN fact
+ * (session-closed.ts in the data dir), so the transcript is never written (a
+ * close only READS its latest input prompt as the watermark; 503 if it cannot):
+ * there is no tag to collide with, no force, and no live-session
+ * refusal (closing is a label — "nothing pending" — not a lifecycle action, so a
+ * running session may be closed). The session must exist (resolveSession), so a
+ * label is never minted for an id with no transcript.
+ */
+async function handleSessionClose(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  url: URL,
+  sessionId: string,
+  closed: boolean,
+): Promise<boolean> {
+  let body: Record<string, unknown> = {};
+  try {
+    body = ((await readBody(req)) ?? {}) as Record<string, unknown>;
+  } catch {
+    body = {};
+  }
+  let target: smut.ResolvedSession;
+  try {
+    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredContainerStore);
+  } catch (err) {
+    return sessionMutationFail(res, err);
+  }
+  try {
+    sessionClosed.setSessionClosed(target, closed);
+    sendJson(res, 200, { session: sessionStateOf(target, smut.readTitleMeta(target.filePath)) });
   } catch (err) {
     return sessionMutationFail(res, err);
   }
@@ -3490,9 +3908,11 @@ async function handleRuntimeRoute(
     // desired pin and the target it must track (the host SDK's bundled CLI),
     // plus each container project's ACTUAL baked image CLI. Nothing is inferred
     // "up to date" from an unknown; a missing label reads as null.
-    const desiredCli = claudeCodePin().version;
-    const targetCli = rt.bundledCliVersion(); // the CLI the host SDK bundles
-    const pinBehindTarget = !!(targetCli && rt.compareVersions(targetCli, desiredCli) > 0);
+    // FEAT-157: containers no longer carry a pinned CLI. Each gets the host SDK's own
+    // boot-proven binary as a layer, so "desired" IS the host's; nothing can lag it.
+    const targetCli = rt.bundledCliVersion(); // the CLI the host SDK bundles (disk)
+    const desiredCli = rt.BOOT_CLI_VERSION ?? targetCli ?? 'unknown';
+    const pinBehindTarget = false;
     const projects = reg.listProjects()
       .filter((p) => p.isolation === 'container')
       .map((p) => {
@@ -3575,40 +3995,18 @@ async function handleRuntimeRoute(
     }
   }
 
-  // POST /api/runtime/container-pin { version? } — WRITE the provision.json pin
-  // (finding #5). Default target is the host SDK's bundled CLI (finding #7:
-  // probed, never string-arithmetic on the SDK version). This changes the image
-  // identity; it does NOT rebuild or restart any running container — the new
-  // image is built when each project next starts a session, so live containers
-  // are never force-replaced.
+  // POST /api/runtime/container-pin — RETIRED by FEAT-157. The container CLI is no
+  // longer a pin in provision.json: every container gets the host SDK's own
+  // boot-proven CLI as a thin layer, so there is nothing to update by hand. 410 with
+  // the reason, rather than a silent success that changes nothing.
   if (action === 'container-pin') {
-    let version: string;
-    if (body.version === undefined) {
-      const target = rt.bundledCliVersion();
-      if (!target) {
-        sendJson(res, 500, { error: 'cannot determine the host SDK bundled CLI version to pin the container to' });
-        return true;
-      }
-      version = target;
-    } else {
-      version = String(body.version);
-    }
-    try {
-      const { changed, previous } = writeClaudeCodePin(version);
-      sendJson(res, 200, {
-        ok: true,
-        changed,
-        previous,
-        version,
-        note: changed
-          ? 'container CLI pin updated. The new image builds when each container project next starts a session; running containers are not restarted.'
-          : `container CLI pin already at ${version}; nothing changed.`,
-      });
-      return true;
-    } catch (err) {
-      sendJson(res, 400, { ok: false, error: (err as Error).message });
-      return true;
-    }
+    sendJson(res, 410, {
+      ok: false,
+      code: 'container-cli-follows-host',
+      error: 'The container Claude CLI now follows the host SDK automatically (FEAT-157): each container gets the host\'s CLI as a thin layer at its next launch with no live session. There is no container pin to update.',
+      version: rt.BOOT_CLI_VERSION,
+    });
+    return true;
   }
 
   return notFound(res, `no runtime action "${action ?? ''}"`);
@@ -3643,7 +4041,7 @@ async function handleContainerRoute(
   const fail = (err: unknown) => {
     const e = err as Error;
     const ce = err instanceof cm.ContainerError ? err : null;
-    sendJson(res, ce?.code === 'docker-missing' || ce?.code === 'docker-unavailable' ? 503 : 500, {
+    sendJson(res, ce?.code === 'docker-missing' || ce?.code === 'docker-unavailable' ? 503 : ce?.code === 'live-sessions' ? 409 : 500, {
       error: e.message,
       code: ce?.code ?? 'unknown',
       state: 'error',
@@ -3653,110 +4051,70 @@ async function handleContainerRoute(
   };
 
   /*
-   * DESTRUCTIVE-OP GUARD.
-   *
-   * `ensureContainer` recreates on ANY config drift, and recreate means
-   * `docker rm -f`. Reproduced: with a session live, an ordinary PATCH of
-   * container.memoryMb followed by POST /container/start returned a clean
-   * {"state":"running"} while the live session's CLI died with exit code 137 and
-   * the socket then hung.
-   *
-   * So: any action that can destroy the container refuses while sessions are
-   * live, unless the caller passes ?force=1 — and then the response says exactly
-   * which sessions were killed. `start` is only destructive when the live
-   * container has drifted or is not running; a no-op ensure is allowed through.
+   * ARCH-022 — no guard here. Whether start/stop/rebuild/remove may destroy anything is decided by the
+   * container lifecycle authority INSIDE the operation (the project's FIFO slot), from the lease set it
+   * holds, and enforced again at the docker call itself. A refusal comes back as `live-sessions` (409).
+   * The per-route cached-status guard that used to stand here was one of the enumerated doors (BUG-214).
    */
-  const DESTRUCTIVE = new Set(['start', 'stop', 'rebuild', 'remove']);
-  if (method === 'POST' && action && DESTRUCTIVE.has(action)) {
-    const live = liveSessionsForProject(projectId);
-    if (live.length && url.searchParams.get('force') !== '1') {
-      let willDestroy = action !== 'start';
-      if (action === 'start') {
-        try {
-          const st = cm.statusOf(project);
-          willDestroy = st.state !== 'running' || st.drifted === true;
-        } catch {
-          willDestroy = true; // cannot tell -> assume the worst
-        }
-      }
-      if (willDestroy) {
-        sendJson(res, 409, {
-          error:
-            `refusing to ${action} container ${cm.containerName(projectId)}: ${live.length} session(s) are live and this would ` +
-            `destroy the container underneath them (the CLI inside dies with exit 137). ` +
-            `Close them first, or retry with ?force=1.`,
-          code: 'live-sessions',
-          liveSessions: live.map((s) => ({ stationSessionId: s.id, sdkSessionId: s.sdkSessionId, busy: s.busy })),
-          state: cm.statusOf(project).state,
-          containerName: cm.containerName(projectId),
-        });
-        return true;
-      }
-    }
-  }
 
   try {
     if ((action === 'status' || action === undefined) && method === 'GET') {
       if (cm.isBuilding(project.id)) {
-        sendJson(res, 200, { state: 'building', containerName: cm.containerName(project.id), image: cm.imageNameFor(project) });
+        sendJson(res, 200, {
+          state: 'building', containerName: cm.containerName(project.id), image: cm.imageNameFor(project),
+          ...(cm.imageSourceOf(project) === 'dockerfile' ? { dockerfile: cm.dockerfileStatus(project) } : {}),
+        });
         return true;
       }
       sendJson(res, 200, cm.statusOf(project));
+      return true;
+    }
+    /*
+     * FEAT-155 round 5 — GET /api/projects/:id/container/build: the project
+     * Dockerfile build — state, error, the last good image, and the (sanitised)
+     * log tail. Read-only; 404 when the project does not build from a Dockerfile.
+     */
+    if (action === 'build' && method === 'GET') {
+      if (cm.imageSourceOf(project) !== 'dockerfile') {
+        sendJson(res, 404, { error: `project ${projectId} does not build its image from a Dockerfile (set container.dockerfile)` });
+        return true;
+      }
+      const rec = buildRecord(project.id);
+      sendJson(res, 200, { ...cm.dockerfileStatus(project), log: rec.log });
       return true;
     }
     if (method !== 'POST') {
       sendJson(res, 405, { error: `method ${method} not allowed on /container/${action ?? ''}` });
       return true;
     }
-    // Anything reaching here with live sessions was explicitly forced. Say so.
-    const forcedOver = liveSessionsForProject(projectId).map((s) => s.id);
+    /*
+     * ?force=1 is consent for the sessions holding the project AT REQUEST TIME only: their leases are
+     * captured now, their sessions closed, and the operation reaps and waits for exactly those. A session
+     * admitted after this request is protected.
+     */
+    const force = url.searchParams.get('force') === '1';
+    const forceOver = force && action !== 'start' ? lifecycle.leasesOf(projectId).map((l) => l.id) : undefined;
+    const forcedSessions = force && action !== 'start' ? liveSessionsForProject(projectId).map((s) => s.id) : [];
+    if (forceOver) for (const s of liveSessionsForProject(projectId)) void s.close(`container ${action} (forced)`).catch(() => {});
     const withCasualties = (status: unknown) =>
-      forcedOver.length ? { ...(status as object), forcedOverLiveSessions: forcedOver } : status;
+      forcedSessions.length ? { ...(status as object), forcedOverLiveSessions: forcedSessions } : status;
+    const current = () => reg.getProject(projectId);
     switch (action) {
       case 'start': {
-        const st = await cm.ensureContainer(project);
-        // FEAT-112 defect 4 (sibling path): `ensureContainer` recreates the
-        // container on config drift, which — like rebuild — drops it off the
-        // service network. Re-join so a manual container start keeps declared
-        // services resolvable. Idempotent; no-op without a service network.
-        try {
-          svc.connectSessionToServices(project.id);
-        } catch (err) {
-          (st as { serviceRejoin?: string }).serviceRejoin = (err as Error).message;
-        }
-        sendJson(res, 200, withCasualties(st));
+        // An image-only change defers under held leases; any other drift refuses (409) — never recreates.
+        sendJson(res, 200, await cm.ensureContainer(project, { current }));
         return true;
       }
       case 'stop': {
-        const st = await cm.stopContainer(project);
-        // FEAT-112: services live and die with the session container. Keep their
-        // data volumes (a Stop is not a purge) so the next session resumes them.
-        svc.teardownServices(project.id, { removeVolumes: false });
-        sendJson(res, 200, withCasualties(st));
+        sendJson(res, 200, withCasualties(await cm.stopContainer(project, { current, forceOver })));
         return true;
       }
       case 'rebuild': {
-        const st = await cm.rebuildContainer(project);
-        // FEAT-112 defect 4: rebuild rm+recreates the session container by the same
-        // name, which drops it off the service network (sidecars keep running,
-        // detached). `service-manager` documents Rebuild as a rejoin point but only
-        // `startSession` was wired to connect. Re-join here so a rebuild under a live
-        // session keeps `redis`/`mongo` resolvable instead of silently losing DNS
-        // until the next session start. No-op when the project declares no services.
-        try {
-          svc.connectSessionToServices(project.id);
-        } catch (err) {
-          // A rejoin failure must not mask a successful rebuild; surface it as a
-          // status note rather than turning the rebuild into a 500.
-          (st as { serviceRejoin?: string }).serviceRejoin = (err as Error).message;
-        }
-        sendJson(res, 200, withCasualties(st));
+        sendJson(res, 200, withCasualties(await cm.rebuildContainer(project, { current, forceOver })));
         return true;
       }
       case 'remove': {
-        const st = await cm.removeProjectContainer(project);
-        svc.teardownServices(project.id, { removeVolumes: false });
-        sendJson(res, 200, withCasualties(st));
+        sendJson(res, 200, withCasualties(await cm.removeProjectContainer(project, { current, forceOver })));
         return true;
       }
       default:
@@ -3800,6 +4158,25 @@ const ALLOWED_HOSTS = new Set<string>([
   ...(process.env.CLAUDE_STATION_ALLOWED_HOSTS ?? '')
     .split(',').map((s) => s.trim()).filter(Boolean),
 ]);
+/* ═══════════════ FEAT-157 — base-update answers over HTTP (logic: base-updates.ts) ═══ */
+
+async function handleBaseUpdate(req: http.IncomingMessage, res: http.ServerResponse, p: reg.Project, actor: 'user' | 'agent'): Promise<boolean> {
+  const origin = req.headers.origin as string | undefined;
+  if (origin !== undefined && !originAllowed(origin)) { sendJson(res, 403, { error: `forbidden: Origin "${origin}" not allowed` }); return true; }
+  if (!/^application\/json\b/i.test(String(req.headers['content-type'] ?? ''))) {
+    sendJson(res, 415, { error: 'application/json required' });
+    return true;
+  }
+  let body: Record<string, unknown>;
+  try { body = ((await readBody(req)) ?? {}) as Record<string, unknown>; } catch (err) { sendJson(res, 400, { error: (err as Error).message }); return true; }
+  const out = await applyBaseUpdate(p.id, actor, body);
+  sendJson(res, out.status, out.body);
+  return true;
+}
+
+// FEAT-157 — a container project's agent answers its OWN project's notice over its dispatch socket.
+registerBaseOp();
+
 /**
  * No `Origin` header = a non-browser client (CLI / dispatch / curl): browsers
  * always attach one to a cross-site WS handshake, so absence means the same-
@@ -3964,6 +4341,226 @@ function releaseSocketSession(session: AgentSession | null, reason: string): voi
  * nor race a second delivery into the same moment.
  */
 const deliveryInFlight = new Map<string, symbol>();
+/** BUG-217 round 3 — sessions a prompt-bearing resume `start` is spawning right now (see the start handler). */
+const resumeStarting = new Set<string>();
+
+/* ====================== BUG-217 round 5: the outbox's hands ================
+ * src/server/outbox.ts owns queued rows and decides nothing about bridges; this
+ * is the wiring it calls. `probe` is synchronous: the answer and the handover
+ * happen in one tick, under the session's delivery reservation (the same
+ * `deliveryInFlight` map every socket path checks), so nothing can slip a
+ * second prompt into the session in between.
+ * ------------------------------------------------------------------------- */
+/** Sessions whose reservation is held by the outbox (so a socket's refusal can say so). */
+const outboxReserved = new Set<string>();
+const OUTBOX_PENDING_MESSAGE = 'queued messages for this session go first — yours joins them and is sent in order';
+/** Queued rows exist, or the outbox is mid-delivery: a typed prompt must join the queue, not jump it. */
+function outboxBlocks(sid: string | null | undefined): boolean {
+  return !!sid && (outboxReserved.has(sid) || outboxHasPending(sid));
+}
+/** When a bridge of THIS server last held each session — its own writes are not "another program". */
+const ownBridgeSeen = new Map<string, number>();
+setInterval(() => { const t = Date.now(); for (const s of liveSessions()) { const k = s.sdkSessionId ?? s.resumeOf; if (k) ownBridgeSeen.set(k, t); } }, 1000).unref();
+/** Consecutive failed resumes per session — a non-transient one becomes `failed` after a few. */
+const outboxResumeFailures = new Map<string, number>();
+
+function outboxTranscriptFile(sid: string, resume: ResumeSettings): string | null {
+  const project = reg.getProject(resume.projectId);
+  const dirs = [...new Set([...(resume.encodedDir ? [resume.encodedDir] : []), ...(project ? resumeDirCandidates(project, resume.encodedDir ?? undefined) : [])])];
+  for (const d of dirs) {
+    const f = hist.resolveSessionFile(d, sid) ?? ot.resolveOrchardSessionFile(d, sid)?.filePath ?? null;
+    if (f) return f;
+  }
+  return null;
+}
+
+const outboxWiring: OutboxWiring = {
+  probe(sid, resume, { overrideExternal }): Probe {
+    const wait = (kind: string, text: string, retryMs = 0, drain?: unknown): Probe => ({ kind: 'wait', hold: { kind, text, ...(drain ? { drain } : {}) }, retryMs });
+    if (deliveryInFlight.has(sid)) return wait('reserved', 'another delivery into this session is finishing first');
+    if (resumeStarting.has(sid)) return wait('starting', 'the session is starting');
+    let running = bridgeForSession(sid);
+    if (running) {
+      const v = running.livenessVerdict();
+      if (!v.live) {
+        // BUG-033: a frameless bridge may still be running — wait for it; a proven-dead one is dropped.
+        if (v.kind === 'frameless') return wait('silent', `the session went quiet (${v.reason}) — waiting for it to answer or end`, 2000);
+        running.reapAsZombie(v);
+        running = undefined;
+      } else if (v.state === 'dead' && !running.busy) {
+        // The bridge's own verdict: its process is gone and no turn runs (e.g. a retired older
+        // host, BUG-191 B5). An empty shell can take nothing; close it and resume from the transcript.
+        console.log(`[orchard] BUG-217: outbox closing the idle bridge of session ${sid} — ${v.evidence?.probeDetail ?? v.reason}`);
+        void running.close('its process is gone (idle) — the outbox resumes the session').catch(() => {});
+        running = undefined;
+      }
+    }
+    if (running) {
+      if (running.budgetStopped) return { kind: 'go', route: 'bridge', ctx: running }; // handOver reports the budget stop
+      // Owner declarations only: the bridge's own send gate (BUG-187/191), decided before any strand shortcut.
+      const gate = running.sendGate();
+      if (!gate.ok) return wait('adopting', gate.message, 3000, gate.drain);
+      if (running.adoptGated) return { kind: 'go', route: 'gated', ctx: running };
+      if (running.busy) {
+        // BUG-159: the bridge's own snapshot declares its main turn is NOT running (a stuck
+        // `busy` behind background lanes): the runtime holds the message for the next boundary.
+        let snap: ReturnType<AgentSession['runningSnapshot']> | null = null;
+        try { snap = running.runningSnapshot(); } catch { snap = null; }
+        if (snap && snap.turn.running === false && snap.running.some((r) => r.row !== 'main')) return { kind: 'go', route: 'strand', ctx: running };
+        return wait('busy', 'sends when Claude pauses');
+      }
+      return { kind: 'go', route: 'bridge', ctx: running };
+    }
+    const survivor = survivingHostForSdkSession(sid);
+    if (survivor) {
+      const probe = livenessOfSurvivor(survivor);
+      if (probe.state === 'alive') {
+        if (survivorAdmits(survivor) && !activeDeliveryFor(sid)) return { kind: 'go', route: 'survivor', ctx: survivor };
+        return wait('draining', 'the session is still finishing earlier work after a restart — it sends when that is done', 3000, {
+          backgroundLive: typeof survivor.backgroundLive === 'number' ? survivor.backgroundLive : 0,
+          backgroundTaskIds: Array.isArray(survivor.backgroundTaskIds) ? survivor.backgroundTaskIds : [],
+          backgroundLifetime: survivor.backgroundLifetime ?? null,
+          brokerState: survivor.state,
+        });
+      }
+      dropDeadSurvivorHost(survivor);
+    }
+    /*
+     * HEURISTIC, and it can only DELAY: a transcript written in the last live
+     * window, by nothing this server holds, is taken to mean another program (a
+     * terminal) is using the session; resuming would put a second CLI on one
+     * transcript. The user's Send now (`overrideExternal`) goes past it.
+     */
+    if (!overrideExternal) {
+      const f = outboxTranscriptFile(sid, resume);
+      let mtime = 0;
+      try { if (f) mtime = fs.statSync(f).mtimeMs; } catch { /* unreadable: not evidence of a writer */ }
+      const own = ownBridgeSeen.get(sid) ?? 0;
+      if (mtime && Date.now() - mtime < watcher.LIVE_WINDOW_MS && mtime > own + 2000) {
+        return wait('external', 'another program is writing this session — it sends once that stops, or press Send now', 2000);
+      }
+    }
+    return { kind: 'go', route: 'resume' };
+  },
+
+  reserve(sid) {
+    const token = Symbol('outbox');
+    deliveryInFlight.set(sid, token);
+    outboxReserved.add(sid);
+    return () => {
+      if (deliveryInFlight.get(sid) === token) deliveryInFlight.delete(sid);
+      outboxReserved.delete(sid);
+    };
+  },
+
+  async handOver(sid, go, prompt, resume): Promise<HandOutcome> {
+    if (go.route === 'bridge' || go.route === 'strand') {
+      const live = go.ctx as AgentSession;
+      try { live.send(prompt); } catch (err) {
+        const e = err as Error & { retryable?: boolean };
+        if (e.retryable) return { kind: 'refused', hold: { kind: 'adopting', text: e.message }, retryMs: 3000 };
+        if (live.closed) return { kind: 'refused', hold: { kind: 'closing', text: 'the session just ended — resuming it' }, retryMs: 300 };
+        return { kind: 'failed', reason: `the session would not take it (${e.message})` };
+      }
+      return { kind: 'delivered', via: go.route };
+    }
+    if (go.route === 'gated') {
+      const r = await (go.ctx as AgentSession).sendGated(prompt);
+      if (r.outcome === 'delivered') return { kind: 'delivered', via: 'gated' };
+      if (r.outcome === 'refused') return { kind: 'refused', hold: { kind: 'adopting', text: r.message, ...(r.drain ? { drain: r.drain } : {}) }, retryMs: 3000 };
+      return { kind: 'uncertain', reason: `${r.message}` };
+    }
+    if (go.route === 'survivor') {
+      const handle = await deliverIntoSurvivor({ survivor: go.ctx as HostStatus, sdkSessionId: sid, prompt, client: null });
+      if (!handle) return { kind: 'refused', hold: { kind: 'draining', text: 'the session is still finishing earlier work after a restart — it sends when that is done' }, retryMs: 3000 };
+      if (handle === 'uncertain') return { kind: 'uncertain', reason: 'the surviving session did not confirm it in time — it may or may not have arrived. Check the conversation, then Send anyway or Discard' };
+      // No tab owns this turn: an approval it raises is denied at once, the existing FEAT-065 posture for a gone tab.
+      handle.attachClient(null);
+      console.log(`[orchard] BUG-217: outbox delivered into the drain-held survivor of session ${sid}`);
+      return { kind: 'delivered', via: 'survivor' };
+    }
+    // Resume from the transcript, with no socket: the bridge runs detached and closes itself after the turn.
+    const project = reg.getProject(resume.projectId);
+    if (!project) return { kind: 'failed', reason: 'its project is no longer registered' };
+    resumeStarting.add(sid);
+    let lastError: { message?: string; code?: string; needsFork?: unknown } | null = null;
+    try {
+      const enc = resume.encodedDir ?? hist.encodeCwd(project.hostPath);
+      if (!(hist.resolveSessionFile(enc, sid) ?? ot.resolveOrchardSessionFile(enc, sid)?.filePath)) {
+        try { cn.importNativeCodexSession(sid, { expectedEncodedDir: enc }); } catch { /* the resume vetting reports it */ }
+      }
+      const instructions = resume.templateIds ? resume.templateIds.map((templateId) => ({ templateId, enabled: true })) : undefined;
+      let overrides;
+      // FEAT-160 round 4 — the pump resumes from a row frozen at enqueue; if the
+      // server owns this session's account, drop the row's stale `claudeAccount`
+      // before validation (the binding decides at the spawn chokepoint), so a row
+      // carrying an account since DELETED is not stranded `failed`.
+      const resumeOverrides = dropBoundAccountOverride(sid, resume.overrides as Record<string, unknown> | null | undefined);
+      if (resumeOverrides) {
+        try { overrides = validateSessionOverrides(resumeOverrides, { isolation: project.isolation }); }
+        catch (err) { return { kind: 'failed', reason: `this session's saved settings are no longer valid (${(err as Error).message}) — open it and Send again` }; }
+      }
+      const s = await startSession({
+        project,
+        firstPrompt: prompt,
+        resumeSessionId: sid,
+        resumeEncodedDir: resume.encodedDir ?? undefined,
+        instructions,
+        overrides,
+        onEvent: (e) => { if (e.t === 'error') lastError = e as typeof lastError; },
+      });
+      s.detach();
+      outboxResumeFailures.delete(sid);
+      console.log(`[orchard] BUG-217: outbox resumed session ${sid} (no tab driving) to deliver queued messages`);
+      return { kind: 'delivered', via: 'resume' };
+    } catch (err) {
+      if ((err as { mayHaveSpawned?: boolean }).mayHaveSpawned) {
+        return { kind: 'uncertain', reason: `starting the session failed after it may have taken the message (${(err as Error).message}) — check the conversation, then Send anyway or Discard` };
+      }
+      const le = lastError as { message?: string; code?: string; needsFork?: unknown } | null;
+      const msg = le?.message ?? (err as Error).message;
+      if (le?.needsFork) return { kind: 'failed', reason: 'this session has to be forked before it can continue — open it, use the fork bar, then Send again' };
+      if (le?.code === 'runtime-check-pending') return { kind: 'refused', hold: { kind: 'starting', text: 'Orchard is still checking its runtime — it sends in a moment' }, retryMs: 1500 };
+      const n = (outboxResumeFailures.get(sid) ?? 0) + 1;
+      outboxResumeFailures.set(sid, n);
+      if (n >= 3) { outboxResumeFailures.delete(sid); return { kind: 'failed', reason: `the session could not be resumed (${msg})` }; }
+      return { kind: 'refused', hold: { kind: 'retry', text: `the session could not be resumed (${msg}) — trying again` } };
+    } finally {
+      resumeStarting.delete(sid);
+    }
+  },
+
+  transcriptHas(sid, resume, needle, from) {
+    const f = outboxTranscriptFile(sid, resume);
+    if (!f) return null;
+    try {
+      const size = fs.statSync(f).size;
+      const start = from > 0 && from <= size ? from : Math.max(0, size - 64 * 1024 * 1024);
+      const fd = fs.openSync(f, 'r');
+      try {
+        const buf = Buffer.alloc(size - start);
+        fs.readSync(fd, buf, 0, buf.length, start);
+        return buf.includes(needle);
+      } finally { fs.closeSync(fd); }
+    } catch { return null; }
+  },
+
+  transcriptSize(sid, resume) {
+    const f = outboxTranscriptFile(sid, resume);
+    try { return f ? fs.statSync(f).size : null; } catch { return null; }
+  },
+
+  interrupt(sid) {
+    const running = bridgeForSession(sid);
+    if (!running || !running.busy) return null;
+    return running.interrupt();
+  },
+
+  announce(sid, e) {
+    const running = bridgeForSession(sid);
+    running?.announce(e);
+  },
+};
 
 const wss = new WebSocketServer({
   server,
@@ -4061,6 +4658,19 @@ wss.on('connection', (ws: WebSocket) => {
     } catch {
       return send({ t: 'error', message: 'malformed command JSON', fatal: false });
     }
+    /*
+     * BUG-217 round 5 — a tab still running the round-3/4 client sends its
+     * queued rows with `queueIds` and expects the (deleted) ledger to arbitrate.
+     * Nothing arbitrates that any more, so it is refused, never delivered: the
+     * tab keeps the row, and a reload hands it to the server's outbox.
+     */
+    if ((cmd?.type === 'start' || cmd?.type === 'send') && Array.isArray((cmd as { queueIds?: unknown }).queueIds)) {
+      return send({
+        t: 'error', fatal: false, code: 'client-outdated', of: cmd.type,
+        sendId: typeof (cmd as { sendId?: unknown }).sendId === 'string' ? (cmd as { sendId: string }).sendId : undefined,
+        message: 'this tab is running an older version of Orchard — reload it. This message was NOT sent; it is still in the dock, and after the reload Orchard asks before sending it.',
+      });
+    }
     try {
       // FEAT-145 — the login frames are not session commands; they are handled
       // (and answered) here, ahead of the session switch.
@@ -4078,16 +4688,97 @@ wss.on('connection', (ws: WebSocket) => {
           // dropped — a drawer showing `overridden` while the agent ignores it is
           // exactly the failure this replaces.
           let overrides;
-          if (cmd.overrides !== undefined) {
+          /*
+           * BUG-196 round 6 — ON A RESUME THE CLIENT'S PROVIDER IS DROPPED BEFORE
+           * ANY VALIDATION. The engine of an existing id is the server's alone (see
+           * below), so the client's `provider` is not a request here and must never
+           * be able to kill the resume: round 5 dropped it only AFTER
+           * validateSessionOverrides, which FATALLY rejected "gemini", null or
+           * "OpenAI" first. Whatever it is — valid, stale, garbage — it is taken off
+           * the raw frame here, remembered only to announce it once the pinned engine
+           * is known, and the rest of the overrides are validated as usual.
+           */
+          let resumeClientProvider: { value: unknown } | null = null;
+          let rawOverrides: unknown = cmd.overrides;
+          if (cmd.resumeSessionId && rawOverrides && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)
+            && 'provider' in rawOverrides) {
+            const { provider: dropped, ...rest } = rawOverrides as Record<string, unknown>;
+            resumeClientProvider = { value: dropped };
+            rawOverrides = Object.keys(rest).length ? rest : undefined;
+          }
+          /*
+           * FEAT-160 round 4 — ON A RESUME OF A SESSION THE SERVER OWNS THE ACCOUNT FOR,
+           * the client's `claudeAccount` is dropped BEFORE validation, exactly like
+           * `provider` above. The account of a switched session is a server-owned fact
+           * (session-accounts.ts, read at the one spawn chokepoint), so a stale tab still
+           * carrying an account that has since been DELETED must not FATAL the resume
+           * ("claudeAccount must be null or the id of an existing account") when the server
+           * already decides the account for that id. An UNBOUND session keeps its override
+           * (the legitimate FEAT-145 launch account), validated as before.
+           */
+          if (cmd.resumeSessionId && rawOverrides && typeof rawOverrides === 'object' && !Array.isArray(rawOverrides)) {
+            rawOverrides = dropBoundAccountOverride(cmd.resumeSessionId, rawOverrides as Record<string, unknown>);
+          }
+          if (rawOverrides !== undefined) {
             try {
               // FEAT-145 step 5: the project's isolation is part of the dialect —
               // `claudeAccount` is a legal per-session override for a `direct`
               // project and refused for a container one (the credential is a
               // container bind). The parameter is required, so a new start path
               // cannot skip that refusal by omission.
-              overrides = validateSessionOverrides(cmd.overrides, { isolation: project.isolation });
+              overrides = validateSessionOverrides(rawOverrides, { isolation: project.isolation }); // BUG-196 round 6: a resume's provider is already off
             } catch (err) {
               return send({ t: 'error', message: `start.overrides rejected: ${(err as Error).message}`, fatal: true });
+            }
+          }
+          /*
+           * BUG-196 round 4 — ON A RESUME THE SERVER ALONE DECIDES THE ENGINE.
+           * A session id is meaningful only to the engine that minted it, so the
+           * engine a resume runs on is a fact about the id, owned by the stores
+           * the resume reads — never by a client value. Round 3 judged the
+           * client's `overrides.provider` at this door and REJECTED a mismatch
+           * (fatal), which (a) missed a NATIVE Codex rollout not yet imported
+           * (its only store is $CODEX_HOME, which the door never read) and (b)
+           * killed the resume of a session the user never switched whenever a
+           * stale client override rode the frame.
+           *
+           * Now: bring every store the resume can read into the one the resolver
+           * reads FIRST (the FEAT-078 native-Codex backfill, moved up from just
+           * before startSession so nothing below judges the id before it exists),
+           * then resolve the engine with the SAME resolver over the SAME dir list
+           * agent-bridge P2b uses (resumeProviderOf ∘ resumeDirCandidates), and
+           * DROP the client's provider for this start. A stale value is ignored,
+           * announced, never fatal; the engine the session actually runs on is
+           * declared back on `session-init.lockedProvider`. A provider override
+           * is a fresh-session concept only.
+           */
+          if (cmd.resumeSessionId) {
+            const enc = cmd.resumeEncodedDir ?? hist.encodeCwd(project.hostPath);
+            const already =
+              hist.resolveSessionFile(enc, cmd.resumeSessionId) ??
+              ot.resolveOrchardSessionFile(enc, cmd.resumeSessionId)?.filePath;
+            if (!already) {
+              try {
+                cn.importNativeCodexSession(cmd.resumeSessionId, { expectedEncodedDir: enc });
+              } catch {
+                /* import is best-effort — if it fails, the normal resume vetting reports honestly */
+              }
+            }
+            // BUG-196 round 6 — the client's provider was taken off the RAW frame
+            // before validation (above); here it is only announced, now that the
+            // pinned engine is known. Nothing it held can reach the validator.
+            if (resumeClientProvider) {
+              const locked = ot.resumeProviderOf(resumeDirCandidates(project, cmd.resumeEncodedDir), cmd.resumeSessionId);
+              if (resumeClientProvider.value !== locked) {
+                const runs = locked === 'openai' ? 'OpenAI Codex' : 'Claude';
+                const shown = typeof resumeClientProvider.value === 'string'
+                  ? resumeClientProvider.value
+                  : JSON.stringify(resumeClientProvider.value) ?? String(resumeClientProvider.value);
+                send({
+                  t: 'status',
+                  status: `ignored a stale provider choice (${shown.slice(0, 60)}) — this session's transcript pins it to ${runs}, so it resumes on ${runs}`,
+                });
+              }
             }
           }
           /*
@@ -4108,13 +4799,28 @@ wss.on('connection', (ws: WebSocket) => {
               if (typeof cmd.prompt === 'string' && cmd.prompt.trim()) {
                 return send({
                   t: 'error', fatal: false, retryable: true,
-                  message: 'another tab is delivering a message into this session right now — your message is queued and sends itself in a moment',
+                  ...(outboxReserved.has(cmd.resumeSessionId) ? { code: 'outbox-pending' as const } : {}),
+                  message: outboxReserved.has(cmd.resumeSessionId)
+                    ? OUTBOX_PENDING_MESSAGE
+                    : 'another tab is delivering a message into this session right now — your message is queued and sends itself in a moment',
                 });
               }
               return send({
                 t: 'error', code: 'live-elsewhere', fatal: true,
                 message: 'this session is being driven in another tab — a session streams to one tab at a time. Close it there (or send from there) to take it over here; until then you can watch it here read-only.',
               });
+            }
+            /*
+             * BUG-217 round 5 — queued messages for this session go first: the
+             * server's outbox says so (it owns the order), and this prompt joins
+             * them. Unless another tab drives the session: then BUG-149's refusal
+             * below answers, exactly as before.
+             */
+            if (typeof cmd.prompt === 'string' && cmd.prompt.trim() && outboxHasPending(cmd.resumeSessionId)) {
+              const holder = bridgeForSession(cmd.resumeSessionId);
+              if (!holder || holder.detached) {
+                return send({ t: 'error', fatal: false, retryable: true, code: 'outbox-pending', message: OUTBOX_PENDING_MESSAGE });
+              }
             }
             /*
              * BUG-033 — LIVENESS GATE, before the bridge is treated as live.
@@ -4129,7 +4835,8 @@ wss.on('connection', (ws: WebSocket) => {
              * `reapAsZombie` deletes it from the registry synchronously, so the
              * `liveSessions()` re-read below cannot see it again.
              */
-            let running = liveSessions().find((s) => s.sdkSessionId === cmd.resumeSessionId);
+            // BUG-217 round 5: the owner's declaration — including a resume whose CLI has not reported its id yet.
+            let running = bridgeForSession(cmd.resumeSessionId);
             if (running) {
               const v = running.livenessVerdict();
               if (!v.live) {
@@ -4226,6 +4933,9 @@ wss.on('connection', (ws: WebSocket) => {
                   t: 'session-init', sessionId: live.sdkSessionId ?? resumeId, cwd: live.cwd,
                   model: String(live.effective?.model ?? 'unknown'), tools: [],
                   permissionMode: live.effective?.permissionMode,
+                  // BUG-196 — declare the reattached session's dispatch engine too, so
+                  // a reattach (no transcript refetch) still locks the provider surfaces.
+                  lockedProvider: String(live.effective?.provider ?? 'anthropic'),
                   slashCommands: knownSlashCommands(),
                 });
                 /*
@@ -4441,18 +5151,10 @@ wss.on('connection', (ws: WebSocket) => {
                  * level frame imminent — the commit could fire at any moment)
                  * still keeps FEAT-065's queue-and-wait.
                  */
-                const bgCount = typeof survivor.backgroundLive === 'number' ? survivor.backgroundLive : 0;
-                const lifetimeDeliverable = survivor.backgroundLifetime === 'yes'
-                  || (survivor.backgroundLifetime === 'unknown' && bgCount > 0);
-                const deliverable = survivorDeliveryEnabled()
-                  && typeof cmd.prompt === 'string' && cmd.prompt.trim().length > 0
-                  // BUG-187 H7/R5: never into a broker that has ended its CLI's input.
-                  && survivor.acceptingInput !== false
-                  // BUG-191: only a broker that can CONFIRM a delivery (H7, protocol 2).
-                  && (survivor.protocol ?? 0) >= 2
-                  && survivor.state === 'draining'
-                  && survivor.midTurn === false
-                  && lifetimeDeliverable
+                // The conditions live in ONE place, the delivery route's owner
+                // (survivor-delivery.ts `survivorAdmits`), read here and by the outbox.
+                const deliverable = typeof cmd.prompt === 'string' && cmd.prompt.trim().length > 0
+                  && survivorAdmits(survivor)
                   && !activeDeliveryFor(cmd.resumeSessionId);
                 if (deliverable) {
                   starting = true; // hold this socket's session slot while the injection settles
@@ -4510,29 +5212,24 @@ wss.on('connection', (ws: WebSocket) => {
           // Starting is async now: isolation "container" must have a live
           // container before the SDK spawns. `starting` holds the slot so a
           // second 'start' racing on the same socket can't open two sessions.
-          starting = true;
           /*
-           * FEAT-078 — resuming a NATIVE codex session. If the resume target is
-           * not in the Claude store nor already an Orchard transcript, backfill
-           * it from codex's own store FIRST. Once present as an 'openai'
-           * transcript, agent-bridge's resume-provider resolution picks the
-           * CodexRuntime and thread/resume continues the same codex thread — the
-           * native session_id IS the thread id. No-op when already imported or
-           * when the id is not a native codex session.
+           * BUG-217 round 3 (plan review #6) — one prompt-bearing resume of a
+           * session at a time, across sockets AND the outbox: two starts of one
+           * session would put two CLIs onto one transcript (the BUG-022 shape).
+           * `starting` is per socket, so it cannot say this. Retryable: the tab
+           * hands the text to the session's outbox, which delivers it once the
+           * first start is a live bridge.
            */
-          if (cmd.resumeSessionId) {
-            const enc = cmd.resumeEncodedDir ?? hist.encodeCwd(project.hostPath);
-            const already =
-              hist.resolveSessionFile(enc, cmd.resumeSessionId) ??
-              ot.resolveOrchardSessionFile(enc, cmd.resumeSessionId)?.filePath;
-            if (!already) {
-              try {
-                cn.importNativeCodexSession(cmd.resumeSessionId, { expectedEncodedDir: enc });
-              } catch {
-                /* import is best-effort — if it fails, the normal resume vetting reports honestly */
-              }
-            }
+          const resumeOne = cmd.resumeSessionId && typeof cmd.prompt === 'string' && cmd.prompt.trim() ? cmd.resumeSessionId : null;
+          if (resumeOne && resumeStarting.has(resumeOne)) {
+            return send({
+              t: 'error', fatal: false, retryable: true,
+              message: 'another tab is starting this session right now — your message is queued and sends itself in a moment',
+            });
           }
+          if (resumeOne) resumeStarting.add(resumeOne);
+          starting = true;
+          // FEAT-078 native-Codex backfill: now done at the door (BUG-196 round 4), before the engine is resolved.
           send({ t: 'status', status: project.isolation === 'container' ? 'preparing container…' : 'starting…' });
           void startSession({
             project,
@@ -4581,11 +5278,19 @@ wss.on('connection', (ws: WebSocket) => {
               // startSession already emitted a fatal 'error' event with the
               // real reason; re-emitting here would double-report it.
               starting = false;
-            });
+            })
+            .finally(() => { if (resumeOne) resumeStarting.delete(resumeOne); });
           return;
         }
         case 'send': {
           if (!session) return send({ t: 'error', message: 'no session on this socket', fatal: false });
+          /*
+           * FEAT-168 r6 — there is deliberately NO auto-reopen call here (or in
+           * any other delivery path). CLOSED is derived: a session reads closed
+           * only while its transcript's latest input prompt is the one recorded
+           * at close (session-closed.ts), so this message reopens it the moment
+           * the CLI records it — as does every other route, listed or not.
+           */
           /*
            * Agent-targeted turns: refused, not faked. The SDK exposes no way to
            * deliver a message into a live subagent — pushing it would just run it
@@ -4622,6 +5327,10 @@ wss.on('connection', (ws: WebSocket) => {
            * bubble for a message that was never delivered.
            */
           const sendId = typeof cmd.sendId === 'string' ? cmd.sendId : undefined;
+          // BUG-217 round 5: queued messages go first, and the outbox's own delivery is never raced.
+          if (outboxBlocks(session.sdkSessionId)) {
+            return send({ t: 'error', fatal: false, retryable: true, code: 'outbox-pending', of: 'send', sendId, message: OUTBOX_PENDING_MESSAGE });
+          }
           if (session.adoptGated) {
             const sid = session.sdkSessionId;
             if (sid && deliveryInFlight.has(sid)) {
@@ -4736,6 +5445,136 @@ wss.on('connection', (ws: WebSocket) => {
             .catch((err: Error) =>
               send({ t: 'ack', of: 'set-model', requestId: cmd.requestId, model: cmd.model, ok: false, error: err.message }),
             );
+          return;
+        }
+        case 'switch-account': {
+          /*
+           * FEAT-160 — switch the Claude account of a RUNNING session. The account
+           * is a spawn-time env var (CLAUDE_CONFIG_DIR), so unlike set-model/
+           * set-permission-mode it cannot be changed in place: this reaps the idle
+           * CLI under the old account and the client re-resumes the SAME session id
+           * under the new account via the ordinary start{resumeSessionId,
+           * overrides:{claudeAccount}} path (BUG-022 survivor guard included).
+           */
+          const requestId = cmd.requestId;
+          const ackFail = (error: string) => send({ t: 'ack', of: 'switch-account', requestId, ok: false, error });
+          if (!session) {
+            return ackFail('no live session on this socket — set the account with start.overrides.claudeAccount when you start one');
+          }
+          const proj = session.project;
+          /*
+           * Validate BEFORE touching the running session: existence + normalization
+           * + the container refusal (validateSessionOverrides), then the loud
+           * ready/credential gate (resolveLaunchAccountDir). A missing, container,
+           * logged-out or credential-less account therefore fails here with the OLD
+           * session still running and untouched — never silently spends the wrong
+           * (or default) plan's quota.
+           */
+          let normalized: string | null;
+          try {
+            /*
+             * FEAT-160 round 4 — resolve an "inherit / Project default" pick HERE, the
+             * same way a FRESH session resolves its account: the project setting UNDER the
+             * machine-wide default (`applyGlobalDefaults`). The client used to resolve it
+             * as `project.settings.claudeAccount ?? null`, which omits the machine-default
+             * layer that lives only on the server — so on a session billing the machine
+             * default M, picking "Project default" bound `{account:null}` (~/.claude) and,
+             * because the binding is authoritative, that mis-bind could not be corrected by
+             * re-picking M. The client now sends the RAW choice (`inherit`) and the server
+             * owns the full chain, so the binding gets the concrete account a new session
+             * on this project would run on.
+             */
+            const requested = cmd.inherit === true
+              ? applyGlobalDefaults({ model: null, effort: null, claudeAccount: proj.settings.claudeAccount ?? null }).claudeAccount
+              : cmd.account;
+            const v = validateSessionOverrides({ claudeAccount: requested }, { isolation: proj.isolation });
+            normalized = (v.claudeAccount ?? null) as string | null;
+            resolveLaunchAccountDir(normalized); // throws (AccountError) if not ready / no credential
+          } catch (err) {
+            return ackFail((err as Error).message);
+          }
+          /*
+           * A turn in flight (a pending permission/question/plan card also keeps the
+           * session busy) must finish first: reaping mid-turn truncates it and the
+           * new CLI cannot pick up a half-delivered turn. Do NOT auto-interrupt.
+           */
+          if (session.busy) {
+            return ackFail('finish or interrupt the current turn before switching accounts — the account applies to the next turn, which cannot start until this one ends');
+          }
+          const live = session;
+          const sessionId = live.sdkSessionId ?? live.resumeOf ?? null;
+          /*
+           * FEAT-160 round 3 (plan review refuted the owed-work-gate plan) — the
+           * account a session runs on is now a SERVER-OWNED fact (session-accounts.ts),
+           * written HERE before the reap and read at the one spawn chokepoint (the
+           * AgentSession constructor). So billing-correctness is no longer this gate's
+           * job: whoever resumes this session next — this tab, another tab with a stale
+           * override, the outbox pump replaying a queued row, a boot re-pump — reads the
+           * bound account and cannot run it on the old one. A queued outbox row is
+           * therefore SAFE to carry across the switch (it resumes under the NEW bound
+           * account — "switch and continue", not a silent per-tab move), so it is NOT a
+           * reason to refuse.
+           *
+           * This gate's ONLY remaining job is not to TRUNCATE live work by reaping it:
+           *   - a turn in flight (checked above, and re-checked after the await);
+           *   - work that OUTLIVES the turn — `closeLifetime()`, the SAME authority
+           *     `releaseSocketSession`/`closeAllSessions` read (ARCH-002/ARCH-010), a
+           *     background lane/subagent/Bash or a draining broker; anything but a
+           *     settled `no` refuses (a lifetime-query error refuses too — biased to
+           *     NOT reaping live work);
+           *   - an ACTIVE delivery into the CLI right now (`deliveryInFlight` — which
+           *     the outbox pump's reserve also sets — or a `resumeStarting` spawn):
+           *     reaping mid-delivery truncates it, so refuse RETRYABLE.
+           */
+          if (!sessionId) {
+            return ackFail('the session has not reported its id yet — wait a moment and switch again');
+          }
+          if (deliveryInFlight.has(sessionId) || resumeStarting.has(sessionId)) {
+            return send({ t: 'ack', of: 'switch-account', requestId, ok: false, retryable: true, error: 'a message is being delivered into this session right now — try the switch again in a moment' });
+          }
+          // Hold the session's delivery reservation (the SAME map the outbox pump's
+          // probe and the send path respect) across the whole reap, so no pump
+          // delivery or second switch can interleave the close. Released in `finally`.
+          const switchToken = Symbol('switch-account');
+          deliveryInFlight.set(sessionId, switchToken);
+          const releaseSwitch = () => { if (deliveryInFlight.get(sessionId) === switchToken) deliveryInFlight.delete(sessionId); };
+          void (async () => {
+            try {
+              let cl: { lifetime: 'yes' | 'unknown' | 'no'; source: string };
+              try { cl = await live.closeLifetime(); }
+              catch (err) { return ackFail(`could not determine whether background work is still running under the current account (${(err as Error)?.message ?? err}) — not switching, so no in-flight work is reaped or mis-billed`); }
+              if (live.closed) return ackFail('the session ended before the account could be switched — reopen it and switch before starting a turn');
+              if (live.busy) return ackFail('finish or interrupt the current turn before switching accounts — the account applies to the next turn, which cannot start until this one ends');
+              if (resumeStarting.has(sessionId)) return send({ t: 'ack', of: 'switch-account', requestId, ok: false, retryable: true, error: 'a resume of this session started while switching — try the switch again in a moment' });
+              if (cl.lifetime !== 'no') {
+                return ackFail(
+                  `background work is still running under the current account (${cl.source}) — ` +
+                  'wait for it to finish or stop it before switching, so the next turn does not bill the old account',
+                );
+              }
+              /*
+               * Commit: record the server-owned binding DURABLY before the reap. A
+               * crash between here and the client's re-resume still resumes on the new
+               * account, because every resume reads this binding. Only after it is
+               * written do we reap.
+               */
+              try { setSessionAccount(sessionId, normalized); }
+              catch (err) { return ackFail(`could not record the account switch (${(err as Error).message}) — not switching, so the session keeps its current account`); }
+              // Detach this socket and reap the old CLI. close() sends a graceful
+              // stdin-EOF, drains, removes the bridge — so the next resume takes the
+              // clean resume path and reads the new bound account. Ack only AFTER the
+              // reap, so the client never races a still-draining broker when it re-resumes.
+              if (session === live) {
+                if (delivery) { delivery.attachClient(null); delivery = null; }
+                session = null;
+              }
+              try { await live.close('account switch (FEAT-160)'); }
+              catch (err) { return send({ t: 'ack', of: 'switch-account', requestId, ok: false, error: `could not stop the current session to switch accounts: ${(err as Error).message}` }); }
+              return send({ t: 'ack', of: 'switch-account', requestId, ok: true, account: normalized, sessionId });
+            } finally {
+              releaseSwitch();
+            }
+          })();
           return;
         }
         case 'follow': {
@@ -4883,6 +5722,82 @@ try {
 markSanctionedRealStoreWriter();
 
 ensureDir(dataDir());
+/*
+ * BUG-217 rounds 7–9 (and BUG-220) — ONE SERVER PER DATA DIR, enforced by the
+ * kernel. Two servers on one CLAUDE_STATION_DATA each loaded the outbox into
+ * their own memory and both handed the same queued message to the CLI (CLI ×2);
+ * they also race the registry, the session hosts, the containers and the lane
+ * ledger. The lock (`lanes.claimDataDir`) is an exclusive flock on the data
+ * DIRECTORY's own inode: a symlink, a bind mount (a container volume), another
+ * namespace or a rename all reach the same lock, there is no lock file to
+ * delete or replace, and the kernel frees it when the holder dies, even by
+ * kill -9. If the path later names a different directory (moved and copied
+ * back), the holder stops and exits — see `onWriterLost` below. It
+ * is taken HERE, before anything below reads or writes the data dir. A restart
+ * that overlaps its predecessor waits for it, bounded; a holder still there
+ * after that is another server, and this one refuses to start.
+ */
+{
+  const waitMs = (() => { const v = Number(process.env.CLAUDE_STATION_DATA_LOCK_WAIT_MS); return Number.isFinite(v) && v >= 0 ? v : 30_000; })();
+  const lock = await lanes.claimDataDir({
+    port: PORT,
+    waitMs,
+    onWait: (h) => console.log(`[orchard] data dir ${dataDir()} is held by another Orchard server (${lanes.describeHolder(h)}) — waiting up to ${Math.round(waitMs / 1000)}s for it to exit (a restart overlap)`),
+  });
+  if (!lock.ok && lock.reason === 'held') {
+    console.error(
+      `[orchard] REFUSING TO START — another Orchard server is using the data dir ${dataDir()} (${lanes.describeHolder(lock.holder)}; it holds the lock on the directory ${lock.name}), ` +
+      `and it was still there after ${Math.round(lock.waitedMs / 1000)}s. One data dir has exactly one server: two would each send the same queued ` +
+      'message and race the registry, the session hosts and the containers. Stop that server, or point CLAUDE_STATION_DATA at another directory.',
+    );
+    process.exit(78); // EX_CONFIG, the same refusal as a mis-set data dir above
+  }
+  if (!lock.ok) {
+    console.error(`[orchard] REFUSING TO START — cannot lock the data dir ${dataDir()}, so nothing guarantees it has one server: ${lock.reason}`);
+    process.exit(78);
+  }
+  if (lock.waitedMs >= 200) console.log(`[orchard] data dir lock taken after waiting ${(lock.waitedMs / 1000).toFixed(1)}s for the previous server to exit`);
+}
+/*
+ * ARCH-022 — container lifecycle RECOVERY, right after the data-dir claim and before anything can admit a
+ * session (the outbox below can start one): persisted leases and every session exec still running in a
+ * container become draining leases, so a crashed or restarted server's work is protected. Every
+ * lifecycle operation waits for this to finish; none can run before it.
+ */
+void lifecycle.recover().then(() => {
+  // ARCH-022 / BUG-219: who this instance IS, as declared in its data dir (never inferred from a path or env).
+  const b = boundInstance();
+  if (b) {
+    console.log(`[orchard] instance ${b.identity.id} (declared in ${b.dir}/orchard-instance.json)${b.identity.legacyKey ? `, also owning its pre-identity objects (key ${b.identity.legacyKey})` : ''}; ` +
+      (b.liveDeclared ? 'LIVE instance (declared by the user): adopts pre-label objects'
+        : 'NOT declared live: adopts no unlabelled or pre-identity object (refuses and reports them). If this is your live Orchard: node scripts/orchard-live-instance.mjs declare, then restart'));
+  }
+}).catch((err) => console.error(`[orchard] container lifecycle recovery FAILED — no container operation will run: ${(err as Error).message}`));
+/*
+ * FEAT-157 — the one-time base-pin migration: every container project without a pin is pinned to exactly the base
+ * its container runs (`legacy:<tag>` for a pre-release base); nothing is rebuilt or recreated. One lifecycle
+ * operation per project (ARCH-022), queued behind recovery.
+ */
+void (async () => {
+  try {
+    const mig = await cm.migrateAllBasePins((l) => console.log(l.trimEnd()));
+    console.log(`[orchard] base-pin migration done: migrated ${mig.migrated.length}, pending ${mig.pending.length}${mig.pending.length ? ` (${mig.pending.join(', ')}: decided at their next launch)` : ''}`);
+  } catch (err) { console.warn(`[orchard] base-pin migration skipped: ${(err as Error).message}`); }
+})();
+// BUG-217 round 5: load every session's outbox and start delivering — a row
+// queued before this boot goes by itself, whether or not any tab ever opens.
+startOutbox(outboxWiring);
+/*
+ * BUG-217 round 9: the data dir this server locked is no longer the one at its path (moved away, a copy put
+ * back). The outbox has already stopped and marked its in-flight rows "not confirmed" in the dir it holds
+ * (it registered first); this server must not carry on as a writer of a path it does not own, so it exits.
+ * Exit 75 (EX_TEMPFAIL): systemd's Restart=on-failure starts a fresh server, which locks whatever directory
+ * the path names now — or refuses, if another server already holds that one.
+ */
+lanes.onWriterLost((why) => {
+  console.error(`[orchard] EXITING — ${why}. Nothing more is sent from this process. Start Orchard again to serve the directory now at ${dataDir()}; the moved directory's unsent messages are kept there, marked "not confirmed".`);
+  process.exit(75);
+});
 const seedResult = tpl.seedTemplates();
 
 server.listen(PORT, HOST, () => {
@@ -4958,6 +5873,7 @@ server.listen(PORT, HOST, () => {
        * same data dir is refused here and writes nothing, rather than quietly
        * interleaving writes and losing records.
        */
+      // Already held since boot (the data-dir lock above); this re-confirms it, and cannot fail while this process lives.
       const claim = await lanes.claimWriter();
       if (!claim.ok) {
         console.warn(`[orchard] lane ledger: another process holds the writer claim for ${dataDir()} (${claim.reason}) — this server will not write or reconcile lane records`);
@@ -5068,6 +5984,7 @@ let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  stopOutbox(); // BUG-217 round 5: hand nothing more over while going down — queued rows wait on disk for the next boot
   clearInterval(browserReaper);
   console.log(`[orchard] ${signal} — closing sessions`);
   /*

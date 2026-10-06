@@ -58,7 +58,7 @@ function runOnboard(targetDir, extraArgs = []) {
 
 function runBoardCheck(dir) {
   try {
-    const out = execFileSync('node', [path.join(dir, 'scripts', 'board.mjs'), 'check', `--dir=${path.join(dir, 'docs', 'bugs')}`], {
+    const out = execFileSync('node', [path.join(dir, '.orchard', 'board.mjs'), 'check', `--dir=${path.join(dir, '.orchard', 'bugs')}`], {
       encoding: 'utf8',
       cwd: dir,
     });
@@ -85,41 +85,50 @@ try {
   const first = runOnboard(projDir);
   check('(a) first onboard run exits 0', first.code === 0, first.out);
 
-  const bugsDir = path.join(projDir, 'docs', 'bugs');
+  const bugsDir = path.join(projDir, '.orchard', 'bugs');
   const expectFiles = [
     path.join(bugsDir, 'README.md'),
     path.join(bugsDir, 'INDEX.md'),
     path.join(bugsDir, 'TEMPLATE.md'),
     path.join(projDir, 'CLAUDE.md'),
-    path.join(projDir, 'docs', 'CONVENTIONS.md'),
-    path.join(projDir, 'scripts', 'board.mjs'),
+    path.join(projDir, '.orchard', 'CONVENTIONS.md'),
+    path.join(projDir, '.orchard', 'config.json'),
+    path.join(projDir, '.orchard', '.gitignore'),
+    path.join(projDir, '.orchard', 'board.mjs'),
+    path.join(projDir, '.orchard', 'lib', 'digest.js'), // public/lib flattened into .orchard/lib
+    path.join(projDir, '.orchard', 'hooks', 'response-format-gate.mjs'),
   ];
   for (const f of expectFiles) {
     check(`(a) created: ${path.relative(projDir, f)}`, fs.existsSync(f));
   }
+  // FEAT-106: public/ must NEVER be written to a target.
+  check('(a) no public/ directory written to the target', !fs.existsSync(path.join(projDir, 'public')));
 
   const claudeMdText = fs.readFileSync(path.join(projDir, 'CLAUDE.md'), 'utf8');
   check(
-    '(a) CLAUDE.md points at the shared Working Agreement',
-    claudeMdText.includes('WORKING_AGREEMENT') && claudeMdText.includes('docs/CONVENTIONS.md'),
+    '(a) CLAUDE.md points at the shared Working Agreement + .orchard/CONVENTIONS.md',
+    claudeMdText.includes('WORKING_AGREEMENT') && claudeMdText.includes('.orchard/CONVENTIONS.md'),
     claudeMdText.slice(0, 200)
   );
 
+  const cfg = JSON.parse(fs.readFileSync(path.join(projDir, '.orchard', 'config.json'), 'utf8'));
+  check('(a) .orchard/config.json declares board=.orchard/bugs + layoutVersion', cfg.board === '.orchard/bugs' && typeof cfg.layoutVersion === 'number', JSON.stringify(cfg));
+
   const readmeText = fs.readFileSync(path.join(bugsDir, 'README.md'), 'utf8');
-  check('(a) docs/bugs/README.md carries the append-only discipline', readmeText.includes('APPEND-ONLY') || readmeText.includes('append-only'));
+  check('(a) .orchard/bugs/README.md carries the append-only discipline', readmeText.includes('APPEND-ONLY') || readmeText.includes('append-only'));
 
   const indexText = fs.readFileSync(path.join(bugsDir, 'INDEX.md'), 'utf8');
-  check('(a) docs/bugs/INDEX.md has Open + Done tables', indexText.includes('## Open') && indexText.includes('## Done'));
+  check('(a) .orchard/bugs/INDEX.md has Open + Done tables', indexText.includes('## Open') && indexText.includes('## Done'));
 
-  const boardCopyText = fs.readFileSync(path.join(projDir, 'scripts', 'board.mjs'), 'utf8');
+  const boardCopyText = fs.readFileSync(path.join(projDir, '.orchard', 'board.mjs'), 'utf8');
   const boardSourceText = fs.readFileSync(boardScript, 'utf8');
-  check('(a) copied board.mjs is byte-identical to source', boardCopyText === boardSourceText);
+  check('(a) copied .orchard/board.mjs is byte-identical to source', boardCopyText === boardSourceText);
 
   const pkgAfterFirst = JSON.parse(fs.readFileSync(path.join(projDir, 'package.json'), 'utf8'));
   check(
-    '(a) package.json wired with board:check + board:gen',
-    pkgAfterFirst.scripts['board:check'] === 'node scripts/board.mjs check' &&
-      pkgAfterFirst.scripts['board:gen'] === 'node scripts/board.mjs gen'
+    '(a) package.json wired with board:check + board:gen pointing at .orchard/',
+    pkgAfterFirst.scripts['board:check'] === 'node .orchard/board.mjs check' &&
+      pkgAfterFirst.scripts['board:gen'] === 'node .orchard/board.mjs gen'
   );
 
   // (b) the copied guard actually works
@@ -135,7 +144,7 @@ try {
 
   const second = runOnboard(projDir);
   check('(c) second onboard run exits 0', second.code === 0, second.out);
-  check('(c) all artifacts report exists, not created', /EXISTS/.test(second.out) && !/CREATED\s+docs\/bugs/.test(second.out), second.out);
+  check('(c) all artifacts report exists, not created', /EXISTS/.test(second.out) && !/CREATED\s+\.orchard\/bugs/.test(second.out), second.out);
 
   const claudeMdAfterRerun = fs.readFileSync(path.join(projDir, 'CLAUDE.md'), 'utf8');
   check('(c) hand-edited CLAUDE.md is NOT clobbered by re-run', claudeMdAfterRerun === claudeMdBeforeRerun);
@@ -163,13 +172,13 @@ try {
   fs.mkdirSync(noBoardDir, { recursive: true });
   const noBoardRun = runOnboard(noBoardDir, ['--no-board']);
   check('(e) --no-board run exits 0', noBoardRun.code === 0, noBoardRun.out);
-  check('(e) docs/bugs NOT created with --no-board', !fs.existsSync(path.join(noBoardDir, 'docs', 'bugs', 'README.md')));
+  check('(e) .orchard/bugs NOT created with --no-board', !fs.existsSync(path.join(noBoardDir, '.orchard', 'bugs', 'README.md')));
   check('(e) CLAUDE.md still created with --no-board (WA pointer is independent of the board)', fs.existsSync(path.join(noBoardDir, 'CLAUDE.md')));
 
   // -------------------------------------------------------------------
   // (f) --force-board-tool re-syncs a diverged copy; a plain re-run doesn't.
   // -------------------------------------------------------------------
-  const boardCopyPath = path.join(projDir, 'scripts', 'board.mjs');
+  const boardCopyPath = path.join(projDir, '.orchard', 'board.mjs');
   fs.appendFileSync(boardCopyPath, '\n// LOCAL DIVERGENCE\n');
   const divergedText = fs.readFileSync(boardCopyPath, 'utf8');
 
@@ -255,9 +264,9 @@ try {
   const createdPkg = JSON.parse(fs.readFileSync(path.join(noPkgDir, 'package.json'), 'utf8'));
   check(
     '(h) created package.json wires board:check/board:gen/arch:watch',
-    createdPkg.scripts?.['board:check'] === 'node scripts/board.mjs check' &&
-      createdPkg.scripts?.['board:gen'] === 'node scripts/board.mjs gen' &&
-      createdPkg.scripts?.['arch:watch'] === 'node scripts/arch-watch.mjs --persist',
+    createdPkg.scripts?.['board:check'] === 'node .orchard/board.mjs check' &&
+      createdPkg.scripts?.['board:gen'] === 'node .orchard/board.mjs gen' &&
+      createdPkg.scripts?.['arch:watch'] === 'node .orchard/arch-watch.mjs --persist',
     JSON.stringify(createdPkg.scripts)
   );
   check('(h) onboard output reports the post-onboard SMOKE PASS', /SMOKE PASS/.test(noPkgRun.out), noPkgRun.out);

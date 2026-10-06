@@ -181,7 +181,7 @@ const ROW_GEO = `[...document.querySelectorAll('#dBody .view.on .set')].map((r) 
     return b ? +(b.y + b.height / 2).toFixed(1) : null; })();
   return { label: (r.querySelector('.l')?.textContent ?? '').trim().slice(0, 18), firstLineCy,
     cols: getComputedStyle(r).gridTemplateColumns,
-    l: q('.l'), prov: q('.prov'), v: q('.v'), why: q('button.why'), rev: q('.rev'), gut: q('.sgut') };
+    l: q('.l'), prov: q('.prov'), v: q('.v, .ssel, .smoney'), why: q('button.why'), rev: q('.rev'), gut: q('.sgut') };
 })`;
 
 /** Every font size actually painted by a non-empty leaf inside the modal. */
@@ -541,7 +541,10 @@ async function main() {
     !!rowNoReset, JSON.stringify(rowNoReset?.label ?? before.map((r) => r.label)));
   // Write a value so the reset appears on the SAME row.
   await cdp.eval(`(() => { const rows = [...document.querySelectorAll('#dBody .view.on .set')];
-    const r = rows.find((x) => x.querySelector('button.why') && !x.querySelector('.rev')); r.click(); })()`);
+    const r = rows.find((x) => x.querySelector('button.why') && !x.querySelector('.rev'));
+    /* FEAT-159: a row no longer writes on click — pick a concrete value in its dropdown. */
+    const s = r.querySelector('select.ssel'); const o = [...s.options].find((x) => /^v\\d+$/.test(x.value) && !x.selected);
+    s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
   await sleep(900);
   const after = await cdp.eval(ROW_GEO);
   const rowWithReset = after.find((r) => r.label === rowNoReset.label);
@@ -729,7 +732,7 @@ async function main() {
   const railCompare = await (async () => {
     const tplRight = Math.max(...tpl.rightEdge);
     await openCat('model');
-    const setRight = await cdp.eval(`(() => { const v = document.querySelector('#dBody .view.on .set .v');
+    const setRight = await cdp.eval(`(() => { const v = document.querySelector('#dBody .view.on .set > .v, #dBody .view.on .set > .ssel, #dBody .view.on .set > .smoney'); /* FEAT-159: the value column holds a control now */
       return Math.round(v.getBoundingClientRect().right); })()`);
     return { tplRight, setRight };
   })();
@@ -895,7 +898,10 @@ async function main() {
   const bBefore = await cdp.eval(ROW_GEO);
   const bNoReset = bBefore.find((r) => r.why && !r.rev);
   await cdp.eval(`(() => { const rows = [...document.querySelectorAll('#dBody .view.on .set')];
-    const r = rows.find((x) => x.querySelector('button.why') && !x.querySelector('.rev')); r.click(); })()`);
+    const r = rows.find((x) => x.querySelector('button.why') && !x.querySelector('.rev'));
+    /* FEAT-159: a row no longer writes on click — pick a concrete value in its dropdown. */
+    const s = r.querySelector('select.ssel'); const o = [...s.options].find((x) => /^v\\d+$/.test(x.value) && !x.selected);
+    s.value = o.value; s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
   await sleep(900);
   const bAfter = await cdp.eval(ROW_GEO);
   const bWithReset = bAfter.find((r) => r.label === bNoReset?.label);

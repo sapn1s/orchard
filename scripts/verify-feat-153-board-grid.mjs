@@ -700,16 +700,18 @@ async function main() {
     xProof.after.RQA === 'idle' && xProof.after.RQB === 'run',
     JSON.stringify(xProof));
 
-  // (z) LOW (r5 gap) — renderRailRequests rqSig mapped snap=null (liveness UNKNOWN)
-  // and snap.running=[] (liveness KNOWN-idle) to the same '[]', so an empty snapshot
-  // that CONFIRMS the lane went idle never repaints the exec badge off "N running".
-  // Reachable in normal use: state.snap starts null and is reset to null on every
-  // session switch (BUG-034), so a running poll returning [] leaves a stale count.
-  // A request bound to a `prog` (board.inflight) ticket with NO attributed lane:
-  // executionOf's COARSE fallback reads `running` for null (count>0, unconfirmed)
-  // but `idle` for the confirmed-empty []. Two synchronous renders, no timer poll.
-  // Before the fix: rqSig unchanged (both '[]') → badge stays "1 running" (WRONG).
-  // After: Array.isArray(state.snap?.running) in the sig (false vs true) → repaint.
+  // (z) LOW — renderRailRequests must REPAINT the exec badge when liveness changes,
+  // so a running poll that later returns [] never leaves a stale "N running" count
+  // (state.snap starts null and resets to null on every session switch — BUG-034).
+  //
+  // UPDATED (FEAT-126 r4, regressed-from FEAT-153 r5): this test used to assert
+  // snap=null → "1 running" as its observable. That was the very "unconfirmed
+  // motion" defect the FEAT-126 r1 independent verify flagged (Finding 5):
+  // executionOf's coarse fallback claimed running on UNKNOWN liveness. requests-view
+  // now reads a 🤖 ticket as idle when there is no snapshot (null) AND when the
+  // snapshot confirms empty ([]) — motion is only ever claimed from a confirmed
+  // live lane. So the repaint guarantee is re-proven across the transitions that
+  // ARE observable post-fix: null(idle) → attributed-running(run) → empty(idle).
   const zProof = await cdp.eval(`(() => {
     const st = window.__station, s = st.state;
     const saved = { requests: s.requests, snap: s.snap, board: s.board, caps: s.caps.requests };
@@ -725,17 +727,21 @@ async function main() {
       return { cls: (e?.className.match(/\\b(run|stall|idle)\\b/) || [])[1] ?? null,
                text: e?.textContent ?? null };
     };
-    s.snap = null;                       // liveness UNKNOWN → coarse fallback = running
+    s.snap = null;                       // liveness UNKNOWN → never claim motion (F5) → idle
     st.renderRail();
     const unknown = readExec();
-    s.snap = { v: 1, turn: { running: false }, running: [] }; // KNOWN-idle: nothing runs
-    st.renderRail();                     // GATED renderRailRequests inside
+    s.snap = { v: 1, turn: { running: true }, running: [{ id: 'lz', row: 'agent', state: 'running', ticket: ['FEAT-210'] }] }; // a CONFIRMED live lane
+    st.renderRail();
+    const running = readExec();
+    s.snap = { v: 1, turn: { running: false }, running: [] }; // KNOWN-idle: the poll confirms nothing runs
+    st.renderRail();                     // GATED renderRailRequests inside — must repaint off "running"
     const knownEmpty = readExec();
     s.requests = saved.requests; s.snap = saved.snap; s.board = saved.board; s.caps.requests = saved.caps;
-    return { unknown, knownEmpty };
+    return { unknown, running, knownEmpty };
   })()`);
-  check('(z) an empty running snapshot after a null one clears the exec badge from "1 running" to "idle" (snap=null vs snap.running=[] discriminated in rqSig)',
-    zProof.unknown.cls === 'run' && /1\s*running/.test(zProof.unknown.text) &&
+  check('(z) the exec badge repaints across liveness changes: null→idle, confirmed lane→running, empty poll→idle (no unconfirmed motion, no stale count)',
+    zProof.unknown.cls === 'idle' && /idle/.test(zProof.unknown.text) &&
+    zProof.running.cls === 'run' && /1\s*running/.test(zProof.running.text) &&
     zProof.knownEmpty.cls === 'idle' && /idle/.test(zProof.knownEmpty.text),
     JSON.stringify(zProof));
 

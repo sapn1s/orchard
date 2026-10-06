@@ -7,7 +7,8 @@ import * as path from 'node:path';
 
 import { dataDir, ensureDir, projectRoot } from '../lib/paths.ts';
 import * as lanes from './lanes.ts';
-import type { Project } from './registry.ts';
+import { laneDockerEnv, sandboxAnswersSync, SANDBOX_DOWN_MESSAGE } from '../../scripts/lib/lane-docker.mjs';
+import { getProject, type Project } from './registry.ts';
 
 export const CONTAINER_DISPATCH_DIR = '/opt/orchard-dispatch';
 export const CONTAINER_DISPATCH_CLIENT = `${CONTAINER_DISPATCH_DIR}/dispatch-client.mjs`;
@@ -453,7 +454,20 @@ function stampAcknowledged(laneId: string, why: string, proof?: string) {
   }
 }
 
-function runDispatch(project: Project, socket: net.Socket, r: Record<string, unknown>) {
+/*
+ * BUG-223 round 6 (ARCH-010: no cached derived copy). A broker is started once per project id
+ * and lives across repoints, so the Project object it was started with goes stale: its hostPath
+ * can now belong to ANOTHER registered project (declared 'host'), and a lane would run in that
+ * directory and be handed that project's daemon. Each lane therefore re-reads its project BY ID
+ * from the registry, the one authority, and takes BOTH its path and its laneDocker from that row.
+ * A project that is no longer registered (or a registry that cannot be read) gets no lane.
+ */
+function runDispatch(started: Project, socket: net.Socket, r: Record<string, unknown>) {
+  let fresh: Project | null;
+  try { fresh = getProject(started.id); }
+  catch (e) { return refusal(socket, 'registry-unreadable', `dispatch refused: the project registry could not be read (${(e as Error).message})`); }
+  if (!fresh) return refusal(socket, 'project-not-registered', `dispatch refused: project ${started.id} is no longer registered`);
+  const project: Project = fresh;
   const own = activeByProject.get(project.id) ?? 0;
   if (own >= PROJECT_CAP) return refusal(socket, 'project-concurrency-cap', `dispatch refused: project concurrency cap ${PROJECT_CAP} reached`, { cap: PROJECT_CAP });
   if (activeGlobal >= GLOBAL_CAP) return refusal(socket, 'global-concurrency-cap', `dispatch refused: global concurrency cap ${GLOBAL_CAP} reached`, { cap: GLOBAL_CAP });
@@ -558,7 +572,12 @@ function runDispatch(project: Project, socket: net.Socket, r: Record<string, unk
   const timeoutGraceMs = Number(process.env.ORCHARD_DISPATCH_TIMEOUT_GRACE_MS ?? 10_000);
   const killTimer = setTimeout(() => { child?.kill('SIGTERM'); finish(1, 'broker-timeout', `dispatch timed out after ${timeoutMin} minute(s)`); }, timeoutMin * 60_000 + timeoutGraceMs);
   try {
-    child = spawn(process.env.ORCHARD_DISPATCH_NODE || process.execPath, args, { cwd: project.hostPath, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
+    // BUG-223: a broker-launched lane gets the daemon its project DECLARES (settings.laneDocker),
+    // read from the row re-read by id above, never by a path lookup; the broker's own env is untouched.
+    const laneDocker = laneDockerEnv({ projectPath: project.hostPath, project });
+    // ARCH-022 (b-i): the server never starts the sandbox; a lane on a sandbox-declared project with it down fails loudly.
+    if (laneDocker.decision === 'sandbox' && !sandboxAnswersSync()) { clearTimeout(killTimer); return finish(1, 'sandbox-down', `dispatch refused: ${SANDBOX_DOWN_MESSAGE}`); }
+    child = spawn(process.env.ORCHARD_DISPATCH_NODE || process.execPath, args, { cwd: project.hostPath, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, ...laneDocker.env } });
   } catch (e) { return finish(1, 'spawn-failed', `could not spawn dispatch: ${(e as Error).message}`); }
   // ARCH-017 rule 3 — the ground truth a later boot re-checks this claim against.
   if (ledgerId) {
@@ -602,12 +621,38 @@ function connection(project: Project, socket: net.Socket) {
     handled = true;
     if (input.slice(nl + 1).trim()) return refusal(socket, 'multiple-requests', 'one request per connection');
     let raw: unknown; try { raw = JSON.parse(input.slice(0, nl)); } catch { return refusal(socket, 'invalid-json', 'request is not valid JSON'); }
+    // FEAT-157 — the base-update op. This socket IS the project (one per project, bound
+    // into that project's container only), so the project is never a request field.
+    if (raw && typeof raw === 'object' && (raw as Record<string, unknown>).op === 'base') return void baseOp(project, socket, raw as Record<string, unknown>);
     const v = validate(raw); if (!v.ok) return refusal(socket, v.kind, v.text);
     if (v.r.op === 'capabilities') return socket.end(`${JSON.stringify({ ok: true, providers: ['openai'], models: { openai: ['default'] }, project: project.id, entitled: true, dispatchCmd: DISPATCH_COMMAND })}\n`);
     runDispatch(project, socket, v.r);
   });
   socket.on('end', () => { if (!handled) { handled = true; refusal(socket, 'partial-frame', 'connection ended before a complete NDJSON frame'); } });
   socket.on('error', () => {});
+}
+
+/**
+ * FEAT-157 — a container project's agent answers ITS OWN project's base-update
+ * notice through this socket (a container cannot reach the host HTTP API). The
+ * handler is registered by the server (index.ts) so this file stays free of the
+ * registry and the policy; `project` is the socket's, never the caller's.
+ */
+export type BaseOpHandler = (project: Project, req: { action: string; version?: number; rev?: string }) => Promise<{ status: number; body: Record<string, unknown> }>;
+let baseOpHandler: BaseOpHandler | null = null;
+export function setBaseOpHandler(fn: BaseOpHandler): void { baseOpHandler = fn; }
+const BASE_KEYS = new Set(['op', 'action', 'version', 'rev']);
+async function baseOp(project: Project, socket: net.Socket, r: Record<string, unknown>): Promise<void> {
+  const reply = (o: Record<string, unknown>) => { try { socket.end(`${JSON.stringify(o)}\n`); } catch { /* peer gone */ } };
+  for (const k of Object.keys(r)) if (!BASE_KEYS.has(k)) return reply({ ok: false, status: 400, error: `base: field ${JSON.stringify(k)} is not allowed (the project is this socket's)` });
+  if (typeof r.action !== 'string' || !/^(status|adopt|defer|skip|dismiss)$/.test(r.action)) return reply({ ok: false, status: 400, error: 'base: action must be status, adopt, defer, skip or dismiss' });
+  if (r.version !== undefined && !(typeof r.version === 'number' && Number.isInteger(r.version))) return reply({ ok: false, status: 400, error: 'base: version must be an integer' });
+  if (r.rev !== undefined && typeof r.rev !== 'string') return reply({ ok: false, status: 400, error: 'base: rev must be a string' });
+  if (!baseOpHandler) return reply({ ok: false, status: 503, error: 'base: this Orchard does not serve base updates' });
+  try {
+    const out = await baseOpHandler(project, { action: r.action, version: r.version as number | undefined, rev: r.rev as string | undefined });
+    reply({ ok: out.status < 300, status: out.status, ...out.body });
+  } catch (e) { reply({ ok: false, status: 500, error: `base: ${(e as Error).message}` }); }
 }
 
 export async function start(project: Project): Promise<string> {

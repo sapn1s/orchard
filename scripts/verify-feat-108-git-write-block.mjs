@@ -175,11 +175,117 @@ const EVASIONS_CAUGHT = [
   ['nohup git push &', 'nohup + background'],
   ['FOO=1 git commit -m x', 'leading assignment'],
   ['sh -c "cd /r && git commit -m x"', 'sh -c with cd + &&'],
+  // FEAT-108 round 4 — evasions the 2026-09-29 clean room found ALLOWED. Each is a
+  // real write reached through a shell form the scanner did not descend into.
+  ["bash -lc 'git commit -m x'", 'bash -lc (combined -c cluster)'],
+  ["bash -ic 'git push'", 'bash -ic (combined -c cluster)'],
+  ['(git commit -m x)', 'parenthesized subshell'],
+  ['( git push )', 'subshell with spaces'],
+  ['env -S "git commit -m x"', 'env -S split-string'],
+  ['env --split-string="git push"', 'env --split-string='],
+  ['env -S"git commit -m x"', 'env -S attached'],
+  ['cat <<EOF\ndata\nEOF\ngit commit -m x', 'git command AFTER a heredoc body'],
+  ['git interpret-trailers --in-place --trailer x=y f', 'interpret-trailers --in-place (write form)'],
+  // FEAT-108 round 5 — the fail-open wrapper/obfuscation forms the 2026-09-29
+  // cross-provider clean room landed real commits through. A MISS here is FAIL-OPEN.
+  ['exec git commit', 'exec wrapper'],
+  ['nice git commit', 'nice wrapper'],
+  ['nice -n 10 git commit', 'nice with its own option'],
+  ['sudo git push', 'sudo wrapper'],
+  ['timeout 10 git commit', 'timeout wrapper'],
+  ['find . -exec git commit \\;', 'find -exec runner'],
+  ['exec sh -c "git commit"', 'exec wrapping a shell'],
+  ['git${IFS}commit', 'IFS word-split obfuscated head'],
+  ['env -S git commit', 'env -S SPACED (unquoted) form'],
+  ["bash -cl 'git commit'", 'bash -cl reversed flag cluster'],
+  ['printf "%s\\n" "<<X"\ngit commit --allow-empty', 'quoted << is NOT a heredoc — trailing commit caught'],
+  // FEAT-108 round 6 — data flowing INTO a runner, and config-driven execution.
+  ["printf 'git commit --allow-empty -m x\\n' | sh", 'data sink piped INTO a shell (finding P)'],
+  ["echo 'git push' | bash", 'echo piped into bash'],
+  ['git status | git apply', 'read piped into a git write'],
+  ["sh <<'EOF'\ngit commit --allow-empty -m x\nEOF", "heredoc BODY is the shell's script (finding H)"],
+  ['bash <<EOF\ngit push\nEOF', 'unquoted heredoc into bash'],
+  ["git -c diff.external='git commit; true #' diff --ext-diff", 'git -c diff.external runs a command (finding X)'],
+  ["git -c core.pager='git commit' log", 'git -c core.pager executes'],
+  ['git -c sequence.editor=x rebase -i HEAD~1', 'git -c sequence.editor executes'],
+  ['git --config-env=core.pager=EV log', 'git --config-env core.pager executes'],
 ];
 for (const [cmd, label] of EVASIONS_CAUGHT) {
   const d = decideGitWrite(cmd);
   ok(`evasion caught (${label}): ${cmd.slice(0, 60)}`, d.allow === false, `offender=${d.offender}`);
 }
+// FEAT-108 round 4, finding 3 — interpret-trailers is dual-mode, not a pure read:
+// the read form (stdin→stdout) stays allowed; only a write flag denies.
+ok('interpret-trailers READ form still allowed', decideGitWrite('git interpret-trailers <commit.txt').allow === true);
+ok('interpret-trailers --in-place is a WRITE (denied)', decideGitWrite('git interpret-trailers --in-place f').allow === false);
+// Non-vacuity / no false positive: a heredoc BODY that merely mentions a git write
+// is still data (the pre-existing property), even though a command AFTER the body
+// is now caught. Both must hold together.
+ok('round-4 control: git write inside a heredoc BODY is still not a false positive',
+  decideGitWrite('cat <<EOF\ngit commit -m x\nEOF').allow === true);
+ok('round-4: the SAME write on a line AFTER the heredoc terminator IS caught',
+  decideGitWrite('cat <<EOF\nbody\nEOF\ngit commit -m x').allow === false);
+
+/* ═══ 4b. FEAT-108 round 5 — FAIL-CLOSED head handling ══════════════════════
+ * The invariant flipped: a command is proven git-clean only for heads that do not
+ * execute their arguments (data sinks); every other non-git head is a possible
+ * runner and a reachable git write is refused. These two halves must BOTH hold:
+ * unknown wrappers deny (no fail-open), and data commands with git as DATA allow
+ * (no runaway over-block). */
+// Data sinks: git appears as an ARGUMENT (data), not executed → still allowed.
+for (const c of ['echo git commit', 'grep commit gitlog.txt', 'cat git', 'wc -l git',
+  'printf "git push\\n"', 'man git commit', 'which git', 'ls git', 'rg "git push" .']) {
+  ok(`data-head allows git-as-data: ${c}`, decideGitWrite(c).allow === true, JSON.stringify(decideGitWrite(c)));
+}
+// A NOVEL wrapper nobody enumerated must fail CLOSED (deny), not open.
+for (const c of ['stdbuf -oL git commit', 'setsid git push', 'ionice git commit',
+  'unbuffer git commit', 'chrt 1 git push', 'doas git commit']) {
+  ok(`unknown wrapper fails CLOSED: ${c}`, decideGitWrite(c).allow === false, JSON.stringify(decideGitWrite(c)));
+}
+// An expansion-obscured git head (real head hidden by $-expansion) denies.
+ok('obfuscated git head via ${IFS} denies', decideGitWrite('git${IFS}push').allow === false);
+ok('a bare git-only subcommand head (real git expanded away) denies',
+  decideGitWrite('$(which git) commit').allow === false);
+
+/* ═══ 4c. FEAT-108 round 6 — data-flow into runners + config execution ══════ */
+// (a) A pipe/redirect into a DATA SINK stays allowed (no runner edge, no over-block).
+for (const c of ['printf hi | sh', 'echo done | grep x', 'git log | grep commit',
+  'cat a.txt | wc -l', 'git diff | less', 'git log --grep "commit | push"']) {
+  ok(`data-sink pipe / no runner edge allows: ${c}`, decideGitWrite(c).allow === true, JSON.stringify(decideGitWrite(c)));
+}
+// A pipe/heredoc into a RUNNER with a git write in the data denies (findings P/H).
+ok('printf git-write | sh denies (finding P)', decideGitWrite("printf 'git commit\\n' | sh").allow === false);
+ok("sh <<EOF git-write EOF denies (finding H)", decideGitWrite("sh <<'EOF'\ngit push\nEOF").allow === false);
+// A heredoc BODY consumed by a DATA SINK is still data (no false positive).
+ok('cat-heredoc body mentioning git is still data', decideGitWrite("cat > f <<'EOF'\ngit commit\nEOF").allow === true);
+// (c) A read head with a config option that RUNS a command denies; the tiny inert
+// allowlist (color.*, core.quotepath, advice.*) still allows.
+ok('git -c diff.external= <read> denies (finding X)', decideGitWrite('git -c diff.external=x diff').allow === false);
+ok('git -c core.pager= <read> denies', decideGitWrite('git -c core.pager=cat log').allow === false);
+ok('git -c core.sshCommand= denies', decideGitWrite('git -c core.sshCommand=x fetch').allow === false);
+ok('git -c color.ui=always <read> still allowed', decideGitWrite('git -c color.ui=always log').allow === true);
+ok('git -c core.quotepath=false status still allowed', decideGitWrite('git -c core.quotepath=false status').allow === true);
+// BUG-228 — `diff.submodule` is an inert DISPLAY setting (short|log|diff): it executes
+// nothing and writes nothing, so the clean-room verifier's hardened diff
+// (`git -c core.quotePath=false -c diff.submodule=short diff …`) must pass. Dangerous
+// command-executing keys must STILL deny (synthesized must-FAIL: these reddened under the
+// pre-fix allowlist, which omitted diff.submodule and refused the verifier's own diff).
+ok('git -c diff.submodule=short diff allowed (BUG-228)', decideGitWrite('git -c diff.submodule=short diff HEAD').allow === true);
+ok('git -c core.quotePath=false -c diff.submodule=short diff allowed (real verifier head)',
+  decideGitWrite('git -C /r -c core.quotePath=false -c diff.submodule=short diff --no-ext-diff --no-textconv --name-only a b').allow === true);
+ok('git -c diff.submodule=log diff allowed', decideGitWrite('git -c diff.submodule=log diff').allow === true);
+ok('git -c diff.submodule=diff diff allowed', decideGitWrite('git -c diff.submodule=diff diff').allow === true);
+ok('git -c diff.submodule=; (unknown value) still denies (fail-closed)', decideGitWrite('git -c diff.submodule=evil diff').allow === false);
+ok('git -c diff.submodule (no value) still denies', decideGitWrite('git -c diff.submodule diff').allow === false);
+// The dangerous keys the allowlist must NEVER admit, re-asserted alongside the new allow.
+ok('git -c core.pager still denies after BUG-228', decideGitWrite('git -c core.pager=x log').allow === false);
+ok('git -c diff.external still denies after BUG-228', decideGitWrite('git -c diff.external=x diff').allow === false);
+ok('git -c core.sshCommand still denies after BUG-228', decideGitWrite('git -c core.sshCommand=x fetch').allow === false);
+ok('git -c alias.x still denies after BUG-228', decideGitWrite('git -c alias.co=commit co').allow === false);
+// The env twin of `-c`: GIT_CONFIG_PARAMETERS/COUNT/KEY_*/VALUE_* inject config inline.
+ok('GIT_CONFIG_PARAMETERS= <read> denies', decideGitWrite(`GIT_CONFIG_PARAMETERS="'diff.external=x'" git diff`).allow === false);
+ok('GIT_CONFIG_COUNT/KEY/VALUE <read> denies', decideGitWrite('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=x git log').allow === false);
+ok('GIT_CONFIG_GLOBAL=/dev/null isolation still allowed', decideGitWrite('GIT_CONFIG_GLOBAL=/dev/null git status').allow === true);
 
 /* Known GAPS — honestly asserted to GET THROUGH, so a regression that silently
  * "fixes" one (likely by over-blocking) is visible, and the list stays truthful.

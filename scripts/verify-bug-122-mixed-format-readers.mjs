@@ -657,17 +657,22 @@ async function uiLeg() {
       const pid2 = reg2.project?.id;
       const before = fs.readFileSync(path.join(sBugs, dec.file), 'utf8');
       const chosen = recD.options[1].label;
+      // FEAT-166 r3: the rail names the decision it showed (BoardItem.decisionKey).
+      const shownKey = (await (await fetch(`${BASE}/api/projects/${encodeURIComponent(pid2)}/board`)).json()).needsYou?.find((i) => i.id === dec.rec.id)?.decisionKey;
       const ansRes = await fetch(`${BASE}/api/projects/${encodeURIComponent(pid2)}/board/answer`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ id: dec.rec.id, answer: chosen }),
+        body: JSON.stringify({ id: dec.rec.id, answer: chosen, decisionKey: shownKey }),
       });
       const ansBody = await ansRes.json();
       const after = fs.readFileSync(path.join(sBugs, dec.file), 'utf8');
       check('ANSWERABLE: the promoted ticket accepts an answer through the same route the card posts to',
         ansRes.status === 200 && ansBody.ok === true, `${ansRes.status} ${JSON.stringify(ansBody).slice(0, 120)}`);
       check('ANSWERABLE: the answer is APPENDED — every prior byte survives, the chosen label is recorded',
-        after.startsWith(before) && after.length > before.length && after.slice(before.length).includes(chosen),
-        JSON.stringify(after.slice(before.length).replace(/\n/g, '⏎').slice(0, 120)));
+        // FEAT-166 r3: a record ticket's typed answer lands in the record block (rewritten,
+        // like every record write); the BODY — the Activity log — is what stays append-only.
+        extractTicketBlock(after).body.startsWith(extractTicketBlock(before).body) && after.length > before.length
+          && extractTicketBlock(after).body.slice(extractTicketBlock(before).body.length).includes(chosen),
+        JSON.stringify(extractTicketBlock(after).body.slice(extractTicketBlock(before).body.length).replace(/\n/g, '⏎').slice(0, 120)));
       const board2 = await (await fetch(`${BASE}/api/projects/${encodeURIComponent(pid2)}/board`)).json();
       const answered = (board2.answeredAwaiting ?? []).find((i) => i.id === dec.rec.id);
       check('ANSWERABLE: it then moves to the answered-awaiting lane, carrying the answer',

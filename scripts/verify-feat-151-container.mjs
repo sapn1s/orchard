@@ -35,7 +35,7 @@ const ok = (name, cond, extra = '') => {
   else { fail++; console.log(`  FAIL ${name}${extra ? ` — ${extra}` : ''}`); }
 };
 
-console.log('FEAT-151 — container pin moves image identity, running container survives\n');
+console.log('FEAT-151 (superseded by FEAT-157) — the container CLI is not a pin; the running container survives\n');
 
 const dockerOk = spawnSync('docker', ['info'], { stdio: 'ignore' }).status === 0;
 if (!dockerOk) { console.log('  docker unavailable — SKIP'); process.exit(0); }
@@ -47,7 +47,8 @@ const baseImg = (() => {
   const line = (r.stdout || '').split('\n').find((l) => l.startsWith('claude-station-base:'));
   return line || 'busybox:latest';
 })();
-const TEST_CTR = `feat151-carryfwd-test-${process.pid}`;
+let TEST_ID = '';
+const TEST_CTR = `feat151-carryfwd-test-${process.pid}-${Math.random().toString(36).slice(2, 8)}`; // FEAT-158: pid alone repeats across pid namespaces
 
 const LIVE_PROVISION = path.join(ROOT, 'src', 'server', 'container', 'provision.json');
 const liveBytesBefore = fs.readFileSync(LIVE_PROVISION);
@@ -58,6 +59,7 @@ fs.mkdirSync(copy);
 try {
   // Stand up a throwaway "running container session".
   const run = spawnSync('docker', ['run', '-d', '--name', TEST_CTR, baseImg, 'sleep', '600'], { encoding: 'utf8' });
+  TEST_ID = (run.stdout || '').trim();
   const started = run.status === 0;
   ok('throwaway test container started (stand-in for a live session)', started, (run.stderr || '').slice(-200));
 
@@ -68,23 +70,24 @@ try {
   cp(['-a', path.join(ROOT, 'src'), path.join(copy, 'src')]);
   cp(['-a', path.join(ROOT, 'scripts'), path.join(copy, 'scripts')]);
 
+  // FEAT-157 SUPERSEDES the pin write this suite used to exercise: the container CLI is no longer a
+  // provision.json pin but the host SDK's own CLI, added as a one-file layer on top of the pinned base.
+  // A CLI change moving the wanted image while a live container survives is proven, against a real
+  // daemon, by verify-feat-157-lifecycle.mjs L4/L4b. What remains here: the pin and its writer are
+  // GONE (a stale pin is a second place able to disagree with the SDK), and the base recipe no longer
+  // installs a CLI (so a CLI change can never move a pinned base).
   const r = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const fs = await import('node:fs');
     const prov = await import('./src/server/provisioning.ts');
-    const before = prov.provisionHash();
-    const beforePin = prov.claudeCodePin().version;
-    // bump to a DIFFERENT valid CLI version (pure file write, no docker)
-    const target = beforePin === '2.1.281' ? '2.1.280' : '2.1.281';
-    const res = prov.writeClaudeCodePin(target);
-    const after = prov.provisionHash();
-    const afterPin = prov.claudeCodePin().version;
-    console.log(JSON.stringify({ before, after, beforePin, afterPin, changed: res.changed, moved: before !== after }));
+    const manifest = JSON.parse(fs.readFileSync('src/server/container/provision.json', 'utf8'));
+    const df = fs.readFileSync('src/server/container/Dockerfile', 'utf8');
+    console.log(JSON.stringify({ pinFns: typeof prov.claudeCodePin + '/' + typeof prov.writeClaudeCodePin, inManifest: 'claude-code' in manifest.tools, dfInstalls: /npm install -g[^\\n]*claude|claude-code@/.test(df) }));
   `], { cwd: copy, encoding: 'utf8' });
   if (r.status !== 0) console.log('  child stderr:', (r.stderr || '').slice(-600));
   let c; try { c = JSON.parse(r.stdout.trim().split('\n').pop()); } catch { c = { _raw: r.stdout }; }
-
-  ok('pin write CHANGED provision.json (changed=true)', c.changed === true, JSON.stringify(c));
-  ok('provisionHash MOVED → new image tag → rebuild wanted on NEXT session', c.moved === true, JSON.stringify(c));
-  ok('the pin version was actually bumped', c.afterPin !== c.beforePin, JSON.stringify(c));
+  ok('FEAT-157: no container-CLI pin reader or writer exists', c.pinFns === 'undefined/undefined', JSON.stringify(c));
+  ok('FEAT-157: provision.json carries no claude-code pin', c.inManifest === false, JSON.stringify(c));
+  ok('FEAT-157: the base recipe installs no Claude CLI (a CLI change cannot move a pinned base)', c.dfInstalls === false, JSON.stringify(c));
 
   // The LIVE provision.json must be byte-identical — the write went to the copy.
   const liveBytesAfter = fs.readFileSync(LIVE_PROVISION);
@@ -95,7 +98,7 @@ try {
   const ps = spawnSync('docker', ['ps', '--filter', `name=${TEST_CTR}`, '--format', '{{.Names}} {{.Status}}'], { encoding: 'utf8' });
   ok('running container SURVIVES the pin write untouched (still Up)', /Up/.test(ps.stdout || ''), (ps.stdout || '').trim());
 } finally {
-  spawnSync('docker', ['rm', '-f', TEST_CTR], { stdio: 'ignore' });
+  if (TEST_ID) spawnSync('docker', ['rm', '-f', TEST_ID], { stdio: 'ignore' }); // FEAT-158: by the id this run created
   fs.rmSync(scratch, { recursive: true, force: true });
 }
 

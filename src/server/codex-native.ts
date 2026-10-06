@@ -41,6 +41,7 @@ import { randomUUID } from 'node:crypto';
 import type { SessionMeta, SessionOS } from '../lib/session-history.ts';
 import { encodeCwd, detectOs } from '../lib/session-history.ts';
 import { orchardTranscriptFile } from './orchard-transcripts.ts';
+import { asOrchardWrite } from './own-writes.ts';
 
 /** Bytes read from the head of each rollout when deriving list metadata. */
 const HEAD_BYTES = 256 * 1024;
@@ -529,7 +530,8 @@ export function importNativeCodexSession(
   const tmp = `${target}.import-${process.pid}-${Date.now()}.tmp`;
   fs.writeFileSync(tmp, lines.length ? lines.join('\n') + '\n' : '');
   try {
-    fs.renameSync(tmp, target);
+    // FEAT-154 r9: an import is ORCHARD's write into an engine dir, not a turn — declared as such.
+    asOrchardWrite(target, () => fs.renameSync(tmp, target));
   } catch (err) {
     // Lost a race to a concurrent import/resume — the target now exists; drop
     // our temp and report the winner.

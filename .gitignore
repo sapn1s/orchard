@@ -78,3 +78,10 @@ docs/bugs/.scratch-*.md
 /adversarial_twosided_budget_fill.py
 /adversarial_twosided_price_drift.py
 /verify_brake_adv.py
+
+# FEAT-162 eval set (docs/evals/): cases, "real/" replies, results and the
+# builders that embed them are DERIVED from real private session transcripts
+# (a private project's conversation content and figures) — never publish. Same
+# class as scripts/experiments/corpus/ above. The scorer/replay harness in
+# scripts/eval/ carries no transcript data and stays tracked.
+docs/evals/

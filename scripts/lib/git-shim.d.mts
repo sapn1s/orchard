@@ -41,7 +41,7 @@ export declare const HOST_GRANT_TIMEOUT_MS: number;
 export declare function askHostGrant(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string },
 ): Promise<GitShimDecision>;
 
 /**
@@ -51,14 +51,14 @@ export declare function askHostGrant(
 export declare function resolveGitShim(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; ignoreEnvHatch?: boolean },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; ignoreEnvHatch?: boolean },
 ): Promise<GitShimDecision>;
 
 /** The loud refusal a shimmed subprocess prints before exiting non-zero. */
 export declare function gitShimRefusal(offender: string): string;
 
 /** Called BY the generated shim executable: decide, then exec real git or deny. */
-export declare function runGitShim(argv: string[], opts?: { realGit?: string; hostUrl?: string; grantKey?: string; shimAuth?: string }): Promise<void>;
+export declare function runGitShim(argv: string[], opts?: { realGit?: string; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string }): Promise<void>;
 
 /**
  * Install the shim onto a COPY of `env` and return the new env. Pure: it does
@@ -69,5 +69,15 @@ export declare function runGitShim(argv: string[], opts?: { realGit?: string; ho
  */
 export declare function installGitShim(
   env?: Record<string, string | undefined>,
-  opts?: { baseDir?: string; grantKey?: string; hostUrl?: string; sessionLabel?: string; shimAuth?: string },
-): { env: Record<string, string>; shimDir: string; realGit: string };
+  opts?: { baseDir?: string; grantKey?: string; hostUrl?: string; sessionLabel?: string; shimAuth?: string; windowKey?: string },
+): { env: Record<string, string>; shimDir: string; realGit: string; ensure: () => GitShimEnsure };
+
+/**
+ * BUG-230 — the owner's fail-closed shim check (only via installGitShim's handle):
+ * intact -> { ok:true, restored:false }; missing/altered and rewritten -> restored:true;
+ * cannot restore safely -> { ok:false, reason } and the caller must refuse.
+ */
+export type GitShimEnsure = { ok: true; restored: boolean } | { ok: false; reason: string };
+
+/** The refusal a runtime gives when its own shim is gone and cannot be restored. */
+export declare function gitShimMissingRefusal(reason: string): string;

@@ -80,7 +80,7 @@ import { renderWorkedExamples } from './lib/ticket-writing.mjs';
 // the ticket view is its other consumer, and one definition is the point: grep
 // `outstandingBroken` and you have found every rule about verification there is.
 import { outstandingBroken } from '../public/lib/ticket-record.js';
-import { VERIFIED_BY_RE, joinVerdictContinuation } from './lib/verdict-contract.mjs';
+import { legacyProseVerifications, ledgerEntriesFor, loadFrozen } from './lib/verification-source.mjs';
 import { provenanceCheck, provenanceOf } from './provenance-check.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
@@ -119,34 +119,52 @@ export function splitAtActivityLog(text) {
  * holds by construction rather than by vigilance.
  */
 export function extractVerificationRecords(text) {
-  const out = [];
-  let heading = null;
-  const lines = String(text || '').split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const h = /^###\s+(\d{4}-\d{2}-\d{2})/.exec(line);
-    if (h) { heading = h[1]; continue; }
-    const m = new RegExp(VERIFIED_BY_RE.source, 'i').exec(line);
-    if (!m) continue;
-    // The record is its list item's first paragraph, not its first line — a
-    // wrapped `— VERDICT: X` is on the next line and was being read as no
-    // verdict at all. See `joinVerdictContinuation`.
-    const record = joinVerdictContinuation(lines, i);
-    const verdict = /VERDICT:\s*([A-Za-z]+)/i.exec(record);
-    const harness = /\(([^)]*?)`([^`]+)`/.exec(record);
-    const v = verdict ? verdict[1].toLowerCase() : null;
-    out.push({
-      provider: m[1],
-      model: m[2] ?? null,
-      run_id: m[3],
-      // VERDICTS is the closed set; anything else is recorded as `invalid`
-      // rather than invented or dropped.
-      verdict: VERDICTS.includes(v) ? v : 'invalid',
-      verdict_on: heading,
-      harness: harness ? harness[2] : null,
-    });
-  }
-  return out;
+  // BUG-225 r3: the ONE legacy prose reader (verification-source.mjs), which is
+  // also what built the frozen snapshot — so a transcription and the snapshot
+  // cannot disagree about a line. Shape unchanged for this module's callers.
+  return legacyProseVerifications(text).map((r) => ({
+    provider: r.provider, model: r.model, run_id: r.run_id,
+    verdict: r.verdict, verdict_on: r.verdict_on, harness: r.harness,
+  }));
+}
+
+/**
+ * BUG-225 r3 — where a migrated record's `verification[]` comes from, decided by
+ * the ONE source rather than by re-reading prose:
+ *   - the ticket already has typed ledger entries → exactly those (they carry the
+ *     frozen history forward);
+ *   - otherwise the prose transcription, but ONLY if every record in it is in the
+ *     board's pinned frozen snapshot. A `Verified-by:` line typed after the freeze
+ *     is not proof, and migration must not turn it into proof — such a ticket is
+ *     quarantined (`g.unfrozenProse`, read by `contestedEvidence`).
+ * Called by the driver with the real board dir. Suites that call `extractGivens`
+ * on archived originals without a board are unaffected.
+ */
+export function applyVerificationSource(g, boardDir, text) {
+  const ledger = ledgerEntriesFor(boardDir, g.id).map(({ id, ...e }) => e);
+  if (ledger.length) { g.verification = ledger; g.unfrozenProse = []; g.verificationSource = 'ledger'; return g; }
+  // No typed entries: the record gets EXACTLY the pinned frozen records, in their
+  // frozen order — never a fresh transcription of the prose. The live prose must
+  // read as the same SEQUENCE (not merely the same set: a frozen HOLDS line
+  // copied below a later BROKEN would otherwise reorder the fold — BUG-225 r3
+  // verify, run cb78c6d6); any difference quarantines the ticket.
+  const frozen = loadFrozen(boardDir);
+  const usable = frozen.present && frozen.pinned && !frozen.error;
+  const frozenRecs = usable ? (frozen.tickets[g.id]?.records ?? []) : [];
+  const key = (r) => `${r.line_sha256}|${r.run_id}|${r.verdict}`;
+  const live = legacyProseVerifications(text);
+  const same = live.length === frozenRecs.length && live.every((r, i) => key(r) === key(frozenRecs[i]));
+  g.unfrozenProse = same ? [] : [
+    `${usable ? '' : 'no pinned frozen snapshot on this board; '}the prose reads ${live.length} record(s) `
+    + `[${live.map((r) => `line ${r.lineNo} ${r.verdict}`).slice(0, 6).join(', ')}] but the pinned snapshot holds `
+    + `${frozenRecs.length} [${frozenRecs.map((r) => r.verdict).slice(0, 6).join(', ')}]`,
+  ];
+  g.verification = frozenRecs.map((r) => ({
+    provider: r.provider, model: r.model ?? null, run_id: r.run_id, verdict: r.verdict,
+    verdict_on: r.verdict_on ?? null, harness: r.harness ?? null,
+  }));
+  g.verificationSource = 'legacy-frozen';
+  return g;
 }
 
 /**
@@ -218,11 +236,19 @@ export function contestedEvidence(g, text) {
       + `BROKEN unresolved (a "broken" with no later "holds"). The ticket disagrees with its own evidence; `
       + `a human resolves which is true before this ticket migrates.`);
   }
+  if (g.unfrozenProse?.length) {
+    reasons.push(`UNFROZEN PROSE VERIFICATION (BUG-225): the ticket's \`Verified-by:\` prose does not match the board's `
+      + `pinned frozen snapshot record-for-record (${g.unfrozenProse.join('; ')}). Prose changed after the freeze is not `
+      + `proof and migration will not transcribe it into \`verification[]\`; record it with \`board-tool verified\`.`);
+  }
+  // Two readings of the PROSE (fence-blind vs fence-aware) — compared with each
+  // other, not with g.verification, which may come from the typed ledger.
+  const blind = extractVerificationRecords(text);
   const strict = extractVerificationRecords(stripFencedBlocks(text));
-  const same = strict.length === g.verification.length
-    && g.verification.every((r, i) => strict[i] && strict[i].run_id === r.run_id && strict[i].verdict === r.verdict);
+  const same = strict.length === blind.length
+    && blind.every((r, i) => strict[i] && strict[i].run_id === r.run_id && strict[i].verdict === r.verdict);
   if (!same) {
-    reasons.push(`CONTESTED ATTRIBUTION: the fence-blind reading finds ${g.verification.length} verification record(s) `
+    reasons.push(`CONTESTED ATTRIBUTION: the fence-blind reading finds ${blind.length} verification record(s) `
       + `and the fence-aware reading finds ${strict.length}, so at least one \`Verified-by:\` line is asserted or `
       + `quoted depending on how the document's fences are read. Neither reading may be trusted to transcribe `
       + `\`verification[]\` unattended; a human says which lines this ticket ASSERTS.`);
@@ -1129,7 +1155,7 @@ function clearQuarantine(failDir, id) {
 function migrateOne(file, opts) {
   const srcPath = path.join(opts.dir, file);
   const originalText = fs.readFileSync(srcPath, 'utf8');
-  const g = extractGivens(file, originalText);
+  const g = applyVerificationSource(extractGivens(file, originalText), opts.dir, originalText);
   const outPath = path.join(opts.out, file);
   const failDir = path.join(opts.out, 'failed');
   const record = { id: g.id, file, attempts: 0, usd: 0, tokens: { input: 0, output: 0 }, seconds: 0, status: 'pending', violations: [] };
@@ -1263,7 +1289,7 @@ export function validateSet(opts) {
     if (!fs.existsSync(originalPath)) { rows.push({ file, ok: false, violations: [`no original at ${originalPath}`] }); continue; }
     const originalText = fs.readFileSync(originalPath, 'utf8');
     const migratedText = fs.readFileSync(path.join(opts.out, file), 'utf8');
-    const g = extractGivens(file, originalText);
+    const g = applyVerificationSource(extractGivens(file, originalText), opts.dir, originalText);
     const parsedBlock = extractTicketBlock(migratedText);
     if (parsedBlock.block === null) { rows.push({ file, ok: false, violations: [`${file}: no orchard-ticket block`] }); continue; }
     let rec = null;

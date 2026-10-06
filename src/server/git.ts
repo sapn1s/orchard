@@ -11,7 +11,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { capGateOutput, hostGateBanner, hostLeakGatePath, ownProjectArgs, passReport } from './leak-gate-host.ts';
 
 export class GitError extends Error {
   readonly status: number;
@@ -382,29 +382,34 @@ export async function init(hostPath: string): Promise<GitStatus> {
  * message is written to a temp file so it is scanned exactly as it will be
  * recorded, without ever becoming shell.
  */
-const ORCHARD_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+// FEAT-156 — the gate path, the repo→project resolution (registry) and the
+// output shaping live in leak-gate-host.ts, shared with the agent git-write guard.
 function runCommitLeakGate(hostPath: string, message: string): { ok: boolean; detail: string } {
-  const gate = path.join(ORCHARD_ROOT, 'scripts', 'leak-gate.mjs');
+  const gate = hostLeakGatePath();
   if (!fs.existsSync(gate)) return { ok: false, detail: `leak gate not found at ${gate} — refusing to commit unscanned (fail-closed)` };
   let msgFile = '';
   try {
     msgFile = fs.mkdtempSync(path.join(os.tmpdir(), 'orchard-commit-')) + '/COMMIT_MSG';
     fs.writeFileSync(msgFile, message, 'utf8');
-    execFileSync(process.execPath, [gate, '--summary', '--staged', '--identity', `--commit-msg=${msgFile}`], {
+    const stdout = execFileSync(process.execPath, [gate, '--summary', '--staged', '--identity', `--commit-msg=${msgFile}`, ...ownProjectArgs(hostPath)], {
       cwd: hostPath, stdio: 'pipe', timeout: 60_000,
     });
-    return { ok: true, detail: '' };
+    // FEAT-156 — a PASS still carries the ran-line and any waivers; surface them
+    // (host log + the commit response) so a waiver is never silent.
+    const report = passReport(stdout.toString());
+    if (/\bwaived\b/.test(report)) console.warn(`[orchard] commit leak gate PASSED with waivers (${hostPath}):\n${report}`);
+    return { ok: true, detail: report };
   } catch (err) {
     const e = err as { stdout?: Buffer; stderr?: Buffer; message?: string };
     const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`.trim() || e.message || 'leak gate failed';
-    return { ok: false, detail: out.slice(0, 1500) };
+    return { ok: false, detail: `${hostGateBanner()}\n${capGateOutput(out)}` };
   } finally {
     try { if (msgFile) fs.rmSync(path.dirname(msgFile), { recursive: true, force: true }); } catch { /* best-effort cleanup */ }
   }
 }
 
 /** Commit the index exactly as staged; never stages working-tree files. */
-export async function commit(hostPath: string, input: string | { title?: unknown; description?: unknown; message?: unknown }): Promise<{ committed: string; status: GitStatus }> {
+export async function commit(hostPath: string, input: string | { title?: unknown; description?: unknown; message?: unknown }): Promise<{ committed: string; status: GitStatus; leakGate: string }> {
   const title = (typeof input === 'string' ? input : String(input.title ?? input.message ?? '')).trim();
   const description = (typeof input === 'string' ? '' : String(input.description ?? '')).trim();
   if (!title) throw new GitError(400, 'commit: a message is required');
@@ -419,7 +424,7 @@ export async function commit(hostPath: string, input: string | { title?: unknown
   const c = await git(hostPath, ['commit', '-m', title, ...(description ? ['-m', description] : []), '--']);
   if (c.code !== 0) throw new GitError(500, `git commit failed: ${c.err || c.out}`);
   const sha = (await git(hostPath, ['rev-parse', '--short', 'HEAD'])).out.trim();
-  return { committed: sha, status: await statusOf(hostPath) };
+  return { committed: sha, status: await statusOf(hostPath), leakGate: gate.detail };
 }
 
 /** git push; first push of a branch gets -u origin <branch>. */

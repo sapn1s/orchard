@@ -99,7 +99,7 @@ async function partA() {
     const hostA = '/orchard-scratch/proj-a';
     const projA = mkProject(idA, hostA, 'container');
     const hostEnc = cm.encodeCwdForStore(hostA);
-    const containerEnc = cm.encodeCwdForStore(cm.containerWorkdir(idA));
+    const containerEnc = cm.containerStoreDirName({ id: idA });
     const sidA = 'aaaaaaaa-0000-4000-c000-000000000001';
     const srcFileA = writeSession(path.join(STORE, hostEnc), sidA, 'pre-container work');
     const origBytesA = fs.readFileSync(srcFileA);

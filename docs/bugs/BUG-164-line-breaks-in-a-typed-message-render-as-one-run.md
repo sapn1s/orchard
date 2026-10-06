@@ -11,9 +11,9 @@
   "reported": "2026-09-02",
   "reported_by": "user",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-09-02",
+  "updated": "2026-09-29",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -113,3 +113,8 @@ One CSS rule on `.you p` (public/styles.css): `white-space: pre-wrap; overflow-w
 - **Stale-asset ruled out:** `src/server/index.ts` serves every static asset (styles.css included) with `cache-control: no-store`, so a user cannot be pinned to a pre-round-1 stylesheet — the fresh pre-wrap rule always reaches them.
 - **Regressions (all green):** `verify-bug-150-load-window-queue` 16/16, `verify-bug-150-adversarial` 25/25, `verify-bug-166-decision-composer` 10/10. `npm run gate` exits 0 (leak-gate + typecheck clean; my only new file is the verify script).
 - **Verdict:** REFUTED as a live defect — BUG-164 is ALREADY satisfied at HEAD by round 1's committed CSS; I could NOT reproduce any residual blob across the five cases in either theme, and stale-cache is impossible under no-store. No code change made (editing the already-correct `.you p` would be decoration). Deliverable is the committed browser-driven regression guard. If the user is STILL seeing a blob post-round-1, it is not this render path — the orchestrator holds the user's actual post-round-1 words and should reconcile: either the report predates `7dd9603` landing, or it concerns a different surface (not the `.you` transcript bubble). No git writes; files left unstaged.
+
+### 2026-09-29 — closing (verifying, round 1)
+- **Closed as DONE (obsolete: fixed at HEAD; round 2 REFUTED any residual live defect).**
+- **Recheck (current tree):** fix present at commit 7dd9603. `public/styles.css` `.you p` block (`:971-988`) carries `white-space: pre-wrap; overflow-wrap: anywhere;` with the explaining comment. Cites the 2026-09-23 round-2 lane: 21/21 PASS over the real reload render path in both themes (single newlines, blank-line gap, leading indentation, long-token wrap with zero horizontal overflow, HTML/markdown rendered as plain text), a non-vacuous must-FAIL (`.you p` synthesized back to `white-space: normal`), and no-store confirmed so no stale-stylesheet pinning. Verdict was "REFUTED as a live defect — already satisfied at HEAD".
+- **Symptom of a deeper design flaw?** no — a single missing display rule on one bubble; the render-vs-storage split is correct (per round-1 log).

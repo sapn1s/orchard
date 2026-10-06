@@ -26,6 +26,7 @@
  * running/idle/died/verified, a missing ticket, a quoted grammar example.
  */
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -167,9 +168,11 @@ T('re-declaring the same id is latest-wins (title/tickets update in place, no du
 });
 
 T('bindings survive a fresh read of the store (server-owned, persisted)', () => {
-  // A brand-new import context reading the same file would see the same rows;
-  // here re-reading through the same module already proves the on-disk round-trip.
-  const raw = JSON.parse(fs.readFileSync(path.join(scratch, 'requests.json'), 'utf8'));
+  // Per-session storage (the FEAT-126 r3 data-loss fix): each session's bindings
+  // live in dataDir()/requests/<enc(sid)>.json. Reading that file directly proves
+  // the on-disk round-trip.
+  const sessFile = path.join(scratch, 'requests', encodeURIComponent(SID) + '.json');
+  const raw = JSON.parse(fs.readFileSync(sessFile, 'utf8'));
   assert.equal(raw.filter((r) => r.stationSessionId === SID).length, 2);
 });
 
@@ -184,13 +187,14 @@ T('a different session sees only its own requests', () => {
 
 // A synthetic board shaped like a busy session: one verified, one in-flight
 // (a lane on it), one queued-open, and a request referencing a missing ticket.
-function boardWith({ inflight = [], queued = [], done = [], needsYou = [] } = {}) {
+function boardWith({ inflight = [], queued = [], done = [], needsYou = [], answeredAwaiting = [] } = {}) {
   return {
     hasBoard: true,
     inflight: inflight.map((id) => ({ id, title: id, owner: '🤖', status: 'IN-PROGRESS' })),
     queued: queued.map((id) => ({ id, title: id, owner: '—', status: 'OPEN' })),
     doneToday: done.map((id) => ({ id, title: id, owner: '', status: 'done' })),
     needsYou: needsYou.map((id) => ({ id, title: id, owner: '👤', status: 'OPEN' })),
+    answeredAwaiting: answeredAwaiting.map((id) => ({ id, title: id, owner: '👤', status: 'OPEN' })),
   };
 }
 const bindingsForJoin = [
@@ -309,12 +313,12 @@ T('a request with no tickets degrades to "no tickets yet", not an error', () => 
 /* ─────────────────────────── 5. PARTIAL / TRUNCATED read tolerance ────────── */
 
 T('a truncated store file at EVERY byte offset yields a clean list or empty — never a throw or wrong value', () => {
-  const full = fs.readFileSync(path.join(scratch, 'requests.json'), 'utf8');
+  const sessFile = path.join(scratch, 'requests', encodeURIComponent(SID) + '.json');
+  const full = fs.readFileSync(sessFile, 'utf8');
   const good = JSON.parse(full);
-  // simulate the file being read mid-write by another session's turn
-  const tmp = path.join(scratch, 'requests.json');
+  // simulate the session's own file being read mid-write
   for (let cut = 0; cut <= full.length; cut++) {
-    fs.writeFileSync(tmp, full.slice(0, cut));
+    fs.writeFileSync(sessFile, full.slice(0, cut));
     let list;
     assert.doesNotThrow(() => { list = requests.listForSession(SID); }, `offset ${cut} threw`);
     // Either the intact set (only the full file parses) or an empty ledger.
@@ -322,7 +326,272 @@ T('a truncated store file at EVERY byte offset yields a clean list or empty — 
     else assert.ok(list.length === 0 || list.length === 2, `offset ${cut} gave a partial/wrong set`);
   }
   // restore for cleanliness
-  fs.writeFileSync(tmp, JSON.stringify(good, null, 2));
+  fs.writeFileSync(sessFile, JSON.stringify(good, null, 2));
+});
+
+/* ─── 6. DATA-LOSS: cross-session isolation under concurrency & torn reads ────
+ *
+ * FEAT-126 round-1 independent verify (run 25cdb5ae) found the store's write
+ * path lost OTHER sessions' bindings: the old single shared requests.json was
+ * mutated read-all → write-all, so a concurrent write from a stale read, or a
+ * write that followed a torn/empty read, rewrote the whole file and wiped every
+ * other session. These two tests reproduce that on the pre-fix tree (anchored to
+ * the committed baseline — see the ticket's must-FAIL command) and pass on the
+ * per-session-file design. Layout-independent: public API only. */
+
+// (B) TORN-STORE, cross-session, deterministic: a brand-new session opening a
+// request while the store is in a torn/partial state must not erase committed
+// sessions. On the pre-fix shared-file design the new write reads [] from the
+// torn shared file and rewrites it as [newRecord], wiping everyone. Per-session
+// files keep each session's bindings in its own file, so a torn shared/legacy
+// file cannot touch them, and the write path refuses to clobber an unreadable file.
+T('DATA-LOSS (torn store): a new session\'s write over a torn store never erases committed sessions', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feat126-torn-'));
+  const prev = process.env.CLAUDE_STATION_DATA;
+  process.env.CLAUDE_STATION_DATA = dir;
+  try {
+    requests.observeAssistantText('sess-G', 'proj', [
+      '```orchard-request', '{"id":"REQ-1","title":"G one","tickets":["T1"]}', '```',
+      '```orchard-request', '{"id":"REQ-2","title":"G two","tickets":["T2"]}', '```',
+      '```orchard-request', '{"id":"REQ-3","title":"G three","tickets":["T3"]}', '```',
+    ].join('\n'));
+    requests.observeAssistantText('sess-H', 'proj',
+      '```orchard-request\n{"id":"REQ-4","title":"H four","tickets":["T4"]}\n```');
+    assert.equal(requests.listForSession('sess-G').length, 3);
+    assert.equal(requests.listForSession('sess-H').length, 1);
+    // Torn the legacy shared file (where the pre-fix design keeps EVERY session's
+    // bindings and what a new session's write reads). Post-fix this is inert.
+    const shared = path.join(dir, 'requests.json');
+    if (fs.existsSync(shared)) {
+      const full = fs.readFileSync(shared, 'utf8');
+      fs.writeFileSync(shared, full.slice(0, Math.max(1, Math.floor(full.length / 2))));
+    } else {
+      fs.writeFileSync(shared, '[{"id":"REQ-1","stationSes'); // inert torn stray under per-session layout
+    }
+    // A brand-new session K opens a request while the store is torn.
+    requests.observeAssistantText('sess-K', 'proj',
+      '```orchard-request\n{"id":"REQ-9","title":"K nine","tickets":["T9"]}\n```');
+    assert.equal(requests.listForSession('sess-G').length, 3, 'sess-G bindings were wiped by an unrelated write over a torn store');
+    assert.equal(requests.listForSession('sess-H').length, 1, 'sess-H bindings were wiped by an unrelated write over a torn store');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_STATION_DATA; else process.env.CLAUDE_STATION_DATA = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// (A) CONCURRENT, cross-session, real multi-process: N processes each the server
+// for its OWN session write to the SAME data dir at once. Deterministically green
+// on the per-session design (zero shared write target); reproduces lost updates
+// on the pre-fix shared-file design (proven in the ticket's must-FAIL command).
+async function concurrentWritersTest() {
+  const name = 'DATA-LOSS (concurrent): parallel cross-session writers never drop another session\'s bindings';
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feat126-conc-'));
+  const NPROC = 6, PER = 8;
+  try {
+    const reqPath = path.join(ROOT, 'src', 'server', 'requests.ts');
+    const childSrc =
+      `process.env.CLAUDE_STATION_DATA = ${JSON.stringify(dir)};\n` +
+      `const r = await import(${JSON.stringify(reqPath)});\n` +
+      `const sid = process.argv[2];\n` +
+      `for (let i = 1; i <= ${PER}; i++) {\n` +
+      `  r.observeAssistantText(sid, 'proj', '\\n\\n\`\`\`orchard-request\\n' + JSON.stringify({ id: 'REQ-' + i, title: sid + ' ' + i, tickets: ['T-' + i] }) + '\\n\`\`\`\\n');\n` +
+      `}\n`;
+    const childFile = path.join(dir, 'child.mjs');
+    fs.writeFileSync(childFile, childSrc);
+    const sids = Array.from({ length: NPROC }, (_, i) => `csess-${String.fromCharCode(65 + i)}`);
+    await Promise.all(sids.map((sid) => new Promise((res, rej) => {
+      const p = spawn(process.execPath, ['--experimental-strip-types', childFile, sid],
+        { env: { ...process.env, CLAUDE_STATION_DATA: dir }, stdio: 'ignore' });
+      p.on('exit', (code) => (code === 0 ? res() : rej(new Error(`child ${sid} exit ${code}`))));
+      p.on('error', rej);
+    })));
+    // Re-read each session from the store in a FRESH process (avoids any cache).
+    const readerSrc =
+      `process.env.CLAUDE_STATION_DATA = ${JSON.stringify(dir)};\n` +
+      `const r = await import(${JSON.stringify(reqPath)});\n` +
+      `const sids = ${JSON.stringify(sids)};\n` +
+      `process.stdout.write(JSON.stringify(sids.map((s) => r.listForSession(s).length)));\n`;
+    const readerFile = path.join(dir, 'reader.mjs');
+    fs.writeFileSync(readerFile, readerSrc);
+    const counts = await new Promise((res, rej) => {
+      let out = '';
+      const p = spawn(process.execPath, ['--experimental-strip-types', readerFile],
+        { env: { ...process.env, CLAUDE_STATION_DATA: dir } });
+      p.stdout.on('data', (d) => { out += d; });
+      p.on('exit', (code) => (code === 0 ? res(JSON.parse(out)) : rej(new Error(`reader exit ${code}`))));
+      p.on('error', rej);
+    });
+    assert.ok(counts.every((n) => n === PER),
+      `some session lost bindings under concurrency: counts=${JSON.stringify(counts)} (expected all ${PER})`);
+    pass++; console.log(`  ok   ${name}`);
+  } catch (err) {
+    fails.push(name); console.log(`  FAIL ${name}\n       ${err?.message ?? err}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+await concurrentWritersTest();
+
+/* ─── 6b. WRONG-SHAPE session file (FEAT-126 r5 finding) ──────────────────────
+ * A session file that is valid JSON of the WRONG SHAPE used to slip past the
+ * parse-only check: `Array.isArray` alone accepted an array of malformed rows, so
+ * a read THREW (sorting a row with no createdAt) and a write CLOBBERED the file.
+ * Now readSession validates the FULL record shape (+ a size cap), so a wrong-shape
+ * file is treated exactly like unreadable: the read returns empty and never
+ * throws, and the write QUARANTINES the bytes aside (BUG-202 convention) and
+ * self-heals, never clobbering — and never touching another session. */
+{
+  const VALID = { id: 'REQ-1', stationSessionId: 'x', projectId: 'p', title: 't', source: null, tickets: ['T1'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' };
+  const noId = { ...VALID }; delete noId.id;
+  const shapeCases = {
+    'array-instead-of-object': '[[1,2,3]]',
+    'top-level object not array': '{"id":"REQ-1"}',
+    'missing field (no id)': JSON.stringify([noId]),
+    'wrong field types': JSON.stringify([{ ...VALID, id: 5, tickets: 'nope', createdAt: null }]),
+    'null': 'null',
+    'huge file (>4MB)': '[' + '"x",'.repeat(1_200_000) + '"x"]',
+  };
+  for (const [label, content] of Object.entries(shapeCases)) {
+    T(`WRONG-SHAPE (${label}): read empty+no-throw, write quarantines+self-heals, other session survives`, () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feat126-shape-'));
+      const prev = process.env.CLAUDE_STATION_DATA;
+      process.env.CLAUDE_STATION_DATA = dir;
+      try {
+        requests.observeAssistantText('sess-good', 'p', '```orchard-request\n{"id":"REQ-9","title":"good","tickets":["T9"]}\n```');
+        const goodBefore = requests.listForSession('sess-good').length;
+        assert.equal(goodBefore, 1);
+        const badFile = path.join(dir, 'requests', encodeURIComponent('sess-bad') + '.json');
+        fs.mkdirSync(path.dirname(badFile), { recursive: true });
+        fs.writeFileSync(badFile, content);
+        // read: empty, never throws
+        let len;
+        assert.doesNotThrow(() => { len = requests.listForSession('sess-bad').length; });
+        assert.equal(len, 0);
+        // write: quarantines the corrupt bytes, self-heals to the fresh record
+        assert.doesNotThrow(() => requests.observeAssistantText('sess-bad', 'p', '```orchard-request\n{"id":"REQ-2","title":"fresh","tickets":["T2"]}\n```'));
+        const quar = fs.readdirSync(path.join(dir, 'requests')).filter((n) => n.includes('sess-bad') && n.includes('.corrupt-'));
+        assert.equal(quar.length, 1, 'exactly one quarantine file');
+        assert.equal(fs.readFileSync(path.join(dir, 'requests', quar[0]), 'utf8'), content, 'quarantined bytes preserved verbatim');
+        assert.equal(requests.listForSession('sess-bad').length, 1, 'session self-healed to the fresh record');
+        // cross-session: the healthy session is untouched throughout
+        assert.equal(requests.listForSession('sess-good').length, goodBefore);
+      } finally {
+        if (prev === undefined) delete process.env.CLAUDE_STATION_DATA; else process.env.CLAUDE_STATION_DATA = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
+/* ─── 6c. Shared quarantine helper reaches this store (FEAT-126 r6) ───────────
+ * requests.ts now routes quarantine through src/server/store-io.ts. These prove
+ * the store benefits from the collision-safe quarantine (round-6 defects 1 & 2):
+ * two corrupt events for the same session must PRESERVE both sets of bytes, never
+ * overwrite the earlier one — even in the same millisecond. */
+function corruptThenUpsert(dir, sid, badBytes, freshId) {
+  const f = path.join(dir, 'requests', encodeURIComponent(sid) + '.json');
+  fs.mkdirSync(path.dirname(f), { recursive: true });
+  fs.writeFileSync(f, badBytes);
+  requests.observeAssistantText(sid, 'p', `\`\`\`orchard-request\n{"id":"${freshId}","title":"t","tickets":["T"]}\n\`\`\``);
+}
+const reqCorruptFiles = (dir, sid) =>
+  fs.readdirSync(path.join(dir, 'requests')).filter((n) => n.startsWith(encodeURIComponent(sid) + '.json.corrupt-'));
+
+T('SHARED QUARANTINE (requests) defects 1&2: two same-millisecond quarantines both survive (no-clobber)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feat126-q1-'));
+  const prev = process.env.CLAUDE_STATION_DATA; process.env.CLAUDE_STATION_DATA = dir;
+  const realNow = Date.now; Date.now = () => 1_790_000_000_000; // frozen clock — a timestamp-only name would collide
+  try {
+    corruptThenUpsert(dir, 'sess-q', '[[1]]', 'REQ-1');           // first corrupt bytes
+    corruptThenUpsert(dir, 'sess-q', '{"not":"array"}', 'REQ-2'); // second corrupt bytes, same ms
+    const q = reqCorruptFiles(dir, 'sess-q');
+    assert.equal(q.length, 2, 'both quarantines preserved (no overwrite despite same-ms)');
+    const bodies = q.map((n) => fs.readFileSync(path.join(dir, 'requests', n), 'utf8')).sort();
+    assert.deepEqual(bodies, ['[[1]]', '{"not":"array"}'].sort(), 'both sets of corrupt bytes preserved verbatim');
+    assert.equal(requests.listForSession('sess-q').length, 1, 'self-healed to the latest fresh record');
+  } finally {
+    Date.now = realNow;
+    if (prev === undefined) delete process.env.CLAUDE_STATION_DATA; else process.env.CLAUDE_STATION_DATA = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+T('SHARED QUARANTINE (requests) defect 3: an oversized VALID-JSON session file is refused (fd-bounded), quarantined, self-heals', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'feat126-q3-'));
+  const prev = process.env.CLAUDE_STATION_DATA; process.env.CLAUDE_STATION_DATA = dir;
+  try {
+    // > 4 MB and a valid array of VALID RequestRecords: an unbounded read would
+    // parse it AND pass shape validation (admitting it); only the fd-bounded read
+    // refuses it as too-big before reading it all.
+    const rec = JSON.stringify({ id: 'REQ-9', stationSessionId: 'sess-big', projectId: 'p', title: 't', source: null, tickets: ['T'], createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z' });
+    const huge = '[' + (rec + ',').repeat(35_000) + rec + ']'; // ~4.5 MB of valid records
+    assert.ok(huge.length > 4 * 1024 * 1024);
+    corruptThenUpsert(dir, 'sess-big', huge, 'REQ-1');
+    const q = reqCorruptFiles(dir, 'sess-big');
+    assert.equal(q.length, 1, 'oversized file quarantined (not read unbounded, not clobbered)');
+    assert.equal(fs.statSync(path.join(dir, 'requests', q[0])).size, huge.length, 'oversized bytes preserved');
+    assert.equal(requests.listForSession('sess-big').length, 1, 'self-healed to the fresh record');
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_STATION_DATA; else process.env.CLAUDE_STATION_DATA = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/* ─── 7. The round-1 independent-verify findings (FEAT-126 r4) ────────────────
+ * Each reproduces on the pre-fix tree (proven in the ticket's must-FAIL command
+ * against the committed baseline) and holds on the fix. */
+
+T('FINDING 1 (fence-inert): an orchard-request inside a MULTI-TOKEN info-string fence declares nothing', () => {
+  const turn = [
+    'For reference (not a declaration):',
+    '```markdown title=example',
+    '```orchard-request',
+    '{ "id": "REQ-999", "title": "quoted example", "tickets": [] }',
+    '```',
+    '```',
+  ].join('\n');
+  const ids = requests.parseRequestsFromText(turn).map((d) => d.id);
+  assert.ok(!ids.includes('REQ-999'), `a quoted block inside \`\`\`markdown title= must stay inert; got ${JSON.stringify(ids)}`);
+});
+
+T('FINDING 2 (conflict→gap): two DISAGREEING blocks for one id in one turn yield nothing', () => {
+  const turn = [
+    '```orchard-request', '{ "id": "REQ-5", "title": "Title one", "tickets": ["FEAT-1"] }', '```',
+    '```orchard-request', '{ "id": "REQ-5", "title": "Title two", "tickets": ["FEAT-2"] }', '```',
+  ].join('\n');
+  assert.equal(requests.parseRequestsFromText(turn).filter((d) => d.id === 'REQ-5').length, 0);
+  // identical repeats collapse to one — not a false conflict, not two rows
+  const same = [
+    '```orchard-request', '{ "id": "REQ-6", "title": "Same", "tickets": ["FEAT-9"] }', '```',
+    '```orchard-request', '{ "id": "REQ-6", "title": "Same", "tickets": ["FEAT-9"] }', '```',
+  ].join('\n');
+  assert.equal(requests.parseRequestsFromText(same).filter((d) => d.id === 'REQ-6').length, 1);
+});
+
+T('FINDING 3a: an answered-awaiting ticket is indexed (not reported missing)', () => {
+  const board = boardWith({ answeredAwaiting: ['FEAT-1'] });
+  const [r] = view.joinRequests([{ id: 'REQ-1', title: 't', tickets: ['FEAT-1'] }], { board, snap: { v: 1, running: [] } });
+  assert.notEqual(r.ticketStates[0].state, 'missing');
+  assert.equal(r.completion.missing, 0);
+  assert.notEqual(r.completion.kind, 'done'); // answered ≠ done — still NOT complete
+});
+
+T('FINDING 4 (sibling attribution): a lane declared to REQ-8 does NOT light REQ-7', () => {
+  const bindings = [
+    { id: 'REQ-7', title: 'seven', tickets: ['FEAT-126'] },
+    { id: 'REQ-8', title: 'eight', tickets: ['BUG-200'] },
+  ];
+  const board = boardWith({ inflight: ['FEAT-126'], queued: ['BUG-200'] });
+  const snap = { v: 1, running: [{ id: 'lane-b', row: 'agent', state: 'running', ticket: ['BUG-200'] }] };
+  const [r7, r8] = view.joinRequests(bindings, { board, snap });
+  assert.equal(r7.exec.state, 'idle', 'REQ-7 must not be lit by REQ-8\'s attributed lane');
+  assert.equal(r8.exec.state, 'running'); // REQ-8 itself is genuinely running
+});
+
+T('FINDING 5 (unconfirmed motion): with no snapshot, a 🤖 ticket reads idle, never running', () => {
+  const board = boardWith({ inflight: ['FEAT-126'] });
+  const [r] = view.joinRequests([{ id: 'REQ-7', title: 'seven', tickets: ['FEAT-126'] }], { board, snap: null });
+  assert.equal(r.exec.state, 'idle');
 });
 
 /* ─────────────────────────────────── summary ─────────────────────────────── */

@@ -194,11 +194,14 @@ test('settings modal: 11-category rail (2 groups) + container-only settings gate
   // ---- persistence, project-default scope: change Model, survive a reload ----
   await page.locator('#sRail-model').click();
   const modelGrp = page.locator('#vSettings .grp[data-focus="projectModel"]');
-  const modelRow = modelGrp.locator('.set').first();
-  const before = await modelRow.locator('.v').textContent();
-  await modelRow.click();
-  await expect.poll(async () => modelRow.locator('.v').textContent()).not.toBe(before);
-  const afterFirstClick = await modelRow.locator('.v').textContent();
+  // FEAT-159: the Model row is a dropdown now; clicking the row writes nothing.
+  const modelSel = modelGrp.locator('#sel-model');
+  const shown = () => modelSel.evaluate((s: any) => s.selectedOptions[0]?.textContent ?? '');
+  const before = await shown();
+  const pick = await modelSel.evaluate((s: any) => [...s.options].find((o) => /^v\d+$/.test(o.value))?.value ?? '');
+  await modelSel.selectOption(pick);
+  await expect.poll(shown).not.toBe(before);
+  const afterFirstClick = await shown();
 
   await page.reload();
   await page.waitForFunction(() => (window as any).__station !== undefined);
@@ -206,8 +209,7 @@ test('settings modal: 11-category rail (2 groups) + container-only settings gate
   await openSettings(page);
   await page.locator('#sRail-model').click();
   const modelGrp2 = page.locator('#vSettings .grp[data-focus="projectModel"]');
-  const modelRow2 = modelGrp2.locator('.set').first();
-  await expect(modelRow2.locator('.v')).toHaveText(afterFirstClick ?? '');
+  await expect.poll(() => modelGrp2.locator('#sel-model').evaluate((s: any) => s.selectedOptions[0]?.textContent ?? '')).toBe(afterFirstClick);
 
   // ---- persistence, this-session scope: an override survives a scope
   //      round-trip without a reload (the in-memory ctx.overrides path) ----
@@ -218,8 +220,8 @@ test('settings modal: 11-category rail (2 groups) + container-only settings gate
   // invariant (a session override is visibly marked and survives the scope
   // round-trip), new marker.
   await page.locator('#dScope button[data-scope="session"]').click();
-  const effortRow = modelGrp2.locator('.set').nth(1); // Effort
-  await effortRow.click();
+  const effortRow = modelGrp2.locator('.set[data-field="effort"]');
+  await effortRow.locator('#sel-effort').selectOption({ label: 'Low' });
   const effortChip = effortRow.locator('.prov[data-level="session"]');
   await expect(effortChip).toHaveAttribute('data-fill', 'true');
   await page.locator('#dScope button[data-scope="project"]').click();

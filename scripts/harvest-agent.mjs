@@ -19,9 +19,19 @@
  *   1. ACTIVITY  — is the transcript file still being appended to? (two size
  *      samples across a short window, plus mtime recency). This observes the
  *      child process's effect on disk directly.
- *   2. COMPLETION — does the transcript's last turn TERMINATE? (an assistant
- *      record with stop_reason end_turn / stop_sequence, or a workflow `result`
- *      record). This is what the model actually emitted, orthogonal to (1).
+ *   2. COMPLETION — does the transcript's last turn TERMINATE? This is decided
+ *      ONLY from a COMPLETE, terminal record per the transcript schema, never a
+ *      partial line or a non-terminal block. We parse only up to the last newline
+ *      (an unterminated trailing line is MID-WRITE — a record in flight — never
+ *      terminal). A terminal record is a workflow `result` record, or an
+ *      assistant turn with NO tool_use block. Its confidence is DEFINITIVE when
+ *      message.stop_reason ends the turn (end_turn / stop_sequence / max_tokens /
+ *      refusal) and AMBIGUOUS when stop_reason is null — because on real data a
+ *      null stop_reason is BOTH a finished answer (measured 258/3547 real child
+ *      transcripts, across opus/sonnet/fable) AND a mid-turn narration block
+ *      whose sibling tool_use is not yet written (Claude Code persists one record
+ *      per content block). The two are byte-identical, so an ambiguous terminal
+ *      is trusted only after the stall horizon confirms no continuation.
  *
  * Two signals on purpose: a single ad-hoc check (a `ps` snapshot; a harness
  * notification) has produced a confidently wrong answer on this project before.
@@ -158,15 +168,40 @@ function readHead(file, bytes) {
   }
 }
 
-/** Read the last `bytes` of a file (for the terminal record + result). */
-function readTail(file, size, bytes) {
-  const n = Math.min(bytes, size);
-  const start = size - n;
+/**
+ * Read the tail of a file for the terminal record + result, but ALIGNED to a
+ * record boundary. `softCap` is the preferred window (`--tail-bytes`); the window
+ * is GROWN past it only as far as needed to contain the final record whole.
+ *
+ * Why grow it: records are newline-delimited JSONL. The last COMPLETE record sits
+ * between the file's last two newlines. If the final record is larger than the
+ * window, the window begins inside it, the only "line" it holds is a truncated
+ * fragment, and dropping that fragment (it is not valid JSON) leaves NOTHING — a
+ * genuinely finished agent then reads STALLED (FEAT-111 round-1 defect 3). So we
+ * require the window to hold >=2 newlines (enough to delimit one whole record at
+ * the end) before trusting it, extending by doubling until it does or we have the
+ * whole file. `fullFile` is true when the window reached the start of the file.
+ */
+function readTailAligned(file, size, softCap) {
   const fd = fs.openSync(file, 'r');
   try {
-    const buf = Buffer.alloc(n);
-    fs.readSync(fd, buf, 0, n, start);
-    return { text: buf.toString('utf8'), bytesRead: n, partial: start > 0 };
+    let n = Math.min(softCap, size);
+    for (;;) {
+      const start = size - n;
+      const buf = Buffer.alloc(n);
+      fs.readSync(fd, buf, 0, n, start);
+      if (start === 0) {
+        return { text: buf.toString('utf8'), bytesRead: n, partial: false, fullFile: true };
+      }
+      let nl = 0;
+      for (let i = 0; i < n && nl < 2; i++) if (buf[i] === 0x0a) nl++;
+      if (nl >= 2) {
+        return { text: buf.toString('utf8'), bytesRead: n, partial: true, fullFile: false };
+      }
+      // The final record is bigger than the current window (only its trailing
+      // newline is visible). Grow until we capture the record boundary before it.
+      n = n >= size ? size : Math.min(size, n * 2);
+    }
   } finally {
     fs.closeSync(fd);
   }
@@ -209,12 +244,35 @@ function assistantText(rec) {
     .trim();
 }
 
+// stop_reason values that END a turn with certainty. In the real transcript
+// schema the model's final content block carries one of these on `message`.
+// `tool_use` is deliberately NOT here: it means the turn is awaiting a tool.
+const DEFINITIVE_STOPS = new Set(['end_turn', 'stop_sequence', 'max_tokens', 'refusal']);
+
 /**
- * Decide completion from the tail records. Returns
- * { finished, result, lastKind, lastStop, lastTs }.
+ * Decide, from the last COMPLETE record, whether the child's turn terminated, and
+ * with what confidence. Returns
+ *   { candidateTerminal, confidence, result, lastKind, lastStop, lastTs }
+ * where confidence is:
+ *   'definitive' — this record is unambiguously the end of the turn (a workflow
+ *                  `result` record, or an assistant text/thinking record whose
+ *                  `message.stop_reason` is a turn-ending reason);
+ *   'ambiguous'  — an assistant record with NO tool_use block but
+ *                  `stop_reason` null/absent. On real data this is BOTH a
+ *                  genuinely finished answer (measured: 258/3547 real child
+ *                  transcripts end on a text block with stop_reason null, across
+ *                  opus/sonnet/fable) AND a mid-turn narration block whose sibling
+ *                  tool_use has not been written yet (Claude Code persists one
+ *                  record per content block). The two are byte-indistinguishable
+ *                  in the transcript, so this record is trusted as terminal only
+ *                  after the stall horizon (see main) confirms no continuation;
+ *   null         — not a terminal shape (an assistant tool_use block, a
+ *                  tool_result, or an injected user turn → mid-turn).
  */
 function analyzeTail(records) {
-  if (!records.length) return { finished: false, result: '', lastKind: 'none', lastStop: null, lastTs: null };
+  if (!records.length) {
+    return { candidateTerminal: false, confidence: null, result: '', lastKind: 'none', lastStop: null, lastTs: null };
+  }
   const last = records[records.length - 1];
   const lastTs = last.timestamp || null;
   const type = last.type;
@@ -228,29 +286,27 @@ function analyzeTail(records) {
   // Workflow fold agents terminate with an explicit result record.
   if (type === 'result' && last.result !== undefined) {
     return {
-      finished: true,
+      candidateTerminal: true,
+      confidence: 'definitive',
       result: typeof last.result === 'string' ? last.result : JSON.stringify(last.result, null, 2),
       lastKind,
       lastStop: 'result',
       lastTs,
     };
   }
-  // A standard subagent terminates with an assistant turn that made NO tool
-  // call — the model ended its turn with a final answer. Detect this by the
-  // absence of a tool_use block, NOT by stop_reason: measured on real data,
-  // claude-opus-5 children persist stop_reason:null on a perfectly finished
-  // text answer, so an end_turn-only check false-STALLs them. An assistant
-  // message that DOES contain a tool_use block is mid-turn (running/awaiting a
-  // tool), regardless of stop_reason. A trailing user/tool_result or injected
-  // user message is likewise mid-turn.
+  // A standard subagent terminates with an assistant turn that made NO tool call.
+  // An assistant message that DOES contain a tool_use block is mid-turn
+  // (running/awaiting a tool); a trailing user/tool_result or injected user
+  // message is likewise mid-turn.
   if (type === 'assistant') {
     const content = last?.message?.content;
     const hasToolUse = Array.isArray(content) && content.some((b) => b && b.type === 'tool_use');
     if (!hasToolUse) {
-      return { finished: true, result: assistantText(last), lastKind, lastStop: stop, lastTs };
+      const confidence = DEFINITIVE_STOPS.has(stop) ? 'definitive' : 'ambiguous';
+      return { candidateTerminal: true, confidence, result: assistantText(last), lastKind, lastStop: stop, lastTs };
     }
   }
-  return { finished: false, result: '', lastKind, lastStop: stop, lastTs };
+  return { candidateTerminal: false, confidence: null, result: '', lastKind, lastStop: stop, lastTs };
 }
 
 function sleep(ms) {
@@ -298,13 +354,23 @@ function main() {
   let head, tail;
   try {
     head = readHead(file, 64 * 1024);
-    tail = readTail(file, size1, opt.tailBytes);
+    tail = readTailAligned(file, size1, opt.tailBytes);
   } catch (e) {
     return emit(opt, { status: 'UNREADABLE', exit: 4, agentId: opt.id, transcript: file, reason: String(e && e.message) });
   }
   const startTs = firstText(parseLines(head.text, false));
   const tailRecords = parseLines(tail.text, tail.partial);
   const a = analyzeTail(tailRecords);
+
+  // Defect 1 (FEAT-111 round-1): a transcript whose last line has no terminating
+  // newline is MID-WRITE — a record is being appended right now, or the writer
+  // died partway through one. Either way the last COMPLETE record is NOT the end
+  // of the turn: more was coming. `parseLines` silently drops the unterminated
+  // fragment, so without this guard the record BEFORE it (often a mid-turn
+  // narration block) is mistaken for the final answer. Only content up to the
+  // last newline is a settled record; anything after it is pending, never terminal.
+  const lastNL = tail.text.lastIndexOf('\n');
+  const incompleteTail = tail.text.slice(lastNL + 1).trim().length > 0;
 
   const lastTsMs = a.lastTs ? Date.parse(a.lastTs) : null;
   const startTsMs = startTs ? Date.parse(startTs) : null;
@@ -333,6 +399,8 @@ function main() {
     sinceLastRecordSec: sinceLastRecordSec == null ? null : +sinceLastRecordSec.toFixed(1),
     lastRecord: a.lastKind,
     lastStop: a.lastStop,
+    terminalConfidence: a.confidence,
+    incompleteTail,
     bytes,
   };
 
@@ -343,20 +411,14 @@ function main() {
   // record; declaring FINISHED off it would be a race. So growth/recency is
   // checked BEFORE completion. `settleSecs` = the file must be untouched at
   // least this long (and not have grown across our sampling window) before a
-  // terminal read is believed.
+  // DEFINITIVE terminal read is believed.
   const settleSecs = Math.max(3, opt.waitMs / 1000);
   const runningGuidance =
     'ALIVE — do not re-run its work. Waiting is correct: measured 2026-08-27, a lane that ' +
     're-ran a live child instead of waiting cost 51.6 duplicated minutes and finished only ' +
     '7.6 min sooner. Re-harvest after a suitable interval.';
 
-  // 1. Actively growing across the window -> unambiguously alive.
-  if (growing) {
-    return emit(opt, { status: 'RUNNING', exit: 10, ...common, guidance: runningGuidance });
-  }
-
-  // 2. Quiescent AND a terminal turn is recorded -> genuinely FINISHED.
-  if (a.finished && idleSec >= settleSecs) {
+  const finishEmit = () => {
     if (!a.result || !a.result.trim()) {
       return emit(opt, {
         status: 'FINISHED_EMPTY',
@@ -366,16 +428,55 @@ function main() {
       });
     }
     return emit(opt, { status: 'FINISHED', exit: 0, ...common, result: a.result });
+  };
+
+  // 1. Actively growing across the window -> unambiguously alive.
+  if (growing) {
+    return emit(opt, { status: 'RUNNING', exit: 10, ...common, guidance: runningGuidance });
   }
 
-  // 3. Recently touched (within the stall horizon) but not a trusted terminal
+  // 2. A record is mid-write (unterminated last line). The last COMPLETE record
+  //    is NOT the end of the turn — more was being written. Never FINISHED. If
+  //    fresh, the writer is active (wait); if silent past the horizon, it died
+  //    mid-record (loud STALLED).
+  if (incompleteTail) {
+    if (idleSec < opt.idleSecs) {
+      return emit(opt, { status: 'RUNNING', exit: 10, ...common, guidance: runningGuidance });
+    }
+    return emit(opt, {
+      status: 'STALLED',
+      exit: 11,
+      ...common,
+      reason:
+        `transcript ends mid-record (a line without its terminating newline) and no write for ${idleSec.toFixed(0)}s. ` +
+        'The writer died partway through a record; the last complete record is NOT a final answer. Verify the process by hand before assuming done or dead.',
+    });
+  }
+
+  // 3. Quiescent AND the last record is a DEFINITIVE terminal (a workflow result,
+  //    or an assistant turn whose stop_reason ends the turn) -> genuinely FINISHED.
+  if (a.candidateTerminal && a.confidence === 'definitive' && idleSec >= settleSecs) {
+    return finishEmit();
+  }
+
+  // 4. Quiescent AND the last record is an AMBIGUOUS terminal (assistant, no
+  //    tool_use, stop_reason null — a finished answer and a not-yet-continued
+  //    narration block are byte-identical here). Trust it as final ONLY past the
+  //    stall horizon: if the turn were still going, a continuation would have
+  //    landed within that window. Before the horizon it reads RUNNING (wait),
+  //    which is the safe bias — never a re-run.
+  if (a.candidateTerminal && a.confidence === 'ambiguous' && idleSec >= opt.idleSecs) {
+    return finishEmit();
+  }
+
+  // 5. Recently touched (within the stall horizon) but not a trusted terminal
   //    read: either mid-turn, or terminal-looking but too freshly written to
   //    trust. Alive -> wait and re-harvest.
   if (idleSec < opt.idleSecs) {
     return emit(opt, { status: 'RUNNING', exit: 10, ...common, guidance: runningGuidance });
   }
 
-  // 4. Silent past the stall horizon with no trusted terminal result.
+  // 6. Silent past the stall horizon with no trusted terminal result.
   return emit(opt, {
     status: 'STALLED',
     exit: 11,
@@ -405,7 +506,11 @@ function emit(opt, r) {
     );
   }
   if (r.elapsedSec != null) L.push(`elapsed: ${r.elapsedSec}s   last activity: ${r.sinceLastRecordSec}s ago   growing: ${r.growing}   idle(mtime): ${r.idleSec}s`);
-  if (r.lastRecord) L.push(`last record: ${r.lastRecord}`);
+  if (r.lastRecord) {
+    const conf = r.terminalConfidence ? ` (terminal: ${r.terminalConfidence})` : '';
+    const inc = r.incompleteTail ? '  [last line MID-WRITE: unterminated record]' : '';
+    L.push(`last record: ${r.lastRecord}${conf}${inc}`);
+  }
   if (r.guidance) L.push(`>> ${r.guidance}`);
   if (r.reason) L.push(`reason: ${r.reason}`);
   if (r.result !== undefined) {

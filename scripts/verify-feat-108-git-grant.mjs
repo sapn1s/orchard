@@ -24,10 +24,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
-import { decideGitWrite } from './lib/git-write-policy.mjs';
+import { decideGitWrite, scanForGitWrite, collectGitWrites, GATE_EXEMPT_WRITES } from './lib/git-write-policy.mjs';
 import { evaluateGitWrite, PUBLISHING_SUBCOMMANDS } from './lib/git-grant.mjs';
 import {
-  grantGitWrite, revokeGitWrite, peekGrant, grantView, listGitWrites,
+  grantGitWrite, revokeGitWrite, grantView, listGitWrites,
   setGitWriteAuditSink, _resetGitGrantsForTest,
 } from './lib/git-grant-store.mjs';
 
@@ -74,8 +74,8 @@ ok('path: allowed within the window',
   evaluateGitWrite({ command: cmd, projectKey: KEY, env: {}, runLeakGate: gateOK, now: t0 + 60_000 }).allow === true);
 ok('path: DENIED after the window expires',
   evaluateGitWrite({ command: cmd, projectKey: KEY, env: {}, runLeakGate: gateOK, now: t0 + 6 * 60_000 }).allow === false);
-ok('path: peekGrant purges the expired grant (indistinguishable from none)',
-  peekGrant(KEY, t0 + 6 * 60_000) === null);
+ok('path: an expired grant is purged on read (indistinguishable from none)',
+  grantView(KEY, t0 + 6 * 60_000) === null);
 _resetGitGrantsForTest();
 
 /* ═══ 3. SELF-GRANT HOLES CLOSED ═══════════════════════════════════════════ */
@@ -95,11 +95,11 @@ ok('req5: the launch-time env hatch on the HOST env still allows',
 
 // (b) WRITING CONFIG. An agent writing a "grant" into a file (registry / any
 //     on-disk config) grants nothing: the store is read from memory only. Prove
-//     the store never consults a file by planting one and checking peekGrant.
+//     the store never consults a file by planting one and checking grantView.
 const fakeRegistry = path.join(os.tmpdir(), `feat108-fakegrant-${process.pid}.json`);
 fs.writeFileSync(fakeRegistry, JSON.stringify({ gitWrite: { [KEY]: { allow: true } } }));
 ok('hole/config: a grant written to a file is NOT read by the store (no grant active)',
-  peekGrant(KEY) === null && evaluateGitWrite({ command: 'git commit -m x', projectKey: KEY, env: {}, runLeakGate: gateOK }).allow === false);
+  grantView(KEY) === null && evaluateGitWrite({ command: 'git commit -m x', projectKey: KEY, env: {}, runLeakGate: gateOK }).allow === false);
 fs.rmSync(fakeRegistry, { force: true });
 
 // (c) CROSS-PROJECT / SUBAGENT bleed. A grant for project A must not permit a
@@ -127,6 +127,71 @@ ok('gate: FAIL-CLOSED — a granted commit with NO gate runner available is refu
   evaluateGitWrite({ command: 'git commit -m x', projectKey: KEY, env: {}, runLeakGate: null }).allow === false);
 ok('publishing set is exactly {commit, push}',
   PUBLISHING_SUBCOMMANDS.has('commit') && PUBLISHING_SUBCOMMANDS.has('push') && !PUBLISHING_SUBCOMMANDS.has('add'));
+_resetGitGrantsForTest();
+
+/* ═══ 4b. FEAT-108 round 4 — the gate runs on EVERY publishing write in a
+ * compound command, not just the first offender. The 2026-09-29 clean room found
+ * `git add f && git commit` returned {allow:true} with gateCalls:0 — the gate was
+ * keyed on the FIRST offender (`git add`), so a publish chained after a non-publish
+ * write skipped the MANDATORY gate. Proven here by a call-counting gate runner. ══ */
+let gateCalls = 0;
+const gateCount = () => { gateCalls++; return { ok: true, detail: '' }; };
+const gateCountFAIL = () => { gateCalls++; return { ok: false, detail: 'LEAK GATE: FAIL' }; };
+
+// MUST-FAIL (synthesized pre-fix, rot-proof — anchored to a constructed function,
+// not to HEAD): the old "gate iff the FIRST offender publishes" decision skips the
+// gate on `add && commit`. This is the exact defect the fix removes.
+const oldFirstOffenderGates = (command) => {
+  const sub = (scanForGitWrite(command) ?? '').replace(/^git /, '');
+  return PUBLISHING_SUBCOMMANDS.has(sub);
+};
+ok('MUST-FAIL(synth pre-fix): first-offender gate SKIPS the gate on `add && commit`',
+  oldFirstOffenderGates('git add f && git commit -m x') === false);
+ok('PASS-after: collectGitWrites sees BOTH writes so the publish is not hidden',
+  collectGitWrites('git add f && git commit -m x').map((o) => o.replace(/^git /, '')).join(',') === 'add,commit');
+
+for (const [cmd, label] of [
+  ['git add f && git commit -m x', 'compound add && commit'],
+  ['git add f && git push', 'compound add && push'],
+  ['git add f\ngit commit -m x', 'newline-separated add / commit'],
+  ['git -c alias.co=commit co', 'inline alias hiding a commit (unknown sub)'],
+  // FEAT-108 round 5 — a publish hidden behind a WRAPPER after a non-publish write
+  // must still gate (collectGitWrites now sees the wrapped publish). These were
+  // fail-open before round 5 (`git add f; exec git commit` → gateCalls 0).
+  ['git add f; exec git commit -m x', 'exec-wrapped publish after add'],
+  ['git add f; nice git commit -m x', 'nice-wrapped publish after add'],
+  ['git add f; sudo git push', 'sudo-wrapped publish after add'],
+  ['git add f; env -S git commit', 'env -S-wrapped publish after add'],
+  // FEAT-108 round 6 — a publish reachable only through a pipe-into-runner, a
+  // heredoc-into-shell, or a config option must ALSO gate on the granted path
+  // (collectGitWrites sees the data-flow / config write, gateCalls stays 1).
+  ["git add f; printf 'git commit\\n' | sh", 'publish piped into sh after add'],
+  ["git add f; sh <<'EOF'\ngit commit\nEOF", 'publish in a heredoc-into-sh after add'],
+  ["git -c core.pager='git commit' log", 'publish via a config option (read head)'],
+]) {
+  _resetGitGrantsForTest();
+  grantGitWrite(KEY, { scope: 'duration', ttlMs: 60_000 });
+  gateCalls = 0;
+  const permitted = evaluateGitWrite({ command: cmd, projectKey: KEY, env: {}, runLeakGate: gateCount });
+  ok(`round-4 gate RUNS on: ${label}`, gateCalls === 1 && permitted.allow === true, `gateCalls=${gateCalls}`);
+  // …and when that gate FAILS the whole compound is refused (the publish cannot land).
+  _resetGitGrantsForTest();
+  grantGitWrite(KEY, { scope: 'duration', ttlMs: 60_000 });
+  gateCalls = 0;
+  const blocked = evaluateGitWrite({ command: cmd, projectKey: KEY, env: {}, runLeakGate: gateCountFAIL });
+  ok(`round-4 a FAILING gate refuses: ${label}`, gateCalls === 1 && blocked.allow === false && blocked.gateFailed === true);
+}
+
+// Non-vacuity that the gate is NOT simply always-on: a granted LONE non-publishing
+// write (in GATE_EXEMPT_WRITES) still skips the gate — so a failing gate allows it,
+// and no gate runner is needed. This is the property line 124 pins, restated by count.
+_resetGitGrantsForTest();
+grantGitWrite(KEY, { scope: 'duration', ttlMs: 60_000 });
+gateCalls = 0;
+const loneAdd = evaluateGitWrite({ command: 'git add -A', projectKey: KEY, env: {}, runLeakGate: gateCountFAIL });
+ok('round-4: a granted LONE `git add` still skips the gate (exempt)', gateCalls === 0 && loneAdd.allow === true);
+ok('round-4: GATE_EXEMPT_WRITES contains add but not commit/push',
+  GATE_EXEMPT_WRITES.has('add') && !GATE_EXEMPT_WRITES.has('commit') && !GATE_EXEMPT_WRITES.has('push'));
 _resetGitGrantsForTest();
 
 /* ── The REAL leak gate over REAL scratch repos (the user's reality) ──────── */

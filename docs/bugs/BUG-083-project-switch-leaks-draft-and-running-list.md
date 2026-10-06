@@ -156,3 +156,6 @@ Late poll results must not repaint agents from the project just left. Draft keys
 - Anti-regressions all green: verify:ui (7/0), verify:running-snapshot (47/47),
   verify:session-switch-url (7/0), verify:queue (14/0), typecheck (0), leak-gate (PASS).
 - Commit: BUG-083: per-project composer draft + running strip scoped to current session.
+
+### 2026-09-28 — BUG-181/106 findings lane (Opus 4.8)
+- **Note:** Latent-harness note (no code change here): scripts/verify-bug-083-project-switch-state.mjs registers a real neighbour project and then locates its header by name (#tree button.proj, projName===NB) WITHOUT first revealing the inactive-projects group — the same pattern BUG-197 fixed in verify-bug-106-crossproject-strip.mjs, where a >14d-inactive neighbour was folded behind the '.inactive-l' toggle and the by-name wait timed out. This suite is not currently reported failing (it opens the neighbour immediately after and its neighbour may not be inactive), so it was NOT changed blind while other lanes are in flight; but if its chosen neighbour ages past INACTIVE_AFTER_DAYS it will time out identically. Fix when touched: reveal the inactive group (click '.inactive-l') before the name-match wait. Pointer: BUG-197 Activity log, 2026-09-29 fixing-lane sweep.

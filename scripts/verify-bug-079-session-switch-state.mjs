@@ -71,7 +71,7 @@ async function waitFor(label, fn, timeoutMs = 20000) {
 let server = null;
 
 async function main() {
-  console.log('\n========== BUG-079 — session switch clears pending drain-wait + force-send state ==========');
+  console.log('\n========== BUG-079 — session switch leaves nothing of the outgoing session able to act on the incoming one ==========');
   if (!fs.existsSync(NEIGHBOR)) throw new Error(`precondition failed: ${NEIGHBOR} missing`);
   const PORT = await freePort();
   const BASE = `http://127.0.0.1:${PORT}`;
@@ -107,7 +107,25 @@ async function main() {
 
   const g = win;
   const realFetch = globalThis.fetch;
-  g.fetch = (input, init) => realFetch(input.startsWith('http') ? input : BASE + input, init);
+  /*
+   * BUG-217 round 5: queued rows now live in each session's SERVER outbox, which
+   * DELIVERS them by itself — and this suite drives REAL sessions of a neighbour
+   * project with the REAL CLI. So every outbox write is intercepted HERE and
+   * recorded (never reaching the server): nothing this suite stages can start a
+   * real turn. Reads pass through (the scratch server's outbox is empty).
+   */
+  const outboxPosts = [];
+  g.fetch = (input, init) => {
+    const url = input.startsWith('http') ? input : BASE + input;
+    if (/\/api\/outbox(\/|$)/.test(new URL(url).pathname) && (init?.method ?? 'GET') === 'POST') {
+      const body = JSON.parse(init.body ?? '{}');
+      outboxPosts.push({ path: new URL(url).pathname, body });
+      const row = { id: `q-staged-${outboxPosts.length}`, nonce: body.nonce ?? 'n', seq: outboxPosts.length, text: body.text ?? '', origin: body.origin ?? 'queued', state: body.initial ?? 'queued', reason: body.reason ?? null, createdAt: Date.now(), updatedAt: Date.now(), forced: false, via: null };
+      const view = { sessionId: body.session, rows: body.discard ? [] : [row], recent: [], hold: null, damaged: null };
+      return Promise.resolve(new Response(JSON.stringify(new URL(url).pathname === '/api/outbox' ? { row, created: true, view } : view), { status: 200, headers: { 'content-type': 'application/json' } }));
+    }
+    return realFetch(url, init);
+  };
   const openSockets = [];
   class TrackedWebSocket extends WebSocket { constructor(...a) { super(...a); openSockets.push(this); } }
   g.WebSocket = TrackedWebSocket;
@@ -157,82 +175,84 @@ async function main() {
     const marker = (t) => `[Force-sent`; // deliverForced's prefix — present iff a force-send was delivered
     const bubbleHas = (needle) => qa('#panes .pane .you').some((n) => (n.textContent ?? '').includes(needle));
 
+    /*
+     * BUG-217 round 5 — the tab no longer holds ANY pending delivery of its own:
+     * the BUG-045 self-retry (drainWaitAttempt + its interval) and the FEAT-031
+     * force-send stash (forceSend) are gone; a retryable refusal becomes a row in
+     * the refused session's SERVER outbox, and Interrupt & send is a request the
+     * server carries out for that session's row. So the class this ticket fixed —
+     * an outgoing session's pointer acting on the incoming one — has nothing left
+     * to point with. What is asserted now is the same user-facing property, on the
+     * new mechanism: after an A -> B switch, B's refusal goes to B's outbox (never
+     * A's, never lost), nothing of A reaches B at B's turn-end, and the session-
+     * boundary pointers the tab still has (pendingStart / pendingSend) are cleared.
+     */
     // ========================= FINDING A — message LOSS =========================
-    // Plant the state a mid-flight drain-wait self-retry leaves in session A:
-    // an in-flight attempt row + an armed self-retry interval.
-    const staleAttempt = { text: 'A drain-wait row (stale)', dead: null, composedAt: Date.now(), drainWait: true, drainProject: st.current.projectId };
-    st.drainWaitAttempt = staleAttempt;
-    st.drainWaitLastTry = Date.now();
-    if (!st.drainWaitTimer) st.drainWaitTimer = setInterval(() => {}, 100000);
-
-    // Switch A -> B (real openSession via the row click).
+    const A_SID = st.current.sessionId;
+    st.pendingStart = 'A in-flight start (stale)';
+    st.pendingStartResume = A_SID;
     await openRow(bIdx);
+    const B_SID = st.current.sessionId;
+    check('A: session switch CLEARED the outgoing session\'s pending start (no pointer survives the boundary)',
+      st.pendingStart == null && st.pendingStartResume == null, `pendingStart=${JSON.stringify(st.pendingStart)} resume=${JSON.stringify(st.pendingStartResume)}`);
+    check('A: the tab carries no self-retry machinery that could act on the new session (BUG-045 is the server outbox\'s now)',
+      !('drainWaitAttempt' in st) && !('drainWaitTimer' in st) && !('forceSend' in st), `fields=${JSON.stringify(Object.keys(st).filter((k) => /drainWait|forceSend/.test(k)))}`);
 
-    check('A: session switch CLEARED the stale drain-wait attempt (must FAIL pre-fix)',
-      st.drainWaitAttempt === null, `drainWaitAttempt=${st.drainWaitAttempt ? JSON.stringify(st.drainWaitAttempt.text) : 'null'}`);
-    check('A: session switch DISARMED the drain-wait self-retry interval (must FAIL pre-fix)',
-      st.drainWaitTimer == null, `drainWaitTimer=${String(st.drainWaitTimer != null && !!st.drainWaitTimer)}`);
-
-    // Now B gets a retryable refusal on its own send. With the stale attempt
-    // gone, queueRetryableRefusal enqueues; with it present it drops the text.
+    // B gets a retryable refusal on its own resume: the text goes to B's server outbox — never A's, never lost.
     const B_MSG = 'BUG-079 finding-A: B own message must be QUEUED not lost';
-    const beforeQ = st.queue.length;
+    const postsBefore = outboxPosts.length;
     st.pendingStart = B_MSG;
-    st.pendingStartResume = null;
+    st.pendingStartResume = B_SID;
     win.__station.onEvent({ t: 'error', fatal: false, retryable: true, message: 'still draining', drain: { count: 1 } });
+    await waitFor('the outbox request', () => outboxPosts.length > postsBefore, 3000);
+    const post = outboxPosts.slice(postsBefore).find((p) => p.body.text === B_MSG);
     const queuedRow = st.queue.find((r) => r.text === B_MSG);
-    check("A: B's own retryable refusal was QUEUED, not dropped (must FAIL pre-fix: lost)",
-      !!queuedRow, `queue.len ${beforeQ}->${st.queue.length}, hasBMsg=${!!queuedRow}`);
+    check("A: B's own retryable refusal was QUEUED into B's outbox, not dropped (and not A's)",
+      !!queuedRow && post?.body?.session === B_SID && (distinct ? B_SID !== A_SID : true), `hasBMsg=${!!queuedRow} posted to=${post?.body?.session ?? null} A=${A_SID} B=${B_SID}`);
 
     // ========================= FINDING B — WRONG-TARGET =========================
-    // Re-open A cleanly (drops B's queue), then plant a pending force-send in A
-    // and an armed watchdog, switch to B, and drive B's next turn-end.
     await openRow(0);
     const A_FORCE = `BUG-079 finding-B force text ${Date.now()}`;
-    st.forceSend = { text: A_FORCE, dead: null, composedAt: Date.now() };
     st.busyWatchdog = setTimeout(() => {}, 100000);
-
     await openRow(bIdx);
-    check('B: session switch CLEARED the stale force-send stash (must FAIL pre-fix)',
-      st.forceSend === null, `forceSend=${st.forceSend ? JSON.stringify(st.forceSend.text) : 'null'}`);
     check('B: session switch CANCELLED the force-send watchdog (must FAIL pre-fix)',
       st.busyWatchdog == null, `busyWatchdog=${String(st.busyWatchdog != null && !!st.busyWatchdog)}`);
-
-    // Drive B's next turn-end. Post-fix nothing to deliver; pre-fix A's text is
-    // injected into B via deliverForced.
     const hadForceBubbleBefore = bubbleHas(A_FORCE);
     win.__station.onEvent({ t: 'turn-end', interrupted: true, subtype: 'interrupted', durationMs: 10 });
     await sleep(150);
     check("B: turn-end did NOT deliver A's force text into B (must FAIL pre-fix: injected)",
       !bubbleHas(A_FORCE), `A-force bubble present in B: before=${hadForceBubbleBefore} after=${bubbleHas(A_FORCE)}`);
 
-    // ================ SAME-SESSION REGRESSIONS (green pre AND post) ================
-    // R1: force-send WITHIN its own session still delivers at turn-end (FEAT-031
-    // Part A) — no switch, so clearPendingDelivery never runs; deliverForced
-    // paints its bubble.
+    // ================ SAME-SESSION REGRESSIONS ================
+    // R1: Interrupt & send (FEAT-031) asks the SERVER to interrupt THIS session and send THIS row first.
     await openRow(0);
-    const SAME_FORCE = `BUG-079 same-session force ${Date.now()}`;
-    st.forceSend = { text: SAME_FORCE, dead: null, composedAt: Date.now() };
-    win.__station.onEvent({ t: 'turn-end', interrupted: true, subtype: 'interrupted', durationMs: 10 });
-    await sleep(150);
-    check('REGRESSION: force-send WITHIN its own session still delivers at turn-end (FEAT-031)',
-      bubbleHas(SAME_FORCE) && st.forceSend === null,
-      `same-force bubble=${bubbleHas(SAME_FORCE)} forceSend=${st.forceSend === null ? 'null' : 'set'}`);
+    const SAME_SID = st.current.sessionId;
+    st.outbox = { sessionId: SAME_SID, rows: [{ id: 'q-same', nonce: 'n-same-0001', seq: 1, text: 'BUG-079 same-session force', origin: 'queued', state: 'queued', reason: null, createdAt: Date.now(), updatedAt: Date.now(), forced: false, via: null }], recent: [], hold: { kind: 'busy', text: '' }, damaged: null };
+    win.__station.paintQueue?.();
+    const postsR1 = outboxPosts.length;
+    // A repaint rebuilds rows from state.outbox; press the row's own button.
+    st.queue = st.outbox.rows.map((r) => ({ ...r, local: false }));
+    win.__station.paintQueue();
+    qa('#queueBox .force-send')[0]?.click();
+    await waitFor('the interrupt request', () => outboxPosts.length > postsR1, 3000);
+    const r1 = outboxPosts.slice(postsR1)[0];
+    check('REGRESSION: Interrupt & send (FEAT-031) asks the server for THIS session\'s row, with interrupt',
+      r1?.path === '/api/outbox/send' && r1.body.session === SAME_SID && r1.body.id === 'q-same' && r1.body.interrupt === true, JSON.stringify(r1 ?? null));
 
-    // R2: BUG-045 exactly-once "retried" guard within one session — a re-refused
-    // self-retry keeps the SAME row queued (no duplicate, no new row). No switch.
+    // R2: BUG-045 — one retryable refusal of one start is ONE outbox request (no duplicate, no loss).
     await openRow(0);
-    const itemX = { text: 'BUG-045 in-flight self-retry row', dead: null, composedAt: Date.now(), drainWait: true, drainProject: st.current.projectId };
-    st.queue.length = 0;
-    st.queue.push(itemX);
-    st.drainWaitAttempt = itemX;
-    st.pendingStart = itemX.text;
-    st.pendingStartResume = null;
-    const qLenBefore = st.queue.length;
+    const postsR2 = outboxPosts.length;
+    st.pendingStart = 'BUG-045 one refusal, one row';
+    st.pendingStartResume = st.current.sessionId;
     win.__station.onEvent({ t: 'error', fatal: false, retryable: true, message: 'still draining', drain: { count: 1 } });
-    check('REGRESSION: BUG-045 re-refused self-retry keeps exactly ONE row (retried guard intact)',
-      st.queue.length === qLenBefore && st.queue.filter((r) => r === itemX).length === 1 && st.drainWaitAttempt === null,
-      `queue.len ${qLenBefore}->${st.queue.length} itemXcount=${st.queue.filter((r) => r === itemX).length} drainWaitAttempt=${st.drainWaitAttempt === null ? 'null' : 'set'}`);
+    await sleep(600);
+    win.__station.onEvent({ t: 'error', fatal: false, retryable: true, message: 'still draining', drain: { count: 1 } }); // a stray second refusal: nothing pending, nothing added
+    await sleep(600);
+    const r2 = outboxPosts.slice(postsR2).filter((p) => p.body.text === 'BUG-045 one refusal, one row');
+    check('REGRESSION: BUG-045 a retryable refusal becomes exactly ONE outbox row (a stray repeat adds nothing)',
+      // (the dock then mirrors the scratch server, which never received the intercepted write — so count the requests)
+      r2.length === 1 && st.queue.filter((r) => r.text === 'BUG-045 one refusal, one row').length <= 1,
+      `requests=${r2.length} rows=${st.queue.filter((r) => r.text === 'BUG-045 one refusal, one row').length}`);
   } finally {
     try {
       const st2 = win.__station?.state;

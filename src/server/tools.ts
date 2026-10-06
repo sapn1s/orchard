@@ -62,7 +62,7 @@ export const CONTAINER_SERENA_BIN = '/usr/local/bin/serena';
 
 export function serenaMcpServerFor(project: Project): McpStdioServer {
   const inContainer = project.isolation === 'container';
-  const projectDir = inContainer ? containerWorkdir(project.id) : project.hostPath;
+  const projectDir = inContainer ? containerWorkdir(project) : project.hostPath;
   return {
     type: 'stdio',
     command: inContainer ? CONTAINER_SERENA_BIN : hostSerenaBin(),

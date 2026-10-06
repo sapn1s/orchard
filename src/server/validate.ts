@@ -13,6 +13,7 @@ import type * as reg from './registry.ts';
 // PATCH validates a chosen account against it (claude-accounts imports only
 // paths, so no cycle).
 import { readAccounts, DEFAULT_ACCOUNT_ID } from './claude-accounts.ts';
+import { dockerfileSettingError, normaliseDockerfileSetting } from './project-dockerfile.ts';
 
 const ISOLATIONS = new Set(['direct', 'container', 'sandbox']);
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
@@ -93,7 +94,7 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
   const SETTINGS = new Set([
     'provider', 'model', 'effort', 'claudeAccount', 'maxBudgetUsd', 'permissionMode',
     'allowedTools', 'disallowedTools', 'mounts', 'instructions', 'container', 'browser', 'tools', 'snapshots',
-    'responseDigest', 'orchestratorProfile', 'methodVersion', 'services',
+    'responseDigest', 'orchestratorProfile', 'methodVersion', 'services', 'laneDocker',
   ]);
 
   for (const k of Object.keys(b)) {
@@ -215,7 +216,10 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
     const c = src.container as Record<string, unknown> | null;
     if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error('container must be an object');
     for (const k of Object.keys(c)) {
-      if (!['image', 'dockerSocket', 'memoryMb', 'pidsLimit'].includes(k)) throw new Error(`unknown container field "${k}"`);
+      // FEAT-157 — the base pin is NOT a setting: it is written only by the base-update
+      // route, which names the notice it answers and enforces the security floor.
+      if (k === 'base') throw new Error('container.base (the Orchard base pin) is not writable here: answer the base-update notice on the rail, or POST /api/projects/:id/base-update { action, version, rev }');
+      if (!['image', 'dockerSocket', 'memoryMb', 'pidsLimit', 'gpu', 'env', 'workspaceRoot', 'dockerfile'].includes(k)) throw new Error(`unknown container field "${k}"`);
     }
     const patch: Partial<reg.ContainerSettings> = {};
     if ('image' in c) {
@@ -227,8 +231,8 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
       patch.dockerSocket = c.dockerSocket;
     }
     if ('memoryMb' in c) {
-      if (typeof c.memoryMb !== 'number' || !Number.isInteger(c.memoryMb) || c.memoryMb < 512) {
-        throw new Error('container.memoryMb must be an integer >= 512');
+      if (typeof c.memoryMb !== 'number' || !Number.isInteger(c.memoryMb) || c.memoryMb < 512 || c.memoryMb > 1_048_576) {
+        throw new Error('container.memoryMb must be an integer between 512 and 1048576 (1 TiB)');
       }
       patch.memoryMb = c.memoryMb;
     }
@@ -237,6 +241,44 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
         throw new Error('container.pidsLimit must be an integer >= 64');
       }
       patch.pidsLimit = c.pidsLimit;
+    }
+    if ('gpu' in c) {
+      if (c.gpu !== 'auto' && c.gpu !== 'on' && c.gpu !== 'off') {
+        throw new Error("container.gpu must be one of 'auto', 'on', 'off'");
+      }
+      patch.gpu = c.gpu;
+    }
+    if ('dockerfile' in c) {
+      // FEAT-155 round 5 — shape only here; containment in the real repo is
+      // re-checked on every read (project-dockerfile.ts readProjectDockerfile).
+      const v = c.dockerfile === '' ? null : c.dockerfile;
+      const why = dockerfileSettingError(v);
+      if (why) throw new Error(why);
+      patch.dockerfile = v === null ? null : normaliseDockerfileSetting(v as string);
+      if (patch.dockerfile === '') throw new Error('container.dockerfile names the repo root, not a file');
+    }
+    if ('workspaceRoot' in c) {
+      if (typeof c.workspaceRoot !== 'boolean') throw new Error('container.workspaceRoot must be a boolean');
+      patch.workspaceRoot = c.workspaceRoot;
+    }
+    if ('env' in c) {
+      const e = c.env;
+      if (!e || typeof e !== 'object' || Array.isArray(e)) throw new Error('container.env must be an object');
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(e as Record<string, unknown>)) {
+        // A container env key is passed straight to `docker create --env K=V`;
+        // reject shapes docker would mangle or that could inject a second flag.
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`container.env key "${k}" is not a valid environment variable name`);
+        if (k === '__proto__' || k === 'constructor' || k === 'prototype') throw new Error(`container.env key "${k}" is not allowed`);
+        const reserved = cm.reservedContainerEnvReason(k);
+        if (reserved) throw new Error(`container.env key "${k}" is reserved: ${reserved}`);
+        if (typeof v !== 'string') throw new Error(`container.env["${k}"] must be a string`);
+        // docker create's argv must fit the kernel's per-argument limit (E2BIG).
+        if (Buffer.byteLength(v) > 32 * 1024) throw new Error(`container.env["${k}"] is longer than 32 KiB — put large values in a mounted file`);
+        if (v.includes('\n') || v.includes('\0')) throw new Error(`container.env["${k}"] must not contain newlines or NUL`);
+        env[k] = v;
+      }
+      patch.env = env;
     }
     settings.container = patch as reg.ContainerSettings;
   }
@@ -410,6 +452,16 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
     settings.methodVersion = src.methodVersion;
   }
 
+  if ('laneDocker' in src) {
+    // BUG-223 round 4 — the declared Docker daemon for this project's direct sessions
+    // and lanes. Exactly 'sandbox' or 'host'; no null (undeclared is a migration state,
+    // not a choice a PATCH can make).
+    if (src.laneDocker !== 'sandbox' && src.laneDocker !== 'host') {
+      throw new Error('laneDocker must be "sandbox" or "host"');
+    }
+    settings.laneDocker = src.laneDocker;
+  }
+
   if (Object.keys(settings).length) out.settings = settings as reg.ProjectSettings;
   if (!Object.keys(out).length) throw new Error('patch contained no updatable fields');
   return out;
@@ -491,6 +543,8 @@ export function validateSessionTitle(raw: unknown): string {
 export interface SessionPatch {
   title?: string;
   pinned?: boolean;
+  /** FEAT-168 — the CLOSED (done) label; Orchard-owned (session-closed.ts), independent of pinned. */
+  closed?: boolean;
   /** Encoded store dir, disambiguating a session id present under several. */
   dir?: string;
 }
@@ -507,7 +561,7 @@ export interface SessionPatch {
 export function validateSessionPatch(body: unknown): SessionPatch {
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('body must be a JSON object');
   const b = body as Record<string, unknown>;
-  const ALLOWED = new Set(['title', 'pinned', 'dir']);
+  const ALLOWED = new Set(['title', 'pinned', 'closed', 'dir']);
   for (const k of Object.keys(b)) {
     if (!ALLOWED.has(k)) throw new Error(`unknown field "${k}" (allowed: ${[...ALLOWED].join(', ')})`);
   }
@@ -524,11 +578,15 @@ export function validateSessionPatch(body: unknown): SessionPatch {
     if (typeof b.pinned !== 'boolean') throw new Error('pinned must be a boolean');
     out.pinned = b.pinned;
   }
+  if ('closed' in b) {
+    if (typeof b.closed !== 'boolean') throw new Error('closed must be a boolean');
+    out.closed = b.closed;
+  }
   if ('dir' in b) {
     if (typeof b.dir !== 'string' || !b.dir.trim()) throw new Error('dir must be a non-empty string (the encoded store dir)');
     out.dir = b.dir.trim();
   }
-  if (out.title === undefined && out.pinned === undefined) throw new Error('patch contained no updatable fields (title, pinned)');
+  if (out.title === undefined && out.pinned === undefined && out.closed === undefined) throw new Error('patch contained no updatable fields (title, pinned, closed)');
   return out;
 }
 

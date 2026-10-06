@@ -31,6 +31,9 @@ process.env.ORCHARD_DISPATCH_SCRIPT = path.join(ROOT, 'scripts', 'fixtures', 'fa
 const hostPath = path.join(tmp, 'repo');
 fs.mkdirSync(hostPath, { recursive: true });
 const project = { id: 'a17-drain', name: 'a17-drain', hostPath, isolation: 'direct', settings: { tools: { openaiDispatch: true } } };
+// BUG-223 r6: the broker re-reads its project by id per lane, so the fixture must be registered.
+const { registerFixtureProjects } = await import('./lib/broker-fixture.mjs');
+registerFixtureProjects(DATA, project);
 
 const ONLY_MUST_FAIL = process.argv.includes('--must-fail-proof');
 let pass = 0, fail = 0;

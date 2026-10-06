@@ -28,6 +28,17 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
+// BUG-230 — run from inside an agent session this process INHERITS that session's
+// ORCHARD_GIT_SHIM_DIR + PATH entry; the hatch-open control would then see the
+// invoker's shim and mis-grade, and the shim-on arm would run under two shims.
+// Start from a shim-free env, as a host process (the real runtime's base) does.
+{
+  const inherited = process.env.ORCHARD_GIT_SHIM_DIR;
+  process.env.PATH = String(process.env.PATH ?? '').split(path.delimiter)
+    .filter((p) => p && p !== inherited && !path.basename(p).startsWith('orchard-git-shim-'))
+    .join(path.delimiter);
+  delete process.env.ORCHARD_GIT_SHIM_DIR;
+}
 let pass = 0, fail = 0;
 const failures = [];
 const cleanup = [];

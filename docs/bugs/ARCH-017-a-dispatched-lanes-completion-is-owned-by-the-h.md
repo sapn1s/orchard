@@ -4097,3 +4097,6 @@ truncated writes. The vacuity scan ran (24/0) but is static and proves none of t
 properties. Note the socket-suite EPERM is a sandbox artifact on the reviewer's box, not a code fault.
 
 No git write commands run; working set left as-is. `board:gen` re-run after this append.
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0cb34-09ee-7521-b940-aa0cf4fb90a2 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN — DO-NOT-LAND (transcribed by BUG-225 verify from this ticket's line 4057, whose shape the shared reader cannot parse)

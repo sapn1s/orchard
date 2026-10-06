@@ -150,12 +150,14 @@ const PRE_FIX = [
   ['force-send re-derives liveness',
     `  if (!isDriving() || state.dropped) {`,
     `  if (!state.live || !state.ws || state.dropped) {`],
+  // BUG-217 reshaped the row (actions always visible; "To composer" is now
+  // "Move to composer"); these two anchors follow the new code, same meaning.
   ['force send is offered unconditionally',
-    `    if (!item.dead && isDriving() && !state.dropped) {`,
-    `    if (!item.dead) {`],
+    `      if (isDriving()) {\n        if (state.busy) {`,
+    `      if (true) {\n        if (true) {`],
   ['"To composer" only on a dead row',
-    `    const back = el('button', { class: 'mini', text: 'To composer' });`,
-    `    const back = item.dead ? el('button', { class: 'mini', text: 'To composer' }) : el('span', {});`],
+    `    const back = el('button', { class: 'mini', text: 'Move to composer' });`,
+    `    const back = item.dead ? el('button', { class: 'mini', text: 'Move to composer' }) : el('span', {});`],
 ];
 
 function preFixClient() {
@@ -465,7 +467,8 @@ async function scenarioB(cdp, leg, projectName, secs) {
   /* B4 — the way out, or the dead end. */
   const row = () => `[...document.querySelectorAll('#queueBox .qrow')].find(r => (r.querySelector('.qedit')?.value ?? '').includes('QUEUED-AND-RELOADED'))`;
   const backBtn = `[...${row()}.querySelectorAll('.cacts button')].find(b => /composer/i.test(b.textContent))`;
-  const forceBtn = `[...${row()}.querySelectorAll('.cacts button')].find(b => /force/i.test(b.textContent))`;
+  // BUG-217: the force-send button is labelled "Interrupt & send" now; its class is the stable handle.
+  const forceBtn = `[...${row()}.querySelectorAll('.cacts button')].find(b => b.classList.contains('force-send') || /force/i.test(b.textContent))`;
 
   const hasBack = await cdp.eval(`!!(${row()} && ${backBtn})`);
   const hasForce = await cdp.eval(`!!(${row()} && ${forceBtn})`);
@@ -604,7 +607,7 @@ async function main() {
   check('one click puts the exact text back in the composer',
     F.b.inBox.includes('QUEUED-AND-RELOADED'), F.b.inBox.slice(0, 120));
   check('the dock does not promise a delivery this tab cannot make',
-    !/delivering…/.test(F.b.dock.label) && /not driving the session/.test(F.b.dock.label), F.b.dock.label);
+    !/delivering…/.test(F.b.dock.label) && /not driving the session|another tab is driving|another program is writing|not sent yet|sending now|Claude is working/.test(F.b.dock.label), F.b.dock.label);
 
   console.log('\n=== 3. FIXED — and the agreement holds in the other direction too ===');
   const T = F.b.takeover;

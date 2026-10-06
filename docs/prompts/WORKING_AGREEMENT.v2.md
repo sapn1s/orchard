@@ -402,9 +402,12 @@ anyone can make. Classify the CHANGE, then spend:
 A landing page that does not scroll to its form is the contained-render row: it gets no round,
 and commissioning one is a spend error, not a safety margin.
 
-**Recorded, not remembered:** the ticket carries a `Verified-by:` line naming the DISPATCH
-RUN (provider + run id) and the verdict, with fixer id ≠ verifier id. Naming a run is what
-makes it architectural: an in-process subagent has no run id to cite.
+**Recorded, not remembered:** the verdict is recorded as a TYPED entry naming the DISPATCH
+RUN (provider + run id) and the verdict, with fixer id ≠ verifier id, written by the board's
+one verification writer (Orchard: `node scripts/board-tool.mjs verified --id … --provider …
+--model … --run … --verdict HOLDS|BROKEN|INVALID`) — never a pasted prose `Verified-by:` line,
+which no reader counts as proof. Naming a run is what makes it architectural: an in-process
+subagent has no run id to cite.
 
 **Every charter carries a falsifiable hypothesis — the orchestrator's reading, labelled
 as a guess.** State it explicitly and require it to be tested first:

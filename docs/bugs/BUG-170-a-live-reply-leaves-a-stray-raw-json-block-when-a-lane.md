@@ -141,3 +141,6 @@ node. No streamed text is lost.
   th.settledStream on the same code path as the tool-call/turn-end boundaries that WERE exercised.
 - **Assessment:** regression-prone streaming/render-lifecycle change; this independent pass
   corroborates the fixer's self-verification rather than relying on it.
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch anthropic run af0a69931483a1beb (clean-room, `scripts/independent-verify.mjs`) — VERDICT: HOLDS — CONFIRMED (transcribed by BUG-225 verify from this ticket's line 4, whose shape the shared reader cannot parse)

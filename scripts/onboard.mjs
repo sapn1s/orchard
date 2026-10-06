@@ -98,9 +98,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import url from 'node:url';
+// BUG-146 — the scaffold text is owned in one place so the injector's
+// "is this an unedited stub?" test can never drift from what we emit here.
+import { CONVENTIONS_STUB } from './lib/conventions-stub.mjs';
+// FEAT-106 stage 3 — the ONE place that classifies a project's board layout, so
+// onboard's board placement (fresh → `.orchard/bugs`; legacy → declared in
+// place) agrees with every reader that routes through the same resolver.
+// FEAT-106 round 9 — the guarded target-read helpers are OWNED by board-path.mjs
+// (node-builtins-only, copied into targets), and onboard/fleet-sync import them
+// from there so EVERY target-repo read in scripts/lib/* and both entry scripts
+// comes from one module. Re-exported below for fleet-sync and the verify suites.
+import { boardLayout, resolveBoardDir, readTargetFile, targetBytesEqual } from './lib/board-path.mjs';
+export { readTargetFile, targetBytesEqual };
 
 const __dirname = path.dirname(url.fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
+
+// FEAT-106 — the consolidated project-local directory, the way `.claude/` works.
+// Everything Orchard generates for a target lives under here; `public/` and the
+// scattered `scripts/`/`docs/` copies are never written to a target again.
+const ORCHARD = '.orchard';
 
 // ---------------------------------------------------------------------------
 // Content templates (mirror ~/.claude/skills/tickets/SKILL.md's scaffold
@@ -298,34 +315,19 @@ in that repo's board for the plan to hoist the shared WA to a project-neutral
 location; until then this pointer is coupled to that checkout existing locally.)
 
 Project-specific rules that are NOT universal — i.e. do not belong in the
-shared Working Agreement above — live in \`docs/CONVENTIONS.md\` next to this
-file. A launched Orchard session auto-injects that doc alongside the WA; a
-bare \`claude\` session should read it too.
+shared Working Agreement above — live in \`.orchard/CONVENTIONS.md\`. A launched
+Orchard session auto-injects that doc alongside the WA; a bare \`claude\` session
+should read it too.
 
-This board (\`docs/bugs/\`) is an accumulating-context ticket tracker — see
-\`docs/bugs/README.md\` before filing or working a ticket. \`npm run
-board:check\` catches drift between tickets and the board index.
+Everything Orchard generates for this project lives under \`.orchard/\` (the way
+\`.claude/\` does): the ticket board is \`.orchard/bugs/\` — see
+\`.orchard/bugs/README.md\` before filing or working a ticket — alongside the
+copied board/gate tools. \`npm run board:check\` catches drift between tickets
+and the board index.
 
 _Scaffolded by \`onboard.mjs\` (claude-station FEAT-038)._
 `;
 }
-
-const CONVENTIONS_STUB = `# Project Conventions (local)
-
-Project-specific rules for THIS project only. Anything universal — not
-specific to this project — belongs in the shared Working Agreement instead
-(see that doc's §L, and \`scripts/check-scope.mjs\` in claude-station, which
-flags misfiled universal-sounding lines here and project-specific ones in the
-shared doc).
-
-This file is auto-injected alongside the shared Working Agreement for
-sessions launched on this project (see \`localConventionsSection()\` in
-claude-station's \`src/server/templates.ts\`). Empty/whitespace-only = treated
-as absent, injects nothing.
-
-<!-- Add this project's local rules below. Examples: repo-specific ports to
-     never touch, a stack-specific test command, a directory layout quirk. -->
-`;
 
 const DEPLOY_CONTEXT_STUB = `# Deploy context — what production/public ACTUALLY looks like
 
@@ -399,8 +401,9 @@ ${WA_POINTER_MARKER_END}
 function appendWaPointer(targetDir) {
   const file = path.join(targetDir, 'CLAUDE.md');
   const rel = path.relative(process.cwd(), file);
-  const text = fs.readFileSync(file, 'utf8');
-  if (text.includes(WA_POINTER_MARKER)) {
+  const r = readTargetFile(file);
+  if (!r.ok) return { path: rel, label: 'CLAUDE.md (--wa-pointer)', status: `SKIPPED (CLAUDE.md ${r.reason} — not modified)` };
+  if (r.data.includes(WA_POINTER_MARKER)) {
     return { path: rel, label: 'CLAUDE.md (--wa-pointer)', status: 'exists (pointer already present)' };
   }
   fs.appendFileSync(file, waPointerSection());
@@ -422,9 +425,12 @@ function ensureFile(file, content, label) {
   return { path: rel, label, status: 'created' };
 }
 
+/** Parse a TARGET-repo JSON file through the guarded reader (never blocks). */
 function readJson(file) {
+  const r = readTargetFile(file);
+  if (!r.ok) return null;
   try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
+    return JSON.parse(r.data);
   } catch {
     return null;
   }
@@ -434,52 +440,171 @@ function readJson(file) {
 // Onboard steps
 // ---------------------------------------------------------------------------
 
+/**
+ * FEAT-106 — where this project's board lives, host-relative, as onboard should
+ * declare it in `.orchard/config.json`. FRESH (no board anywhere) → `.orchard/bugs`.
+ * A project that already has a LEGACY `docs/bugs` full of the target's own tickets
+ * is declared IN PLACE (`docs/bugs`) and NEVER relocated — a live board is user
+ * data, not something Orchard provably wrote, so moving it is out of the guarded
+ * cleanup contract. An already-consolidated / declared board keeps its resolved
+ * location. Returns a POSIX host-relative path.
+ */
+function boardRelFor(targetDir) {
+  const layout = boardLayout(targetDir);
+  if (layout === 'none') return `${ORCHARD}/bugs`;
+  if (layout === 'legacy') return 'docs/bugs';
+  const abs = resolveBoardDir(targetDir);
+  return path.relative(path.resolve(targetDir), abs).split(path.sep).join('/');
+}
+
+/**
+ * Scaffold the ticket board. A FRESH project gets `.orchard/bugs/{README,INDEX,
+ * TEMPLATE,TEMPLATE-ARCH}` + `assets/`. A project that already carries a board
+ * (legacy `docs/bugs` or a consolidated one) is left byte-untouched — its
+ * tickets are user data. `ensureFile` is never-clobber besides.
+ */
 function scaffoldBoard(targetDir) {
-  const bugsDir = path.join(targetDir, 'docs', 'bugs');
+  const layout = boardLayout(targetDir);
   const reports = [];
-  reports.push(ensureFile(path.join(bugsDir, 'README.md'), BUGS_README, 'docs/bugs/README.md'));
-  reports.push(ensureFile(path.join(bugsDir, 'INDEX.md'), BUGS_INDEX, 'docs/bugs/INDEX.md'));
-  reports.push(ensureFile(path.join(bugsDir, 'TEMPLATE.md'), BUGS_TEMPLATE, 'docs/bugs/TEMPLATE.md'));
+  if (layout !== 'none') {
+    // Board already exists (legacy or consolidated) — do not re-scaffold or move.
+    const rel = boardRelFor(targetDir);
+    reports.push({ path: rel, label: `${rel}/*`, status: `exists (${layout} board left in place, declared in .orchard/config.json)` });
+    return reports;
+  }
+  const bugsDir = path.join(targetDir, ORCHARD, 'bugs');
+  const base = `${ORCHARD}/bugs`;
+  reports.push(ensureFile(path.join(bugsDir, 'README.md'), BUGS_README, `${base}/README.md`));
+  reports.push(ensureFile(path.join(bugsDir, 'INDEX.md'), BUGS_INDEX, `${base}/INDEX.md`));
+  reports.push(ensureFile(path.join(bugsDir, 'TEMPLATE.md'), BUGS_TEMPLATE, `${base}/TEMPLATE.md`));
   const arch = bugsTemplateArch();
   if (arch) {
-    reports.push(ensureFile(path.join(bugsDir, 'TEMPLATE-ARCH.md'), arch, 'docs/bugs/TEMPLATE-ARCH.md'));
+    reports.push(ensureFile(path.join(bugsDir, 'TEMPLATE-ARCH.md'), arch, `${base}/TEMPLATE-ARCH.md`));
   }
   fs.mkdirSync(path.join(bugsDir, 'assets'), { recursive: true });
   return reports;
 }
 
-function scaffoldWaPointer(targetDir) {
-  const reports = [];
-  reports.push(ensureFile(path.join(targetDir, 'CLAUDE.md'), claudeMd(), 'CLAUDE.md'));
-  reports.push(
-    ensureFile(path.join(targetDir, 'docs', 'CONVENTIONS.md'), CONVENTIONS_STUB, 'docs/CONVENTIONS.md')
-  );
-  return reports;
+const ORCHARD_GITIGNORE = `# Orchard-generated, not checked in.
+bugs/.arch/
+.legacy-backup-*/
+`;
+
+/**
+ * The `.orchard/config.json` a target declares its layout in. `layoutVersion`
+ * lets a later migration recognise the format; `board` is the host-relative
+ * board path the resolver honours (its `declared` precedence). Never clobbers an
+ * existing config (a user may have hand-declared a board path).
+ */
+function orchardConfigJson(boardRel) {
+  const cfg = { layoutVersion: 1 };
+  if (boardRel) cfg.board = boardRel;
+  return JSON.stringify(cfg, null, 2) + '\n';
 }
 
 /**
- * The copied, per-repo tools. Both are single-file, zero-dependency (node
- * builtins only) and `--dir`-aware, which is exactly what makes the copy-not-
- * dependency decision above work. FEAT-056 added arch-watch.mjs — the
- * recurrence detector that raises architecture questions from the project's OWN
- * board — on the same terms: copied here, re-synced by `--force-board-tool`
- * (and fleet-wide by scripts/fleet-sync.mjs), never a shared import.
+ * The root-level scaffold: CLAUDE.md at the target root (the harness reads it
+ * there) + everything else under `.orchard/` — config.json, nested .gitignore,
+ * and CONVENTIONS.md. On UPGRADE a filled-in legacy `docs/CONVENTIONS.md` is
+ * COPIED into `.orchard/CONVENTIONS.md` (content preserved) rather than
+ * re-stubbed, so the user's local rules travel to the new location.
  */
-// board.mjs is no longer zero-dep: it imports ./lib/verdict-contract.mjs, so the
-// copy must carry that too or the copied drift-guard fails to load (the guard's
-// whole point is to WORK in the target — step 1 of the method genuinely running).
+function scaffoldRoot(targetDir, { noBoard = false } = {}) {
+  const reports = [];
+  const orchardDir = path.join(targetDir, ORCHARD);
+  reports.push(ensureFile(path.join(targetDir, 'CLAUDE.md'), claudeMd(), 'CLAUDE.md'));
+  reports.push(ensureFile(path.join(orchardDir, 'config.json'), orchardConfigJson(noBoard ? null : boardRelFor(targetDir)), `${ORCHARD}/config.json`));
+  reports.push(ensureFile(path.join(orchardDir, '.gitignore'), ORCHARD_GITIGNORE, `${ORCHARD}/.gitignore`));
+
+  // CONVENTIONS.md: prefer migrating a non-stub legacy doc into `.orchard/`.
+  const orchardConv = path.join(orchardDir, 'CONVENTIONS.md');
+  const legacyConv = path.join(targetDir, 'docs', 'CONVENTIONS.md');
+  if (fs.existsSync(orchardConv)) {
+    reports.push({ path: `${ORCHARD}/CONVENTIONS.md`, label: `${ORCHARD}/CONVENTIONS.md`, status: 'exists' });
+  } else if (fs.existsSync(legacyConv)) {
+    // Guarded read — a FIFO/dir/oversized file at docs/CONVENTIONS.md must not
+    // block or be migrated (round-6/7 hang); fall back to the stub and note it.
+    const r = readTargetFile(legacyConv);
+    const legacyText = r.ok ? r.data : '';
+    fs.mkdirSync(orchardDir, { recursive: true });
+    fs.writeFileSync(orchardConv, legacyText || CONVENTIONS_STUB);
+    const migratedUser = legacyText && legacyText !== CONVENTIONS_STUB;
+    const status = !r.ok
+      ? `created (from stub — legacy docs/CONVENTIONS.md not migrated: ${r.reason})`
+      : migratedUser ? 'migrated from docs/CONVENTIONS.md (user content preserved)' : 'created (from legacy stub)';
+    reports.push({ path: `${ORCHARD}/CONVENTIONS.md`, label: `${ORCHARD}/CONVENTIONS.md`, status });
+  } else {
+    reports.push(ensureFile(orchardConv, CONVENTIONS_STUB, `${ORCHARD}/CONVENTIONS.md`));
+  }
+  return reports;
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-106 stage 3 — the SINGLE SOURCE mapping every generated file this repo
+// ships into a target to its `.orchard/`-relative destination. Everything the
+// old scattered layout put across `scripts/`, `public/lib/` and `scripts/hooks/`
+// now lands under `.orchard/`; the nine `public/lib/*.js` + the `scripts/lib/*`
+// modules fold into ONE flat `.orchard/lib/`. Every relative import inside these
+// files resolves byte-unchanged because the layout is preserved RELATIVE TO each
+// file's new home (a tool at `.orchard/board.mjs` imports `./lib/x` =
+// `.orchard/lib/x`, exactly as `scripts/board.mjs` imported `scripts/lib/x`); the
+// Stop hook + gate were made candidate-loop / sibling-relative in stage 1 so
+// `.orchard/hooks/…` and `.orchard/gate.mjs` resolve their deps in `.orchard/lib`
+// and `.orchard/` respectively.
 //
-// lib/ticket-schema.mjs joins on the same terms: BOTH board.mjs and
-// arch-watch.mjs import it (it is the one definition of the ticket format and
-// of "done"), so an onboarded repo that lacks it cannot load either tool. It is
-// deliberately import-free — not even node builtins — so copying it out cannot
-// drag anything else along.
-//
-// lib/board-path.mjs joins on the same terms (FEAT-106): it is the ONE place
-// that resolves where an onboarded project keeps its Orchard-generated files
-// (legacy scattered layout vs. the consolidated `.orchard/` one). It is plain
-// ESM, node builtins only, so it copies out cleanly and imports without a build.
-const COPIED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs', 'lib/ticket-schema.mjs', 'lib/board-path.mjs'];
+// `resync` marks a file that is re-copied over an existing divergent copy on
+// EVERY run (the Stop hook — BUG-118; nothing but this project ships it, so a
+// re-copy clobbers only our own stale copy). Everything else is never-clobber
+// unless `--force-board-tool`, preserving any hand-edit under `.orchard/`.
+// ---------------------------------------------------------------------------
+
+// Tools that sit at the top of `.orchard/` (src: scripts/<name>).
+const ORCHARD_TOOLS = ['board.mjs', 'arch-watch.mjs', 'gate.mjs', 'leak-gate.mjs', 'check-nul.mjs'];
+// The response-format Stop hook (src: scripts/hooks/…, dest: .orchard/hooks/…).
+const ORCHARD_HOOK = 'response-format-gate.mjs';
+// The flattened method library. Each entry is a repo-relative source; the
+// basename is its name inside the flat `.orchard/lib/`.
+const ORCHARD_LIB_SOURCES = [
+  'scripts/lib/verdict-contract.mjs', // board.mjs dep
+  'scripts/lib/verification-source.mjs', // board.mjs dep (BUG-225 r3 typed verification source)
+  'scripts/lib/answer-source.mjs', // board.mjs dep (FEAT-166 r3 typed answer stores)
+  'public/lib/ticket-record.js', // verification-source.mjs dep (the one proof rule)
+  'scripts/lib/ticket-schema.mjs', // board.mjs + arch-watch.mjs dep
+  'scripts/lib/board-path.mjs', // board.mjs + hook dep (FEAT-106 resolver)
+  'scripts/lib/readability.mjs', // hook dep
+  'scripts/lib/structure.mjs', // hook dep
+  'scripts/lib/format-metrics.mjs', // hook dep (dynamic import)
+  'scripts/lib/leak-tokens.mjs', // leak-gate.mjs dep
+  'public/lib/response-blocks.js', // hook dep (layer-2 block grammar)
+  'public/lib/digest.js', // hook dep (digest grammar)
+  'public/lib/dom.js', // digest.js closure
+  'public/lib/route.js', // digest.js closure
+];
+
+/**
+ * The full copy manifest for a target: `{ src (abs), dest (abs), label
+ * (.orchard-relative), resync }`. The ONE list that both the writer
+ * (installOrchardFiles) and the legacy-cleanup dry-run reason about, so a file
+ * added here is copied AND its legacy twin is recognised for cleanup.
+ */
+export function orchardFileManifest(targetDir) {
+  const orchardDir = path.join(targetDir, ORCHARD);
+  const out = [];
+  for (const t of ORCHARD_TOOLS) {
+    out.push({ src: path.join(repoRoot, 'scripts', t), dest: path.join(orchardDir, t), label: `${ORCHARD}/${t}`, resync: false });
+  }
+  out.push({
+    src: path.join(repoRoot, 'scripts', 'hooks', ORCHARD_HOOK),
+    dest: path.join(orchardDir, 'hooks', ORCHARD_HOOK),
+    label: `${ORCHARD}/hooks/${ORCHARD_HOOK}`,
+    resync: true,
+  });
+  for (const rel of ORCHARD_LIB_SOURCES) {
+    const name = path.basename(rel);
+    out.push({ src: path.join(repoRoot, rel), dest: path.join(orchardDir, 'lib', name), label: `${ORCHARD}/lib/${name}`, resync: false });
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------------------
 // FEAT-121 — the SINGLE SOURCE of the `npm run <x>` commands onboarding wires
@@ -494,78 +619,51 @@ const COPIED_TOOLS = ['board.mjs', 'arch-watch.mjs', 'lib/verdict-contract.mjs',
 // against an existing project.
 // ---------------------------------------------------------------------------
 const WIRED_NPM_SCRIPTS = {
+  'board:check': 'node .orchard/board.mjs check',
+  'board:gen': 'node .orchard/board.mjs gen',
+  'arch:watch': 'node .orchard/arch-watch.mjs --persist',
+  // FEAT-089: the sanctioned pre-commit gate (leak-gate + typecheck),
+  // invoked as `npm run gate`. Never overwrites a target's own `gate`.
+  gate: 'node .orchard/gate.mjs',
+  // BUG-103: the NUL-in-source guard, also run inside `gate`. Wired standalone
+  // too for discoverability. Never overwrites a target's own.
+  'check:nul': 'node .orchard/check-nul.mjs',
+};
+
+// FEAT-106 stage 3 — the EXACT values onboard used to wire under the legacy
+// scattered layout. A script whose value still matches its legacy entry here is
+// provably onboard's own and is RE-POINTED to the `.orchard/` value on upgrade;
+// any other value is a user customization and is kept + reported. This is the
+// npm-script half of the "only re-point what Orchard provably wrote" rule.
+const LEGACY_NPM_SCRIPTS = {
   'board:check': 'node scripts/board.mjs check',
   'board:gen': 'node scripts/board.mjs gen',
   'arch:watch': 'node scripts/arch-watch.mjs --persist',
-  // FEAT-089: the sanctioned pre-commit gate (leak-gate + typecheck),
-  // invoked as `npm run gate`. Never overwrites a target's own `gate`.
   gate: 'node scripts/gate.mjs',
-  // BUG-103: the NUL-in-source guard, also run inside `gate`. Wired standalone
-  // too for discoverability. Never overwrites a target's own.
   'check:nul': 'node scripts/check-nul.mjs',
 };
 
 // ---------------------------------------------------------------------------
-// FEAT-089 — the method's runtime pieces that today live only in THIS repo:
-// the readability/response-format Stop hook and the sanctioned pre-commit gate.
-// Both are general Claude-Code / node capabilities (nothing Orchard-specific in
-// them) — they simply were never installed anywhere else. onboard now carries
-// them too, under the SAME never-clobber, idempotent, report-what-it-did
-// contract as everything above.
+// FEAT-089 / FEAT-106 — the method's runtime pieces (the readability Stop hook,
+// the sanctioned pre-commit gate + its closure) now travel INSIDE `.orchard/`
+// via orchardFileManifest() above, so the never-clobber-a-target's-own-file
+// worry is gone: `.orchard/` is Orchard's namespace, the way `.claude/` is, and
+// nothing a target owns collides with it. The idempotency contract still holds
+// (a hand-edited copy under `.orchard/` is reported diverged and left, resynced
+// only with `--force-board-tool`; the Stop hook alone is always current).
 // ---------------------------------------------------------------------------
 
 /**
- * Files copied VERBATIM (byte-for-byte) into the target so the format hook and
- * the gate actually run there. Each keeps its repo-relative path, because the
- * hook resolves its own dependencies with relative imports
- * (`../lib/readability.mjs`, `../../public/lib/digest.js`) — copying the whole
- * closure at the same relative layout is what makes those resolve in the
- * target. Same copy-not-shared-dependency rationale as COPIED_TOOLS above:
- * self-contained, keeps working if this repo later moves/renames.
- *
- * NEVER clobbers: a file that already exists at the destination is left exactly
- * as-is and reported `exists` (so a target that happens to ship its own
- * `public/lib/dom.js` is never overwritten — at worst the hook's import of a
- * mismatched local copy fails, and the hook is written to FAIL OPEN, so it goes
- * inert rather than wedging a turn).
- */
-const METHOD_FILES = [
-  // The Stop hook + its dependency closure (readability grader, digest grammar).
-  'scripts/hooks/response-format-gate.mjs',
-  'scripts/lib/readability.mjs',
-  'scripts/lib/structure.mjs',
-  // FEAT-091: layer-2 block grammar + the durable metrics sink the hook writes.
-  // The hook imports both dynamically and fails soft without them, but a target
-  // missing them silently records nothing — which is the whole point of the
-  // feature — so they travel with the hook. The grammar lives in public/lib/ (the
-  // renderer lane moved it there so the hook and the browser UI share ONE parser,
-  // mirroring public/lib/digest.js); the hook imports it as ../../public/lib.
-  'public/lib/response-blocks.js',
-  'scripts/lib/format-metrics.mjs',
-  'public/lib/digest.js',
-  'public/lib/dom.js',
-  'public/lib/route.js',
-  // The sanctioned pre-commit gate wrapper + its one dependency (the leak-gate).
-  'scripts/gate.mjs',
-  'scripts/leak-gate.mjs',
-  // The shared private-token list leak-gate.mjs now imports. Must travel with
-  // it, or the copied gate fails to resolve its import and goes dark — the exact
-  // invisible-false-negative hazard the gate exists to prevent.
-  'scripts/lib/leak-tokens.mjs',
-  // BUG-103: the NUL-in-source guard `gate.mjs` invokes. Must travel with the
-  // gate, or the copied gate fails to spawn it and the onboarded repo carries
-  // the exact invisible-false-negative hazard this guard exists to prevent.
-  'scripts/check-nul.mjs',
-];
-
-/**
- * The Stop-hook entry installed into the target's OWN `.claude/settings.json`.
- * Defined inline (not read from this repo's `.claude/settings.json`, which is
- * gitignored here and may be absent) so the installed config is deterministic.
- * Uses `$CLAUDE_PROJECT_DIR` so it resolves against the target at run time.
+ * The Stop-hook command installed into the target's OWN `.claude/settings.json`.
+ * Points at the consolidated `.orchard/hooks/…` location. Uses
+ * `$CLAUDE_PROJECT_DIR` so it resolves against the target at run time.
  * ADVISORY-ONLY, matching this repo (FEAT-085): it never blocks a turn.
  */
-const STOP_HOOK_COMMAND = 'node "$CLAUDE_PROJECT_DIR/scripts/hooks/response-format-gate.mjs"';
+const STOP_HOOK_COMMAND = `node "$CLAUDE_PROJECT_DIR/${ORCHARD}/hooks/${ORCHARD_HOOK}"`;
+// The exact legacy command onboard used to install (scattered layout). A Stop
+// hook whose command still matches this is provably onboard's own and is
+// RE-POINTED to the `.orchard/` command on upgrade; any other command is left.
+const LEGACY_STOP_HOOK_COMMAND = 'node "$CLAUDE_PROJECT_DIR/scripts/hooks/response-format-gate.mjs"';
 const STOP_HOOK_ENTRY = {
   hooks: [
     {
@@ -578,66 +676,38 @@ const STOP_HOOK_ENTRY = {
 };
 
 /**
- * BUG-118 — the ONE method file that is ALWAYS re-synced over an existing copy.
- *
- * Why a single-file exception rather than a `--force-method` covering all of
- * METHOD_FILES: most of that list has names a target repo can plausibly own
- * itself (`public/lib/dom.js`, `scripts/gate.mjs`), and overwriting those would
- * destroy the target's own code. Nothing but this project ships
- * `scripts/hooks/response-format-gate.mjs`, so re-copying it clobbers only our
- * own earlier copy — there is no user content to lose.
- *
- * ROUND 4 — WHY IT IS NO LONGER BEHIND A FLAG. Round 3 added `--force-hook` and
- * left ordinary onboarding on the never-clobber path, which reported a stale
- * copy as `exists (diverged — left untouched)` and moved on. That is delivery
- * that never arrives: a project onboarded before a hook fix keeps the OLD hook
- * until somebody runs a flag nobody knows to run. It bit exactly that way — a
- * project still holding the round-1 hook (which accepts only `1|true|yes` as
- * the marker) went silent for every genuine launched session once the launcher
- * started sending a session id, and ordinary onboarding left it that way.
- *
- * The never-clobber rule is right for files a user may own. This is not one of
- * them, so it does not get that protection. Re-syncing is reported (`re-synced
- * (stale hook replaced)`), and the target's own git history holds whatever was
- * there before, so an overwrite is visible and recoverable rather than silent.
- * `--force-hook` remains accepted as a no-op alias (fleet-sync passes it).
+ * Copy one manifest entry into the target under `.orchard/`. Because `.orchard/`
+ * is Orchard's namespace (like `.claude/`), no file a target owns collides here,
+ * so the old never-clobber-a-user-file worry is gone — but a HAND-EDITED copy
+ * under `.orchard/` is still respected: a diverged copy is reported and left,
+ * re-synced only with `--force-board-tool`. The Stop hook (`resync: true`) is
+ * the one exception, always kept current (BUG-118), because nothing but this
+ * project ships it and staleness there silently kills the launched-session gate.
  */
-const RESYNCABLE_HOOK = 'scripts/hooks/response-format-gate.mjs';
-
-/** Copy one repo-relative file into the target. Never overwrites an existing
- *  file EXCEPT RESYNCABLE_HOOK, which is ours alone and is always kept current. */
-function copyMethodFile(targetDir, rel, { forceHook = false } = {}) {
-  const src = path.join(repoRoot, rel);
-  const dest = path.join(targetDir, rel);
-  const label = rel;
+function copyOrchardFile(entry, { forceBoardTool = false } = {}) {
+  const { src, dest, label, resync } = entry;
   let srcBytes;
   try {
     srcBytes = fs.readFileSync(src);
   } catch {
-    return { path: rel, label, status: 'SKIPPED (source missing in this repo)' };
+    return { path: label, label, status: 'SKIPPED (source missing in this repo)' };
   }
   if (fs.existsSync(dest)) {
-    // Never clobber. Note when the existing copy differs from source so a
-    // collision (e.g. the target ships its own public/lib/dom.js) is visible.
-    let identical = false;
-    try {
-      identical = fs.readFileSync(dest).equals(srcBytes);
-    } catch {
-      /* unreadable dest — treat as diverged */
-    }
-    if (!identical && rel === RESYNCABLE_HOOK) {
-      // Always, flag or no flag — see RESYNCABLE_HOOK. `forceHook` is kept in the
-      // signature only so existing callers (fleet-sync) stay valid; it changes
-      // nothing.
-      void forceHook;
+    // Guarded read of the target-side copy — a non-regular file where our copy
+    // should be is left untouched (never read/overwrite a FIFO → no hang).
+    const dr = readTargetFile(dest, { encoding: null });
+    if (!dr.ok) return { path: path.relative(process.cwd(), dest), label, status: `exists (${dr.reason} — left untouched)` };
+    const identical = dr.data.equals(srcBytes);
+    if (identical) return { path: path.relative(process.cwd(), dest), label, status: 'exists (identical)' };
+    if (resync) {
       fs.writeFileSync(dest, srcBytes);
       return { path: path.relative(process.cwd(), dest), label, status: 're-synced (stale hook replaced)' };
     }
-    return {
-      path: path.relative(process.cwd(), dest),
-      label,
-      status: identical ? 'exists (identical)' : 'exists (diverged — left untouched)',
-    };
+    if (forceBoardTool) {
+      fs.writeFileSync(dest, srcBytes);
+      return { path: path.relative(process.cwd(), dest), label, status: 're-synced (--force-board-tool)' };
+    }
+    return { path: path.relative(process.cwd(), dest), label, status: 'exists (diverged — rerun with --force-board-tool to re-sync)' };
   }
   fs.mkdirSync(path.dirname(dest), { recursive: true });
   fs.writeFileSync(dest, srcBytes);
@@ -645,13 +715,27 @@ function copyMethodFile(targetDir, rel, { forceHook = false } = {}) {
 }
 
 /**
- * Install / MERGE the Stop-hook config into the target's own
+ * FEAT-106: copy the full `.orchard/` file manifest (board + gate tools, the
+ * Stop hook, the flattened lib closure) into the target, then wire the target's
+ * `.claude` Stop hook.
+ */
+function installOrchardFiles(targetDir, { forceBoardTool = false } = {}) {
+  const reports = [];
+  for (const entry of orchardFileManifest(targetDir)) reports.push(copyOrchardFile(entry, { forceBoardTool }));
+  reports.push(installClaudeHook(targetDir));
+  return reports;
+}
+
+/**
+ * Install / MERGE / RE-POINT the Stop-hook config in the target's own
  * `.claude/settings.json`. Never clobbers an existing settings file:
- *   - no file            → create it with the Stop hook.
- *   - file, no such hook → MERGE our entry into hooks.Stop, preserving all
- *                          other keys and hooks byte-for-value.
- *   - file, hook present → no-op, reported `exists`.
- *   - unparseable file   → SKIPPED (never overwrite a file we can't safely merge).
+ *   - no file                     → create it with the `.orchard/` Stop hook.
+ *   - file already on `.orchard/`  → no-op, reported `exists`.
+ *   - file on the LEGACY command   → re-point that command in place to `.orchard/`
+ *                                    (FEAT-106 upgrade), leaving everything else.
+ *   - file, no such hook           → MERGE our entry into hooks.Stop, preserving
+ *                                    all other keys/hooks byte-for-value.
+ *   - unparseable file             → SKIPPED (never overwrite what we can't merge).
  */
 function installClaudeHook(targetDir) {
   const dir = path.join(targetDir, '.claude');
@@ -669,14 +753,16 @@ function installClaudeHook(targetDir) {
     return { path: rel, label, status: 'created (Stop hook)' };
   }
 
-  let raw;
-  try {
-    raw = fs.readFileSync(file, 'utf8');
-  } catch {
-    return { path: rel, label, status: 'SKIPPED (existing settings unreadable — not overwritten)' };
-  }
-  // Fast idempotence check on the raw text — our hook already wired?
-  if (raw.includes('response-format-gate.mjs')) {
+  // Guarded read — a non-regular `.claude/settings.json` must not block or be
+  // overwritten (round-7 target-read class).
+  const sr = readTargetFile(file);
+  if (!sr.ok) return { path: rel, label, status: `SKIPPED (settings.json ${sr.reason} — not modified)` };
+  const raw = sr.data;
+  // Already on the `.orchard/` command → nothing to do. Match on the path
+  // substring (never quote-escaped inside JSON), NOT the full command string
+  // whose embedded quotes ARE escaped in the file — matching the full string
+  // here silently re-merged a duplicate hook on every re-run.
+  if (raw.includes(`${ORCHARD}/hooks/${ORCHARD_HOOK}`)) {
     return { path: rel, label, status: 'exists (hook already present)' };
   }
   let settings;
@@ -686,6 +772,25 @@ function installClaudeHook(targetDir) {
   } catch {
     return { path: rel, label, status: 'SKIPPED (existing settings not mergeable JSON — not overwritten)' };
   }
+  // Upgrade path: an entry still on the exact LEGACY command is provably ours —
+  // re-point it to `.orchard/` in place, disturbing nothing else.
+  const stop = Array.isArray(settings?.hooks?.Stop) ? settings.hooks.Stop : null;
+  let repointed = false;
+  if (stop) {
+    for (const group of stop) {
+      const hooks = Array.isArray(group?.hooks) ? group.hooks : [];
+      for (const h of hooks) {
+        if (h && h.command === LEGACY_STOP_HOOK_COMMAND) {
+          h.command = STOP_HOOK_COMMAND;
+          repointed = true;
+        }
+      }
+    }
+  }
+  if (repointed) {
+    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
+    return { path: rel, label, status: 're-pointed (legacy Stop-hook command → .orchard/, existing config preserved)' };
+  }
   // Merge: add our Stop entry, disturbing nothing else.
   settings.hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks)) ? settings.hooks : {};
   settings.hooks.Stop = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
@@ -694,46 +799,16 @@ function installClaudeHook(targetDir) {
   return { path: rel, label, status: 'merged (Stop hook added, existing config preserved)' };
 }
 
-/** FEAT-089: copy the format hook + gate closure, then wire the target's .claude hook. */
-function installMethod(targetDir, { forceHook = false } = {}) {
+/**
+ * Wire (and, on upgrade, RE-POINT) the `npm run <x>` board/gate scripts in the
+ * target's package.json. A key that is absent is ADDED with the `.orchard/`
+ * value; a key whose value is EXACTLY the known legacy value is RE-POINTED to
+ * the `.orchard/` value (provably onboard's own — the "only touch what Orchard
+ * wrote" rule); any other value is a user customization and is left + reported.
+ * No package.json → create a minimal one (FEAT-121 half-onboarding trap).
+ */
+function wireNpmScripts(targetDir) {
   const reports = [];
-  for (const rel of METHOD_FILES) reports.push(copyMethodFile(targetDir, rel, { forceHook }));
-  reports.push(installClaudeHook(targetDir));
-  return reports;
-}
-
-function installBoardTool(targetDir, { forceBoardTool }) {
-  const reports = [];
-  for (const tool of COPIED_TOOLS) {
-    const label = `scripts/${tool}`;
-    const src = path.join(repoRoot, 'scripts', tool);
-    const dest = path.join(targetDir, 'scripts', tool);
-    const srcContent = fs.readFileSync(src, 'utf8');
-
-    fs.mkdirSync(path.dirname(dest), { recursive: true });
-    if (!fs.existsSync(dest)) {
-      fs.writeFileSync(dest, srcContent);
-      reports.push({ path: path.relative(process.cwd(), dest), label, status: 'created' });
-    } else if (forceBoardTool) {
-      const identical = fs.readFileSync(dest, 'utf8') === srcContent;
-      if (identical) {
-        reports.push({ path: path.relative(process.cwd(), dest), label, status: 'exists (identical)' });
-      } else {
-        fs.writeFileSync(dest, srcContent);
-        reports.push({ path: path.relative(process.cwd(), dest), label, status: 're-synced (--force-board-tool)' });
-      }
-    } else {
-      const identical = fs.readFileSync(dest, 'utf8') === srcContent;
-      reports.push({
-        path: path.relative(process.cwd(), dest),
-        label,
-        status: identical ? 'exists (identical)' : 'exists (diverged — rerun with --force-board-tool to re-sync)',
-      });
-    }
-  }
-
-  // Wire npm scripts. Never overwrite an existing board:check/board:gen script
-  // (someone may have customized it) — only add the keys if absent.
   const pkgPath = path.join(targetDir, 'package.json');
   if (fs.existsSync(pkgPath)) {
     const pkg = readJson(pkgPath);
@@ -741,50 +816,38 @@ function installBoardTool(targetDir, { forceBoardTool }) {
       pkg.scripts ??= {};
       let changed = false;
       const added = [];
+      const repointed = [];
       const already = [];
+      const kept = [];
       for (const [key, value] of Object.entries(WIRED_NPM_SCRIPTS)) {
-        if (pkg.scripts[key] === undefined) {
+        const cur = pkg.scripts[key];
+        if (cur === undefined) {
           pkg.scripts[key] = value;
           added.push(key);
           changed = true;
-        } else {
+        } else if (cur === value) {
           already.push(key);
+        } else if (cur === LEGACY_NPM_SCRIPTS[key]) {
+          pkg.scripts[key] = value; // provably onboard's own legacy value → re-point
+          repointed.push(key);
+          changed = true;
+        } else {
+          kept.push(key); // user-customized → never overwrite
         }
       }
-      if (changed) {
-        fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-      }
-      reports.push({
-        path: path.relative(process.cwd(), pkgPath),
-        label: 'package.json scripts',
-        status:
-          added.length && already.length
-            ? `added [${added.join(', ')}], already had [${already.join(', ')}]`
-            : added.length
-              ? `added [${added.join(', ')}]`
-              : `already had [${already.join(', ')}]`,
-      });
+      if (changed) fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      const parts = [];
+      if (added.length) parts.push(`added [${added.join(', ')}]`);
+      if (repointed.length) parts.push(`re-pointed to .orchard/ [${repointed.join(', ')}]`);
+      if (already.length) parts.push(`already [${already.join(', ')}]`);
+      if (kept.length) parts.push(`kept customized [${kept.join(', ')}]`);
+      reports.push({ path: path.relative(process.cwd(), pkgPath), label: 'package.json scripts', status: parts.join(', ') || 'no change' });
     } else {
-      // Unparseable existing package.json: we must NOT overwrite it (it is the
-      // user's own file). Leave it, and let the smoke check at the end of
-      // onboard() fail loudly — the emitted docs reference npm-run commands
-      // that cannot resolve here, and silently proceeding is the exact
-      // half-onboarding trap FEAT-121 exists to close.
       reports.push({ path: pkgPath, label: 'package.json scripts', status: 'SKIPPED (package.json unparseable — not overwritten; smoke check will flag the dead npm-run refs)' });
     }
   } else {
-    // FEAT-121: NO package.json. Previously onboarding SKIPPED wiring here and
-    // moved on — leaving a CLAUDE.md / docs/bugs/README.md that reference
-    // `npm run board:check` etc. with NOTHING to resolve them (the
-    // trading_volume half-onboarding: every documented board command failed
-    // outright, undetected). Onboarding writes those docs, so onboarding owns
-    // making them TRUE: create a minimal package.json exposing exactly the
-    // board scripts the docs reference. Chosen over rewriting the docs to
-    // `node scripts/board.mjs …` because the method's whole UX is `npm run
-    // board:*` — one dialect everywhere beats a second, no-package.json-only
-    // dialect that every other doc example contradicts. A minimal, private,
-    // dependency-free package.json is small and standard, and makes every
-    // emitted npm-run reference resolve uniformly.
+    // FEAT-121: NO package.json → create a minimal one so the emitted docs'
+    // `npm run board:*` commands resolve (the trading_volume half-onboarding).
     const pkg = {
       name: path.basename(path.resolve(targetDir)).toLowerCase().replace(/[^a-z0-9._-]+/g, '-') || 'onboarded-project',
       version: '0.0.0',
@@ -798,7 +861,6 @@ function installBoardTool(targetDir, { forceBoardTool }) {
       status: `created (minimal — wired [${Object.keys(WIRED_NPM_SCRIPTS).join(', ')}] so the emitted docs' npm-run commands resolve)`,
     });
   }
-
   return reports;
 }
 
@@ -840,11 +902,11 @@ function extractNpmRunRefs(text) {
  */
 function emittedDocTemplates() {
   return [
-    { file: 'docs/bugs/README.md', text: BUGS_README },
-    { file: 'docs/bugs/INDEX.md', text: BUGS_INDEX },
-    { file: 'docs/bugs/TEMPLATE.md', text: BUGS_TEMPLATE },
+    { file: '.orchard/bugs/README.md', text: BUGS_README },
+    { file: '.orchard/bugs/INDEX.md', text: BUGS_INDEX },
+    { file: '.orchard/bugs/TEMPLATE.md', text: BUGS_TEMPLATE },
     { file: 'CLAUDE.md', text: claudeMd() },
-    { file: 'docs/CONVENTIONS.md', text: CONVENTIONS_STUB },
+    { file: '.orchard/CONVENTIONS.md', text: CONVENTIONS_STUB },
   ];
 }
 
@@ -916,6 +978,402 @@ function smokeCheckReports(targetDir) {
 }
 
 // ---------------------------------------------------------------------------
+// FEAT-106 stage 3 — GUARDED cleanup of the legacy scattered layout.
+//
+// High stakes: this deletes files in a TARGET repo. THE INVARIANT (hardened
+// across three cross-provider verify rounds):
+//
+//   Cleanup only ever removes a REGULAR FILE that lies INSIDE the target repo
+//   (realpath-checked; a symlink is never followed or traversed), whose captured
+//   bytes equal the bytes hash-matched as Orchard-written — and, stated as byte
+//   conservation: EVERY INODE OBSERVED AT A CLEANUP PATH AT ANY MOMENT DURING THE
+//   RUN STILL EXISTS AFTERWARDS, either at the path or in the run's backup dir.
+//   (Round 5 sharpened this from "path bytes" to "inode": an editor's atomic save
+//   swaps the inode under the path, so the removal must move the exact inode it
+//   captured, never re-resolve and unlink the path.)
+//
+// How each clause is enforced:
+//   - "regular file, symlinks never followed/traversed, inside the repo":
+//     `safeRemovable` walks the path component-by-component with lstat (like the
+//     store-isolation guard), REFUSING the moment any component is a symlink or
+//     a non-directory ancestor, requiring the leaf to be a regular file, and
+//     realpath-confining the result under the resolved repo root. A `public`
+//     that is a symlink (the round-1 escape: `public` → operator HOME) is thus
+//     never traversed — the whole dir is KEPT and reported.
+//   - "captured bytes == hash-matched, and no inode is ever destroyed": the
+//     forward move is a SINGLE atomic `rename(original → uniqueBackupPath)` into a
+//     FRESH per-run backup dir (`mkdtemp`, collision-proof). rename captures
+//     exactly the inode at the path at that instant and cannot clobber a unique
+//     destination; EXDEV (backup on another fs) refuses rather than copy+delete.
+//     The captured inode is re-hashed against the Orchard source; if it is not
+//     Orchard's, it is put BACK with a no-clobber `link()`+`unlink(backupName)`
+//     — so a NEW user file that has taken the original path is never overwritten
+//     (round-3 FINDING 2), and the unlink only ever drops the BACKUP name whose
+//     inode we hold, never the original path (round-4 hole: an atomic save between
+//     a forward link and unlink made unlink destroy the user's new inode).
+//
+//   - "captured leaf is a regular file": at the INSTANT before capture the leaf
+//     is re-lstat'd and REFUSED IN PLACE if it is not a regular file, and the
+//     CAPTURED inode is type-checked before any read — so a FIFO / directory /
+//     symlink swapped in after the scan can never hang a blocking read or empty
+//     the original path (round-5 FINDINGS 2 & 3).
+//
+// THREAT MODEL (explicit). This defends BENIGN CONCURRENCY: the user (or their
+// tools) reading, creating, or editing their OWN files in the target while
+// onboarding runs. It does NOT defend against an ADVERSARY who can write to the
+// target repo DURING onboarding — such an actor can already do worse directly,
+// so openat/O_NOFOLLOW dir-handle machinery is deliberately NOT built. The one
+// adversarial race we narrow cheaply (round-3 FINDING 3): an ancestor dir swapped
+// for an outside-pointing symlink AFTER `safeRemovable` but BEFORE the move. We
+// re-validate the parent's realpath immediately before every move and ABORT the
+// WHOLE cleanup (leaving everything else in place) on any mismatch. This shrinks
+// the window to the interval between one realpath read and one link() call; the
+// residual race is ACCEPTED as out of the threat model, stated here so a later
+// reader does not mistake it for an oversight.
+//
+// Two more residual races are likewise ACCEPTED (attacker with write access to
+// the target mid-onboarding): a process placing a user inode at our private,
+// unpredictable mkdtemp backup dest in the check→rename gap (round-5 FINDING 1 —
+// nothing benign knows that path), and a leaf swapped in the gap between the
+// capture-time regular-file re-lstat and the rename. Neither is reachable by
+// benign concurrency; closing them needs renameat2(NOREPLACE)/openat handles Node
+// does not expose, which the threat model does not warrant.
+//
+// Dry-run by DEFAULT; `--migrate` applies. Idempotent: once cleaned, a re-run
+// finds nothing. The board (`docs/bugs` — user tickets) is never in the delete
+// set; the operator home is out of scope and is never enumerated.
+// ---------------------------------------------------------------------------
+
+// The exact target-relative paths onboard used to scatter under the legacy
+// layout. Source for the byte-compare is the same repo-relative path.
+const LEGACY_TOOL_FILES = [
+  'scripts/board.mjs', 'scripts/arch-watch.mjs', 'scripts/gate.mjs', 'scripts/leak-gate.mjs', 'scripts/check-nul.mjs',
+  'scripts/hooks/response-format-gate.mjs',
+  'scripts/lib/verdict-contract.mjs', 'scripts/lib/ticket-schema.mjs', 'scripts/lib/board-path.mjs',
+  'scripts/lib/readability.mjs', 'scripts/lib/structure.mjs', 'scripts/lib/format-metrics.mjs', 'scripts/lib/leak-tokens.mjs',
+];
+// The legacy public/lib files. The whole root public/ is only deletable if it
+// contains nothing but these (current-source) files.
+const LEGACY_PUBLIC_FILES = ['public/lib/response-blocks.js', 'public/lib/digest.js', 'public/lib/dom.js', 'public/lib/route.js'];
+
+/**
+ * Resolve `targetDir`'s realpath, or null if it cannot be resolved. Every
+ * cleanup path is checked against THIS, and paths are walked FROM it, so a
+ * symlinked target is resolved once up front and everything downstream stays
+ * inside the real repo.
+ */
+export function resolveRootReal(targetDir) {
+  try { return fs.realpathSync(targetDir); } catch { return null; }
+}
+
+/**
+ * Return `{ ok:true, abs }` only if `relPath` under `rootReal` is SAFE to
+ * remove: every path component exists and is NOT a symlink (never followed or
+ * traversed), every ancestor is a real directory, the leaf is a REGULAR file,
+ * and the realpath is confined to the repo. Otherwise `{ ok:false, reason }`.
+ */
+export function safeRemovable(rootReal, relPath) {
+  const parts = relPath.split('/').filter(Boolean);
+  if (parts.length === 0) return { ok: false, reason: 'empty path' };
+  let cur = rootReal;
+  for (let i = 0; i < parts.length; i++) {
+    cur = path.join(cur, parts[i]);
+    let st;
+    try { st = fs.lstatSync(cur); } catch { return { ok: false, reason: 'absent' }; }
+    if (st.isSymbolicLink()) return { ok: false, reason: `symlink component '${parts.slice(0, i + 1).join('/')}' — not followed` };
+    const last = i === parts.length - 1;
+    if (last) {
+      if (!st.isFile()) return { ok: false, reason: 'not a regular file' };
+    } else if (!st.isDirectory()) {
+      return { ok: false, reason: `non-directory ancestor '${parts[i]}'` };
+    }
+  }
+  // Belt & braces: the component walk already refused every symlink, so realpath
+  // must equal the lexical path under rootReal. Confirm it never escaped, and
+  // capture the PARENT's realpath so the apply step can re-validate it at the
+  // instant of the move (round-3 FINDING 3 window-narrowing).
+  let real, parentReal;
+  try {
+    real = fs.realpathSync(cur);
+    parentReal = fs.realpathSync(path.dirname(cur));
+  } catch { return { ok: false, reason: 'realpath failed' }; }
+  if (real !== cur && !real.startsWith(rootReal + path.sep)) return { ok: false, reason: 'realpath escapes the target repo' };
+  if (parentReal !== rootReal && !parentReal.startsWith(rootReal + path.sep)) return { ok: false, reason: 'parent realpath escapes the target repo' };
+  return { ok: true, abs: cur, parentReal };
+}
+
+/**
+ * Enumerate a REAL directory without ever following a symlink. Returns regular
+ * files (relative to `baseAbs`, posix) and a separate list of any symlink /
+ * non-regular entries encountered (which alone disqualify a wholesale removal).
+ */
+function scanNoFollow(baseAbs, relBase = '', acc = { files: [], symlinks: [], unreadable: false }) {
+  let entries;
+  try { entries = fs.readdirSync(baseAbs, { withFileTypes: true }); } catch { acc.unreadable = true; return acc; }
+  for (const e of entries) {
+    const childRel = relBase ? `${relBase}/${e.name}` : e.name;
+    const childAbs = path.join(baseAbs, e.name);
+    if (e.isSymbolicLink()) { acc.symlinks.push(childRel); continue; } // NEVER follow
+    if (e.isDirectory()) scanNoFollow(childAbs, childRel, acc);
+    else if (e.isFile()) acc.files.push(childRel);
+    else acc.symlinks.push(childRel); // socket/fifo/device — a non-regular entry, treat as disqualifying
+  }
+  return acc;
+}
+
+/**
+ * Remove `abs` (a safe-checked regular file) ATOMICALLY by renaming it into the
+ * backup dir, then verifying the moved bytes equal the Orchard source. rename is
+ * atomic within one filesystem (the backup dir lives under the repo's own
+ * `.orchard/`), so the file is never in a half-state and never lost. If a
+ * concurrent writer changed it between the hash-match and the rename, the moved
+ * bytes will NOT match — rename it straight back and report the race (KEPT). A
+ * cross-filesystem or permission error means we cannot do this atomically, so we
+ * refuse and leave the file untouched (never fall back to copy-then-delete,
+ * which is the very TOCTOU this design removes).
+ */
+/**
+ * Move `src` → `dst` WITHOUT ever overwriting an existing `dst`. `link()` FAILS
+ * with EEXIST if `dst` exists (the atomic no-clobber guarantee) and with EXDEV
+ * across filesystems; on success `src` and `dst` briefly share one inode, then
+ * `src`'s name is unlinked, leaving the exact bytes at `dst`. A crash between the
+ * two steps leaves BOTH names on one inode — no byte is ever lost. If the unlink
+ * of `src` fails, the freshly-made `dst` link is removed again so no duplicate is
+ * left and `src` stays intact. Throws on any failure; never overwrites.
+ */
+export function noClobberMove(src, dst) {
+  fs.mkdirSync(path.dirname(dst), { recursive: true });
+  fs.linkSync(src, dst); // EEXIST if dst exists; EXDEV across filesystems
+  try {
+    fs.unlinkSync(src);
+  } catch (e) {
+    try { fs.unlinkSync(dst); } catch { /* leave dst; the bytes are still safe there */ }
+    throw e;
+  }
+}
+
+/**
+ * `hooks` is a TEST-ONLY seam (undefined in production): `afterCapture` and
+ * `beforePutBack` let a test inject a concurrent editor atomic-save at the exact
+ * instants a real race could occur, so the byte-conservation invariant is proven
+ * deterministically rather than by luck.
+ */
+export function atomicRemoveVerified(abs, relPath, srcAbs, backupDir, hooks = {}) {
+  const dest = path.join(backupDir, relPath);
+  // FORWARD (CAPTURE) — a SINGLE atomic `rename` moves whatever inode currently
+  // sits at `abs` into a UNIQUE backup path, capturing exactly that inode. We
+  // NEVER unlink `abs` by path (the round-4 hole: an editor's atomic save landing
+  // between a link() and an unlink() made unlink destroy the user's NEW inode).
+  // With a single rename there is no such window: an atomic save either PRECEDES
+  // this rename (we capture the new inode, hash-fail, and put it back) or FOLLOWS
+  // it (abs is already free; the save recreates abs; we never touch that path
+  // again). `dest` is inside a fresh mkdtemp dir with a unique relpath, so it
+  // never pre-exists; we still refuse if it somehow does, so no prior backup inode
+  // is ever clobbered (round-3 FINDING 1).
+  // RE-ASSERT the leaf is a REGULAR FILE at the instant of capture. safeRemovable
+  // checked it at scan; a FIFO / directory / symlink swapped in since (a leaf
+  // swap) must be REFUSED IN PLACE, never captured — else we would blocking-read
+  // a FIFO (hang) or empty the original path for a directory whose put-back can't
+  // link (round-5 FINDINGS 2 & 3). The residual microsecond between this lstat and
+  // the rename is an ACCEPTED adversarial gap (an attacker with write access to
+  // the target mid-onboarding — out of the threat model).
+  let leafLst;
+  try { leafLst = fs.lstatSync(abs); } catch { return { removed: false, reason: 'not removed (leaf vanished before capture; left in place)' }; }
+  if (!leafLst.isFile()) {
+    const kind = leafLst.isDirectory() ? 'directory' : leafLst.isSymbolicLink() ? 'symlink' : leafLst.isFIFO() ? 'FIFO' : 'special file';
+    return { removed: false, reason: `not removed (leaf is a ${kind} at capture, not a regular file — refused IN PLACE, never captured)` };
+  }
+  // Backup-dest guard (round-3 FINDING 1). The dest lives in a fresh, unpredictable
+  // per-run mkdtemp dir, so nothing BENIGN can occupy it; the residual check→rename
+  // gap is only reachable by an attacker racing our private backup dir (out of
+  // the threat model). Refuse rather than clobber if it somehow pre-exists.
+  let destLst = null;
+  try { destLst = fs.lstatSync(dest); } catch { destLst = null; }
+  if (destLst) return { removed: false, reason: `not removed (backup dest already exists — refusing to overwrite: ${dest})` };
+  try {
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.renameSync(abs, dest); // EXDEV if the backup is on another fs → refuse below
+  } catch (e) {
+    return { removed: false, reason: `not removed (capture-move failed: ${e.code || e.message}; left in place — never a copy+delete)` };
+  }
+  if (hooks.afterCapture) hooks.afterCapture({ abs, dest });
+  // Type-guard the CAPTURED inode before ANY read: never blocking-read a
+  // non-regular inode (defence-in-depth for the residual pre-check→rename gap).
+  let capturedRegular = false;
+  try { capturedRegular = fs.lstatSync(dest).isFile(); } catch { capturedRegular = false; }
+  // Authoritative check: the (regular) inode we captured carries the Orchard
+  // bytes. Routed through the CAPPED reader (round-9): a legacy file grown past
+  // the cap between classification and capture is bounded, not read unbounded —
+  // and, being oversized, is correctly judged "not Orchard" and put back.
+  if (capturedRegular && targetBytesEqual(dest, srcAbs)) return { removed: true };
+  if (hooks.beforePutBack) hooks.beforePutBack({ abs, dest });
+  // PUT-BACK — no-clobber (round-3 FINDING 2): link the captured inode back to the
+  // original path; if a NEW file now occupies it, link fails EEXIST and we keep
+  // the captured bytes in the backup rather than overwrite the new file. The
+  // unlink here drops the BACKUP name (whose inode we captured), never the
+  // original path, so no un-captured inode is ever removed.
+  try {
+    noClobberMove(dest, abs);
+    return { removed: false, reason: 'KEPT (changed between hash-check and removal — restored, not deleted)' };
+  } catch (e) {
+    if (e.code === 'EEXIST') return { removed: false, reason: `KEPT-in-backup (original path re-occupied by a new file during cleanup — NOT overwritten; the removed bytes are preserved in the backup: ${dest})` };
+    return { removed: false, reason: `KEPT-in-backup (put-back failed: ${e.code || e.message}; the removed bytes are safe at ${dest})` };
+  }
+}
+
+/**
+ * Compute (and, with `apply`, perform) the guarded cleanup. Returns report lines.
+ * Writes nothing unless `apply` is true. See the invariant at the top of this
+ * section. The board (`docs/bugs` — user tickets) is never in the delete set.
+ */
+function cleanupLegacy(targetDir, { apply = false } = {}) {
+  const reports = [];
+  const rootReal = resolveRootReal(targetDir);
+  if (!rootReal) return [{ path: '', label: 'legacy cleanup', status: 'SKIPPED (target realpath unresolvable — refusing to enumerate)' }];
+  const toDelete = []; // { rel, src, parentReal } — proven safe + Orchard-written at classification time
+  let found = false;
+
+  // 1. Scattered tool files.
+  for (const rel of LEGACY_TOOL_FILES) {
+    if (!fs.existsSync(path.join(rootReal, rel))) continue;
+    found = true;
+    const safe = safeRemovable(rootReal, rel);
+    if (!safe.ok) { reports.push({ path: rel, label: `legacy ${rel}`, status: `KEPT (${safe.reason})` }); continue; }
+    const src = path.join(repoRoot, rel);
+    if (targetBytesEqual(safe.abs, src)) toDelete.push({ rel, src, parentReal: safe.parentReal });
+    else reports.push({ path: rel, label: `legacy ${rel}`, status: 'KEPT (diverged from Orchard source — user-modified or stale; review manually)' });
+  }
+
+  // 2. Legacy stub docs — deletable only if still the exact unedited stub.
+  const docChecks = [
+    { rel: 'docs/CONVENTIONS.md', stub: CONVENTIONS_STUB },
+    { rel: 'docs/DEPLOY-CONTEXT.md', stub: DEPLOY_CONTEXT_STUB },
+  ];
+  for (const { rel, stub } of docChecks) {
+    if (!fs.existsSync(path.join(rootReal, rel))) continue;
+    found = true;
+    const safe = safeRemovable(rootReal, rel);
+    if (!safe.ok) { reports.push({ path: rel, label: `legacy ${rel}`, status: `KEPT (${safe.reason})` }); continue; }
+    const dr = readTargetFile(safe.abs); // guarded — a non-regular doc never blocks
+    const text = dr.ok ? dr.data : null;
+    // A stub doc is Orchard-written verbatim; an exact string match is the test.
+    if (text === stub) toDelete.push({ rel, src: null, stub, parentReal: safe.parentReal });
+    else reports.push({ path: rel, label: `legacy ${rel}`, status: 'KEPT (edited — user content; migrated into .orchard/ where applicable, legacy copy left for you to remove)' });
+  }
+
+  // 3. The root public/ — wholesale, only if nothing but current Orchard files
+  //    AND no symlink anywhere in it. A symlinked `public` (the round-1 escape)
+  //    is never traversed.
+  const publicAbs = path.join(rootReal, 'public');
+  let publicLst = null;
+  try { publicLst = fs.lstatSync(publicAbs); } catch { publicLst = null; }
+  const publicToDelete = [];
+  if (publicLst) {
+    found = true;
+    if (publicLst.isSymbolicLink()) {
+      reports.push({ path: 'public', label: 'legacy public/', status: 'KEPT (public/ is a SYMLINK — never followed or removed; may point outside the repo)' });
+    } else if (!publicLst.isDirectory()) {
+      reports.push({ path: 'public', label: 'legacy public/', status: 'KEPT (public/ is not a directory)' });
+    } else {
+      const scan = scanNoFollow(publicAbs);
+      const known = new Map(LEGACY_PUBLIC_FILES.map((rel) => [rel, path.join(repoRoot, rel)]));
+      if (scan.unreadable) {
+        reports.push({ path: 'public', label: 'legacy public/', status: 'KEPT (public/ unreadable)' });
+      } else if (scan.symlinks.length) {
+        reports.push({ path: 'public', label: 'legacy public/', status: `KEPT WHOLE dir — contains ${scan.symlinks.length} symlink/non-regular entry(ies) (never traversed): [${scan.symlinks.slice(0, 8).join(', ')}${scan.symlinks.length > 8 ? ', …' : ''}]` });
+      } else if (scan.files.length === 0) {
+        reports.push({ path: 'public', label: 'legacy public/', status: 'KEPT (empty — not created by this onboard; left as-is)' });
+      } else {
+        const unexpected = [];
+        for (const r of scan.files) {
+          const rel = `public/${r}`;
+          const src = known.get(rel);
+          const safe = safeRemovable(rootReal, rel);
+          if (!safe.ok || !src || !targetBytesEqual(safe.abs, src)) unexpected.push(rel);
+          else publicToDelete.push({ rel, src, parentReal: safe.parentReal });
+        }
+        if (unexpected.length) {
+          reports.push({ path: 'public', label: 'legacy public/', status: `KEPT WHOLE dir — contains ${unexpected.length} non-Orchard/diverged entry(ies): [${unexpected.slice(0, 8).join(', ')}${unexpected.length > 8 ? ', …' : ''}]` });
+        } else {
+          for (const d of publicToDelete) toDelete.push(d);
+          reports.push({ path: 'public', label: 'legacy public/', status: apply ? `whole dir removed (${publicToDelete.length} Orchard file(s), backed up)` : `would remove WHOLE dir (${publicToDelete.length} Orchard file(s) — nothing else present)` });
+        }
+      }
+    }
+  }
+
+  if (!found) {
+    reports.push({ path: '', label: 'legacy cleanup', status: 'no legacy layout found (nothing to clean up)' });
+    return reports;
+  }
+
+  if (!apply) {
+    for (const { rel } of toDelete) {
+      reports.push({ path: rel, label: `legacy ${rel}`, status: 'would remove (matches Orchard source — run --migrate to apply)' });
+    }
+    if (toDelete.length) reports.push({ path: '', label: 'legacy cleanup', status: `DRY-RUN — ${toDelete.length} file(s) would be removed; re-run with --migrate to apply (atomic backup-move first)` });
+    return reports;
+  }
+
+  // Apply: create a FRESH, collision-proof backup dir for THIS run (`mkdtemp`
+  // guarantees uniqueness even within the same millisecond — round-3 FINDING 1).
+  // Only now, since dry-run writes nothing.
+  let backupDir;
+  try {
+    fs.mkdirSync(path.join(rootReal, ORCHARD), { recursive: true });
+    backupDir = fs.mkdtempSync(path.join(rootReal, ORCHARD, '.legacy-backup-'));
+  } catch (e) {
+    reports.push({ path: '', label: 'legacy cleanup', status: `SKIPPED (could not create a backup dir: ${e.code || e.message}; nothing removed)` });
+    return reports;
+  }
+
+  // For each file, RE-CHECK safety AND re-validate the parent realpath at the
+  // instant before the move; on any ancestor swap, ABORT the whole cleanup.
+  let removedCount = 0;
+  for (const item of toDelete) {
+    const { rel, src, stub, parentReal } = item;
+    const safe = safeRemovable(rootReal, rel);
+    if (!safe.ok) {
+      // 'absent' = the user removed it themselves since the scan — benign, skip.
+      if (safe.reason === 'absent') { reports.push({ path: rel, label: `legacy ${rel}`, status: 'SKIPPED (removed by someone else since scan)' }); continue; }
+      // Anything else (a symlink/non-regular where a regular file stood at scan)
+      // is an ancestor/leaf swap under us — round-3 FINDING 3 signal. HALT.
+      reports.push({ path: rel, label: `legacy ${rel}`, status: `ABORTED — became unsafe since scan (${safe.reason}); whole cleanup halted, everything else left in place.` });
+      break;
+    }
+    // round-3 FINDING 3 (adversarial window-narrowing): if the parent's realpath
+    // changed since the scan (an ancestor swapped for a symlink pointing
+    // elsewhere), STOP everything rather than move through the new path.
+    if (safe.parentReal !== parentReal) {
+      reports.push({ path: rel, label: `legacy ${rel}`, status: `ABORTED — parent path changed since scan ('${parentReal}' → '${safe.parentReal}'); possible ancestor symlink swap. Whole cleanup halted; everything else left in place.` });
+      break;
+    }
+    // For a stub doc there is no source file to hash against; materialise the
+    // exact stub bytes into a throwaway so removal verifies against them too.
+    let srcAbs = src;
+    let tmpStub = null;
+    if (srcAbs === null && typeof stub === 'string') {
+      tmpStub = path.join(backupDir, `.stub-ref-${path.basename(rel)}`);
+      try { fs.writeFileSync(tmpStub, stub); } catch { tmpStub = null; }
+      srcAbs = tmpStub;
+    }
+    if (!srcAbs) { reports.push({ path: rel, label: `legacy ${rel}`, status: 'SKIPPED (could not materialise reference bytes)' }); continue; }
+    const res = atomicRemoveVerified(safe.abs, rel, srcAbs, backupDir);
+    if (tmpStub) { try { fs.rmSync(tmpStub); } catch { /* ignore */ } }
+    if (res.removed) { removedCount++; reports.push({ path: rel, label: `legacy ${rel}`, status: 'removed (no-clobber move into .orchard/.legacy-backup-*)' }); }
+    else reports.push({ path: rel, label: `legacy ${rel}`, status: res.reason });
+  }
+  // Prune now-empty legacy container dirs. rmdir refuses a non-empty dir and a
+  // symlink (ENOTDIR), so this can never follow a link or delete user content.
+  for (const rel of ['scripts/hooks', 'scripts/lib', 'public/lib', 'public']) {
+    try { fs.rmdirSync(path.join(rootReal, rel)); } catch { /* non-empty, symlink, or absent — leave */ }
+  }
+  if (removedCount) reports.push({ path: path.relative(process.cwd(), backupDir), label: 'legacy backup', status: `${removedCount} file(s) moved here (no-clobber) before removal` });
+  else { try { fs.rmdirSync(backupDir); } catch { /* not empty — a stub-ref or KEPT-in-backup file remains; leave it */ } }
+  return reports;
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -927,6 +1385,7 @@ function parseArgs(argv) {
   let waPointer = false;
   let deployContext = false;
   let verifyOnly = false;
+  let migrate = false;
   for (const a of argv) {
     if (a === '--no-board') noBoard = true;
     else if (a === '--force-board-tool') forceBoardTool = true;
@@ -934,14 +1393,36 @@ function parseArgs(argv) {
     else if (a === '--wa-pointer') waPointer = true;
     else if (a === '--deploy-context') deployContext = true;
     else if (a === '--verify-only') verifyOnly = true;
+    else if (a === '--migrate') migrate = true;
     else if (a.startsWith('--dir=')) targetDir = a.slice('--dir='.length);
     else if (!a.startsWith('--')) targetDir = a;
   }
-  return { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly };
+  return { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly, migrate };
 }
 
-export function onboard(targetDir, { noBoard = false, forceBoardTool = false, forceHook = false, waPointer = false, deployContext = false } = {}) {
+/** FEAT-106 opt-in: `.orchard/DEPLOY-CONTEXT.md`, migrating a filled-in legacy copy. */
+function scaffoldDeployContext(targetDir) {
+  const orchardDc = path.join(targetDir, ORCHARD, 'DEPLOY-CONTEXT.md');
+  const legacyDc = path.join(targetDir, 'docs', 'DEPLOY-CONTEXT.md');
+  const label = `${ORCHARD}/DEPLOY-CONTEXT.md`;
+  if (fs.existsSync(orchardDc)) return { path: label, label, status: 'exists' };
+  if (fs.existsSync(legacyDc)) {
+    const r = readTargetFile(legacyDc); // guarded — never block on a FIFO/dir
+    const text = r.ok ? r.data : '';
+    fs.mkdirSync(path.dirname(orchardDc), { recursive: true });
+    fs.writeFileSync(orchardDc, text || DEPLOY_CONTEXT_STUB);
+    const migratedUser = text && text !== DEPLOY_CONTEXT_STUB;
+    const status = !r.ok
+      ? `created (from stub — legacy docs/DEPLOY-CONTEXT.md not migrated: ${r.reason})`
+      : migratedUser ? 'migrated from docs/DEPLOY-CONTEXT.md (user content preserved)' : 'created (from legacy stub)';
+    return { path: label, label, status };
+  }
+  return ensureFile(orchardDc, DEPLOY_CONTEXT_STUB, label);
+}
+
+export function onboard(targetDir, { noBoard = false, forceBoardTool = false, forceHook = false, waPointer = false, deployContext = false, migrate = false } = {}) {
   if (!targetDir) throw new Error('onboard: target dir is required');
+  void forceHook; // accepted as a no-op alias (the Stop hook is always resynced)
   const resolved = path.resolve(targetDir);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
     throw new Error(`onboard: not a directory: ${resolved}`);
@@ -951,12 +1432,14 @@ export function onboard(targetDir, { noBoard = false, forceBoardTool = false, fo
   if (!noBoard) {
     reports.push(...scaffoldBoard(resolved));
   } else {
-    reports.push({ path: path.join(path.relative(process.cwd(), resolved), 'docs/bugs'), label: 'docs/bugs/*', status: 'SKIPPED (--no-board)' });
+    reports.push({ path: `${ORCHARD}/bugs`, label: `${ORCHARD}/bugs/*`, status: 'SKIPPED (--no-board)' });
   }
-  const waReports = scaffoldWaPointer(resolved);
-  reports.push(...waReports);
+  // Root CLAUDE.md + everything else under .orchard/ (config.json, .gitignore,
+  // CONVENTIONS.md).
+  const rootReports = scaffoldRoot(resolved, { noBoard });
+  reports.push(...rootReports);
   if (waPointer) {
-    const claudeMdReport = waReports.find((r) => r.label === 'CLAUDE.md');
+    const claudeMdReport = rootReports.find((r) => r.label === 'CLAUDE.md');
     if (claudeMdReport && claudeMdReport.status === 'exists') {
       // Only a PRE-EXISTING CLAUDE.md needs the append — a fresh
       // onboard-authored one (status 'created') already has the full pointer.
@@ -964,14 +1447,14 @@ export function onboard(targetDir, { noBoard = false, forceBoardTool = false, fo
     }
   }
   if (deployContext) {
-    // FEAT-050 opt-in: DEPLOY-CONTEXT.md stub for the commit gatekeeper.
-    reports.push(
-      ensureFile(path.join(resolved, 'docs', 'DEPLOY-CONTEXT.md'), DEPLOY_CONTEXT_STUB, 'docs/DEPLOY-CONTEXT.md')
-    );
+    reports.push(scaffoldDeployContext(resolved));
   }
-  reports.push(...installBoardTool(resolved, { forceBoardTool }));
-  // FEAT-089: the format/readability Stop hook + the sanctioned gate wrapper.
-  reports.push(...installMethod(resolved, { forceHook }));
+  // FEAT-106: the board/gate tools + Stop hook + flattened lib, all under .orchard/.
+  reports.push(...installOrchardFiles(resolved, { forceBoardTool }));
+  // package.json script values, re-pointed to .orchard/ (guarded).
+  reports.push(...wireNpmScripts(resolved));
+  // Guarded cleanup of the legacy scattered layout (dry-run unless --migrate).
+  reports.push(...cleanupLegacy(resolved, { apply: migrate }));
   // FEAT-121: prove the instructions we just wrote actually work — every
   // `npm run <x>` the emitted docs reference must resolve to a real script.
   // A fresh onboard that left dead commands now fails LOUDLY here.
@@ -982,17 +1465,21 @@ export function onboard(targetDir, { noBoard = false, forceBoardTool = false, fo
 function reportTag(status) {
   if (status.startsWith('SMOKE FAIL')) return 'FAIL   ';
   if (status.startsWith('SMOKE PASS')) return 'SMOKE  ';
-  if (status.startsWith('created') || status.startsWith('added') || status.startsWith('appended')) return 'CREATED';
+  if (status.startsWith('created') || status.startsWith('added') || status.startsWith('appended') || status.startsWith('migrated')) return 'CREATED';
   if (status.startsWith('merged')) return 'MERGED ';
+  if (status.startsWith('re-pointed')) return 'REPOINT';
+  if (status.startsWith('removed') || status.startsWith('whole dir removed')) return 'REMOVED';
+  if (status.startsWith('would remove') || status.startsWith('DRY-RUN')) return 'WOULD  ';
+  if (status.startsWith('KEPT')) return 'KEPT   ';
   if (status.startsWith('SKIPPED')) return 'SKIPPED';
   if (status.startsWith('re-synced')) return 'RESYNC ';
   return 'EXISTS ';
 }
 
 function main() {
-  const { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly } = parseArgs(process.argv.slice(2));
+  const { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly, migrate } = parseArgs(process.argv.slice(2));
   if (!targetDir) {
-    console.error('usage: node scripts/onboard.mjs <target-dir> [--no-board] [--force-board-tool] [--force-hook] [--wa-pointer] [--deploy-context] [--verify-only]');
+    console.error('usage: node scripts/onboard.mjs <target-dir> [--no-board] [--force-board-tool] [--force-hook] [--wa-pointer] [--deploy-context] [--migrate] [--verify-only]');
     process.exit(2);
   }
 
@@ -1019,7 +1506,7 @@ function main() {
 
   let reports;
   try {
-    reports = onboard(targetDir, { noBoard, forceBoardTool, forceHook, waPointer, deployContext });
+    reports = onboard(targetDir, { noBoard, forceBoardTool, forceHook, waPointer, deployContext, migrate });
   } catch (e) {
     console.error(`onboard: ${e.message}`);
     process.exit(1);

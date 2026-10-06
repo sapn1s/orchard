@@ -5,15 +5,15 @@
   "title": "Live agents from one project showed under another project",
   "summary": "The dashboard's list of currently running agents stayed bound to whichever session was last opened. Selecting a different project in the sidebar left the previous project's live rows and its permission notice on screen, still ticking. Selecting a project now re-scopes that area, and the case that reproduced the leak fails before the fix and passes after it.",
   "impact_if_we_wait": "People trust a live view that attributes one project's work to another. Bounded: this is display-correctness only, no stored data is affected, and opening any session in the newly selected project already cleared it.",
-  "current_need": "Nothing is outstanding. The leak case, the own-project case, an empty project and switching back all pass, and two clean-room findings raised against the first attempt were fixed.",
+  "current_need": "Residual leak: the permission SEAL chip still paints the foreign project's skip-prompts posture while the dock is foreign — an ungated live-state surface. Blocked on the ARCH-005 decision that owns this class; not a standalone point-fix.",
   "severity": "medium",
   "area": "Running agents view",
   "reported": "2026-08-18",
   "reported_by": "user",
   "owner": "agent",
-  "work_state": "done",
+  "work_state": "blocked",
   "human_action": "none",
-  "updated": "2026-08-18",
+  "updated": "2026-09-28",
   "decision": null,
   "decision_history": [
     {
@@ -231,3 +231,6 @@ A fix that simply hides everything would be worse than the bug, so the own-proje
 - ARCH-005 carries the testable invariant, the options (encapsulate the fields / scope the view state by construction / a lint-ratchet on direct reads / keep patching, priced), a step-wise migration around the single-file constraint, and the proof bar. It is OPEN pending a HUMAN decision; **no build starts until an option is chosen.**
 - **The three surfaces from the verdict above remain UNFIXED pending that decision** — `paintComposerFor` (`th.status === 'running' && state.live`), `runningAgentCount()` (`state.snap`), `paintAuto()` (`state.live`). Fixing them now would be the fourth round of exactly the patching ARCH-005 exists to decide about; if the decision is "keep patching", they become three ordinary point-fixes and should be filed as such.
 - **Changed:** ticket prose only — no product code, no scripts.
+
+### 2026-09-28 — BUG-181/106 findings lane (Opus 4.8)
+- **verify:** The BUG-106 cross-project suite (scripts/verify-bug-106-crossproject-strip.mjs), now unblocked by BUG-197's harness fix (it reveals the inactive-projects fold before matching a project header by name), runs to completion at 32/33. The one remaining red is a REAL product leak, not a harness defect: while project B is selected and project A owns the open session (dockIsForeign()===true), the permission SEAL chip (#seal .perm) still paints A's "skips prompts" posture — an ungated dock surface. Every other dock surface (crown model chip, integrations strip, rail live-count, run-dot, dock accessors) re-scopes correctly. This is a fresh instance of the ungated-live-state class promoted out of this ticket to ARCH-005 (which owns per-project live state); a 7th point-fix is exactly what ARCH-005 exists to decide, so the fix is gated on that human decision rather than patched here. Moving from done to BLOCKED: a marked-fixed ticket with a live leak is not fixed, and the residual surface is blocked on the ARCH-005 decision. Pointer: BUG-197 Activity log, the 2026-09-29 fixing-lane entry (the SEAL-chip FAIL is recorded there).

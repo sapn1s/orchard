@@ -49,6 +49,10 @@ process.env.ORCHARD_DISPATCH_SCRIPT = path.join(ROOT, 'scripts', 'fixtures', 'fa
 const hostPath = path.join(tmp, 'repo');
 fs.mkdirSync(hostPath, { recursive: true });
 const project = { id: 'arch017-proj', name: 'arch017', hostPath, isolation: 'direct', settings: { tools: { openaiDispatch: true } } };
+// BUG-223 r6: the broker re-reads its project by id per lane, so every fixture id must be
+// registered in the data dir that is active when its lane is dispatched.
+const { registerFixtureProjects } = await import('./lib/broker-fixture.mjs');
+registerFixtureProjects(DATA, project);
 
 let pass = 0, fail = 0;
 function check(name, fn) {
@@ -404,6 +408,7 @@ if (process.argv.includes('--must-fail-proof')) {
   const broker4 = await import(path.join(ROOT, 'src', 'server', 'dispatch-broker.ts'));
   const sock4 = await broker4.start({ ...project, id: 'arch017-leg4' });
   const legDir = path.join(tmp, 'leg4');
+  registerFixtureProjects(legDir, { ...project, id: 'arch017-leg4' });
   await withDataDir(legDir, async () => {
     let ackSeen = false;
     const s = net.createConnection(sock4);
@@ -473,6 +478,7 @@ if (process.argv.includes('--must-fail-proof')) {
    */
   const broker6 = await import(path.join(ROOT, 'src', 'server', 'dispatch-broker.ts'));
   const sock6 = await broker6.start({ ...project, id: 'arch017-leg6' });
+  registerFixtureProjects(path.join(tmp, 'leg6'), { ...project, id: 'arch017-leg6' });
   const FORGE6 = 4096;
   await withDataDir(path.join(tmp, 'leg6'), async () => {
     let claimed = -1;
@@ -521,6 +527,7 @@ if (process.argv.includes('--must-fail-proof')) {
    */
   const broker7 = await import(path.join(ROOT, 'src', 'server', 'dispatch-broker.ts'));
   const sock7 = await broker7.start({ ...project, id: 'arch017-leg7' });
+  registerFixtureProjects(path.join(tmp, 'leg7'), { ...project, id: 'arch017-leg7' });
   await withDataDir(path.join(tmp, 'leg7'), async () => {
     const seen = {};
     for (const [tag, prompt] of [['empty', 'emptyresult leg7a lane'], ['fd2', 'size=2048 leg7b lane']]) {
@@ -1501,6 +1508,7 @@ await sleep(2500);
 const w3BeforeKill = await withDataDirProbe(w3Dir);
 holderProc.child.kill('SIGKILL');
 await sleep(300);
+const w3RecordLeft = fs.existsSync(path.join(w3Dir, '.orchard-server.holder')); // before the successor claims (and cleanly releases) it
 const w3T0 = Date.now();
 const w3After = await withDataDirProbe(w3Dir);
 const w3ClaimMs = Date.now() - w3T0;
@@ -1564,26 +1572,23 @@ check('W4 — writing a populated ledger under four contenders never freezes the
   assert.ok(maxGap < 1000, `the event loop must never stall for ~a second; worst gap was ${maxGap}ms`);
 });
 
-check('W5 — no lock file, no staleness judgement, nothing on disk to go stale', () => {
+check('W5 — the claim is a kernel flock on the data DIRECTORY itself: no staleness judgement, and no file decides anything', () => {
+  // BUG-217 round 8 replaced round 3's abstract socket (a NAME, which a bind mount or another network namespace
+  // does not share) with a flock on a file in the dir; round 9 moved it onto the directory's own inode, because a
+  // file can be unlinked or replaced under its holder. The holder record beside it only names the holder, and it
+  // stays after its holder dies; W3 above is the proof that a dead holder's record blocks nothing.
   const entries = fs.readdirSync(w2Dir);
   show('data dir entries', entries);
-  show('claim name (abstract: no filesystem entry)', JSON.stringify(lanes.writerClaimName(w2Dir)));
-  assert.equal(entries.includes('lanes.lock'), false);
-  assert.equal(entries.some((e) => e.includes('lock')), false);
-  if (process.platform === 'linux') assert.ok(lanes.writerClaimName(w2Dir).startsWith('\0'), 'on Linux the claim lives in the abstract namespace');
+  show('claim name', lanes.writerClaimName(w2Dir));
+  assert.equal(lanes.writerClaimName(w2Dir), path.resolve(w2Dir), 'the claim is the data dir itself');
+  assert.equal(entries.includes('lanes.lock'), false, 'the round-2 mtime lock file must not come back');
+  assert.equal(entries.includes('.orchard-server.lock'), false, 'the round-8 lock FILE must not come back');
+  assert.ok(w3RecordLeft, 'precondition: the SIGKILLed writer in W3 left its holder record behind — and W3 claimed past it');
 });
 
-/* --- W6: the NON-LINUX claim path, which no test on this host had ever run ---
- * Round 3 flagged it and declined to touch it: off Linux the claim is a
- * FILESYSTEM socket, whose inode outlives its process, so after a SIGKILL the
- * successor is refused EADDRINUSE forever and the ledger becomes permanently
- * unwritable. It is unreachable on this host unless `process.platform` is faked
- * BEFORE lanes.ts is imported — everything else (socket, SIGKILL, EADDRINUSE)
- * is real. Round 4 does not auto-unlink (two successors racing that recovery
- * would produce two writers); it DIAGNOSES, so the failure is named and
- * actionable instead of an unexplained EADDRINUSE. This test guards the
- * diagnosis, and the control leg guards that a LIVE holder is still refused
- * plainly. Full reproducer: scripts/scratch-a17-r4-fssock-wedge.mjs */
+/* --- W6: round 4's non-Linux wedge (a filesystem socket whose inode outlived a SIGKILLed holder, so the
+ * successor was refused forever) is gone with the socket: the claim no longer depends on the platform. The
+ * same leg that used to wedge — platform faked to darwin before the import, a real SIGKILL — now recovers. */
 const w6Dir = path.join(tmp, 'w6');
 fs.mkdirSync(w6Dir, { recursive: true });
 const w6Js = path.join(tmp, 'w6-claim.mjs');
@@ -1606,20 +1611,17 @@ const w6Holder = await w6Run('hold');
 const w6Live = await w6Run('once');          // control: a LIVE holder
 process.kill(w6Holder.pid, 'SIGKILL');
 await sleep(400);
-const w6Stale = await w6Run('once');         // the wedge: the holder is dead, the inode is not
-check('W6 — the non-Linux FILESYSTEM claim: a live holder is refused plainly, and a dead one is refused with a DIAGNOSIS (round-3 flagged, never exercised)', () => {
-  show('claim name off Linux', w6Holder.claim.name);
-  show('socket file left on disk after SIGKILL', fs.existsSync(w6Holder.claim.name));
+const w6After = await w6Run('once');         // round 4's wedge: the holder is dead, its file is not
+check('W6 — the claim is the same on every platform: a live holder is refused, and a SIGKILLed one\'s leftover file wedges nothing (round 4\'s filesystem-socket wedge is gone)', () => {
+  show('claim name (platform faked to darwin)', w6Holder.claim.name);
+  show('holder record left on disk after SIGKILL', fs.existsSync(path.join(w6Holder.claim.name, '.orchard-server.holder')));
   show('second claimant while the holder is ALIVE', w6Live.claim);
-  show('claimant after the holder was SIGKILLed', w6Stale.claim.reason);
+  show('claimant after the holder was SIGKILLed', w6After.claim);
   assert.equal(w6Holder.claim.ok, true, 'precondition: the first claim must succeed');
-  assert.ok(!w6Holder.claim.name.startsWith('\0'), 'precondition: the faked platform must take the FILESYSTEM path');
-  assert.equal(w6Live.claim.ok, false, 'precondition: a live holder must still exclude a second writer');
-  assert.equal(w6Live.claim.reason, 'EADDRINUSE', 'a live holder is a plain EADDRINUSE, not a stale socket');
-  assert.equal(fs.existsSync(w6Holder.claim.name), true, 'precondition: the wedge exists only because the inode outlives the process');
-  assert.equal(w6Stale.claim.ok, false, 'the stale socket is NOT auto-recovered — that race would admit two writers');
-  assert.ok(w6Stale.claim.reason.startsWith('EADDRINUSE-stale-socket:'), `the refusal must NAME the condition; got ${w6Stale.claim.reason}`);
-  assert.ok(w6Stale.claim.reason.includes(w6Holder.claim.name), 'the refusal must name the file a human has to remove');
+  assert.equal(w6Live.claim.ok, false, 'a live holder must still exclude a second writer');
+  assert.equal(w6Live.claim.reason, 'held');
+  assert.equal(fs.existsSync(path.join(w6Holder.claim.name, '.orchard-server.holder')), true, 'precondition: the holder record outlives its holder — the case that wedged round 4');
+  assert.equal(w6After.claim.ok, true, 'a dead holder\'s leftover file must not block the successor');
 });
 try { process.kill(w6Holder.wrapper, 'SIGKILL'); } catch { /* already gone */ }
 
@@ -1876,6 +1878,7 @@ check('S7 — a live process wearing the wrong argv is not our child', () => {
  */
 const restartDir = path.join(tmp, 'restart');
 fs.mkdirSync(restartDir, { recursive: true });
+registerFixtureProjects(restartDir, { ...project, id: 'arch017-restart' });
 const serverJs = path.join(tmp, 'mini-server.mjs');
 fs.writeFileSync(serverJs, `
 import * as net from 'node:net';

@@ -89,6 +89,27 @@ export interface SurvivorDelivery {
 const active = new Map<string, DeliveryImpl>();
 
 /** The in-flight delivery for this sdk session, if any (one injected turn at a time). */
+/**
+ * FEAT-065 (BUG-048 (c+), BUG-074, BUG-187 H7/R5, BUG-191) — may a message be
+ * injected into this drain-held survivor right now? Every condition is the
+ * broker's OWN declaration: it holds a drain (`draining`), its foreground is
+ * provably idle (`midTurn === false`), the hold is for declared live
+ * background work (`yes`, or `unknown` with a non-empty level — BUG-074), it
+ * still accepts input, and it can confirm a delivery (protocol 2). One
+ * function, read by both callers (the socket's start and the BUG-217 outbox).
+ */
+export function survivorAdmits(survivor: HostStatus): boolean {
+  const bgCount = typeof survivor.backgroundLive === 'number' ? survivor.backgroundLive : 0;
+  const lifetimeDeliverable = survivor.backgroundLifetime === 'yes'
+    || (survivor.backgroundLifetime === 'unknown' && bgCount > 0);
+  return survivorDeliveryEnabled()
+    && survivor.acceptingInput !== false
+    && (survivor.protocol ?? 0) >= 2
+    && survivor.state === 'draining'
+    && survivor.midTurn === false
+    && lifetimeDeliverable;
+}
+
 export function activeDeliveryFor(sdkSessionId: string): SurvivorDelivery | null {
   return active.get(sdkSessionId) ?? null;
 }

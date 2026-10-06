@@ -1,0 +1,209 @@
+{
+  "schema": "orchard-answers-legacy-freeze/1",
+  "frozen_on": "2026-10-05",
+  "note": "Frozen output of the round-2 Activity-log prose answer reader (FEAT-166 r3). Read-only: pinned by sha256 in scripts/lib/answer-source.mjs. New answers are typed entries written by the server answer route.",
+  "tickets": {
+    "ARCH-003": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-18",
+        "kind": "decision",
+        "chose": null,
+        "note": "none of these seem like real fixes tbh, im not sure i fully believe its not detectable, wym, we run linux host, we have ability to track literary anything? plus claude code source codewas leaked and is not public property i think which can give insuights for anything relevant?",
+        "followups": [],
+        "last_you_k": 3
+      },
+      "lane": {
+        "answer": "none of these seem like real fixes tbh, im not sure i fully believe its not detectable, wym, we run linux host, we have ability to track literary anything? plus claude code source codewas leaked and is not public property i think which can give insuights for anything relevant?",
+        "answeredOn": "2026-08-18",
+        "last_k": 3
+      },
+      "heading_shas": [
+        "5c2db3c2fb8f97c19d399f4b1c303899962bdcf6a4d9ebedf763025575e8e219"
+      ]
+    },
+    "ARCH-004": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-18",
+        "kind": "decision",
+        "chose": null,
+        "note": "bro obviously it must be fixed set choicees, idk why is this a qustion",
+        "followups": [],
+        "last_you_k": 2
+      },
+      "lane": {
+        "answer": "bro obviously it must be fixed set choicees, idk why is this a qustion",
+        "answeredOn": "2026-08-18",
+        "last_k": 2
+      },
+      "heading_shas": [
+        "5c2db3c2fb8f97c19d399f4b1c303899962bdcf6a4d9ebedf763025575e8e219"
+      ]
+    },
+    "ARCH-007": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-25",
+        "kind": "decision",
+        "chose": {
+          "key": "A",
+          "label": "Capability-owned laziness"
+        },
+        "note": "",
+        "followups": [],
+        "last_you_k": 1
+      },
+      "lane": {
+        "answer": "**Question:** How should browser startup become lazy without unnecessary protocol ownership?",
+        "answeredOn": "2026-08-25",
+        "last_k": 1
+      },
+      "heading_shas": [
+        "d3a11298811e9a183cb6441c6ab2bfc816d8f69205f343243ee6efc168b090d1"
+      ]
+    },
+    "ARCH-010": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-25",
+        "kind": "decision",
+        "chose": {
+          "key": "A",
+          "label": "Settle the class once"
+        },
+        "note": "",
+        "followups": [],
+        "last_you_k": 1
+      },
+      "lane": {
+        "answer": "**Question:** Should the eight open instances be settled as one class, or kept as separate decisions?",
+        "answeredOn": "2026-08-25",
+        "last_k": 1
+      },
+      "heading_shas": [
+        "d3a11298811e9a183cb6441c6ab2bfc816d8f69205f343243ee6efc168b090d1"
+      ]
+    },
+    "ARCH-011": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-25",
+        "kind": "decision",
+        "chose": null,
+        "note": "Can we make it time-based or probably even files-touched based. If files themselves code didnt change since the last time the worker made the changes, then it wont be stale, otherwise if hashes changed, use fresh context? isnt this best or? Perhaps incorporting C option too, depennds if it makes it actually better",
+        "followups": [],
+        "last_you_k": 1
+      },
+      "lane": {
+        "answer": "Can we make it time-based or probably even files-touched based. If files themselves code didnt change since the last time the worker made the changes, then it wont be stale, otherwise if hashes changed, use fresh context? isnt this best or? Perhaps incorporting C option too, depennds if it makes it actually better",
+        "answeredOn": "2026-08-25",
+        "last_k": 1
+      },
+      "heading_shas": [
+        "d3a11298811e9a183cb6441c6ab2bfc816d8f69205f343243ee6efc168b090d1"
+      ]
+    },
+    "BUG-129": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-25",
+        "kind": "decision",
+        "chose": {
+          "key": "A",
+          "label": "Keep the queue in the browser"
+        },
+        "note": "has to be browser storage, if the claude station goes down, it wouldnt store otherwise and we keep losing, so better to just be reliable client side",
+        "followups": [],
+        "last_you_k": 2
+      },
+      "lane": {
+        "answer": "**Question:** Where should a typed message become durable before it is delivered?",
+        "answeredOn": "2026-08-25",
+        "last_k": 2
+      },
+      "heading_shas": [
+        "d3a11298811e9a183cb6441c6ab2bfc816d8f69205f343243ee6efc168b090d1"
+      ]
+    },
+    "FEAT-023": {
+      "decision_key": "rec:1cf45e6ad8e277e6cd3ec807bdd4494cdac4f78bd8f5869591d4b82fb0a2de84",
+      "state": {
+        "on": "2026-08-20",
+        "kind": "decision",
+        "chose": null,
+        "note": "uhm what, what does this mean, not being able to control a sessionw ithin a container? im pretty sure it already works? or what do u mean",
+        "followups": [],
+        "last_you_k": 1
+      },
+      "lane": {
+        "answer": "uhm what, what does this mean, not being able to control a sessionw ithin a container? im pretty sure it already works? or what do u mean",
+        "answeredOn": "2026-08-20",
+        "last_k": 1
+      },
+      "heading_shas": [
+        "5d5ed6817121e4d759b3e2cff203098f916dd47b2b4f84ee196de8a4ff4176cf"
+      ]
+    },
+    "FEAT-028": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-04",
+        "kind": "decision",
+        "chose": null,
+        "note": "DONE",
+        "followups": [],
+        "last_you_k": 2
+      },
+      "lane": {
+        "answer": "DONE",
+        "answeredOn": "2026-08-04",
+        "last_k": 2
+      },
+      "heading_shas": [
+        "726485466020e05ed8145f65082fc1a72617b3d17bef4d2ded40202cc05ef7bd"
+      ]
+    },
+    "FEAT-038": {
+      "decision_key": "none",
+      "state": {
+        "on": "2026-08-04",
+        "kind": "decision",
+        "chose": null,
+        "note": "not sure whats this jsut ack yes i see design",
+        "followups": [],
+        "last_you_k": 1
+      },
+      "lane": {
+        "answer": "not sure whats this jsut ack yes i see design",
+        "answeredOn": "2026-08-04",
+        "last_k": 1
+      },
+      "heading_shas": [
+        "726485466020e05ed8145f65082fc1a72617b3d17bef4d2ded40202cc05ef7bd"
+      ]
+    },
+    "FEAT-096": {
+      "decision_key": "prose:389b908d07acdf4311080ac4b495e2b05b0b9df51e860ee77b4ebf0bb5c8fd73",
+      "state": {
+        "on": "2026-08-25",
+        "kind": "decision",
+        "chose": {
+          "key": "A",
+          "label": "leave it recording"
+        },
+        "note": "",
+        "followups": [],
+        "last_you_k": 2
+      },
+      "lane": {
+        "answer": "**Question:** leave the recorder running, or revert it?",
+        "answeredOn": "2026-08-25",
+        "last_k": 2
+      },
+      "heading_shas": [
+        "d3a11298811e9a183cb6441c6ab2bfc816d8f69205f343243ee6efc168b090d1"
+      ]
+    }
+  }
+}

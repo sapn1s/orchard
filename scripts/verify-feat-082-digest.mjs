@@ -34,6 +34,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { appendAnswer, decisionKey } from '../src/server/board.ts';
 import { parseTicketsHash, formatTicketsHash } from '../public/lib/route.js';
 import { shotLedger } from './lib/shot-luma.mjs';
 
@@ -134,8 +135,9 @@ function seedBoard() {
   fs.writeFileSync(path.join(BUGS, 'FEAT-706-answer-here.md'),
     `# FEAT-706 — answer a ticket where you read it\n\n- **Status:** OPEN\n- **Severity:** med\n- **Area:** UI\n\n` +
     `## Question\nShip steps 1-7 now, or wait for the visual review?\n\n` +
-    `## Activity log (APPEND-ONLY)\n\n### ${daysBack(1)} — orchestrator\n- filed, waiting on the user.\n` +
-    `\n### ${TODAY} — you (answered from ticket)\n- **Answer:** ship steps 1-7 now\n`);
+    `## Activity log (APPEND-ONLY)\n\n### ${daysBack(1)} — orchestrator\n- filed, waiting on the user.\n`);
+  // FEAT-166 r3: the answer is recorded through the ONE writer (typed), not a heading.
+  appendAnswer(WORK, 'FEAT-706', 'ship steps 1-7 now', decisionKey(fs.readFileSync(path.join(BUGS, 'FEAT-706-answer-here.md'), 'utf8')));
 
   // IN FLIGHT (🤖). Empty on the real board — seeded here so it ships exercised.
   fs.writeFileSync(path.join(BUGS, 'BUG-707-flaky-retry.md'),

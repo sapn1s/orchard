@@ -403,12 +403,17 @@ async function main() {
     "overriding a project pinned to A back to the DEFAULT account really drops the var (the switch works both ways)",
     'CLAUDE_CONFIG_DIR' in envD2 ? JSON.stringify(envD2.CLAUDE_CONFIG_DIR) : '<absent>');
 
-  /* ─────────────────────────────────────────────── §6 the one call site ── */
-  section('6. the call site passes the project isolation (the refusal cannot be skipped)');
+  /* ─────────────────────────────────────────── §6 the call sites pass isolation ── */
+  // FEAT-160 added a second call site (the live `switch-account` handler). The
+  // invariant — not a brittle count — is that EVERY call site passes an isolation
+  // context, so no path can skip the container refusal. A count===1 assertion
+  // reddened on that legitimate addition (docs/CONVENTIONS: assert the invariant,
+  // not a value legitimate use changes).
+  section('6. every validateSessionOverrides call site passes isolation (the refusal cannot be skipped)');
   const indexSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'index.ts'), 'utf8');
   const callSites = [...indexSrc.matchAll(/validateSessionOverrides\(([^)]*)\)/g)].map((x) => x[1].trim());
-  ok(callSites.length === 1 && /isolation:\s*project\.isolation/.test(callSites[0]),
-    'the ONE call site passes { isolation: project.isolation }', callSites);
+  ok(callSites.length >= 1 && callSites.every((c) => /isolation:\s*[\w.]*\bisolation\b/.test(c)),
+    'every validateSessionOverrides call site passes an { isolation } context', callSites);
   const validateSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'validate.ts'), 'utf8');
   ok(/export function validateSessionOverrides\(body: unknown, ctx: SessionOverrideContext\)/.test(validateSrc),
     'the context parameter is REQUIRED (not optional) — a new call site fails to compile rather than skipping the refusal',

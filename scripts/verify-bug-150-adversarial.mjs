@@ -276,10 +276,15 @@ async function main() {
   /* ═══ ROUND-4: attack the new shape — re-binding lives INSIDE resetTranscript ═══ */
   transcriptMode = 'delay';
   const setCur = (obj) => `window.__station.state.current = ${JSON.stringify(obj)};`;
+  // BUG-217 round 5: the tab's store now holds only requests the server has not acknowledged, one entry per
+  // request (keyed by nonce, filed under the session key) — seed it in THAT shape. The properties below are unchanged.
   const putStore = (key, texts) => `(() => {
     const st = window.__station;
     const raw = JSON.parse(localStorage.getItem(st.QUEUE_KEY) ?? '{}');
-    raw[${JSON.stringify(key)}] = { at: Date.now(), rows: ${JSON.stringify(texts)}.map((t) => ({ text: t, composedAt: Date.now(), dead: null })), outbox: null };
+    ${JSON.stringify(texts)}.forEach((t, i) => {
+      const nonce = 'n-seed-' + Math.random().toString(36).slice(2) + '-' + i;
+      raw[nonce] = { key: ${JSON.stringify(key)}, at: Date.now() + i, req: { nonce, text: t, origin: 'queued' } };
+    });
     localStorage.setItem(st.QUEUE_KEY, JSON.stringify(raw));
   })();`;
 
@@ -314,7 +319,7 @@ async function main() {
     st.resetTranscript();
     const store = JSON.parse(localStorage.getItem(st.QUEUE_KEY) ?? '{}');
     return { texts: st.state.queue.map((q) => q.text), owner: st.queueOwnerKey(), want: st.draftKey(st.state.current),
-             otherStillStored: !!store[${JSON.stringify(keyOther)}] };
+             otherStillStored: Object.values(store).some((e) => e?.key === ${JSON.stringify(keyOther)}) };
   })()`);
   check('G: only the current session’s row is on the dock (OTHER not pulled in)',
     g.texts.includes('G-KEEP') && !g.texts.includes('OTHER-STAY'), JSON.stringify(g.texts));
@@ -350,7 +355,7 @@ async function main() {
     ${setCur({ projectId: null, encodedDir: null, sessionId: null })}
     let threw = null; try { st.resetTranscript(); } catch (e) { threw = String(e && e.message || e); }
     const store = JSON.parse(localStorage.getItem(st.QUEUE_KEY) ?? '{}');
-    return { threw, owner: st.queueOwnerKey(), bystanderIntact: !!store['s\\x00${encDir}\\x00keepme'] || !!store[${JSON.stringify(`s\x00${encDir}\x00keepme`)}] };
+    return { threw, owner: st.queueOwnerKey(), bystanderIntact: Object.values(store).some((e) => e?.key === ${JSON.stringify(`s\x00${encDir}\x00keepme`)}) };
   })()`);
   check('I: reset did not throw with no ownable current session', i.threw === null, JSON.stringify({ threw: i.threw }));
   check('I: ownership is null (nothing to own)', !i.owner, JSON.stringify({ owner: i.owner }));

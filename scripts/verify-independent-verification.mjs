@@ -1388,8 +1388,9 @@ let recordDir = null;
   check('…while KEEPING the code and tests the verifier has to run',
     !!cleanroomDir && fs.existsSync(path.join(cleanroomDir, 'src', 'thing.mjs')) && fs.existsSync(path.join(cleanroomDir, 'test', 'thing.test.mjs')),
     cleanroomDir ? fs.readdirSync(cleanroomDir).join(', ') : 'no clean room');
-  check('the stripped set is reported honestly on stderr',
-    /stripped: .*CLAUDE\.md/.test(r.stderr) && /docs\/prompts/.test(r.stderr), r.stderr.split('\n').find((l) => l.startsWith('stripped')) ?? r.stderr.slice(0, 200));
+  check('the stripped set is reported honestly on stderr (ambient + the prose root)',
+    /stripped: .*CLAUDE\.md/.test(r.stderr) && /\bdocs\b/.test(r.stderr.split('\n').find((l) => l.startsWith('stripped')) ?? ''),
+    r.stderr.split('\n').find((l) => l.startsWith('stripped')) ?? r.stderr.slice(0, 200));
   check('the composed prompt charters the run recorder (evidence = artifacts, not prose)',
     /EVIDENCE RECORDING \(mandatory( — READ THIS FIRST)?\)/.test(prompt) && /vrun\.mjs/.test(prompt) && /MANIFEST/.test(prompt),
     'prompt must instruct: every command through ./vrun.mjs, recorder ids cited');
@@ -1501,8 +1502,10 @@ process.stdout.write(JSON.stringify({ type: 'result', is_error: false, session_i
     check('the verifier is granted Bash (an evidence contract it cannot execute is theatre)',
       cap.argv.includes('--allowedTools') && cap.argv.some((a) => a === 'Bash'), cap.argv.join(' ').slice(0, 200));
   }
-  check('the run id from the dispatch becomes the Verified-by line',
-    /Verified-by:\*\* dispatch anthropic run shim-run-abc123/.test(r.stdout), (r.stdout.split('\n').find((l) => l.includes('Verified-by')) ?? r.stdout.slice(-200)));
+  // BUG-225 r3: the harness prints the board-tool command that records a TYPED
+  // entry (a pasted prose line counts for nothing).
+  check('the run id from the dispatch becomes the board-tool verified command',
+    /board-tool\.mjs verified --id=<TICKET> --provider=anthropic.* --run=shim-run-abc123 --verdict=HOLDS/.test(r.stdout), (r.stdout.split('\n').find((l) => l.includes('board-tool')) ?? r.stdout.slice(-200)));
   check('a manifest-backed VALID HOLDS verdict makes the whole run exit 0 (live runs always check the manifest)',
     r.status === 0 && /VERDICT-CONTRACT: VALID .*manifest-backed/.test(r.stdout),
     `exit=${r.status}; ${(r.stdout.split('\n').find((l) => l.includes('VERDICT-CONTRACT')) ?? '').trim()}`);
@@ -1815,6 +1818,15 @@ console.log('\n(D) board:check warns on VERIFIED with no Verified-by');
   fs.writeFileSync(path.join(dir, 'BUG-901-selfverified.md'), ticket('BUG-901', 'self verified', ''));
   fs.writeFileSync(path.join(dir, 'BUG-902-independent.md'), ticket('BUG-902', 'independently verified',
     '- **Verified-by:** dispatch openai/gpt-5 run 0f8c12ab-77 (clean-room) — VERDICT: HOLDS'));
+  // BUG-225 r3: proof is a TYPED entry (here in the board ledger, as
+  // `board-tool verified` writes it for a legacy ticket) — the prose line above
+  // is only an echo and would not count on its own.
+  fs.writeFileSync(path.join(dir, 'verification-ledger.json'), JSON.stringify({
+    schema: 'orchard-verification-ledger/1',
+    entries: [{ id: 'BUG-902', provider: 'openai', model: 'gpt-5', run_id: '0f8c12ab-77', verdict: 'holds', recorded_by: 'board-tool' }],
+  }));
+  fs.writeFileSync(path.join(dir, 'BUG-906-proseonly.md'), ticket('BUG-906', 'prose only',
+    '- **Verified-by:** dispatch openai/gpt-5 run 0f8c12ab-78 (clean-room) — VERDICT: HOLDS'));
   fs.writeFileSync(path.join(dir, 'BUG-903-trivial.md'), ticket('BUG-903', 'trivial exempt', '- **Verification-class:** trivial'));
   fs.writeFileSync(path.join(dir, 'BUG-904-subagent.md'), ticket('BUG-904', 'subagent claim',
     '- **Verified-by:** a second agent reviewed it and agreed'));
@@ -1822,18 +1834,24 @@ console.log('\n(D) board:check warns on VERIFIED with no Verified-by');
     '# BUG-905 — closed before the rule existed\n\n- **Status:** VERIFIED\n- **Severity:** low\n\n## Activity log\n### 2026-08-04 — builder\n- did the thing\n');
   fs.writeFileSync(path.join(dir, 'INDEX.md'),
     '# Board\n\n## Open\n\n| ID | Sev | Title | Owner | Status |\n|---|---|---|---|---|\n\n## Done (committed)\n\n| ID | Sev | Title | Commit |\n|---|---|---|---|\n' +
-    ['BUG-901|med|self verified', 'BUG-902|med|independently verified', 'BUG-903|med|trivial exempt', 'BUG-904|med|subagent claim', 'BUG-905|low|closed before the rule existed']
+    ['BUG-901|med|self verified', 'BUG-902|med|independently verified', 'BUG-903|med|trivial exempt', 'BUG-904|med|subagent claim', 'BUG-905|low|closed before the rule existed', 'BUG-906|med|prose only']
       .map((r) => `| ${r.split('|').join(' | ')} | — |`).join('\n') +
     '\n\n## Shipped earlier (pre-tracker)\n\n(nothing)\n');
 
   const r = spawnSync(process.execPath, [BOARD, 'check', `--dir=${dir}`], { encoding: 'utf8' });
   const warned = (id) => new RegExp(`NO INDEPENDENT VERIFICATION \\(advisory\\): ${id}\\b`).test(r.stdout);
   check('a VERIFIED ticket with no Verified-by is WARNED', warned('BUG-901'), r.stdout.split('\n').filter((l) => l.includes('WARN')).join(' | ') || r.stdout.slice(0, 300));
-  check('a ticket citing a dispatch run is NOT warned', !warned('BUG-902'), 'no warning expected');
+  check('a ticket with a typed HOLDS entry is NOT warned', !warned('BUG-902'), 'no warning expected');
+  check('BUG-225 r3: a prose-only Verified-by HOLDS (no typed entry) IS warned', warned('BUG-906'), 'warning expected');
   check('an explicitly `trivial` ticket is NOT warned (the threshold is honoured)', !warned('BUG-903'), 'no warning expected');
   check('a prose "another agent reviewed it" claim IS warned (no dispatch id)', warned('BUG-904'), 'warning expected');
   check('a ticket closed before the rule took effect is NOT retro-flagged', !warned('BUG-905'), 'no warning expected');
-  check('the warning is advisory — board:check still exits 0', r.status === 0, `exit=${r.status}`);
+  // The advisory itself never fails the board. (This never-frozen fixture board
+  // carries prose Verified-by lines, so board:check FAILs FROZEN VERIFICATIONS
+  // MISSING — BUG-225 r3 — which is a separate, deliberate finding.)
+  const failLines = r.stdout.split('\n').filter((l) => /^\s*FAIL\s/.test(l));
+  check('the warning is advisory — no FAIL except the never-frozen-board finding',
+    failLines.every((l) => l.includes('FROZEN VERIFICATIONS MISSING')), failLines.join(' | '));
 }
 
 /* ============ (E) the NUL-in-argv clean-room blocker (BUG-106 lane) ====== */

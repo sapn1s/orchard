@@ -85,17 +85,25 @@ is rejected mechanically rather than argued with, which is the only form of
 rejection that survives a persuasive reviewer.
 
 ## Recording it
-The ticket gets a `Verified-by:` line naming the DISPATCH RUN — provider, run
-id, verdict — with fixer id ≠ verifier id:
+Record the verdict with the board's one verification writer — never by pasting
+a prose `Verified-by:` line. It writes a TYPED entry naming the DISPATCH RUN —
+provider, model, run id, verdict — with fixer id ≠ verifier id:
 
 ```
-- **Verified-by:** dispatch anthropic/haiku run 0f8c… (clean-room,
-  `scripts/independent-verify.mjs`) — VERDICT: BROKEN
+node scripts/board-tool.mjs verified --id=BUG-123 --provider=anthropic \
+  --model=claude-opus-5-5 --run=0f8c1d2e-… --verdict=BROKEN --note='property a'
 ```
+
+The entry lands in the ticket record's `verification[]` (or the board ledger for
+a legacy prose ticket); the Activity-log line it appends ("Verification
+recorded:") is an echo, not proof. A hand-typed `Verified-by:` line counts for
+nothing in any spelling, and `npm run board:check` names one typed after the
+freeze as an advisory (BUG-225).
 
 Naming a run is what makes this architectural rather than polite: an in-process
 subagent has no run id to cite, so "I had a subagent check it" cannot satisfy
-the line. `npm run board:check` warns when a ticket reaches VERIFIED without one.
+the record. Only a standing HOLDS (no later BROKEN) counts; `board:check` warns
+when a done ticket has none.
 
 ## Failure modes to avoid
 - **Verifying with a Task subagent because it is right there.** It shares your

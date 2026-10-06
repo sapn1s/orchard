@@ -6,6 +6,22 @@ import * as net from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+/*
+ * FEAT-157 — `… dispatch-client.mjs base status|adopt|defer|skip [--version N] [--rev R]`:
+ * answer THIS project's Orchard base-update notice over the project's own socket
+ * (the socket is the project; there is no --project). Prints the server's JSON reply.
+ */
+if (process.argv[2] === 'base') {
+  const a = process.argv.slice(3); const req = { op: 'base', action: a[0] ?? 'status' };
+  for (let i = 1; i < a.length; i++) { if (a[i] === '--version') req.version = Number(a[++i]); else if (a[i] === '--rev') req.rev = a[++i]; else { process.stderr.write(`unknown argument ${a[i]}\n`); process.exit(2); } }
+  const sock = process.env.ORCHARD_DISPATCH_SOCK;
+  if (!sock) { process.stderr.write('base: no Orchard socket in this session (OpenAI dispatch is off for this project); ask the user to answer the base notice on the Needs-You rail\n'); process.exit(3); }
+  const c = net.createConnection(sock); let out = '';
+  c.on('connect', () => c.write(`${JSON.stringify(req)}\n`));
+  c.on('data', (d) => { out += String(d); });
+  c.on('end', () => { process.stdout.write(out.endsWith('\n') ? out : `${out}\n`); let ok = false; try { ok = JSON.parse(out).ok === true; } catch { /* */ } process.exit(ok ? 0 : 1); });
+  c.on('error', (e) => { process.stderr.write(`base: ${e.message}\n`); process.exit(1); });
+} else {
 const args = process.argv.slice(2); const opts = { provider: null, model: null, sandbox: null, timeoutMin: null, ticket: null, phase: null, round: null, class: null, stdin: false, check: false }; const prompt = [];
 const take = (i, flag) => { if (i + 1 >= args.length) throw new Error(`${flag} needs a value`); return args[i + 1]; };
 try { for (let i = 0; i < args.length; i++) { const a = args[i]; if (a === '--check') opts.check = true; else if (a === '--prompt-stdin') opts.stdin = true; else if (['--provider','--model','--sandbox','--timeout-min','--ticket','--phase','--round','--class'].includes(a)) { const key = a === '--timeout-min' ? 'timeoutMin' : a.slice(2); opts[key] = take(i, a); i++; } else if (a.startsWith('--')) throw new Error(`unknown flag ${a}`); else prompt.push(a); } } catch (e) { process.stderr.write(`${e.message}\n`); process.exit(2); }
@@ -176,3 +192,4 @@ function socketRequest(req, check) { const s = net.createConnection(socketPath);
 
 if (opts.check) { if (process.env.ORCHARD_DISPATCH_ENTITLED === '0') unavailable('this session was launched with settings.tools.openaiDispatch disabled'); else if (process.env.ORCHARD_DISPATCH_UNAVAILABLE_REASON) unavailable(process.env.ORCHARD_DISPATCH_UNAVAILABLE_REASON, 'fix the reported host broker failure and launch a new session'); else if (socketPath) socketRequest({ op:'capabilities' }, true); else if (fs.existsSync(checkoutScript)) { void directCheck(); } else unavailable('no broker socket and the Orchard checkout is not readable'); }
 else { let body = prompt.join(' ').trim(); if (opts.stdin) { if (body) { process.stderr.write('dispatch failed [invalid-request] --prompt-stdin and positional prompt are mutually exclusive\n'); process.exit(2); } body=fs.readFileSync(0,'utf8'); } if (!body.trim()) { process.stderr.write('dispatch failed [invalid-request] no prompt given\n'); process.exit(2); } if (!opts.provider) opts.provider='openai'; if (socketPath) socketRequest({ op:'dispatch', ack:true, provider:opts.provider, ...(opts.model?{model:opts.model}:{}), ...(opts.sandbox?{sandbox:opts.sandbox}:{}), ...(opts.timeoutMin?{timeoutMin:Number(opts.timeoutMin)}:{}), ...(opts.ticket?{ticket:opts.ticket}:{}), ...(opts.phase?{phase:opts.phase}:{}), ...(opts.round?{round:opts.round}:{}), ...(opts.class?{class:opts.class}:{}), prompt:body }, false); else if (fs.existsSync(checkoutScript)) { const av=['--provider',opts.provider,'--prompt-stdin']; for (const [k,f] of [['model','--model'],['sandbox','--sandbox'],['timeoutMin','--timeout-min'],['ticket','--ticket'],['phase','--phase'],['round','--round'],['class','--class']]) if(opts[k]) av.push(f,String(opts[k])); direct(av,body); } else unavailable('no broker socket and the Orchard checkout is not readable'); }
+}

@@ -194,6 +194,12 @@ export interface SnapshotSource extends BridgeLike {
    * fact at all simply carries no method, and the snapshot omits `background`.
    */
   isBackgroundLane?(agentId: string): boolean | undefined;
+  /**
+   * FEAT-154 (round 6) — lanes the engine's background level lists as live that
+   * have no running agent row (an adopted bridge's inherited lanes). Published as
+   * rows so work that keeps the session alive is visible and stoppable.
+   */
+  levelOnlyLanes?(): { id: string; kind: 'agent' | 'tool'; description: string; since: number | null }[];
 }
 
 function entryFor(a: LiveAgent, source: SnapshotSource, now: number): RunningEntry {
@@ -280,6 +286,25 @@ export function snapshotOfSession(
     }
     for (const a of s.liveAgents()) {
       if (a.status === 'running') running.push(entryFor(a, s, now));
+    }
+    // FEAT-154 (round 6) — the engine's level vouches for these (it is the live
+    // process signal), so they are `running`, never stall-judged on progress a
+    // row-less lane cannot have. A shell is labelled plainly.
+    const seen = new Set(running.map((r) => r.id));
+    for (const lane of s.levelOnlyLanes?.() ?? []) {
+      if (seen.has(lane.id)) continue;
+      running.push({
+        id: lane.id,
+        row: lane.kind === 'tool' ? 'tool' : 'agent',
+        label: lane.kind === 'tool' ? 'background command' : 'agent',
+        description: lane.description,
+        startedAt: lane.since,
+        lastTool: null,
+        toolUses: 0,
+        totalTokens: 0,
+        state: 'running',
+        background: true,
+      });
     }
   }
   return {

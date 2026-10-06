@@ -202,9 +202,6 @@ const state = {
   pendingStart: null,      // text of a `start`/resume awaiting its `ack`; non-null == turn not yet begun
   pendingStartResume: null,// the sdk session id that pending `start` was resuming (null for a fresh start)
   pendingStartEl: null,    // BUG-149: the exact optimistic bubble that `start` painted — set with pendingStart, in the same tick
-  drainWaitTimer: null,    // BUG-045: slow self-retry interval while a drain-wait row is queued
-  drainWaitAttempt: null,  // BUG-045: the queue row whose self-retry `start` is in flight (exactly-once guard)
-  drainWaitLastTry: 0,     // BUG-045: throttle so poll + liveness-transition triggers cannot hammer the gate
   deliveryRelay: null,     // FEAT-065: the open ws is ONLY the approval relay for a turn delivered into the drain-held survivor (sdk id, or true)
   closingOnPurpose: false, // distinguishes our own close() from a real drop
   pendingAnswers: new Map(), // requestId -> answer awaiting the server's ack
@@ -231,19 +228,12 @@ const state = {
   forkFrom: null, // session id being branched from, set by the Windows fork bar
   forkEncodedDir: null, // BUG-090: the SOURCE store dir a needs-fork branch must stage from (server-supplied)
   pendingFork: null, // BUG-090: {resumeSessionId, resumeEncodedDir, cause} — a resume the server said needs a fork
-  queue: [], // messages typed mid-turn: {text, el} — delivered at turn boundaries
-  /*
-   * BUG-129 (option A): the batch flushQueue/deliverForced has HANDED to the
-   * socket but whose turn this tab has not yet seen start. It is spliced out of
-   * state.queue at that moment, so without this it exists nowhere for the whole
-   * send→turn-end window and a reload in that window destroys it. Cleared at
-   * turn-end — the point at which the server has certainly written the prompt to
-   * the transcript, i.e. the point at which it is durable somewhere else.
-   * {texts: string[], at: number}
-   */
-  outbox: null,
+  queue: [], // BUG-217 round 5: the dock's rows — the server outbox's unfinished rows, then this tab's unacknowledged requests
+  queueUnfiled: [], // BUG-217 round 5: rows typed while no session binding existed (queueKey null) — on screen only, never stored
+  outbox: null, // BUG-217 round 5: the server's last answer for the current session's outbox ({ sessionId, rows, recent, hold, damaged })
+  outboxFollowing: false, // BUG-217 round 5: a reopen to follow a server-started turn is in flight
+  queueUndo: null, // BUG-217 r2: the last Discard, undoable for a few seconds ({ key, text, until, timer })
   sendAttempts: new Map(), // BUG-191: sendId -> { texts, el, at, resume } — per-attempt ownership of an in-flight `send`
-  forceSend: null, // {text, composedAt} pulled out of queue, awaiting the interrupt it triggered to land at turn-end (FEAT-031 Part A)
   /*
    * BUG-083 — unsent composer text, keyed to the project/session it was typed
    * in. A switch SAVES the outgoing draft under its key and RESTORES the target
@@ -291,8 +281,8 @@ const state = {
   sessSurvival: { key: null, entry: null, at: 0 },
 };
 
-/** BUG-191 — the note a send whose delivery was never confirmed carries (read by the dock to say "not confirmed", not "not delivered"). */
-const UNCONFIRMED_NOTE = 'sent, but the session never confirmed it arrived — check the transcript before sending it again';
+/** BUG-191 — the reason a send whose delivery was never confirmed carries (the dock says "not confirmed", not "not delivered"). */
+const UNCONFIRMED_NOTE = 'it may already have been sent, and Orchard cannot confirm either way — check the conversation before sending it again';
 
 /* ------------------------------------------------- sidebar attention state */
 /*
@@ -428,6 +418,10 @@ async function refreshUsage() {
 function startUsagePolling() {
   void refreshUsage();
   setInterval(() => { if (!document.hidden) void refreshUsage(); }, USAGE_POLL_MS);
+  // FEAT-161 — one cheap per-second tick that updates ONLY the maxed-out countdown
+  // text (a no-op when nothing is maxed). Separate from the slow poll so the clock
+  // reads live without re-rendering the crown on every second.
+  setInterval(() => { if (!document.hidden) { tickUsageCountdown(); tickUsagePop(); } }, 1000);
 }
 
 /** Short relative countdown to a reset (unix seconds): "now" | "40m" | "4h" | "5d". */
@@ -449,6 +443,44 @@ function usageAsOf(asOf) {
   if (asOf == null) return 'never read';
   return new Date(asOf).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
+/**
+ * FEAT-161 — a compact live countdown to a reset (unix seconds). Seconds precision
+ * under an hour so a maxed-out window reads as a real clock ticking down:
+ * "2d 5h" | "1h 23m" | "4m 10s" | "42s". Returns null once the window has reset (<= 0) so the
+ * caller can hide the readout and refetch rather than show "0s" or a negative time.
+ */
+function fmtCountdown(sec) {
+  if (sec == null) return null;
+  const left = Math.round((sec * 1000 - Date.now()) / 1000);
+  if (left <= 0) return null;
+  const h = Math.floor(left / 3600);
+  const m = Math.floor((left % 3600) / 60);
+  const s = left % 60;
+  if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`; // r2: never "53h 0m"
+  if (h >= 1) return `${h}h ${m}m`;
+  if (m >= 1) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+/**
+ * FEAT-161 — is this window fully burned? The provider reports percent as a rounded
+ * integer, so >= 100 is "no remaining". This is the gate for showing the countdown.
+ */
+function usageMaxed(w) {
+  return !!w && typeof w.usedPercent === 'number' && w.usedPercent >= 100;
+}
+/**
+ * FEAT-161 — the reset time (unix seconds) the face countdown is currently tracking,
+ * or null when nothing is maxed / the reset is unknown. The ticker reads this and
+ * updates ONLY the countdown text node each second, so the crown never re-renders on
+ * a tick (avoids the re-render storm the ticket warns about). Set by paintUsageChip.
+ */
+let usageCountdownAt = null;
+/** FEAT-161 r2 — the usage popover was opened by a click and stays until dismissed. */
+let usagePinned = false;
+/** FEAT-163 — a click on the "no git" chip pins its popover open until dismissed. */
+let gitPinned = false;
+/** FEAT-163 — the project id whose "Initialize git repository" is armed (awaiting confirm). */
+let gitInitArmed = null;
 /**
  * FEAT-145 — which Claude ACCOUNT this project's next lane would run on. Same
  * resolution shape as providerView(): an armed per-launch override wins, then
@@ -518,25 +550,24 @@ function paintUsageChip() {
   if (!btn || !node.usageRing) return; // markup not present (older shell)
   const p = currentProject();
   if (!p) { btn.hidden = true; return; }
-  const provider = providerView(); // the engine THIS project's next lane would use
   // FEAT-145: the badge answers "can I dispatch RIGHT NOW", so it must show the
   // window binding the account this session will ACTUALLY run on — not whichever
   // account happens to be listed first. Falls back to the first snapshot for the
   // provider (the default account) when the selected one is not in the list, so
-  // a single-account user's badge is byte-identical to pre-145.
-  const list = state.usage ?? [];
-  const snap =
-    provider === 'anthropic'
-      ? (list.find((s) => s.provider === 'anthropic' && (s.accountId ?? 'default') === claudeAccountView())
-        ?? list.find((s) => s.provider === 'anthropic'))
-      : list.find((s) => s.provider === provider);
-  btn.classList.remove('warn', 'danger', 'unknown');
+  // a single-account user's badge is byte-identical to pre-145. One pick, shared
+  // with the popover's ordering (usageFaceSnap).
+  const snap = usageFaceSnap(state.usage ?? []);
+  btn.classList.remove('warn', 'danger', 'unknown', 'maxed');
+  // FEAT-161 — the native `title` tooltip is replaced by #usagePop (paintUsagePop);
+  // drop it so the two never double up on hover.
+  btn.removeAttribute('title');
   if (!snap || !snap.available) {
     paintUsageRing(null);
     btn.classList.add('unknown');
-    btn.title = usageTitle() || 'Provider usage — not available';
+    setUsageCountdown(null);
     btn.setAttribute('aria-label', 'Provider usage — not available');
     btn.hidden = false;
+    if (node.usagePop?.classList.contains('open')) paintUsagePop();
     return;
   }
   // The binding window is the one that will actually stop the next lane.
@@ -544,13 +575,56 @@ function paintUsageChip() {
   const short = /weekly/i.test(b.label) ? 'weekly' : b.label;
   const reset = usageResetShort(b.resetsAt);
   paintUsageRing(b.usedPercent);
-  if (b.usedPercent >= 90) btn.classList.add('danger');
-  else if (b.usedPercent >= 75) btn.classList.add('warn');
-  btn.title = usageTitle();
-  // The percent + window + reset that left the FACE survive on hover (title
-  // above, full detail) and here for screen readers — nothing dropped.
-  btn.setAttribute('aria-label', `Usage — ${b.usedPercent}% of the ${short} window used${reset ? `, resets in ${reset}` : ''}`);
+  // FEAT-161 r2 — one threshold scale with the popover bars (usageTier): calm
+  // below 75%, ochre from 75%, brick only when the window is actually full.
+  const tier = usageTier(b.usedPercent);
+  if (tier === 'full') btn.classList.add('danger');
+  else if (tier === 'warn') btn.classList.add('warn');
+  // FEAT-161 — when the binding window is maxed out AND its reset time is known,
+  // track it so the face shows a live "resets in …" countdown. Unknown reset →
+  // track nothing (never a wrong number); not maxed → nothing.
+  setUsageCountdown(usageMaxed(b) && b.resetsAt != null ? b.resetsAt : null);
+  btn.classList.toggle('maxed', usageMaxed(b));
+  // The percent + window + reset that left the FACE survive here for screen
+  // readers and in the popover — nothing dropped.
+  btn.setAttribute('aria-label', usageMaxed(b)
+    ? `Usage — ${short} limit reached${b.resetsAt != null ? `, resets ${fmtResetIn(b.resetsAt)} · ${fmtResetAt(b.resetsAt)}` : ''}`
+    : `Usage — ${b.usedPercent}% of the ${short} window used${reset ? `, resets in ${reset}` : ''}`);
   btn.hidden = false;
+  if (node.usagePop?.classList.contains('open')) paintUsagePop();
+}
+
+/**
+ * FEAT-161 — set (or clear) the maxed-out reset the face countdown tracks, and
+ * paint it immediately. Passing null hides the countdown. The per-second ticker
+ * (startUsagePolling) re-reads `usageCountdownAt` and refreshes only this text.
+ */
+function setUsageCountdown(resetsAt) {
+  usageCountdownAt = resetsAt;
+  tickUsageCountdown();
+}
+
+/**
+ * FEAT-161 — one tick of the face countdown. Updates ONLY the #usageCountdown text
+ * node (no crown re-render). When the tracked window has reset (fmtCountdown → null),
+ * hide the readout and kick one usage refresh so the ring reverts to the fresh value.
+ */
+function tickUsageCountdown() {
+  const cd = node.usageCountdown;
+  if (!cd) return;
+  if (usageCountdownAt == null) { cd.hidden = true; cd.textContent = ''; return; }
+  const txt = fmtCountdown(usageCountdownAt);
+  if (txt == null) {
+    // Crossed zero — the window has (almost certainly) reset. Stop tracking and
+    // pull a fresh snapshot; the next paint decides whether to show it again.
+    usageCountdownAt = null;
+    cd.hidden = true;
+    cd.textContent = '';
+    void refreshUsage();
+    return;
+  }
+  cd.textContent = txt;
+  cd.hidden = false;
 }
 
 /** The station's own port — always shown first in the proc popover. */
@@ -613,6 +687,9 @@ const node = {
   sealBreak: $('#sealBreak'), // this-feat — the tier divider; mounts insert before it
   fold: $('#fold'),
   settingsBtn: $('#settingsBtn'), // BUG-158 — labelled seal-strip opener for the settings drawer
+  closeSessBtn: $('#closeSessBtn'), // FEAT-168 — in-session Close/Reopen control
+  closeSessG: $('#closeSessG'),
+  closeSessLbl: $('#closeSessLbl'),
 
   insBtn: $('#insBtn'),
   insN: $('#insN'),
@@ -620,11 +697,19 @@ const node = {
   gitBtn: $('#gitBtn'),
   gitN: $('#gitN'),
   gitDot: $('#gitDot'),       // FEAT-139 r3 — shape-coded git state dot
+  gitStat: $('#gitStat'),     // FEAT-165 — inline diffstat (+added −removed)
+  gitAdd: $('#gitAdd'),
+  gitDel: $('#gitDel'),
+  gitPop: $('#gitPop'),       // FEAT-165 — styled per-file git popover
+  gitPopBody: $('#gitPopBody'),
   procBtn: $('#procBtn'),
   procN: $('#procN'),
   procPop: $('#procPop'),
   usageBtn: $('#usageBtn'),   // FEAT-116 — provider rate-limit window readout
   usageRing: $('#usageRing'), // FEAT-139 r3 — filled window-burn ring (no % text)
+  usageCountdown: $('#usageCountdown'), // FEAT-161 — maxed-out reset countdown
+  usagePop: $('#usagePop'),   // FEAT-161 — styled limits popover (replaces title)
+  usagePopBody: $('#usagePopBody'),
   procPorts: $('#procPorts'),
   sealSep: $('#sealSep'),
   rowMenu: $('#rowMenu'),
@@ -869,21 +954,166 @@ function ovrStore() {
   try { return JSON.parse(localStorage.getItem(OVR_KEY) ?? '{}'); } catch { return {}; }
 }
 
-function persistOverrides() {
-  const { encodedDir, sessionId } = state.current;
-  if (!sessionId) return; // pre-start arming persists once session-init names the id
+/*
+ * BUG-196 round 3 — THE ENGINE A SESSION IS PINNED TO, keyed by SESSION ID.
+ *
+ * A session id is meaningful only to the engine that minted it (a Codex thread
+ * id continues only on Codex, a Claude file only on Claude), so "which engine
+ * does session X resume on" is a fact about X — it does not change when the
+ * sidebar selection moves, a pending-new view is shown, or the dock is foreign.
+ * Rounds 1 and 2 stored it on transient VIEW state (state.current.lockedProvider)
+ * and gated its readers on view predicates (pendingNew, dockIsForeign), and each
+ * new UI state made the lock vanish. Here it is written ONLY from the server's
+ * declarations (the transcript route's `lockedProvider` — resumeProviderOf — and
+ * the `session-init` frame's), and every reader asks by the id of the session it
+ * is acting on (lockedProviderOf). Nothing else writes it; nothing re-derives it.
+ */
+const lockedProviders = new Map(); // sessionId → 'anthropic' | 'openai'
+
+function lockedProviderOf(sessionId) {
+  return sessionId ? (lockedProviders.get(sessionId) ?? null) : null;
+}
+
+/**
+ * Record a server-declared pin, and heal what a pinned session can never honour:
+ * a per-session `provider` override persisted for it (the round-2 foreign-dock
+ * path wrote exactly that under the LOCKED session's own key, and restoreOverrides
+ * re-armed it on every reopen). Other armed fields on that entry are kept.
+ */
+function declareLockedProvider(sessionId, provider) {
+  if (!sessionId || (provider !== 'anthropic' && provider !== 'openai')) return;
+  lockedProviders.set(sessionId, provider);
   const all = ovrStore();
-  const k = `${encodedDir ?? ''} ${sessionId}`;
-  if (Object.keys(state.overrides).length) all[k] = { ...state.overrides };
+  let dirty = false;
+  for (const [k, v] of Object.entries(all)) {
+    if (!k.endsWith(` ${sessionId}`) || !v || typeof v !== 'object' || !('provider' in v)) continue;
+    delete v.provider;
+    if (!Object.keys(v).length) delete all[k];
+    dirty = true;
+  }
+  if (dirty) { try { localStorage.setItem(OVR_KEY, JSON.stringify(all)); } catch { /* volatile is fine */ } }
+  if (state.current?.sessionId === sessionId) delete state.overrides.provider;
+  paintProvSurfaces();
+}
+
+/*
+ * BUG-198 — WHOSE overrides the in-memory bag holds, declared when the bag is
+ * (re)loaded, never re-derived from the view. `state.overrides` is ONE bag shared
+ * by reference (the drawer holds it), and it belongs to exactly one session: the
+ * one restoreOverrides() loaded it for. The old writer re-derived its storage key
+ * from `state.current` at write time, and selectProject() emptied the bag on any
+ * sidebar project change while the dock's session stayed A — so the next persist
+ * wrote an empty bag under A's key and erased A's saved permissionMode/model/effort.
+ * Now: the bag's owner key is set ONLY by resetOverrides() at the transitions that
+ * change which session the bag is for (openSession → restoreOverrides, startNew,
+ * fork staging, a dead-link route) and adopted once at session-init by a bag
+ * that was pending (a not-yet-born session). persistOverrides() writes under that
+ * owner and nothing else; a pending bag (owner null) persists nothing. Navigation
+ * (selectProject) and repaints no longer touch the bag at all.
+ */
+/*
+ * BUG-198 round 2 — the owner is a TAGGED value, not a nullable key. Round 1 used
+ * null for two different intents — "a NEW session, not yet born" and "no session
+ * at all" (a dead link) — so a late session-init for an ABANDONED "+" attempt
+ * adopted a bag armed later on a dead-link view and wrote it under the stale id.
+ *   { kind: 'session', key }  — a born session's bag; the ONLY kind that persists.
+ *   { kind: 'pending', token } — a not-yet-born session's bag. The token is minted
+ *       client-side at the act that begins it ("+", a fork staged) and is unique,
+ *       so two pending attempts can never be confused for each other.
+ *   { kind: 'none' }          — no session (dead link): persists nothing and is
+ *       never adopted by any session-init.
+ * A session-init adopts ONLY a pending bag whose token is the one the `start`
+ * frame carrying that bag was sent under, on the socket the init arrived over
+ * (ovrStart, stamped in startTurn). Any other init — late, stray, from a
+ * closed or different socket — adopts nothing.
+ */
+const OVR_NONE = Object.freeze({ kind: 'none' });
+let ovrPendingSeq = 0;
+const ovrSession = (key) => (key ? { kind: 'session', key } : OVR_NONE);
+const ovrPending = () => ({ kind: 'pending', token: `pending-${++ovrPendingSeq}-${Date.now().toString(36)}` });
+let overridesOwner = OVR_NONE; // BUG-198 round 2 — see the tagged kinds above
+/** BUG-198 round 2 — {token, ws}: the pending bag the in-flight `start` carried, and its socket. */
+let ovrStart = null;
+const ovrKeyOf = (encodedDir, sessionId) => (sessionId ? `${encodedDir ?? ''} ${sessionId}` : null);
+
+/** BUG-198 round 2 — empty the bag and declare who it now belongs to (a tagged owner). */
+function resetOverrides(owner) {
+  for (const k of Object.keys(state.overrides)) delete state.overrides[k];
+  overridesOwner = owner?.kind ? owner : OVR_NONE;
+}
+
+/**
+ * BUG-198 round 2 — the bag a `start` for a NOT-YET-BORN session carries belongs
+ * to that session: declared here, at the one moment it is known (startTurn, the
+ * same tick the frame is sent). A bag that is not already pending — a dead-link
+ * view, or a fresh start from a view whose bag was another session's — is
+ * re-owned to a fresh token WITHOUT touching storage; the in-memory contents are
+ * exactly what the frame carries.
+ */
+function stampPendingStart(ws, bornFresh) {
+  if (!bornFresh) { ovrStart = null; return; }
+  if (overridesOwner.kind !== 'pending') overridesOwner = ovrPending();
+  ovrStart = { token: overridesOwner.token, ws };
+}
+
+/** BUG-198 round 2 — a pending bag now belongs to the id ITS OWN session-init named (token + socket bound). */
+function adoptPendingOverrides(encodedDir, sessionId, fromWs) {
+  const st = ovrStart;
+  // A frame that did not arrive over the start's own socket (stray, injected, a
+  // different socket) neither adopts nor consumes the binding.
+  if (!st || !fromWs || st.ws !== fromWs) return;
+  ovrStart = null;
+  if (overridesOwner.kind === 'pending' && st.token === overridesOwner.token && sessionId) {
+    overridesOwner = ovrSession(ovrKeyOf(encodedDir, sessionId));
+  }
+}
+
+function persistOverrides() {
+  const k = overridesOwner.kind === 'session' ? overridesOwner.key : null; // BUG-198 round 2 — only a born session's bag is written
+  if (!k) return; // BUG-198 — pending (pre-start) arming persists once session-init names the id
+  const all = ovrStore();
+  // BUG-196 round 3 — never persist a provider for a session its transcript pins:
+  // the one write path, so no UI state (foreign dock, drawer, a future surface)
+  // can store a switch the resume would ignore.
+  // BUG-196 round 4 — every entry here is keyed by a session ID, and a session
+  // with an id already has (or is writing) a transcript that pins its engine; the
+  // server alone decides a resume's engine. So a provider is never persisted for
+  // ANY id — not only once the pin has landed (the pre-pin window was round 3's gap).
+  const keep = { ...state.overrides };
+  delete keep.provider;
+  if (Object.keys(keep).length) all[k] = keep;
   else delete all[k];
   try { localStorage.setItem(OVR_KEY, JSON.stringify(all)); } catch { /* volatile is fine */ }
 }
 
 /** Replace the in-memory overrides with what THIS session had armed, if anything. */
 function restoreOverrides(encodedDir, sessionId) {
-  for (const k of Object.keys(state.overrides)) delete state.overrides[k];
+  resetOverrides(ovrSession(ovrKeyOf(encodedDir, sessionId))); // BUG-198 round 2 — the bag is now THIS session's (tagged owner)
   const saved = ovrStore()[`${encodedDir ?? ''} ${sessionId}`];
-  if (saved && typeof saved === 'object') Object.assign(state.overrides, saved);
+  // BUG-196 round 4 — never re-arm a persisted provider for an existing session id,
+  // pinned yet or not: restore runs at openSession ENTRY, before the transcript
+  // fetch declares the pin, and a send in that window used to carry the stale
+  // value. The server decides a resume's engine; the next persist drops the stale
+  // field from storage too (and declareLockedProvider heals it when the pin lands).
+  // BUG-196 round 5 — stripped BEFORE the assign, so this is not even a transient
+  // provider writer: pickProvider is the only one.
+  if (saved && typeof saved === 'object') {
+    const { provider: _stale, ...rest } = saved;
+    Object.assign(state.overrides, rest);
+    // BUG-196 round 6 — and heal STORAGE here too, not only when a pin lands: the
+    // matrix found a stale provider left on disk whenever the pin never arrived
+    // (transcript read failed and the turn died before session-init). Inert (never
+    // re-armed), but storage must not hold what no id may carry.
+    // Written under THIS key directly: restore runs before openSession reassigns
+    // state.current, so persistOverrides() would write under the OUTGOING session.
+    if ('provider' in saved) {
+      const all = ovrStore();
+      const k = `${encodedDir ?? ''} ${sessionId}`;
+      if (Object.keys(rest).length) all[k] = rest;
+      else delete all[k];
+      try { localStorage.setItem(OVR_KEY, JSON.stringify(all)); } catch { /* volatile is fine */ }
+    }
+  }
 }
 
 /** Outstanding live permission-mode change: {requestId, next, timer}. */
@@ -897,6 +1127,13 @@ let permModePending = null;
  * live, so the picker reverted on reopen and the session never switched.
  */
 let modelPending = null;
+
+/*
+ * FEAT-160 — an account switch on the RUNNING session is in flight. Like
+ * modelPending it claims nothing until the server acks: the switch reaps the old
+ * CLI server-side and only the ok ack arms the new account + the resume.
+ */
+let acctPending = null;
 
 /*
  * FEAT-042 — the always-visible model chip's two sources of truth:
@@ -962,6 +1199,17 @@ const drawer = createDrawer({
   acctPlanDesc: (a) => acctPlanDesc(a),
   acctUsageDesc: (id) => acctUsageDesc(id),
   accountLockedReason: () => accountLockedReason(),
+  // BUG-196 round 6 — the drawer's SESSION-scope provider control reads the ONE
+  // engine state (engine shown, refusal, unknown) the composer-tray button and
+  // popover read, instead of its own lockedProvider + refusal pair.
+  sessionEngine: () => sessionEngine(),
+  // BUG-196 round 6 — the session-scope model cycle follows the same engine state.
+  // FEAT-159 — the same list WITH its labels, for the settings Model dropdown.
+  sessionModelOpts: () => activeModelOpts().map((o) => ({ value: o.v ?? null, label: o.n })),
+  // BUG-196 round 5 — the drawer's SESSION-scope provider control writes ONLY
+  // through pickProvider (the one guarded writer, same pattern as
+  // pickSessionAccount/pickAccount), and disables itself on the same guard.
+  pickSessionProvider: (next) => pickProvider(next),
   pickSessionAccount: (next) => pickAccount(next),
   notify: say,
   openGit: () => void gitView?.open(),
@@ -1085,6 +1333,15 @@ async function loadSessions(id, { force = false } = {}) {
       s.encodedDir = r.encodedDir ?? null;
       s.dirs = r.dirs ?? [];
       s.loaded = true;
+      // FEAT-168 r6 — the crown's Close/Reopen mirrors the SERVER's derived answer
+      // for the open session (the same `closed` the sidebar row shows). Nothing
+      // pushes "reopened" any more: a session reopens because a new prompt landed
+      // in its transcript, and this re-read is how the crown learns it.
+      const cur = state.current;
+      if (cur.projectId === id && cur.sessionId) {
+        const row = s.list.find((x) => x.sessionId === cur.sessionId && (!cur.encodedDir || !x.encodedDir || x.encodedDir === cur.encodedDir));
+        if (row && api.closedOf(row) !== (cur.closed === true)) { cur.closed = api.closedOf(row); paintCloseSessPill(); }
+      }
     } catch (err) {
       s.error = err.message;
     } finally {
@@ -1545,13 +1802,30 @@ function stampUserSubmit(sessionId, encodedDir) {
 const SUBSTANTIAL_MSGS = 6;          // >= this many renderable messages = a real session, not a one-shot
 const BRIEF_WINDOW_H = 2;            // a brief session leaves the default view this fast
 const SUBSTANTIAL_WINDOW_H = 72;     // a substantial one you may be mid-way through lingers ~3 days
+/*
+ * FEAT-070 amendment (2026-10-05 user decision): a session the USER started
+ * stays in the default recent window for at least a full day even when it is
+ * brief. A 2-message question you asked yesterday is still YOUR working set —
+ * folding it into "N more" within 2h (as a one-shot the orchestrator spun up
+ * would be) was the wrong call for a row the human opened themselves. Only a
+ * HUMAN-started, non-folded brief row earns this; agent-started and
+ * fold-by-default brief rows (dispatch lanes, external programmatic sessions)
+ * keep the short BRIEF_WINDOW_H — their clutter is exactly what the window culls.
+ */
+const USER_BRIEF_WINDOW_H = 24;
 const hoursSince = (iso) => {
   const t = Date.parse(iso ?? '');
   return Number.isFinite(t) ? (Date.now() - t) / 3600000 : Infinity;
 };
 const isBriefSession = (sess) => (Number(sess?.messageCount) || 0) < SUBSTANTIAL_MSGS;
+// A brief row's window depends on provenance: a human-started, non-folded
+// session gets the full-day USER_BRIEF_WINDOW_H; everything else (agent lanes,
+// fold-by-default programmatic rows) keeps the short one. `foldsFromList` is the
+// server-owned fold decision (defined below; called lazily at render time).
+const briefWindowH = (sess) =>
+  (sess?.startedBy === 'user' && !foldsFromList(sess)) ? USER_BRIEF_WINDOW_H : BRIEF_WINDOW_H;
 const withinRecentWindow = (sess) =>
-  hoursSince(sess?.lastActivityAt) < (isBriefSession(sess) ? BRIEF_WINDOW_H : SUBSTANTIAL_WINDOW_H);
+  hoursSince(sess?.lastActivityAt) < (isBriefSession(sess) ? briefWindowH(sess) : SUBSTANTIAL_WINDOW_H);
 /*
  * "Attention" = activity the user has not seen since they last had the session
  * open (the same signal `unseenCount`/the row `fresh` badge use). BUG-085: this
@@ -1694,11 +1968,16 @@ function endedUnanswered(sess) {
 function isSessionRunning(sess) {
   const info = liveInfo(sess);
   if (!info) return false;
-  // `running` is the liveness authority's verdict, carried through by
-  // api.liveSessions() (ARCH-010). `null` = a transcript-mtime-only entry with
-  // no bridge verdict (actively being written) OR the degraded no-route fallback
-  // (liveInfo's `sess.live` branch) — both keep the historical "present ⇒
-  // running" answer; only a boolean `false` (an alive-but-idle bridge) is not.
+  // The liveness authority's own verdict, carried through by api.liveSessions()
+  // (ARCH-010). `working` (FEAT-154 round 5) is the user's notion of running — a
+  // MAIN turn in flight OR a live subagent/background lane — so a session whose
+  // main turn ended while its subagents keep working reads as running; prefer it.
+  // Fall back to `running` (main turn only) on an older server that omits it.
+  // `null`/absent for both = a transcript-mtime-only entry (actively being
+  // written) OR the degraded no-route fallback (liveInfo's `sess.live` branch) —
+  // both keep the historical "present ⇒ running" answer; only a boolean `false`
+  // (an alive-but-idle bridge with no live work) is not running (round 3).
+  if (typeof info.working === 'boolean') return info.working;
   if (typeof info.running === 'boolean') return info.running;
   return true;
 }
@@ -1761,6 +2040,19 @@ function visibleSessions(s) {
   const pinned = ordered.filter((x) => api.pinnedOf(x));
   const rest = ordered.filter((x) => !api.pinnedOf(x)); // recency-ordered
   const windowed = s.windowed !== false;                // "N more" sets this false
+  // FEAT-168 — a CLOSED (done) session leaves the DEFAULT view even when recent:
+  // the user tucked it away. It is NOT bypassed by liveness or attention (close is
+  // the user overriding those), and it never buys a seat. The one exception is the
+  // currently-OPEN session: you are looking at it, so it stays on screen. When the
+  // window is lifted ("N more", windowed === false) closed rows reappear in the
+  // ordinary recency order like any other folded row, and the `hidden` count below
+  // (rest.length − shown.length) already includes them so "N more" reveals them.
+  // A PINNED session is the user's explicit "keep this on top", so pin wins over
+  // closed for placement (it stays in the pinned block, rendered muted with both
+  // markers); unpin it to let the closed label fold it.
+  const openNow = (x) => state.current.sessionId != null
+    && x?.sessionId === state.current.sessionId && x?.encodedDir === state.current.encodedDir;
+  const closedAway = (x) => windowed && api.closedOf(x) && !openNow(x);
   // Never folded, whatever the budget: the open session (on screen) and any
   // session with live/background work in flight — BUT NEVER a FOLDED row.
   //   BUG-193 (user decision, round 5): a programmatic row (a dispatch/verify
@@ -1777,7 +2069,7 @@ function visibleSessions(s) {
   //   row is withheld. A NON-folded live/open session (dashboard/interactive)
   //   still always shows, so real work never vanishes.
   const alwaysIds = new Set(rest.filter((x) =>
-    !foldsFromList(x) && (isAlwaysVisible(x) || hasLiveWork(x))).map((x) => x.sessionId));
+    !foldsFromList(x) && !closedAway(x) && (isAlwaysVisible(x) || hasLiveWork(x))).map((x) => x.sessionId));
   // The pool competing for the budget: everything not already always-in, kept if
   // it is within the (substance-scaled) recency window OR carries unseen
   // attention (so an old-but-active session still competes rather than being
@@ -1788,7 +2080,7 @@ function visibleSessions(s) {
   // folded row, and a live/open one already bypassed the pool via alwaysIds above,
   // so running work is never hidden. `foldsFromList` is the server-owned decision.
   const pool = rest.filter((x) => !alwaysIds.has(x.sessionId)
-    && (!windowed || (!foldsFromList(x) && (withinRecentWindow(x) || isAttentionSession(x)))));
+    && (!windowed || (!closedAway(x) && !foldsFromList(x) && (withinRecentWindow(x) || isAttentionSession(x)))));
   // Adaptive seat budget: sized by how many pool sessions are genuinely recent,
   // clamped to [MIN_SEATS, MAX_SEATS]. Lifting the window ("N more") hands the
   // budget to s.shown — the progressive reveal.
@@ -1796,14 +2088,28 @@ function visibleSessions(s) {
   const seats = windowed
     ? Math.min(MAX_SEATS, Math.max(MIN_SEATS, recentInPool))
     : Math.max(0, s.shown);
-  // Rank for the scarce seats: SUBSTANTIAL sessions first, then unseen
-  // attention, then recency (a stable sort preserves recency order among
-  // equals). Substance leads because a long session from yesterday you are
-  // mid-way through must outrank a one-message throwaway from an hour ago — the
-  // reverse (pure recency/attention) would fold the work and keep the clutter.
+  // Rank for the scarce seats. Tiers, highest priority first:
+  //   1. IN-WINDOW first (withinRecentWindow). A session the user worked in
+  //      recently must outrank one that is only in the pool because it carries
+  //      STALE unseen activity (an old seen-stamp older than its last activity
+  //      makes an out-of-window row "attention"). Without this tier the attention
+  //      key below promoted ALL attention rows — however old — ahead of every
+  //      non-attention row, so a day-old session the user just worked in (seen,
+  //      so not attention) lost its seat to a 5-day-old stale-attention one and
+  //      got folded. FEAT-070 round 2: the user's recent/active sessions were
+  //      being buried this way (open/live rows already bypass via alwaysIds; this
+  //      covers the recent-but-not-open ones). Stale-attention rows take LEFTOVER
+  //      seats only — they still compete, they just no longer displace recents.
+  //   2. SUBSTANTIAL before brief (within a window tier): a long session from
+  //      yesterday you are mid-way through outranks a one-message throwaway from
+  //      an hour ago — the reverse would fold the work and keep the clutter.
+  //   3. unseen ATTENTION before seen, then recency (a stable sort preserves
+  //      recency order among equals).
+  const windowRank = (x) => (withinRecentWindow(x) ? 0 : 1);
   const briefRank = (x) => (isBriefSession(x) ? 1 : 0);
   const ranked = pool.slice().sort((a, b) =>
-    briefRank(a) - briefRank(b)
+    windowRank(a) - windowRank(b)
+    || briefRank(a) - briefRank(b)
     || (isAttentionSession(b) ? 1 : 0) - (isAttentionSession(a) ? 1 : 0));
   const capped = ranked.slice(0, seats);
   const keep = new Set([...alwaysIds, ...capped.map((x) => x.sessionId)]);
@@ -1814,8 +2120,9 @@ function visibleSessions(s) {
 }
 
 /** Multi-line tooltip. Only states what an explicit server field says is true. */
-function rowTooltip(sess, pinned, renamed) {
+function rowTooltip(sess, pinned, renamed, closed) {
   const bits = [rowTitle(sess)];
+  if (closed) bits.push('Closed — set aside as done; appears under “N more”, reopens on a new message');
   if (pinned) bits.push('Pinned — held at the top of this project');
   if (renamed) {
     const auto = api.autoTitleOf(sess);
@@ -1829,6 +2136,7 @@ function sessionRow(p, sess) {
   const pendingRow = sess.pending === true; // FEAT-073 — the not-yet-sent new session
   const active = pendingRow || state.current.sessionId === sess.sessionId;
   const pinned = !pendingRow && api.pinnedOf(sess);
+  const closed = !pendingRow && api.closedOf(sess); // FEAT-168 — CLOSED (done) label
   const renamed = !pendingRow && api.renamedOf(sess);
   const k = seenKey(sess.encodedDir, sess.sessionId);
   const fresh = !active
@@ -1850,10 +2158,10 @@ function sessionRow(p, sess) {
   // carries the unread type-lift is withheld there too, not just the tick.
   const showUnread = fresh && life !== 'running';
   const b = el('button', {
-    class: `row${isWin ? ' win' : ''}${pendingRow ? ' pending' : ''}${pinned ? ' pinned' : ''}${renamed ? ' named' : ''}${showUnread ? ' fresh' : ''}`
+    class: `row${isWin ? ' win' : ''}${pendingRow ? ' pending' : ''}${pinned ? ' pinned' : ''}${closed ? ' closed' : ''}${renamed ? ' named' : ''}${showUnread ? ' fresh' : ''}`
       + `${awaiting ? ' awaiting' : ''}${life === 'stopped' ? ' died' : ''}${visited ? ' visited' : ''}`,
     'aria-current': String(active),
-    title: pendingRow ? 'New session — not sent yet' : rowTooltip(sess, pinned, renamed),
+    title: pendingRow ? 'New session — not sent yet' : rowTooltip(sess, pinned, renamed, closed),
   });
   b.append(el('span', { class: 'when', text: when(sess.lastActivityAt) }));
   // BUG-086: pinned rows carry an explicit pin GLYPH (reads as "pinned"), not a
@@ -1862,6 +2170,15 @@ function sessionRow(p, sess) {
   // pinned-AND-open row shows the active highlight AND this marker.
   if (pinned) {
     b.append(el('span', { class: 'pin-mark', title: 'Pinned', 'aria-hidden': 'true' }, svg(MENU_ICON.pin, 11)));
+  }
+  // FEAT-168 — the CLOSED marker (archive-box glyph) sits in the SAME right-rail
+  // slot as the pin bookmark (appended before the long title so its float lands on
+  // the first line, not wrapped beneath). The row's muted `.closed` tone carries
+  // the colour; this carries the shape/meaning. Round 4: pin and closed are
+  // INDEPENDENT (closed is Orchard's own label, pin the transcript tag), so a
+  // pinned+closed row shows both markers, side by side in the same rail.
+  if (closed) {
+    b.append(el('span', { class: 'closed-mark', title: 'Closed — set aside; appears under “N more”', 'aria-hidden': 'true' }, svg(MENU_ICON.close, 11)));
   }
   b.append(document.createTextNode(rowTitle(sess)));
   // FEAT-037 P2b: an Orchard-owned (non-Claude) session names its engine — the
@@ -2118,11 +2435,16 @@ function projectHitRow(p) {
 
   b.addEventListener('click', () => {
     closeFinder();
-    state.expanded.add(p.id);
-    saveExpanded();
-    void loadSessions(p.id);
-    selectProject(p.id, { quiet: true });
-    renderTree();
+    // BUG-194 / ARCH-010 — selecting a project must land the view FULLY in it.
+    // A bare selectProject() only moved the sidebar header to p while the FOREIGN
+    // session (from another project) stayed open in the dock: the header said p
+    // but the transcript — and the composer's send target (state.current's
+    // encodedDir/sessionId) — still belonged to the other project. startNew() is
+    // the ONE project-open transition (the same path as the sidebar "+"/pending-
+    // new row): it closes the foreign session, sets openProjectId to p, and opens
+    // a fresh new-session composer for p. No agent launches until the user sends,
+    // so "which project is this view showing" has one answer, not two.
+    startNew(p.id);
     revealProject(p.id);
   });
   return b;
@@ -2429,6 +2751,9 @@ function placeAt(popEl, x, y) {
 const MENU_ICON = {
   rename: 'M10.4 2.9 13.1 5.6 5.5 13.2 2.2 13.8l.6-3.3z',
   pin: 'M4.6 2.6h6.8v10.8L8 10.7l-3.4 2.7z',
+  // FEAT-168 — an archive-box glyph (lid + body + handle slot): reads as "set
+  // aside / closed", a distinct SHAPE from the pin bookmark and the lifecycle dots.
+  close: 'M2.6 4.3h10.8v2.2H2.6zM3.7 6.6h8.6v6.3H3.7zM6.4 9.4h3.2',
   fork: 'M4.4 13V3.2M4.4 6.3h4.3c1.3 0 2.4 1 2.4 2.4V13',
   copy: 'M6 6h6.6v6.6H6zM3.4 10V3.4H10',
   del: 'M3.2 4.6h9.6M6.2 4.6V3.1h3.6v1.5M4.7 4.6l.6 8.3h5.4l.6-8.3',
@@ -2511,6 +2836,19 @@ function paintMenuRoot(host, sess) {
   // Filled bookmark when it IS pinned — the state, next to the action that undoes it.
   if (pinned) pinItem.classList.add('on');
   host.append(pinItem);
+
+  // FEAT-168 — close / reopen (the sidebar entry point). "Close" marks the session
+  // done so it leaves the immediate list; "Reopen" undoes it. Both are the same
+  // one-tag toggle the crown control fires.
+  const closed = api.closedOf(sess);
+  const closeItem = mitem(
+    menu.busy === 'close' ? (closed ? 'reopening…' : 'closing…') : (closed ? 'Reopen session' : 'Close session'),
+    'close',
+    () => void doClose(!closed),
+    { disabled: busy || menu.closeDead },
+  );
+  if (closed) closeItem.classList.add('on');
+  host.append(closeItem);
 
   host.append(mitem('Fork to another project…', 'fork', () => { menu.view = 'fork'; menu.err = null; menu.note = null; menu.force = null; paintRowMenu(); focusInMenu(); }, { disabled: busy }));
 
@@ -2623,6 +2961,49 @@ async function doPin(next, { force = false } = {}) {
   say(`${next ? 'pinned' : 'unpinned'} · confirmed by the server`);
 }
 
+/* ------------------------------------------------------------------- close */
+/*
+ * FEAT-168 — close/reopen from the row menu. Same contract as doPin: the server's
+ * 200 is not proof, so the list is re-read and the row's `closed` state verified
+ * before the menu reports success. Round 4: the label is Orchard's own (never the
+ * transcript tag), so there is no tag conflict and no "anyway" override; any
+ * error is shown with the server's message.
+ */
+async function doClose(next) {
+  const sess = menuSession();
+  const p = menu.p;
+  menu.busy = 'close';
+  menu.err = null;
+  paintRowMenu();
+  try {
+    await api.setClosed(sess.sessionId, sess.encodedDir, next);
+  } catch (err) {
+    menu.busy = null;
+    if (err.missing) {
+      menu.closeDead = true;
+      menu.err = 'nothing changed — this server has no close route yet';
+    } else {
+      menu.err = `not ${next ? 'closed' : 'reopened'} — ${err.message}`;
+    }
+    return paintRowMenu();
+  }
+  const row = await reread(p.id, sess);
+  menu.busy = null;
+  if (!row || api.closedOf(row) !== next) {
+    menu.closeDead = true;
+    menu.err = `not ${next ? 'closed' : 'reopened'} — the server accepted the change but still reports this session as ${api.closedOf(row) ? 'closed' : 'open'}`;
+    return paintRowMenu();
+  }
+  closeRowMenu();
+  // Keep the open session's crown control in step if this row IS the open one.
+  if (state.current.sessionId === sess.sessionId && state.current.encodedDir === sess.encodedDir) {
+    state.current.closed = next;
+    paintCrown();
+  }
+  renderTree();
+  say(`${next ? 'closed' : 'reopened'} · confirmed by the server`);
+}
+
 /* ---------------------------------------------------------------- copy id */
 
 async function doCopyId(sess) {
@@ -2685,6 +3066,14 @@ async function armFork(target, sess) {
   const src = menu.p;
   closeRowMenu();
   await openSession(src, sess); // put the history being branched on screen first
+  // BUG-198 — the staged fork is a NOT-YET-BORN session: its bag must never persist
+  // under the SOURCE's key (state.current still names the source id until
+  // session-init). Contents keep the pre-BUG-198 behaviour — a cross-project fork
+  // started clean (selectProject used to clear), a same-project fork kept the
+  // source's armed values — but the owner is pending in both cases.
+  const keepArmed = src.id === target.id ? { ...state.overrides } : {};
+  resetOverrides(ovrPending()); // BUG-198 round 2 — a fresh token: the fork-to-be's own bag
+  Object.assign(state.overrides, keepArmed);
   selectProject(target.id, { quiet: true });
   state.current.projectId = target.id;
   // The source dir must survive: it is where the transcript to stage lives, and
@@ -2836,6 +3225,53 @@ function iconCog() {
 
 /* -------------------------------------------------------------- the crown */
 
+/*
+ * FEAT-168 — the crown's Close/Reopen control. Visible only when a REAL on-disk
+ * session is open (a pending-new row has no sessionId and nothing to close). The
+ * label, glyph, pressed-state and tooltip all track state.current.closed, which
+ * openSession seeds from the row and doClose/doCloseCurrent keep in step.
+ */
+function paintCloseSessPill() {
+  const open = !!state.current.sessionId;
+  node.closeSessBtn.hidden = !open;
+  if (!open) return;
+  const isClosed = state.current.closed === true;
+  node.closeSessLbl.textContent = isClosed ? 'Reopen' : 'Close';
+  node.closeSessG.textContent = isClosed ? '▣' : '▢';
+  node.closeSessBtn.classList.toggle('on', isClosed);
+  node.closeSessBtn.setAttribute('aria-pressed', String(isClosed));
+  node.closeSessBtn.title = isClosed
+    ? 'Reopen this session — it rejoins the immediate list'
+    : 'Mark this session closed (done) — it leaves the immediate list and reopens on a new message';
+}
+
+/*
+ * FEAT-168 — toggle CLOSED for the currently-open session from the crown. Unlike
+ * the row menu's doClose (which drives the row's menu state), this acts on
+ * state.current and repaints the crown + tree. The server's 200 is not proof: the
+ * session list is re-read and the row's `closed` verified before we commit the UI.
+ */
+async function doCloseCurrent() {
+  const cur = state.current;
+  if (!cur.sessionId) return;
+  const next = !(cur.closed === true);
+  node.closeSessBtn.disabled = true;
+  try {
+    await api.setClosed(cur.sessionId, cur.encodedDir, next);
+  } catch (err) {
+    node.closeSessBtn.disabled = false;
+    say(`not ${next ? 'closed' : 'reopened'} — ${err.message}`, true);
+    return;
+  }
+  node.closeSessBtn.disabled = false;
+  cur.closed = next;
+  paintCloseSessPill();
+  // Reflect the change on the row the moment the list is refreshed.
+  try { await loadSessions(cur.projectId, { force: true }); } catch { /* best-effort repaint */ }
+  renderTree();
+  say(`${next ? 'closed' : 'reopened'} · confirmed by the server`);
+}
+
 function paintCrown() {
   const p = currentProject();
   node.where.textContent = p ? p.name : '';
@@ -2858,7 +3294,7 @@ function paintCrown() {
 
   const has = !!p;
   paintModelChip(); // FEAT-042 — chip visibility tracks project selection
-  paintProvSel();   // FEAT-139 — now keeps the header provider selector hidden (moved into Settings)
+  paintProvSurfaces(); // FEAT-139 header twin stays hidden; BUG-196 round 3 — button + popover repaint together on every selection change
   paintAccountSel(); // FEAT-145 — which Claude subscription the next session bills to
   // FEAT-139 — the CONFIG chips leave the strip entirely and live under the one
   // Settings door (Machine · This project · This session spine). Provider,
@@ -2872,6 +3308,7 @@ function paintCrown() {
   // index.html): a door nothing could open is not a door.
   node.insBtn.hidden = true;
   node.settingsBtn.hidden = !has; // BUG-158 — the ONE config door, visible whenever a project is selected
+  paintCloseSessPill(); // FEAT-168 — in-session Close/Reopen control
   node.seal.querySelector('.seal-vdiv').hidden = true; // nothing left to divide — nav sits alone
   node.sealSep.hidden = !has;
   for (const m of [...node.seal.querySelectorAll('.mnt, .addm')]) m.remove();
@@ -2991,7 +3428,13 @@ function paintIntegrations() {
   const live = liveAttachedServers(); // null = no live report — planned view (also null when foreign, BUG-106)
   const provider = live
     ? (dockEffective()?.provider ?? 'anthropic')
-    : (state.overrides.provider ?? p.settings?.provider ?? 'anthropic');
+    // BUG-196 — an open, resumable session's engine is pinned by its transcript, so
+    // the integrations posture (Codex ⟹ MCP off) must reflect that, not a project
+    // setting / override the resume ignores. lockedSessionProvider is null for the
+    // launch surface (pending-new / no session), where the project default applies.
+    // BUG-196 round 6 — read from the one engine state (null = not known yet, so the
+    // posture is not claimed either way), not re-derived here.
+    : providerView();
   const mcpOff = live
     ? dockEffective()?.capabilities?.mcpConfig === false
     : provider === 'openai';
@@ -3391,6 +3834,80 @@ function setModelLive(value) {
 }
 
 /**
+ * FEAT-160 — switch the Claude account of the RUNNING session. Claims nothing
+ * until the server acks (same discipline as setModelLive): the server reaps the
+ * idle CLI under the old account and only the ok ack arms the new account and
+ * the resume. `next` is the picker choice: `undefined` = inherit the project's
+ * account, `null` = the default (~/.claude) account, a string = that account id.
+ */
+function switchAccountLive(next) {
+  if (acctPending) return say('still waiting on the last account switch', true);
+  /*
+   * FEAT-160 round 4 — send the RAW picker choice; the SERVER resolves it. An
+   * "inherit / Project default" pick (`next === undefined`) must NOT be resolved
+   * here: the full chain is the project setting UNDER the machine-wide default,
+   * and the machine-default layer lives only on the server (global-settings).
+   * The old client resolution `project.settings.claudeAccount ?? null` omitted
+   * it, so picking "Project default" on a session billing the machine default
+   * bound ~/.claude instead — an un-correctable mis-bill. So: `inherit:true` for
+   * the inherit pick (the server resolves it exactly as a fresh session would),
+   * else the concrete choice (`null` = default, or an account id).
+   */
+  const inherit = next === undefined;
+  const account = inherit ? null : next; // concrete pick; ignored by the server when inherit
+  const requestId = `acc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  if (!send({ type: 'switch-account', requestId, account, inherit })) {
+    return say('account unchanged — no live connection, nothing was sent', true);
+  }
+  acctPending = { requestId, next, account };
+  acctPending.timer = setTimeout(() => finishAccountSwitch(requestId, false,
+    'the server never confirmed — this session is still running on the old account'), 8000);
+  // The resolved account comes back on the ack (the server owns the chain); for an
+  // inherit pick we cannot name it yet, so say the generic target.
+  say(inherit
+    ? 'switching the running session to the project default account…'
+    : `switching the running session to ${acctShortName(account ?? 'default')}…`);
+  closePops();
+  paintAccountSel();
+}
+
+/**
+ * Settle a live account switch. `ok` is the server's word. On success the old CLI
+ * was already reaped server-side, so we arm the new account override and re-arm
+ * the resume — the transcript is intact and the NEXT message resumes the same
+ * session id under the new account (we never invent a turn, same rule as
+ * reconnectDropped). On failure the old session is still running, untouched.
+ */
+function finishAccountSwitch(requestId, ok, why, account = null, sessionId = null) {
+  if (!acctPending || acctPending.requestId !== requestId) return;
+  clearTimeout(acctPending.timer);
+  const chosen = acctPending.next; // undefined | null | id
+  const acctLabel = acctPending.account; // the resolved account this switch targeted
+  acctPending = null;
+  if (!ok) { paintAccountSel(); return say(why || 'account switch declined — the session is still on the old account', true); }
+  // Arm the override exactly as pickAccount would, so the resume carries it.
+  if (chosen === undefined) delete state.overrides.claudeAccount;
+  else state.overrides.claudeAccount = chosen;
+  persistOverrides();
+  // The old CLI is gone: re-arm the resume like reconnectDropped (no invented turn).
+  const resume = sessionId || state.sdkSessionId;
+  state.live = false;
+  if (resume) {
+    state.resumeOnNextSend = resume;
+    const th = mainThread();
+    th.paneEl.append(el('div', { class: 'ran-lbl', text: `account switched · resuming session ${resume.slice(0, 8)} on your next message` }));
+    paintComposerFor(viewedThread());
+  }
+  const name = acctShortName((account ?? acctLabel) ?? 'default');
+  say(`Claude account switched to ${name} — your next message resumes this session on it`);
+  paintSessStatus();
+  paintAccountSel();
+  paintAcctPop();
+  paintUsageChip();
+  drawer.repaintLive?.();
+}
+
+/**
  * Settle a live model change. `ok` comes from the server's ack — never from the
  * fact that we managed to send something.
  */
@@ -3636,6 +4153,7 @@ function resetTranscript() {
   queueKey = null;
   state.outbox = null; // the outgoing session's in-flight batch is not ours to retire or resend
   state.queue.length = 0; // a queue belongs to the session being left behind
+  state.queueUnfiled = [];
   state.followingLive = false; // the followed run belongs to the session we left
   state.followingExternal = false; // …and so does any external-follow framing
   paintQueue();
@@ -4677,26 +5195,69 @@ function paintComposerFor(th) {
 
 /* ------------------------------------------------------- git crown chip */
 /*
- * "Is my work safe?" at a glance: branch · dirty count · ahead/behind.
- * Fetched lazily with a short TTL; hidden entirely for non-repos (the drawer's
- * Git group still offers init/create there). Clicking opens that group.
+ * "Is my work safe?" at a glance. FEAT-165: the face carries the diffstat a
+ * developer expects — changed-file count, green +added, red −removed — and the
+ * detail (branch, upstream, every changed file with its status letter and +/−)
+ * lives in #gitPop, a styled popover in the shared .pop chrome that opens on hover
+ * and keyboard focus. Clicking the chip still opens the Git panel (FEAT-099).
+ * FEAT-163: a project that is NOT a git repository still shows the chip, in a
+ * "no repo" state; its popover offers "Initialize git repository" behind a
+ * confirm, which runs the server's init in the project directory (for a
+ * container project that is the same directory the container mounts). Status is
+ * fetched lazily with a short TTL; an UNKNOWN status (not yet fetched, or a
+ * missing project dir) still hides the chip rather than guessing.
  */
 
 const GIT_TTL_MS = 15_000;
+/** The popover lists at most this many files; the rest are one "and N more" line. */
+const GIT_POP_MAX_FILES = 200;
+/** Status letters, in the `git status -s` / editor vocabulary the user already reads. */
+const GIT_LETTER = { modified: 'M', added: 'A', deleted: 'D', renamed: 'R', untracked: 'U' };
+/** 1234 → "1,234"; 23456 → "23.5k" — the face stays short, the popover is exact. */
+function gitCount(n, exact = false) {
+  if (!Number.isFinite(n)) return '?';
+  if (exact || n < 10_000) return n.toLocaleString('en-US');
+  return `${(n / 1000).toFixed(n < 100_000 ? 1 : 0)}k`;
+}
+/** True when the status carries real line totals worth showing (not 0/0, not absent). */
+function gitHasLines(s) {
+  return Number.isFinite(s?.added) && Number.isFinite(s?.removed) && (s.added > 0 || s.removed > 0);
+}
+
+// (gitPinned / gitInitArmed are declared beside usagePinned near the top: closePops
+// resets them and may run before this point of module evaluation.)
+let gitHoverTimer = null;
+let gitInitBusy = null;      // project id whose init is in flight
+let gitInitError = null;     // { projectId, message } from the last failed init
+
+function hideGitChip() {
+  node.gitBtn.hidden = true;
+  if (node.gitPop.classList.contains('open')) closePops();
+}
 
 function paintGitChip() {
   const p = currentProject();
-  if (!p) { node.gitBtn.hidden = true; return; }
+  // A project whose directory is gone has nothing to show or initialise.
+  if (!p || p.pathMissing) { hideGitChip(); return; }
   const g = state.git.get(p.id);
   if (!g || (Date.now() - g.at > GIT_TTL_MS && !g.loading)) { void refreshGit(p.id); }
   const s = g?.status;
-  if (!s?.repo) { node.gitBtn.hidden = true; return; }
-  // FEAT-139 r3 — the FACE carries only the CATEGORY (branch glyph), the STATE
-  // (a shape-coded dot) and the one number the user reads (dirty count). The
-  // branch name, +/− line totals and ahead/behind — everything that used to make
-  // this a sentence — move to the tooltip (the full original sentence, below) and
-  // to the Git panel this chip opens. The dot's state is carried by SHAPE + FILL
-  // first, colour only as reinforcement, so it survives colour-blindness:
+  if (!s) { hideGitChip(); return; }
+  node.gitBtn.hidden = false;
+  if (!s.repo) {
+    // FEAT-163 — the chip is the way in to version control for this project.
+    node.gitBtn.dataset.repo = 'false';
+    node.gitDot.dataset.state = 'none';
+    setText(node.gitN, 'no git');
+    node.gitStat.hidden = true;
+    node.gitBtn.removeAttribute('title');
+    node.gitBtn.setAttribute('aria-label', 'Git — this project is not a git repository. Open to initialise one.');
+    if (node.gitPop.classList.contains('open')) paintGitPop();
+    return;
+  }
+  node.gitBtn.dataset.repo = 'true';
+  // FEAT-139 r3 — the dot's state is carried by SHAPE + FILL first, colour only
+  // as reinforcement, so it survives colour-blindness:
   //   clean   = hollow ring   (on a branch, nothing to commit)
   //   dirty   = filled disc   (on a branch, uncommitted work)
   //   conflict= filled diamond(mid-merge — a distinct silhouette, not just a hue)
@@ -4705,9 +5266,22 @@ function paintGitChip() {
   const detached = !s.branch;
   const dotState = conflicted ? 'conflict' : (detached ? 'detached' : (s.dirty ? 'dirty' : 'clean'));
   node.gitDot.dataset.state = dotState;
-  // The single number: dirty count when there is dirt (clean shows none).
-  node.gitN.textContent = s.dirty ? String(s.dirty) : '';
-  // Full original sentence, on hover — nothing dropped, just relocated.
+  // FEAT-165 — the diffstat on the face: "12 files +340 −28". The unit word is
+  // a separate span so a narrow bar can drop it (CSS) and keep the number.
+  const key = s.dirty ? `${s.dirty}` : '';
+  if (node.gitN.dataset.key !== key) {
+    node.gitN.dataset.key = key;
+    clear(node.gitN);
+    if (s.dirty) node.gitN.append(String(s.dirty), el('span', { class: 'git-unit', text: s.dirty === 1 ? ' file' : ' files' }));
+  }
+  const lines = gitHasLines(s);
+  node.gitStat.hidden = !lines;
+  setText(node.gitAdd, lines ? `+${gitCount(s.added)}` : '');
+  setText(node.gitDel, lines ? `−${gitCount(s.removed)}` : '');
+  // FEAT-165 — no native title: the styled popover is the hover detail.
+  node.gitBtn.removeAttribute('title');
+  if (node.gitPop.classList.contains('open')) paintGitPop();
+  // The full sentence, for assistive tech — nothing dropped.
   const bits = [s.branch ? s.branch : `detached @ ${s.detachedAt ?? '?'}`];
   if (s.dirty) bits.push(`${s.dirty} dirty`);
   if (conflicted) bits.push(`${s.conflicted} conflict${s.conflicted === 1 ? '' : 's'}`);
@@ -4718,16 +5292,15 @@ function paintGitChip() {
   if (s.untrackedLinesIncluded === false && showLineCounts && (added || removed)) bits.push('(tracked only)');
   if (Number.isFinite(s.ahead) && s.ahead > 0) bits.push(`↑${s.ahead}`);
   if (Number.isFinite(s.behind) && s.behind > 0) bits.push(`↓${s.behind}`);
-  const sentence = `⎇ ${bits.join(' · ')}`;
-  node.gitBtn.title = `${sentence}\n${s.lastCommit ?? ''}${s.upstream ? ` · tracking ${s.upstream}` : ' · no upstream'}\nOpen the Git panel`;
   node.gitBtn.setAttribute('aria-label', `Git — ${bits.join(', ')}. Open the Git panel.`);
-  node.gitBtn.hidden = false;
 }
 
 async function refreshGit(projectId) {
   const cur = state.git.get(projectId);
   if (cur?.loading) return;
-  const rec = { status: cur?.status ?? null, at: Date.now(), loading: true };
+  // The per-file list (FEAT-165) rides along so a status refresh never blanks an
+  // open popover; it is refetched on its own when the popover opens.
+  const rec = { status: cur?.status ?? null, at: Date.now(), loading: true, changes: cur?.changes ?? null, changesAt: cur?.changesAt ?? 0 };
   state.git.set(projectId, rec);
   try {
     rec.status = await api.gitStatus(projectId);
@@ -4737,10 +5310,198 @@ async function refreshGit(projectId) {
   if (state.current.projectId === projectId) paintGitChip();
 }
 
-// FEAT-099: the chip used to deep-link to Advanced ▸ Git in the drawer. It now
-// routes to the working-tree view — per-file staging and diffs — for the
-// project the chip names, so browser Back returns to the full session route.
-node.gitBtn.addEventListener('click', () => navGit(currentProject()?.id));
+/** FEAT-165 — the per-file list for the popover, fetched only while it is open. */
+async function loadGitChanges(projectId) {
+  const rec = state.git.get(projectId);
+  if (!rec || rec.changesLoading) return;
+  rec.changesLoading = true;
+  try {
+    const r = await api.gitChanges(projectId);
+    rec.changes = { list: r.changes ?? [], error: null };
+    if (r.status) { rec.status = r.status; rec.at = Date.now(); }
+  } catch (err) {
+    rec.changes = { list: rec.changes?.list ?? null, error: err.message };
+  }
+  rec.changesLoading = false;
+  rec.changesAt = Date.now();
+  if (state.current.projectId === projectId) paintGitChip();
+  if (state.current.projectId === projectId && node.gitPop.classList.contains('open')) paintGitPop();
+}
+
+/**
+ * FEAT-165 — the git detail popover. Branch + upstream, the diffstat, then each
+ * changed file: status letter, path (directory quiet, file name full ink) and its
+ * own +/− counts. FEAT-163 — for a non-repo it is the "Initialize" surface.
+ */
+function paintGitPop() {
+  const body = node.gitPopBody;
+  clear(body);
+  const p = currentProject();
+  const g = p ? state.git.get(p.id) : null;
+  const s = g?.status;
+  if (!p || !s) { body.append(el('div', { class: 'gp-note', text: 'Git status is not available yet.' })); return; }
+  if (!s.repo) { paintGitInit(body, p); return; }
+  const head = el('div', { class: 'gp-head' });
+  head.append(el('span', { class: 'gp-branch', text: s.branch ?? `detached @ ${s.detachedAt ?? '?'}` }));
+  const sync = [];
+  if (Number.isFinite(s.ahead) && s.ahead > 0) sync.push(`↑${s.ahead}`);
+  if (Number.isFinite(s.behind) && s.behind > 0) sync.push(`↓${s.behind}`);
+  head.append(el('span', { class: 'gp-up', text: s.upstream ? `${s.upstream}${sync.length ? ` · ${sync.join(' ')}` : ' · up to date'}` : 'no upstream' }));
+  body.append(head);
+  if (s.lastCommit) body.append(el('div', { class: 'gp-last', title: s.lastCommit, text: s.lastCommit }));
+  const sum = el('div', { class: 'gp-sum' });
+  if (!s.dirty) {
+    sum.append(el('span', { class: 'gp-files', text: 'Working tree clean' }));
+  } else {
+    sum.append(el('span', { class: 'gp-files', text: `${gitCount(s.dirty, true)} changed file${s.dirty === 1 ? '' : 's'}` }));
+    if (Number.isFinite(s.added)) sum.append(el('span', { class: 'gp-add', text: `+${gitCount(s.added, true)}` }));
+    if (Number.isFinite(s.removed)) sum.append(el('span', { class: 'gp-del', text: `−${gitCount(s.removed, true)}` }));
+    if (Number.isFinite(s.conflicted) && s.conflicted > 0) sum.append(el('span', { class: 'gp-conflict', text: `${s.conflicted} conflict${s.conflicted === 1 ? '' : 's'}` }));
+  }
+  body.append(sum);
+  if (s.dirty && s.untrackedLinesIncluded === false) {
+    body.append(el('div', { class: 'gp-note', text: 'Line totals count tracked files only — the untracked set is too large to read.' }));
+  }
+  if (s.dirty) {
+    const ch = g.changes;
+    const list = el('div', { class: 'gp-list', role: 'list' });
+    if (!ch && !g.changesLoading) void loadGitChanges(p.id);
+    if (!ch?.list) {
+      list.append(el('div', { class: 'gp-note', text: ch?.error ? `Could not list files: ${ch.error}` : 'Reading changes…' }));
+    } else {
+      for (const c of ch.list.slice(0, GIT_POP_MAX_FILES)) {
+        const letter = GIT_LETTER[c.type] ?? '?';
+        const slash = c.path.lastIndexOf('/');
+        const dir = slash >= 0 ? c.path.slice(0, slash + 1) : '';
+        const base = slash >= 0 ? c.path.slice(slash + 1) : c.path;
+        const nums = el('span', { class: 'gp-n' });
+        if (c.binary) nums.append(el('span', { class: 'gp-bin', text: 'binary' }));
+        else {
+          nums.append(el('span', { class: 'gp-add', text: `+${gitCount(c.added ?? 0, true)}` }));
+          nums.append(el('span', { class: 'gp-del', text: `−${gitCount(c.removed ?? 0, true)}` }));
+        }
+        list.append(el('div', {
+          class: `gp-row${c.staged ? ' staged' : ''}`, role: 'listitem', 'data-type': c.type,
+          title: `${c.oldPath ? `${c.oldPath} → ` : ''}${c.path} — ${c.type}${c.staged ? ', staged' : ''}`,
+        },
+        el('span', { class: 'gp-letter', 'aria-label': c.type, text: letter }),
+        el('span', { class: 'gp-path' }, el('span', { class: 'gp-dir', text: dir }), el('span', { class: 'gp-base', text: base })),
+        nums));
+      }
+      const more = ch.list.length - GIT_POP_MAX_FILES;
+      if (more > 0) list.append(el('div', { class: 'gp-note gp-more', text: `and ${gitCount(more, true)} more — open the Git panel for the full list` }));
+      if (ch.error) list.append(el('div', { class: 'gp-note', text: `List may be stale: ${ch.error}` }));
+    }
+    body.append(list);
+  }
+  const foot = el('div', { class: 'pop-foot' });
+  const open = el('button', { type: 'button', class: 'gp-open' }, 'Open Git panel', el('span', { class: 'cx', text: '›' }));
+  open.addEventListener('click', () => { closePops(); navGit(p.id); });
+  foot.append(open);
+  body.append(foot);
+}
+
+/** FEAT-163 — "this project is not a git repository", with a confirmed init. */
+function paintGitInit(body, p) {
+  const busy = gitInitBusy === p.id;
+  const armed = gitInitArmed === p.id;
+  body.append(el('div', { class: 'gp-head' }, el('span', { class: 'gp-branch', text: 'Not a git repository' })));
+  body.append(el('div', { class: 'gp-note', text: `${p.name} has no version control yet. Initialising creates a .git folder in the project directory with an empty main branch. Nothing is committed or pushed.` }));
+  body.append(el('div', { class: 'gp-where', title: p.hostPath, text: `${shortPath(p.hostPath)}${p.isolation === 'container' ? ' · mounted into the container' : ''}` }));
+  const act = el('div', { class: 'gp-init' });
+  if (busy) {
+    act.append(el('button', { type: 'button', class: 'gp-btn primary', disabled: true, text: 'Initialising…' }));
+  } else if (!armed) {
+    const b = el('button', { type: 'button', class: 'gp-btn primary', 'data-act': 'init', text: 'Initialize git repository' });
+    b.addEventListener('click', () => { gitInitArmed = p.id; gitInitError = null; paintGitPop(); node.gitPop.querySelector('[data-act="confirm"]')?.focus(); });
+    act.append(b);
+  } else {
+    act.append(el('span', { class: 'gp-ask', text: 'Run git init here?' }));
+    const yes = el('button', { type: 'button', class: 'gp-btn primary', 'data-act': 'confirm', text: 'Initialize' });
+    yes.addEventListener('click', () => void doGitInit(p));
+    const no = el('button', { type: 'button', class: 'gp-btn', 'data-act': 'cancel', text: 'Cancel' });
+    no.addEventListener('click', () => { gitInitArmed = null; paintGitPop(); });
+    act.append(yes, no);
+  }
+  body.append(act);
+  if (gitInitError?.projectId === p.id) body.append(el('div', { class: 'gp-err', role: 'alert', title: gitInitError.message, text: gitInitError.message }));
+}
+
+async function doGitInit(p) {
+  gitInitBusy = p.id;
+  gitInitArmed = null;
+  gitInitError = null;
+  paintGitPop();
+  try {
+    const r = await api.gitAction(p.id, 'init');
+    state.git.set(p.id, { status: r.status ?? null, at: Date.now(), loading: false, changes: null, changesAt: 0 });
+    say(`initialised a git repository in ${p.name} (branch main)`);
+  } catch (err) {
+    gitInitError = { projectId: p.id, message: `Could not initialise: ${err.message}` };
+    say(`could not initialise git in ${p.name}: ${err.message}`, true);
+  }
+  gitInitBusy = null;
+  if (state.current.projectId === p.id) {
+    paintGitChip();
+    if (node.gitPop.classList.contains('open')) paintGitPop();
+  }
+}
+
+/*
+ * Hover intent (same contract as the usage popover, FEAT-161): open after a short
+ * dwell, close after a grace period so the pointer can cross into the popover;
+ * keyboard focus opens it. A click on a REPO chip opens the Git panel (FEAT-099);
+ * a click on a "no git" chip pins the popover so the init action can be reached.
+ */
+function openGitPop() {
+  if (node.gitBtn.hidden) return;
+  clearTimeout(gitHoverTimer);
+  if (node.gitPop.classList.contains('open')) return;
+  closePops();
+  const p = currentProject();
+  const g = p ? state.git.get(p.id) : null;
+  if (p && g?.status?.repo && g.status.dirty && Date.now() - (g.changesAt ?? 0) > 5_000) void loadGitChanges(p.id);
+  paintGitPop();
+  node.gitPop.classList.add('open');
+  place(node.gitPop, node.gitBtn, node.gitPop.offsetWidth || 380);
+  node.gitBtn.setAttribute('aria-expanded', 'true');
+}
+function closeGitPopSoon() {
+  clearTimeout(gitHoverTimer);
+  if (gitPinned) return;
+  gitHoverTimer = setTimeout(() => {
+    if (gitPinned) return;
+    if (node.gitPop.matches(':hover') || node.gitBtn.matches(':hover')) return;
+    if (node.gitPop.contains(document.activeElement) || document.activeElement === node.gitBtn) return;
+    if (node.gitPop.classList.contains('open')) closePops();
+  }, 220);
+}
+node.gitBtn.addEventListener('mouseenter', () => {
+  clearTimeout(gitHoverTimer);
+  if (node.gitPop.classList.contains('open')) return;
+  gitHoverTimer = setTimeout(openGitPop, 150);
+});
+node.gitBtn.addEventListener('mouseleave', closeGitPopSoon);
+node.gitPop.addEventListener('mouseenter', () => clearTimeout(gitHoverTimer));
+node.gitPop.addEventListener('mouseleave', closeGitPopSoon);
+node.gitPop.addEventListener('click', (e) => e.stopPropagation());
+node.gitBtn.addEventListener('focus', () => { if (node.gitBtn.matches(':focus-visible')) openGitPop(); });
+node.gitBtn.addEventListener('blur', closeGitPopSoon);
+// FEAT-099: a repo chip routes to the working-tree view — per-file staging and
+// diffs — for the project the chip names, so browser Back returns to the full
+// session route. FEAT-163: a "no git" chip has no panel to open; pin the popover.
+node.gitBtn.addEventListener('click', (e) => {
+  const p = currentProject();
+  if (state.git.get(p?.id)?.status?.repo === false) {
+    e.stopPropagation();
+    if (node.gitPop.classList.contains('open') && gitPinned) return closePops();
+    openGitPop();
+    gitPinned = true;
+    return;
+  }
+  closePops();
+  navGit(p?.id);
+});
 
 /** Crown chip: the CURRENT project's running processes, at a glance. */
 function paintProcChip() {
@@ -4805,6 +5566,201 @@ node.procBtn.addEventListener('click', (e) => {
 });
 // FEAT-054: land on Advanced ▸ Running here, not the drawer's default top.
 $('#procPopSettings').addEventListener('click', () => { closePops(); void drawer.open('settings', { focus: 'processes' }); });
+
+/* ------------------------------------------------------- FEAT-161 usage popover */
+
+/**
+ * FEAT-161 r2 — "in 2h 34m" style relative reset, two units of precision so it
+ * never contradicts the face countdown ("in 42s" | "in 23m" | "in 2h 34m" |
+ * "in 3d 4h"). "now" once passed — the next poll replaces the window.
+ */
+function fmtResetIn(sec) {
+  if (sec == null) return null;
+  const left = Math.round(sec - Date.now() / 1000);
+  if (left <= 0) return 'now';
+  // Floors like the face countdown (fmtCountdown), so the two never disagree.
+  const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60);
+  if (h >= 24) return `in ${Math.floor(h / 24)}d${h % 24 ? ` ${h % 24}h` : ''}`;
+  if (h >= 1) return `in ${h}h${m ? ` ${m}m` : ''}`;
+  if (m >= 1) return `in ${m}m`;
+  return `in ${left}s`;
+}
+/**
+ * FEAT-161 r2 — the wall-clock reset, as short as is unambiguous: "18:40" today,
+ * "tomorrow 18:40", "Mon 18:40" within the week, else "Oct 9, 18:40". Time is in
+ * the user's own locale format.
+ */
+function fmtResetAt(sec) {
+  if (sec == null) return null;
+  const d = new Date(sec * 1000);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  const day0 = new Date(); day0.setHours(0, 0, 0, 0);
+  const days = Math.floor((d - day0) / 86400000);
+  if (days <= 0) return time;
+  if (days === 1) return `tomorrow ${time}`;
+  if (days < 7) return `${d.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+}
+/** "Resets in 2h 34m · 18:40" — or null when the provider gave no reset time. */
+function fmtResetLine(sec) {
+  if (sec == null) return null;
+  return `Resets ${fmtResetIn(sec)} · ${fmtResetAt(sec)}`;
+}
+/** Window label in plain words: '5h' → '5-hour session', 'weekly · Fable' → ['Weekly', 'Fable only']. */
+function usageWinName(label) {
+  const raw = String(label ?? '');
+  if (/^5h$/i.test(raw)) return { name: '5-hour session', scope: null };
+  const m = /^weekly(?:\s*·\s*(.+))?$/i.exec(raw);
+  if (m) return { name: 'Weekly', scope: m[1] ? `${m[1]} only` : null };
+  return { name: raw, scope: null };
+}
+/** Severity tier shared by the bar colour: calm < 75 ≤ warn < 100 ≤ full. */
+function usageTier(pct) {
+  if (pct >= 100) return 'full';
+  if (pct >= 75) return 'warn';
+  return 'ok';
+}
+/** The snapshot the crown face is reading (same pick as paintUsageChip). */
+function usageFaceSnap(list) {
+  const provider = providerView();
+  return provider === 'anthropic'
+    ? (list.find((s) => s.provider === 'anthropic' && (s.accountId ?? 'default') === claudeAccountView())
+      ?? list.find((s) => s.provider === 'anthropic'))
+    : list.find((s) => s.provider === provider);
+}
+
+/**
+ * FEAT-161 — the provider-usage detail, in the shared .pop chrome (replaces the old
+ * native `title`). r2 redesign: one group per provider — a name + plan header whose
+ * right edge says "Limit reached" only when it is blocked — then its windows. The
+ * binding window (the one that stops the next lane) is the emphasised row: full-ink
+ * label and a heavier bar. Bars are calm below 75%, ochre to 99%, brick when full.
+ * The snapshot the face reads is listed first. Live text ([data-until]) ticks.
+ */
+function paintUsagePop() {
+  const body = node.usagePopBody;
+  if (!body) return;
+  clear(body);
+  const list = state.usage ?? [];
+  const snaps = list.filter((s) => s.provider === 'anthropic' || s.provider === 'openai');
+  const face = usageFaceSnap(snaps);
+  if (face) snaps.splice(snaps.indexOf(face), 1), snaps.unshift(face);
+  if (!snaps.length) {
+    body.append(el('div', { class: 'usnap' }, el('div', { class: 'usnap-note', text: 'Usage limits are not available yet.' })));
+    return;
+  }
+  let oldest = null;
+  for (const s of snaps) {
+    const block = el('section', { class: `usnap${s.available ? '' : ' unknown'}` });
+    const head = el('div', { class: 'usnap-h' });
+    head.append(el('span', { class: 'usnap-name', text: usageSnapName(s) }));
+    if (s.plan) head.append(el('span', { class: 'usnap-plan', text: String(s.plan).replace(/^./, (c) => c.toUpperCase()) }));
+    block.append(head);
+    if (!s.available) {
+      block.append(el('div', { class: 'usnap-note', text: s.note ? String(s.note) : 'Usage could not be read.' }));
+      body.append(block);
+      continue;
+    }
+    if (s.asOf != null) oldest = oldest == null ? s.asOf : Math.min(oldest, s.asOf);
+    const b = s.windows.find((w) => w.binding) ?? s.windows[0];
+    // Only a blocked provider earns a status; its time lives on the row below.
+    if (b && usageMaxed(b)) head.append(el('span', { class: 'usnap-status', text: 'Limit reached' }));
+    const wins = el('div', { class: 'uwins' });
+    for (const w of s.windows) {
+      const pct = Math.max(0, Math.min(100, Math.round(w.usedPercent)));
+      const { name, scope } = usageWinName(w.label);
+      const win = el('div', { class: `uwin ${usageTier(pct)}${w === b ? ' binding' : ''}` });
+      const top = el('div', { class: 'uwin-top' });
+      const lab = el('span', { class: 'uwin-label', text: name });
+      if (scope) lab.append(el('span', { class: 'uwin-scope', text: scope }));
+      top.append(lab, el('span', { class: 'uwin-pct', text: `${pct}%` }));
+      const bar = el('div', { class: 'ubar', role: 'meter', 'aria-valuemin': '0', 'aria-valuemax': '100',
+        'aria-valuenow': String(pct), 'aria-label': `${name}${scope ? ` (${scope})` : ''} used` });
+      const fill = el('div', { class: 'ubar-fill' });
+      fill.style.width = `${pct}%`;
+      bar.append(fill);
+      const reset = el('div', { class: 'uwin-reset' });
+      if (w.resetsAt != null) {
+        reset.dataset.until = String(w.resetsAt);
+        reset.textContent = fmtResetLine(w.resetsAt);
+      } else {
+        reset.textContent = 'Reset time unknown';
+        reset.classList.add('unknown');
+      }
+      win.append(top, bar, reset);
+      wins.append(win);
+    }
+    block.append(wins);
+    body.append(block);
+  }
+  if (oldest != null) {
+    const foot = el('div', { class: 'usage-foot' });
+    foot.dataset.asof = String(oldest);
+    foot.textContent = usageUpdatedText(oldest);
+    body.append(foot);
+  }
+}
+function usageUpdatedText(asOf) {
+  const mins = Math.floor((Date.now() - asOf) / 60000);
+  return mins < 1 ? 'Updated just now' : mins < 60 ? `Updated ${mins} min ago` : `Updated ${usageAsOf(asOf)}`;
+}
+/** FEAT-161 r2 — refresh the live text inside an OPEN popover (called each second). */
+function tickUsagePop() {
+  const pop = node.usagePop;
+  if (!pop?.classList.contains('open')) return;
+  for (const n of pop.querySelectorAll('[data-until]')) setText(n, fmtResetLine(Number(n.dataset.until)));
+  const foot = pop.querySelector('[data-asof]');
+  if (foot) setText(foot, usageUpdatedText(Number(foot.dataset.asof)));
+}
+
+/*
+ * Hover intent: open after a short dwell (so sweeping the pointer across the
+ * header does not flash it), close after a grace period (so the pointer can cross
+ * the gap into the popover — the popover also carries an invisible bridge over
+ * that gap). Focus opens it for keyboard users; a click pins it until Escape, an
+ * outside click, or a second click.
+ */
+let usageHoverTimer = null;
+function openUsagePop() {
+  if (node.usageBtn.hidden) return;
+  clearTimeout(usageHoverTimer);
+  if (node.usagePop.classList.contains('open')) return;
+  closePops();
+  paintUsagePop();
+  node.usagePop.classList.add('open');
+  place(node.usagePop, node.usageBtn, node.usagePop.offsetWidth || 320);
+  node.usageBtn.setAttribute('aria-expanded', 'true');
+}
+function closeUsagePopSoon() {
+  clearTimeout(usageHoverTimer);
+  if (usagePinned) return;
+  usageHoverTimer = setTimeout(() => {
+    if (usagePinned) return;
+    if (node.usagePop.matches(':hover') || node.usageBtn.matches(':hover')) return;
+    if (node.usagePop.contains(document.activeElement) || document.activeElement === node.usageBtn) return;
+    if (node.usagePop.classList.contains('open')) closePops();
+  }, 220);
+}
+node.usageBtn.addEventListener('mouseenter', () => {
+  clearTimeout(usageHoverTimer);
+  if (node.usagePop.classList.contains('open')) return;
+  usageHoverTimer = setTimeout(openUsagePop, 120);
+});
+node.usageBtn.addEventListener('mouseleave', closeUsagePopSoon);
+node.usagePop.addEventListener('mouseenter', () => clearTimeout(usageHoverTimer));
+node.usagePop.addEventListener('mouseleave', closeUsagePopSoon);
+// Clicks inside the popover must not reach the document-level closer.
+node.usagePop.addEventListener('click', (e) => e.stopPropagation());
+// Keyboard: focusing the chip opens it; blur out of chip+popover closes it.
+node.usageBtn.addEventListener('focus', () => { if (node.usageBtn.matches(':focus-visible')) openUsagePop(); });
+node.usageBtn.addEventListener('blur', closeUsagePopSoon);
+// Click pins it open (a hover-opened popover stays put); a second click closes.
+node.usageBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (node.usagePop.classList.contains('open') && usagePinned) return closePops();
+  openUsagePop();
+  usagePinned = true;
+});
 
 /* ------------------------------------------------------------- rendering */
 
@@ -5534,6 +6490,7 @@ async function openSession(p, sess, opts = {}) {
     sessionId: sess.sessionId,
     title: rowTitle(sess),
     os: sess.os,
+    closed: api.closedOf(sess), // FEAT-168 — drives the crown Close/Reopen control
   };
   // BUG-106 — record the project that OWNS this now-open session, distinct from
   // the sidebar selection. A later bare selectProject moves current.projectId but
@@ -5567,14 +6524,12 @@ async function openSession(p, sess, opts = {}) {
   closeSocket();
   paintCrown();
   renderTree();
-  // BUG-150 — resetTranscript re-binds the queue to state.current and hands
-  // back this session's outbox descriptor SYNCHRONOUSLY, before the transcript
-  // fetch below is awaited. So queueKey is set from the first moment the session
-  // is on screen: a message queued while the transcript is still loading
-  // persists under the right key instead of vanishing into the tab's heap. Only
-  // the outbox delivery-judgment (which reads the painted transcript) is
-  // deferred, via judgeAdoptedOutbox once the pane is on screen.
-  const adoptedOutbox = resetTranscript();
+  // BUG-150 — resetTranscript re-binds the queue to state.current SYNCHRONOUSLY,
+  // before the transcript fetch below is awaited. So queueKey is set from the
+  // first moment the session is on screen: a message queued while the transcript
+  // is still loading is filed under the right key instead of vanishing into the
+  // tab's heap. (BUG-217 round 5: and the server's outbox for it is asked for.)
+  resetTranscript();
   restoreDraft(state.current); // BUG-083 — this session's own saved draft (empty if none)
   // BUG-087 — capture the transcript-pane scope AFTER resetTranscript bumped it.
   // If the user opens another session before this one's transcript fetch lands,
@@ -5594,12 +6549,18 @@ async function openSession(p, sess, opts = {}) {
     // scroll-up by loadOlder(). Fetched even when restoring at a deep index,
     // because it carries `total` — needed to know the restore IS deep.
     const t = await api.transcriptTail(sess.encodedDir, sess.sessionId, { limit: TAIL_PAGE });
+    // BUG-196 round 3 — record the engine THIS session id is pinned to, as the
+    // server declared it (resumeProviderOf). Keyed by the id, so it is true
+    // whatever is on screen when it lands — recorded BEFORE the scope guard.
+    declareLockedProvider(sess.sessionId, t.lockedProvider);
     // BUG-087 — switched away while this fetch was in flight: the pane now belongs
     // to a different session (resetTranscript already cleared it and bumped the
     // scope). Drop this answer rather than paint the prior session's transcript
     // under the current header. `wait` was detached by that reset, so leave it.
     if (scope !== state.txScope) return;
     wait.remove();
+    paintIntegrations();
+    paintAccountSel();
     // FEAT-132 — the session-configuration card pinned above the first turn.
     // Fire-and-forget: it fetches its own record and prepends when ready, so it
     // never delays the transcript paint, and it stays the pane's top child
@@ -5647,15 +6608,10 @@ async function openSession(p, sess, opts = {}) {
     }
     if (opts.highlightAt != null) highlightMessageAt(th, opts.highlightAt);
     /*
-     * BUG-129: this session's undelivered messages come back here — AFTER its
-     * transcript is on screen, because a handed-off batch is only judged
-     * undelivered by NOT being in that transcript (transcriptHasAll). Before
-     * this point the pane is empty and every restored batch would read as lost.
-     * BUG-150: the ROWS were already adopted synchronously before the fetch;
-     * only the outbox delivery-judgment is settled here, against the now-painted
-     * transcript.
+     * BUG-150: this session's queued rows were adopted synchronously before the
+     * fetch. BUG-217 round 5: nothing is judged against the transcript here —
+     * the server's outbox says what became of each row.
      */
-    judgeAdoptedOutbox(adoptedOutbox);
     // Is this session being written LIVE right now (dashboard bridge OR an
     // external terminal this tab only follows)? Decided BEFORE the agent
     // summary, because a live session must not get one dumped into its tail.
@@ -5765,22 +6721,26 @@ async function openSession(p, sess, opts = {}) {
         say('this session is being written live by another process — following along as it goes.');
       }
     }
+    /*
+     * BUG-217 round 5: queued messages are the SERVER's to deliver (its outbox
+     * delivers them when the session can take a turn, tab or no tab); this tab
+     * only shows them — ask for the current answer now the pane is settled.
+     */
+    void refreshOutbox();
   } catch (err) {
     // BUG-087 — a fetch that REJECTS after the user switched away is not this
     // session's error to render: resetTranscript()+the message would wipe and
     // scribble on the pane that now belongs to the newly-opened session.
     if (scope !== state.txScope) return;
     // BUG-129 + BUG-150: the transcript could not be read, but the session's
-    // undelivered rows are still its own. resetTranscript re-binds ownership and
-    // restores those rows by construction (it is the sole owner of the queue↔
-    // session binding), so this failure path CANNOT leave queueKey null — the
-    // round-1 regression where a message typed after a failed fetch was written
-    // nowhere. With no transcript on screen a handed-off batch cannot be
-    // confirmed, so the returned outbox is judged (its own fetch fallback) and
-    // comes back as an honest "not confirmed" row, which is the truth here.
-    judgeAdoptedOutbox(resetTranscript());
+    // queued rows are still its own. resetTranscript re-binds ownership by
+    // construction (it is the sole owner of the queue↔session binding), so this
+    // failure path CANNOT leave queueKey null — the round-1 regression where a
+    // message typed after a failed fetch was written nowhere.
+    resetTranscript();
     mainThread().paneEl.append(el('div', { class: 'hint-row', text: `could not read this session: ${err.message}` }));
     say(err.message, true);
+    paintQueue();
   }
 }
 
@@ -5821,7 +6781,10 @@ async function openHistoryWindow(th, sess, at, total, frozen) {
 function selectProject(id, { quiet = false } = {}) {
   if (state.current.projectId !== id) {
     state.current.projectId = id;
-    for (const k of Object.keys(state.overrides)) delete state.overrides[k];
+    // BUG-198 — the override bag is NOT cleared here: it belongs to the session
+    // open in the dock (overridesOwner), which a sidebar selection does not change.
+    // Transitions that DO change the session reset it themselves (restoreOverrides,
+    // startNew, armFork, the dead-link route).
   }
   paintCrown();
   void refreshRail();
@@ -7027,7 +7990,8 @@ function boardGridModel(b) {
  * whose state/title/etc actually moved. Cheap string, compared on data-sig.
  */
 function cardSig(x) {
-  return `${x.state}|${x.answerable ? 1 : 0}|${x.isNeeds ? 1 : 0}|${x.it.title}|${x.it.sev || ''}|${x.it.kind || ''}`;
+  // FEAT-157: a base notice's revision is part of what it asks, so a moved notice re-renders.
+  return `${x.state}|${x.answerable ? 1 : 0}|${x.isNeeds ? 1 : 0}|${x.it.title}|${x.it.sev || ''}|${x.it.kind || ''}|${x.it.baseUpdate?.rev ?? ''}`;
 }
 
 /**
@@ -7046,7 +8010,8 @@ function ticketCard(x) {
     'aria-label': `${it.id} — ${it.title}${isNeeds ? ' — needs you' : ''}`,
     title: `${it.id} — ${it.title}${isNeeds ? (answerable ? ' · click to answer' : ' · needs you (read-only)') : ' · open ticket'}`,
   });
-  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.id }));
+  // FEAT-157: Orchard's base notice has no ticket id worth reading; it is named for what it is.
+  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.baseUpdate ? (it.baseUpdate.security ? 'Orchard base · security' : 'Orchard base') : it.id }));
   const mark = ncSevMark(it.sev);
   if (mark) top.append(mark);
   card.append(top);
@@ -7213,7 +8178,8 @@ function renderAnswerMount(needs) {
   const it = (needs ?? []).find((x) => x.id === id);
   if (!it) { state.openAnswerId = null; clear(host); return; } // resolved out-of-band
   const esc = window.CSS?.escape ? CSS.escape(id) : id;
-  if (host.querySelector(`.needs-card[data-id="${esc}"]`)) return; // preserve typing/focus
+  const mounted = host.querySelector(`.needs-card[data-id="${esc}"]`);
+  if (mounted && !(it.baseUpdate && mounted.dataset.rev !== it.baseUpdate.rev)) return; // preserve typing/focus (FEAT-157: a moved base notice re-renders)
   clear(host);
   const wrap = el('div', { class: 'answer-open' });
   const close = el('button', { type: 'button', class: 'answer-x', title: 'Close', 'aria-label': 'Close', text: '✕' });
@@ -7320,7 +8286,8 @@ function renderRailSummary() {
     const isTicket = !!fit && fit.kind !== 'decision' && fit.kind !== 'finding' && fit.kind !== 'stall';
     focusRow.append(el('span', { class: 'rs-glyph', text: isNeeds ? '👤' : '🤖' }));
     const body = [
-      el('span', { class: 'rs-id', text: focus.id }),
+      // FEAT-157: Orchard's base notice is named for what it is, not by its internal id.
+      el('span', { class: 'rs-id', text: fit?.baseUpdate ? 'Orchard base' : focus.id }),
       el('span', { class: 'rs-ft', text: focus.title }),
     ];
     if (isTicket) {
@@ -7571,6 +8538,7 @@ function railMoreRow(n, label) {
 
 /** Category of a rail item, as a short hue-independent tag. */
 function ncKindOf(it) {
+  if (it.baseUpdate) return { kt: 'base', tag: 'BASE', word: 'Orchard base update' };
   if (it.gitWrite) return { kt: 'git', tag: 'GIT', word: 'git-write request' };
   if (it.services) return { kt: 'svc', tag: 'SVC', word: 'services request' };
   if (it.kind === 'decision') return { kt: 'dec', tag: 'DEC', word: 'runtime decision' };
@@ -7681,7 +8649,10 @@ function reconcileNeeds(needs) {
   // it connected the whole time, so a focused textarea does not blur.
   let cursor = container.firstChild;
   for (const it of shown) {
-    const have = existing.get(it.id);
+    let have = existing.get(it.id);
+    // FEAT-157: a base notice is re-rendered when its revision moved, so its buttons
+    // never answer (consent to) a notice the user is no longer looking at.
+    if (have && it.baseUpdate && have.dataset.rev !== it.baseUpdate.rev) { existing.delete(it.id); have.remove(); have = undefined; }
     const target = have ?? needsCard(it);
     if (have) existing.delete(it.id);
     if (target === cursor) cursor = target.nextSibling; // already in place — leave untouched
@@ -7869,7 +8840,77 @@ function needsStallRow(it) {
   return card;
 }
 
+/**
+ * FEAT-157 — Orchard's base-update notice. DERIVED by the server (nothing stores
+ * it; no session can raise one), answered only through the base-update route with
+ * the notice revision the card shows, so a card that went stale (a newer release,
+ * another answer) is refused instead of consenting to something the user did not
+ * see. A security release offers no Skip.
+ */
+function needsBaseCard(it) {
+  const pid = state.boardProjectId ?? state.current.projectId;
+  const n = it.baseUpdate;
+  const err = el('span', { class: 'nc-err' });
+  const card = el('div', {
+    class: `needs-card decision base-update${n.security ? ' security' : ''}${n.escalated ? ' escalated' : ''}`,
+    'data-id': it.id, 'data-kind': 'base', 'data-rev': n.rev, 'data-state': n.state,
+  },
+  el('div', { class: 'nc-head' },
+    el('span', { class: 'nc-id', text: n.security ? 'Orchard base · security' : 'Orchard base' }),
+    el('span', { class: 'nc-sev', text: '' })),
+  el('div', { class: 'nc-title', text: it.title }));
+  const where = el('div', { class: 'nc-question bu-where' },
+    el('span', { class: 'bu-k', text: 'pinned' }), el('span', { class: 'bu-v', text: n.pinned }),
+    ...(n.observed ? [el('span', { class: 'bu-k', text: 'running' }), el('span', { class: 'bu-v', text: n.observed })] : []));
+  // The title already says SECURITY; the message need not open with it again.
+  card.append(el('div', { class: 'nc-question bu-msg', text: n.security ? n.message.replace(/^SECURITY — /, '') : n.message }), where);
+  if (Array.isArray(n.entries) && n.entries.length) {
+    const list = el('ul', { class: 'nc-question bu-entries' });
+    for (const e of n.entries) {
+      list.append(el('li', { class: `bu-entry cls-${e.class}` },
+        el('div', { class: 'bu-line' },
+          el('span', { class: 'bu-ver', text: `v${e.version}` }),
+          el('span', { class: 'bu-cls', text: e.class }),
+          el('span', { class: 'bu-date', text: e.date })),
+        el('div', { class: 'bu-sum', text: e.summary }),
+        e.adjust ? el('div', { class: 'bu-adj', text: e.adjust }) : null));
+    }
+    card.append(list);
+  }
+  const labels = { adopt: `Adopt v${n.to}`, defer: n.security ? 'Acknowledge' : 'Defer 7 days', skip: `Skip v${n.to}`, dismiss: 'Dismiss' };
+  const tips = {
+    adopt: 'Pin this project to it. The container moves at its next launch with no live session; a running session is never interrupted.',
+    defer: n.security ? 'A security release cannot be deferred past the next launch with no live session; this only acknowledges it.' : 'Hide this for 7 days, then ask again.',
+    skip: 'Ignore this release. A later release asks again and lists this one too.',
+    dismiss: 'Hide this notice for this release (Orchard cannot apply it to a prebuilt image).',
+  };
+  if (Array.isArray(n.actions) && n.actions.length) {
+    const row = el('div', { class: 'nc-opts' });
+    for (const a of n.actions) {
+      const b = el('button', { class: `nc-opt bu-${a}`, type: 'button', text: labels[a] ?? a, title: tips[a] ?? '', 'data-action': a });
+      b.addEventListener('click', async () => {
+        for (const x of row.querySelectorAll('button')) x.disabled = true;
+        err.textContent = '';
+        try {
+          await api.baseUpdate(pid, { action: a, version: n.to, rev: n.rev });
+          say(a === 'adopt' ? `adopted base v${n.to} — applies at the next launch with no live session` : `base v${n.to}: ${labels[a] ?? a}`);
+        } catch (e) {
+          err.textContent = e.message;
+          for (const x of row.querySelectorAll('button')) x.disabled = false;
+        }
+        void refreshRail(true);
+      });
+      row.append(b);
+    }
+    card.append(row);
+  }
+  card.append(el('div', { class: 'nc-form' }, el('div', { class: 'nc-acts' }, err)));
+  return makeCollapsible(card, it);
+}
+
 function needsCard(it) {
+  // FEAT-157: Orchard's base-update notice has its own card and answer route.
+  if (it.baseUpdate) return needsBaseCard(it);
   // BUG-046: a stalled-work advisory is read-only and actionless — its own row.
   if (it.kind === 'stall') return needsStallRow(it);
   // FEAT-047: a consolidation finding is read-only + dismissible — its own row.
@@ -7930,7 +8971,7 @@ function needsCard(it) {
     if (state.board) state.board.needsYou = (state.board.needsYou ?? []).filter((x) => x.id !== it.id);
     renderRail();
     try {
-      const r = await api.answerBoard(pid, it.id, text);
+      const r = await api.answerBoard(pid, it.id, text, it.decisionKey);
       // FEAT-090: answering a TICKET records the decision to the board and hands
       // it back via the answered-awaiting lane — it dispatches NOTHING. A live
       // session that RAISED a decision is the exception (that is a reply it asked
@@ -8118,7 +9159,7 @@ function startNew(projectId) {
   // tools — survives into a new session, same-project or not. Each new
   // session starts honestly from the project's own default; the user
   // re-arms whatever they want per-session.
-  for (const k of Object.keys(state.overrides)) delete state.overrides[k];
+  resetOverrides(ovrPending()); // BUG-198 round 2 — a fresh pending token: persisted only once ITS session-init names the id
   state.current = { projectId, encodedDir: null, sessionId: null, title: 'New session', os: 'linux' };
   state.openProjectId = projectId; // BUG-106 — the pending-new dock is owned by this project
   state.pendingNew = projectId; // FEAT-073 — this drives the derived pending-new row
@@ -8135,11 +9176,9 @@ function startNew(projectId) {
   followCurrent(); // no session on screen any more: drops every watch
   closeSocket();
   // BUG-129/BUG-150 — resetTranscript re-binds ownership and restores this
-  // project's pending-new undelivered rows (same key) by construction; judge the
-  // handed-off outbox it hands back.
-  const adoptedOutbox = resetTranscript();
+  // project's pending-new filed rows (same key) by construction.
+  resetTranscript();
   restoreDraft(state.current); // BUG-083 — this project's pending-new draft (empty if none)
-  judgeAdoptedOutbox(adoptedOutbox);
   node.box.hidden = false;
   node.frozen.hidden = true;
   node.agentDone.hidden = true;
@@ -8252,7 +9291,11 @@ function stripModel() {
     return snap.running.map((r) => ({
       key: r.id,
       row: r.row,
-      ty: r.row === 'main' ? 'main' : (r.label || 'agent'),
+      // FEAT-154 (round 6) — a background SHELL is labelled plainly (the engine's
+      // `local_bash` name means nothing to a reader), and is stoppable from here.
+      ty: r.row === 'main' ? 'main'
+        : (r.row === 'tool' && r.background === true ? 'background command' : (r.label || 'agent')),
+      stoppable: r.row === 'tool' && r.background === true,
       de: r.row === 'main' ? (state.current.title ?? 'working') : (r.description || r.lastTool || ''),
       startedAt: r.startedAt,
       stale,
@@ -8362,6 +9405,8 @@ function renderStrip() {
     stallWhy: r.blocked || r.stopped ? (r.stateWhy || (r.blocked ? 'blocked' : 'stopped'))
       : r.stalled ? (r.stallWhy || 'no progress evidence for this row') : '',
     notRunning: r.blocked || r.stopped,
+    stale: r.stale,
+    stoppable: r.stoppable === true,
   }));
   for (const r of rows) {
     const row = el('button', {
@@ -8380,6 +9425,39 @@ function renderStrip() {
       el('span', { class: 'gl', text: r.gl }),
       el('span', { class: 'el', text: r.el }));
     row.addEventListener('click', () => (r.key === 'main' ? showThread('main') : void viewAgent(r.key)));
+    if (r.stoppable && !r.notRunning && !r.stale) {
+      // FEAT-154 (round 6) — a background command keeps the session alive but is
+      // not an agent, so it no longer colours the list; it is listed here with a
+      // stop control instead, through the engine's own per-task stop (`stop_task`).
+      // A sibling of the row button (a button may not nest a button), wrapped so
+      // the strip keeps ONE child per model row (the 1s tick indexes by child).
+      const stop = el('button', { type: 'button', class: 'lag-stop', title: `Stop this background command${r.de ? ` — ${r.de}` : ''}`, 'aria-label': `Stop background command ${r.key}`, text: 'stop' });
+      stop.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        // FEAT-154 (round 7) — addressed by (session, task) over HTTP, so it reaches
+        // the owning bridge whether or not this tab drives it (an adopted session
+        // viewed after a restart is the case round 6 missed). The session is the
+        // one the strip's snapshot is about — never whatever this socket holds.
+        const sid = state.snap?.stationSessionId || state.snap?.sdkSessionId || state.current.sessionId;
+        if (!sid) { say('cannot tell which session this command belongs to — reload and try again', true); return; }
+        if (!confirm(`Stop this background command?\n\n${r.de || r.key}`)) return;
+        stop.disabled = true;
+        void api.stopTask(sid, r.key).then((res) => {
+          if (res.ok) {
+            say('stop sent — the command leaves the list once the engine confirms it ended');
+            void pollRunning();
+            return;
+          }
+          stop.disabled = false;
+          say(res.reason === 'no-bridge'
+            ? 'could not stop it: this server is no longer driving that session (it may already have ended) — reload to refresh'
+            : `could not stop that command: ${res.error || res.reason || 'the server refused'}`, true);
+          void pollRunning();
+        });
+      });
+      node.stripRows.append(el('div', { class: 'lag-wrap stoppable', 'data-thread': r.key }, row, stop));
+      continue;
+    }
     node.stripRows.append(row);
   }
   paintStripSummary(model);
@@ -8602,46 +9680,11 @@ function applySnapshot(snap, { trusted = false } = {}) {
   // never a stored copy. The bindings are not refetched here — only the live join
   // is recomputed, so idle→running→done moves the instant the snapshot does.
   renderRailRequests();
-  // BUG-159 — the poll/push just told us the main turn is not running while a
-  // lane is live (the strand). Any message queued behind the stuck `busy` would
-  // otherwise wait for a `turn-end` that may be hours away; deliver it now.
-  deliverQueuedBehindBackground();
+  // BUG-159 — a message queued behind a stuck `busy` (the strand) is the server
+  // outbox's to deliver: it reads the bridge's own snapshot and hands it to the
+  // runtime queue. The dock only repaints its wording.
+  if (state.queue.length) paintQueue();
   return true;
-}
-
-/**
- * BUG-159 — flush queued messages held behind the STRAND to the server, which
- * holds+pushes them into the runtime queue (Part A) so the idle CLI runs them at
- * the next boundary. This is the pre-queued counterpart to submit()'s direct
- * route: a message queued while a turn was genuinely running, whose turn then
- * stuck as a woken `busy`, would otherwise never flush (flushQueue waits for the
- * busy→idle transition that never comes). Delivers ONLY when the authority
- * confirms the strand shape, and does NOT touch `state.busy` — the composer
- * stays consistent with the server, and once the CLI picks the message up the
- * next snapshot reports the turn running again.
- */
-function deliverQueuedBehindBackground() {
-  if (!state.busy || !idleBehindBackground()) return;
-  const items = state.queue.filter((q) => !q.dead && q.text.trim() && q !== state.drainWaitAttempt);
-  if (!items.length) return;
-  const text = items.map((q, i) => `${queueItemNote(q, i, items.length)}\n${q.text.trim()}`).join('\n\n');
-  // Hand the batch to the outbox before it leaves state.queue (BUG-129), then
-  // remove the delivered rows, keeping dead/drain-wait rows exactly as flushQueue does.
-  state.outbox = { texts: items.map((q) => q.text.trim()), at: Date.now() };
-  state.queue = state.queue.filter((q) => q.dead || q === state.drainWaitAttempt);
-  const bgEl = youBubble(mainThread(), text);
-  if (state.viewing === 'main') scrollDown();
-  if (!sendTurn(text, { texts: items.map((q) => q.text.trim()), el: bgEl })) {
-    // Socket died between the decision and the send — put them ALL back.
-    for (let i = items.length - 1; i >= 0; i--) state.queue.unshift(items[i]);
-    state.outbox = null;
-    paintQueue();
-    return;
-  }
-  say(items.length === 1
-    ? 'delivered the queued message behind background work'
-    : `delivered ${items.length} queued messages behind background work`);
-  paintQueue();
 }
 
 /* -------------------------------------------- BUG-034: the correcting poll */
@@ -9248,17 +10291,13 @@ function connect() {
       state.ws = null;
       state.deliveryRelay = null; // FEAT-065: the approval relay is per-socket state
       setBusy(false);
-      // BUG-191: a drain-wait retry whose socket died before ANY answer — the
-      // server may have delivered it (its ack lost with the socket). Keep it
-      // dead and visible ("not confirmed"); never resend it blindly. It is a
-      // retry's own socket, so it is not a dropped DRIVING session either.
-      const ghost = !state.closingOnPurpose && state.pendingStart != null && !!state.drainWaitAttempt;
-      if (ghost) keepUnconfirmedStart();
+      // (BUG-217 round 5: queued rows never ride this socket — the server's
+      // outbox delivers them — so nothing queued can die with it.)
       // Our own close() is routine. A close we did not ask for, on a session
       // that had started, is a fault the user must see — and until they
       // resolve it we refuse to send, because the alternative (silently
       // starting a fresh session) throws away the conversation on screen.
-      if (!ghost && !state.closingOnPurpose && wasLive && state.sdkSessionId) {
+      if (!state.closingOnPurpose && wasLive && state.sdkSessionId) {
         state.dropped = true;
         say('the session connection dropped — nothing on screen was lost, but the agent is no longer attached', true);
         paintComposerFor(viewedThread());
@@ -9276,7 +10315,7 @@ function connect() {
     ws.addEventListener('message', (ev) => {
       let e;
       try { e = JSON.parse(ev.data); } catch { return say('malformed event from the server', true); }
-      onEvent(e);
+      onEvent(e, ws); // BUG-198 round 2 — the socket is part of the frame's identity (session-init adoption)
     });
   });
 }
@@ -9641,6 +10680,9 @@ async function refreshLive() {
       catch { bridged = true; }
       if (!bridged) {
         state.followingLive = false;
+        // BUG-217: no bridge is left, so no other tab is driving it either — a
+        // row held back by that refusal may go now (setBusy's flush below).
+        state.liveElsewhere = '';
         setBusy(false);
         state.turnStartedAt = 0;
         say('the run finished');
@@ -9655,11 +10697,17 @@ async function refreshLive() {
   // whose live sessions just ended, or "finished" would never badge.
   const ended = [...state.liveIds.entries()].filter(([k]) => !next.has(k));
   state.liveIds = next;
-  // BUG-045: a drain-wait row retries the moment its session leaves the live
-  // set — that transition IS "the drain settled". The slow interval in
-  // armDrainWaitRetry stays as the fallback for a transition this poll missed.
-  if (ended.some(([, rec]) => state.queue.some((q) => !q.dead && q.drainWait === rec.sessionId))) {
-    attemptDrainRetry({ immediate: true });
+  /*
+   * BUG-217: "written by another program" is only ever inferred from a fresh
+   * transcript mtime (no bridge), and it is also exactly how THIS dashboard's
+   * own session reads for ~30s after its bridge closed. Once nothing has written
+   * it for the live window, nobody is writing it: stop claiming otherwise.
+   * (Round 5: a queued message waiting on that is the server outbox's to send.)
+   */
+  if (state.followingExternal && state.current.sessionId
+    && !list.some((x) => x.sessionId === state.current.sessionId)) {
+    state.followingExternal = false;
+    paintPerm();
   }
   for (const [, rec] of ended) {
     for (const [projectId, s] of state.sessions) {
@@ -9717,6 +10765,7 @@ function closeSocket() {
     try { state.ws.send(JSON.stringify({ type: 'close' })); state.ws.close(); } catch { /* already gone */ }
   }
   state.ws = null;
+  ovrStart = null; // BUG-198 round 2 — a start's pending bag binding dies with its socket
   state.live = false;
   state.dropped = false;
   state.deliveryRelay = null; // FEAT-065: the relay (if that is what this was) dies with its socket
@@ -9787,8 +10836,7 @@ function isBudgetStop(e) {
 
 /**
  * Undo the optimistic "you" bubble `submit()` paints before the server has
- * confirmed delivery. Mirrors what the mid-turn queue already does for a
- * message that never reached Claude (see queueMessage/failQueue) — a bubble
+ * confirmed delivery. A bubble
  * must never claim delivery for a turn the agent never saw (BUG-013).
  */
 function rollBackPendingSend() {
@@ -9857,9 +10905,10 @@ function rollBackPendingStart() {
  *     exactly the loss BUG-129 shipped storage durability to end; this route
  *     never reached the code that stores.
  *
- * The invariant restored here, in the user's words: keep it in browser storage
- * unless the server acknowledged it. The text becomes an ordinary dock row —
- * durable through persistQueue, saying plainly that it was NOT delivered, and
+ * The invariant restored here, in the user's words: never lose it. The text
+ * becomes a dock row — BUG-217 round 5: a `failed` row in the server's outbox
+ * ("another tab is driving this session"), saying plainly that it was NOT
+ * delivered, offering Send now (which queues it for that session's pause), and
  * recoverable into the composer in one click — and never a bubble claiming a
  * delivery the server explicitly refused. It is deliberately NOT auto-resent
  * when the other tab lets go: sending a person's message on their behalf,
@@ -9907,20 +10956,8 @@ function handleLiveElsewhere(message) {
   state.turnStartedAt = 0;
   state.sessReconnecting = false;
   if (text && text.trim()) {
-    const storable = queueTargetKey() != null;
-    state.queue.push({
-      text,
-      dead: 'another tab is driving this session',
-      composedAt: Date.now(),
-    });
-    // paintQueue mirrors the row into storage (BUG-129: every mutation repaints,
-    // and that repaint IS the write path).
-    paintQueue();
-    if (!storable) {
-      // Storage is unavailable / this view owns no session key: the row is on
-      // screen but WILL NOT survive a reload. Say so rather than imply durability.
-      say('your message is in the dock but could not be saved for a reload — copy it out before reloading', true);
-    }
+    // Not sent by itself (BUG-149): the user's Send now queues it for that session's next pause.
+    enqueueOutbox(text, { origin: 'direct', initial: 'failed', reason: 'another tab is driving this session — Send now queues it for that session’s next pause' });
   }
   state.liveElsewhere = message;
   say(message, true);
@@ -9944,9 +10981,13 @@ function armNeedsFork(nf) {
   else setBusy(false);
   state.resumeOnNextSend = null; // a plain resume cannot work here — the fork replaces it
   state.sessError = null;        // not a dead end; the fork bar is the way forward
-  state.pendingFork = { resumeSessionId: nf.resumeSessionId, resumeEncodedDir: nf.resumeEncodedDir, cause: nf.cause };
+  state.pendingFork = { resumeSessionId: nf.resumeSessionId, resumeEncodedDir: nf.resumeEncodedDir, cause: nf.cause, toContainer: nf.toContainer };
   say(nf.cause === 'isolation-changed'
-    ? 'This session was recorded before you enabled the container — resuming it here can’t reach that history. Fork it into the container to continue; the original stays on the host.'
+    ? (nf.toContainer === false
+      // container→direct: the project used to run in a container and now runs
+      // direct on the host. Saying "into the container" here is backwards.
+      ? 'This session ran in a container, but the project now runs directly on the host — resuming it here can’t reach that history. Fork it to continue here; the original stays untouched.'
+      : 'This session was recorded before you enabled the container — resuming it here can’t reach that history. Fork it into the container to continue; the original stays on the host.')
     : nf.cause === 'path-changed'
       // BUG-138: the project's directory was renamed and the project repointed.
       // The transcript is intact and still listed — the CLI just cannot continue
@@ -9967,7 +11008,14 @@ function paintFrozenBar(ctx) {
   const btn = $('#forkBtn');
   if (!span || !btn) return;
   clear(span);
-  if (ctx && ctx.cause === 'isolation-changed') {
+  if (ctx && ctx.cause === 'isolation-changed' && ctx.toContainer === false) {
+    // container→direct: the mirror of the classic case. "Into the container" is
+    // the wrong direction here — the project now runs direct on the host.
+    span.append(
+      el('b', { text: 'Recorded in a container.' }),
+      document.createTextNode(' This session ran in a container; the project now runs directly on the host. Fork it to continue here? The original stays untouched.'));
+    btn.textContent = 'Fork to continue here';
+  } else if (ctx && ctx.cause === 'isolation-changed') {
     span.append(
       el('b', { text: 'Recorded before the container.' }),
       document.createTextNode(' This session was recorded before you enabled the container. Fork it into the container? The original stays on the host.'));
@@ -9994,17 +11042,17 @@ function paintFrozenBar(ctx) {
 
 /* ============== BUG-191: a refused or unconfirmed send is never lost ========
  * Every `send` carries a client `sendId`, and the tab records what THAT attempt
- * carried (its rows' texts and the exact bubble it painted). The server echoes
- * the id on its ack and on a refusal, so a refusal recovers exactly that
- * attempt's rows — never a neighbour's, and never from `pendingSend`/`outbox`
- * guesses, which other attempts and turn-ends overwrite.
- *  - retryable (definitely NOT delivered, e.g. an adoption still settling):
- *    the rows go back to the FRONT of the queue as drain-wait rows, in their
- *    original order, persisted before the socket is released and the BUG-045
- *    retry armed.
- *  - uncertain (the delivery went out, its acceptance never came back): the
- *    rows come back DEAD — visible, editable, one click to resend — and are
- *    never resent automatically (it may already have arrived).
+ * carried (its text and the exact bubble it painted). The server echoes the id
+ * on its ack and on a refusal, so a refusal recovers exactly that attempt's
+ * text — never a neighbour's.
+ * BUG-217 round 5: the recovered text goes to the session's SERVER outbox:
+ *  - retryable (definitely NOT delivered — an adoption still settling, a drain
+ *    still held, queued messages ahead of it): a row the server delivers itself
+ *    as soon as the session can take it (BUG-045's "it will send itself", now
+ *    kept by the server instead of a tab's retry loop);
+ *  - uncertain (the delivery went out, its acceptance never came back): a row
+ *    marked "not confirmed" — visible, editable, Send anyway — never resent
+ *    automatically (it may already have arrived).
  * ------------------------------------------------------------------------- */
 
 /** BUG-191: the queued-line for a refusal from an adopt-gated session, or null for any other refusal. */
@@ -10014,6 +11062,7 @@ function adoptQueuedLine(drain) {
   return null;
 }
 
+/** A typed prompt goes straight to the session over this tab's socket (queued rows never ride a frame — the server's outbox delivers them). */
 function sendTurn(prompt, { texts, el }) {
   const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   state.sendAttempts.set(sendId, {
@@ -10027,20 +11076,18 @@ function sendTurn(prompt, { texts, el }) {
   return ok;
 }
 
-/** Undo what one attempt painted/handed off — only its own bubble and its own outbox batch. */
+/** Undo what one attempt painted — only its own bubble. */
 function unwindSendAttempt(a) {
   a.el?.remove?.();
   if (state.pendingSend && state.pendingSend.el === a.el) state.pendingSend = null;
-  const ob = state.outbox?.texts;
-  if (ob && ob.length === a.texts.length && ob.every((t, i) => t === a.texts[i])) state.outbox = null;
 }
 
-/** Release this tab's socket after a refusal, so the BUG-045 retry can re-attempt the resume. */
+/** Release this tab's socket after a refusal of a `start` (it has no server-side session). */
 function releaseSocketForRetry(resume) {
   if (state.ws) {
     state.closingOnPurpose = true;
     try { state.ws.close(); } catch { /* already gone */ }
-    state.ws = null; // dead NOW — see queueRetryableRefusal for why not at its close event
+    state.ws = null; // dead NOW, not at its close event
     state.live = false;
   }
   if (resume) state.resumeOnNextSend = resume;
@@ -10050,205 +11097,76 @@ function releaseSocketForRetry(resume) {
   paintSessStatus();
 }
 
-
-function queueRefusedSend(a, drain) {
+/** A `send` the server refused retryably: its text joins the session's outbox, which delivers it. */
+function queueRefusedSend(a, drain, code) {
   unwindSendAttempt(a);
-  const now = Date.now();
-  const rows = a.texts.map((text) => ({
-    text, dead: null, composedAt: a.at,
-    drainWait: a.resume ?? true,
-    drainProject: state.current.projectId,
-    drain: drain ?? null, drainAt: now,
-  }));
-  state.queue.unshift(...rows);
-  paintQueue(); // BUG-129: persisted before anything below can lose it
-  releaseSocketForRetry(a.resume);
-  say(adoptQueuedLine(drain) ?? 'message queued — the session cannot take it yet; it will send itself');
-  armDrainWaitRetry();
+  for (const text of a.texts) enqueueOutbox(text, { origin: code === 'outbox-pending' ? 'queued' : 'direct', quiet: true });
+  setBusy(false);
   paintQueue();
+  say(code === 'outbox-pending'
+    ? 'queued behind the messages already waiting — they go in order'
+    : adoptQueuedLine(drain) ?? 'message queued — the session cannot take it yet; it will send itself');
 }
 
 function keepUnconfirmedSend(a) {
   unwindSendAttempt(a);
-  for (const text of a.texts) state.queue.push({ text, dead: UNCONFIRMED_NOTE, composedAt: a.at });
+  for (const text of a.texts) enqueueOutbox(text, { origin: 'direct', initial: 'uncertain', reason: UNCONFIRMED_NOTE, quiet: true });
   setBusy(false);
   paintQueue();
   say(`${a.texts.length === 1 ? 'a message' : `${a.texts.length} messages`} could not be confirmed as delivered — kept in the dock, not resent`, true);
 }
 
-/** A start (fresh Enter or a drain-wait retry) whose delivery could not be confirmed. */
+/** A start (a typed Enter) whose delivery could not be confirmed. */
 function keepUnconfirmedStart() {
   const text = state.pendingStart;
   const resume = state.pendingStartResume;
-  const retried = state.drainWaitAttempt;
-  state.drainWaitAttempt = null;
   state.pendingStart = null;
   state.pendingStartResume = null;
   state.pendingStartKeepComposer = false;
   if (state.pendingStartEl) state.pendingStartEl.remove();
   else { const bs = mainThread().paneEl.querySelectorAll(':scope > .you'); bs[bs.length - 1]?.remove(); }
   state.pendingStartEl = null;
-  if (retried) { retried.dead = UNCONFIRMED_NOTE; retried.drainWait = null; }
-  else if (text) state.queue.push({ text, dead: UNCONFIRMED_NOTE, composedAt: Date.now() });
-  paintQueue();
+  if (text) enqueueOutbox(text, { origin: 'direct', initial: 'uncertain', reason: UNCONFIRMED_NOTE, quiet: true });
   releaseSocketForRetry(resume);
-  if (!drainWaitItem()) disarmDrainWaitRetry();
   say('your message could not be confirmed as delivered — kept in the dock, not resent', true);
   paintQueue();
 }
 
-/* ============== BUG-045: retryable refusal queues + retries itself ==========
- * BUG-029 stopped the refusal LOSING the message; this stops it stranding the
- * user. A `retryable:true` pre-ack refusal (the BUG-022 survivor-drain guard,
- * BUG-033's frameless drop) means "this will work soon" — so the text becomes
- * a row in the SAME queue the busy path uses (visible, editable, discardable)
- * marked drain-wait, and the client re-attempts the SAME resume itself:
- * immediately when the live poll sees the draining session leave the live set
- * (the drain settled — see refreshLive), and on a slow interval as fallback.
- * Every retry is a full `start` the server's gate re-judges — nothing here
- * weakens BUG-033's liveness gate or races a second CLI (BUG-022); it only
- * automates the Enter the old message told the user to press.
- * ------------------------------------------------------------------------- */
-
-const DRAIN_RETRY_MS = 7000;      // slow-poll fallback while a drain-wait row exists
-const DRAIN_RETRY_MIN_GAP = 4500; // transition + interval triggers must not compound into a hammer
-
-function queueRetryableRefusal(drain) {
+/*
+ * BUG-045 (round 5 form): a `retryable:true` pre-ack refusal of a typed start
+ * (BUG-022's survivor-drain guard, BUG-033's frameless drop, an adoption still
+ * settling, queued messages ahead of it) means "this will work soon". The text
+ * becomes a row in the session's server outbox, which delivers it the moment
+ * the session can take it — whether or not this tab is still open. The server's
+ * gates are unchanged: nothing here weakens BUG-033's liveness gate or races a
+ * second CLI (BUG-022). A brand-new session has no id for the outbox yet, so its
+ * text goes back to the composer, as BUG-029 always did.
+ */
+function queueRetryableRefusal(drain, code) {
   const text = state.pendingStart;
   const resume = state.pendingStartResume;
-  const retried = state.drainWaitAttempt; // a self-retry that was re-refused — its row is still queued
-  state.drainWaitAttempt = null;
-  // FEAT-064: the server's refusal now says WHAT holds the drain (background
-  // task count/ids + how long the broker has been holding). Keep it on the row
-  // — refreshed on every re-refusal — so the chip states the reason and an
-  // elapsed that stays honest between retries.
-  if (retried && drain) { retried.drain = drain; retried.drainAt = Date.now(); }
+  if (!resume || !state.current?.sessionId) { rollBackPendingStart(); return; }
   state.pendingStart = null;
   state.pendingStartResume = null;
   state.pendingStartKeepComposer = false; // BUG-132: this start is settled either way
-  // Same rollback as rollBackPendingStart, minus the composer hand-back — the
-  // text's home is its queue row now (created below on the first refusal).
-  const bs = mainThread().paneEl.querySelectorAll(':scope > .you');
-  bs[bs.length - 1]?.remove();
+  if (state.pendingStartEl) state.pendingStartEl.remove();
+  else { const bs = mainThread().paneEl.querySelectorAll(':scope > .you'); bs[bs.length - 1]?.remove(); }
+  state.pendingStartEl = null;
   if (state.ws) {
     state.closingOnPurpose = true;
     try { state.ws.close(); } catch { /* already gone */ }
-    // Mark the socket dead NOW, not when its close event lands: setBusy(false)
-    // below schedules flushQueue, and a still-"live" closing socket would let
-    // it push the drain-wait row into a session-less socket — the exact
-    // double-delivery window settleDrainWaitDelivery exists to prevent.
     state.ws = null;
     state.live = false;
   }
-  if (resume) state.resumeOnNextSend = resume; // a manual Enter still re-attempts the same resume
+  state.resumeOnNextSend = resume; // a later typed Enter still re-attempts the same resume
   setBusy(false);
   state.turnStartedAt = 0;
   state.sessReconnecting = false;
   paintSessStatus();
-  if (!retried && text) {
-    state.queue.push({
-      text, dead: null, composedAt: Date.now(),
-      drainWait: resume ?? true,                // which session the retry must resume
-      drainProject: state.current.projectId,    // retries only run while this project is current
-      drain: drain ?? null, drainAt: Date.now(), // FEAT-064: what holds the drain, per the server
-    });
-    say(adoptQueuedLine(drain) ?? 'message queued — waiting for the previous turn to finish draining; it will send itself');
-  }
-  armDrainWaitRetry();
-  paintQueue();
-}
-
-/** The oldest live drain-wait row whose retry is legal right now, or null. */
-function drainWaitItem() {
-  return state.queue.find((q) => !q.dead && q.drainWait && q.text.trim()
-    && (!q.drainProject || q.drainProject === state.current.projectId)) ?? null;
-}
-
-function armDrainWaitRetry() {
-  if (state.drainWaitTimer) return;
-  state.drainWaitTimer = setInterval(() => attemptDrainRetry(), DRAIN_RETRY_MS);
-}
-
-function disarmDrainWaitRetry() {
-  clearInterval(state.drainWaitTimer);
-  state.drainWaitTimer = null;
-}
-
-/**
- * One self-retry of the next drain-wait row: a full startTurn over the SAME
- * resume, judged by the same server gate. Exactly-once by construction: the
- * row leaves the queue ONLY on this start's `ack` (settleDrainWaitDelivery),
- * a re-refusal keeps it queued (queueRetryableRefusal's `retried` branch),
- * and while an attempt is in flight flushQueue skips the row, so a busy
- * transition can never deliver the same text a second time.
- */
-function attemptDrainRetry({ immediate = false } = {}) {
-  // An attempt whose socket died with neither an ack nor a refusal reaching us
-  // would guard a ghost forever — release it once it is clearly not in flight.
-  // BUG-191: it may have been delivered (its ack lost with the socket), so it
-  // is kept DEAD — visible, one click to resend — never re-sent blindly.
-  if (state.drainWaitAttempt && !state.busy && state.pendingStart == null
-    && Date.now() - (state.drainWaitLastTry || 0) > 15000) {
-    const ghost = state.drainWaitAttempt;
-    state.drainWaitAttempt = null;
-    ghost.dead = UNCONFIRMED_NOTE;
-    ghost.drainWait = null;
-    paintQueue();
-  }
-  if (state.drainWaitAttempt || state.busy || state.pendingStart != null || state.live) return;
-  const item = drainWaitItem();
-  if (!item) { if (!state.queue.some((q) => !q.dead && q.drainWait)) disarmDrainWaitRetry(); return; }
-  const now = Date.now();
-  if (!immediate && now - (state.drainWaitLastTry || 0) < DRAIN_RETRY_MIN_GAP) return;
-  state.drainWaitLastTry = now;
-  state.drainWaitAttempt = item;
-  /*
-   * BUG-132: the composer is NOT this retry's channel — `keepComposer` makes
-   * startTurn (and the refusal rollback behind it) leave the box alone entirely.
-   * The previous save-and-restore-around-the-promise could not work: startTurn
-   * blanked the box synchronously and the restore only ran a server round-trip
-   * later, guarded on the box still being empty — and the refusal in between had
-   * already filled it with the QUEUED row's text, so the guard declined and the
-   * user's typing was gone. Never save/restore across an await what you can
-   * simply not touch.
-   */
-  Promise.resolve(startTurn(item.text, {
-    resumeSessionId: typeof item.drainWait === 'string' ? item.drainWait : undefined,
-    keepComposer: true,
-  })).catch(() => { state.drainWaitAttempt = null; });
-}
-
-/** The retry's `start` was ACKED with its prompt delivered — retire the row, exactly once. */
-function settleDrainWaitDelivery({ quiet = false } = {}) {
-  const item = state.drainWaitAttempt;
-  if (!item) return;
-  state.drainWaitAttempt = null;
-  const idx = state.queue.indexOf(item);
-  if (idx !== -1) state.queue.splice(idx, 1);
-  if (!drainWaitItem()) disarmDrainWaitRetry();
-  paintQueue();
-  // FEAT-065: a survivor delivery says its own (more accurate) line — the
-  // drain did NOT finish, the message was injected into it.
-  if (!quiet) say('the previous turn finished draining — delivered your queued message');
-}
-
-/**
- * A self-retry refused NON-terminally keeps its row, marked dead, so the text
- * stays recoverable.
- *
- * BUG-132: this used to RETIRE the row whenever the composer was empty, because
- * the rollback right after would deposit the text there instead (BUG-029's
- * composer-return). A retry no longer touches the composer at all — it never
- * took the text from there — so retiring the row now would be the one thing
- * neither side holds it: always keep it. The row is the durable copy (BUG-129
- * mirrors it to storage on the repaint below).
- */
-function failDrainWaitAttempt(why) {
-  const item = state.drainWaitAttempt;
-  if (!item) return;
-  state.drainWaitAttempt = null;
-  item.dead = why;
-  if (!drainWaitItem()) disarmDrainWaitRetry();
+  if (text) enqueueOutbox(text, { origin: code === 'outbox-pending' ? 'queued' : 'direct', quiet: true });
+  say(code === 'outbox-pending'
+    ? 'queued behind the messages already waiting — they go in order'
+    : adoptQueuedLine(drain) ?? 'message queued — waiting for the previous turn to finish draining; it will send itself');
   paintQueue();
 }
 
@@ -10331,7 +11249,6 @@ function armBusyWatchdog(why) {
     setBusy(false);
     state.turnStartedAt = 0;
     state.pendingSend = null; // ambiguous outcome (see comment above) — stop tracking it either way
-    cancelForceSend(`${why} — no turn is running`);
     say(`${why} — no turn is running, composer released`, true);
   }, 4000);
 }
@@ -10624,14 +11541,12 @@ function setBusy(busy) {
   renderStrip();
   paintSessStatus();
   /*
-   * The queue flushes on the busy TRANSITION, not on one lucky event. It was
-   * wired to turn-end only, and busy also drops through interrupt acks,
-   * watchdogs and error paths — a queued message then waited forever
-   * (observed live: an interrupted turn stranded a queued message). The
-   * microtask lets the caller finish first (a fatal handler marks the queue
-   * failed before the flush would try a dead socket).
+   * BUG-217 round 5: a queued message is delivered by the SERVER's outbox at the
+   * session's boundary, not by this tab on its busy transition (the transition
+   * a tab sees is exactly what a reload or a closed tab loses). The dock only
+   * asks the server for its current answer.
    */
-  if (!busy) queueMicrotask(flushQueue);
+  if (!busy) queueMicrotask(() => { void refreshOutbox(); });
   paintQueue();
   paintTitle();
 }
@@ -10657,7 +11572,7 @@ function iconStop() {
 const LIVE_ACTIVITY = new Set(['text', 'text-delta', 'tool-call', 'tool-result', 'tool-progress',
   'agent-started', 'agent-progress', 'agent-completed', 'thinking-tokens', 'session-init']);
 
-function onEvent(e) {
+function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving socket this frame arrived over (null = not from one)
   if (state.busy && LIVE_ACTIVITY.has(e.t)) clearTimeout(state.busyWatchdog);
   switch (e.t) {
     case 'session-appended':
@@ -10691,6 +11606,16 @@ function onEvent(e) {
       paintModelChip(); // FEAT-042 — the chip tracks the same authoritative value
       if (e.ignoredOverrides?.length) {
         say(`ignored: ${e.ignoredOverrides.map((i) => `${i.field} (${i.reason})`).join('; ')}`, true);
+        // BUG-196 round 6 — the server DECLARED that this session's engine cannot run
+        // the armed model pick (judged by its one classifier against the real
+        // engine). Forget exactly that pick — memory and storage — so it stops
+        // riding every start. Never judged here: the client holds no classifier.
+        const bad = e.ignoredOverrides.find((i) => i.field === 'model');
+        if (bad && !dockIsForeign() && state.overrides.model === bad.value) {
+          delete state.overrides.model;
+          persistOverrides();
+          paintModelBtn();
+        }
       }
       return;
 
@@ -10705,6 +11630,11 @@ function onEvent(e) {
       if (e.of === 'set-model') {
         const good = e.ok === true || (e.ok === undefined && e.matched !== false && !e.error);
         finishModel(e.requestId, good, e.error || e.reason || 'the server declined the change');
+        return;
+      }
+      if (e.of === 'switch-account') {
+        // FEAT-160 — the server reaped the old CLI on ok; arm the new account + resume.
+        finishAccountSwitch(e.requestId, e.ok === true, e.error || 'the server declined the account switch', e.account ?? null, e.sessionId ?? null);
         return;
       }
       if (e.of === 'question-response' || e.of === 'plan-response') {
@@ -10724,9 +11654,12 @@ function onEvent(e) {
         return;
       }
       // BUG-191: the server confirmed (or declined) THIS attempt — it is settled either way.
-      if (e.of === 'send' && e.sendId) state.sendAttempts.delete(e.sendId);
+      if (e.of === 'send' && e.sendId) {
+        state.sendAttempts.delete(e.sendId);
+      }
       if (e.of === 'send' && e.delivered === false) {
         setBusy(false);
+        paintQueue();
         return; // subagent-send-unsupported carries the explanation
       }
       if (e.of === 'start') {
@@ -10743,14 +11676,13 @@ function onEvent(e) {
            * file-follow, so the optimistic bubble startTurn painted must come
            * out (the follow re-renders it, and doubling it would lie).
            */
-          settleDrainWaitDelivery({ quiet: true }); // BUG-045 exactly-once: the retried row is delivered
           state.pendingStart = null;
           state.pendingStartResume = null;
           state.deliveryRelay = e.sdkSessionId ?? true;
           state.sdkSessionId = null; // no bridge — closing this relay later is routine, never a "drop"
           state.turnStartedAt = 0;
           state.sessReconnecting = false;
-          setBusy(false); // flushQueue is relay-guarded; other queued rows wait for the retry loop
+          setBusy(false);
           const dbs = mainThread().paneEl.querySelectorAll(':scope > .you');
           dbs[dbs.length - 1]?.remove();
           /*
@@ -10842,7 +11774,6 @@ function onEvent(e) {
               state.turnStartedAt = e.turnStartedAt;
               state.turnStartUnknown = false;
             }
-            settleDrainWaitDelivery({ quiet: true });
             state.pendingStart = null;
             state.pendingStartResume = null;
             state.pendingStartEl = null;
@@ -10862,35 +11793,22 @@ function onEvent(e) {
             setBusy(true);
             const t = state.pendingStart;
             if (t) {
-              const bs = mainThread().paneEl.querySelectorAll(':scope > .you');
-              bs[bs.length - 1]?.remove();
-              if (state.drainWaitAttempt) {
-                // BUG-045: this text ALREADY sits in the queue as its drain-wait
-                // row — re-queueing would double it. The bridge is live now, so
-                // the normal boundary flush owns delivery from here.
-                state.drainWaitAttempt.drainWait = null;
-                state.drainWaitAttempt = null;
-                if (!drainWaitItem()) disarmDrainWaitRetry();
-                paintQueue();
-              } else queueMessage(t);
+              // Not handed over (the server delivers nothing into a running turn): the
+              // text joins the session's outbox, which sends it at this turn's pause.
+              if (state.pendingStartEl) state.pendingStartEl.remove();
+              else { const bs = mainThread().paneEl.querySelectorAll(':scope > .you'); bs[bs.length - 1]?.remove(); }
+              state.pendingStartEl = null;
+              queueMessage(t);
             }
             // BUG-160: a promptless reattach (reattachDriving) carries no `t`, so
-            // there may be nothing pending — say what is true either way. A
-            // restored queue row (if any) delivers at this turn's boundary; the
-            // boundary flush (setBusy(false)/turn-end) owns it now we drive.
-            say(state.queue.some((q) => !q.dead)
+            // there may be nothing pending — say what is true either way.
+            say(state.queue.some((q) => q.state === 'queued' || q.state === 'pending')
               ? 're-attached — this session is still working; your queued message goes at the next pause'
               : 're-attached — this session is still working here');
           } else {
-            // Idle reattach: the server delivered this start's prompt as a new
-            // turn — a drain-wait retry's row is settled (BUG-045), exactly once.
-            settleDrainWaitDelivery();
+            // Idle reattach: the server delivered this start's prompt (if any) as a new turn.
             say('re-attached to the running session');
-            // BUG-160: now that we hold the driving socket and the session is
-            // idle, THIS is the boundary a message queued before a reload was
-            // waiting for — deliver it (flushQueue is guarded on isDriving() &&
-            // !busy, so it only fires here because the reattach just made both true).
-            flushQueue();
+            void refreshOutbox();
           }
           state.pendingStart = null;
           state.pendingStartResume = null;
@@ -10898,9 +11816,6 @@ function onEvent(e) {
         }
         state.pendingStart = null;
         state.pendingStartResume = null;
-        // BUG-045: a fresh ack means the start (and its prompt) was accepted —
-        // if it was a drain-wait self-retry, its queue row is delivered.
-        settleDrainWaitDelivery();
         const ovr = (e.overridden ?? []).length ? ` · overrides applied: ${e.overridden.join(', ')}` : '';
         const forked = e.fork?.forked ? ` · forked from ${String(e.fork.from ?? '').slice(0, 8)}` : '';
         const ss = state.startSnapshot;
@@ -10912,6 +11827,19 @@ function onEvent(e) {
     case 'session-init':
       state.sdkSessionId = e.sessionId;
       state.current.sessionId = e.sessionId;
+      // BUG-196 — a session made real by its first turn (or reattached) never goes
+      // through openSession's transcript-tail fetch, so lockedProvider was never
+      // learned and pendingNew stayed set — every provider surface fell back to the
+      // project/override and accepted a switch the resume silently ignores. The
+      // server DECLARES the engine it dispatched on (session-init.lockedProvider —
+      // this.effective.provider, the same fact the transcript is pinned to and
+      // resumeProviderOf returns on reopen). Record it, and mark the session real so
+      // lockedSessionProvider() stops gating on pendingNew and returns the real engine.
+      // BUG-196 round 3 — recorded against the session ID the frame names (the
+      // one declared source, lockedProviderOf), never on view state.
+      declareLockedProvider(e.sessionId, e.lockedProvider);
+      state.pendingNew = null; // a running session is no longer a switchable pending-new view
+      paintProvSurfaces();
       // FEAT-051: the CLI's own tool report is the ground truth for which MCP
       // servers ACTUALLY attached (mcp__<name>__… tools) — repaint the strip.
       state.liveTools = Array.isArray(e.tools) ? e.tools : null;
@@ -10920,19 +11848,15 @@ function onEvent(e) {
       // not push: this is the same place, not a navigation), so a reload
       // lands back IN this session instead of another blank one.
       if (!state.current.encodedDir) state.current.encodedDir = state.sessions.get(state.current.projectId)?.encodedDir ?? null;
+      adoptPendingOverrides(state.current.encodedDir, e.sessionId, fromWs); // BUG-198 round 2 — only ITS OWN pending bag, over ITS socket
       persistOverrides(); // a pre-start armed toggle now has a session id to belong to
       /*
-       * BUG-129: the same move for undelivered rows. Until this frame the queue
-       * was stored under the pending-new PROJECT key; from here the session has
-       * a real id and a reload lands in the SESSION, which is where the rows
-       * must be found. Doing it here rather than lazily at the next queue
-       * mutation is not a refinement — a message queued during this very first
-       * turn is mutated once and never again, so a lazy migration would leave it
-       * stored under a key nothing reads and the reload would lose it exactly as
-       * before. (Caught by the browser leg, which is why it is driven there.)
+       * BUG-129: the same move for filed rows. Until this frame a message queued
+       * during a new session's first turn had no session to go to; from here it
+       * does — point it at the session and hand it to the server's outbox now
+       * (BUG-217 round 5), rather than lazily, so a reload in between finds it.
        */
       retargetQueue();
-      persistQueue();
       if (Array.isArray(e.slashCommands) && e.slashCommands.length) {
         state.slashCommands = e.slashCommands;
         try { localStorage.setItem('cs-slash', JSON.stringify(e.slashCommands)); } catch { /* volatile is fine */ }
@@ -10958,6 +11882,18 @@ function onEvent(e) {
         paintModelChip();
       }
       syncUrl('replace');
+      // BUG-195 — the session is now ACTIVE and real. Setting state.current.sessionId
+      // above makes the derived pending-new row (pendingNewFor) vanish, but the real
+      // row is not yet in this project's s.list — it was fetched at startNew, before
+      // the session existed on disk. Without a refetch here the nav shows NO row for
+      // the new session until turn-end (refreshCurrentProjectSessions, the same call)
+      // or a reload. Refetch now so the just-started session appears in the nav the
+      // moment its first message creates it, which is what the user asked for. The
+      // CLI has already written the transcript + session-provenance record by
+      // session-init, so the row lists as a non-folded user session (BUG-193) and the
+      // open session shows immediately via visibleSessions' alwaysIds. Not a poll —
+      // it hangs off the live event that already marks the session real.
+      void refreshCurrentProjectSessions();
       say(`${shortPath(e.cwd)} · ${e.model} · ${e.tools.length} tools · ${e.sessionId.slice(0, 8)}`);
       return;
 
@@ -11354,16 +12290,10 @@ function onEvent(e) {
       // pending bubble for — it reached the agent, so there is nothing left
       // to roll back (see rollBackPendingSend / BUG-013).
       state.pendingSend = null;
-      /*
-       * BUG-129: a turn ENDED, so the prompt that started it is in the server's
-       * transcript — the handed-off batch is durable somewhere other than this
-       * tab and the outbox copy can go. This is the only place that retires it:
-       * an ack does not, because the server acks `delivered: true`
-       * unconditionally without knowing whether the bridge took the text.
-       * Cleared BEFORE the force-send / flush dispatch below, which sets a new one.
-       */
-      state.outbox = null;
-      persistQueue();
+      // FEAT-168 r6 — a turn just ran in a session the crown shows CLOSED. If a
+      // new prompt started it, the server now derives "open" (the prompt is in
+      // the transcript by now); re-read so the crown and row follow.
+      if (state.current.closed === true) void refreshCurrentProjectSessions().catch(() => {});
       // BUG-031: an API-error turn reports subtype 'success' with is_error:
       // true (terminal_reason 'api_error') — labelling it by subtype would
       // literally print "success" as the error. Prefer the attributed
@@ -11422,18 +12352,10 @@ function onEvent(e) {
       // advances (server auto-continues) or halts at the stop condition. Re-read
       // the authoritative mode so the badge counter and the halt are both shown.
       if (state.autonomous.autonomous) void refreshAuto();
-      // FEAT-031 Part A: a force-send's interrupt lands here as an
-      // `interrupted:true` turn-end — this is the ONLY reliable signal that
-      // the aborted turn has actually stopped, so deliver the forced item
-      // right now, ahead of (and instead of) the normal queue flush this
-      // cycle. Whatever else is still queued flushes next time around.
-      if (state.forceSend) {
-        const item = state.forceSend;
-        state.forceSend = null;
-        deliverForced(item);
-      } else {
-        flushQueue(); // the boundary the queue was waiting for
-      }
+      // BUG-217 round 5: this boundary is the one a queued message waits for —
+      // the SERVER's outbox delivers it (a forced row first, alone — FEAT-031);
+      // the dock asks for the new answer.
+      void refreshOutbox();
       return;
     }
 
@@ -11479,12 +12401,31 @@ function onEvent(e) {
         return;
       }
       say(e.message, true);
+      if (e.fatal && state.pendingStart != null) {
+        /*
+         * BUG-215 round 2 — a FATAL error on a start/fork that never began (e.g. a
+         * refused fork: the server's Codex-fork or stage-truncated guard) must not
+         * swallow the typed message. Before, the fatal branch below latched
+         * sessError and returned WITHOUT reclaiming pendingStart, so the optimistic
+         * bubble stayed painted, the composer stayed empty, and a reload destroyed
+         * the message with no trace (the fork never created a session/transcript).
+         * The turn never started, so this is the same "start refused before ack"
+         * recovery the non-fatal branch already uses: rollBackPendingStart removes
+         * the phantom bubble and returns the text to the composer, recoverable and
+         * with the error still shown (say above) and latched. resumeOnNextSend it
+         * re-arms lets the next Send retry the resume (which re-arms the fork bar,
+         * or plain-resumes a genuine Codex thread — the very action its error names).
+         */
+        state.sessError = e.message;
+        rollBackPendingStart();
+        return;
+      }
       if (e.fatal) {
         state.sessError = e.message; // set BEFORE setBusy(false) so its repaint sees it
         setBusy(false);
         state.turnStartedAt = 0;
-        cancelForceSend('the session hit a fatal error');
-        failQueue('the session hit a fatal error');
+        // (BUG-217 round 5: queued messages are the server outbox's — it decides
+        // what becomes of them, and says so in the dock.)
       }
       else if (isBudgetStop(e)) {
         // BUG-013: lock the composer for good (until a fresh connect), and if
@@ -11497,15 +12438,13 @@ function onEvent(e) {
         rollBackPendingSend();
         setBusy(false);
         state.turnStartedAt = 0;
-        cancelForceSend('the session hit its budget limit');
-        failQueue('the session hit its budget limit');
         paintComposerFor(viewedThread());
       } else if (e.of === 'send' && e.sendId && state.sendAttempts.has(e.sendId)) {
         // BUG-191: a `send` the server did NOT deliver (retryable) or could not
         // confirm (uncertain) — recover exactly that attempt's rows.
         const attempt = state.sendAttempts.get(e.sendId);
         state.sendAttempts.delete(e.sendId);
-        if (e.retryable) queueRefusedSend(attempt, e.drain);
+        if (e.retryable) queueRefusedSend(attempt, e.drain, e.code);
         else if (e.uncertain) keepUnconfirmedSend(attempt);
         else if (state.busy) armBusyWatchdog(e.message);
       } else if (state.pendingStart != null && e.uncertain) {
@@ -11515,19 +12454,18 @@ function onEvent(e) {
         // BUG-029: a `start`/resume refused before its `ack` — the turn never
         // began (e.g. the retryable survivor-drain guard). BUG-045: when the
         // SERVER says the refusal is retryable (a drain that WILL end), the
-        // message becomes a queue row that retries itself — bouncing it to the
-        // composer left the user mashing Enter for the length of the drain. A
-        // non-retryable refusal keeps BUG-029's composer hand-back exactly.
-        if (e.retryable) queueRetryableRefusal(e.drain);
-        else {
-          failDrainWaitAttempt(e.message);
-          rollBackPendingStart();
-        }
+        // message goes to the session's outbox, which sends it by itself —
+        // bouncing it to the composer left the user mashing Enter for the length
+        // of the drain. A non-retryable refusal keeps BUG-029's composer hand-back.
+        if (e.retryable) queueRetryableRefusal(e.drain, e.code);
+        else rollBackPendingStart();
       } else if (state.busy) armBusyWatchdog(e.message);
       return;
 
     case 'session-closed':
-      say(`session closed (${e.reason})`);
+      // FEAT-160 — an account switch reaps the old CLI on purpose; finishAccountSwitch
+      // reports it as "switched", so don't also say the generic "session closed".
+      if (!acctPending) say(`session closed (${e.reason})`);
       // BUG-153: the run is over, so nothing is "running in the background"
       // either — this is the third place `sessDetached` was cleared, and the
       // follow flag now carries that meaning on its own.
@@ -11535,9 +12473,26 @@ function onEvent(e) {
       setBusy(false);
       state.turnStartedAt = 0;
       state.pendingSend = null;
-      cancelForceSend(`the session closed (${e.reason})`);
-      failQueue(`the session closed (${e.reason})`);
+      void refreshOutbox();
       return;
+
+    /*
+     * BUG-217 round 5 — the server's outbox handed THIS session (driven over this
+     * socket) a turn made of queued rows. This tab did not send it, so it paints
+     * the prompt as the user's bubble and goes busy exactly as for its own send;
+     * the rows leave the dock on the outbox's next answer.
+     */
+    case 'outbox-turn': {
+      if (e.sessionId && state.current?.sessionId && e.sessionId !== state.current.sessionId) return;
+      youBubble(mainThread(), e.text);
+      if (state.viewing === 'main') scrollDown();
+      state.turnStartedAt = Date.now();
+      state.turnStartUnknown = false; // BUG-033: the server started it just now — the clock is real
+      setBusy(true);
+      for (const id of e.ids ?? []) outboxSeenDone.add(id); // announced here; not followed again
+      void refreshOutbox();
+      return;
+    }
 
     default:
       return;
@@ -11553,268 +12508,441 @@ async function refreshCurrentProjectSessions() {
 /* --------------------------------------------------------------- composer */
 
 /* --------------------------------------------------- mid-turn send queue */
+/* (BUG-217 round 5: the queue is the server's — see the block below.) */
 
-/* ------------------------------------------------- BUG-129: a queue that
- * survives the tab (option A — the CONTAINED half of the fix)
+/* ------------------------------------ BUG-217 round 5: the dock is a VIEW
+ * of the session's server-owned outbox (src/server/outbox.ts).
  *
- * The defect: durability was attached to DELIVERY, not to acceptance. The only
- * durable copy of a typed message was the one the server writes AFTER a
- * successful handoff, so everything between "the composer accepted it" and
- * "the CLI took it" lived in one tab's heap: a reload, a tab close, a crash or
- * a session switch destroyed it silently, and no store on either side had a
- * copy to notice the loss against (see the ticket's Evidence — the lost message
- * was in no file anywhere).
- *
- * What this closes: the reload / close / switch half. Every mutation of
- * state.queue mirrors the rows into localStorage under the SAME session key the
- * composer draft uses (draftKey — BUG-083), and openSession/startNew read them
- * back for the session they belong to.
- *
- * What this deliberately does NOT close (do not read the dock as claiming
- * otherwise — they are option B's, and each is named in the ticket):
- *   - a refusal that arrives AFTER the socket accepted the frame: the server
- *     acks delivery unconditionally, so the optimistic bubble still stands and
- *     the transcript still lies about that one;
- *   - the mid-reply re-attach that deletes a painted bubble (its text lands in
- *     this queue, so it is now at least durable — but the bubble still vanishes);
- *   - the composer box itself, which is still volatile (state.drafts is a Map).
- *
- * Two rules this file keeps deliberately:
- *   - A row is cleared from storage when the USER clears it (discard / edit to
- *     empty) or when it becomes durable somewhere else — never merely because
- *     it was optimistically painted or handed to a socket. That is why
- *     state.outbox exists.
- *   - A row that comes back from storage is marked `restored` and SAYS it was
- *     not delivered. Making the unsent state visible is worth more than making
- *     the loss rarer (and an outbox row comes back `dead`, never auto-resent —
- *     redelivering a message the user already sent is a different harm, and the
- *     ticket's Risks section names it).
+ * Four rounds put the "was this queued message sent, and may it go now?"
+ * question in the browser — a tab's memory, a localStorage merge with locks and
+ * tombstones, then a server ledger the tab asked with its own clock and scope —
+ * and each broke "delivered exactly once" because a reader worked the answer
+ * out from something that could lie or forget. Now the SERVER mints the row,
+ * stores it, and delivers it itself when the session can take a turn (with or
+ * without any tab open). This file:
+ *   - renders the server's rows (`state.outbox`, refreshed every 2 s and after
+ *     every change) and asks for Edit / Discard / Send now / Send anyway /
+ *     Interrupt & send by the server's row id;
+ *   - keeps exactly ONE thing of its own: a request the server has not yet
+ *     acknowledged (`QUEUE_KEY`), written BEFORE it is sent and replayed
+ *     verbatim until the server answers — idempotent by its nonce. That is the
+ *     BUG-129/BUG-150 durability guarantee: accepted text is never only in a
+ *     tab's heap.
+ * It never sends a queued row, never judges delivery, and never supplies a
+ * clock or a scope the server trusts.
  */
-const QUEUE_KEY = 'cs.queue.v1';
-const QUEUE_MAX_SESSIONS = 20;      // newest N sessions keep rows; older entries are dropped
-const QUEUE_MAX_BYTES = 400_000;    // well under the ~5 MB origin quota, with the other keys in mind
+const QUEUE_KEY = 'cs.outbox-pending.v1';
+/** Rows kept by a round-1…4 client. Handed to the server once, as "not confirmed" (it may have gone). */
+const LEGACY_QUEUE_KEY = 'cs.queue.v1';
+const OUTBOX_POLL_MS = 2000;
 
 /*
- * The storage key state.queue currently mirrors — null means "these rows belong
- * to no session yet / a boundary just happened", and nothing is written. It is
- * nulled by resetTranscript (every session boundary passes through it) BEFORE
- * the rows are dropped, so a boundary can never write the outgoing session's
- * empty queue over the INCOMING session's stored rows, nor the reverse.
+ * The session key state.queue belongs to (draftKey — BUG-083). Null only for
+ * the span of resetTranscript; it is the key pending requests are filed under
+ * (BUG-150: taken synchronously, before any await, so nothing typed in a load
+ * window is filed nowhere).
  */
 let queueKey = null;
+/** Per-row UI state that must survive a repaint (open editor, the text being edited), by nonce. */
+const queueUi = new Map();
 
-function readQueueStore() {
+function pendingStore() {
   try {
     const o = JSON.parse(localStorage.getItem(QUEUE_KEY) ?? '{}');
     return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
-  } catch { return {}; } // garbage / private mode — start fresh rather than throw in a paint
+  } catch { return {}; }
 }
-
-function writeQueueStore(store) {
-  // Newest-first by `at`, capped by count and then by bytes. Age alone never
-  // evicts: dropping a person's undelivered words because they are old is the
-  // very failure this exists to stop.
-  let keys = Object.keys(store).sort((a, b) => (store[b]?.at ?? 0) - (store[a]?.at ?? 0));
-  for (const k of keys.slice(QUEUE_MAX_SESSIONS)) delete store[k];
-  keys = keys.slice(0, QUEUE_MAX_SESSIONS);
-  let body = JSON.stringify(store);
-  while (body.length > QUEUE_MAX_BYTES && keys.length > 1) {
-    delete store[keys.pop()];
-    body = JSON.stringify(store);
-  }
-  try { localStorage.setItem(QUEUE_KEY, body); return true; }
-  catch {
-    // Quota (or private mode): shed everything but this session and try once.
-    try { localStorage.setItem(QUEUE_KEY, JSON.stringify(queueKey && store[queueKey] ? { [queueKey]: store[queueKey] } : {})); }
-    catch { /* storage is unavailable — volatile, exactly as before this change */ }
-    return false;
-  }
-}
-
-/**
- * The key to write under, or null to write nothing. STRICT: only the key the
- * rows were adopted under, and only while state.current still agrees with it.
- *
- * It is deliberately not clever about mismatches. A mismatch means a boundary
- * this code has not been told about, and the tempting repair — "assume the key
- * moved, carry the entry over" — destroyed a session's stored rows in testing:
- * mid-`openSession` the key had already become the incoming session's while the
- * queue was momentarily empty, so the "migration" retargeted onto that
- * session's key and the empty-queue write then deleted its rows. Writing
- * NOTHING on a mismatch cannot lose anything; the one real retarget (a
- * pending-new session acquiring its id) is done explicitly by retargetQueue().
- */
-function queueTargetKey() {
-  const k = draftKey(state.current);
-  return queueKey && k && k === queueKey ? k : null;
-}
-
-/**
- * The pending-new session just acquired a real id: its rows were stored under
- * `p\0<project>` and a reload now lands in `s\0<dir>\0<id>`, so carry them.
- * Called ONLY from the session-init frame — never inferred from a key mismatch,
- * for the reason above. Refuses to overwrite an existing destination entry:
- * those are another session's undelivered words.
- */
-function retargetQueue() {
-  const k = draftKey(state.current);
-  if (!queueKey || !k || k === queueKey || !queueKey.startsWith('p\x00') || !k.startsWith('s\x00')) return;
-  const store = readQueueStore();
-  if (store[queueKey] && !store[k]) { store[k] = store[queueKey]; delete store[queueKey]; writeQueueStore(store); }
-  queueKey = k;
-}
-
-/** Mirror state.queue (+ the in-flight outbox) into storage. Never throws. */
-function persistQueue() {
-  const k = queueTargetKey();
-  if (!k) return;
-  const rows = state.queue
-    .filter((q) => typeof q.text === 'string' && q.text.trim())
-    .map((q) => ({ text: q.text, composedAt: q.composedAt ?? Date.now(), dead: q.dead ?? null }));
-  // A force-send waiting for its interrupt to land is out of state.queue and not
-  // yet handed over (FEAT-031 Part A) — a third volatile spot, mirrored as an
-  // ordinary undelivered row. cancelForceSend puts the live copy back itself.
-  if (state.forceSend?.text?.trim()) {
-    rows.push({ text: state.forceSend.text, composedAt: state.forceSend.composedAt ?? Date.now(), dead: null });
-  }
-  const store = readQueueStore();
-  if (!rows.length && !state.outbox) delete store[k];
-  else store[k] = { at: Date.now(), rows, outbox: state.outbox ?? null };
-  writeQueueStore(store);
-}
-
-/**
- * Is every text of a handed-off batch already in the transcript ON SCREEN? If
- * so the server DID take it and it is durable — the row must not come back
- * (crying "undelivered" over a message that plainly arrived trains the user to
- * ignore the one time it is true). Matched against `.you` bubbles only, never
- * the whole pane: the assistant quotes the user constantly.
- */
-function transcriptHasAll(texts) {
-  const said = [...mainThread().paneEl.querySelectorAll('.you')].map((n) => n.textContent ?? '');
-  return texts.every((t) => {
-    const needle = t.trim();
-    return needle ? said.some((s) => s.includes(needle)) : true;
-  });
-}
-
-/**
- * The same question asked of the STORE rather than the screen. What is on
- * screen is not the whole transcript: reopening at a remembered position
- * renders a WINDOW around that position (openHistoryWindow), so a message that
- * was delivered perfectly well can be absent from the pane — and raising "this
- * may never have arrived" over it is the crying-wolf failure above, in the case
- * the reader is least able to check. (Observed: a delivered message read as
- * unconfirmed purely because the reload landed at a deep index.) Read-only,
- * over the transcript endpoint the session view already uses; a failure to
- * answer means "not confirmed", which errs toward keeping the text.
- */
-async function outboxDelivered(texts) {
-  if (transcriptHasAll(texts)) return true;
-  const cur = state.current;
-  if (!cur?.sessionId) return false;
+function writePendingStore(o) {
   try {
-    const t = await api.transcriptTail(cur.encodedDir, cur.sessionId, { limit: 60 });
-    const said = (t.messages ?? [])
-      .filter((m) => m.role === 'user')
-      .flatMap((m) => (m.blocks ?? []).filter((b) => b.type === 'text').map((b) => b.text ?? ''));
-    return texts.every((x) => said.some((s) => s.includes(x.trim())));
-  } catch { return false; }
+    if (Object.keys(o).length) localStorage.setItem(QUEUE_KEY, JSON.stringify(o));
+    else localStorage.removeItem(QUEUE_KEY);
+    return true;
+  } catch { return false; } // storage unavailable: the row still goes to the server, it is just not reload-proof
+}
+function newNonce() {
+  try { return `n-${crypto.randomUUID()}`; }
+  catch { return `n-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`; }
+}
+const nonceSafe = (s) => String(s).replace(/[^A-Za-z0-9._:-]/g, '-').slice(0, 120);
+
+/** Which session a new row goes to — null while a brand-new session has no id yet (it is filed until session-init). */
+function outboxTarget(cur = state.current) {
+  if (!cur?.sessionId || !cur.projectId) return null;
+  return { session: cur.sessionId, dir: cur.encodedDir ?? undefined, project: cur.projectId };
 }
 
 /**
- * Take ownership of the current session's stored rows and put them back on
- * screen. Called for a pending-new session (startNew) and the re-take paths
- * (route restore, fresh-start) — i.e. wherever state.current settles and
- * resetTranscript has emptied the queue with NO await before this call.
- *
- * openSession has an await (the transcript fetch) between resetTranscript and
- * the point the transcript is on screen, so it does NOT call this: it takes
- * ownership synchronously via adoptQueueRows() BEFORE the fetch (closing the
- * BUG-150 window) and settles the outbox via judgeAdoptedOutbox() after.
+ * A row this tab typed but the server has not acknowledged. `req` is the
+ * COMPLETE request (plan review B2): it is replayed verbatim, so a replay can
+ * never lose `initial`/`reason` and turn an "ask first" row into one that sends.
  */
-function adoptQueue() {
-  judgeAdoptedOutbox(adoptQueueRows());
+function fileRequest(req, key = queueKey) {
+  if (!key) return false; // no declared owner (ARCH-010: queueKey is set only by adoptQueueRows) — never guess one here
+  const store = pendingStore();
+  store[req.nonce] = { key, at: Date.now(), req };
+  return writePendingStore(store);
+}
+function dropRequest(nonce) {
+  const store = pendingStore();
+  if (!store[nonce]) return;
+  delete store[nonce];
+  writePendingStore(store);
 }
 
 /**
- * The SYNCHRONOUS half of adoption, and the one that fixes BUG-150. It assigns
- * `queueKey` — the fact "which session state.queue currently belongs to"
- * (ARCH-010: declared here, its sole owner; read by queueTargetKey and never
- * re-derived) — and restores this session's stored rows onto the dock. Because
- * it is synchronous it can run BEFORE openSession's transcript fetch, with no
- * await between resetTranscript (which nulls queueKey) and here: so from the
- * first moment the session is on screen, persistQueue writes under the right
- * key and a message queued during the load window is durable, not stranded in
- * the tab's heap. Returns the handed-off outbox descriptor (for
- * judgeAdoptedOutbox) or null when there is nothing to judge.
+ * Hand text to the session's outbox. `origin: 'queued'` — typed while Claude was
+ * working; `'direct'` — a typed send the session could not take at once (the
+ * server delivers it when it can). `initial` may only make it MORE cautious:
+ * `uncertain` (it may already have arrived) or `failed` (with the reason) —
+ * such a row is never sent until the user says so.
+ */
+function enqueueOutbox(text, { origin = 'queued', initial, reason, quiet = false } = {}) {
+  const t = typeof text === 'string' ? text : '';
+  if (!t.trim()) return null; // BUG-150 D: nothing durable for a blank row
+  const target = outboxTarget();
+  const req = {
+    nonce: newNonce(), text: t, origin,
+    ...(initial ? { initial } : {}),
+    ...(reason ? { reason } : {}),
+    // The session settings a server-side resume would use (the tab owns them today).
+    overrides: sessionOverrides({ resuming: true }) ?? null,
+    templateIds: drawer.startTemplateIds?.() ?? null,
+    ...(target ?? { project: state.current?.projectId ?? null }),
+  };
+  const durable = fileRequest(req);
+  // Not filed (no session binding, or storage refused): the words stay on screen, in this tab only —
+  // and where there IS a session, still go straight to its outbox (just not reload-proof until it answers).
+  if (!durable) {
+    const row = { id: null, nonce: req.nonce, text: t, origin, state: 'pending', reason: 'not saved — copy it out before reloading', createdAt: Date.now(), local: true };
+    state.queueUnfiled.push(row);
+    if (queueKey && req.session) {
+      void api.outboxCreate(req).then((r) => {
+        const i = state.queueUnfiled.indexOf(row);
+        if (i !== -1) state.queueUnfiled.splice(i, 1);
+        if (r?.view) applyOutboxView(r.view, { quiet: true });
+      }, () => { /* stays on screen, marked not saved */ });
+    }
+  }
+  rebuildQueue();
+  paintQueue();
+  void flushPending();
+  if (!durable && !quiet) say('your message is in the dock but could not be saved for a reload — copy it out before reloading', true);
+  return req;
+}
+
+function queueMessage(text) {
+  if (!enqueueOutbox(text)) return;
+  const n = state.queue.filter((q) => q.state === 'queued' || q.state === 'pending' || q.state === 'sending').length;
+  say(`message queued — ${n} waiting; it sends at the next pause (Edit or Discard it in the dock)`);
+}
+
+/** POST every filed request this tab holds for a session that has an id. Idempotent by nonce. */
+let pendingBusy = false;
+let pendingAgain = false;
+async function flushPending() {
+  if (pendingBusy) { pendingAgain = true; return; }
+  pendingBusy = true;
+  try {
+    do {
+      pendingAgain = false;
+      const store = pendingStore();
+      for (const [nonce, e] of Object.entries(store)) {
+        const req = e?.req;
+        if (!req?.session || !req.project) continue; // a new session without an id yet — retargetQueue fills it in
+        let r;
+        try { r = await api.outboxCreate(e.discard ? { ...req, discard: true } : req); }
+        catch (err) {
+          const why = err?.status === 404 ? 'the server does not know this session yet — Orchard keeps trying'
+            : err?.status === 409 ? 'the server already holds a different message under this id — move this one to the composer and send it again'
+              : err?.status >= 400 && err?.status < 500 ? `the server refused it (${err.message})`
+                : 'not saved on the server yet — Orchard keeps trying';
+          const s2 = pendingStore();
+          if (s2[nonce]) { s2[nonce].error = why; writePendingStore(s2); }
+          continue;
+        }
+        dropRequest(nonce);
+        if (r?.view && r.view.sessionId === state.current?.sessionId) applyOutboxView(r.view, { quiet: true });
+        else if (r?.skipped) rebuildQueue();
+      }
+    } while (pendingAgain);
+  } finally {
+    pendingBusy = false;
+  }
+  rebuildQueue();
+  paintQueue();
+}
+
+/** Read the current session's outbox. The server's answer replaces this tab's view wholesale. */
+let outboxBusy = false;
+async function refreshOutbox() {
+  const sid = state.current?.sessionId;
+  if (!sid || !queueKey) return;
+  if (outboxBusy) return;
+  outboxBusy = true;
+  try {
+    const v = await api.outboxGet(sid);
+    if (state.current?.sessionId === sid && queueKey) applyOutboxView(v);
+  } catch { /* unreachable: the next tick asks again — the rows are the server's, nothing is lost meanwhile */ }
+  finally { outboxBusy = false; }
+}
+
+/** Rows this tab has seen finish (id → true), so "sent" is said once and a delivery it did not start is followed once. */
+const outboxSeenDone = new Set();
+function applyOutboxView(v, { quiet = false } = {}) {
+  if (!v || v.sessionId !== state.current?.sessionId) return;
+  const first = state.outbox?.sessionId !== v.sessionId;
+  state.outbox = v;
+  let sent = 0;
+  let followed = false;
+  for (const r of v.recent ?? []) {
+    if (outboxSeenDone.has(r.id)) continue;
+    outboxSeenDone.add(r.id);
+    if (first) continue; // finished before this tab looked — nothing to announce
+    if (r.state === 'delivered') {
+      sent++;
+      // A turn the server started while this tab was not driving: show it — reopening at the
+      // latest reattaches a still-running bridge (BUG-160) or reads the transcript as it now is.
+      if (!isDriving()) followed = true;
+    }
+  }
+  rebuildQueue();
+  paintQueue();
+  if (sent && !quiet) say(sent === 1 ? 'sent your queued message' : `sent ${sent} queued messages`);
+  if (followed && !state.outboxFollowing) {
+    state.outboxFollowing = true;
+    setTimeout(() => { state.outboxFollowing = false; }, 3000);
+    reopenAtLatest();
+  }
+}
+
+/** state.queue = the server's unfinished rows, then this tab's unacknowledged requests (in the order typed). */
+function rebuildQueue() {
+  const rows = [];
+  const sid = state.current?.sessionId ?? null;
+  const v = state.outbox && state.outbox.sessionId === sid ? state.outbox : null;
+  const known = new Set();
+  for (const r of v?.rows ?? []) {
+    known.add(r.nonce);
+    rows.push({ ...r, local: false });
+  }
+  for (const r of v?.recent ?? []) known.add(r.nonce);
+  const store = pendingStore();
+  const mine = Object.values(store)
+    .filter((e) => e?.req && e.key === queueKey && !known.has(e.req.nonce))
+    .sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  for (const e of mine) {
+    if (e.discard) continue;
+    rows.push({
+      id: null, nonce: e.req.nonce, text: e.req.text, origin: e.req.origin ?? 'queued',
+      state: 'pending', reason: e.error ?? null, createdAt: e.at ?? Date.now(), local: true,
+    });
+  }
+  state.queue = rows.concat(state.queueUnfiled);
+}
+
+/*
+ * The synchronous half of adoption (BUG-150): assign queueKey for the session
+ * now on screen, BEFORE openSession's transcript fetch, so a message typed in
+ * the load window is filed under the right key. Then hand any rows an older
+ * client kept in this browser to the server (once, as "not confirmed"), and ask
+ * the server what the session's outbox holds.
  */
 function adoptQueueRows() {
   queueKey = draftKey(state.current);
   if (!queueKey) return null;
-  const entry = readQueueStore()[queueKey];
-  if (!entry) return null;
-  let restored = 0;
-  for (const r of (Array.isArray(entry.rows) ? entry.rows : [])) {
-    if (typeof r?.text !== 'string' || !r.text.trim()) continue;
-    state.queue.push({
-      text: r.text,
-      dead: typeof r.dead === 'string' ? r.dead : null,
-      composedAt: Number.isFinite(r.composedAt) ? r.composedAt : Date.now(),
-      restored: true,
-    });
-    restored++;
-  }
-  const ob = entry.outbox;
-  const obTexts = ob && Array.isArray(ob.texts) ? ob.texts.filter((t) => typeof t === 'string' && t.trim()) : [];
+  importLegacyRows(queueKey);
   state.outbox = null;
-  if (restored) {
-    paintQueue();
-    say(`${restored} undelivered message${restored === 1 ? '' : 's'} restored from before the reload — in the dock, still unsent`);
-  } else if (!obTexts.length) {
-    persistQueue(); // an entry with nothing left in it — retire it
-    return null;
-  }
-  if (!obTexts.length) return null;
-  return { mine: queueKey, texts: obTexts, at: ob.at };
+  rebuildQueue();
+  paintQueue();
+  void flushPending();
+  void refreshOutbox();
+  return null;
+}
+function adoptQueue() { adoptQueueRows(); }
+
+/**
+ * A round-1…4 client kept this session's undelivered rows in `cs.queue.v1`. Each
+ * becomes a filed request with a DETERMINISTIC nonce (two tabs importing the
+ * same row name it alike, so the server keeps one) and `legacyId`: the server
+ * reads its old ledger once, drops a row it knew was delivered or withdrawn,
+ * and brings anything else back as "not confirmed" — never sent by itself.
+ */
+function importLegacyRows(k) {
+  let legacy;
+  try { legacy = JSON.parse(localStorage.getItem(LEGACY_QUEUE_KEY) ?? 'null'); } catch { return; }
+  const entry = legacy?.[k];
+  if (!entry) return;
+  const [kind, dir, sid] = String(k).split('\x00');
+  if (kind !== 's' || !sid || !state.current?.projectId) return; // a never-started session: nothing to take it
+  const store = pendingStore();
+  const add = (text, legacyId) => {
+    if (typeof text !== 'string' || !text.trim()) return;
+    const nonce = nonceSafe(`legacy:${legacyId}`);
+    if (store[nonce]) return;
+    store[nonce] = {
+      key: k, at: Date.now(),
+      req: { nonce, text, origin: 'queued', legacyId: String(legacyId), session: sid, dir: dir || undefined, project: state.current.projectId },
+    };
+  };
+  let h = 0;
+  const hash = (s) => { h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
+  for (const r of Array.isArray(entry.rows) ? entry.rows : []) add(r?.text, typeof r?.id === 'string' ? r.id : `l${hash(`${r?.composedAt}\x00${r?.text}`)}`);
+  const ob = entry.outbox;
+  (Array.isArray(ob?.texts) ? ob.texts : []).forEach((t, i) => add(t, `ob${i}-${hash(`${ob.at}\x00${t}`)}`));
+  if (!writePendingStore(store)) return; // keep the legacy copy until the new one is safe
+  delete legacy[k];
+  try {
+    if (Object.keys(legacy).length) localStorage.setItem(LEGACY_QUEUE_KEY, JSON.stringify(legacy));
+    else localStorage.removeItem(LEGACY_QUEUE_KEY);
+  } catch { /* harmless: the next import finds the same nonces */ }
 }
 
 /**
- * The ASYNC half of adoption: judge a handed-off batch (the outbox) against the
- * transcript, which may need a fetch — so it settles after the rows are already
- * on screen rather than holding them up, and after openSession's transcript is
- * painted rather than before it. `pending.mine` pins the session this answer
- * belongs to: a switch while the fetch is in flight must not drop the outgoing
- * session's row into the incoming one (the BUG-079 class — a late answer acting
- * on the wrong session).
+ * A new session just got its id (session-init): its filed requests were under
+ * `p\0<project>` with no session — point them at the session and send them.
+ * Called ONLY from the session-init frame, never inferred from a key mismatch.
  */
-function judgeAdoptedOutbox(pending) {
-  if (!pending) return;
-  const { mine, texts, at } = pending;
-  void outboxDelivered(texts).then((delivered) => {
-    if (queueKey !== mine) return;
-    if (delivered) { persistQueue(); return; } // confirmed on disk — retire the stored copy
-    // Handed to the socket, and no turn was ever seen carrying it. It may have
-    // arrived; it may have been refused after the ack (that refusal is option
-    // B's to fix). It comes back DEAD — readable, copyable, editable, and never
-    // resent behind the user's back.
-    for (const t of texts) {
-      state.queue.push({
-        text: t,
-        dead: 'sent, but this tab never saw its turn start — check the transcript before sending it again',
-        composedAt: Number.isFinite(at) ? at : Date.now(),
-        restored: true,
-      });
-    }
-    paintQueue();
-    say(`${texts.length} message${texts.length === 1 ? '' : 's'} sent before the reload cannot be confirmed as delivered — kept in the dock`, true);
+function retargetQueue() {
+  const k = draftKey(state.current);
+  if (!queueKey || !k || k === queueKey || !queueKey.startsWith('p\x00') || !k.startsWith('s\x00')) return;
+  const target = outboxTarget();
+  const store = pendingStore();
+  let moved = false;
+  for (const e of Object.values(store)) {
+    if (e?.key !== queueKey || !e.req || !target) continue;
+    Object.assign(e.req, target);
+    e.key = k;
+    moved = true;
+  }
+  if (moved) writePendingStore(store);
+  queueKey = k;
+  void flushPending();
+  void refreshOutbox();
+}
+
+setInterval(() => {
+  if (document.hidden) return;
+  if (state.current?.sessionId && queueKey) void refreshOutbox();
+  if (Object.keys(pendingStore()).length) void flushPending();
+}, OUTBOX_POLL_MS);
+// Another tab filed or cleared a request: this tab's dock follows (the server rows follow on the poll).
+window.addEventListener('storage', (e) => {
+  if (e.key !== QUEUE_KEY || !queueKey) return;
+  rebuildQueue();
+  paintQueue();
+});
+
+/* ------------------------------------------------ asking the server to act */
+
+/** Run one outbox action; the answer (or the refusal's row state) repaints the dock. Returns true on success. */
+async function outboxAct(item, fn, { onConflict } = {}) {
+  const sid = state.current?.sessionId;
+  if (!sid || !item?.id) return false;
+  try {
+    const v = await fn(sid, item.id);
+    applyOutboxView(v, { quiet: true });
+    return true;
+  } catch (err) {
+    if (err?.status === 409) onConflict?.(err.body?.row ?? null, err);
+    else say(`Orchard could not do that (${err.message}) — nothing changed`, true);
+    void refreshOutbox();
+    return false;
+  }
+}
+
+const QUEUE_UNDO_MS = 8000;
+/** Discard: the server withdraws the row (if it has not gone already); the words can be put back for a few seconds. */
+async function discardQueueRow(item) {
+  if (state.queueUnfiled.includes(item)) {
+    state.queueUnfiled.splice(state.queueUnfiled.indexOf(item), 1);
+  } else if (item.local) {
+    // Not acknowledged yet: re-file it as a DISCARD, so whatever the server has (or later gets) under this nonce is withdrawn.
+    const store = pendingStore();
+    if (store[item.nonce]) { store[item.nonce].discard = true; writePendingStore(store); }
+    void flushPending();
+  } else {
+    const ok = await outboxAct(item, (sid, id) => api.outboxDiscard(sid, id), {
+      onConflict: () => say('that message had already been sent — discarding it here did not unsend it', true),
+    });
+    if (!ok) return;
+  }
+  clearTimeout(state.queueUndo?.timer);
+  state.queueUndo = {
+    key: queueKey, text: item.text,
+    until: Date.now() + QUEUE_UNDO_MS,
+    timer: setTimeout(() => { state.queueUndo = null; paintQueue(); }, QUEUE_UNDO_MS),
+  };
+  rebuildQueue();
+  paintQueue();
+}
+function undoQueueDiscard() {
+  const u = state.queueUndo;
+  if (!u) return;
+  clearTimeout(u.timer);
+  state.queueUndo = null;
+  if (u.key !== queueKey) { paintQueue(); return; }
+  // A NEW row: the discarded one is finished for good; this is the user putting the words back.
+  enqueueOutbox(u.text, { quiet: true });
+  say('message restored to the queue');
+}
+
+/** Save an edit. A row that went meanwhile keeps what was sent; the edited words go to the composer, not lost. */
+async function saveQueueEdit(item, text) {
+  if (text === item.text) return true;
+  if (!text.trim()) { say('an empty message cannot be queued — use Discard to remove it', true); return false; }
+  return outboxAct(item, (sid, id) => api.outboxEdit(sid, id, text), {
+    onConflict: () => {
+      node.prompt.value = node.prompt.value ? `${node.prompt.value}\n\n${text}` : text;
+      autosize();
+      say('that message had already been sent, so the edit was not applied — your edited words are in the message box', true);
+    },
   });
 }
 
-function queueMessage(text) {
-  state.queue.push({ text, dead: null, composedAt: Date.now() });
+/**
+ * Send anyway (not confirmed) / Send again (failed): the server re-queues it ONCE
+ * — a second press is refused. Send now (a queued row held because another
+ * program is writing the session): the user's say-so past that heuristic.
+ */
+function sendRowNow(item) {
+  const now = item.state === 'queued';
+  void outboxAct(item, (sid, id) => api.outboxSend(sid, id, now ? { now: true } : {}), {
+    onConflict: (row) => say(row?.state === 'delivered' ? 'that message had already been sent' : 'that message is already on its way', true),
+  });
+}
+
+/*
+ * FEAT-031 Part A — Interrupt & send: the SERVER interrupts the running turn and
+ * delivers this row alone, first, at the boundary. Deliberately destructive (the
+ * in-flight work is lost) and unmistakably separate from the row's ordinary wait.
+ */
+function forceSend(item) {
+  say('force-sending — interrupting current work…');
+  void outboxAct(item, (sid, id) => api.outboxSend(sid, id, { interrupt: true }), {
+    onConflict: (row) => say(row?.state === 'delivered' ? 'that message had already been sent' : 'that message is already on its way', true),
+  });
+}
+
+/** Take a row's words out of the queue into the composer (the server withdraws it first — it may have gone). */
+async function moveRowToComposer(item) {
+  if (state.queueUnfiled.includes(item)) {
+    state.queueUnfiled.splice(state.queueUnfiled.indexOf(item), 1);
+  } else if (item.local) {
+    const store = pendingStore();
+    if (store[item.nonce]) { store[item.nonce].discard = true; writePendingStore(store); }
+    void flushPending();
+  } else {
+    const ok = await outboxAct(item, (sid, id) => api.outboxDiscard(sid, id), {
+      onConflict: () => say('that message had already been sent — it was not moved', true),
+    });
+    if (!ok) return;
+  }
+  node.prompt.value = node.prompt.value ? `${node.prompt.value}\n\n${item.text}` : item.text;
+  rebuildQueue();
   paintQueue();
-  say(`message queued — ${state.queue.length} waiting; expand it in the dock to edit before it sends`);
+  autosize();
+  node.prompt.focus();
+  say('moved to the message box — press Enter to send it');
 }
 
 /** "2m11s" / "43s" — coarse enough for a factual note, not a stopwatch. */
@@ -11826,189 +12954,77 @@ function fmtElapsed(ms) {
   return `${m}m${String(rem).padStart(2, '0')}s`;
 }
 
-/*
- * Every item that reaches this queue was queued because `state.busy` was true
- * (queueMessage is only ever called mid-turn — see submit() and the
- * re-attach path) and it only DELIVERS once `state.busy` flips back to false
- * (flushQueue runs off that transition). So anything in state.queue crossed
- * at least one turn boundary between compose and delivery, by construction —
- * unlike a normal submit(), which bubbles and sends in the same tick. That is
- * exactly the "meaningful" case FEAT-002 wants a note for; a directly-typed
- * message never goes through this function at all, so it never gets one.
- *
- * FEAT-031 Part B — PER-ITEM note, not one per batch: FEAT-002 originally
- * gave the whole delivered batch ONE note framed on the earliest item. Live
- * use (FEAT-031, user-confirmed) showed that flattens distinct messages —
- * three texts composed minutes apart at different points in the turn read
- * as ONE message with one timestamp, losing exactly the context the note
- * was meant to preserve. Each item now gets its OWN bracketed header
- * immediately above its OWN text (`[msg 2/3 · queued 1m10s ago]`) so the
- * model can still tell them apart even though they still arrive together
- * in a single combined turn (see flushQueue below — delivery is still one
- * turn, just no longer one undifferentiated blob).
- */
-function queueItemNote(item, index, total) {
-  const elapsed = fmtElapsed(Date.now() - item.composedAt);
-  if (total === 1) {
-    return `[Queued ${elapsed} ago, composed while the previous response was still being written — it predates that response.]`;
-  }
-  return `[msg ${index + 1}/${total} · queued ${elapsed} ago, composed while the previous response was still being written]`;
-}
+/* ---------------------------------------------------------------- the dock */
 
 /**
  * The queue lives in the DOCK, not the transcript: a bubble at a transcript
- * position would claim the message was said there — it was not said at all
- * yet. Rows collapse to a preview and expand to an EDITABLE textarea; the
- * text sent is whatever the row holds at delivery time.
+ * position would claim the message was said there — it was not said at all yet.
+ * Every row shows its words, a plain muted status, and its actions at once
+ * (BUG-217 round 1): nothing non-clickable looks pressable, Discard is set
+ * apart and undoable (round 2). What the dock says about WHY a row waits is the
+ * server's own declaration (`state.outbox.hold`), never worked out here.
  */
 function paintQueue() {
   const box = $('#queueBox');
-  const pending = state.queue.filter((q) => !q.dead);
-  // BUG-129: storage mirrors the queue at EVERY mutation, and every mutation
-  // repaints — so this one call is the whole write path. It runs before the
-  // early return too: emptying the queue (discarding the last row) must clear
-  // the stored copy, or a discarded message would come back from the dead.
-  persistQueue();
-  if (!state.queue.length) { box.hidden = true; clear(box); return; }
+  const undo = state.queueUndo && state.queueUndo.key === queueKey && state.queueUndo.until > Date.now() ? state.queueUndo : null;
+  const damaged = state.outbox?.sessionId === state.current?.sessionId ? state.outbox?.damaged ?? null : null;
+  if (!state.queue.length && !undo && !damaged) { box.hidden = true; clear(box); return; }
   clear(box);
+  if (damaged) {
+    const bar = el('div', { class: 'q-undo q-damaged', role: 'alert' });
+    bar.append(el('span', { class: 'q-undo-t', text: 'Orchard’s saved queue for this session was damaged. Anything it could not confirm is marked below — some queued messages may be missing, so check the conversation.' }));
+    const b = el('button', { class: 'mini q-undo-b', text: 'Dismiss' });
+    b.addEventListener('click', () => { const sid = state.current?.sessionId; if (sid) void api.outboxDismissDamage(sid).then((v) => applyOutboxView(v, { quiet: true }), () => {}); });
+    bar.append(b);
+    box.append(bar);
+  }
+  if (undo) {
+    const bar = el('div', { class: 'q-undo', role: 'status' });
+    const gist = undo.text.replace(/\s+/g, ' ').trim();
+    bar.append(el('span', { class: 'q-undo-t', text: `Discarded “${gist.length > 48 ? `${gist.slice(0, 47)}…` : gist}”` }));
+    const b = el('button', { class: 'mini q-undo-b', text: 'Undo' });
+    b.addEventListener('click', () => undoQueueDiscard());
+    bar.append(b);
+    box.append(bar);
+  }
+  if (!state.queue.length) { box.hidden = false; return; }
+  const waiting = state.queue.filter((q) => q.state === 'queued' || q.state === 'pending' || q.state === 'sending');
+  const unresolved = state.queue.filter((q) => q.state === 'uncertain' || q.state === 'failed');
+  // The server's hold; until its first answer lands, a tab mid-reply knows the one thing that is true.
+  const hold = (state.outbox?.sessionId === state.current?.sessionId ? state.outbox?.hold : null)
+    ?? (isDriving() && state.busy ? { kind: 'busy', text: '' } : null);
   /*
-   * BUG-134 — this chip said three things, and all three were wrong.
-   * (Filed as BUG-135 in commit e9efb92; renumbered when another lane minted the
-   * same id minutes earlier.)
-   *
-   * FEAT-064 rendered the server's refusal payload verbatim: an elapsed, a
-   * count of background agents and their ids. Read live, it said "held 45m59s
-   * by 2 background agents (a3d3e1022ec985f4e, a3ba9374904af5e4d)". Against the
-   * broker's own record at that moment:
-   *
-   *  - The 45m59s was `drainHeldSince` — the epoch of the FIRST decline this
-   *    broker ever made, deliberately never reset (session-host.mjs: "an epoch,
-   *    not a ticker"). The user's message had been queued for a fraction of it.
-   *    Presenting a broker-lifetime statistic in a sentence about the user's
-   *    message reads as "your message has been ignored for 46 minutes".
-   *  - The ids were captured at ONE refusal and never refreshed; the broker's
-   *    level frames reported 4, 5 and 6 lanes with different ids over two
-   *    minutes of sampling. Opaque, and stale besides.
-   *  - The attribution was false. Background agents do NOT hold delivery:
-   *    FEAT-065 delivers into a drain-held survivor precisely while they run,
-   *    and the journal shows it doing so 13 times in the hour this was
-   *    displayed. What delays a message is the FOREGROUND turn (`midTurn`),
-   *    which opens and closes continuously.
-   *
-   * So: report the user's OWN wait, from the row this tab has held all along,
-   * and name the condition that actually resolves it. No ids — nothing the user
-   * can act on was ever in them.
+   * BUG-178: queued behind a genuinely-running main turn held inside a long-lived
+   * FOREGROUND step — name the step and its live elapsed instead of "the next pause".
    */
-  const heldRow = pending.find((q) => q.drainWait && q.drain);
-  const heldWhy = (row) => {
-    // A row restored from storage may predate composedAt — then say nothing
-    // about elapsed rather than render a NaN.
-    const waited = Number.isFinite(row.composedAt) ? ` · queued ${fmtElapsed(Date.now() - row.composedAt)} ago` : '';
-    // BUG-191: a refusal from an adopt-gated session names the real reason.
-    if (row.drain?.adoptState === 'pending') return `waiting for the session to finish re-attaching after a server restart — this retries every few seconds and goes in once it is ready${waited} — edit or discard below`;
-    if (row.drain?.adoptState) return `waiting — the session is finishing an earlier server's work after a restart (${row.drain.why ?? 'not ready'}); this retries every few seconds${waited} — edit or discard below`;
-    return `waiting on drain — the session is mid-reply; this retries every few seconds and goes in at its next pause${waited} — edit or discard below`;
-  };
-  /*
-   * BUG-129: rows can now outlive the tab, so for the first time the dock can
-   * hold pending text while this tab is NOT driving the session (a reload
-   * mid-reply follows the live session but does not take it over until the user
-   * sends). Nothing flushes in that state — so the ordinary "delivers at the
-   * next pause" would be a promise the client cannot keep, which is the same
-   * class of lie as the transcript claiming a refused message was delivered.
-   * Say what is actually true and name the action that resolves it.
-   */
-  /*
-   * BUG-149 widened this from `restored rows only` to the actual condition, and
-   * moved it below the branches that are MORE specific about the same state.
-   *
-   * The test was `some(restored) && !live`, but nothing about a restored row is
-   * what stops delivery — flushQueue's own first line is `!state.live ||
-   * !state.ws`, so ANY pending row in a tab that holds no socket is going
-   * nowhere. Observed in a screenshot of the two-tab refusal: a message queued
-   * in a read-only tab sat under "1 queued message · delivering…" while nothing
-   * was delivering or could. Same class of lie as the transcript claiming a
-   * refused message was delivered, in the one place the user looks for the
-   * truth about undelivered text.
-   *
-   * The drain-wait rows are the exception and are handled ABOVE: those DO have
-   * a self-retry loop that reconnects, so "not driving" would understate them.
-   */
-  const notDriving = !isDriving(); // BUG-153: the same predicate the chip and the guards read
-  /*
-   * BUG-178: when a message is queued behind a genuinely-running main turn that
-   * is held inside a long-lived FOREGROUND step (a subagent or a long tool
-   * lane), the bare "delivers at the next pause" reads identically to a
-   * two-second wait while the real wait can be tens of minutes. Detect that one
-   * state — same guards as the busy/not-strand chip branch below — and render a
-   * copy that names the step and shows its live elapsed. Null everywhere else,
-   * so every other branch (including the ordinary tool chain, where the pause
-   * really is seconds away) keeps its existing honest wording.
-   */
-  const fg = (pending.length && !heldRow && !pending.some((q) => q.drainWait)
-    && !state.dropped && !notDriving && state.busy && !idleBehindBackground())
-    ? foregroundWait() : null;
-  const why = !pending.length
-    // BUG-149: name the affordance that now exists, instead of asking the user
-    // to select text out of a textarea by hand.
-    // BUG-191: a row whose delivery was never CONFIRMED may have arrived — do not call it undelivered.
-    ? (state.queue.every((q) => q.dead === UNCONFIRMED_NOTE)
-      ? 'not confirmed as delivered — check the transcript, then put it back in the composer or discard'
-      : 'never delivered — put it back in the composer, or discard')
-    : heldRow
-      ? heldWhy(heldRow)
-      : pending.some((q) => q.drainWait)
-      // BUG-045: the visible "why is this waiting" chip for a retryable refusal.
-      ? 'waiting for the previous turn to finish draining — retries itself; edit or discard below'
-      : state.dropped
-        ? 'connection dropped — reconnect, then these deliver at the next pause'
-        : notDriving
-        // BUG-153: name the way out. The row now carries "To composer" in this
-        // state, and a way out nobody can see is the dead end this fixes — the
-        // user's account of it was "id need to remove msg from queue and send
-        // again", which is what a person does when the affordance is invisible.
-        ? 'this tab is not driving the session — send a message (or reconnect) and these go with the next turn, or put one back in the composer'
-        : state.busy
-          /*
-           * BUG-130: this said "one per turn", which is what the queue did
-           * before FEAT-002/FEAT-031 and has not been true since — flushQueue
-           * delivers the WHOLE pending batch as a single turn (segmented, one
-           * `[msg i/N …]` header per item). The label was the only thing still
-           * describing the old behaviour, and a user read it and reported the
-           * old bug. Say what actually happens, and say it in the plural only
-           * when there IS a batch.
-           *
-           * BUG-159: when the server is idle behind a live background lane (the
-           * strand), "Claude is working … at the next pause" is a lie — no main
-           * turn is running and the pause is a lane-completion away, possibly
-           * hours. Say what is actually true: it is queued behind background work
-           * and the idle session picks it up promptly (deliverQueuedBehindBackground).
-           */
+  const fg = (waiting.length && hold?.kind === 'busy' && isDriving() && state.busy && !idleBehindBackground()) ? foregroundWait() : null;
+  const n = waiting.length;
+  const s = n === 1 ? '' : 's';
+  const why = !waiting.length
+    ? (unresolved.every((q) => q.state === 'uncertain') ? 'check the conversation before sending it again' : 'press Send again, edit it, or discard it')
+    : waiting.some((q) => q.state === 'sending') || hold?.kind === 'sending'
+      ? 'sending now'
+      : waiting.every((q) => q.state === 'pending')
+        ? (waiting.some((q) => q.reason) ? waiting.find((q) => q.reason).reason : 'saving…')
+        : hold?.kind === 'busy'
           ? (idleBehindBackground()
-              ? 'queued behind background work — the idle session delivers it at the next pause'
-              : fg
-                // BUG-178: rendered specially below (buildForegroundWhy) so the
-                // elapsed can be a live span the 1s ticker refreshes.
-                ? ''
-                : (pending.length > 1
-                    ? 'Claude is working — these deliver together at the next pause, as one turn'
-                    : 'Claude is working — delivers at the next pause'))
-          : 'delivering…';
-  /*
-   * BUG-129: say it whatever else the dock is saying. A restored row is text
-   * that outlived the tab and is STILL UNSENT; if that fact only appeared in
-   * the branches where nothing else was happening, the one state where it
-   * matters most — reattached mid-reply, where the label is busy explaining the
-   * running turn — would be exactly the one that hid it.
-   */
-  const restoredNote = pending.some((q) => q.restored)
-    ? ' · restored after a reload, still unsent' : '';
-  const n = pending.length || state.queue.length;
-  // BUG-191: rows that were sent but never confirmed are "unconfirmed", not "undelivered".
-  const prefix = `${n} ${pending.length ? 'queued' : state.queue.every((q) => q.dead === UNCONFIRMED_NOTE) ? 'unconfirmed' : 'undelivered'} message${n === 1 ? '' : 's'} · `;
+            ? 'queued behind background work — the idle session delivers it at the next pause'
+            : fg ? ''
+              // BUG-130: a batch is delivered as ONE turn — say so, and plural only when there is a batch.
+              : n > 1 ? 'Claude is working — these deliver together at the next pause, as one turn'
+                : 'Claude is working — delivers at the next pause')
+          : hold?.kind === 'draining'
+            // BUG-045: the visible "why is this waiting" line for a session still draining.
+            ? 'waiting for the previous turn to finish draining — this sends by itself'
+            : hold?.kind === 'adopting'
+              ? `waiting for the session to finish re-attaching after a server restart — it goes in once it is ready (${hold.text})`
+              : hold?.kind === 'external'
+                ? 'another program is writing this session — it sends once that stops, or press Send now'
+                : hold?.text || 'sending now';
+  const prefix = waiting.length ? `${n} queued message${s} · `
+    : unresolved.every((q) => q.state === 'uncertain') ? `${unresolved.length} message${unresolved.length === 1 ? '' : 's'} not confirmed as sent · `
+      : `${unresolved.length} message${unresolved.length === 1 ? '' : 's'} not sent · `;
   if (fg) {
-    // BUG-178: build the line from nodes so the elapsed is a live `.q-el` span
-    // (refreshed by the 1s strip ticker) instead of a value frozen at queue time.
     const ql = el('div', { class: 'q-l' });
     ql.append(document.createTextNode(`${prefix}Claude is working — “${fg.label}” `));
     if (fg.startedAt) {
@@ -12018,276 +13034,120 @@ function paintQueue() {
     } else {
       ql.append(document.createTextNode('is still running, '));
     }
-    ql.append(document.createTextNode(pending.length > 1
-      ? 'and your messages can’t reach it until that step finishes, then deliver together. Use Force send below to interrupt it (its progress is lost) and deliver now.'
-      : 'and your message can’t reach it until that step finishes. Use Force send below to interrupt it (its progress is lost) and deliver now.'));
-    if (restoredNote) ql.append(document.createTextNode(restoredNote));
+    ql.append(document.createTextNode(n > 1
+      ? 'so your messages go together when that step finishes — or use Interrupt & send (that step’s progress is lost).'
+      : 'so your message goes when that step finishes — or use Interrupt & send (that step’s progress is lost).'));
     box.append(ql);
   } else {
-    box.append(el('div', { class: 'q-l', text: `${prefix}${why}${restoredNote}` }));
+    box.append(el('div', { class: 'q-l', text: `${prefix}${why}` }));
   }
-  state.queue.forEach((item, i) => {
-    // BUG-129: `restored` is its own visual state — a row that outlived the tab
-    // and is still unsent must not look like one on its way out.
-    const det = el('details', { class: `qrow${item.dead ? ' dead' : ''}${!item.dead && item.drainWait ? ' drain-wait' : ''}${item.restored ? ' restored' : ''}` });
-    const preview = item.text.replace(/\s+/g, ' ').slice(0, 72);
-    det.append(el('summary', {},
-      el('span', { class: 'tw', text: '▶' }),
-      el('span', { class: 'qp', text: preview + (item.text.length > 72 ? '…' : '') }),
-      el('span', {
-        class: 'qs',
-        // BUG-191: an unconfirmed send may have arrived — say "not confirmed", never "not delivered".
-        text: item.dead === UNCONFIRMED_NOTE ? `NOT confirmed — ${item.dead}`
-          : item.dead ? `NOT delivered — ${item.dead}`
-          : item.drainWait ? 'waiting on drain'
-            : item.restored ? `unsent · restored${i === 0 ? ' · next' : ` · #${i + 1}`}`
-              : (i === 0 ? 'next' : `#${i + 1}`),
-      })));
+  const rowStatus = (item) => (
+    item.state === 'uncertain' ? `Not confirmed — ${item.reason ?? 'it may already have been sent'}`
+      : item.state === 'failed' ? `Not sent — ${item.reason ?? 'it was not sent'}`
+        : item.state === 'sending' ? 'Sending…'
+          : item.state === 'pending' ? (item.reason ? `Not saved yet — ${item.reason}` : 'Saving…')
+            : item.forced ? 'Sending after the interrupt…'
+              : 'Waiting to send');
+  for (const item of state.queue) {
+    const ui = queueUi.get(item.nonce) ?? {};
+    const unresolvedRow = item.state === 'uncertain' || item.state === 'failed';
+    const row = el('div', {
+      class: `qrow${unresolvedRow ? ' dead' : ''}${item.state === 'sending' ? ' sending' : ''}${item.local ? ' pending' : ''}`,
+      role: 'group',
+      'aria-label': 'Queued message',
+    });
     const ta = el('textarea', { class: 'qedit', 'aria-label': 'Edit queued message' });
-    ta.value = item.text;
-    // BUG-129: an edit is a mutation of the only copy — mirror it as it is typed,
-    // not at some later repaint that may never come.
-    ta.addEventListener('input', () => { item.text = ta.value; persistQueue(); });
-    const acts = el('div', { class: 'cacts' });
-    /*
-     * BUG-153 — force-send is offered only where it can actually run. It is
-     * gated on the SAME predicate forceSend() itself refuses on, because the
-     * button that answers "no live session to force-send over" is a button that
-     * should not have been there: the only action it can perform in that state
-     * is to tell the user it cannot act.
-     */
-    if (!item.dead && isDriving() && !state.dropped) {
-      // FEAT-031 Part A — unmistakably distinct from the normal queue (which
-      // waits): this INTERRUPTS whatever is running and delivers NOW. Reuses
-      // the existing `.mini.danger` treatment (the app's one destructive-
-      // action style — see rename/delete-session confirms) rather than
-      // inventing a second "this is serious" visual language. Only offered
-      // on live rows — a dead row has nothing left to interrupt over.
-      const force = el('button', { class: 'mini danger force-send', text: 'Force send' });
-      // BUG-178: state the cost at the point of action, and name the step that
-      // is lost when a long foreground lane is what is holding the boundary.
-      force.title = fg
-        ? `Interrupt in-flight work (including “${fg.label}”) and deliver now — that step's progress is lost`
-        : 'Interrupt in-flight work and deliver this message right now — in-flight work is lost';
-      force.addEventListener('click', () => forceSend(item));
-      acts.append(force);
+    ta.value = ui.editing && typeof ui.draft === 'string' ? ui.draft : item.text;
+    ta.dataset.nonce = item.nonce;
+    ta.addEventListener('input', () => { queueUi.set(item.nonce, { ...(queueUi.get(item.nonce) ?? {}), editing: true, draft: ta.value }); });
+    const editBox = el('div', { class: 'qeditbox' });
+    editBox.hidden = !ui.editing;
+    const preview = el('div', { class: 'qp', text: item.text.replace(/\s+/g, ' ').trim() });
+    preview.title = item.text;
+    const acts = el('div', { class: 'cacts qracts' });
+    const primary = (label, title, onClick) => {
+      const b = el('button', { class: 'mini qgo', text: label });
+      b.title = title;
+      b.addEventListener('click', onClick);
+      acts.append(b);
+    };
+    const settled = item.state === 'queued' || unresolvedRow;
+    if (item.state === 'uncertain') {
+      // It may already have arrived: sending it is the user's call, named as such — and it happens once.
+      primary('Send anyway', 'It may already have been sent — send it again anyway', () => sendRowNow(item));
+    } else if (item.state === 'failed') {
+      primary('Send again', 'Send this message now', () => sendRowNow(item));
+    } else if (item.state === 'queued') {
+      if (hold?.kind === 'busy' && !item.forced) {
+        const force = el('button', { class: 'mini force-send', text: 'Interrupt & send' });
+        force.title = fg
+          ? `Stop the current step (“${fg.label}”) and send this now — that step's progress is lost`
+          : 'Stop what Claude is doing and send this now — the in-flight work is lost';
+        force.addEventListener('click', () => forceSend(item));
+        acts.append(force);
+      } else if (hold?.kind === 'external') {
+        primary('Send now', 'Send this message to the session now', () => sendRowNow(item));
+      }
+    }
+    if (settled) {
+      const edit = el('button', { class: 'mini', text: ui.editing ? 'Done' : 'Edit' });
+      edit.setAttribute('aria-expanded', ui.editing ? 'true' : 'false');
+      edit.addEventListener('click', () => {
+        const cur = queueUi.get(item.nonce) ?? {};
+        if (!cur.editing) {
+          queueUi.set(item.nonce, { editing: true, draft: item.text });
+          paintQueue();
+          [...box.querySelectorAll('.qedit')].find((t) => t.dataset.nonce === item.nonce)?.focus();
+          return;
+        }
+        const draft = typeof cur.draft === 'string' ? cur.draft : item.text;
+        queueUi.delete(item.nonce);
+        void saveQueueEdit(item, draft).then(() => paintQueue());
+      });
+      acts.append(edit);
+    }
+    if (settled || item.local) {
+      /*
+       * BUG-217 r2 (UI review #1): Discard destroys the user's words, so it is set
+       * apart from Edit — its own destructive ink, a gap before it — and can be
+       * undone for a few seconds (the undo line above).
+       */
+      const drop = el('button', { class: 'mini x qdrop', text: 'Discard' });
+      drop.title = 'Delete this message without sending it (you can undo this for a few seconds)';
+      drop.addEventListener('click', () => { queueUi.delete(item.nonce); void discardQueueRow(item); });
+      acts.append(drop);
     }
     /*
-     * BUG-149 — a dead row was a dead end: the only ways out were selecting
-     * the textarea by hand or Discard, so "recoverable" meant "retypeable in
-     * practice". One click puts the text back in the composer where the next
-     * Enter sends it. Explicit by design — the app never re-sends a refused
-     * message on the user's behalf (see handleLiveElsewhere).
-     *
-     * BUG-153 widened it from dead rows to EVERY row, because the state the
-     * user actually got stuck in produces a live one. Reload a tab that is not
-     * driving a still-running session and the queued text comes back as
-     * `restored` — not dead, so no way back — offering only a Force send that
-     * refuses. Reported verbatim: "if i reload page it still shows the message
-     * in queue instead of input field, then id need to remove msg from queue
-     * and send again". Deleting and retyping IS losing the message, just
-     * slowly, so the way back out is unconditional now: a row is the user's
-     * own words, and reclaiming your own words needs no precondition.
+     * BUG-149/BUG-153 — "Move to composer" (inside Edit): one click puts the words
+     * back where the next Enter sends them.
      */
-    const back = el('button', { class: 'mini', text: 'To composer' });
-    back.title = 'Put this text back in the composer to send it again';
-    back.addEventListener('click', () => {
-      node.prompt.value = node.prompt.value ? `${node.prompt.value}\n\n${item.text}` : item.text;
-      state.queue.splice(state.queue.indexOf(item), 1);
-      // BUG-153: this row may be the drain-wait retry's in-flight attempt — the
-      // text is leaving the queue, so the attempt must not keep pointing at it
-      // (a stale pointer makes the next refusal read as "already retried" and
-      // drop it — BUG-079's Finding A, in miniature).
-      if (state.drainWaitAttempt === item) state.drainWaitAttempt = null;
-      if (!drainWaitItem()) disarmDrainWaitRetry();
-      paintQueue();
-      autosize();
-      node.prompt.focus();
-      say('put back in the composer — press Enter to send it');
-    });
-    acts.append(back);
-    const drop = el('button', { class: 'mini x', text: 'Discard' });
-    drop.addEventListener('click', () => {
-      state.queue.splice(state.queue.indexOf(item), 1);
-      paintQueue();
-    });
-    acts.append(drop);
-    det.append(ta, acts);
-    box.append(det);
-  });
+    const back = el('button', { class: 'mini', text: 'Move to composer' });
+    back.title = 'Take this text out of the queue and put it in the message box';
+    back.addEventListener('click', () => { queueUi.delete(item.nonce); void moveRowToComposer(item); });
+    editBox.append(ta, el('div', { class: 'cacts qedit-acts' }, back));
+    row.append(
+      el('div', { class: 'qhead' }, el('div', { class: 'qrtext' }, preview, el('div', { class: 'qs', text: rowStatus(item) })), acts),
+      editBox,
+    );
+    box.append(row);
+  }
   box.hidden = false;
-}
-
-/** Boundary: deliver the WHOLE pending batch as one turn — see the note below. */
-let flushBackoff = false; // breaks the send-failed → setBusy(false) → flush loop
-/*
- * Deliver ALL pending queued messages as ONE turn, not one-per-turn. Messages
- * queued during a single work period are a batch of context for the next
- * opportunity — fragmenting them into separate turns loses the connection
- * between them and burns turns. They join as blank-line-separated SEGMENTS,
- * each with its own `queueItemNote` header (FEAT-031 Part B — see that
- * comment for why per-item, not per-batch), in their real order — which is
- * also exactly how the transcript persists them, so a live render and a
- * reload agree.
- */
-function flushQueue() {
-  if (flushBackoff) return;
-  // FEAT-065: a delivery-relay socket has no session behind it — flushing into
-  // it would bounce every row. Queued rows wait for the drain-wait retry loop
-  // (or a real bridge) instead.
-  // BUG-153: one predicate — `isDriving()` already excludes the relay socket.
-  if (!isDriving() || state.busy || state.dropped) { paintQueue(); return; }
-  // BUG-045: a drain-wait row whose self-retry is IN FLIGHT is that retry's to
-  // deliver (or put back) — flushing it too would send the same text twice.
-  const items = state.queue.filter((q) => !q.dead && q.text.trim() && q !== state.drainWaitAttempt);
-  /*
-   * BUG-129: hand the batch to the OUTBOX before it leaves state.queue, not
-   * after. Between the splice below and turn-end these rows are in no store
-   * anywhere — that window is exactly where a reload used to destroy them, and
-   * it is why the outbox is set first: any paint in between must already see it.
-   */
-  if (items.length) state.outbox = { texts: items.map((q) => q.text.trim()), at: Date.now() };
-  // Drop empties (edited to nothing) but keep any dead rows for their notice.
-  state.queue = state.queue.filter((q) => q.dead || q === state.drainWaitAttempt);
-  if (!items.length) { paintQueue(); return; }
-  const text = items.map((q, i) => `${queueItemNote(q, i, items.length)}\n${q.text.trim()}`).join('\n\n');
-  // One bubble for the combined turn — it IS one turn now, and this matches
-  // what the store writes, so reopening the session shows the same thing.
-  const flushEl = youBubble(mainThread(), text);
-  if (state.viewing === 'main') scrollDown();
-  state.turnStartedAt = Date.now();
-  state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
-  setBusy(true);
-  if (!sendTurn(text, { texts: items.map((q) => q.text.trim()), el: flushEl })) {
-    // The socket died between the boundary and this send — put them ALL back.
-    for (let i = items.length - 1; i >= 0; i--) state.queue.unshift(items[i]);
-    state.outbox = null; // nothing was handed over: the rows themselves are the record again
-    flushBackoff = true;
-    setTimeout(() => { flushBackoff = false; }, 1500);
-    setBusy(false);
-    paintQueue();
-    return;
-  }
-  say(items.length === 1 ? 'delivered the queued message' : `delivered ${items.length} queued messages together`);
-  paintQueue();
-}
-
-/*
- * FEAT-031 Part A — force-send: interrupt in-flight work and deliver a
- * queued message NOW instead of waiting for the natural turn boundary
- * flushQueue() waits for. Deliberately destructive — the user accepts
- * losing whatever the current turn was mid-producing — and unmistakably
- * distinct from the normal queue row, which only ever waits.
- *
- * Reuses the SAME interrupt path the composer's stop button already drives
- * (`send({ type: 'interrupt' })` -> `AgentSession.interrupt()` in
- * agent-bridge.ts, see the `#go` click handler) rather than inventing a
- * second abort channel. The item is pulled out of state.queue immediately
- * so the eventual flushQueue() for whatever else is still queued does not
- * also redeliver it, and stashed in state.forceSend so the turn-end handler
- * (which is the ONLY place that reliably knows the interrupted turn has
- * actually stopped) can deliver it the moment that happens.
- */
-function forceSend(item) {
-  const idx = state.queue.indexOf(item);
-  if (idx !== -1) state.queue.splice(idx, 1);
-  if (!isDriving() || state.dropped) {
-    // No socket to interrupt over — same honesty rule as the detached-run
-    // guard on the stop button, and BUG-153: the same predicate, so the chip
-    // beside the composer cannot claim a turn this refusal denies exists.
-    if (idx !== -1) state.queue.splice(idx, 0, item); else state.queue.push(item);
-    paintQueue();
-    return say('no live session to force-send over — reattach first, then force-send again', true);
-  }
-  if (!state.busy) {
-    // Nothing running to interrupt — this degrades to an immediate send.
-    paintQueue();
-    return deliverForced(item);
-  }
-  state.forceSend = item;
-  paintQueue();
-  send({ type: 'interrupt' });
-  say('force-sending — interrupting current work…');
-}
-
-/** Deliver one force-sent item as its own turn, right now (not batched). */
-function deliverForced(item) {
-  const elapsed = fmtElapsed(Date.now() - item.composedAt);
-  const text = `[Force-sent ${elapsed} after being queued — in-flight work was interrupted to deliver this immediately.]\n${item.text.trim()}`;
-  // BUG-129: forceSend already pulled this row OUT of state.queue, so from here
-  // to turn-end the outbox is its only record (same window as flushQueue's).
-  state.outbox = { texts: [item.text.trim()], at: Date.now() };
-  const forcedEl = youBubble(mainThread(), text);
-  if (state.viewing === 'main') scrollDown();
-  state.turnStartedAt = Date.now();
-  state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
-  setBusy(true);
-  if (!sendTurn(text, { texts: [item.text.trim()], el: forcedEl })) {
-    // The socket died between the interrupt landing and this send — keep the
-    // text recoverable rather than silently dropping it.
-    item.dead = 'the socket dropped before the force-send could go out';
-    state.queue.unshift(item);
-    state.outbox = null; // back in the queue, which is itself persisted (BUG-129)
-    setBusy(false);
-  } else {
-    say('force-sent — delivered immediately');
-  }
-  paintQueue();
-}
-
-/** A pending force-send whose turn will never end cleanly — put it back, marked dead. */
-function cancelForceSend(why) {
-  const item = state.forceSend;
-  if (!item) return;
-  state.forceSend = null;
-  item.dead = why;
-  state.queue.unshift(item);
-  paintQueue();
 }
 
 /*
  * BUG-079: a session-boundary transition (openSession / startNew / a route that
- * resolves to no session) abandons the OUTGOING session. resetTranscript zeroes
- * state.queue, but two pending-delivery pointers survive it and then act on the
- * WRONG session — this clears them (and their live timers) at every boundary:
- *
- *   - drainWaitAttempt + the drain-wait self-retry interval (Finding A / LOSS):
- *     a stale attempt makes queueRetryableRefusal read `retried` truthy and DROP
- *     the incoming session's next retryable refusal instead of queuing it.
- *   - forceSend + the force-send watchdog (Finding B / WRONG-TARGET): a stale
- *     stash makes the incoming session's next turn-end deliver the OUTGOING
- *     session's text into it.
- *   - pendingStart/pendingStartResume + pendingSend (audited siblings, same
- *     class): the outgoing session's in-flight `start` text / optimistic bubble.
- *     `resumeOnNextSend`, `deliveryRelay`, and `pendingAnswers` are the other
- *     members of this class and are ALREADY cleared by closeSocket().
- *
- * Deliberately NOT called from resetTranscript()/closeSocket(): both are
- * re-entered WITHIN a single session — the BUG-045 drain-retry runs
- * attemptDrainRetry -> startTurn -> resetTranscript with drainWaitAttempt
- * already set, and the FEAT-065 relay close runs closeSocket while the drain-
- * wait loop must keep running — so clearing there would break those same-
- * session behaviors. Only the true boundary entry points call this.
+ * resolves to no session) abandons the OUTGOING session: its in-flight `start`
+ * text / optimistic bubble must not act on the INCOMING one. (The queue itself
+ * is the server's, per session — nothing of it follows the user.)
  */
 function clearPendingDelivery() {
-  state.drainWaitAttempt = null;
-  state.drainWaitLastTry = 0;
-  disarmDrainWaitRetry();           // the drain-wait ghost-release self-retry interval
-  state.forceSend = null;
-  clearTimeout(state.busyWatchdog); // the force-send watchdog (armBusyWatchdog -> cancelForceSend)
+  clearTimeout(state.busyWatchdog);
   state.busyWatchdog = null;
   state.pendingStart = null;
   state.pendingStartResume = null;
   state.pendingStartEl = null;
   state.pendingSend = null;
   state.liveElsewhere = ''; // BUG-149: a banner about the OUTGOING session must not follow the user
-}
-
-/** The session is gone — queued rows say so and keep the text recoverable. */
-function failQueue(why) {
-  let changed = false;
-  for (const item of state.queue) if (!item.dead) { item.dead = why; changed = true; }
-  if (changed) paintQueue();
 }
 
 async function submit() {
@@ -12335,6 +13195,19 @@ async function submit() {
    * which re-judges the survivor (deliver again, or queue-and-wait).
    */
   if (state.deliveryRelay) closeSocket();
+
+  /*
+   * BUG-217 round 5: queued messages for this session are still waiting in its
+   * server outbox — this one joins them, in order, rather than jumping ahead.
+   * (The server enforces the same order — it refuses a typed prompt with
+   * `outbox-pending` — this only spares the bubble that refusal would unwind.)
+   */
+  if (state.current?.sessionId && state.queue.some((q) => q.state === 'queued' || q.state === 'sending' || q.state === 'pending')) {
+    queueMessage(text);
+    node.prompt.value = '';
+    autosize();
+    return;
+  }
 
   if (state.live && state.ws) {
     /*
@@ -12480,9 +13353,8 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
     }
     // BUG-129/BUG-150: this IS the session those rows were typed under, and
     // resetTranscript re-binds ownership + restores them by construction, so
-    // nothing queued in this fresh start is left un-persisted. Judge the
-    // handed-off outbox it returns.
-    judgeAdoptedOutbox(resetTranscript());
+    // nothing queued in this fresh start is left un-filed.
+    resetTranscript();
     state.current.title = titleFrom(text);
   }
   /*
@@ -12525,6 +13397,9 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
   state.pendingStartResume = resumeSessionId ?? null; // so a pre-turn refusal (BUG-029) can re-arm the SAME resume
   state.pendingStartKeepComposer = !!keepComposer; // BUG-132: this text is not the composer's — the rollback must not put it there
   const templateIds = drawer.startTemplateIds();
+  // BUG-198 round 2 — a start that BIRTHS a session (new, or a fork) carries this
+  // bag: bind it to a pending token + this socket so only ITS session-init adopts it.
+  stampPendingStart(state.ws, !resumeSessionId || !!fork);
   send({
     type: 'start',
     projectId: p.id,
@@ -12538,49 +13413,41 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
     resumeEncodedDir: resumeSessionId ? (resumeEncodedDir ?? state.current.encodedDir ?? undefined) : undefined,
     fork,
     templateIds,
-    overrides: sessionOverrides(),
+    overrides: sessionOverrides({ resuming: !!resumeSessionId }), // BUG-196 round 4 — a resume never carries a provider
   });
   renderTree();
 }
 
 /** The session-scope overrides that are legal to send with `start`. */
 /*
- * BUG-188 round 2 — which engine a model id belongs to, or null when it can't be
- * told. Mirrors the server owner (global-settings.modelProviderOf): a `claude-*`
- * id is anthropic, a `gpt-*`/`o<n>`/`codex-*` id is openai. Used only to STOP the
- * client replaying a model override that belongs to a different engine than the
- * session's provider — the exact way a `claude-*` id the UI cached (from the
- * pre-fix leak) into an openai session's persisted overrides kept reaching Codex
- * and 400ing on every resume. Unknown → null, so a model we can't place is left
- * alone (the server is the authority; this is just not re-sending a known-bad one).
+ * BUG-196 round 6 — the client's copy of the model→engine classifier
+ * (modelProviderOfClient, BUG-188 round 2) is DELETED. It was a second judge of a
+ * fact the server owns (global-settings.modelProviderOf), and it had already
+ * drifted: it did not know the Claude aliases. The server judges every pick against
+ * the engine the session really runs on and DECLARES the verdict back
+ * (effective-config.ignoredOverrides); the client forgets a pick only on that
+ * declaration (see the effective-config handler).
  */
-function modelProviderOfClient(model) {
-  if (!model || typeof model !== 'string') return null;
-  if (/^claude/i.test(model)) return 'anthropic';
-  if (/^(gpt|o\d|codex)/i.test(model)) return 'openai';
-  return null;
-}
-
-function sessionOverrides() {
+function sessionOverrides({ resuming = false } = {}) {
   const out = {};
   // The provider this start will run under (a session provider override wins,
   // then the project's own setting) — the engine a model override must match.
-  const provider = ('provider' in state.overrides ? state.overrides.provider : null)
-    ?? currentProject()?.settings?.provider ?? 'anthropic';
+  // BUG-196 round 3 — a session pinned by its transcript runs on that engine; its
+  // start never carries a provider override (the server ignores one — round 4).
+  const locked = lockedSessionProvider();
+  // BUG-196 round 4 — a start for an EXISTING session id is a resume, whose engine
+  // the server alone decides (from the stores the resume reads). It never carries a
+  // provider, and until the server has declared the pin the client does not know
+  // the engine — so it must not judge (and destroy) a model pick against a guess.
+  // BUG-196 round 5 — on a RESUME the client does not judge the model at all, pin
+  // landed or not: the server resolves it against the engine the transcript pins
+  // (agent-bridge, after P2b) and ANNOUNCES a pick that engine cannot run (status +
+  // ignoredOverrides). Dropping it here was a silent second judge of the same fact.
+  // BUG-196 round 6 — no model judging here at all, fresh start or resume: the
+  // server announces a pick the engine cannot run and the client heals on that.
   for (const field of SESSION_OVERRIDABLE) {
     if (!(field in state.overrides)) continue;
-    if (field === 'model') {
-      const belongs = modelProviderOfClient(state.overrides.model);
-      if (belongs != null && belongs !== provider) {
-        // A stale cross-engine model override: drop it here AND from the persisted
-        // per-session memory, so it stops riding every resume. The server would
-        // neutralise it anyway (resolveModelForProvider), but not re-sending it
-        // keeps the client's own effective view honest.
-        delete state.overrides.model;
-        persistOverrides();
-        continue;
-      }
-    }
+    if (field === 'provider' && (locked || resuming)) continue;
     out[field] = state.overrides[field];
   }
   return Object.keys(out).length ? out : undefined;
@@ -12690,6 +13557,13 @@ $('#forkBtn').addEventListener('click', () => {
   const pf = state.pendingFork;
   const sid = pf ? pf.resumeSessionId : state.current.sessionId;
   if (!sid) return;
+  // BUG-198 round 2 — the frozen-bar fork stages a NOT-YET-BORN session, like
+  // armFork: its bag must stop being the source's (edits while staged, and every
+  // edit after the fork's session-init, wrote under the SOURCE's key). Same
+  // project, so the armed values carry over, as armFork's same-project case does.
+  const keepArmed = { ...state.overrides };
+  resetOverrides(ovrPending());
+  Object.assign(state.overrides, keepArmed);
   state.forkFrom = sid;
   if (pf) {
     state.forkEncodedDir = pf.resumeEncodedDir;
@@ -12701,7 +13575,9 @@ $('#forkBtn').addEventListener('click', () => {
   node.frozen.hidden = true;
   node.prompt.focus();
   say(pf && pf.cause === 'isolation-changed'
-    ? 'Forking into the container — type the first message and send; it branches this history into a new session in the container. The original stays on the host.'
+    ? (pf.toContainer === false
+      ? 'Forking to continue here — type the first message and send; it branches this history into a new session running direct on the host. The original stays untouched.'
+      : 'Forking into the container — type the first message and send; it branches this history into a new session in the container. The original stays on the host.')
     : pf && pf.cause === 'path-changed'
       ? 'Forking — type the first message and send; it branches this history into a new session under the project’s current directory. The original stays untouched.'
       : 'Forking — type the first message and send; it branches from this history into a new session on this machine. The original stays untouched.');
@@ -12713,6 +13589,7 @@ $('#cogBtn').addEventListener('click', () => void drawer.open('settings'));
 // BUG-158 — the seal-strip Settings pill: the deliberate, labelled opener that
 // makes the drawer reachable without knowing which status chip is clickable.
 node.settingsBtn.addEventListener('click', () => void drawer.open('settings'));
+node.closeSessBtn.addEventListener('click', () => void doCloseCurrent()); // FEAT-168
 
 /* ------------------------------------------------------- model picker */
 /*
@@ -12758,13 +13635,78 @@ function adoptModelList(models) {
  * session's resolved provider wins, then an armed per-launch override, then
  * the project setting. Same resolution paintModelChip used inline pre-045.
  */
-function providerView() {
+/**
+ * BUG-196 — the engine an EXISTING session's next turn will resume on, which its
+ * transcript PINS (a Codex thread id continues only on Codex, a Claude file only
+ * on Claude). The server owns this fact and declares it per SESSION ID
+ * (declareLockedProvider ← transcript route / session-init — resumeProviderOf, the
+ * SAME resolver agent-bridge P2b applies on resume). Read it here so no UI surface
+ * re-derives the engine from the project setting or a per-session override the
+ * resume silently ignores (ARCH-010). Null only when the subject session has no
+ * declared pin (a pending-new view, or before the server has answered) — never
+ * because of what the sidebar happens to show (round 3).
+ * A LIVE session is already fixed via dockLive(); dockEffective().provider (the
+ * running engine) agrees with this value, so providerView prefers it and this is
+ * the non-live-but-resumable case the bug was about.
+ */
+function lockedSessionProvider() {
+  // BUG-196 round 3 — looked up by the id of the session every provider surface
+  // ACTS ON: state.current.sessionId is what a send resumes (submit → startTurn),
+  // what persistOverrides writes under and what the drawer's session scope edits
+  // — foreign dock or not. A pending-new view has no id yet, so it is unlocked by
+  // construction (no view predicate needed); session-init names the id and the
+  // server declares its engine in the same frame.
+  return lockedProviderOf(state.current?.sessionId);
+}
+
+/** The short, honest sentence a disabled provider control shows for a locked session. */
+function lockedProviderExplain(locked) {
+  const runs = locked === 'openai' ? 'OpenAI Codex' : 'Claude';
+  const other = locked === 'openai' ? 'Claude' : 'OpenAI Codex';
+  return `This conversation runs on ${runs} — its transcript pins the engine, so a resume can only continue on ${runs}. Start a new session to use ${other}.`;
+}
+
+/*
+ * BUG-196 round 6 — THE engine state of the session every provider surface acts on,
+ * computed in ONE place. Round 5 had three readers deriving it separately —
+ * providerView (engine shown), providerSwitchRefusal (may it change) and
+ * paintProvBtn (locked or not, keyed on the pin alone) — so after a FAILED
+ * transcript read the popover and drawer refused while #provBtn showed "Claude
+ * (project default)", unlocked: two surfaces, two answers. Every surface now reads
+ * this one record, and paintProvSurfaces paints all of them from it.
+ *
+ *   engine  — 'anthropic' | 'openai', or NULL = not known. An EXISTING session
+ *             (it has an id) whose engine the server has not declared yet — the
+ *             transcript is still loading, or the read failed — is UNKNOWN. It is
+ *             never shown as the project default: that is a guess the resume
+ *             ignores, and the round-5 surfaces that showed it offered that
+ *             engine's models (a Claude alias then rode a Codex resume).
+ *   refusal — why the engine cannot be changed from this view, or null when it
+ *             can (only a view with no session id and nothing running in view).
+ *   source  — 'running' | 'pinned' | 'unknown' | 'armed' | 'project'.
+ */
+const ENGINE_UNKNOWN_REFUSAL = 'This conversation already exists, so its engine is set by its transcript, which has not been read yet (still loading, or the read failed). A pick here cannot apply to it. Start a new session to choose an engine.';
+function sessionEngine() {
   // BUG-106 — a foreign dock's live provider is not about the selected project;
-  // dockEffective() blanks it so the crown chip / integrations / launch control
-  // fall back to the selected project's own provider rather than A's live engine.
-  return dockEffective()?.provider
-    ?? ('provider' in state.overrides ? state.overrides.provider : null)
-    ?? currentProject()?.settings?.provider ?? 'anthropic';
+  // dockEffective() blanks it (the pin below is keyed by id, so it is not).
+  const running = dockEffective()?.provider ?? null;
+  if (state.current?.sessionId) {
+    // BUG-196 — an existing session's engine is pinned by its transcript (declared
+    // by the server per id); the resume ignores any project default or override.
+    const fixed = running ?? lockedSessionProvider();
+    if (fixed) return { engine: fixed, refusal: lockedProviderExplain(fixed), source: running ? 'running' : 'pinned' };
+    return { engine: null, refusal: ENGINE_UNKNOWN_REFUSAL, source: 'unknown' };
+  }
+  const armed = 'provider' in state.overrides ? state.overrides.provider : null;
+  const engine = running ?? armed ?? currentProject()?.settings?.provider ?? 'anthropic';
+  // BUG-106 — dockLive(): only a live session IN VIEW fixes the engine.
+  const refusal = dockLive() ? 'the engine is fixed for a running session — start a new session to switch' : null;
+  return { engine, refusal, source: running ? 'running' : armed ? 'armed' : 'project' };
+}
+
+/** The engine this view speaks for, or null when an existing session's engine is not known yet (BUG-196 round 6). */
+function providerView() {
+  return sessionEngine().engine;
 }
 
 /*
@@ -12787,8 +13729,15 @@ function adoptCodexModelList(models) {
 
 /** The catalog for the CURRENT provider view. Anthropic = MODEL_OPTS, byte-identical to pre-045. */
 function activeModelOpts() {
-  if (providerView() !== 'openai') return MODEL_OPTS;
-  return CODEX_MODEL_OPTS ?? [MODEL_OPTS.find((o) => o.v == null) ?? { v: null, n: 'Project default', d: '' }];
+  const engine = providerView();
+  const defaultRow = MODEL_OPTS.find((o) => o.v == null) ?? { v: null, n: 'Project default', d: '' };
+  // BUG-196 round 6 — an existing session whose engine is not known yet offers NO
+  // engine's catalog: round 5 fell through to the Claude rows here, so after a
+  // failed read an OpenAI thread offered Opus/Sonnet/Haiku. The free-text field
+  // still works, and the server judges any pick against the real engine.
+  if (engine == null) return [defaultRow];
+  if (engine !== 'openai') return MODEL_OPTS;
+  return CODEX_MODEL_OPTS ?? [defaultRow];
 }
 
 let codexModelsInflight = null;
@@ -12846,13 +13795,42 @@ function paintProvBtn() {
   // the launch surface, where overrides are armed pre-start.
   const show = !!currentProject() && !dockLive(); // BUG-106 — A's live session must not hide B's launch control
   node.provBtn.hidden = !show;
+  // BUG-196 — a session pinned by its transcript shows its real engine and says so;
+  // the popover's options are disabled and the switch is refused. Round 3: written
+  // BEFORE the hidden early-return, so the attribute is never left stale.
+  // BUG-196 round 6 — keyed on the ONE engine state (sessionEngine), the same record
+  // the popover and the drawer read: round 5 keyed this on the pin alone, so after a
+  // failed read the button stayed unlocked and said "Claude (project default)" while
+  // its own popover refused. An unknown engine is shown as unknown, never guessed.
+  const se = sessionEngine();
+  node.provBtn.dataset.locked = String(!!se.refusal);
   if (!show) return;
-  const cur = providerView();
+  const cur = se.engine;
   const opt = PROVIDER_OPTS.find((o) => o.v === cur);
-  node.provBtn.dataset.provider = cur;
-  node.provBtn.dataset.set = String('provider' in state.overrides);
+  node.provBtn.dataset.provider = cur ?? 'unknown';
+  node.provBtn.dataset.set = String(!se.refusal && 'provider' in state.overrides);
+  if (se.refusal) {
+    node.provBtn.title = `Engine: ${cur == null ? 'not known yet' : (opt?.n ?? cur)} — ${se.refusal}`;
+    return;
+  }
   const inherited = 'provider' in state.overrides ? ' (this session only)' : ' (project default)';
   node.provBtn.title = `Provider: ${opt?.n ?? cur}${inherited} — applies when the next session starts. Click to change`;
+}
+
+/**
+ * BUG-196 round 3 — the button, the header twin and the (open) popover repaint
+ * TOGETHER from the same source (providerView / lockedSessionProvider), so they
+ * can never disagree — round 2 left #provBtn[data-locked] stale while the popover
+ * repainted unlocked, because a project switch repainted one and not the other.
+ * Called from paintCrown (every selection change) and from declareLockedProvider.
+ */
+function paintProvSurfaces() {
+  paintProvBtn();
+  paintProvSel();
+  if (node.provPop.classList.contains('open')) paintProvPop();
+  // BUG-196 round 6 — the drawer's session-scope Provider control is a lock
+  // surface too; it repaints with the others, from the same sessionEngine().
+  drawer.repaintLive?.();
 }
 
 // this-feat — the header twin of paintProvBtn. Same source of truth
@@ -12894,18 +13872,32 @@ function openaiVerdict() {
 
 function paintProvPop() {
   clear(node.provOpts);
-  const cur = providerView();
+  // BUG-196 — a transcript-pinned session's engine cannot change on resume; the
+  // options are disabled and an explanation replaces the availability verdict.
+  // BUG-196 round 6 — engine AND refusal from the one sessionEngine() record, so an
+  // unknown engine presses no option (round 5 pressed the project default).
+  const se = sessionEngine();
+  const cur = se.engine;
+  const refusal = se.refusal;
+  const locked = refusal ? true : null;
   for (const o of PROVIDER_OPTS) {
     const isCur = o.v === cur;
-    const b = el('button', { class: 'opt', role: 'menuitem', 'aria-pressed': String(isCur) });
+    const b = el('button', { class: 'opt', role: 'menuitem', 'aria-pressed': String(isCur), 'aria-disabled': String(!!locked) });
+    if (locked) b.disabled = true;
     b.append(el('span', { class: 'g', text: isCur ? '●' : '○' }));
     const mid = el('span');
     mid.append(el('span', { class: 'n', text: o.n }));
     if (o.d) mid.append(el('span', { class: 'd', text: o.d }));
-    if (isCur && !('provider' in state.overrides)) mid.append(el('span', { class: 'tag', text: 'project default' }));
+    if (!locked && isCur && !('provider' in state.overrides)) mid.append(el('span', { class: 'tag', text: 'project default' }));
     b.append(mid);
-    b.addEventListener('click', () => pickProvider(o.v));
+    if (!locked) b.addEventListener('click', () => pickProvider(o.v));
     node.provOpts.append(b);
+  }
+  if (locked) {
+    const warn = el('div', { class: 'grp-note', text: refusal });
+    warn.dataset.warn = 'true';
+    node.provOpts.append(warn);
+    return;
   }
   // The live detection verdict, in the drawer's own voice (.prov-state).
   const oai = openaiVerdict();
@@ -12929,13 +13921,39 @@ function paintProvPop() {
   }
 }
 
+/*
+ * BUG-196 round 5 — THE guard for a per-session provider write, and the ONE place
+ * that decides whether one is allowed at all. Every client surface that can arm,
+ * clear or reset a session-scope provider (the composer-tray popover, the Settings
+ * drawer's session-scope Provider control, its reset chip, its generic put()) goes
+ * through pickProvider below, which asks this first — round 4 guarded pickProvider
+ * but the drawer wrote ctx.overrides.provider itself, so a switch for an existing
+ * id was accepted in the pre-pin window and after a failed transcript fetch.
+ * Returns the refusal text, or null when the view may arm an engine (only a
+ * pending-new session with nothing running in view).
+ */
+function providerSwitchRefusal() {
+  // BUG-196 round 6 — a read of the one engine state (sessionEngine), not a second
+  // derivation: pinned → the lock explanation; an existing id with no declared
+  // engine (loading / read failed) → refused; a live session in view → refused.
+  return sessionEngine().refusal;
+}
+
+/**
+ * The ONE writer of `state.overrides.provider` (BUG-196 round 5). `next` is an
+ * engine key, or null = "no override" (the project default).
+ */
 function pickProvider(next) {
-  // BUG-106 — dockLive(): a foreign dock's live session belongs to another project;
-  // the selected project's launch provider is still freely armable (its provBtn is
-  // shown for the same reason). Only a live session IN VIEW fixes the engine.
-  if (dockLive()) return say('the engine is fixed for a running session — start a new session to switch', true);
+  const refusal = providerSwitchRefusal();
+  if (refusal) {
+    say(refusal, true);
+    paintProvSurfaces();
+    drawer.repaintLive?.();
+    return false;
+  }
   const before = providerView();
   const projectDefault = currentProject()?.settings?.provider ?? 'anthropic';
+  if (next == null) next = projectDefault;
   // Picking the project's own default is "no override" — clear rather than
   // storing an override equal to the default (same rule as the drawer).
   if (next === projectDefault) delete state.overrides.provider;
@@ -12963,6 +13981,7 @@ function pickProvider(next) {
   paintModelBtn();
   paintModelChip();
   drawer.repaintLive?.();
+  return true;
 }
 
 node.provBtn.addEventListener('click', (e) => {
@@ -13103,26 +14122,36 @@ function accountLockedReason() {
 
 function paintAccountSel() {
   const p = currentProject();
-  // Only ever built/shown when there is a real choice: a second Claude account
-  // exists, a project is selected, nothing is live in view (the account is fixed
-  // for a running session, like the engine), and this project runs on Claude.
+  // Built/shown when there is a real choice: a second Claude account exists, a
+  // project is selected, and this view runs on Claude. FEAT-160 — a LIVE session
+  // is no longer excluded: a direct project switches the account on the running
+  // session (the old CLI is reaped and the same session resumes under the new
+  // account). A container project's live session is shown LOCKED, with the reason.
   if (!p || ACCOUNTS === undefined) { void (p ? refreshAccounts() : null); if (acctSel) acctSel.hidden = true; return; }
-  const show = !!p && !dockLive() && providerView() === 'anthropic' && extraAccountRows().length > 0;
+  const show = !!p && providerView() === 'anthropic' && extraAccountRows().length > 0;
   if (!show) { if (acctSel) acctSel.hidden = true; return; }
   ensureAccountEls();
   acctSel.hidden = false;
   const cur = claudeAccountView(); // the ONE resolver — override → project → default
   const armed = 'claudeAccount' in state.overrides;
   const locked = accountLockedReason();
+  const live = dockLive();
+  // A live switch is blocked only while a turn is in flight (it applies to the
+  // next turn, which cannot start until this one ends).
+  const busyLocked = live && !locked && state.busy;
   acctSelN.textContent = acctShortName(cur);
   acctSel.dataset.set = String(armed);
-  acctSel.dataset.locked = String(!!locked);
+  acctSel.dataset.locked = String(!!locked || busyLocked);
   const usage = acctUsageDesc(cur);
   const scope = armed ? ' (this session only)' : ' (project default)';
   acctSel.title = locked
     ? `Claude account: ${acctShortName(cur)} — fixed for this project. ${locked}`
-    : `Claude account: ${acctShortName(cur)}${scope} — which subscription the next session bills to`
-      + `${usage ? `; ${usage}` : ''}. Applies when the next session starts; click to change.`;
+    : busyLocked
+      ? `Claude account: ${acctShortName(cur)} — finish or interrupt the current turn to switch; the account applies to the next turn.`
+      : live
+        ? `Claude account: ${acctShortName(cur)}${usage ? ` — ${usage}` : ''}. Click to switch this running session to another subscription — the same conversation resumes on it on your next message.`
+        : `Claude account: ${acctShortName(cur)}${scope} — which subscription the next session bills to`
+          + `${usage ? `; ${usage}` : ''}. Applies when the next session starts; click to change.`;
 }
 
 function paintAcctPop() {
@@ -13157,6 +14186,11 @@ function paintAcctPop() {
     const warn = el('div', { class: 'grp-note', text: locked });
     warn.dataset.warn = 'true';
     acctOpts.append(warn);
+  } else if (dockLive()) {
+    // FEAT-160 — a live direct session: the pick switches THIS running session.
+    acctOpts.append(el('div', { class: 'grp-note', text: state.busy
+      ? 'A turn is in flight — finish or interrupt it first. The account applies to the next turn, which cannot start until this one ends.'
+      : 'Switches THIS running session: the current CLI stops and the same conversation resumes under the chosen subscription on your next message. Each account is a thin overlay over ~/.claude, so the transcript history is shared; only the subscription differs.' }));
   } else {
     acctOpts.append(el('div', { class: 'grp-note', text: 'Applies to the NEXT session only — the project and machine defaults are untouched. Each account is a thin overlay over ~/.claude, so the transcript history is shared; only the subscription differs.' }));
   }
@@ -13175,7 +14209,14 @@ function paintAcctPop() {
 function pickAccount(next) {
   const locked = accountLockedReason();
   if (locked) return say(`the Claude account is project-scope for a container project — ${locked}`, true);
-  if (dockLive()) return say('the Claude account is fixed for a running session — start a new session to switch', true);
+  // FEAT-160 — a LIVE session (direct project; container is caught by `locked`
+  // above) switches account on the running session instead of refusing: the old
+  // CLI is reaped and the same session resumes under the new account. A turn in
+  // flight must finish first (the account applies to the NEXT turn).
+  if (dockLive()) {
+    if (state.busy) return say('finish or interrupt the current turn before switching accounts — the account applies to the next turn', true);
+    return switchAccountLive(next);
+  }
   if (next === undefined) delete state.overrides.claudeAccount;
   else state.overrides.claudeAccount = next;
   persistOverrides();
@@ -13350,14 +14391,14 @@ function paintModelChip() {
   // FEAT-045: name codex models by the engine's own displayName once known
   // (one lazy probe; a picker open re-asks the server regardless).
   if (provider === 'openai' && CODEX_MODEL_OPTS == null) void refreshCodexModels();
-  node.modelChip.dataset.provider = provider;
+  node.modelChip.dataset.provider = provider ?? 'unknown'; // BUG-196 round 6 — null = engine not known yet
   const provMark = provider === 'openai' ? 'codex · ' : '';
   node.modelChipName.textContent = provMark + (eff != null ? shortModelName(eff) : (resolveInheritedModelLabel() ?? '—'));
   node.modelChip.dataset.live = String(!!(dockLive() && eff != null)); // BUG-106
   const src = dockLiveModel()
     ? ' (reported by the running session)'
     : dockLive() ? ' (effective config)' : ' (resolves at launch)';
-  node.modelChip.title = `Provider: ${provider === 'openai' ? 'OpenAI Codex' : 'Claude (Anthropic)'} · Model: ${eff != null ? String(eff) : 'not resolved yet'}${src} — click to change`;
+  node.modelChip.title = `Provider: ${provider == null ? 'not known yet' : provider === 'openai' ? 'OpenAI Codex' : 'Claude (Anthropic)'} · Model: ${eff != null ? String(eff) : 'not resolved yet'}${src} — click to change`;
 }
 
 /**
@@ -13497,6 +14538,14 @@ function paintModelPop() {
     node.modelOpts.append(el('div', {
       class: 'grp-note',
       text: 'The Codex catalog is reported by the engine itself — it fills in when a Codex session runs.',
+    }));
+  }
+  // BUG-196 round 6 — the engine-unknown state says why no catalog is offered.
+  if (providerView() == null) {
+    node.modelOpts.append(el('div', {
+      class: 'grp-note',
+      'data-engine-unknown': 'true',
+      text: 'This conversation\'s engine is not known yet (its transcript has not been read), so no engine\'s model list is shown. A model typed below is checked by the server against the engine the session really runs on.',
     }));
   }
 
@@ -13668,6 +14717,13 @@ function closePops() {
   acctPop?.classList.remove('open'); // FEAT-145 — built on demand, so it may not exist yet
   acctSel?.setAttribute('aria-expanded', 'false');
   node.procPop.classList.remove('open');
+  node.usagePop?.classList.remove('open'); // FEAT-161
+  usagePinned = false;
+  node.gitPop?.classList.remove('open'); // FEAT-165
+  gitPinned = false;
+  gitInitArmed = null;
+  node.gitBtn?.setAttribute('aria-expanded', 'false');
+  node.usageBtn?.setAttribute('aria-expanded', 'false');
   projMenu.classList.remove('open');
   $('#treeMenu').classList.remove('open');
   node.modelBtn.setAttribute('aria-expanded', 'false');
@@ -16404,6 +17460,7 @@ async function applyRoute(route) {
       : (matches.length === 1 ? matches[0] : null);
     if (!sess) {
       selectProject(p.id, { quiet: true });
+      resetOverrides(OVR_NONE); // BUG-198 round 2 — no session here: owns nothing, never adopted (selectProject no longer clears)
       state.current = { projectId: p.id, encodedDir: null, sessionId: null, title: null, os: null };
       followCurrent(false);
       clearPendingDelivery(); // BUG-079: a link that resolves to no session is still a boundary
@@ -16615,6 +17672,8 @@ async function boot() {
     // made to produce — chiefly a STALE server whose response predates the
     // added/removed fields entirely, which is what rendered "+undefined".
     paintGitChip,
+    // FEAT-163/165 — the git popover + its init action, for verify scripts.
+    paintGitPop, openGitPop, refreshGit,
     // FEAT-058: the ticket dashboard's internals, so a verify script can drive
     // the route and assert on what it rendered without re-deriving the rules.
     // `ticketDetailNode` is the REUSABLE renderer FEAT-053's modal should call.
@@ -16687,6 +17746,11 @@ async function boot() {
     // so a verify script can inject N>cap ports and assert the inline cap/+N,
     // the :4317-first stable order, and the popover's full list.
     paintProcChip, paintProcPop, orderedPorts, closePops,
+    // FEAT-161: the usage reset-countdown + styled limits popover, exposed so a
+    // verify script can assert maxed→countdown, not-maxed→hidden, unknown-reset→
+    // hidden, the zero-crossing, and the popover's per-window filled bars.
+    paintUsageChip, paintUsagePop, fmtCountdown, usageMaxed, tickUsageCountdown, openUsagePop,
+    fmtResetIn, fmtResetAt, tickUsagePop,
     // FEAT-048: survival ground truth on the hover — exposed so a verify
     // script can await the lazy fetch deterministically instead of racing a
     // real mouseenter.
@@ -16707,6 +17771,23 @@ async function boot() {
     // foreign selection B. dockSnap/dockLive/dockEffective/dockLiveTools/
     // dockLiveModel are the SINGLE gate the paint surfaces route through.
     providerView, paintProvBtn, projectDot, effectivePerm,
+    // BUG-196 — the transcript-owned resume engine + the selector's refusal path,
+    // exposed so a browser suite can drive the real openSession→lockedProvider flow
+    // and assert the per-session indicator shows the real engine and the selector
+    // refuses a switch (vs a fresh session, which is switchable).
+    lockedSessionProvider, pickProvider, paintProvPop,
+    // BUG-196 round 3 — the id-keyed pin store (read by id; written only from
+    // server declarations), exposed so the suite can synthesize the pre-fix state.
+    lockedProviderOf, declareLockedProvider, lockedProviders,
+    // BUG-196 round 5 — the ONE guard every provider write asks (drawer included).
+    providerSwitchRefusal,
+    // BUG-196 round 6 — the ONE engine state every provider surface paints from.
+    sessionEngine, paintProvSurfaces,
+    // BUG-196 round 2 — the REAL live-event dispatcher, so a browser suite can
+    // drive the session-init frame (the new-session-first-turn / reattach entry
+    // path that never goes through openSession's transcript fetch) and assert the
+    // provider surfaces lock without re-deriving the handler.
+    onEvent,
     // FEAT-145 — the launch-surface Claude-account control, so a browser suite
     // can drive the real pick/paint path (container lock, per-account window)
     // instead of re-deriving it. `setAccountsForTest` injects the account list
@@ -16717,7 +17798,9 @@ async function boot() {
     // BUG-129: the queue's durability surface — so a verify script can drive
     // the REAL accept/persist/restore path (rather than re-deriving the storage
     // shape from the outside) and read back the exact key it writes under.
-    queueMessage, paintQueue, adoptQueue, persistQueue, flushQueue, QUEUE_KEY,
+    queueMessage, paintQueue, adoptQueue, QUEUE_KEY,
+    // BUG-217 round 5: the server-outbox view (read it, never re-derive it).
+    refreshOutbox, flushPending, enqueueOutbox,
     // BUG-150: resetTranscript is the single owner of the queue↔session binding
     // (it re-adopts on every exit path), exposed so a verify script can assert
     // ownership is never left null and can detect a synthesized pre-fix client.

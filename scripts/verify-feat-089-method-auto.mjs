@@ -203,18 +203,19 @@ async function main() {
     Array.isArray(method.reports) && method.reports.length > 0, `${method.reports?.length} reports`);
   const projId = add.json.project.id;
 
-  // board
-  check('board installed: docs/bugs/INDEX.md + README.md',
-    fs.existsSync(path.join(dir, 'docs', 'bugs', 'INDEX.md')) && fs.existsSync(path.join(dir, 'docs', 'bugs', 'README.md')), 'present');
+  // board — FEAT-106: consolidated under .orchard/ (the way .claude/ works).
+  check('board installed: .orchard/bugs/INDEX.md + README.md',
+    fs.existsSync(path.join(dir, '.orchard', 'bugs', 'INDEX.md')) && fs.existsSync(path.join(dir, '.orchard', 'bugs', 'README.md')), 'present');
   // conventions + drift guard
-  check('conventions stub installed: docs/CONVENTIONS.md', fs.existsSync(path.join(dir, 'docs', 'CONVENTIONS.md')), 'present');
-  check('drift guard installed: scripts/board.mjs + board:check script',
-    fs.existsSync(path.join(dir, 'scripts', 'board.mjs')) &&
+  check('conventions stub installed: .orchard/CONVENTIONS.md', fs.existsSync(path.join(dir, '.orchard', 'CONVENTIONS.md')), 'present');
+  check('drift guard installed: .orchard/board.mjs + board:check script',
+    fs.existsSync(path.join(dir, '.orchard', 'board.mjs')) &&
       JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).scripts['board:check'] !== undefined, 'present');
-  // format hook + its dependency closure
+  // format hook + its dependency closure — FEAT-106 flattens the lib closure
+  // (scripts/lib/* AND public/lib/*.js) into one .orchard/lib/.
   const hookClosure = [
-    'scripts/hooks/response-format-gate.mjs', 'scripts/lib/readability.mjs', 'scripts/lib/structure.mjs',
-    'public/lib/digest.js', 'public/lib/dom.js', 'public/lib/route.js',
+    '.orchard/hooks/response-format-gate.mjs', '.orchard/lib/readability.mjs', '.orchard/lib/structure.mjs',
+    '.orchard/lib/digest.js', '.orchard/lib/dom.js', '.orchard/lib/route.js',
   ];
   check('format hook + its full dependency closure copied into the repo',
     hookClosure.every((rel) => fs.existsSync(path.join(dir, rel))),
@@ -229,16 +230,16 @@ async function main() {
   check('pre-existing CLAUDE.md was NOT clobbered',
     fs.readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8') === '# CLAUDE.md\n\nThis repo already has its own rules.\n', 'untouched');
   // gate wrapper + closure + npm script
-  check('sanctioned gate wrapper installed: scripts/gate.mjs + scripts/leak-gate.mjs',
-    fs.existsSync(path.join(dir, 'scripts', 'gate.mjs')) && fs.existsSync(path.join(dir, 'scripts', 'leak-gate.mjs')), 'present');
+  check('sanctioned gate wrapper installed: .orchard/gate.mjs + .orchard/leak-gate.mjs',
+    fs.existsSync(path.join(dir, '.orchard', 'gate.mjs')) && fs.existsSync(path.join(dir, '.orchard', 'leak-gate.mjs')), 'present');
   check('`gate` npm script wired',
-    JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).scripts.gate === 'node scripts/gate.mjs', 'wired');
+    JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')).scripts.gate === 'node .orchard/gate.mjs', 'wired');
   check('repo’s own package.json fields preserved (name/version/build script)',
     (() => { const p = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); return p.name === 'f089-apply' && p.version === '1.2.3' && p.scripts.build === 'echo build'; })(), 'intact');
 
   // hook actually runs in the target (imports resolve) — empty stdin → allow, exit 0
   let hookExit = null;
-  try { execFileSync('node', [path.join(dir, 'scripts', 'hooks', 'response-format-gate.mjs')], { input: '', encoding: 'utf8' }); hookExit = 0; }
+  try { execFileSync('node', [path.join(dir, '.orchard', 'hooks', 'response-format-gate.mjs')], { input: '', encoding: 'utf8' }); hookExit = 0; }
   catch (e) { hookExit = e.status ?? 1; }
   check('copied hook executes in the target (deps resolve; empty stdin → allow)', hookExit === 0, `exit ${hookExit}`);
 
@@ -281,7 +282,7 @@ async function main() {
 
   // ── [5] idempotence — re-onboard changes nothing (mtimes + contents) ────────
   console.log('\n[5] IDEMPOTENCE — re-running onboard on the applied repo changes nothing');
-  const watch = ['scripts/hooks/response-format-gate.mjs', 'scripts/gate.mjs', '.claude/settings.json', 'docs/bugs/README.md', 'package.json'];
+  const watch = ['.orchard/hooks/response-format-gate.mjs', '.orchard/gate.mjs', '.claude/settings.json', '.orchard/bugs/README.md', 'package.json'];
   const snap = Object.fromEntries(watch.map((rel) => {
     const p = path.join(dir, rel); const st = fs.statSync(p);
     return [rel, { mtimeMs: st.mtimeMs, sha: fs.readFileSync(p, 'utf8') }];

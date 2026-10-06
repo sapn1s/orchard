@@ -274,6 +274,14 @@ function baseModelId(m: string): string {
  *  stable vendor wire-id prefixes, NOT to any single model name. */
 const ANTHROPIC_MODEL_RE = /^claude/i;
 const OPENAI_MODEL_RE = /^(gpt|o\d|codex)/i;
+/** BUG-196 round 6 — the Claude CLI's own model ALIASES (`claude --help`: "an alias
+ *  for the latest model (e.g. 'fable', 'opus', or 'sonnet')", plus the `default` /
+ *  `haiku` / `opusplan` rows its catalog reports). The UI offers these as picks
+ *  (the static opus/sonnet/haiku rows, the drawer's alias cycle) on a machine with
+ *  no catalog yet, so they must classify as Claude WITHOUT a catalog — round 5 left
+ *  them unclassified, and an unclassified pick is passed through, so `opus` reached
+ *  a Codex session. Matched on the base id, so `opus[1m]` is covered too. */
+const ANTHROPIC_ALIAS_RE = /^(default|fable|opus|sonnet|haiku|opusplan)$/i;
 
 /** The per-provider model catalog file the runtime remembers (mirrors
  *  agent-bridge's `modelsFile`): `models.json` for anthropic, `models-<p>.json`
@@ -310,6 +318,7 @@ export function modelProviderOf(model: string | null): 'anthropic' | 'openai' | 
   if (catalogClaims('anthropic', model)) return 'anthropic';
   if (catalogClaims('openai', model)) return 'openai';
   if (ANTHROPIC_MODEL_RE.test(model)) return 'anthropic';
+  if (ANTHROPIC_ALIAS_RE.test(baseModelId(model))) return 'anthropic'; // BUG-196 round 6
   if (OPENAI_MODEL_RE.test(model)) return 'openai';
   return null;
 }

@@ -220,6 +220,10 @@ try {
         /audit|logged|record/i.test(reason));
       ok('4a denial does NOT falsely claim the bypass was LOGGED',
         !/allowed and LOGGED/.test(reason));
+      // BUG-226 round 3 — this ledger-not-written refusal path carried NO "Still
+      // available here" list (plan-review finding A, round-2 break (a) repeating).
+      ok('4a denial now carries the "Still available here" help (BUG-226 r3)',
+        /Still available here/.test(reason));
       ok('4a nothing was published and no temp was left (record dir empty)',
         rowsIn(badData).length === 0 && tempsIn(badData) === 0 && fs.readdirSync(blocker).join() === 'occupied');
       // Count must NOT advance for a denied (unlogged) bypass: repoint to a
@@ -469,6 +473,11 @@ try {
     const out = evaluateOrchestratorProfileHook(throwingInput as any, rec);
     ok('5f PASS: a throw in decide() → DENY (fail closed, outer catch never reached)', decision(out) === 'deny');
     ok('5f PASS: the deny reason names it could not be evaluated', /could not be evaluated/.test(reasonOf(out)));
+    // BUG-226 round 3 — the fail-closed message now also tells the session what IS
+    // available (guarded append, so a throw from the help helper degrades to the
+    // bare message rather than taking the session down).
+    ok('5f PASS: the fail-closed reason carries the "Still available here" help (BUG-226 r3)',
+      /Still available here/.test(reasonOf(out)));
   }
 
   /* ── 5g. Happy path still works through the extracted hook function ─────────
@@ -689,6 +698,11 @@ try {
     ok('6c unchanged: a throw inside evaluateFileLock\'s own classifier stays FEAT-129\'s allow ({})', empty(orch.res?.writeThrow));
     ok('6c PASS: the fail-closed reason says the decision could not be evaluated',
       /could not be evaluated/.test(orch.res?.bashThrow?.hookSpecificOutput?.permissionDecisionReason ?? ''));
+    // BUG-226 round 3 — the registered callback's OUTER catch (plan-review finding
+    // B) is a char-for-char duplicate of the inner fail-closed string; both now
+    // share ONE builder and carry the help.
+    ok('6c PASS: the outer-catch fail-closed reason also carries the "Still available here" help (BUG-226 r3)',
+      /Still available here/.test(orch.res?.bashThrow?.hookSpecificOutput?.permissionDecisionReason ?? ''));
     ok('6c anti-regression: a valid bypass is still ALLOWED through the registered callback', dec('bypass') === 'allow');
     ok('6c anti-regression: a plain blocked command is still DENIED', dec('deniedPlain') === 'deny');
     ok('6c anti-regression: a lane keeps Bash (no decision)', empty(orch.res?.laneBash));

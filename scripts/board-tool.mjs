@@ -58,6 +58,7 @@
  * summarised into prose for the caller to re-interpret.
  *
  * USAGE (all output is JSON on stdout; exit 0 = ok, 1 = refused/failed, 2 = usage)
+ * Values may be given as `--flag=value` or `--flag value`.
  *
  *   node scripts/board-tool.mjs query   [--id=BUG-133] [--state=open,blocked]
  *                                       [--section=open|done] [--owner=you|agent|unassigned]
@@ -72,6 +73,16 @@
  *                                       [--status-line='FIXED — …']   (legacy tickets)
  *                                       [--log='what happened'] [--log-author=…] [--log-label=…]
  *                                       [--rev=<token>]
+ *   node scripts/board-tool.mjs verified --id=BUG-133 --provider=anthropic
+ *                                       [--model=claude-opus-5] --run=<dispatch run id>
+ *                                       --verdict=HOLDS|BROKEN|INVALID [--note='…']
+ *                                       [--work-state=…] [--author='verify lane'] [--rev=<token>]
+ *                                       (writes a TYPED entry — BUG-225 r3; prose is not proof)
+ *   node scripts/board-tool.mjs decide  --id=FEAT-164 --question='Which …?'
+ *                                       --option='A=label | what changes | gains | costs | why not obvious'
+ *                                       --option='B=…' [--option=…] [--recommend=A --why='…']
+ *                                       [--replace] [--work-state=blocked] [--author='worker (fixing r2)'] [--rev=<token>]
+ *                                       (a fork that needs the user — FEAT-166; never Activity-log prose)
  *   node scripts/board-tool.mjs commit  --ids=BUG-133,FEAT-097 --message='…'
  *
  * The board directory is this repo's own `docs/bugs/`. `ORCHARD_BOARD_TOOL_ROOT`
@@ -85,13 +96,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 
 import {
   TICKET_TYPES, WORK_STATES, SEVERITIES, HUMAN_ACTIONS, OWNERS, TICKET_ID_RE,
   parseTicket, validateTicket, formatTicket, extractTicketBlock, deriveBodySlots,
-  classifyLegacyStatus, statusIssue, typeFromId,
+  classifyLegacyStatus, statusIssue, typeFromId, VERDICTS,
 } from './lib/ticket-schema.mjs';
 import { genBoard, checkBoard, decisionShapeFails, reachabilityFails } from './board.mjs';
+import * as VS from './lib/verification-source.mjs';
 // FEAT-106 — resolve the board dir (docs/bugs legacy / .orchard/bugs flat) for
 // whatever root the tool is pointed at; ORCHARD_BOARD_TOOL_ROOT semantics are
 // unchanged (it still names the host, the resolver just finds the board under it).
@@ -200,14 +213,41 @@ class Refusal extends Error {
  * bare path, silently check `docs/bugs` instead, and print `OK — no drift` about
  * a board the caller never asked about.
  */
+/**
+ * Flags that take no value. Every other flag also accepts the space-separated
+ * form `--flag value` (FEAT-166): docs/CONVENTIONS.md has long shown
+ * `verified --id BUG-123 --provider anthropic …`, and lanes type it that way, but
+ * the parser only knew `--flag=value` and refused the documented line. A token
+ * that follows a value-taking flag and does not itself start with `--` is that
+ * flag's value; anything that was valid before parses exactly as before.
+ */
+const BOOLEAN_FLAGS = new Set(['include-body', 'replace']);
+
 function parseArgs(argv) {
   const verb = argv[0] ?? '';
   const flags = new Map();
   const unknown = [];
-  for (const a of argv.slice(1)) {
+  // Flags given more than once (last value wins in the Map). A verb whose
+  // meaning a repeat could silently flip — `verified --verdict=BROKEN
+  // --verdict=HOLDS` — refuses them (BUG-225 r3 verify). `flags.all` keeps EVERY
+  // value in order, for the one flag that is repeatable by design
+  // (`decide --option`).
+  flags.repeated = [];
+  flags.all = new Map();
+  const rest = argv.slice(1);
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
     const m = /^--([a-z0-9][a-z0-9-]*)(?:=([\s\S]*))?$/.exec(a);
     if (!m) { unknown.push(a); continue; }
-    flags.set(m[1], m[2] === undefined ? 'true' : m[2]);
+    let value = m[2];
+    if (value === undefined && !BOOLEAN_FLAGS.has(m[1]) && i + 1 < rest.length && !rest[i + 1].startsWith('--')) {
+      value = rest[++i];
+    }
+    if (flags.has(m[1])) flags.repeated.push(m[1]);
+    const v = value === undefined ? 'true' : value;
+    flags.set(m[1], v);
+    if (!flags.all.has(m[1])) flags.all.set(m[1], []);
+    flags.all.get(m[1]).push(v);
   }
   return { verb, flags, unknown };
 }
@@ -593,8 +633,10 @@ async function verbUpdate(root, flags) {
       // construction rather than by care.
       const { body } = extractTicketBlock(detail.markdown);
       const next = formatTicket(record, body);
-      const revNow = currentRev(file);
-      assertFresh(file, revNow); // as late as physically possible
+      // FEAT-166 r3 — the rev of the bytes this update READ, as late as physically
+      // possible: a concurrent writer (e.g. the server recording a user answer into
+      // the record) since that read makes this refuse instead of erasing it.
+      assertFresh(file, detail.rev);
       fs.writeFileSync(file, next);
       touched.push('record');
     }
@@ -684,6 +726,385 @@ async function verbUpdate(root, flags) {
   };
 }
 
+/* ────────────────────────────────────────────────────────── verified (record) */
+
+const VERIFIED_FLAGS = ['id', 'provider', 'model', 'run', 'verdict', 'work-state', 'author', 'note', 'rev'];
+
+/**
+ * `verified` — the ONE writer of an independent-verification entry (BUG-225 r3).
+ *
+ * Proof is a TYPED entry, not a prose line (scripts/lib/verification-source.mjs):
+ * `{provider, model, run_id, verdict: holds|broken|invalid, verdict_on,
+ * recorded_at, author, recorded_by: "board-tool", harness, note?}`, stored in the
+ * record's `verification[]` (record-format ticket) or the board ledger (legacy
+ * prose ticket — no migration). The first typed entry on a ticket carries its
+ * frozen legacy history forward, so the one structured place holds the whole
+ * ordered record. The Activity log gets a "Verification recorded:" echo that no
+ * reader treats as proof. `work_state` advances to `verified` only on HOLDS (or an
+ * explicit `--work-state`), and only on a record-format ticket.
+ */
+async function verbVerified(root, flags) {
+  assertKnownFlags(flags, VERIFIED_FLAGS, 'verified');
+  if (flags.repeated?.length) {
+    throw new Refusal('repeated-flag', `verified: --${[...new Set(flags.repeated)].join(', --')} given more than once — say each field once`);
+  }
+  const api = await ticketsApi();
+  const { readTicket, appendNote, assertFresh, currentRev } = api;
+  const id = assertId(flags.get('id'), '--id');
+
+  for (const k of ['verdict', 'author', 'model', 'run', 'note', 'provider']) {
+    if (flags.has(k) && /[\r\n\u2028\u2029]/.test(String(flags.get(k)))) {
+      throw new Refusal('multi-line', `verified: --${k} must be a single line`);
+    }
+  }
+  const provider = assertEnum(flags.get('provider'), VS.PROVIDERS, '--provider');
+  const model = flags.has('model') ? String(flags.get('model')).trim() || null : null;
+  if (model && !VS.MODEL_RE.test(model)) {
+    throw new Refusal('bad-model', `verified: --model ${JSON.stringify(flags.get('model'))} is not one token (no whitespace, backtick or parenthesis)`);
+  }
+  const runId = String(flags.get('run') ?? '').trim();
+  if (!runId) throw new Refusal('missing-arg', 'verified: --run=<the dispatch run id it printed> is required');
+  if (!VS.RUN_ID_RE.test(runId)) {
+    throw new Refusal('bad-run-id', `verified: --run ${JSON.stringify(flags.get('run'))} is not a run id (expected ${VS.RUN_ID_RE.source})`);
+  }
+  const verdictRaw = String(flags.get('verdict') ?? '').trim();
+  if (!verdictRaw) throw new Refusal('missing-arg', 'verified: --verdict=HOLDS|BROKEN|INVALID is required — an entry without a verdict proves nothing');
+  const verdict = verdictRaw.toLowerCase();
+  if (!VERDICTS.includes(verdict)) {
+    throw new Refusal('bad-verdict', `verified: --verdict ${JSON.stringify(verdictRaw)} must be exactly one of HOLDS, BROKEN, INVALID (put anything else in --note)`);
+  }
+  const note = flags.has('note') ? String(flags.get('note')).trim() || null : null;
+  if (note && note.length > 300) throw new Refusal('bad-note', 'verified: --note must be at most 300 characters');
+  const author = flags.has('author') ? String(flags.get('author')).trim() || null : null;
+
+  await assertNoLeak([
+    { label: '--model', text: model },
+    { label: '--note', text: note },
+    { label: '--author', text: author },
+  ], `verified ${id}`);
+
+  const detail = readTicket(root, id); // throws TicketError(404) if there is none
+  const file = detail.file;
+  const base = path.basename(file);
+  if (flags.has('rev')) assertFresh(file, flags.get('rev'));
+  const parsed = parseTicket(detail.markdown, { file: base, mode: 'auto' });
+  const boardDir = boardDirOf(root);
+
+  const now = new Date();
+  const entry = {
+    provider, model, run_id: runId, verdict,
+    verdict_on: now.toISOString().slice(0, 10),
+    recorded_at: now.toISOString(),
+    author: author ?? `dispatch ${provider}`,
+    recorded_by: 'board-tool',
+    harness: 'scripts/independent-verify.mjs',
+    ...(note ? { note } : {}),
+  };
+  const probs = VS.entryProblems(entry);
+  if (probs.length) throw new Refusal('invalid-entry', `verified: the entry is invalid — ${probs.join('; ')}`, probs);
+
+  // The history this ticket's ONE structured place must hold before the new entry.
+  const current = VS.ticketVerifications(boardDir, { id, markdown: detail.markdown });
+  if (current.entries.some((e) => e.run_id === runId && e.verdict === verdict)) {
+    throw new Refusal('duplicate', `verified: ${id} already records run ${runId} as ${verdict.toUpperCase()}`);
+  }
+  const carried = current.source === 'legacy-frozen'
+    ? current.entries.map(({ origin, ...e }) => ({ ...e, origin: 'legacy-prose-freeze' }))
+    : [];
+
+  // work_state is DERIVED from the ONE proof rule (isIndependentlyVerified) over
+  // the WHOLE verification history, in BOTH directions (BUG-225 r5, decision 4) —
+  // never a second rule, and never a one-way latch. The bug this closes: a HOLDS
+  // write advanced work_state to `verified`, and a later BROKEN left it there, so
+  // a refuted ticket kept reading verified until a lane reset it by hand.
+  //   · a HOLDS with no later BROKEN ⇒ `verified`;
+  //   · a BROKEN after a standing HOLDS ⇒ demote to `in_verification`;
+  //   · a verdict that does not change isIndependentlyVerified (INVALID, or a
+  //     BROKEN with no prior HOLDS) leaves work_state untouched — the transition
+  //     of the rule, not the verdict word, decides.
+  // An explicit --work-state still overrides the derivation. `current.entries` is
+  // the history BEFORE this write (record.verification[], ledger, or frozen), from
+  // the one reader; the new entry is appended to it below.
+  const explicitState = flags.has('work-state') ? assertEnum(flags.get('work-state'), WORK_STATES, '--work-state') : null;
+  const nextList = [...current.entries, entry];
+  const wasVerified = current.verified;
+  const nowVerified = VS.isIndependentlyVerified(nextList);
+  const derivedState = nowVerified ? 'verified' : (wasVerified ? 'in_verification' : null);
+  const wantState = explicitState ?? derivedState;
+
+  const touched = [];
+  let stateSet = null;
+  let stateSkipped = null;
+  let where;
+  if (parsed.format === 'block') {
+    const record = {
+      ...parsed.record,
+      verification: nextList,
+      ...(wantState ? { work_state: wantState } : {}),
+      updated: TODAY(),
+    };
+    const v = validateTicket(record, { file: base });
+    if (!v.ok) {
+      throw new Refusal('invalid-ticket', `verified: ${id} would fail validateTicket (${v.violations.length} violation(s)) — nothing was written`, v.violations);
+    }
+    const { body: keepBody } = extractTicketBlock(detail.markdown);
+    assertFresh(file, detail.rev); // FEAT-166 r3: the rev READ, so a user answer since is never erased
+    fs.writeFileSync(file, formatTicket(record, keepBody));
+    where = 'the record\'s verification[]';
+    touched.push('verification');
+    if (wantState) { stateSet = wantState; touched.push('work-state'); }
+  } else {
+    VS.appendLedger(boardDir, [...carried.map((e) => ({ id, ...e })), { id, ...entry }]);
+    where = VS.LEDGER_FILE;
+    touched.push('ledger');
+    // A legacy prose ticket has no record field to advance.
+    if (wantState) stateSkipped = wantState;
+  }
+
+  // Human-readable echo. Its label is NOT `Verified-by`, so no reader of prose
+  // (legacy or migration) mistakes it for a record; the typed entry is the proof.
+  const echo = `dispatch ${provider}${model ? `/${model}` : ''} run ${runId} — VERDICT: ${verdict.toUpperCase()}` +
+    `${note ? ` — ${note}` : ''}. Typed entry in ${where}; this line is an echo, not proof.`;
+  const appended = appendNote(root, id, echo, currentRev(file), {
+    author: entry.author,
+    label: 'Verification recorded',
+  }).appended;
+  touched.push('echo');
+
+  genBoard(boardDir);
+  const after = VS.ticketVerifications(boardDir, { id, markdown: fs.readFileSync(file, 'utf8') });
+  return {
+    verb: 'verified', id, file: rel(root, file), rev: currentRev(file),
+    format: parsed.format, entry, stored_in: where, carried_forward: carried.length,
+    independently_verified: after.verified, source: after.source,
+    work_state: stateSet, work_state_skipped: stateSkipped, touched, appended,
+    index_row: indexRowOf(root, id), board: await boardReport(root, { warns: 'summary' }),
+  };
+}
+
+/* ──────────────────────────────────────────────────────────── decide (record) */
+
+const DECIDE_FLAGS = ['id', 'question', 'option', 'recommend', 'why', 'replace', 'work-state', 'author', 'rev'];
+/** The option-key shape the Decide parser accepts (OPTION_BULLET_RE in src/server/board.ts). */
+const OPTION_KEY_RE = /^[A-Za-z0-9]{1,6}$/;
+const OPTION_FIELDS = ['label', 'what_changes', 'benefit', 'cost', 'why_not_obvious'];
+const OPTION_SHAPE = '--option "KEY=label | what changes | gains | costs | why it is not obviously best"';
+
+/** src/server/board.ts, lazily — for `ticketAnswerState`, the ONE reader of "was it answered". */
+let BOARD_TS = null;
+async function boardApi() {
+  if (BOARD_TS) return BOARD_TS;
+  BOARD_TS = await import(url.pathToFileURL(path.resolve(DEFAULT_ROOT, 'src', 'server', 'board.ts')).href);
+  return BOARD_TS;
+}
+
+/** One `--option` value → a record option, or a refusal naming the shape. */
+function parseOption(raw, i) {
+  const s = String(raw ?? '');
+  const eq = s.indexOf('=');
+  const key = eq === -1 ? '' : s.slice(0, eq).trim();
+  if (!OPTION_KEY_RE.test(key)) {
+    throw new Refusal('bad-options', `decide: --option #${i + 1} has no valid KEY= prefix (1-6 letters/digits, e.g. A=…)`, [OPTION_SHAPE]);
+  }
+  const parts = s.slice(eq + 1).split('|').map((p) => p.replace(/\s+/g, ' ').trim());
+  if (parts.length !== OPTION_FIELDS.length || parts.some((p) => !p)) {
+    throw new Refusal('bad-options', `decide: --option ${key} has ${parts.filter(Boolean).length} of the 5 "|"-separated fields the Decide card shows — nothing was written`, [
+      OPTION_SHAPE,
+      'Every field is required: the card renders each one, and an empty field would be a placeholder, which the record forbids.',
+    ]);
+  }
+  const o = { key };
+  OPTION_FIELDS.forEach((f, k) => { o[f] = parts[k]; });
+  return o;
+}
+
+/** Date of the last `- **Decision declared:**` entry in the Activity log, or null. */
+function lastDeclaredOn(markdown) {
+  let on = null;
+  let date = null;
+  for (const line of String(markdown).split('\n')) {
+    const h = /^###\s+(\d{4}-\d\d-\d\d)\s+—\s+/.exec(line.trim());
+    if (h) { date = h[1]; continue; }
+    if (date && /^[-*]\s*\*\*Decision declared:?\*\*/i.test(line.trim())) on = date;
+  }
+  return on;
+}
+
+/**
+ * `decide` — the ONE writer of a ticket's open decision (FEAT-166, ARCH-010).
+ *
+ * The Decide card and the Needs-You rail render a decision only from the record's
+ * `decision` (src/server/board.ts `decisionFromRecord`) — deliberately never from
+ * prose (BUG-025). Without a writer, a lane at a fork wrote options as Activity-log
+ * prose and the user saw nothing (FEAT-164). This verb writes the exact record the
+ * parser reads, sets `human_action: decide` + owner `you` (the INDEX 👤 the rail
+ * reads), appends a `Decision declared:` log entry, and regenerates INDEX.
+ *
+ * It NEVER writes a user answer. An existing decision with no user answer is
+ * "open" and is only overwritten with --replace; an answered one is superseded
+ * freely. Either way the old one moves to `decision_history` (with its typed
+ * answers, as history), and the new decision starts with none — so the earlier
+ * answer cannot count against the new question (FEAT-166 r3: binding by
+ * containment, not by reading the `Decision declared:` prose).
+ */
+async function verbDecide(root, flags) {
+  assertKnownFlags(flags, DECIDE_FLAGS, 'decide');
+  const repeatedBad = [...new Set(flags.repeated)].filter((k) => k !== 'option');
+  if (repeatedBad.length) {
+    throw new Refusal('repeated-flag', `decide: --${repeatedBad.join(', --')} given more than once — say each field once (only --option repeats)`);
+  }
+  const api = await ticketsApi();
+  const { readTicket, appendNote, setBoardOwner, assertFresh, currentRev, TicketError } = api;
+  const { ticketAnswerState } = await boardApi();
+  const id = assertId(flags.get('id'), '--id');
+
+  for (const k of ['question', 'recommend', 'why', 'author', 'option']) {
+    if ((flags.all.get(k) ?? []).some((v) => /[\r\n\u2028\u2029]/.test(String(v)))) {
+      throw new Refusal('multi-line', `decide: --${k} must be a single line`);
+    }
+  }
+  const question = String(flags.get('question') ?? '').trim();
+  if (!question) throw new Refusal('missing-arg', 'decide: --question="…?" is required');
+
+  const rawOptions = flags.all.get('option') ?? [];
+  if (rawOptions.length < 2) {
+    throw new Refusal('bad-options', `decide: ${rawOptions.length} --option given — a decision needs at least 2 (one option is not a choice)`, [OPTION_SHAPE]);
+  }
+  const options = rawOptions.map(parseOption);
+  const keys = options.map((o) => o.key);
+  const dup = keys.filter((k, i) => keys.indexOf(k) !== i);
+  if (dup.length) throw new Refusal('bad-options', `decide: duplicate option key(s) ${[...new Set(dup)].join(', ')} — keys must be unique`);
+
+  const recommend = flags.has('recommend') ? String(flags.get('recommend')).trim() : null;
+  const why = flags.has('why') ? String(flags.get('why')).trim() : null;
+  if (recommend !== null && !keys.includes(recommend)) {
+    throw new Refusal('bad-recommend', `decide: --recommend ${JSON.stringify(recommend)} is not one of the option keys (${keys.join(', ')})`);
+  }
+  if (recommend && !why) throw new Refusal('missing-arg', 'decide: --recommend needs --why="the reason" — a recommendation without a reason is not reviewable');
+  if (!recommend && why) throw new Refusal('missing-arg', 'decide: --why was given without --recommend');
+
+  const author = (flags.has('author') ? String(flags.get('author')).trim() : '') || 'agent';
+  if (/^(you|user)\b/i.test(author)) {
+    throw new Refusal('bad-author', `decide: --author ${JSON.stringify(author)} reads as the user — this verb declares a question and never writes a user's answer`);
+  }
+
+  await assertNoLeak([
+    { label: '--question', text: question },
+    { label: '--why', text: why },
+    { label: '--author', text: author },
+    ...rawOptions.map((t, i) => ({ label: `--option #${i + 1}`, text: t })),
+  ], `decide ${id}`);
+
+  const detail = readTicket(root, id); // throws TicketError(404) if there is none
+  const file = detail.file;
+  const base = path.basename(file);
+  if (flags.has('rev')) assertFresh(file, flags.get('rev'));
+  const parsed = parseTicket(detail.markdown, { file: base, mode: 'auto' });
+  if (parsed.format !== 'block' || !parsed.record) {
+    // A record block that does not parse (half-written by a concurrent writer, or
+    // invalid) is NOT a legacy ticket — say which it is.
+    const isLegacy = parsed.format === 'legacy' && !/^\s*```orchard-ticket\b/.test(detail.markdown);
+    const why2 = isLegacy
+      ? `${id} is a legacy prose ticket with no record`
+      : `${id}'s record could not be read (half-written, or invalid)`;
+    throw new Refusal(isLegacy ? 'legacy-ticket' : 'unreadable-ticket', `decide: ${why2} — nothing was written`, [
+      'A legacy ticket declares a decision with a `## Decision — …?` section of `- **A — label.** …` bullets (docs/bugs/README.md).',
+    ]);
+  }
+  const old = parsed.record;
+  if (['done', 'not_a_bug'].includes(old.work_state)) {
+    throw new Refusal('not-applicable', `decide: ${id} is ${old.work_state} — reopen it before asking a new question`);
+  }
+
+  // Supersede rule. "Answered" is read by the ONE reader the Decide card uses.
+  const history = Array.isArray(old.decision_history) ? [...old.decision_history] : [];
+  let superseded = null;
+  if (old.decision && typeof old.decision === 'object') {
+    const ans = ticketAnswerState(detail.markdown, file);
+    const answered = ans && ans.kind === 'decision';
+    if (!answered && flags.get('replace') !== 'true') {
+      throw new Refusal('open-decision', `decide: ${id} already has an open decision the user has not answered ("${old.decision.question}") — pass --replace to supersede it`);
+    }
+    superseded = answered ? 'answered' : 'unanswered';
+    history.push({
+      id: old.decision.id ?? null,
+      asked_on: lastDeclaredOn(detail.markdown) ?? old.updated ?? null,
+      question: old.decision.question ?? null,
+      mode: old.decision.mode,
+      options_keys: Array.isArray(old.decision.options) ? old.decision.options.map((o) => o && o.key) : [],
+      chosen: answered ? (ans.chose?.key ?? null) : null,
+      chosen_on: answered ? ans.on : null,
+      chosen_by: answered ? 'you' : null,
+      note: answered
+        ? `Answered by the user; superseded on ${TODAY()} by a new decision declared with board-tool decide.`
+        : `Superseded unanswered on ${TODAY()} with board-tool decide --replace.`,
+      // FEAT-166 r3 — the typed answers move with their decision, as HISTORY: no
+      // reader counts decision_history; board:check uses their heading shas to
+      // account for the display headings they wrote. The new decision below is
+      // built fresh from flags, so it starts with no answers.
+      ...(Array.isArray(old.decision.answers) && old.decision.answers.length ? { answers: old.decision.answers } : {}),
+    });
+  }
+
+  const workState = flags.has('work-state') ? assertEnum(flags.get('work-state'), WORK_STATES, '--work-state') : 'blocked';
+  // FEAT-166 r2 — mint the decision's OWN identity, once, here (ARCH-010: declared
+  // by its owner, never reconstructed). A full UUID, so re-use is not a concern.
+  // FEAT-166 r3 — the decision object is built FRESH from flags, so it carries no
+  // `answers`: the user's typed answers (written only by the server's answer route)
+  // live inside the decision they answered, and a re-declaration starts empty.
+  const decisionId = randomUUID();
+  const record = {
+    ...old,
+    decision: {
+      id: decisionId,
+      mode: 'single',
+      question,
+      options,
+      recommendation: recommend,
+      recommendation_reason: recommend ? why : null,
+      prerequisite: null,
+    },
+    decision_history: history,
+    human_action: 'decide',
+    owner: 'you',
+    work_state: workState,
+    updated: TODAY(),
+  };
+  const v = validateTicket(record, { file: base });
+  if (!v.ok) {
+    throw new Refusal('invalid-ticket', `decide: ${id} would fail validateTicket (${v.violations.length} violation(s)) — nothing was written`, v.violations);
+  }
+
+  // Record first (body byte-for-byte), then the log through the one appender.
+  const { body } = extractTicketBlock(detail.markdown);
+  // FEAT-166 r3 — against the rev of the bytes we READ (not a fresh rev, which is
+  // a tautology): a user answer recorded since that read is never overwritten.
+  assertFresh(file, detail.rev);
+  fs.writeFileSync(file, formatTicket(record, body));
+
+  const summary = options.map((o) => `${o.key} — ${o.label}`).join('; ');
+  const logText = `${question} Options: ${summary}.`
+    + (recommend ? ` Recommended: ${recommend} — ${why}` : ' No recommendation.')
+    + (superseded ? ` Supersedes the earlier ${superseded} decision (kept in decision_history).` : '')
+    + ' Written to the record with board-tool decide; the Decide card reads the record, not this line.';
+  const appended = appendNote(root, id, logText, currentRev(file), { author, label: 'Decision declared' }).appended;
+
+  let ownerCell = null;
+  try {
+    ownerCell = setBoardOwner(root, id, 'you').owner;
+  } catch (err) {
+    if (err instanceof TicketError) throw new Refusal('no-open-row', `decide: the decision was written but ${err.message}`);
+    throw err;
+  }
+  genBoard(boardDirOf(root));
+
+  return {
+    verb: 'decide', id, file: rel(root, file), rev: currentRev(file),
+    decision: record.decision, superseded, work_state: workState, owner_cell: ownerCell, appended,
+    index_row: indexRowOf(root, id), board: await boardReport(root, { warns: 'summary' }),
+  };
+}
+
 /* ─────────────────────────────────────────────────────────────── committing */
 
 const COMMIT_FLAGS = ['ids', 'message'];
@@ -708,9 +1129,14 @@ function git(root, args) {
  * failing lines and no commit happens.
  */
 function runGate(root) {
-  const gate = path.join(root, 'scripts', 'gate.mjs');
+  // FEAT-106: onboard consolidates the gate under `.orchard/`; Orchard's own
+  // repo keeps it at `scripts/gate.mjs`. Prefer the consolidated location, fall
+  // back to the legacy one, so both a migrated target and Orchard itself resolve.
+  const orchardGate = path.join(root, '.orchard', 'gate.mjs');
+  const legacyGate = path.join(root, 'scripts', 'gate.mjs');
+  const gate = fs.existsSync(orchardGate) ? orchardGate : legacyGate;
   if (!fs.existsSync(gate)) {
-    return { ran: false, ok: false, status: null, output: `no gate at ${rel(root, gate)} — refusing to commit without one` };
+    return { ran: false, ok: false, status: null, output: `no gate at ${rel(root, legacyGate)} or ${rel(root, orchardGate)} — refusing to commit without one` };
   }
   const r = spawnSync(process.execPath, [gate], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   return { ran: true, ok: r.status === 0, status: r.status, output: ((r.stdout || '') + (r.stderr || '')).trim() };
@@ -804,6 +1230,8 @@ const VERBS = {
   reconcile: verbReconcile,
   file: verbFile,
   update: verbUpdate,
+  verified: verbVerified,
+  decide: verbDecide,
   commit: verbCommit,
 };
 

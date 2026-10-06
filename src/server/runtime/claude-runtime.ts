@@ -19,20 +19,21 @@ import { fileURLToPath } from 'node:url';
 import { query, type Options, type SDKMessage, type SDKUserMessage, type PermissionResult } from '@anthropic-ai/claude-agent-sdk';
 // FEAT-096: the policy is imported, never reimplemented — the enforcing hook and
 // the counting report must not each carry their own idea of "allowed" (ARCH-008).
-import { decide } from '../../../scripts/lib/orchestrator-profile.mjs';
+import { decide, stillAvailableHere } from '../../../scripts/lib/orchestrator-profile.mjs';
 // FEAT-108 — git writes are denied for EVERY agent session (orchestrator AND
 // lane), a different axis from the orchestrator profile: `decide()` lets a lane
 // keep everything, but BUG-155 was a lane committing private paths. Same
 // PreToolUse callback, runs first, gated only by its own escape hatch.
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
-import { installGitShim } from '../../../scripts/lib/git-shim.mjs';
+import { installGitShim, gitShimMissingRefusal } from '../../../scripts/lib/git-shim.mjs';
 import { getShimSecret } from '../../../scripts/lib/git-shim-secret.mjs';
 // FEAT-108 round 2 — the git-write decision is now grant-aware: a runtime,
 // per-project, revocable grant (git-grant-store.mjs, host-memory only) can lift
 // the block WITHOUT relaunching, and a granted commit/push still runs the
 // mandatory leak gate. evaluateGitWrite folds all three onto the round-1
 // classifier; the leak-gate runner is injected from here (a real subprocess).
-import { evaluateGitWrite } from '../../../scripts/lib/git-grant.mjs';
+import { evaluateGitWrite, beginGitWriteToolCall, endGitWriteToolCall, endGitWriteToolCalls, endGitWriteAgent } from '../../../scripts/lib/git-grant.mjs';
+import { hostLeakGatePath, ownProjectArgs, passReport, hostGateBanner, capGateOutput, repoContentFingerprint } from '../leak-gate-host.ts';
 // FEAT-124 — an UNJUSTIFIED Fable (`model: fable`) dispatch is rerouted UP to
 // Opus on this same PreToolUse callback. A different axis again: model-keyed, not
 // tool-name-keyed, and it REWRITES (updatedInput) rather than denies, so the lane
@@ -338,7 +339,10 @@ function announceFableTier(
  */
 export function runLeakGateForRepo(repoPath: string | undefined | null): { ok: boolean; detail: string } {
   if (!repoPath) return { ok: false, detail: 'no repo path known for this session — cannot verify the leak gate; failing closed' };
-  const gate = path.join(REPO_ROOT, 'scripts', 'leak-gate.mjs');
+  const gate = hostLeakGatePath();
+  // FEAT-156 — the repo's registered project (registry, never re-derived here)
+  // may waive ITS OWN project-name token; every other token still fails.
+  const own = ownProjectArgs(repoPath);
   // FEAT-130 round 2 — this gate runs as a PRE-EXECUTION guard on an arbitrary
   // git-write Bash command, so it must catch BOTH shapes of the index bypass:
   //   • `git add secret && git commit`  — nothing is staged yet at guard time,
@@ -353,17 +357,22 @@ export function runLeakGateForRepo(repoPath: string | undefined | null): { ok: b
   // needs the union.)
   const run = (args: string[]): { ok: boolean; detail: string } => {
     try {
-      execFileSync(process.execPath, [gate, ...args], { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
-      return { ok: true, detail: '' };
+      const stdout = execFileSync(process.execPath, [gate, ...args, ...own], { cwd: repoPath, stdio: 'pipe', timeout: 30_000 });
+      return { ok: true, detail: passReport(stdout.toString()) };
     } catch (err) {
       const e = err as { stdout?: Buffer; stderr?: Buffer; message?: string };
       const out = `${e.stdout?.toString() ?? ''}${e.stderr?.toString() ?? ''}`.trim() || e.message || 'leak gate failed';
-      return { ok: false, detail: out.slice(0, 1500) };
+      return { ok: false, detail: `${hostGateBanner()}\n${capGateOutput(out)}` };
     }
   };
   const tree = run(['--summary']);
   if (!tree.ok) return tree;
-  return run(['--summary', '--staged']);
+  const staged = run(['--summary', '--staged']);
+  // FEAT-156 — a PASS with waivers is logged, never silent.
+  if (staged.ok && /\bwaived\b/.test(`${tree.detail}\n${staged.detail}`)) {
+    console.warn(`[orchard] agent git-write leak gate PASSED with waivers (${repoPath}):\n${tree.detail}\n${staged.detail}`);
+  }
+  return staged;
 }
 
 /** FEAT-108 round 2 — one stderr line per permitted/blocked-by-gate agent git
@@ -553,6 +562,35 @@ function recordOrchBypass(rec: {
 }
 
 /**
+ * BUG-226 round 3 — append the "Still available here" help to a profile refusal
+ * message, from the ONE helper that derives it from the grant authority. GUARDED:
+ * these messages fire BECAUSE the profile module just threw, so calling back into
+ * it unguarded could re-throw inside the hook — a throw here must degrade to the
+ * bare message, never take the session down.
+ */
+function withProfileHelp(message: string): string {
+  try {
+    return `${message}\n\n${stillAvailableHere().join('\n')}`;
+  } catch {
+    return message;
+  }
+}
+
+/**
+ * BUG-226 round 3 — the "could not be evaluated" fail-closed reason, in ONE place.
+ * It was typed identically at two refusal sites (the FEAT-152 inner catch and the
+ * registered callback's outer catch); a duplicated string is a second owner that
+ * drifts, and the plan review caught that appending help to one copy and not the
+ * other would mint exactly that. One builder, both sites.
+ */
+function profileEvalFailedReason(detail: string): string {
+  return withProfileHelp(
+    'Orchestrator tool profile: the permission decision could not be evaluated ' +
+      `(${detail}); denied (fail closed, FEAT-152). Dispatch a lane instead.`,
+  );
+}
+
+/**
  * FEAT-152 — the stateful glue between a pure `decide()` bypass verdict and what
  * the PreToolUse hook must DO about it, in ONE place so the count, the ledger
  * row and the allow-reason are defined together (ARCH-010) and can be driven by
@@ -581,11 +619,12 @@ export function makeOrchBypassRecorder(ctx: { sessionId?: string | null; session
         hookSpecificOutput: {
           hookEventName: 'PreToolUse' as const,
           permissionDecision: 'deny' as const,
-          permissionDecisionReason:
+          permissionDecisionReason: withProfileHelp(
             'ORCH-BYPASS refused: this command carried a valid `# ORCH-BYPASS:` marker, but the ' +
-            'audit ledger could not be written, so the bypass cannot be recorded. FEAT-152 requires ' +
-            'every bypass to be durably logged — an unauditable bypass is DENIED (fail closed), never ' +
-            'run silently. Fix the record directory (dataDir()/orch-bypass-audit/) or dispatch a lane instead.',
+              'audit ledger could not be written, so the bypass cannot be recorded. FEAT-152 requires ' +
+              'every bypass to be durably logged — an unauditable bypass is DENIED (fail closed), never ' +
+              'run silently. Fix the record directory (dataDir()/orch-bypass-audit/) or dispatch a lane instead.',
+          ),
         },
       };
     }
@@ -642,9 +681,7 @@ export function evaluateOrchestratorProfileHook(
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         permissionDecision: 'deny',
-        permissionDecisionReason:
-          'Orchestrator tool profile: the permission decision could not be evaluated ' +
-          `(${(err as Error).message}); denied (fail closed, FEAT-152). Dispatch a lane instead.`,
+        permissionDecisionReason: profileEvalFailedReason((err as Error).message),
       },
     };
   }
@@ -656,9 +693,10 @@ export function evaluateOrchestratorProfileHook(
         hookSpecificOutput: {
           hookEventName: 'PreToolUse',
           permissionDecision: 'deny',
-          permissionDecisionReason:
+          permissionDecisionReason: withProfileHelp(
             'ORCH-BYPASS refused: the bypass could not be recorded ' +
-            `(${(err as Error).message}); denied (fail closed, FEAT-152 — an unauditable bypass never runs).`,
+              `(${(err as Error).message}); denied (fail closed, FEAT-152 — an unauditable bypass never runs).`,
+          ),
         },
       };
     }
@@ -827,6 +865,12 @@ export class ClaudeRuntime implements AgentRuntime {
    * so it never keeps the process alive on its own.
    */
   #fileLockHeartbeat: ReturnType<typeof setInterval> | null = null;
+  /**
+   * BUG-231 — this session's binding between the PreToolUse hook's per-tool-call git
+   * decisions and its shim (baked into the shim source; git-grant.mjs windows). Ended
+   * for the whole session at every turn end and at close().
+   */
+  #gitWindowKey: string | null = null;
 
   start(config: RuntimeStartConfig): void {
     /*
@@ -875,25 +919,43 @@ export class ClaudeRuntime implements AgentRuntime {
      * Guarded by `gitWriteBlockEnabled()`: with the ORCHARD_ALLOW_GIT_WRITE hatch
      * open the shim is not installed, mirroring the hook's own kill-switch.
      */
-    const baseSessionEnv = { ...process.env, ...(config.env ?? {}), [ORCHARD_SESSION_ENV]: declaredSessionId };
+    // BUG-223: dockerEnv (DOCKER_HOST at the sandbox for a sandboxed project) rides the
+    // same copy; the server's own process.env is never written.
+    const baseSessionEnv = { ...process.env, ...(config.env ?? {}), ...(config.dockerEnv ?? {}), [ORCHARD_SESSION_ENV]: declaredSessionId };
     // BUG-173 — bake the grant authority coordinates so the shim consults the SAME
     // host grant the FEAT-108 hook reads (per call, over loopback). The port is the
     // one THIS host process listens on (index.ts: PORT ?? 4317); we are in-process.
-    const sessionEnv = gitWriteBlockEnabled()
+    // BUG-230 — keep the install HANDLE: it is this session's ownership of its shim
+    // dir, and its ensure() is the fail-closed check the PreToolUse hook runs below.
+    // BUG-231 — a random per-session key that binds this session's shim invocations
+    // to the hook's per-tool-call decisions (one Bash git write = one decision).
+    const gitWindowKey = gitWriteBlockEnabled() ? randomBytes(32).toString('hex') : null;
+    this.#gitWindowKey = gitWindowKey;
+    const gitShim = gitWriteBlockEnabled()
       ? installGitShim(baseSessionEnv, {
           grantKey: config.gitGrantKey ?? undefined,
           hostUrl: `http://127.0.0.1:${process.env.PORT ?? 4317}`,
           // BUG-173 round 3 — baked into the shim source (not env) and required by
           // /api/git-shim/decide, so the consult cannot be redirected to a forged host.
           shimAuth: getShimSecret(),
-        }).env
-      : baseSessionEnv;
+          windowKey: gitWindowKey ?? undefined,
+        })
+      : null;
+    /** BUG-231 — end one Bash call's git decision window (no-op when there is none). */
+    const endGitCall = (toolUseId: unknown) => {
+      if (gitWindowKey && typeof toolUseId === 'string' && toolUseId) endGitWriteToolCall(gitWindowKey, toolUseId);
+    };
+    const sessionEnv = gitShim ? gitShim.env : baseSessionEnv;
     const options: Options = {
       cwd: config.cwd,
       includePartialMessages: true,
       permissionMode: config.permissionMode as never,
-      canUseTool: (toolName, input, o) =>
-        config.onApproval({ toolName, input, meta: o as never }) as Promise<PermissionResult>,
+      canUseTool: async (toolName, input, o) => {
+        const r = await (config.onApproval({ toolName, input, meta: o as never }) as Promise<PermissionResult>);
+        // BUG-231 — a denied call never runs: release any git decision it reserved.
+        if (r?.behavior === 'deny') endGitCall((o as { toolUseID?: unknown } | undefined)?.toolUseID);
+        return r;
+      },
       /*
        * ARMED, NOT ENGAGED.
        *
@@ -1069,6 +1131,17 @@ export class ClaudeRuntime implements AgentRuntime {
       if (typeof timer.unref === 'function') timer.unref();     // never keep the process alive on the heartbeat alone
       this.#fileLockHeartbeat = timer;
     }
+    /**
+     * BUG-231 — a PreToolUse answer of DENY means the call never runs, so any git
+     * decision window the git block opened for it (a later stage — the file lock, the
+     * orchestrator profile — denied it) is ended here and a reserved grant released.
+     */
+    const settleGitCallOnDeny = <I, R>(fn: (input: I) => Promise<R>) => async (input: I): Promise<R> => {
+      const r = await fn(input);
+      const d = (r as { hookSpecificOutput?: { permissionDecision?: string } } | undefined)?.hookSpecificOutput?.permissionDecision;
+      if (d === 'deny') endGitCall((input as { tool_use_id?: unknown } | undefined)?.tool_use_id);
+      return r;
+    };
     if (gitBlockOn || config.orchestratorProfile || fableGateOn || fileLockDir) {
       options.hooks = {
         ...(options.hooks ?? {}),
@@ -1081,9 +1154,15 @@ export class ClaudeRuntime implements AgentRuntime {
              */
             ...(hookTimeoutSecondsFromEnv() ? { timeout: hookTimeoutSecondsFromEnv()! } : {}),
             hooks: [
-              async (input) => {
+              settleGitCallOnDeny(async (input) => {
                 try {
-                  const i = input as { tool_name?: string; tool_input?: unknown; agent_id?: string };
+                  const i = input as { tool_name?: string; tool_input?: unknown; agent_id?: string; tool_use_id?: string };
+                  /*
+                   * BUG-231 — this agent's next tool call means its previous write-
+                   * classified Bash call has ended (Claude Code runs one alone), so any
+                   * git decision window it left open ends here, even without a Post.
+                   */
+                  if (gitBlockOn && gitWindowKey) beginGitWriteToolCall({ binding: gitWindowKey, toolUseId: i.tool_use_id ?? null, agentKey: i.agent_id ?? 'main' });
                   // Git-write block first, for ALL sessions. `decide()` below
                   // would allow `git commit` (an allowed Bash head), so order
                   // matters. The decision is now grant-aware and evaluated PER
@@ -1091,6 +1170,26 @@ export class ClaudeRuntime implements AgentRuntime {
                   // mid-session takes effect on the next tool call with no
                   // relaunch — and a single-use grant is consumed here.
                   if (gitBlockOn && i.tool_name === 'Bash') {
+                    /*
+                     * BUG-230 — FAIL CLOSED on a missing shim. If this session's shim
+                     * dir vanished (an older nested runtime deleted it, a tmp cleaner,
+                     * anything), `git` in this Bash call would resolve straight to the
+                     * real binary, ungated. Restore our OWN shim first; if that is not
+                     * possible, refuse the call rather than let it fall through.
+                     */
+                    if (gitShim) {
+                      const ensured = gitShim.ensure();
+                      if (!ensured.ok) {
+                        return {
+                          hookSpecificOutput: {
+                            hookEventName: 'PreToolUse' as const,
+                            permissionDecision: 'deny' as const,
+                            permissionDecisionReason: gitShimMissingRefusal(ensured.reason),
+                          },
+                        };
+                      }
+                      if (ensured.restored) console.warn(`[orchard] BUG-230: restored a missing git shim for session ${config.sessionLabel ?? declaredSessionId} (${gitShim.shimDir})`);
+                    }
                     const cmd = i.tool_input && typeof i.tool_input === 'object'
                       ? (i.tool_input as { command?: unknown }).command
                       : '';
@@ -1099,6 +1198,12 @@ export class ClaudeRuntime implements AgentRuntime {
                       projectKey: config.gitGrantKey ?? null,
                       sessionLabel: config.sessionLabel ?? null,
                       runLeakGate: () => runLeakGateForRepo(config.gitRepoPath),
+                      repoFingerprint: () => repoContentFingerprint(config.gitRepoPath),
+                      // BUG-231 — this decision is THE decision for this Bash call: the
+                      // shim redeems it per invocation instead of deciding again.
+                      window: gitWindowKey && i.tool_use_id
+                        ? { binding: gitWindowKey, toolUseId: i.tool_use_id, agentKey: i.agent_id ?? 'main', shimReachesCli: !!gitShim && config.gitShimReachesCli === true }
+                        : null,
                     });
                     if (!g.allow) {
                       if (g.gateFailed) announceGitWrite('gate-blocked', g.offender ?? 'git', config.sessionLabel);
@@ -1198,19 +1303,44 @@ export class ClaudeRuntime implements AgentRuntime {
                       hookSpecificOutput: {
                         hookEventName: 'PreToolUse' as const,
                         permissionDecision: 'deny' as const,
-                        permissionDecisionReason:
-                          'Orchestrator tool profile: the permission decision could not be evaluated ' +
-                          `(${(err as Error)?.message ?? String(err)}); denied (fail closed, FEAT-152). Dispatch a lane instead.`,
+                        permissionDecisionReason: profileEvalFailedReason(
+                          (err as Error)?.message ?? String(err),
+                        ),
                       },
                     };
                   }
                   return {};
                 }
-              },
+              }),
             ],
           },
         ],
       };
+      /*
+       * BUG-231 — SETTLE each Bash call's git decision when the call ends. The hook's
+       * decision for a Bash git write is a window the shim redeems; it must end with
+       * the tool call so a reserved once-grant nothing used is released, and so no
+       * window can authorise a write after its call is over. tool_use_id names it.
+       * (Turn end and close() end every window of the session as the backstop.)
+       */
+      if (gitBlockOn && gitWindowKey) {
+        const settle = async (input: unknown) => {
+          endGitCall((input as { tool_use_id?: unknown } | undefined)?.tool_use_id);
+          return {};
+        };
+        options.hooks = {
+          ...options.hooks,
+          PostToolUse: [...(options.hooks.PostToolUse ?? []), { hooks: [settle] }],
+          PostToolUseFailure: [...(options.hooks.PostToolUseFailure ?? []), { hooks: [settle] }],
+          PermissionDenied: [...(options.hooks.PermissionDenied ?? []), { hooks: [settle] }],
+          // A subagent that ended cannot still be inside one of its tool calls.
+          SubagentStop: [...(options.hooks.SubagentStop ?? []), { hooks: [async (input: unknown) => {
+            const a = (input as { agent_id?: unknown } | undefined)?.agent_id;
+            if (typeof a === 'string' && a) endGitWriteAgent(gitWindowKey, a);
+            return {};
+          }] }],
+        };
+      }
     }
     if (config.resume) {
       options.resume = config.resume;
@@ -1335,6 +1465,12 @@ export class ClaudeRuntime implements AgentRuntime {
     await this.#query.interrupt();
   }
 
+  /** FEAT-154 (round 6) — the engine's own per-task stop (`stop_task`). */
+  async stopTask(taskId: string): Promise<void> {
+    if (!this.#query) throw new Error('runtime not started');
+    await this.#query.stopTask(taskId);
+  }
+
   async setPermissionMode(mode: string): Promise<void> {
     if (!this.#query) throw new Error('runtime not started');
     await this.#query.setPermissionMode(mode as never);
@@ -1375,6 +1511,8 @@ export class ClaudeRuntime implements AgentRuntime {
 
   close(): void {
     this.#closed = true; // FEAT-055: stops a pending gate from pushing into an ended queue
+    // BUG-231 — the session is ending: no git decision window of it may outlive it.
+    if (this.#gitWindowKey) endGitWriteToolCalls(this.#gitWindowKey);
     // FEAT-129 — stop the file-lock heartbeat. The session is ending; its locks
     // must no longer be kept fresh, so they fall to the TTL backstop and release.
     if (this.#fileLockHeartbeat) { clearInterval(this.#fileLockHeartbeat); this.#fileLockHeartbeat = null; }
@@ -1392,9 +1530,18 @@ export class ClaudeRuntime implements AgentRuntime {
     // addition is the BUG-118 drift watch below, which never alters a message.
     const inner = this.#query as unknown as AsyncIterable<RuntimeMessage>;
     const note = (m: RuntimeMessage) => this.#noteSessionId(m);
+    // BUG-231 — a turn's `result` means every tool call of that turn has ended, so
+    // every git decision window of the session ends with it (the backstop for a call
+    // whose Post event never came); so does the end of the stream.
+    const key = this.#gitWindowKey;
+    const endTurn = (m: RuntimeMessage) => { if (key && (m as { type?: unknown }).type === 'result') endGitWriteToolCalls(key); };
     return {
       async *[Symbol.asyncIterator]() {
-        for await (const msg of inner) { note(msg); yield msg; }
+        try {
+          for await (const msg of inner) { note(msg); endTurn(msg); yield msg; }
+        } finally {
+          if (key) endGitWriteToolCalls(key);
+        }
       },
     };
   }

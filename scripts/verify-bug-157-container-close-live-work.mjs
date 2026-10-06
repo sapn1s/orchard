@@ -40,9 +40,12 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { ownerKeyFor, removeOwnedContainer, removeOwnedImages, pruneOwnedImages, refuseTakenName } from './lib/owned-docker.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-b157c-data-'));
+// FEAT-158: cleanup removes only containers THIS scratch server owns (the name is a fixed slug).
+const OWNER = await ownerKeyFor(DATA);
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-b157c-work-'));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let pass = 0, fail = 0;
@@ -93,6 +96,7 @@ try {
   if (created.status !== 201) throw new Error(`create failed: ${JSON.stringify(created.body)}`);
   const pid = created.body.project.id;
   cname = `claude-station-${pid}`;
+  refuseTakenName(cname); // FEAT-158: never adopt another instance's same-named container
   console.log(`project=${pid} container=${cname} work=${WORK}`);
 
   /* ============ A: socket drop with a LIVE background agent ============ */
@@ -184,7 +188,7 @@ try {
   fail++;
   console.error(`\nHARNESS ERROR: ${err.stack}`);
 } finally {
-  try { if (cname) execFileSync('docker', ['rm', '-f', cname], { stdio: 'pipe' }); } catch {}
+  try { removeOwnedContainer(cname, OWNER); } catch {}
   try { process.kill(-server.pid, 'SIGTERM'); } catch {}
   await sleep(1500);
   try { process.kill(-server.pid, 'SIGKILL'); } catch {}

@@ -502,8 +502,10 @@ async function main() {
         console.log(`VERIFY-FIX-LOOP: VERIFIED after ${n} round(s).`);
         if (opts.noFinalCross && role !== 'final') console.log('  NOTE: cross-provider final verdict was explicitly disabled (--no-final-cross); this HOLDS is single-provider.');
         printRounds();
-        console.log('\nPaste-ready (the final round):');
-        console.log(`- **Verified-by:** dispatch ${provider}${model ? `/${model}` : ''} run ${v.runId ?? 'UNKNOWN-RUN-ID'} (clean-room via verify-fix-loop) — VERDICT: HOLDS`);
+        // BUG-225 r3: record a TYPED entry through the board tool — a pasted
+        // prose `Verified-by:` line counts for nothing.
+        console.log('\nRecord it (the final round):');
+        console.log(`  node scripts/board-tool.mjs verified --id=<TICKET> --provider=${provider}${model ? ` --model=${model}` : ''} --run=${v.runId ?? 'UNKNOWN-RUN-ID'} --verdict=HOLDS`);
         process.exit(0);
       }
       pendingFinal = true; // the next round is the cross-provider last word

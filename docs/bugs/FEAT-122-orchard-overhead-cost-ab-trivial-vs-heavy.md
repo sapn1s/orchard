@@ -1,6 +1,6 @@
 # FEAT-122 — Measure Orchard's per-task cost overhead (A/B: bare CLI vs full Orchard), trivial vs heavy
 
-- **Status:** OPEN — finding recorded (measurement complete; see log). No code change.
+- **Status:** NOT-A-BUG — measurement-only finding recorded (measurement complete; see log). No code change. Closed 2026-09-29.
 - **Severity:** low
 - **Area:** analysis / cost-model (FEAT-086 family)
 - **Reported:** 2026-09-04 by dispatched lane (cost experiment, round 2)
@@ -69,3 +69,8 @@ whenever they dispatch; it is a delta only on trivial work, where bare sometimes
 - **Symptom of a deeper design flaw?** no — the overhead is the cost of what Orchard buys
   (traceability, forced verification independence, a durable per-lane record). The decision-relevant
   finding is that it amortises to ~nil on real work.
+
+### 2026-09-29 — closing (verifying, round 1)
+- **Closed as NOT-A-BUG (measurement-only finding; no defect, no code to build).**
+- **Recheck (current tree):** the ticket is a docs-only cost measurement (Arm A/B, trivial vs heavy) with figures recorded 2026-09-04 from `scripts/lib/cost-model.mjs` over real transcripts; it names no code change and lists none. Method doc `docs/analysis/COST-METHOD.md` and the corrected model `scripts/lib/cost-model.mjs` are the cited artifacts; scratch projects were deregistered/deleted after measurement. Nothing to re-run or build — the finding stands as recorded.
+- **Symptom of a deeper design flaw?** no — the overhead is the cost of what Orchard buys and amortises to ~nil on real work (per the 2026-09-04 log).

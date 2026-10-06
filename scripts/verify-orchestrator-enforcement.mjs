@@ -27,9 +27,13 @@ import {
   decide,
   decideBashCommand,
   bashSegmentHead,
+  stillAvailableHere,
+  allowedBashHeads,
+  restrictedBashHeads,
   ENFORCE_ALLOWED_TOOLS,
   ENFORCE_ALLOWED_BASH,
   ENFORCE_DENIED_GIT_SUBCOMMANDS,
+  KNOWN_DENIED,
 } from './lib/orchestrator-profile.mjs';
 
 let pass = 0;
@@ -112,6 +116,195 @@ ok('no tool named Dispatch is in the policy (it does not exist in this harness)'
   !ENFORCE_ALLOWED_TOOLS.includes('Dispatch'));
 ok('an unknown future tool is denied by default, not allowed by default',
   decide({ toolName: 'BrandNewToolName' }).allow === false);
+
+/* ═══ 3b. ListAgents — the orchestrator's lane-LIVENESS read (BUG-226) ══════
+ * WA §C REQUIRES confirming a lane is alive from ground truth before treating
+ * it as dead or re-dispatching. `ListAgents` (the SDK's `ListPeers`) is the read
+ * that answers it: the dispatched lanes and their busy/idle status — names and
+ * state, no tree reading. It was never NAMED in ENFORCE_ALLOWED_TOOLS, so it
+ * fell to default-deny: dispatch/steer/stop a lane were all allowed, while the
+ * one verb that CHECKS whether the lane still runs was refused. Pinned both ways.
+ */
+ok('orchestrator keeps ListAgents (lane liveness, WA §C)',
+  decide({ toolName: 'ListAgents' }).allow === true);
+ok('ListAgents is in the one allow-list declaration (ARCH-010 — one owner)',
+  ENFORCE_ALLOWED_TOOLS.includes('ListAgents'));
+{
+  /*
+   * MUST-FAIL PROOF — synthesized pre-fix declaration, NOT HEAD-anchored
+   * (docs/CONVENTIONS.md). The allowlist before this fix was exactly the current
+   * one minus ListAgents, and a non-Bash tool is allowed IFF it is named in that
+   * list (see decide()'s final branch). Reconstruct the pre-fix list and model
+   * that same decision to show the old declaration refused ListAgents — so this
+   * proof keeps biting even after the fix is committed.
+   */
+  const PRE_FIX_ALLOWED = ENFORCE_ALLOWED_TOOLS.filter((t) => t !== 'ListAgents');
+  const preFixWouldAllow = (name) => name === 'Bash' || PRE_FIX_ALLOWED.includes(name);
+  ok('MUST-FAIL: the pre-fix allowlist refused ListAgents (the proof is real)',
+    preFixWouldAllow('ListAgents') === false);
+  // Non-vacuity: the reconstruction still ALLOWS what the profile has always
+  // allowed, so the proof above is about ListAgents specifically, not a broken model.
+  ok('MUST-FAIL non-vacuity: the pre-fix model still allowed Agent and SendMessage',
+    preFixWouldAllow('Agent') === true && preFixWouldAllow('SendMessage') === true);
+}
+ok('the still-available prose names ListAgents so a blocked session is told it has the liveness read',
+  /ListAgents/.test(decide({ toolName: 'Read' }).reason ?? ''));
+
+/* ═══ 3c. "Still available here" prose is GENERATED from the allowlist (BUG-226) ══
+ * The round-1 clean-room verify (dispatch anthropic run 9a3e17fc…, VERDICT BROKEN)
+ * found the hand-written prose OMITTED 9 tools ENFORCE_ALLOWED_TOOLS allows —
+ * TaskCreate/Update/Get/List, Workflow, Skill, TodoWrite, ExitPlanMode, ToolSearch.
+ * The round-1 test only regex-checked the prose for "ListAgents"; it never diffed
+ * the prose against the allowlist, so the drift was invisible. The fix builds the
+ * line FROM the allowlist (ARCH-010 — one owner, read everywhere else), so the two
+ * can't drift. Asserted against the REAL message a blocked session sees
+ * (decide().reason), not only the helper, in BOTH directions, with a must-FAIL
+ * reddening on the exact pre-fix hand-list this replaced.
+ */
+{
+  const reason = decide({ toolName: 'Read' }).reason ?? '';
+  // Direction 1 — every non-Bash allowed tool is named in the message the user reads.
+  const omitted = ENFORCE_ALLOWED_TOOLS.filter((t) => t !== 'Bash' && !reason.includes(t));
+  ok('the "Still available here" prose names EVERY tool in the allowlist (none omitted)',
+    omitted.length === 0, `omitted: ${omitted.join(', ')}`);
+  // The 9 tools the round-1 hand-list silently dropped are specifically present now.
+  for (const t of ['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'Workflow',
+    'Skill', 'TodoWrite', 'ExitPlanMode', 'ToolSearch']) {
+    ok(`the prose now names ${t} (BUG-226 P3 — was omitted pre-fix)`, reason.includes(t));
+  }
+  // Bash is described from its own single owner (ENFORCE_ALLOWED_BASH), so the
+  // Bash-subset wording is derived and accurate rather than a hand gloss that drifts.
+  const bashOmitted = [...new Set(ENFORCE_ALLOWED_BASH)].filter((h) => !reason.includes(h));
+  ok('the prose lists the Bash command heads from ENFORCE_ALLOWED_BASH (derived, accurate)',
+    bashOmitted.length === 0, `omitted heads: ${bashOmitted.join(', ')}`);
+  // Direction 2 — EXACTLY the allowlist: it must claim no tool decide() actually
+  // denies. KNOWN_DENIED minus anything the enforcement list allows is the set of
+  // genuinely-refused names; none may appear as a standalone word in the line.
+  const lineText = stillAvailableHere().join(' ');
+  const claimedButDenied = [...new Set(KNOWN_DENIED)].filter(
+    (t) => !ENFORCE_ALLOWED_TOOLS.includes(t) && new RegExp(`\\b${t}\\b`).test(lineText),
+  );
+  ok('the prose claims NO tool outside the allowlist (lists EXACTLY the allowlist)',
+    claimedButDenied.length === 0, `claimed but denied: ${claimedButDenied.join(', ')}`);
+
+  /*
+   * MUST-FAIL PROOF — the exact pre-fix HAND-LIST this fix replaced, synthesized
+   * here (NOT read from HEAD, per docs/CONVENTIONS.md) so it keeps biting after
+   * commit. Applying direction 1's check to the old prose must FAIL, proving the
+   * guard catches drift rather than passing vacuously. `>= 9` not `=== 9` so a
+   * future tool ADDED to the allowlist (more omissions) does not spuriously redden.
+   */
+  const PRE_FIX_PROSE =
+    'Still available here: Agent, SendMessage, TaskStop, ListAgents (lane ' +
+    'liveness — names + busy/idle), AskUserQuestion, Edit, Write, and Bash for ' +
+    'npm/node/git/status commands (the gate, the board, your own commits).';
+  const preFixOmitted = ENFORCE_ALLOWED_TOOLS.filter((t) => t !== 'Bash' && !PRE_FIX_PROSE.includes(t));
+  ok('MUST-FAIL: the pre-fix hand-list omits allowlisted tools (guard bites on real drift)',
+    preFixOmitted.length >= 9, `pre-fix omitted ${preFixOmitted.length}: ${preFixOmitted.join(', ')}`);
+}
+
+/* ═══ 3d. SINGLE AUTHORITY: every refusal carries the help, and the help names
+ *        ONLY what the two deciders actually allow (BUG-226 round 3) ════════
+ * Round 1 broke via a hand-list; round 2 broke via (a) a SECOND refusal path
+ * (invalidBypassReason) with no help, and (b) the Bash half advertising `npx`
+ * which decideBashCommand refuses unconditionally. The redesign: every refusal
+ * is built by ONE function, and the help's tool/Bash sets are derived from the
+ * SAME authority that grants (decide / decideBashCommand), not a parallel list.
+ */
+{
+  const RE = (w) => new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+
+  // ── Property A: EVERY refusal path carries the help ──────────────────────
+  // Three decide() refusal routes — a non-Bash tool, a read-shaped Bash command,
+  // and a Bash command with a PRESENT-but-INVALID ORCH-BYPASS marker (the second
+  // route round-2 (a) found carrying no help). All must name the help now.
+  const refusalPaths = [
+    ['non-Bash tool', decide({ toolName: 'Read', toolInput: { file_path: '/x' } })],
+    ['read-shaped Bash', decide({ toolName: 'Bash', toolInput: { command: 'grep -rn x /' } })],
+    ['invalid ORCH-BYPASS marker',
+      decide({ toolName: 'Bash', toolInput: { command: '# ORCH-BYPASS: x\ngrep -rn x /' } })],
+  ];
+  for (const [label, d] of refusalPaths) {
+    ok(`refusal path "${label}" is refused`, d.allow === false, JSON.stringify(d).slice(0, 120));
+    ok(`refusal path "${label}" carries "Still available here"`,
+      /Still available here/.test(d.reason ?? ''));
+    const toolsMissing = ENFORCE_ALLOWED_TOOLS.filter((t) => t !== 'Bash' && !RE(t).test(d.reason ?? ''));
+    ok(`refusal path "${label}" names every allowlisted tool`,
+      toolsMissing.length === 0, `missing: ${toolsMissing.join(', ')}`);
+  }
+  // The invalid-bypass route specifically is the round-2 (a) regression — pin it.
+  ok('the invalid-ORCH-BYPASS refusal names the liveness read (help is present, not just a stub)',
+    /ListAgents/.test(refusalPaths[2][1].reason ?? ''));
+
+  // ── Property B: every ADVERTISED Bash head has an allowed shape ───────────
+  // Token-match the GENERATED Bash line (NOT reason.includes over the whole
+  // message — the read-shaped refusal already contains "(node/npm only)", which
+  // would mask a dropped head; plan-review finding 6).
+  const bashLine = stillAvailableHere().find((l) => /allowed heads:/.test(l)) ?? '';
+  // Parse the head list the line actually advertises (delimiter-based, so a
+  // non-word head like `[` or `[[` is matched exactly, not via \b which they fail).
+  const headTokens = (bashLine.split('allowed heads:')[1] ?? '').split(/,\s*/).map((s) => s.trim());
+  const advertised = allowedBashHeads();
+  const PROBE = (h) => [h, `${h} ./x.mjs`];
+  for (const h of advertised) {
+    ok(`advertised head "${h}" appears as a token in the generated Bash line`,
+      headTokens.includes(h), bashLine);
+    ok(`advertised head "${h}" has at least one shape decideBashCommand ALLOWS`,
+      PROBE(h).some((p) => decideBashCommand(p).allow));
+  }
+  // The round-2 (b) offender, both directions: npx is neither advertised nor allowed.
+  ok('npx is NOT in the advertised Bash heads (round-2 b)', !advertised.includes('npx'));
+  ok('npx is NOT a token in the generated Bash line', !headTokens.includes('npx'));
+  ok('decideBashCommand refuses `npx tsx x` (the real authority)',
+    decideBashCommand('npx tsx x').allow === false);
+  ok('`node` IS advertised (bare node is refused but `node <script>` is allowed — not dropped)',
+    advertised.includes('node') && headTokens.includes('node'));
+
+  // Restricted heads are a subset of advertised (finding 4 — npx must not sneak
+  // back as "restricted", which would imply some shape of it works).
+  const restricted = restrictedBashHeads();
+  ok('restricted heads are a subset of the advertised heads',
+    restricted.every((h) => advertised.includes(h)), `restricted: ${restricted.join(', ')}`);
+  ok('npx is NOT named as a restricted head', !restricted.includes('npx'));
+
+  // ── Property C: the Bash prose does not PROMISE git commits (finding 3) ───
+  // The git-write block is default-ON and denies commits before decide() runs, so
+  // advertising "your own commits" is advertising a refused command one layer up.
+  ok('the generated help does not promise git commits', !/your own commits?/i.test(stillAvailableHere().join(' ')));
+
+  // ── MUST-FAIL (a): the pre-fix invalid-bypass message had NO help ─────────
+  // Synthesized pre-fix text (NOT read from HEAD — docs/CONVENTIONS.md), so the
+  // proof keeps biting after commit. The guard above must distinguish it from the
+  // fixed message.
+  const PRE_FIX_INVALID_BYPASS = [
+    'Orchestrator tool profile: the `# ORCH-BYPASS:` marker on this command is not usable — the reason is missing.',
+    '',
+    "The escape hatch needs a real reason on the command's FIRST line, e.g.:",
+    '    # ORCH-BYPASS: need the live gate exit status to decide whether to commit now',
+    'then the command itself on the following line(s).',
+  ].join('\n');
+  ok('MUST-FAIL (a): the pre-fix invalid-bypass message OMITS "Still available here" (guard is real)',
+    !/Still available here/.test(PRE_FIX_INVALID_BYPASS));
+  ok('…and the fixed invalid-bypass message now CARRIES it',
+    /Still available here/.test(refusalPaths[2][1].reason ?? ''));
+
+  // ── MUST-FAIL (b): the pre-fix raw-allowlist advertisement named npx, which
+  // the decider refuses. Reconstruct the pre-fix advertiser (raw ENFORCE_ALLOWED_BASH
+  // with npx re-added) and show it names a head decideBashCommand refuses. ──────
+  const PRE_FIX_HEADS = [...new Set(['npx', ...ENFORCE_ALLOWED_BASH])];
+  const preFixAdvertisedButRefused = PRE_FIX_HEADS.filter(
+    (h) => !PROBE(h).some((p) => decideBashCommand(p).allow),
+  );
+  ok('MUST-FAIL (b): the pre-fix raw advertisement names a head decideBashCommand refuses',
+    preFixAdvertisedButRefused.includes('npx'), `offenders: ${preFixAdvertisedButRefused.join(', ')}`);
+  ok('…and the derived advertisement names NO head decideBashCommand refuses',
+    advertised.every((h) => PROBE(h).some((p) => decideBashCommand(p).allow)));
+
+  // ── Property D: every advertised TOOL is allowed by the real decide() ─────
+  for (const t of ENFORCE_ALLOWED_TOOLS.filter((t) => t !== 'Bash')) {
+    ok(`advertised tool "${t}" is allowed by decide()`, decide({ toolName: t }).allow === true);
+  }
+}
 
 /* ═══ 4. Bash: the two defects the real corpus found, pinned as must-FAIL ═══
  * Both of these PASSED a hand-written fixture set and FAILED the real data.

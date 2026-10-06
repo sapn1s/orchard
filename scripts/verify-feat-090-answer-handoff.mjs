@@ -27,7 +27,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
 import {
-  readBoard, boardStateSection, composeAnswerEntry, ticketAnswerState,
+  readBoard, boardStateSection, composeAnswerEntry, legacyProseAnswerState,
   boardAnswerBriefing, answeredAwaitingKeys,
 } from '../src/server/board.ts';
 import { answerTicket, readTicket, TicketError } from '../src/server/tickets.ts';
@@ -122,13 +122,16 @@ function partA() {
 
   // The ticket-detail parser round-trips the composer's output.
   const md1 = `# X\n## Activity log\n${dec}`;
-  const s1 = ticketAnswerState(md1);
+  // FEAT-166 r3: a composed heading in a string is display only now — answered state
+  // is the typed entry (answerTicket legs below). The composer grammar is still the
+  // contract of the FROZEN prose reader that built answers-legacy.frozen.json.
+  const s1 = legacyProseAnswerState(md1);
   check('ticketAnswerState(decision): kind=decision, chose B, note captured, awaiting=true',
     s1?.kind === 'decision' && s1?.chose?.key === 'B' && s1?.note === 'but ship D first' && s1?.awaiting === true, s1);
-  const s2 = ticketAnswerState(`# X\n## Activity log\n${ques}`);
+  const s2 = legacyProseAnswerState(`# X\n## Activity log\n${ques}`);
   check('ticketAnswerState(question): kind=question, awaiting=false (not a decision)',
     s2?.kind === 'question' && s2?.awaiting === false, s2);
-  const s3 = ticketAnswerState(`# X\n## Activity log\n${dec}\n### ${TODAY} — agent\n- picked it up.\n`);
+  const s3 = legacyProseAnswerState(`# X\n## Activity log\n${dec}\n### ${TODAY} — agent\n- picked it up.\n`);
   check('ticketAnswerState: a dated agent note AFTER the answer → awaiting=false',
     s3?.kind === 'decision' && s3?.awaiting === false, s3);
 
@@ -260,8 +263,10 @@ async function partB() {
   const turnsBefore = countTurnEnds(c.events);
 
   // Legacy rail route — the deleted auto-send WOULD have injected a turn here.
+  // FEAT-166 r3: the rail names the decision it showed (BoardItem.decisionKey).
+  const shownKey = (await (await fetch(`${BASE}/api/projects/${pid}/board`)).json()).needsYou?.find((i) => i.id === NEEDS_ID)?.decisionKey;
   const railAns = await (await fetch(`${BASE}/api/projects/${pid}/board/answer`, {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: NEEDS_ID, answer: 'go with csv' }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: NEEDS_ID, answer: 'go with csv', decisionKey: shownKey }),
   })).json();
   await sleep(1500);
   check('legacy /board/answer records the answer and DISPATCHES nothing (no delivered flag)',

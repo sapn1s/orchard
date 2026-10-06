@@ -457,13 +457,18 @@ async function armA6() {
     await waitEv(s.c, (e) => e.t === 'turn-end', 20_000);
     s.c.close();
     await stopServer(srv);
-    const [a, b] = await Promise.all([bootServer(w), bootServer(w)]);
+    // BUG-217 round 7: one data dir has ONE server (a kernel lock taken at boot), so the loser of this race is
+    // refused at boot (exit 78) instead of booting as a second adopter. Short wait, so the refusal is prompt.
+    const LOCK = { CLAUDE_STATION_DATA_LOCK_WAIT_MS: '1000' };
+    const raced = await Promise.allSettled([bootServer(w, LOCK), bootServer(w, LOCK)]);
+    const up = raced.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+    const refused = raced.filter((r) => r.status === 'rejected' && /exited early \(78\)[\s\S]*REFUSING TO START/.test(String(r.reason?.message))).length;
     await sleep(6_000);
-    const la = await liveSession(a, s.station); const lb = await liveSession(b, s.station);
-    const winners = [la, lb].filter((x) => x && x.adoptState === 'adopted').length;
+    const lives = await Promise.all(up.map((x) => liveSession(x, s.station)));
+    const winners = lives.filter((x) => x && x.adoptState === 'adopted').length;
     const bs = brokerState(w, s.station);
-    k.check('A6.3 two servers racing: exactly one adopts, the loser never reaps (broker running, CLI alive)',
-      winners === 1 && !!bs && bs.state !== 'draining' && bs.cli, { a: la?.adoptState ?? null, b: lb?.adoptState ?? null, broker: bs });
+    k.check('A6.3 two servers racing on one data dir: exactly one boots (the other is refused, exit 78) and adopts; the broker is never reaped (running, CLI alive)',
+      up.length === 1 && refused === 1 && winners === 1 && !!bs && bs.state !== 'draining' && bs.cli, { booted: up.length, refused, adopt: lives.map((x) => x?.adoptState ?? null), broker: bs });
     fakeCmd(w, s.cli, { op: 'hook', lane: 'LA' });
     const ans = await waitFor(() => answersFor(w, s.cli, 'LA')[0] ?? null, 5_000);
     k.check('A6.3 …and the winner answers', !!ans && ans.verdict === 'allow', { answer: ans });

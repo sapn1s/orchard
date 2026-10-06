@@ -95,7 +95,17 @@
     "FEAT-091",
     "BUG-109"
   ],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "ea4f1e87-01f8-4544-a104-79f5b9c1956b",
+      "verdict": "holds",
+      "verdict_on": "2026-09-29",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Step 1 of the migration only (boundary normalise at bulletLines + entryBody). The ARCH migration as a whole remains incomplete."
+    }
+  ],
   "verification_class": "arch",
   "body_slots": {
     "Diagnosis": true,
@@ -203,3 +213,80 @@ Boundary normalization fails silently when the inventory misses a source or a ne
   one with a live defect behind it. Keep the existing renderer normalisations until then: they are
   the safety net, and the class rule is satisfied by the boundary declaring the fact, not by
   deleting the net early.
+
+### 2026-09-29 — fixing lane, round 1 (worker): step 1 of option A landed at the two clean server sites
+
+- **Understood:** the migration's first landable step — normalize text as it ENTERS at the two
+  server entry points whose files are clean (`board.ts` `bulletLines`, `tickets.ts` `entryBody`).
+  Out of scope this round because other live sessions hold uncommitted edits there:
+  `src/server/index.ts` (~:263) and `src/server/orchard-transcripts.ts`. Confirmed clean before
+  editing: `git diff src/server/board.ts src/server/tickets.ts` empty; live-sessions poll shows
+  the dirty owners are FEAT-155/BUG-196 on index.ts/events.ts/app.js, not my two files.
+- **Reproduced the harm FIRST (must-FAIL before the fix).** Both sites composed a user
+  reply/note into a ticket's append-only Activity log while replacing `\r\n` ONLY, so a bare/lone
+  `\r` in the reply survived into the markdown record. Drove the REAL write path
+  (`appendNote` → `entryBody`, and the exported `composeAnswerEntry` → `bulletLines`) over a COPY
+  of the real `docs/bugs` board with a realistic 4-paragraph reply whose paragraphs are separated
+  by LF, CRLF and a lone CR. Pre-fix the record read
+  `…Third paragraph…vanishes.<CR>Fourth paragraph…` — P3 and P4 collapsed onto ONE physical line
+  with an embedded CR, so a CR-honouring renderer/terminal hides P3 (the ticket record the user
+  reads). Hypothesis confirmed: a lone CR at these entry points does hide content in the ticket
+  record. Command: `npx tsx scripts/verify-arch-006-boundary-normalise.mjs` → **8 passed, 6 failed**
+  (exit 1) against pre-fix code.
+- **Changed:** added ONE shared normaliser `normalizeLineEndings(text)` in
+  `src/server/board.ts` (owner's single declaration; `/\r\n?/g` collapses CRLF then lone CR to LF)
+  and applied it at `bulletLines` (was `/\r\n/g`); imported it into `src/server/tickets.ts` and
+  applied it at `entryBody` (was `/\r\n/g`). Per the ticket, renderer-level rules
+  (`LINE_ENDINGS_RE` in `public/lib/response-blocks.js`, the `public/lib/*` normalisations) STAY —
+  not removed — because sources feeding them are not yet all converted. New test:
+  `scripts/verify-arch-006-boundary-normalise.mjs`.
+- **Verified:** after the fix `npx tsx scripts/verify-arch-006-boundary-normalise.mjs` → **14
+  passed, 0 failed** (exit 0); the record now carries all four paragraphs on their own indented
+  continuation lines, no embedded CR. PART 0 is a git-independent must-FAIL anchored to a
+  synthesized pre-fix `\r\n`-only state (not a moving baseline). Anti-regression on the
+  composer/write-path suites: `verify-feat-090-followup` 13/13, `verify-bug-104-chose-roundtrip`
+  11/0. `verify-feat-090-answer-handoff` (23/24) and `verify-feat-090-answered-lane` (25/26) each
+  have ONE failing check — a live-session precondition and live-board answered-section ordering
+  respectively — both environment/live-board dependent, neither feeds reply text through the
+  composers I changed, so pre-existing, not a regression. `npm run gate` **PASS (exit 0)** incl.
+  typecheck (the export/import wiring compiles). `npm run board:check` exits 1 but every FAIL is a
+  pre-existing INDEX/status mismatch on obsolete tickets (BUG-143/150/164/166/FEAT-104/140 DONE-in-
+  Open, BUG-199 missing row) — orchestrator/INDEX-owned, none involve ARCH-006.
+- **Still open / handoff:** NEXT STEP — apply `normalizeLineEndings` at the remaining server
+  entry points once their owning lanes land: `src/server/index.ts` (~:263, the transcript/model
+  ingest) and `src/server/orchard-transcripts.ts`. After ALL sources feeding a given renderer are
+  converted, and only then, remove that renderer's own rule (`public/lib/*`,
+  `response-blocks.js` `LINE_ENDINGS_RE`). Do not mark VERIFIED: this is one step of a multi-step
+  migration and warrants an independent clean-room verify (touches an append-only record; a
+  regression-prone class). `work_state` left `open` (migration incomplete); INDEX untouched
+  (orchestrator-owned).
+
+### 2026-09-29 — clean-room verify lane, round 1 (driver): step 1 HOLDS (VALID)
+
+- **Verified-by:** dispatch anthropic run ea4f1e87-01f8-4544-a104-79f5b9c1956b (clean-room,
+  `scripts/independent-verify.mjs --working-tree`, grey account — same-provider fallback, openai
+  exhausted; VERIFY.md #5) — VERDICT: HOLDS, verdict-contract VALID.
+- **What was verified:** the step-1 boundary normaliser (`normalizeLineEndings` applied at
+  `board.ts` `bulletLines` via `composeAnswerEntry`, and `tickets.ts` `entryBody` via `appendNote`).
+  The independent verifier re-ran the fixer test (`npx tsx
+  scripts/verify-arch-006-boundary-normalise.mjs`, exit 0, 14/14) and then constructed adversarial
+  cases the fixer fixture does NOT cover, all exit 0: bare-CR-ONLY input, CR-then-CRLF/blank-line
+  mixes (`\r\r\n`, `\n\r\n`, `\r\n\r`), a leading/trailing lone CR, CRLF-only, and a CR-FREE
+  identity check byte-comparing the post-transform output against the pre-fix `entryBody`/
+  `bulletLines` rule — driven through the REAL `appendNote`/`readTicket` and `composeAnswerEntry`
+  over a copy of the real board, byte-comparing the file prefix before/after each append
+  (append-only-safety). No embedded CR survived; every paragraph landed on its own line; CR-free
+  input was byte-unchanged. The real board was provided to the clean room as a declared input
+  (`--allow-input docs/bugs`) because the fixer test drives the real write path over a real ticket.
+- **Verifier's own "could not test" (recorded honestly, not defects):** CR inside the OTHER fields
+  `composeAnswerEntry` writes (`question`, `chose` label, `author`/`label`) is not normalised — out
+  of scope (requirement covers the reply/note text only); the HTTP route handlers in
+  `src/server/index.ts` that also call these fns (that server entry point is a LATER migration step,
+  still not converted); and visual render in a real terminal/browser (checked structurally: no CR
+  byte, one paragraph per physical line).
+- **Scope of this verdict:** step 1 ONLY. This ARCH ticket tracks a multi-step migration; the
+  remaining server entry points (`index.ts` ~:263, `orchard-transcripts.ts`) and the eventual
+  removal of the renderer-level `public/lib/*` safeguards are NOT done. `work_state` stays `open`.
+  Whether/when to close the ARCH ticket is an orchestrator decision, not implied by this HOLDS.
+  Independent clean-room verify of step 1 is now satisfied per the fixer's handoff (append-only
+  record, regression-prone class). INDEX untouched (orchestrator-owned).

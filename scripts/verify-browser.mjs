@@ -17,6 +17,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { ownerKeyFor, removeOwnedContainer, removeOwnedImages, pruneOwnedImages, refuseTakenName } from './lib/owned-docker.mjs';
 
 /* Never a fixed port: two suites defaulting to the same number collide the
    moment both run (observed: verify-ui + verify-sessions on 4319). The OS
@@ -42,6 +43,8 @@ if (!SBMCP) {
 }
 const STATE = path.join(os.homedir(), '.stealth-browser-mcp');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-br-data-'));
+// FEAT-158: cleanup removes only containers THIS scratch server owns (the names are fixed slugs).
+const OWNER = await ownerKeyFor(DATA);
 const WORK_A = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-br-a-'));
 const WORK_B = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-br-b-'));
 /*
@@ -107,6 +110,7 @@ try {
   const a = (await api('/api/projects', 'POST', { hostPath: WORK_A, name: 'Br A' })).body.project;
   const b = (await api('/api/projects', 'POST', { hostPath: WORK_B, name: 'Br B' })).body.project;
   projects.push(a.id, b.id);
+  refuseTakenName(`claude-station-${a.id}`); refuseTakenName(`claude-station-${b.id}`); // FEAT-158
   const bad = await api(`/api/projects/${a.id}`, 'PATCH', { browser: { enabled: 'yes' } });
   // 30s is below the floor: shorter than that and the shared host daemon can
   // close Chrome inside the ~6s gap between a session starting and its first
@@ -345,7 +349,7 @@ try {
 } finally {
   section('cleanup');
   for (const id of projects) {
-    try { execFileSync('docker', ['rm', '-f', `claude-station-${id}`], { stdio: 'pipe' }); } catch { /* none */ }
+    try { removeOwnedContainer(`claude-station-${id}`, OWNER); } catch { /* none */ }
     try { execFileSync(process.execPath, [path.join(SBMCP, 'src/cli.mjs'), 'stop', id], { stdio: 'pipe' }); } catch { /* not running */ }
     fs.rmSync(path.join(STATE, 'projects', id), { recursive: true, force: true });
     fs.rmSync(path.join(os.homedir(), '.claude', 'projects', `-workspace-${id}`), { recursive: true, force: true });

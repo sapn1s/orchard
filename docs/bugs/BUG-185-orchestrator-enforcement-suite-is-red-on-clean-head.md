@@ -170,3 +170,71 @@ suite's oracle produces false expectations on multi-line dispatch prompts and on
   oracle mis-models will redden it again. Consider whether these two should be
   reported numbers with a small tolerance rather than hard equalities — deferred
   to close.)
+
+### 2026-09-29 — independent verification (BROKEN, VALID, reduced isolation)
+- **Requirement (plain terms):** `npm run verify:orchestrator-enforcement` must
+  pass green on a clean tree against the real corpus; the fix is to the suite's
+  OWN oracle (`isPureGateWork`/`decidableForOracle`/`readsAFile`/`readsViaGit`),
+  NOT to the policy `decideBashCommand` (which must stay unchanged); and the fix
+  must be robust by command SHAPE, not a hard-coded offender list. Requirement
+  written to a temp file, not the fixer's prose.
+- **Strategy: OPTION-B (read-only dispatch on the live checkout), NOT a clean
+  room.** The suite grades the REAL transcript corpus whose store path is derived
+  from the repository directory (`~/.claude/projects/<flattened repo path>`); a
+  stripped temp clean room resolves that to its own temp path, finds no corpus,
+  and SKIPS the load-bearing 139/0 grade. So a clean room cannot verify the
+  ticket's actual claim. Dispatched via `scripts/dispatch.mjs --sandbox read-only`
+  cwd = the live repo so the real corpus is reachable. REDUCED ISOLATION: no
+  clean-room strip, so the board/methodology are present on disk; the verifier was
+  instructed not to read `docs/bugs`/`docs/prompts`/CLAUDE.md and self-reported it
+  did not ("I haven't read the prohibited files") — mitigated, not architecturally
+  enforced.
+- **Command (tilde form):**
+  `node scripts/dispatch.mjs --provider openai --cwd ~/projects/orchard --sandbox read-only --timeout-min 22 --ticket BUG-185 --phase verifying --round 1 --class verify --meta-out <meta-file> --prompt-stdin < <prompt-file>`
+- **Verdict: BROKEN — VALID** (executed-evidence contract met by hand: fixer suite
+  re-run 139/0, adversarial probes with real output, explicit UNTESTED list;
+  dispatch.mjs has no auto contract-check, judged VALID on the reply's content).
+- **Confirmed GOOD:** suite PASSES 139/0 on the current real corpus (grown to 1686
+  calls · 494 Bash). `decideBashCommand` and every declaration before it are
+  BYTE-IDENTICAL to the pre-fix baseline (`prefix through decideBashCommand
+  identical: true`) — the policy was NOT weakened. The suite's non-vacuity proofs
+  still BITE: sabotaging `readsAFile→false` reddens 6 proofs, `isPureGateWork→false`
+  reddens 2.
+- **FINDING (the oracle is still not shape-robust — the ticket's own deeper-flaw
+  candidate, substantiated).** Three constructed shapes NOT yet in the corpus make
+  the oracle and the policy disagree, each verified by calling the real
+  `decideBashCommand` and the extracted oracle:
+  - `npm run gate; echo "$(cat package.json)"` → oracle `pureGate:true` (expects
+    ALLOW) but policy REFUSES (`offender:"cat"`). The oracle's data-strip removes
+    the `$(…)` substitution before classifying, but the POLICY inspects inside
+    `$(…)` and refuses — an asymmetry the Offender-B strip introduced.
+  - `npm run gate | node -e "console.log(1)"` → oracle `pureGate:true` but policy
+    REFUSES (`offender:"node -e"`). The Offender-A fix caught `&&`/`;`-chained
+    `node -e` but NOT the PIPE form; a piped non-gate executable still reads as
+    pure gate.
+  - `npm run gate; echo git diff` → oracle `readsAFile:true` (expects REFUSE) but
+    policy ALLOWS. Unquoted `git diff` PROSE as an `echo` argument is still read as
+    a git-read command by the oracle.
+  Net: the fix makes the current corpus green but does NOT make the oracle robust
+  to command shape (the stated bar). Any of these shapes entering the corpus
+  re-reddens the suite on a clean tree — exactly the structural fragility the
+  filing/fixing lanes both flagged.
+- **Could-not-test (verifier):** a genuinely clean tree (this live checkout had 80
+  unrelated modified tracked files — the verify script itself is unmodified vs
+  HEAD, established in the Repro, so 139/0 reflects the committed oracle);
+  synthetic strings were classified, not executed as shell workloads; oracle
+  mutations ran only the extracted proofs, not a full modified-corpus suite. Note:
+  the verifier observed commit 561ad6b also changed
+  `scripts/lib/orchestrator-profile.mjs` — that is the bundled FEAT-152 ORCH-BYPASS
+  addition to `decide()`, NOT the BUG-185 fix, and it left `decideBashCommand`
+  itself byte-identical.
+- **Verified-by:** dispatch openai run 01a0ec14-e263-7e32-bf37-79707f7141eb
+  (option-b read-only on live checkout, REDUCED isolation, `scripts/dispatch.mjs`)
+  — VERDICT: BROKEN
+- **Status:** stays OPEN. Handoff: the two brittle equalities are still shape-
+  fragile. Either (a) fix the oracle for the three shapes (pipe-borne non-gate
+  executables; substitution reads the policy honors; unquoted git-read prose as a
+  command argument), OR (b) take the deferred deeper-flaw option and demote the two
+  equalities to reported numbers with a tolerance, so the suite green-lights only
+  on a genuine regression. The `Symptom of a deeper design flaw?` candidate now has
+  independent evidence FOR it.

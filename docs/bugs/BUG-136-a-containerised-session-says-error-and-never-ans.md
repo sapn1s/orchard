@@ -242,3 +242,35 @@ self-healing.
   touching their registry entries or repos.
 
   regressed-from: none - this path predates BUG-136 and no prior fix touched it.
+
+### 2026-09-29 — clean-room independent verify (verifying, round 1) — NOT-RUN (infra); status unchanged
+
+Attempted an independent clean-room pass per `scripts/independent-verify.mjs` and could not run
+one honestly. Recording why, so the next lane does not re-derive it.
+
+- **No isolatable commit range.** BUG-136's fixes were committed pre-collapse (`41a9d6f`,
+  `632e178`, and the browser-socket fix in the third report); the 2026-08-25 history collapse
+  absorbed them all into the public-release root `609db5e`. None of those shas is reachable from
+  HEAD, the preserved branch `local-history-before-collapse-20260825` is NOT present in this
+  checkout (only `main` / `origin/main` exist), and no post-collapse commit re-touches these files
+  in isolation. So neither `--range <sha>` (no isolatable diff) nor `--working-tree` (the fix is
+  COMMITTED into the root, not an uncommitted edit; the dirty tree carries only other lanes' WIP)
+  can furnish the verifier a BUG-136 diff to attack. The fix code IS present in the current tree —
+  `staleFileBinds` in `src/server/container-manager.ts` and the `resultText` turn-end label in
+  `public/app.js` both confirmed by inspection — it simply has no reviewable boundary.
+- **No repeatable repro.** There is no `verify-bug-136-*` script (confirmed). The ticket's three
+  passes were all proven MANUALLY on the LIVE system — a real drifted container with an orphaned
+  credentials inode (link count 0), a real `docker create`/`ensureContainer`, and a real
+  `type:'start'` over the live ws. A stripped clean room has no Docker daemon and cannot reproduce
+  the user's drifted container, so the drift-detection and recreate criteria are not clean-room
+  testable as they stand.
+- **Handoff to make this verifiable:** (a) write a `verify-bug-136` script that unit-tests
+  `staleFileBinds` inode-identity logic against fabricated file/dir binds (host-inode vs
+  container-held-inode mismatch → one drift reason naming the bind; healthy bind and directory bind
+  → no reason; docker/stat surprise → no reason) AND the turn-end `endLabel` `resultText` path
+  (is_error turn with terminal reason `completed` → engine's sentence, never the bare `success`
+  subtype); then run it clean-room against the current tree. OR (b) recover the pre-collapse
+  commits from the backup bundle under `~/scratch/orchard-backup-20260825/` to obtain a real
+  `--range 41a9d6f^..<browser-socket-fix>` boundary. Until one of these exists, an independent
+  verdict cannot be produced.
+- **Status: unchanged** (not flipped to VERIFIED). No code, no verdict — infra/not-run only.

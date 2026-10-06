@@ -6,7 +6,10 @@ import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { dataDir, registryFile, slugify, writeAtomic, ensureDir, scratchDir } from '../lib/paths.ts';
+import { dataDir, registryFile, slugify, writeAtomic, ensureDir, scratchDir, projectRoot } from '../lib/paths.ts';
+// BUG-223 round 4 — the registration-time classification of `settings.laneDocker`.
+// lane-docker.mjs imports only paths.ts and docker-sandbox.mjs, so there is no cycle.
+import { classifyLaneDocker, type LaneDockerSetting } from '../../scripts/lib/lane-docker.mjs';
 import type { Isolation } from './events.ts';
 // BUG-144 — the single Working-Agreement mutation source (wiring.ts imports only
 // TYPES + toolSettingsOf back from here, and both sides use their imports lazily
@@ -22,6 +25,7 @@ import { reflinkProbe } from './snapshots.ts';
 // FEAT-133 — provisioning does NOT import registry, so this is a plain (acyclic)
 // dependency: the one owner of "is the host Playwright MCP present?" (ARCH-010).
 import { hostPlaywrightBinExists } from './provisioning.ts';
+import { readCatalog } from './base-releases.ts';
 import {
   readGlobalDefaults,
   PROJECT_SETTINGS_SEED_KEYS,
@@ -73,10 +77,65 @@ export interface ContainerSettings {
   dockerSocket: boolean;
   memoryMb: number;
   pidsLimit: number;
+  /**
+   * GPU passthrough (`docker create --gpus all`). Tri-state:
+   *   'auto' — on IFF the host actually supports it (nvidia-smi present AND the
+   *            docker daemon has an nvidia runtime or CDI configured). This is
+   *            the default: a project pays nothing on a host with no GPU stack,
+   *            and gets the GPU automatically once the host is set up — matching
+   *            "on by default when the host supports it". See hostGpuAvailable().
+   *   'on'   — force it on. `docker create` will fail loudly if the host lacks
+   *            the toolkit; that surfaced error is better than a silent no-op.
+   *   'off'  — never, even on a capable host (a project that wants no GPU blast
+   *            radius). Blast radius matters because `--gpus all` on a rootful
+   *            daemon exposes ALL host GPUs, incl. the display GPU, to the
+   *            container — so this stays a per-project knob, not a global on.
+   */
+  gpu: 'auto' | 'on' | 'off';
+  /**
+   * Extra environment variables set on the session container (`docker create
+   * --env`). Propagates to the CLI and everything it spawns inside. Project
+   * scope only — same reason mounts are (see desiredBinds / FEAT-145): env is
+   * baked into the container at create time, so a per-session value would
+   * recreate the container under every other session on the project. Use it for
+   * things like PYTHONPATH; secrets belong in a mounted file, not here.
+   */
+  env: Record<string, string>;
+  /**
+   * FEAT-155 item 3 — mount the repo at BARE `/workspace` (and run there)
+   * instead of `/workspace/<id>`, for projects whose scripts hardcode
+   * `/workspace/...`. Default false. Session-history identity does NOT move with
+   * it: the host store dir stays `containerStoreDirName(project)` either way
+   * (container-manager.ts owns that fact), only the container side of the
+   * history bind follows the cwd. Toggling it is drift (workdir + bind change),
+   * so it recreates the container once.
+   */
+  workspaceRoot: boolean;
+  /**
+   * FEAT-155 round 5 — build this project's image from a Dockerfile IN ITS OWN
+   * REPO (path relative to the repo root), instead of using `image` or
+   * Orchard's own. Orchard builds it with the repo as context, tags it with a
+   * hash of the Dockerfile + build inputs, rebuilds when that changes (checked
+   * at every session launch), and keeps the last good image running when a
+   * build fails. Wins over `image` when both are set (`imageSourceOf` in
+   * container-manager.ts is the one place that decides). The Dockerfile
+   * controls image CONTENTS only: user, entry command, capabilities, mounts,
+   * GPU, memory and network are pinned by Orchard at `docker create`.
+   */
+  dockerfile: string | null;
+  /**
+   * FEAT-157 — the Orchard base release this project is pinned to, plus skipped
+   * and deferred versions. Written ONLY by the base-update routes, project
+   * creation and the one-time migration (never the settings PATCH); read through
+   * `container-manager.ts` `basePinRawOf` / `base-releases.ts` `parsePin`, and the
+   * target a launch builds comes from `base-releases.ts` `baseTarget` alone.
+   * Absent on registries written before FEAT-157 (the migration fills it).
+   */
+  base?: import('./base-releases.ts').BasePin | null;
 }
 
 export function defaultContainerSettings(): ContainerSettings {
-  return { image: null, dockerSocket: false, memoryMb: 8192, pidsLimit: 4096 };
+  return { image: null, dockerSocket: false, memoryMb: 8192, pidsLimit: 4096, gpu: 'auto', env: {}, workspaceRoot: false, dockerfile: null };
 }
 
 /** Container settings with defaults filled in for registries written earlier. */
@@ -385,6 +444,44 @@ export interface ProjectSettings {
    * Read it through `methodVersionOf()`.
    */
   methodVersion?: number;
+  /**
+   * BUG-223 round 4 — which Docker daemon this project's DIRECT sessions and its
+   * dispatched lanes reach: 'sandbox' (the FEAT-158 sandbox: DOCKER_HOST at its socket,
+   * inherited by every child) or 'host' (the host daemon, for a project whose own
+   * compose stack lives there). DECLARED, never derived at spawn (ARCH-010): written
+   * once at registration by `classifyLaneDocker` (sandbox iff the project holds an
+   * Orchard checkout), once for older rows by scripts/classify-lane-docker.mjs, and
+   * flipped by the user in Settings → Isolation. Read only by `laneDockerEnv`
+   * (scripts/lib/lane-docker.mjs), from this registry. Absent = undeclared, which that
+   * reader treats as 'sandbox' (fail-safe) and logs. Container sessions are unaffected
+   * (their `docker exec` runs with the server's env).
+   */
+  laneDocker?: LaneDockerSetting;
+  /**
+   * FEAT-164 — the PERMANENT agent git-write grant for this project. DECLARED here,
+   * once (ARCH-010): written only by `setGitWritePermanent` (called by the
+   * user-facing grant route, never by the generic settings PATCH, which rejects the
+   * key), and read only by `gitWritePermanentOf`, the source the git-grant store
+   * consults at call time for every agent git write. Absent/null/anything but
+   * `{ permanent: true }` = no permanent grant. It never lifts the leak gate.
+   */
+  gitWrite?: { permanent: boolean; grantedAt?: string; grantedVia?: string } | null;
+}
+
+/** FEAT-164 — the declared permanent git-write grant of a project, or null. The
+ * ONE reader; the git-grant store calls it per decision, so a revoke bites on a
+ * running session's next git write. Throws only if the registry is unreadable,
+ * which the store treats as "no grant" (fail closed). */
+export function gitWritePermanentOf(projectId: string): { permanent: boolean; grantedAt?: string; grantedVia?: string } | null {
+  return getProject(projectId)?.settings?.gitWrite ?? null;
+}
+
+/** FEAT-164 — the ONE writer of the permanent grant. `on:false` clears it. */
+export function setGitWritePermanent(projectId: string, on: boolean, opts: { via?: string } = {}): Project {
+  const value = on
+    ? { permanent: true, grantedAt: new Date().toISOString(), grantedVia: String(opts.via || 'user') }
+    : null;
+  return updateProject(projectId, { settings: { gitWrite: value } as unknown as ProjectSettings });
 }
 
 /**
@@ -777,6 +874,19 @@ export function createProject(input: CreateProjectInput): Project {
     settings.tools = t.tools;
     toolPreflight = t.preflight;
   }
+  // BUG-223 round 4 — declare the project's lane Docker daemon now, once, unless the
+  // request named it. Never re-derived later: laneDockerEnv reads this value.
+  if (!input.settings?.laneDocker) {
+    const c = classifyLaneDocker(hostPath, { checkouts: [projectRoot()] });
+    settings.laneDocker = c.value;
+    console.log(`[orchard] BUG-223: project ${id} (${hostPath}) declared laneDocker=${c.value}: ${c.reason}`);
+  }
+  // FEAT-157 — a new container project is pinned to the newest base release at
+  // creation (it has nothing running to preserve), unless the request set a pin.
+  if (resolved.isolation === 'container' && !(input.settings?.container && 'base' in (input.settings.container as object))) {
+    const cat = readCatalog();
+    if (cat.ok) settings.container = { ...defaultContainerSettings(), ...(settings.container ?? {}), base: { pinned: cat.newest.version, hash: cat.newest.hash, skipped: [], deferred: null } };
+  }
   const project: Project = {
     id,
     name,
@@ -846,6 +956,14 @@ export function ensureScratchProject(): Project {
   // backfill sees it as already handled.
   project.settings.instructions = coherentWaStack(project);
   project.settings.methodVersion = CURRENT_METHOD_VERSION;
+  // BUG-223 round 4 — scratch is registered here, not through createProject, so it
+  // declares its lane Docker daemon here. Round 5 (attacker p1 break 2): it is ALWAYS
+  // 'sandbox', never classified. Scratch is Orchard's own throwaway catch-all; its
+  // directory outlives the row, so classifying it after a delete/re-ensure read a
+  // previous session's leftovers and declared 'host' that nobody chose. The user can
+  // still flip it in Settings.
+  project.settings.laneDocker = 'sandbox';
+  console.log(`[orchard] BUG-223: project ${SCRATCH_PROJECT_ID} (${hostPath}) declared laneDocker=sandbox: the scratch project always starts on the safe side`);
   reg.projects.push(project);
   save(reg);
   return project;
@@ -928,6 +1046,20 @@ export function updateProject(id: string, patch: Partial<Omit<Project, 'id' | 'c
     // Re-declare identity from the directory we were just pointed at. A repoint
     // is a user-initiated write of this row, so this is not a silent capture.
     next.identity = captureIdentity(next.hostPath);
+    /*
+     * BUG-223 round 4 (attacker break 2) — the declared laneDocker was classified for the
+     * OLD directory. A repoint is a re-registration of the row's directory, so classify the
+     * new one now, and move the value only to the SAFE side: a new directory that holds an
+     * Orchard checkout (or is empty) becomes 'sandbox'; a 'sandbox' row is never moved to
+     * 'host' by a repoint. A laneDocker named in the same PATCH wins.
+     */
+    if (!patch.settings?.laneDocker && next.settings.laneDocker !== 'sandbox') {
+      const c = classifyLaneDocker(next.hostPath, { checkouts: [projectRoot()] });
+      if (c.value === 'sandbox') {
+        next.settings = { ...next.settings, laneDocker: 'sandbox' };
+        console.log(`[orchard] BUG-223: project ${next.id} repointed to ${next.hostPath}; laneDocker ${cur.settings.laneDocker ?? '(undeclared)'} -> sandbox: ${c.reason}`);
+      }
+    }
   }
   reg.projects[idx] = next;
   save(reg);

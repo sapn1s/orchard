@@ -53,6 +53,12 @@ function flatGateTree(name, { gateSrc, includeCheckNul = true } = {}) {
   fs.mkdirSync(orch, { recursive: true });
   fs.writeFileSync(path.join(orch, 'gate.mjs'), gateSrc ?? fs.readFileSync(path.join(ROOT, 'scripts', 'gate.mjs')));
   fs.copyFileSync(path.join(ROOT, 'scripts', 'leak-gate.mjs'), path.join(orch, 'leak-gate.mjs'));
+  // FEAT-106: leak-gate.mjs imports `./lib/leak-tokens.mjs`, so the real flat
+  // layout carries it under `.orchard/lib/` — mirror that, or the flat gate
+  // crashes on a missing module before it can report anything (exactly what
+  // onboard's flattened `.orchard/lib/` provides).
+  fs.mkdirSync(path.join(orch, 'lib'), { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'scripts', 'lib', 'leak-tokens.mjs'), path.join(orch, 'lib', 'leak-tokens.mjs'));
   if (includeCheckNul) fs.copyFileSync(path.join(ROOT, 'scripts', 'check-nul.mjs'), path.join(orch, 'check-nul.mjs'));
   fs.writeFileSync(path.join(base, 'README.md'), '# scratch flat tree\n'); // one clean tracked file
   // A real repo so leak-gate's REPO mode (git ls-files) has a tree to scan.

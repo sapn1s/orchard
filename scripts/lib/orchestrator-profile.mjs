@@ -264,6 +264,14 @@ export function isDispatchViaShell(command) {
 export const ENFORCE_ALLOWED_TOOLS = [
   // Dispatch and lane control — the whole point of the role.
   'Agent', 'SendMessage', 'TaskStop', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList',
+  // Lane LIVENESS, which is lane control's missing read half (BUG-226). ListAgents
+  // (the SDK's `ListPeers`) lists the dispatched lanes with their busy/idle status —
+  // names and state, no tree reading — and WA §C REQUIRES confirming a lane is alive
+  // from ground truth before treating it as dead or re-dispatching. It was never
+  // NAMED in this allowlist, so it fell to default-deny: an allowlist gap, not a
+  // decision. Dispatch + steer + stop a lane were all here; checking whether the
+  // lane is still running was the one orchestration verb left out.
+  'ListAgents',
   // Talking to the user. Denying this was the retroactive analysis's flagged bug.
   'AskUserQuestion',
   // Orchestration surface that carries no read: plans, todos, skills, workflows.
@@ -282,7 +290,15 @@ export const ENFORCE_ALLOWED_TOOLS = [
  * purpose table in the retroactive analysis §2 — gate, board, git, status.
  */
 export const ENFORCE_ALLOWED_BASH = [
-  'npm', 'npx', 'node',            // gate, board:gen/check/tool, dispatch.mjs, verifiers
+  // `npx` is DELIBERATELY not here (BUG-226 round 3). It was listed, but
+  // ENFORCE_HEAD_ARG_RULES.npx refuses `npx <anything>` UNCONDITIONALLY — so the
+  // allowlist (said "allowed") and the arg rule (said "always refused") were two
+  // owners of the Bash verdict disagreeing, and the "Still available here" line
+  // read the allowlist and advertised a head that is never usable. A head with
+  // ZERO allowed shapes does not belong in an allowlist. Removing it is inert at
+  // runtime (the arg rule still refuses `… | npx foo` in a filter stage, where
+  // the stage-0 allowlist check is skipped); it only stops the false advertisement.
+  'npm', 'node',                   // gate, board:gen/check/tool, dispatch.mjs, verifiers
   'git',                           // its own commits (minus the content-dumping subcommands below)
   'systemctl', 'ss', 'curl', 'docker', // service and port status
   'date', 'pwd', 'which', 'echo', 'mkdir', 'true', 'false', 'test', '[', '[[',
@@ -296,12 +312,102 @@ export const ENFORCE_ALLOWED_BASH = [
 ];
 
 /**
- * `git` subcommands that exist to print file content or history bodies. These
- * are reads wearing a git prefix, and letting them through would leave the
- * largest hole in the Bash policy — `git show HEAD:src/foo.ts` is `cat`.
- * `git status`, `git log --oneline`, `git add`, `git commit` are unaffected.
+ * `git` is ALLOW-KNOWN-GOOD, default-deny (BUG-226 round 4). A deny-list of
+ * "bad" subcommands was leaky three times over: round-3's clean room proved
+ * `git -c core.pager=cat show HEAD:<file>` read any blob (the `-c k=v` pair was
+ * consumed as the subcommand so `show` was never seen), and `git stash show -p`,
+ * `git whatchanged`, `git ls-files`, `git ls-tree` all slipped the same way. A
+ * deny-list admits every reader nobody enumerated; an allow-list fails SAFE —
+ * an unlisted subcommand is refused (and the refusal names dispatch), so a
+ * content/tree reader we never thought of cannot read.
+ *
+ * The set is the orchestrator's REAL git surface (corpus of 574 Bash calls):
+ * status/log/commit/diff/add/branch/rev-parse/remote/push/checkout/worktree/
+ * rev-list/bundle, plus the sibling status reads and the write/management verbs
+ * that emit NO tracked-file content (git-write-policy is their real gate, and it
+ * runs BEFORE decide()). The readers/dumpers — show, grep, blame, cat-file,
+ * ls-files, ls-tree, whatchanged, archive, format-patch, stash, notes, reflog,
+ * config — are DELIBERATELY ABSENT, so default-deny refuses them. `log` and
+ * `diff` are allowed only in content-free forms (see the flag gate below).
  */
-export const ENFORCE_DENIED_GIT_SUBCOMMANDS = ['show', 'diff', 'grep', 'blame', 'cat-file', 'log'];
+export const GIT_ALLOWED_SUBCOMMANDS = [
+  // status / ref reads — no tracked-file content
+  'status', 'rev-parse', 'rev-list', 'branch', 'remote', 'symbolic-ref', 'show-ref',
+  'for-each-ref', 'merge-base', 'describe', 'name-rev', 'var', 'ls-remote',
+  'check-ignore', 'shortlog', 'count-objects',
+  // read-shaped, allowed ONLY in content-free forms — see GIT_CONTENT_FLAG / diff gate
+  'log', 'diff',
+  // writes / management: mutate the tree, do not DUMP tracked content into context;
+  // git-write-policy is their actual gate and runs ahead of this one.
+  'commit', 'add', 'push', 'fetch', 'pull', 'checkout', 'switch', 'restore', 'reset',
+  'merge', 'rebase', 'cherry-pick', 'revert', 'worktree', 'bundle', 'tag', 'clean', 'mv', 'rm',
+];
+
+/**
+ * git GLOBAL options that take a VALUE in the NEXT token (not `=`-joined), so the
+ * subcommand resolver must skip two tokens, not one. `-c name=value` is the one
+ * round-3 defeated — the resolver read `name=value` as the subcommand. The rest
+ * are the other value-taking globals that could shield a real subcommand the
+ * same way (`git -C <dir> show HEAD:x`, `git --git-dir <dir> show …`).
+ */
+const GIT_GLOBAL_VALUE_OPTS = new Set([
+  '-c', '-C', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env',
+]);
+
+/**
+ * Flags that make `git log`/`git diff` EMIT A DIFF/PATCH or run a content search —
+ * i.e. print tracked-file content or hunt it. Scoped to log/diff so it cannot
+ * collide with same-spelled flags on other verbs (`git commit -S` = GPG-sign).
+ */
+const GIT_CONTENT_FLAG = (w) =>
+  w === '-p' || w === '-u' || w === '--patch' || /^--patch-with-/.test(w) ||
+  w === '-U' || /^-U\d/.test(w) || /^--unified(?:=|$)/.test(w) ||
+  w === '-W' || w === '--function-context' ||
+  /^--word-diff(?:=|$)/.test(w) || /^--color-words(?:=|$)/.test(w) ||
+  w === '-G' || /^-G./.test(w) || w === '-S' || /^-S./.test(w) || /^-L/.test(w);
+
+/**
+ * `git diff` prints full file content UNLESS it carries a summary-only flag. The
+ * orchestrator's real diff usage is all `--stat`/`--numstat`/`--name-only`/
+ * `--shortstat`/`--cached --name-only`; bare `git diff <path>` is a content dump
+ * that belongs in a dispatched lane.
+ */
+const GIT_DIFF_SUMMARY_FLAG = (w) =>
+  /^--stat(?:=|$)/.test(w) || w === '--numstat' || w === '--shortstat' || w === '--summary' ||
+  w === '--name-only' || w === '--name-status' || w === '--compact-summary' ||
+  /^--dirstat(?:=|$)/.test(w) || w === '--raw' || w === '--check' || w === '--quiet' ||
+  w === '--exit-code' || w === '--cumulative';
+
+/**
+ * Resolve the REAL git subcommand past any leading global options, so a `-c k=v`
+ * (or `-C <dir>`, `--git-dir <dir>`, …) pair cannot shield it (BUG-226 round 4).
+ * `words[0]` is `git`. Returns '' when there is no subcommand (`git`,
+ * `git --version`) — harmless, allowed.
+ */
+export function resolveGitSubcommand(words) {
+  let i = 1;
+  while (i < words.length) {
+    const w = words[i];
+    if (!w.startsWith('-')) return w;        // first bare token is the subcommand
+    if (w === '--') { i += 1; continue; }    // end-of-options marker; keep scanning
+    // A value-taking global in its space-separated form consumes the NEXT token.
+    if (!w.includes('=') && GIT_GLOBAL_VALUE_OPTS.has(w)) { i += 2; continue; }
+    i += 1;                                   // a flag (or `--opt=value`): skip one
+  }
+  return '';
+}
+
+/** The offender string for a refused git command, or null to allow. Applied at EVERY stage. */
+function gitArgRule(words) {
+  const sub = resolveGitSubcommand(words);
+  if (!sub) return null;                                   // bare `git` / `git --version`
+  if (!GIT_ALLOWED_SUBCOMMANDS.includes(sub)) return `git ${sub}`;
+  if (sub === 'log' || sub === 'diff') {
+    if (words.some(GIT_CONTENT_FLAG)) return `git ${sub} -p`;
+    if (sub === 'diff' && !words.some(GIT_DIFF_SUMMARY_FLAG)) return 'git diff (no --stat)';
+  }
+  return null;
+}
 
 /**
  * Shell separators that start a NEW command (as opposed to `|`, which chains one
@@ -393,6 +499,45 @@ function subcommandOf(words) {
 
 const DOCKER_STATUS_SUBCOMMANDS = ['ps', 'images', 'image', 'inspect', 'stats', 'version', 'info', 'top', 'port'];
 
+/**
+ * curl is kept for one real purpose (corpus: 14 calls, ALL to `127.0.0.1:4317`):
+ * confirming a LOCAL dev server's health. So it is localhost-only. The read holes
+ * curl opens are (a) `file:` (and other local-file schemes) — the round-3 break —
+ * and (b) a `-K <file>` config read that can itself redirect curl to `file:`. Both
+ * are refused. A non-local host is refused too (the charter: http(s) to localhost
+ * only). SSRF/exfil over http is not the profile's stated guarantee, but locality
+ * costs nothing to enforce and the orchestrator never needs a remote fetch.
+ */
+const CURL_LOCAL_HOST = /^(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?)$/i;
+/** Any non-http(s) URL scheme followed by a slash — file:/, ftp://, gopher:/, scp:/, … */
+const CURL_BAD_SCHEME =
+  /(?:^|[\s"'=(])(?:file|ftp|ftps|gopher|gophers|dict|ldap|ldaps|scp|sftp|smb|smbs|tftp|telnet|imaps?|pop3s?|smtps?|rtsp|rtmps?|mqtt|wss?):\/+/i;
+
+/**
+ * curl safety on the RAW command region (quotes intact), because the per-stage
+ * parser runs AFTER stripQuotedAndComments — a QUOTED `curl "file:/etc/passwd"`
+ * would otherwise blank to `curl ` and be allowed while the real shell still reads
+ * the file. Scans each `curl … (up to the next shell separator)` region. Returns an
+ * offender or null. Exported for the enforcement suite's decider probes.
+ */
+export function curlRawViolation(raw) {
+  const text = typeof raw === 'string' ? raw : '';
+  for (const m of text.matchAll(/\bcurl\b([^|;&\n]*)/gi)) {
+    const region = m[1];
+    if (CURL_BAD_SCHEME.test(region)) return 'curl non-http scheme';
+    // A config-file read (`-K`/`--config <file>`) can carry its own `url=file:/…`.
+    if (/(?:^|\s)(?:-K|--config)(?:\s|=|$)/.test(region)) return 'curl -K (config file read)';
+    // http(s):// host must be local (host ends at / : whitespace or a closing quote).
+    for (const h of region.matchAll(/https?:\/\/([^/:\s"')\]]+)/gi))
+      if (!CURL_LOCAL_HOST.test(h[1])) return 'curl to a non-local host';
+    // A scheme-less host.tld / bare-IP target must be local too. Path segments
+    // (preceded by `/`) are excluded by requiring a leading separator/quote.
+    for (const t of region.matchAll(/(?:^|[\s"'=])((?:[a-z0-9-]+\.)+[a-z]{2,}|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?(?=[/?"'\s]|$)/gi))
+      if (!CURL_LOCAL_HOST.test(t[1])) return 'curl to a non-local host';
+  }
+  return null;
+}
+
 const ENFORCE_HEAD_ARG_RULES = {
   node(words) {
     if (words.some((w) => NODE_EVAL_FLAG.test(w))) return 'node -e';
@@ -417,9 +562,11 @@ const ENFORCE_HEAD_ARG_RULES = {
     const sub = subcommandOf(words);
     return sub === 'cat' ? 'systemctl cat' : null;
   },
-  curl(words) {
-    return words.some((w) => w.includes('file://')) ? 'curl file://' : null;
-  },
+  curl(words) { return curlRawViolation(words.join(' ')); },
+  // git is ALLOW-KNOWN-GOOD (BUG-226 round 4). As a per-head arg rule it is decided
+  // at EVERY pipeline stage, so `npm run gate | git show HEAD:x` cannot leak a read in
+  // a filter position (the old inline git block decided stage 0 only).
+  git(words) { return gitArgRule(words); },
   cp(words) { return words.slice(1).some((w) => STD_STREAM.test(w)) ? 'cp to a std stream' : null; },
   mv(words) { return words.slice(1).some((w) => STD_STREAM.test(w)) ? 'mv to a std stream' : null; },
 };
@@ -570,20 +717,25 @@ export function decideBashCommand(command) {
    * Substitutions are pulled out ABOVE this line, so blanking quotes here cannot
    * hide a command: `"$(grep …)"` has already been decided.
    */
+  const quotedFlattened = flattened;   // quotes still intact — the curl raw guard needs them
   flattened = stripQuotedAndComments(flattened);
 
+  let curlIsAHead = false;
   for (const pipeline of flattened.split(COMMAND_SPLIT)) {
     const stages = pipeline.split('|');
     for (let i = 0; i < stages.length; i++) {
       const words = bashSegmentWords(stages[i]);
       const head = words[0] ?? '';
       if (!head) continue;
+      if (head === 'curl') curlIsAHead = true;
       // Re-entrant execution is refused at any depth.
       if (EXEC_VERBS.has(head)) return { allow: false, offender: head };
       /*
        * Head-argument rules are checked at EVERY stage too, for the same reason:
        * `git status | node -e "…readFileSync…"` is a read, and its head sits in
-       * a filter position where stage-0 reasoning does not apply.
+       * a filter position where stage-0 reasoning does not apply. `git` is an arg
+       * rule now (BUG-226 round 4), so a git content/tree read is caught in a
+       * filter stage too — not just at stage 0.
        */
       const argRule = ENFORCE_HEAD_ARG_RULES[head];
       if (argRule) {
@@ -593,23 +745,58 @@ export function decideBashCommand(command) {
       // Later stages are stdout filters; the read was already decided at stage 0.
       if (i > 0) continue;
       if (!ENFORCE_ALLOWED_BASH.includes(head)) return { allow: false, offender: head };
-      if (head === 'git') {
-        const words = stages[i].trim().split(/\s+/).filter(Boolean);
-        const sub = words.find((w, j) => j > 0 && !w.startsWith('-'));
-        // `git log --oneline` is a status check; `git log -p` prints file bodies.
-        if (sub === 'log') {
-          if (/(?:^|\s)(?:-p|--patch|-[A-Za-z]*p)(?:\s|$)/.test(stages[i])) {
-            return { allow: false, offender: 'git log -p' };
-          }
-          continue;
-        }
-        if (sub && ENFORCE_DENIED_GIT_SUBCOMMANDS.includes(sub)) {
-          return { allow: false, offender: `git ${sub}` };
-        }
-      }
     }
   }
+  /*
+   * curl's URL argument is often QUOTED, and the per-stage parse above runs on the
+   * quote-STRIPPED text — so a quoted `curl "file:/etc/passwd"` blanks to `curl `
+   * and the arg rule sees no target, while the real shell still reads the file.
+   * Re-check curl against the quotes-intact text here to close that (BUG-226 r4).
+   */
+  if (curlIsAHead) {
+    const offender = curlRawViolation(quotedFlattened);
+    if (offender) return { allow: false, offender };
+  }
   return { allow: true, offender: null };
+}
+
+/**
+ * The two fixed, GENERIC command shapes the advertiser probes each allowed head
+ * with. NOT a per-head invocation table (that would be a THIRD owner of the Bash
+ * verdict — ARCH-010); these are two questions asked of the ONE authority,
+ * `decideBashCommand`. A bare head answers for everything with no arg rule; the
+ * `./x.mjs` shape is what distinguishes a head that is only usable WITH a script
+ * (`node` — bare `node` is refused as `node (stdin)`, `node ./x.mjs` is allowed)
+ * from one with no allowed shape at all (`npx` — refused both ways). (BUG-226 r3.)
+ */
+const BASH_HEAD_PROBES = (head) => [head, `${head} ./x.mjs`];
+
+/**
+ * The Bash command heads worth ADVERTISING, derived by asking `decideBashCommand`
+ * itself rather than re-reading one of its two declarations (ENFORCE_ALLOWED_BASH
+ * and ENFORCE_HEAD_ARG_RULES). A head is advertised iff the decider allows at
+ * least one of its probe shapes — so a head that is allowlisted but refused for
+ * every argument (the `npx` contradiction) is automatically excluded, and the
+ * advertiser can never name something the decider denies (BUG-226 round 3, the
+ * single-authority fix for the Bash half). Errs toward UNDER-advertising, which
+ * is the safe direction: the invariant is "never claim a denied command".
+ */
+export function allowedBashHeads() {
+  return [...new Set(ENFORCE_ALLOWED_BASH)].filter((head) =>
+    BASH_HEAD_PROBES(head).some((probe) => decideBashCommand(probe).allow),
+  );
+}
+
+/**
+ * The advertised heads that carry an argument rule — i.e. are allowed in some
+ * forms but refused when talked into a read. Intersected with `allowedBashHeads()`
+ * so a head that is NOT advertised (e.g. `npx`, whose arg rule refuses everything)
+ * can never be named as "restricted", which would imply some shape of it works
+ * (BUG-226 round 3, finding 4).
+ */
+export function restrictedBashHeads() {
+  const advertised = new Set(allowedBashHeads());
+  return Object.keys(ENFORCE_HEAD_ARG_RULES).filter((h) => advertised.has(h));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -687,15 +874,64 @@ export function detectOrchBypass(command) {
  * the shape, and carries the same criteria as every other refusal.
  */
 function invalidBypassReason(problem) {
+  // Routes through the ONE refusal builder (BUG-226 round 3), so this path — a
+  // SECOND refusal route the round-2 verify found carrying no "Still available
+  // here" list (break a) — now gets the help like every other refusal.
+  return buildRefusal({
+    lead: [
+      `Orchestrator tool profile: the \`# ORCH-BYPASS:\` marker on this command is not usable — ${problem}.`,
+      '',
+      'The escape hatch needs a real reason on the command\'s FIRST line, e.g.:',
+      '    # ORCH-BYPASS: need the live gate exit status to decide whether to commit now',
+      'then the command itself on the following line(s).',
+    ],
+  });
+}
+
+/**
+ * A one-phrase gloss for the few allowed tools that earn an explanation in the
+ * "Still available here" line. DECORATION ONLY — the authoritative set of names
+ * is ENFORCE_ALLOWED_TOOLS and is read from there; a tool with no gloss is named
+ * by itself. A gloss keyed to a name no longer in the allowlist is simply unused,
+ * so this map can never make the line claim a tool `decide()` does not permit.
+ */
+const STILL_AVAILABLE_GLOSS = {
+  ListAgents: 'ListAgents (lane liveness — names + busy/idle)',
+};
+
+/**
+ * The "Still available here" help text, GENERATED from the allowlists so it can
+ * never drift from what `decide()` actually permits (ARCH-010 — one owner, read
+ * everywhere else). The prose was hand-maintained and silently fell 9 tools
+ * behind ENFORCE_ALLOWED_TOOLS — TaskCreate/Update/Get/List, Workflow, Skill,
+ * TodoWrite, ExitPlanMode, ToolSearch — which BUG-226's clean-room verify caught
+ * (P3). Every allowed tool is now named straight from ENFORCE_ALLOWED_TOOLS, and
+ * Bash — decided per command HEAD, not by name — is described from its own single
+ * owner, ENFORCE_ALLOWED_BASH, so both halves move with the policy automatically.
+ * Returned as an array of lines (one per array element, joined with '\n' by the
+ * caller). Exported so the enforcement suite can assert the line lists EXACTLY
+ * the allowlist rather than re-typing a second copy of it.
+ */
+export function stillAvailableHere() {
+  const named = ENFORCE_ALLOWED_TOOLS
+    .filter((t) => t !== 'Bash')
+    .map((t) => STILL_AVAILABLE_GLOSS[t] ?? t);
+  // Derived from decideBashCommand itself (allowedBashHeads), not from the raw
+  // allowlist — so an always-refused head (npx) is never advertised (BUG-226 r3).
+  const bashHeads = allowedBashHeads().join(', ');
+  const restricted = restrictedBashHeads().join('/');
   return [
-    `Orchestrator tool profile: the \`# ORCH-BYPASS:\` marker on this command is not usable — ${problem}.`,
-    '',
-    'The escape hatch needs a real reason on the command\'s FIRST line, e.g.:',
-    '    # ORCH-BYPASS: need the live gate exit status to decide whether to commit now',
-    'then the command itself on the following line(s).',
-    '',
-    ...BYPASS_CRITERIA,
-  ].join('\n');
+    `Still available here: ${named.join(', ')}.`,
+    `Plus Bash, decided per command HEAD (default-deny) — allowed heads: ${bashHeads}`,
+    '(the gate, board bookkeeping, service/status reads). Some of those heads are',
+    `allowed only in read-free forms — ${restricted} are refused when talked into a`,
+    'read (e.g. node -e, npm exec, docker run, systemctl cat). git is ALLOW-known-good:',
+    'status/log/diff --stat/branch/rev-parse/worktree and the commit-side verbs pass,',
+    'while the content/tree readers (show, bare diff, log -p, ls-files, ls-tree,',
+    'whatchanged, grep, blame, cat-file) and any other file read or tree-search are',
+    'refused; curl is localhost-only (file: and non-local hosts refused). git WRITES',
+    '(commit/add) are governed separately by the git-write policy, not promised here.',
+  ];
 }
 
 /**
@@ -705,48 +941,60 @@ function invalidBypassReason(problem) {
  * was refused, why, and the specific thing to do instead. The last part is what
  * turns a wall into a redirect.
  */
+/**
+ * FEAT-149 — the board:status redirect, as its own block so the ONE refusal
+ * builder can splice it in without each caller re-typing it. Highest-value
+ * placement: it fires exactly when an orchestrator is blocked from inspecting the
+ * tree, which is when it is most tempted to substitute a lane's claim about a
+ * ticket's state (measured 2026-09-23: a status asserted four times from
+ * contradictory lane reports, wrong each time).
+ */
+function boardStatusRedirect() {
+  return [
+    "If what you wanted was a TICKET's or the BOARD's state — its status, round",
+    'count, placement, dirty/committed, or latest activity — do NOT dispatch and',
+    'do NOT trust a lane report for it. Run `npm run board:status -- <ID>` (or',
+    'with no id for a whole-board summary). It is allowed under this profile',
+    '(node/npm only), needs no lane, and reads the board through its own parser —',
+    'so a status is CHECKED, never asserted from memory or relayed from a lane.',
+  ];
+}
+
+/**
+ * THE one refusal builder (BUG-226 round 3). EVERY orchestrator-profile refusal
+ * message is assembled here, so none can omit the "Still available here" help
+ * again — the round-1/round-2 failure was exactly that the help lived in ONE of
+ * several refusal paths. Callers supply only their own LEAD (what was refused /
+ * why / what to do instead); the help footer (derived from the same authority
+ * that grants — stillAvailableHere) and the bypass criteria are appended here,
+ * once, for all of them.
+ */
+function buildRefusal({ lead, readShaped = false }) {
+  const lines = [...lead];
+  if (readShaped) lines.push('', ...boardStatusRedirect());
+  lines.push('', ...stillAvailableHere(), '', ...BYPASS_CRITERIA);
+  return lines.join('\n');
+}
+
 function refusalReason(toolName, offender) {
   const what = offender ? `\`${offender}\` (via Bash)` : `\`${toolName}\``;
-  const lines = [
-    `Orchestrator tool profile: ${what} is not available to this session.`,
-    '',
-    'This session is running as an ORCHESTRATOR in a project where the tool',
-    'profile is enforced. Reading, searching and inspecting the tree inline is',
-    'what the profile removes, because that work belongs in a dispatched lane —',
-    'a lane reads with a fresh context that is thrown away, while anything you',
-    'read here is re-read on every subsequent request for the rest of the session.',
-    '',
-    'Do this instead: dispatch it with the Agent tool. Give the lane the question,',
-    'not your answer — e.g. an Explore agent for "where/what is X", a worker for a',
-    'change. The lane has the full toolset, including Bash; nothing is being taken',
-    'away from the work, only from this session.',
-  ];
-  // FEAT-149 — the highest-value placement of the board:status redirect: it fires
-  // exactly when an orchestrator is blocked from inspecting the tree, which is
-  // when it is most tempted to substitute a lane's claim about a ticket's state
-  // (measured 2026-09-23: a status asserted four times from contradictory lane
-  // reports, wrong each time). For BOARD/ticket state there is no need to dispatch
-  // — `board:status` runs under this very profile and reads the board's own parser.
-  if (isReadShapedRefusal(toolName, offender)) {
-    lines.push(
+  return buildRefusal({
+    lead: [
+      `Orchestrator tool profile: ${what} is not available to this session.`,
       '',
-      "If what you wanted was a TICKET's or the BOARD's state — its status, round",
-      'count, placement, dirty/committed, or latest activity — do NOT dispatch and',
-      'do NOT trust a lane report for it. Run `npm run board:status -- <ID>` (or',
-      'with no id for a whole-board summary). It is allowed under this profile',
-      '(node/npm only), needs no lane, and reads the board through its own parser —',
-      'so a status is CHECKED, never asserted from memory or relayed from a lane.',
-    );
-  }
-  lines.push(
-    '',
-    'Still available here: Agent, SendMessage, TaskStop, AskUserQuestion, Edit,',
-    'Write, and Bash for npm/node/git/status commands (the gate, the board, your',
-    'own commits).',
-    '',
-    ...BYPASS_CRITERIA,
-  );
-  return lines.join('\n');
+      'This session is running as an ORCHESTRATOR in a project where the tool',
+      'profile is enforced. Reading, searching and inspecting the tree inline is',
+      'what the profile removes, because that work belongs in a dispatched lane —',
+      'a lane reads with a fresh context that is thrown away, while anything you',
+      'read here is re-read on every subsequent request for the rest of the session.',
+      '',
+      'Do this instead: dispatch it with the Agent tool. Give the lane the question,',
+      'not your answer — e.g. an Explore agent for "where/what is X", a worker for a',
+      'change. The lane has the full toolset, including Bash; nothing is being taken',
+      'away from the work, only from this session.',
+    ],
+    readShaped: isReadShapedRefusal(toolName, offender),
+  });
 }
 
 /**

@@ -33,11 +33,17 @@ touches the issue MUST:
    claiming a fix — anti-regression. If your change touches a file another
    ticket also touches, run that ticket's test too.
 5. **Do not verify your own fix into VERIFIED.** For anything above `trivial`/docs-only,
-   the ticket needs a `Verified-by:` line naming a clean-room verification DISPATCH
+   the ticket needs a recorded HOLDS verdict from a clean-room verification DISPATCH
    (`node scripts/independent-verify.mjs` → `dispatch <provider> run <id>`, never a Task
    subagent, which shares the fixer's context) that ran a case your own fixture does not
    cover — you wrote the fixture, so it can only test what you already thought of
    (`docs/prompts/patterns/VERIFY.md`; `npm run board:check` warns if it is missing).
+   **Record it with `node scripts/board-tool.mjs verified --id … --provider … --model …
+   --run … --verdict HOLDS|BROKEN|INVALID`, never by hand.** Proof is a TYPED entry (the
+   record's `verification[]`, or the board ledger for a legacy prose ticket), and only a
+   standing HOLDS counts (BUG-225). A hand-typed `Verified-by:` line is not proof in any
+   spelling — the board never parses prose to decide it — and `board:check` WARNs on one
+   typed after the freeze (`PROSE VERIFIED-BY NOT COUNTED (advisory)`); it counts for nothing.
 6. **Answer the closing question when you close a ticket**: TEMPLATE.md's
    "**Symptom of a deeper design flaw?** (no / yes → ARCH-### filed)" — one line,
    required, so a structural suspicion is handed forward instead of dropped
@@ -79,6 +85,24 @@ labelled as such rather than faked as a test.
 
 ## Tickets that need a human decision — the shape is ENFORCED, not conventional
 
+**A fork that needs the user is declared with `board-tool decide`, never as log
+prose** (FEAT-166). On a record-format ticket it writes the record shape below,
+sets Owner `👤`, appends the log entry and regenerates INDEX in one step:
+
+    node scripts/board-tool.mjs decide --id FEAT-123 --question "Which … ?" \
+      --option "A=label | what changes | gains | costs | why it is not obviously best" \
+      --option "B=…" --recommend A --why "…"
+
+It refuses fewer than two options, duplicate keys, a recommendation that names no
+option, and an open (unanswered) decision unless you pass `--replace`. It never
+writes the user's answer: that is a typed entry (`decision.answers[]`, or
+`answer-ledger.json` for a ticket with no record decision) written only by the
+server when the user answers on the Decide card or the Needs-You rail. A
+`### … — you (answer …)` heading in the Activity log is display only and counts
+for nothing (FEAT-166); answers given before 2026-10-05 are read from the
+hash-pinned `answers-legacy.frozen.json`. What follows is the shape it writes, and the shape a
+legacy prose ticket still needs by hand.
+
 A ticket blocked on a person is only really blocked on them if the person is
 actually asked. Two things have to be true, and `npm run board:check` now FAILS
 if either is missing:
@@ -102,8 +126,7 @@ if either is missing:
 
 2. **The ticket is marked as awaiting you** — Owner `👤` on its `INDEX.md` Open
    row. The rail reads only `👤` rows, so a perfectly-formed decision on a `—`
-   row is still invisible. INDEX is orchestrator-owned (see the rule above): ask
-   for the flip rather than editing it in a fix lane.
+   row is still invisible. `board-tool decide` sets it; never hand-edit INDEX.
 
 Optionally add `Recommended: <key>` to the `- **Status:**` line; it is validated
 against the parsed keys and dropped if it matches none, so it can never badge an

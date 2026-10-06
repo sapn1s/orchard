@@ -11,9 +11,9 @@
   "reported": "2026-08-25",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-09-29",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -196,3 +196,8 @@ pending diff / working tree, so a private name already committed at HEAD is neve
 
 **Verdict:** no code change required — FEAT-104's fix is implemented and verified at HEAD. Working
 tree left unstaged/clean (this Activity-log edit is the only change).
+
+### 2026-09-29 — closing (verifying, round 1)
+- **Closed as DONE (obsolete: fix present at HEAD; re-verify already confirmed no code change required).**
+- **Recheck (current tree):** tokens I–Q present in `scripts/lib/leak-tokens.mjs:39-51` (I–P at `:39-46`, Q at `:51`), each anchored on a distinctive stem and mapped to its `external-project-<letter>` alias — present regardless of the FEAT-156 lane's dirty edits to that file (noted in the charter). `node scripts/leak-gate.mjs` today: **PASS — 0 hits across 1170 files, exit 0** (token list sha256 27d7d7d4987f; one sanctioned LICENSE waiver). Cites the 2026-09-23 re-verify: fix implemented + verified at HEAD, scan-scope hypothesis refuted (REPO mode enumerates git-tracked files, not just the diff).
+- **Symptom of a deeper design flaw?** Yes (as the 2026-08-25 entry recorded) — the token list is an allowlist, so a name nobody listed produces a green PASS over a leak. NOT filed as ARCH: that entry left it pending the user's view on whether a candidate-scanner's noise is worth it. Closing this ticket does not resolve that standing question.

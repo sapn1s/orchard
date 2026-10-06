@@ -11,9 +11,9 @@
   "reported": "2026-08-25",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-09-29",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -115,3 +115,8 @@
 - **Only finding is a benign CHARACTERIZATION, not a defect (WA stopping rule → STOP).** Case H re-shows the project's OWN pending-new rows under its OWN `p\0<proj>` key after a dead-link navigation, where the pre-round-3 code showed an empty dock. That is truthful (identical to what `startNew` already does with the same key) and is NOT a discarded-queue resurrection nor cross-contamination. One adjacent NIT (do not spend a round on it): the `applyRoute` no-session site at ~15174 calls `resetTranscript()` and IGNORES its return, so a `p\0<proj>` OUTBOX (if any) is not judged there until the next open — narrow, not data-loss (rows persist), and strictly better than the pre-round-3 no-adopt behavior. Converted the remaining concern into STANDING property assertions (F/G/H/I) in the adversarial suite rather than opening another round.
 - **Could NOT test:** (1) BUG-129 real-model-turn suite — same environmental block as rounds 1–3 (bypassPermissions account); not re-attempted. (2) The `applyRoute` route-to-no-session path was exercised by setting `state.current` + calling the exposed `resetTranscript` directly (reset semantics are identical) rather than driving a real dead-link navigation end-to-end, so `applyRoute`'s surrounding side-effects (renderTree/selectProject) were not driven.
 - **Verified-by:** `node scripts/verify-bug-150-adversarial.mjs` (25 pass / 0 fail; F/G/H/I are the round-4 standing assertions) + one clean re-run of `scripts/verify-bug-150-load-window-queue.mjs` (16 pass / 0 fail, scenario E green). Verifier fixture: `scripts/verify-bug-150-adversarial.mjs` (untracked, unstaged; not the fixer's).
+
+### 2026-09-29 — closing (verifying, round 1)
+- **Closed as DONE (obsolete: fixed + independently verified through round 4, which said STOP).**
+- **Recheck (current tree):** fix present at commit 18e6b20 ("BUG-150: queue ownership re-bound on every reset path"). `public/app.js`: `resetTranscript()` (`:3690`) ends with `return adoptQueueRows()` (`:3753`) — the single-owner ARCH-010 re-bind; `adoptQueueRows()` (`:11849`) and `judgeAdoptedOutbox()` (`:11888`) present. Cites the 2026-09-23 round-4 independent verify: PASS · STOP (fixer suite 16/16, adversarial 25/25 incl. the round-2 scenario-E regression now green, plus the F/G/H/I standing assertions). The one round-1 regression (catch-path loss) is closed by construction.
+- **Symptom of a deeper design flaw?** no — a single-owner (ARCH-010) re-bind now lives inside `resetTranscript`; the design lesson is applied, not outstanding.

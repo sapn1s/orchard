@@ -65,7 +65,14 @@ const SUITE_SESSION_ID = '0b118000-0000-4000-8000-000000000118';
  * file, tool-only turn) leave it unset and exercise the fail-open fallback. */
 function finalAssistantText(transcriptPath) {
   let raw;
-  try { raw = fs.readFileSync(transcriptPath, 'utf8'); } catch { return ''; }
+  try {
+    // BUG-204: only read a REGULAR file. A synchronous readFileSync on a FIFO with
+    // an unclosed writer blocks this harness forever before the hook is spawned.
+    // This suite feeds only regular fixtures today, so this is defensive parity with
+    // the adversarial suite's fix; statSync does not block on a FIFO.
+    if (!fs.statSync(transcriptPath).isFile()) return '';
+    raw = fs.readFileSync(transcriptPath, 'utf8');
+  } catch { return ''; }
   const lines = raw.split('\n');
   const isMain = (ev) => ev && ev.type === 'assistant' && ev.isSidechain !== true && Array.isArray(ev?.message?.content);
   const textOf = (content) => content.filter((c) => c && c.type === 'text' && typeof c.text === 'string').map((c) => c.text).join('');

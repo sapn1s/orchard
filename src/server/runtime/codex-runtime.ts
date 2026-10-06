@@ -53,7 +53,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
-import { installGitShim } from '../../../scripts/lib/git-shim.mjs';
+import { installGitShim, gitShimMissingRefusal } from '../../../scripts/lib/git-shim.mjs';
 import { getShimSecret } from '../../../scripts/lib/git-shim-secret.mjs';
 import type {
   AgentRuntime,
@@ -366,6 +366,8 @@ export class CodexRuntime implements AgentRuntime {
    * re-announced.
    */
   #collabAgents = new Map<string, { label: string; description: string; settled: boolean }>();
+  /** BUG-230 — this session's own git shim (install handle); null when the block is off. */
+  #gitShim: ReturnType<typeof installGitShim> | null = null;
 
   start(config: RuntimeStartConfig): void {
     this.#config = config;
@@ -419,10 +421,13 @@ export class CodexRuntime implements AgentRuntime {
      * Guarded by `gitWriteBlockEnabled()`: with the ORCHARD_ALLOW_GIT_WRITE hatch
      * open the shim is not installed, mirroring the hook's own kill-switch.
      */
-    const baseEnv = { ...process.env };
+    // BUG-223: the launch's Docker daemon (sandbox for a sandboxed project). Only
+    // dockerEnv is merged here; this runtime's handling of `config.env` is unchanged.
+    const baseEnv = { ...process.env, ...(config.dockerEnv ?? {}) };
     // BUG-173 — same call-time host-grant consult as the Claude runtime: bake the
     // grant key + loopback host URL so a grant minted after launch reaches the shim.
-    const env = gitWriteBlockEnabled()
+    // BUG-230 — keep the install handle (ownership + the per-turn fail-closed check).
+    const gitShim = gitWriteBlockEnabled()
       ? installGitShim(baseEnv, {
           grantKey: config.gitGrantKey ?? undefined,
           hostUrl: `http://127.0.0.1:${process.env.PORT ?? 4317}`,
@@ -430,8 +435,10 @@ export class CodexRuntime implements AgentRuntime {
           // BUG-173 round 3 — baked into the shim source (not env) and required by
           // /api/git-shim/decide, so the consult cannot be redirected to a forged host.
           shimAuth: getShimSecret(),
-        }).env
-      : baseEnv;
+        })
+      : null;
+    this.#gitShim = gitShim;
+    const env = gitShim ? gitShim.env : baseEnv;
     let child: ChildLike;
     if (config.spawnProcess) {
       // Isolation/survival seam — same contract as ClaudeRuntime's
@@ -588,6 +595,26 @@ export class CodexRuntime implements AgentRuntime {
   #startTurn(text: string): void {
     this.#turnActive = true;
     this.#lastUsage = undefined; // per-turn: filled by thread/tokenUsage/updated
+    /*
+     * BUG-230 — FAIL CLOSED on a missing shim. This runtime has no per-command
+     * hook, so the turn is the check point: restore our OWN shim if it vanished;
+     * if it cannot be restored, refuse the turn rather than let the app-server's
+     * subprocess `git` fall through PATH to the real binary.
+     */
+    if (this.#gitShim) {
+      const ensured = this.#gitShim.ensure();
+      if (!ensured.ok) {
+        this.#finishTurn({
+          type: 'result',
+          subtype: 'error_during_execution',
+          is_error: true,
+          num_turns: 1,
+          result: gitShimMissingRefusal(ensured.reason),
+        });
+        return;
+      }
+      if (ensured.restored) console.warn(`[orchard] BUG-230: restored a missing git shim (${this.#gitShim.shimDir})`);
+    }
     const params: Record<string, unknown> = {
       threadId: this.#threadId,
       input: [{ type: 'text', text }],

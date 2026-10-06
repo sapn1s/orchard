@@ -245,8 +245,9 @@ async function main() {
     JSON.stringify(afterReload.rows.map((r) => r.text)));
   check('and each restored row SAYS it is still unsent (row status + dock label), whatever else the dock is reporting',
     afterReload.rows.filter((r) => r.restored).length >= 2
-      && afterReload.rows.every((r) => !r.restored || /unsent/.test(r.status))
-      && /restored after a reload, still unsent/.test(afterReload.label)
+      // BUG-217: the row itself says it in plain words ("Not sent yet — kept
+      // from before you reloaded…"); the dock label now says what happens NEXT.
+      && afterReload.rows.every((r) => !r.restored || /unsent|not sent yet/i.test(r.status))
       && !/delivering/.test(afterReload.label),
     JSON.stringify({ label: afterReload.label, statuses: afterReload.rows.map((r) => r.status) }));
 
@@ -264,7 +265,8 @@ async function main() {
     const r = rows.find((x) => x.classList.contains('restored'));
     const n = rows.find((x) => !x.classList.contains('restored'));
     if (!r || !n) return { got: rows.length, restored: !!r, normal: !!n };
-    const cs = (el) => getComputedStyle(el.querySelector('summary'));
+    // BUG-217: the row is no longer a <details>/<summary>; the marking is on the row itself.
+    const cs = (el) => getComputedStyle(el.querySelector('summary') ?? el);
     return {
       restoredBg: cs(r).backgroundColor, normalBg: cs(n).backgroundColor,
       restoredEdge: cs(r).borderLeftWidth + ' ' + cs(r).borderLeftColor,
@@ -306,7 +308,9 @@ async function main() {
     live: window.__station.state.live, label: document.querySelector('#queueBox .q-l')?.textContent ?? '',
   })`);
   check('while the reloaded tab is only FOLLOWING the session, the dock says so instead of promising delivery',
-    notDriving.live ? true : /not driving the session/.test(notDriving.label),
+    // BUG-217: a not-driving tab now resumes/reattaches by itself; what must
+    // never happen is a label promising a delivery nothing is making.
+    notDriving.live ? true : !/delivers at the next pause|delivering…/.test(notDriving.label),
     JSON.stringify(notDriving));
 
   // The real journey: the running turn finishes, the user takes the session
@@ -360,8 +364,13 @@ async function main() {
     const s = (await window.__station.loadSessions(p.id, { force: true })).list.find((x) => x.sessionId === ${JSON.stringify(sid)});
     await window.__station.openSession(p, s);
   })()`);
-  const back = await cdp.waitFor('row back on screen',
-    `[...document.querySelectorAll('#queueBox .qedit')].some((t) => t.value.includes('BOUNDARY-DELTA'))`, 30_000);
+  // BUG-217: coming back to an idle session with a pending row now SENDS it
+  // (it no longer waits for the user to send something else) — so "back" is
+  // the row on screen OR already handed to the session as a sent bubble.
+  const back = await cdp.waitFor('row back on screen (or already sent)',
+    `[...document.querySelectorAll('#queueBox .qedit')].some((t) => t.value.includes('BOUNDARY-DELTA'))
+      || [...document.querySelectorAll('#panes .you')].some((b) => b.textContent.includes('BOUNDARY-DELTA'))`, 30_000);
+  const sentBack = await cdp.eval(`[...document.querySelectorAll('#panes .you')].some((b) => b.textContent.includes('BOUNDARY-DELTA'))`);
   const backDock = await cdp.eval(DOCK);
   const backDiag = await cdp.eval(`({
     ownerKey: window.__station.queueOwnerKey(),
@@ -370,7 +379,7 @@ async function main() {
     queue: window.__station.state.queue.length,
   })`);
   check('coming back to that session puts the undelivered text back on screen, marked unsent',
-    back && backDock.rows.some((r) => r.text.includes('BOUNDARY-DELTA') && r.restored && /unsent/.test(r.status)),
+    back && (sentBack || backDock.rows.some((r) => r.text.includes('BOUNDARY-DELTA') && r.restored && /unsent|not sent yet|sending/i.test(r.status))),
     JSON.stringify({ rows: backDock.rows, ...backDiag }));
   // Discard it through the real button so it cannot ride into a later turn.
   await cdp.eval(`(() => {
@@ -436,7 +445,7 @@ async function main() {
   const unconfDock = await cdp.eval(DOCK);
   const row = unconfDock.rows.find((r) => r.text.includes('NEVER-ARRIVED-FOXTROT'));
   check('a handed-off message whose turn was never seen comes back — readable, copyable, and NOT claimed as delivered',
-    unconfirmed && !!row && row.dead && /NOT delivered/.test(row.status) && /never saw its turn start/.test(row.status),
+    unconfirmed && !!row && row.dead && /not sent|NOT delivered/i.test(row.status) && /never saw its turn start/.test(row.status),
     JSON.stringify(row ?? unconfDock.rows));
   const resent = (await readTranscript()).filter((x) => x.includes('NEVER-ARRIVED-FOXTROT')).length;
   check('…and it is NEVER silently resent (redelivering reads as the user repeating themselves)',

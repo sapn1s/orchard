@@ -8,7 +8,8 @@
  *
  *   node scripts/git-grant.mjs <project>              # grant ONE occasion (single git write)
  *   node scripts/git-grant.mjs <project> --minutes 15 # grant a 15-minute window
- *   node scripts/git-grant.mjs <project> --revoke     # revoke
+ *   node scripts/git-grant.mjs <project> --permanent  # FEAT-164: no expiry, a project setting, until revoked
+ *   node scripts/git-grant.mjs <project> --revoke     # revoke (timed AND permanent)
  *   node scripts/git-grant.mjs <project> --status     # show current grant + recent writes
  *   node scripts/git-grant.mjs --list                 # projects + their grant state
  *
@@ -74,6 +75,8 @@ function fmtOutcome(w) {
 
 function fmtGrant(g) {
   if (!g) return 'none';
+  // FEAT-164 — a permanent grant is a project setting with no expiry.
+  if (g.scope === 'permanent') return `scope=PERMANENT · no expiry (until revoked) · since ${g.grantedAt ?? '?'} · via ${g.grantedVia}`;
   const mins = Math.round((g.expiresInMs ?? 0) / 60000);
   return `scope=${g.scope} · uses=${g.remainingUses ?? '∞'} · expires in ~${mins}m (${g.expiresAt}) · via ${g.grantedVia}`;
 }
@@ -81,7 +84,7 @@ function fmtGrant(g) {
 async function main() {
   const args = process.argv.slice(2);
   if (!args.length || args.includes('--help') || args.includes('-h')) {
-    console.log('usage: node scripts/git-grant.mjs <project> [--once|--minutes N|--revoke|--status]   |   --list');
+    console.log('usage: node scripts/git-grant.mjs <project> [--once|--minutes N|--permanent|--revoke|--status]   |   --list');
     process.exit(args.length ? 0 : 1);
   }
   if (args.includes('--list')) {
@@ -113,7 +116,7 @@ async function main() {
   }
   const mi = args.indexOf('--minutes');
   const minutes = mi >= 0 ? Number(args[mi + 1]) : undefined;
-  const scope = minutes && minutes > 0 ? 'duration' : 'once';
+  const scope = args.includes('--permanent') ? 'permanent' : minutes && minutes > 0 ? 'duration' : 'once';
   const r = await j('POST', `/api/projects/${p.id}/git-write-grant`, { scope, minutes });
   console.log(`granted git-write for ${p.id} (${p.name}): ${fmtGrant(r.grant)}`);
   console.log('  (a granted commit/push still runs the mandatory leak gate and is refused on a leak)');

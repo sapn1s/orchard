@@ -25,8 +25,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
 
-import { VERIFIED_BY_RE, joinVerdictContinuation, isVerdictContinuationLine, formatVerifiedBy } from './lib/verdict-contract.mjs';
+import { VERIFIED_BY_RE, joinVerdictContinuation, isVerdictContinuationLine, formatVerifiedBy, extractVerifiedBy } from './lib/verdict-contract.mjs';
 import { VERDICTS } from './lib/ticket-schema.mjs';
+import { legacyProseVerifications } from './lib/verification-source.mjs';
 import { extractVerificationRecords, extractGivens, contestedEvidence, grade, compose } from './migrate-tickets.mjs';
 import { extractVerifications, provenanceCheck } from './provenance-check.mjs';
 
@@ -109,8 +110,25 @@ for (const c of changes) console.log(`         ${idOf(c.f)}  run ${c.run_id ?? '
 
 ok('the corpus CONTAINS wrapped verdicts — this suite is not grading an empty set',
   changes.length > 0, `${changes.length} changed record(s)`);
-ok('no record COUNT changes — joining continuations never invents or swallows a record',
-  !changes.some((c) => c.kind === 'COUNT'), changes.filter((c) => c.kind === 'COUNT').map((c) => `${c.f} ${c.before}->${c.after}`).join(', ') || 'none');
+// BUG-225 (round-1 verify): the shared reader now ALSO reads a record whose RUN
+// ID wrapped onto its continuation line (the same join, earlier in the record),
+// which the per-line reader above never saw. So a count may GROW — but only by
+// records whose id is NOT on their head line. Never shrink, never invent.
+const countOk = (c) => {
+  if (c.kind !== 'COUNT') return true;
+  if (c.after < c.before) return false;
+  const text = readTicket(c.f);
+  const lines = text.split('\n');
+  const recs = extractVerifiedBy(text);
+  const onHead = recs.filter((r) => lines[r.index].includes(r.runId));
+  // BUG-225 round 4: the legacy reader also reads the audited label/emphasis
+  // spellings the shared reader does not (`**Verified-by (round 2, …):** dispatch
+  // **anthropic** …`, `**Verified-by** (unchanged): …`) — count those as explained.
+  const r4Extra = legacyProseVerifications(text).length - recs.length;
+  return onHead.length === c.before && recs.length - onHead.length + r4Extra === c.after - c.before;
+};
+ok('no record COUNT changes except wrapped-run-id records (BUG-225) — joining never invents or swallows a record',
+  changes.every(countOk), changes.filter((c) => !countOk(c)).map((c) => `${c.f} ${c.before}->${c.after}`).join(', ') || 'none');
 ok('no run id changes — the head line still identifies the record',
   !changes.some((c) => c.kind === 'RUN-ID'));
 ok('every change is FROM the no-verdict fallback, never a rewrite of a recorded verdict',
@@ -126,12 +144,19 @@ for (const c of changes.filter((x) => x.kind === 'VERDICT')) {
   const lines = text.split('\n');
   const i = lines.findIndex((l) => new RegExp(VERIFIED_BY_RE.source, 'i').test(l) && l.includes(c.run_id));
   const joined = joinVerdictContinuation(lines, i);
-  ok(`${idOf(c.f)} run ${c.run_id.slice(0, 8)}: the verdict is on a CONTINUATION line, and only the joined read finds it`,
-    i >= 0
+  const wrapped = i >= 0
     && !/VERDICT:/i.test(lines[i])
     && new RegExp(`VERDICT:\\s*${c.after}`, 'i').test(joined)
-    && joined.length > lines[i].length,
-    `line ${i + 1}: ${JSON.stringify(lines[i].slice(-42))} + ${JSON.stringify((lines[i + 1] ?? '').trim().slice(0, 46))}`);
+    && joined.length > lines[i].length;
+  // BUG-225 round 4 (audit of the verified→unverified flips): the verdict was in
+  // plain sight but under emphasis (`VERDICT: **HOLDS**`) or as the one verdict word
+  // in the run's parenthetical (`run <id> (clean-room round 3, HOLDS)`).
+  const U = c.after.toUpperCase();
+  const r4 = i >= 0 && (new RegExp(`VERDICT:\\s*\\*\\*${U}\\*\\*`).test(joined)
+    || new RegExp(`run[ \\t]+\`?${c.run_id}\`?[ \\t]*\\([^)]*\\b${U}\\b[^)]*\\)`).test(joined));
+  ok(`${idOf(c.f)} run ${c.run_id.slice(0, 8)}: the verdict was written in plain sight (on a CONTINUATION line, or under emphasis / in the run parenthetical — BUG-225 r4)`,
+    wrapped || r4,
+    `line ${i + 1}: ${JSON.stringify(lines[i]?.slice(-42))} + ${JSON.stringify((lines[i + 1] ?? '').trim().slice(0, 46))}`);
 }
 
 /* ═════════════════════════════════ 2. the two readers still agree, byte for byte */
@@ -174,7 +199,11 @@ section('the same run id recorded twice, once wrapped — the reconciliation tha
   // and at least one of those lines wraps.
   const donor = ticketFiles.find((f) => {
     const text = readTicket(f);
-    const recs = extractVerificationRecords(text);
+    // The duplicate must be visible to the PRE-CHANGE per-line reader (both copies'
+    // head lines carry the id): that is the FEAT-062 shape this case is about. A
+    // run id wrapped onto its continuation line (BUG-142's run 625ee528, first read
+    // by BUG-225) is a different record shape and legitimately differs in verdict.
+    const recs = oldExtractRecords(text);
     const dup = recs.filter((r, i) => recs.findIndex((x) => x.run_id === r.run_id) !== i);
     if (!dup.length) return false;
     const lines = text.split('\n');

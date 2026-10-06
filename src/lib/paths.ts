@@ -369,6 +369,19 @@ export function accountsDir(): string {
   return path.join(dataDir(), 'claude-accounts');
 }
 
+/**
+ * FEAT-160 — the server-owned session→account binding, sibling to `registry.json`.
+ * "Which Claude account is this session on" used to live ONLY in each tab's client
+ * `state.overrides` (and frozen into each outbox row), so every resume route
+ * re-derived it from a client-carried value — the ARCH-010 defect that let a live
+ * account switch be undone by a stale override on another tab/row. This file is the
+ * ONE owner of that fact: written by the account switch, read at the single spawn
+ * chokepoint (`AgentSession`'s constructor). See `src/server/session-accounts.ts`.
+ */
+export function sessionAccountsFile(): string {
+  return path.join(dataDir(), 'session-accounts.json');
+}
+
 export function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
 }

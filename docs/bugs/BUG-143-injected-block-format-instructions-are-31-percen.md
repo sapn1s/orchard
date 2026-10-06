@@ -11,9 +11,9 @@
   "reported": "2026-08-25",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-09-29",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -72,3 +72,8 @@ Cutting the section risks dropping a rule that a session needs; raising the budg
 
 ### 2026-08-25 — agent
 - **Filed:** through the board tool; the record was validated before it was written.
+
+### 2026-09-29 — closing (verifying, round 1)
+- **Closed as DONE (obsolete: nothing left to build).** The budget was RESTATED, not silently raised — success criterion #3 satisfied.
+- **Recheck (current tree):** `verify-feat-091-response-blocks.mjs:1458-1467` pins the injected core at `<= 6200` with a written reason (the 4000→6200 move when FEAT-098 / round 14 grew the core to ~5245), in step with `verify-feat-084-response-format-inject.mjs:190-194` (also `<= 6200`); landed in commit ca672b9. `npm run verify:feat-091` today: the check **`the injected core stays inside its stated budget` → ok (green)**. The suite's 10 remaining failures are all onboarding-scratch checks (`onboard.mjs` on a fresh project) — a DIFFERENT concern from BUG-143's budget, consistent with success criterion #2 ("green, or its one failure is a different one"), and attributable to the dirty working tree (`scripts/onboard.mjs` is modified).
+- **Symptom of a deeper design flaw?** no — a single budget number restated in step across two suites, with the reason in writing.

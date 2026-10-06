@@ -133,35 +133,404 @@ export function grantGitWrite(projectKey, { scope = 'once', ttlMs, grantedVia = 
   return viewGrant(grant, now);
 }
 
-/** Remove any grant for a project. Returns true if one was present. */
+/*
+ * ── FEAT-164 — THE PERMANENT GRANT, AND WHY IT IS NOT IN THIS MAP ────────────
+ * The user asked for a per-project grant that does not expire. It must survive a
+ * restart, so it cannot live in the memory map above: it is a DECLARED PROJECT
+ * SETTING (`settings.gitWrite` in the registry, owned by registry.ts and written
+ * only by the user-facing grant route). Under ARCH-010 the registry is the one
+ * place that holds it; this module READS it at call time through the source
+ * index.ts registers and never copies it into the map. So a revoke (the route
+ * clearing the setting) bites on the very next git write of a session that is
+ * already running, and no second place can hold a different answer.
+ *
+ * Fail-closed: no source registered, a source that throws (an unreadable or torn
+ * registry), or anything other than `{ permanent: true }` reads as "none".
+ *
+ * RESIDUAL, STATED: reading a grant back from a file reopens self-grant hole 2
+ * (header) for a DIRECT (host) session, which can write the registry file with
+ * its own uid. That is the same class as the loopback-route residual recorded
+ * above, and it is neutralised the same way: a granted commit/push still runs
+ * the mandatory leak gate (git-grant.mjs) and is refused on a leak, and every
+ * permitted write is recorded and announced. Container sessions reach neither
+ * the registry file nor the loopback route.
+ */
+let permanentSource = null;
+
+/** Register (or clear) the reader of the declared permanent grant. index.ts wires
+ * it to the registry's `gitWritePermanentOf`. */
+export function setPermanentGrantSource(fn) { permanentSource = typeof fn === 'function' ? fn : null; }
+
+/** The declared permanent grant for a project as a grant view, or null. Never throws. */
+export function permanentGrantOf(projectKey) {
+  if (!permanentSource || !projectKey) return null;
+  let d;
+  try { d = permanentSource(projectKey); } catch { return null; }
+  if (!d || typeof d !== 'object' || d.permanent !== true) return null;
+  return {
+    projectKey,
+    scope: 'permanent',
+    remainingUses: null,
+    grantedAt: typeof d.grantedAt === 'string' ? d.grantedAt : null,
+    grantedVia: typeof d.grantedVia === 'string' ? d.grantedVia : 'user',
+    note: '',
+    expiresAt: null,
+    expiresInMs: null,
+  };
+}
+
+/** Remove any TIMED/single-use grant for a project, and REVOKE every live claim on
+ * it (FEAT-164 r4: the project's revocation generation moves, so no claim minted
+ * before this instant can authorise another write — revocation always wins). The
+ * generation moves even when no timed grant is present: the DELETE route calls this
+ * after clearing the permanent setting, and a spent once-grant's live call must stop
+ * too. Returns true if a timed grant was present. */
 export function revokeGitWrite(projectKey) {
+  if (projectKey) revocationGen.set(projectKey, genOf(projectKey) + 1);
   return grants.delete(projectKey);
 }
 
-/**
- * The active grant for a project, or null. Purges an expired one on read so an
- * expired grant is indistinguishable from none. Does NOT consume a single-use
- * grant — the caller consumes only once it actually permits a write.
+/*
+ * ── FEAT-164 r4 — THE STORE IS THE ONLY AUTHORITY ───────────────────────────────
+ * The property broke three times, each time because something OTHER than the
+ * store's current answer authorised a write:
+ *   r1 (verify run 01a10ba1-8393-7e23-9ba1-a14a63e1e6f9): consume re-read the
+ *      permanent setting after a mid-gate revoke and spent an independent once-grant;
+ *   r2 (verify run 01a10bbd-44d2-7420-8d4e-e1e73b939a22): a re-entrant decision in
+ *      the gate peeked the same un-reserved once-grant (one once-grant, two writes);
+ *   r3 (verify run 01a10ca5-0fb3-7032-a8c0-5374865424e8): BUG-231's per-call window
+ *      kept authorising the call's next commit after the grant was revoked, and a
+ *      claim reserved before a revoke still committed (the claim cached the answer).
+ *
+ * So no claim, window, hook or shim HOLDS authorisation. They hold a claim HANDLE,
+ * and every git write asks the store, AT THE MOMENT OF THE WRITE, through ONE call:
+ *
+ *   claimGrant(projectKey)  — mints a handle. Reads the permanent setting once
+ *                             (permanent first), else the live timed grant, and
+ *                             RESERVES a once-grant's use (a nested or concurrent
+ *                             claimer cannot take it). null → no grant → deny.
+ *                             A handle authorises NOTHING by itself.
+ *   useClaim(claim, now)    — THE allow. True iff, right now: the handle was minted
+ *                             here and has not ended; the project's revocation
+ *                             generation is the one it was minted under; it has not
+ *                             lapsed (CLAIM_MAX_MS); and the grant it was minted
+ *                             under is STILL the store's grant — the same timed grant
+ *                             object, unexpired, or the same permanent setting
+ *                             (same grantedAt incarnation). A reserved once-claim
+ *                             spends its use HERE, atomically, and only once per
+ *                             handle; later uses of a spent handle re-validate but
+ *                             never spend again. The permanent re-read only NARROWS
+ *                             (revoked → false); it never redirects a spend to
+ *                             another grant, so r1 cannot recur. Invalid → false,
+ *                             and the handle ENDS (its reservation returns).
+ *   endClaim(claim)         — idempotent end; a still-reserved use returns.
+ *   settleClaim(claim, 'commit'|'release') — the r3 single-write form, kept:
+ *                             'commit' = useClaim then end; 'release' = end. Throws
+ *                             on a second settle or a handle not minted here.
+ *
+ * Synchronous throughout, so nothing interleaves between check and spend. grantView
+ * / permanentGrantOf are DISPLAY reads; no enforcement path may act on them. The
+ * later self-grant check (A/B/C fork, not chosen) belongs in claimGrant only.
+ *
+ * Semantic change from r3, deliberate: r3 let a claim taken before a revoke still
+ * commit ("a revoke governs the NEXT claim"). Now a revoke, an expiry, a lapse or a
+ * replacement that lands between claim and use (mid-gate, mid-call) DENIES the write.
+ * Callers pass the clock as read AFTER their gate ran, never a pre-gate timestamp.
  */
-export function peekGrant(projectKey, now = Date.now()) {
+/*
+ * BUG-231 r6 — the lapse must EXCEED the longest a single foreground Bash call can
+ * run, or it breaks ordinary use. r5 set this to 5 min, so a live, non-withdrawn
+ * call that legitimately runs longer (e.g. `npm test && git commit` where the tests
+ * take 6 min) had its commit DENIED when the lapse withdrew its still-open call. The
+ * Claude Code Bash tool caps a single call at `timeout` ≤ 600000 ms (10 min). Orchard
+ * does NOT set or override that cap anywhere — no BASH_MAX_TIMEOUT_MS / BASH_DEFAULT_
+ * TIMEOUT_MS in settings.json or the env passthrough (checked 2026-10-06) — so there is
+ * no single source to derive from; we take the harness max (10 min) and add a 5-min
+ * margin for gate/startup/clock-skew slack, giving 15 min. A withdrawn/revoked/expired
+ * call is still denied IMMEDIATELY (that is the store's generation/expiry check, not
+ * this lapse); this bound only governs when an otherwise-live call's own handle lapses.
+ * CALL_TOMBSTONE_MS (below) stays far above this so an orphan tombstone outlives it.
+ */
+export const BASH_MAX_TIMEOUT_MS = 600 * 1000; // Claude Code Bash tool hard cap (10 min)
+export const CLAIM_MAX_MS = BASH_MAX_TIMEOUT_MS + 5 * 60 * 1000; // 15 min
+
+/** projectKey → revocation generation (bumped by revokeGitWrite). Memory-only. */
+const revocationGen = new Map();
+function genOf(projectKey) { return revocationGen.get(projectKey) ?? 0; }
+
+/** claim → { g, projectKey, kind, gen, permAt, at, state: 'reserved'|'live'|'spent'|'ended' }.
+ * Module-private: a claim is an opaque handle only this module can read. */
+const claims = new WeakMap();
+/** Number of `useClaim` calls that answered true. The FEAT-164 r4 structural test
+ * checks that every granted write maps 1:1 onto one of these. */
+let authorisations = 0;
+
+/** The live timed grant for a project, purging an expired one. Reservations are
+ * NOT counted here: a reserved once-grant is still live (it may be released). */
+function liveTimedGrant(projectKey, now) {
   const g = grants.get(projectKey);
   if (!g) return null;
   if (now >= g.expiresAt || g.remainingUses <= 0) { grants.delete(projectKey); return null; }
-  return viewGrant(g, now);
+  return g;
+}
+
+/** Drop reservations whose claim ended or lapsed (CLAIM_MAX_MS) — lazy, on every read. */
+function reapLapsed(g, now) {
+  if (!g.holds) return;
+  for (const c of g.holds) {
+    const st = claims.get(c);
+    if (!st || st.state !== 'reserved' || now - st.at >= CLAIM_MAX_MS) g.holds.delete(c);
+  }
+}
+
+/** Uses of a timed grant still claimable now. */
+function available(g, now) {
+  if (g.remainingUses === Infinity) return Infinity;
+  reapLapsed(g, now);
+  return g.remainingUses - (g.holds ? g.holds.size : 0);
+}
+
+/** Mint a claim handle (see the block above). Authorises nothing until useClaim. */
+export function claimGrant(projectKey, now = Date.now()) {
+  if (!projectKey || typeof projectKey !== 'string') return null;
+  const perm = permanentGrantOf(projectKey); // read ONCE, here, for this decision
+  let g = null;
+  let view;
+  if (perm) {
+    view = perm;
+  } else {
+    g = liveTimedGrant(projectKey, now);
+    if (!g || available(g, now) <= 0) return null;
+    view = viewGrant(g, now);
+  }
+  const kind = perm ? 'permanent' : g.remainingUses === Infinity ? 'duration' : 'once';
+  const claim = Object.freeze({ scope: view.scope, view: Object.freeze({ ...view }) });
+  claims.set(claim, {
+    g, projectKey, kind, gen: genOf(projectKey), permAt: perm ? perm.grantedAt : null,
+    at: now, state: kind === 'once' ? 'reserved' : 'live',
+  });
+  if (kind === 'once') (g.holds ??= new Set()).add(claim);
+  return claim;
+}
+
+/** Is the store's CURRENT answer still the grant this claim was minted under? */
+function stillValid(st, claim, now) {
+  if (st.state === 'ended') return false;
+  if (genOf(st.projectKey) !== st.gen) return false; // revoked since
+  if (now - st.at >= CLAIM_MAX_MS) return false; // lapsed
+  if (st.kind === 'permanent') {
+    const perm = permanentGrantOf(st.projectKey); // narrows only, never redirects
+    return !!perm && perm.grantedAt === st.permAt;
+  }
+  const g = st.g;
+  if (now >= g.expiresAt) return false; // expired since
+  if (st.state === 'spent') return true; // this handle consumed the once-grant's use
+  if (grants.get(st.projectKey) !== g) return false; // revoked / replaced since
+  if (st.kind === 'once') return g.holds?.has(claim) === true && g.remainingUses > 0;
+  return true;
+}
+
+function endState(st, claim) {
+  st.state = 'ended';
+  st.g?.holds?.delete(claim); // a still-reserved once-use returns to the grant
 }
 
 /**
- * Consume one use of a single-use grant (no-op for a duration grant). Called by
- * the runtime AFTER it has decided to permit a git write, so one grant maps to
- * exactly one permitted write.
+ * THE allow. True iff the store, now, still stands behind this claim; a reserved
+ * once-claim spends its use here, once. False ends the claim. Never throws.
  */
-export function consumeGrant(projectKey, now = Date.now()) {
-  const g = grants.get(projectKey);
-  if (!g) return;
-  if (g.scope === 'duration') return; // time-bounded, not use-bounded
-  g.remainingUses -= 1;
-  if (g.remainingUses <= 0 || now >= g.expiresAt) grants.delete(projectKey);
+export function useClaim(claim, now = Date.now()) {
+  const st = claim && typeof claim === 'object' ? claims.get(claim) : undefined;
+  if (!st) return false;
+  if (!stillValid(st, claim, now)) { endState(st, claim); return false; }
+  if (st.state === 'reserved') {
+    const g = st.g;
+    g.holds.delete(claim);
+    g.remainingUses -= 1;
+    if (g.remainingUses <= 0 && grants.get(g.projectKey) === g) grants.delete(g.projectKey);
+    st.state = 'spent';
+  }
+  authorisations += 1;
+  return true;
 }
+
+/** End a claim. Idempotent, never throws. */
+export function endClaim(claim) {
+  const st = claim && typeof claim === 'object' ? claims.get(claim) : undefined;
+  if (st && st.state !== 'ended') endState(st, claim);
+}
+
+/** True once a claim has ended (or was never minted here). Never throws. */
+export function claimSettled(claim) {
+  const st = claim && typeof claim === 'object' ? claims.get(claim) : undefined;
+  return !st || st.state === 'ended';
+}
+
+/**
+ * The single-write form: 'commit' → useClaim then end (true iff the write may
+ * proceed); 'release' → end, always false. Throws on a second settle or a claim
+ * this module did not mint.
+ */
+export function settleClaim(claim, outcome, now = Date.now()) {
+  const st = claim && typeof claim === 'object' ? claims.get(claim) : undefined;
+  if (!st) throw new TypeError('settleClaim: not a claim from claimGrant (FEAT-164 r3: one authority)');
+  if (st.state === 'ended') throw new Error('settleClaim: claim already settled (FEAT-164 r3: a decision ends once)');
+  if (outcome !== 'commit' && outcome !== 'release') throw new TypeError(`settleClaim: outcome must be 'commit' or 'release'`);
+  const ok = outcome === 'commit' ? useClaim(claim, now) : false;
+  endClaim(claim);
+  return ok;
+}
+
+/*
+ * ── BUG-231 r5 — PER-CALL CLAIM STATE LIVES HERE, AND ITS END IS TERMINAL ─────────
+ * The 5th break (verify run 01a10df8-9157-76b0-8c9b-bd5fb2cd70d9): the per-call window
+ * lived in git-grant.mjs and was dropped by a TIME-based reap at CLAIM_MAX_MS while its
+ * call was still in flight. The "this call was withdrawn" fact went with it, so the
+ * call's next written-out commit found no window, decided afresh on the independent
+ * path and spent a fresh re-grant. The window's mere existence decided behaviour, and
+ * time — not the call ending — destroyed it. Reopening a known call id did the same.
+ *
+ * So the call's claim state is the STORE's, keyed by call id (binding + tool_use_id):
+ *   status 'open'      — the handle may still authorise (useCallClaim asks useClaim).
+ *   status 'withdrawn' — TERMINAL for the call: the store refused it once (revoke,
+ *                        expiry, replacement, or the CLAIM_MAX_MS lapse). Every later
+ *                        written-out write of that call is denied; nothing re-decides it.
+ *   status 'ended'     — the call-end signal arrived (Post / deny / supersession /
+ *                        SubagentStop / turn end / session close). A tombstone only:
+ *                        its id can never be decided again, and it no longer matches
+ *                        shim writes (git after the call ended is not the call's).
+ * Time never deletes a not-ended record before CALL_TOMBSTONE_MS, far longer than any
+ * foreground call lives; the lapse only ENDS THE HANDLE (a reserved use returns) and
+ * withdraws the call. Unknown id → not valid, not usable.
+ */
+export const CALL_TOMBSTONE_MS = 24 * 60 * 60 * 1000;
+/** binding → Map(toolUseId → { agentKey, projectKey, claim, status, at, data }). Memory-only. */
+const calls = new Map();
+let lastGlobalSweep = 0;
+
+function sweepBinding(binding, m, now) {
+  for (const [id, r] of [...m]) {
+    if (now - r.at >= CALL_TOMBSTONE_MS) { if (r.claim) endClaim(r.claim); m.delete(id); continue; }
+    if (r.status === 'open') {
+      const st = claims.get(r.claim);
+      if (!st || st.state === 'ended' || now - st.at >= CLAIM_MAX_MS) withdraw(r);
+    }
+  }
+  if (m.size === 0) calls.delete(binding);
+}
+function sweep(binding, now) {
+  if (now - lastGlobalSweep >= 60_000 || now < lastGlobalSweep) {
+    lastGlobalSweep = now;
+    for (const [b, m] of [...calls]) sweepBinding(b, m, now);
+    return;
+  }
+  const m = binding ? calls.get(binding) : null;
+  if (m) sweepBinding(binding, m, now);
+}
+function withdraw(r) { if (r.claim) endClaim(r.claim); r.claim = null; r.status = 'withdrawn'; }
+function recOf(binding, toolUseId) { return binding && toolUseId ? calls.get(binding)?.get(toolUseId) : undefined; }
+
+/** The store's answer for a call id: 'unknown' | 'open' | 'withdrawn' | 'ended'. */
+export function callClaimState(binding, toolUseId, now = Date.now()) {
+  sweep(binding, now);
+  return recOf(binding, toolUseId)?.status ?? 'unknown';
+}
+
+/**
+ * Bind a claim handle to a call id. False (and the handle ENDS) when the id is already
+ * known in any state: one call id is decided once. `data` is the caller's non-authority
+ * bookkeeping (slots, gate fingerprint, record), freed when the call ends.
+ */
+export function openCallClaim({ binding, toolUseId, agentKey = 'main', projectKey, claim, data = {} }, now = Date.now()) {
+  if (!binding || !toolUseId || !claims.get(claim)) { endClaim(claim); return false; }
+  sweep(binding, now);
+  let m = calls.get(binding);
+  if (m?.has(toolUseId)) { endClaim(claim); return false; }
+  if (!m) { m = new Map(); calls.set(binding, m); }
+  m.set(toolUseId, { agentKey: agentKey ?? 'main', projectKey, claim, status: 'open', at: now, data });
+  return true;
+}
+
+/**
+ * BUG-231 r7 — record a call id as TERMINALLY DENIED when NO claim was opened for it: the
+ * pre-claim refusals (no grant for the project, or any deny before openCallClaim). Every
+ * other terminal outcome already tombstones an EXISTING record (useCallClaim → withdraw,
+ * endCallClaims → ended, the CLAIM_MAX_MS lapse → withdraw, the 24h sweep → delete); this
+ * is the one path that otherwise left NO record at all, so the id settled to 'unknown' and
+ * a once-grant issued AFTER the deny let the SAME id retry and steal it (verify run
+ * 01a10e18, probe 7f57e10c4704). A 'withdrawn' tombstone keyed by the call id makes the id
+ * (a) undecidable again — callClaimState != 'unknown', the hook refuses the retry — and
+ * (b) deny a shim write of the same call — findCallFor returns a not-ended match with its
+ * slots, and redeemGitWrite denies any status != 'open'. A call id that has ever been
+ * denied stays denied for its life; a grant issued after a deny reaches only the agent's
+ * NEXT Bash call (a new id), the normal retry shape. Idempotent; never throws. */
+export function denyCallClaim({ binding, toolUseId, agentKey = 'main', projectKey = null, data = {} } = {}, now = Date.now()) {
+  if (!binding || !toolUseId) return false;
+  sweep(binding, now);
+  let m = calls.get(binding);
+  if (!m) { m = new Map(); calls.set(binding, m); }
+  const existing = m.get(toolUseId);
+  if (existing) { if (existing.status === 'open') withdraw(existing); return true; }
+  m.set(toolUseId, { agentKey: agentKey ?? 'main', projectKey: projectKey ?? null, claim: null, status: 'withdrawn', at: now, data: data ?? {} });
+  return true;
+}
+
+/** THE allow for a call's write: true iff the call is open AND the store stands behind its
+ * handle now (useClaim). A false answer withdraws the call — terminally. */
+export function useCallClaim(binding, toolUseId, now = Date.now()) {
+  sweep(binding, now);
+  const r = recOf(binding, toolUseId);
+  if (!r || r.status !== 'open') return false;
+  if (useClaim(r.claim, now)) return true;
+  withdraw(r);
+  return false;
+}
+
+/**
+ * The not-ended call of `binding` in `projectKey` whose written-out slots include `verb`
+ * (open OR withdrawn — a withdrawn match is the caller's DENY), or null when the write
+ * belongs to no live call (the independent path).
+ */
+export function findCallFor(binding, projectKey, verb, now = Date.now()) {
+  sweep(binding, now);
+  const m = binding ? calls.get(binding) : null;
+  if (!m) return null;
+  for (const [toolUseId, r] of m) {
+    if (r.status !== 'ended' && r.projectKey === projectKey && r.data?.slots?.includes(verb)) {
+      return { toolUseId, status: r.status, data: r.data };
+    }
+  }
+  return null;
+}
+
+/** The call-end signal for every not-ended call of `binding` matching `pred({toolUseId, agentKey})`.
+ * Its handle ends (a reserved use returns), its bookkeeping is freed, a tombstone stays. */
+export function endCallClaims(binding, pred = () => true, now = Date.now()) {
+  const m = binding ? calls.get(binding) : null;
+  if (m) {
+    for (const [toolUseId, r] of m) {
+      if (r.status === 'ended' || !pred({ toolUseId, agentKey: r.agentKey })) continue;
+      if (r.claim) endClaim(r.claim);
+      r.claim = null; r.status = 'ended'; r.data = null;
+    }
+  }
+  sweep(binding, now);
+}
+
+/** TEST-ONLY: end and forget every call record. */
+export function _resetCallClaimsForTest() {
+  for (const m of calls.values()) for (const r of m.values()) if (r.claim) endClaim(r.claim);
+  calls.clear(); lastGlobalSweep = 0;
+}
+
+/** TEST/DIAGNOSTIC: a binding's not-ended calls (no handles). */
+export function _callClaimsOf(binding) {
+  const m = binding ? calls.get(binding) : null;
+  return m ? [...m].filter(([, r]) => r.status !== 'ended').map(([toolUseId, r]) => ({ toolUseId, status: r.status, agentKey: r.agentKey, data: r.data })) : [];
+}
+
+/** TEST/DIAGNOSTIC: how many writes the store has authorised (useClaim → true). */
+export function _authorisationCount() { return authorisations; }
 
 /**
  * Record an agent git write for the after-the-fact view. Returns the record.
@@ -172,7 +541,7 @@ export function consumeGrant(projectKey, now = Date.now()) {
  * it there via `confirmGitWrite`, because only the executor observes git's exit.
  * The record carries a stable `id` so that confirmation can find it later.
  */
-export function recordGitWrite({ projectKey, offender, command, sessionLabel = null, grantScope = null, gatePassed = null, outcome = 'permitted', now = Date.now() }) {
+export function recordGitWrite({ projectKey, offender, command, sessionLabel = null, grantScope = null, gatePassed = null, outcome = 'permitted', decision = null, now = Date.now() }) {
   const rec = {
     // BUG-184 round 3 — id is `w<seq>-<boot>`: the per-process boot nonce makes it
     // globally unique across restarts (A3). It is only a LOOKUP handle, NOT the
@@ -186,6 +555,10 @@ export function recordGitWrite({ projectKey, offender, command, sessionLabel = n
     // place to re-store a payload that might itself carry private text.
     command: typeof command === 'string' ? command.slice(0, 200) : null,
     grantScope: grantScope ?? null,
+    // BUG-231 — the ONE grant decision this write was authorised under. Every record
+    // of one Bash tool call (the hook's, and each invocation the shim redeemed against
+    // it) names the same decision, so a reader groups them instead of guessing.
+    decision: typeof decision === 'string' && decision ? decision : null,
     // gatePassed records the gate result AT DECIDE TIME (true/false/n-a). It is NOT
     // proof the write landed — `outcome` owns that. Kept for continuity/detail.
     gatePassed: gatePassed === null ? null : !!gatePassed,
@@ -260,25 +633,30 @@ export function listGitWrites(projectKey = null, limit = 100) {
   return rows.slice(-Math.max(0, limit)).reverse();
 }
 
-/** A serialisable view of the grant for a project (or null). */
+/** A serialisable DISPLAY view of the grant for a project (or null): permanent
+ * first, as claimGrant resolves it. Not a decision — enforcement uses claimGrant.
+ * A once-grant whose use is reserved by an in-flight claim still shows, with
+ * `remainingUses` = uses still claimable and `reserved` = uses in flight. */
 export function grantView(projectKey, now = Date.now()) {
-  const g = grants.get(projectKey);
-  if (!g) return null;
-  if (now >= g.expiresAt || g.remainingUses <= 0) { grants.delete(projectKey); return null; }
-  return viewGrant(g, now);
+  const perm = permanentGrantOf(projectKey);
+  if (perm) return perm;
+  const g = liveTimedGrant(projectKey, now);
+  return g ? viewGrant(g, now) : null;
 }
 
 /** Register (or clear) the durable audit sink. index.ts wires the host log file. */
 export function setGitWriteAuditSink(fn) { auditSink = typeof fn === 'function' ? fn : null; }
 
 /** TEST-ONLY: forget every grant and clear the ledger. */
-export function _resetGitGrantsForTest() { grants.clear(); ledger.length = 0; ledgerSeq = 0; confirmCaps.clear(); auditSink = null; }
+export function _resetGitGrantsForTest() { grants.clear(); revocationGen.clear(); calls.clear(); lastGlobalSweep = 0; authorisations = 0; ledger.length = 0; ledgerSeq = 0; confirmCaps.clear(); auditSink = null; permanentSource = null; }
 
 function viewGrant(g, now) {
+  const bounded = g.remainingUses !== Infinity;
   return {
     projectKey: g.projectKey,
     scope: g.scope,
-    remainingUses: g.remainingUses === Infinity ? null : g.remainingUses,
+    remainingUses: bounded ? available(g, now) : null,
+    reserved: bounded ? g.remainingUses - available(g, now) : 0,
     grantedAt: g.grantedAt,
     grantedVia: g.grantedVia,
     note: g.note,

@@ -4,16 +4,9 @@ Project-specific working rules. Auto-injected into sessions launched for this
 project (see src/server/templates.ts localConventionsSection). Grows by hand and
 by relocation from the universal Working Agreement (`wa-consolidate --apply`, WA §L).
 
-## Whoever owns a fact writes it down; no reader works it out again (ARCH-010, 2026-08-25)
+<!-- conventions-inject:start -->
 
-Half of every defect on this board — 58 of 119, and eight of the nine architecture
-tickets — is one habit: **a fact a reader has to act on is never written down by
-whoever owns it, so each reader works it out again from something that does not
-carry it.** Is this process alive? Does this work outlive the turn? Which project
-is this view showing? Where does this record end? Each answer existed somewhere
-and was never stated, so every call site substituted whatever signal was to hand —
-right for the cases its author imagined, quietly wrong for the rest, and
-unfixable one reader at a time.
+## Whoever owns a fact writes it down; no reader works it out again (ARCH-010, 2026-08-25)
 
 The user settled it as a class on 2026-08-25 (ARCH-010, option A) rather than
 answering it once per subsystem. **The rule:** every fact a reader has to act on
@@ -45,12 +38,6 @@ the fact can change while it is being read. And it does not license a migration
 of existing records to make a fact declarable: if a change needs one, stop and
 ask, because 194 archived originals matter more than any one ticket.
 
-Worked examples on this board: `ARCH-002` (lifetime declared at dispatch, not
-inferred), `ARCH-009` (the derived proof field was deleted, and `verification[]`
-carries attributed entries instead), `FEAT-100` (the `Dispatch:` line below),
-`ARCH-001` (one liveness authority in `src/server/liveness.ts`), `FEAT-145`
-(one account-id→dir authority; see the account-dir overlay section below).
-
 ### A ticket's state is declared by the board — read it, don't reconstruct it (FEAT-149, 2026-09-23)
 
 A direct corollary of ARCH-010 for the one fact the orchestrator cites most: a
@@ -64,6 +51,36 @@ review history four times from three contradictory lane reports and was wrong
 each time, while the user read the real answer off their own board. Lane reports
 are summaries written under their own framing and disagree by construction — the
 board is the source, so check it.
+
+### Independent verification is a TYPED entry with ONE writer — never a prose line (BUG-225, 2026-09-30)
+
+Proof that a ticket was independently verified is a typed entry — `{provider, model,
+run_id, verdict: holds|broken|invalid, author, recorded_at}` — in the ticket record's
+`verification[]` (or, for a legacy prose ticket, the board's `verification-ledger.json`),
+read by ONE function (`ticketVerifications`, scripts/lib/verification-source.mjs). Only a
+HOLDS with no later BROKEN counts. Record it with the tool:
+
+    node scripts/board-tool.mjs verified --id BUG-123 --provider anthropic \
+      --model claude-opus-5 --run <dispatch run id> --verdict HOLDS
+
+A hand-typed `Verified-by:` line counts for nothing, in any spelling. Lines written before
+2026-09-30 are read from a frozen, hash-pinned snapshot
+(`docs/bugs/verification-legacy.frozen.json`); `board:check` FAILs a dispatch-shaped
+`Verified-by:` line typed after it, so the mistake is loud.
+
+### A fork that needs the user is declared with `board-tool decide`, never as log prose (FEAT-166, 2026-10-05)
+
+The Decide card reads only the ticket record, so options written in the Activity log reach the
+user as nothing. Declare them (one `--option` per choice, five `|`-separated fields each):
+
+    node scripts/board-tool.mjs decide --id BUG-123 --question "Which …?" \
+      --option "A=label | what changes | gains | costs | why not obviously best" \
+      --option "B=…" --recommend A --why "…"
+
+The user's answer is a typed entry (record `decision.answers[]`, or the board's
+`answer-ledger.json`) written only by the server's answer route; a `### … — you (answer …)`
+heading is display and counts for nothing. Never write one — `board:check` names any typed
+after the 2026-10-05 freeze (`answers-legacy.frozen.json`).
 
 ## Declare the dispatch — one line at the top of every charter (FEAT-100, 2026-08-21)
 
@@ -81,12 +98,6 @@ and none of which anything used to ask you for:
 | `round` | a positive integer | which attempt this is, so the verification yield curve is counted rather than reconstructed |
 | `class` | `trivial` \| `fix` \| `explore` \| `plan+review` \| `arch` \| `verify` | the class WA §I already requires you to choose — this is where "recorded in the charter" actually lands |
 
-Why a line of prose rather than a field somewhere: the charter is already being
-written and already becomes the lane's first transcript message, which
-`npm run cost:collect` already reads. So this adds no store, no extra write and
-no runtime cost — it records what is already in your head at the one moment it
-is known.
-
 **Omit what you do not know. Never invent a value.** An absent field is reported
 as `undeclared` and shows up in the coverage line; a wrong one silently poisons
 every table it appears in. Two declarations that disagree are dropped entirely
@@ -95,22 +106,7 @@ rather than resolved, so do not paste a second one.
 **Quoting the syntax is safe** — a `Dispatch:` line inside a fenced code block is
 ignored, which is why the example above is indented instead of fenced.
 
-For a dispatch that goes through the CLI rather than an in-process agent, pass
-the same four as flags and the line is composed for you, validated by
-round-tripping through the reader's own grammar:
-
-    node scripts/dispatch.mjs --provider openai --ticket BUG-123 --phase verifying \
-      --round 2 --class verify --meta-out <file> …
-
-Read it back with `npm run cost:collect` (coverage + the per-ticket
-finding/fixing/verifying split) or `node scripts/cost-collect.mjs --ticket=BUG-123`
-for one ticket lane by lane. Grammar and both directions live in one place,
-`scripts/lib/cost-model.mjs`.
-
 ## Testing — added 2026-08-18
-
-Both rules come from the same failure shape seen repeatedly here: a check that
-passed while the thing it guarded was wrong.
 
 ### Test against the real artifact, not a constructed one
 
@@ -232,11 +228,44 @@ product is safe; your fixture still is not, because a record naming real paths
 will mislead anything else that reads it. Rewrite `status`, `sock`, `errlog` and
 the `.ctl.json` twins to your scratch dir, then scrub pids.
 
-## A Claude account dir is an overlay, not a copy — do not tidy it (FEAT-145, 2026-09-18)
+## Container tests run in the standing Docker sandbox, never on the host daemon (FEAT-158, 2026-09-30)
 
-Everything in this section looks like a bug in isolation. Each item is here
-because a reader who "fixed" it would split the transcript store, prune the
-user's history, or silently disarm a data-loss guard.
+The host daemon runs the user's live projects (BUG-216). Anything that creates, sweeps
+or removes Docker objects runs in the one shared sandbox; do not build a private dind:
+
+    npm run sandbox:docker -- up && eval "$(npm run -s sandbox:docker -- env)"
+
+`status` shows it, `reset` empties it (keeps images), `down` stops it (keeps the cache).
+A destructive suite calls `assertIsolatedDocker()` (`scripts/lib/docker-sandbox.mjs`)
+first: it refuses the host daemon, pins `DOCKER_HOST`, and takes the daemon's exclusive
+lock, so lanes take turns (a waiter prints the holder; exit 3 on
+`ORCHARD_DOCKER_LOCK_TIMEOUT`). A suite that must stay on the host (GPU, host `/proc`)
+removes only what its own scratch server owns, via `scripts/lib/owned-docker.mjs`;
+never a fixed-name `docker rm -f claude-station-<slug>`. Known limits (host `/tmp`
+writable from the sandbox, lock rendezvous) are under "Docker sandbox detail" below.
+
+**Which Docker a project's lanes use is a declared project setting (BUG-223).** Each
+project declares `settings.laneDocker: 'sandbox' | 'host'` (Settings → Isolation & environment).
+The live server reads it when it launches a direct session or a broker-dispatched lane. It never
+scans the project's files at that point. A `sandbox` project's launch gets `DOCKER_HOST` at the
+sandbox and `ORCHARD_LANE_DOCKER=<socket>`. A `host` project's launch gets
+`ORCHARD_LANE_DOCKER=host`. Every descendant inherits `ORCHARD_LANE_DOCKER` as-is and never decides
+again, and that includes scratch servers. An unusable value fails closed to an unreachable socket.
+The initial value is set once, when the project is registered: `sandbox` if the project holds an
+Orchard checkout or is empty, else `host`. Repointing a project at a directory that holds a
+checkout moves it to `sandbox`. Nothing ever moves a project to `host` without the user. Rows older than the setting are classified once with
+`npm run lane-docker:classify`, which backs up the registry first. An undeclared row runs on the
+sandbox and logs a warning. The host is reached only through the logged opt-out:
+`useHostDocker('<reason>')` (`scripts/lib/lane-docker.mjs`) in a suite, or
+`eval "$(npm run -s sandbox:docker -- host-env '<reason>')"` in a shell. The live server's own
+process and container sessions keep the host daemon.
+
+## Restart checkpoint protocol (2026-09-30)
+
+Snapshot every file before your first edit. On "CHECKPOINT NOW", follow "Restart
+checkpoint protocol — detail" (below the injected region) and end with `CHECKPOINTED`.
+
+## A Claude account dir is an overlay, not a copy — do not tidy it (FEAT-145, 2026-09-18)
 
 **The invariant.** A Claude account dir is a **thin overlay over `~/.claude`
 that differs in exactly ONE file, `.credentials.json`.** `projects` and
@@ -317,12 +346,6 @@ all of `/tmp` is wiped **on every boot**, and swept at 10 days besides. That is
 correct system policy, it is not to be changed, and it makes `/tmp` the wrong
 home for two things the tooling builds:
 
-- **Expensive** scratch. A clean room (`scripts/independent-verify.mjs`) exports
-  the tree and copies this project's 374 MB / ~10,900-file `node_modules`.
-- **Long-lived** scratch. A room kept with `--keep-cleanroom`, and the record dir
-  holding `manifest.jsonl` + `<id>.out`, are the artifacts a verdict CITES — read
-  when the ticket is closed, possibly days and one boot later.
-
 Use `scripts/lib/scratch.mjs`: `mkdtempScratch(prefix)` instead of
 `fs.mkdtempSync(path.join(os.tmpdir(), prefix))`. It resolves
 `$CLAUDE_STATION_TMPDIR` → `$XDG_STATE_HOME/claude-station/scratch` →
@@ -352,12 +375,6 @@ boundary is preflighted (`checkSameFilesystem`, the same shape
 lost, and the knob that fixes it) and **reported** — unlike the snapshot store it
 does not throw, because a snapshot on the wrong filesystem permanently consumes
 the project's full size while a clean room is a throwaway that is merely slow.
-
-Deliberately **not** age-swept: a sweeper here would re-invent what we just
-escaped, and could delete a directory a still-running process is using. Kept
-rooms are yours to remove; every caller prints the path it used.
-
-Proof: `node scripts/verify-scratch-root.mjs` (28/28).
 
 ## Relocated from the universal Working Agreement — 2026-08-05
 
@@ -408,16 +425,6 @@ reaching for this rule, the rule you actually want is the working agreement's §
 `.git/config`.** That is by design, and it is why a correct `.git/config` cannot
 protect you: the override wins precisely because you asked for it.
 
-Three commits here carry the user's personal address in both author and committer
-fields, the most recent on 2026-08-25 — days after global config was corrected —
-and every one of them was an agent explicitly passing `-c user.email=` on the
-command line. None of them had read `git config` first. The address came from the
-agent's own context: the Claude Code harness injects a `userEmail` line (the
-**account** email) into the system prompt of every session and subagent, so an
-agent reaching for "the identity to commit under" finds a personal address sitting
-right there and helpfully supplies it — overriding the repo identity that exists
-specifically to keep that address out of the history.
-
 **Rule:** when committing to a REAL repo, pass no identity at all — `git commit`
 with no `-c user.*`, no `--author`, no `GIT_*` identity env. The repo's configured
 identity is the answer, and it is already correct. The `userEmail` in your context
@@ -445,20 +452,6 @@ the working tree the 369-commit local history had produced. On 2026-08-25 local
 `main` was collapsed onto that commit, so local and published now share one
 history and a plain `git push` is an ordinary fast-forward.
 
-**Why it was collapsed, so nobody helpfully restores it.** Those 369 commits
-contain real, unremovable leaks — at a commit from that same day the leak gate
-fails with 12 hits across 3 files, including two real Codex session paths and a
-client's product terms. The leaks are in the *history*, which no later commit
-can fix. Collapsing is what makes local match published and is the only thing
-stopping that history being pushed later by someone treating this as a normal
-repo. If you find yourself about to publish "the full history", this paragraph
-is the answer to why you must not.
-
-**The old history is preserved, not lost:** local branch
-`local-history-before-collapse-20260825` (369 commits, tip `9e74119`), plus the
-bundle and `.git` copy under `~/scratch/orchard-backup-20260825/`, plus remote
-branch `backup-before-publish-20260825`. Do not delete any of these.
-
 **Never push the preserved branch.** It is exactly the leaking history. In
 practice that means: push `main` and ordinary feature branches; never
 `git push --all`, never `git push origin local-history-before-collapse-*`, and
@@ -481,3 +474,174 @@ leak and the public repo.
   that session's instructions, board snapshot and framing — contaminated by construction.
   Verification goes out through the project's dispatch CLI (Orchard:
   `scripts/independent-verify.mjs`, which wraps `scripts/dispatch.mjs`).
+
+<!-- conventions-inject:end -->
+
+## Docker sandbox detail: guard, lock and known limits (FEAT-158)
+
+The host Docker daemon runs the user's live projects. BUG-216 is what happens when
+a test removes things there. Anything that creates, sweeps or removes containers,
+networks, volumes or images runs in the one shared sandbox:
+
+    npm run sandbox:docker -- up && eval "$(npm run -s sandbox:docker -- env)"
+
+`up` is idempotent: about 2 s warm, about 22 s cold, with Orchard's base and the
+fixture images already loaded. `status` shows what is in it. `reset` removes its
+containers, networks and volumes and keeps images and build cache. `down` stops it
+and keeps the cache. Do not build a private docker-in-docker.
+
+A destructive suite calls `assertIsolatedDocker()` from `scripts/lib/docker-sandbox.mjs`
+first. It compares daemon IDs and refuses unless the daemon is provably not the
+host's. "The host" is every well-known host socket addressed directly plus the
+default context, so a persisted `docker context use` cannot disguise it. A new
+destructive suite must call it too.
+
+**The sandbox is shared, and a lock makes that safe.** The guard, `reset`, `down` and a
+restarting `up` each take an exclusive lock on the target daemon. The lock is a kernel
+`flock` on `.orchard-docker.lock` beside the daemon's socket, so every lane that reaches
+the daemon shares it, whatever its `XDG_STATE_HOME`. A second lane waits, printing who
+holds the lock, and exits 3 with `TIMED OUT` after `ORCHARD_DOCKER_LOCK_TIMEOUT` seconds
+(default 1800). The lock is held until the holder and every child it started have exited.
+That includes `kill -9` of the holder: the lock is not freed while its server child is
+still working, and no stale lock is left once they are gone. A suite's own children
+re-enter its lock. Lanes therefore take turns in the one warm daemon; they do not run in
+it concurrently.
+
+**A suite that stays on the host removes only what it owns.** Some container suites
+cannot run in the sandbox (GPU/CDI, host `/proc`). Their cleanup goes through
+`scripts/lib/owned-docker.mjs`, which removes a container or image only if it carries
+this run's scratch data-dir owner key (the BUG-216 `claude-station.owner` label). A
+fixed-name `docker rm -f claude-station-<slug>` removes another instance's container of
+the same name, so do not write one.
+
+**Known limit: host `/tmp` and scratch are writable from the sandbox.** They are mounted
+at the same paths so that bind mounts resolve. The guard protects the daemon, not those
+files. A container in the sandbox can read and write them just as the test itself can,
+including any unix socket that lives there (an ssh-agent or tmux socket under `/tmp`).
+The guard also does not defend against a hostile `docker` binary on `PATH` or a lying
+socket proxy, which could answer `info` from one daemon and act on another. When the
+host socket is masked (a jailed lane), `HOST_DOCKER_ID` is trusted as the host's id, so
+take it from `sandbox:docker env`, never type it by hand. `DOCKER_HOST` must be exactly
+`unix:///<absolute path>` or `tcp://host:port`; the guard pins a unix path to its real path
+and writes that back into `DOCKER_HOST`. The lock is shared only by lanes that reach the
+socket's directory: a lane that bind-mounts the socket FILE alone elsewhere, or reaches the
+daemon over `tcp://`, gets a different lock. A worker that detaches itself from the suite's
+process tree (`setsid`, a double fork) is not waited for. The socket is a file in a dir you
+own, so replacing it after a suite's guard has checked it redirects that suite; `reset` is
+not affected (it checks the daemon id and removes over one connection). The CLI's other host
+paths are path-based too: a same-uid process that swaps the run dir for a symlink between `up`'s
+check and dockerd's bind moves the socket there, and `down --purge` removes the volume by name
+after a last label check (Docker has no conditional delete). Likewise `owned-docker.mjs`
+removes images by tag after listing them by owner label, so a tag re-pointed in between goes,
+and a suite's own per-run image tags (which carry no owner label) are removed by name.
+A scratch server (explicit `CLAUDE_STATION_DATA`) adopts no unlabelled container, network or
+volume; only the shared instance keeps its pre-label objects (`mayActOn`, instance-owner.ts).
+
+## Restart checkpoint protocol — detail (standard text for every long lane's charter)
+
+An Orchard restart deploys whatever is in the working tree. A lane caught mid-edit
+ships half-finished hunks, and the restart also kills the lane's own turn. So every
+charter for a lane that may outlive one restart window carries this text verbatim:
+
+> **Before your first edit:** copy the pre-lane version of every file you will touch
+> to `$scratch/<lane>/pre/` (use `scripts/lib/scratch.mjs`, never `/tmp`). Add each
+> new file to the list the moment you decide to touch it.
+>
+> **On "CHECKPOINT NOW"** (from the orchestrator), stop editing and, in order:
+> 1. Stop every child you started, by process group (`kill -- -<pgid>`), never
+>    `pkill` and never a process you did not start.
+> 2. Release the Docker sandbox lock by letting those children exit. Do not delete
+>    the lock file.
+> 3. Save the WIP under `$scratch/<lane>/wip-<timestamp>/`: `git diff -- <your files>`
+>    as a patch, plus full copies of every file you touched (new files included).
+> 4. Restore only YOUR hunks. For a file only you touched, copy back its `pre/` copy.
+>    For a file other lanes also changed, reverse-apply only your hunks
+>    (`git apply -R` of your own patch). Never run `git checkout`/`git stash`/
+>    `git restore` on the tree: they take other lanes' changes too.
+> 5. Run `npm run gate` unpiped and read its exit status.
+> 6. Append to your ticket's Activity log: the WIP path, the files restored, the
+>    gate result, and what remains.
+> 7. End your turn with the single word `CHECKPOINTED`.
+>
+> **On resume:** re-apply your saved patch over the CURRENT tree (`git apply --3way`),
+> not over your `pre/` copies, so changes other lanes landed during the restart are
+> kept. Resolve conflicts by hand, then re-run your must-FAIL proof before going on.
+> Nothing you verified before the checkpoint counts as verified after it.
+
+## Background, history & evidence (not injected into sessions — read this file in full for these)
+
+Half of every defect on this board — 58 of 119, and eight of the nine architecture
+tickets — is one habit: **a fact a reader has to act on is never written down by
+whoever owns it, so each reader works it out again from something that does not
+carry it.** Is this process alive? Does this work outlive the turn? Which project
+is this view showing? Where does this record end? Each answer existed somewhere
+and was never stated, so every call site substituted whatever signal was to hand —
+right for the cases its author imagined, quietly wrong for the rest, and
+unfixable one reader at a time.
+
+Worked examples on this board: `ARCH-002` (lifetime declared at dispatch, not
+inferred), `ARCH-009` (the derived proof field was deleted, and `verification[]`
+carries attributed entries instead), `FEAT-100` (the `Dispatch:` line below),
+`ARCH-001` (one liveness authority in `src/server/liveness.ts`), `FEAT-145`
+(one account-id→dir authority; see the account-dir overlay section below).
+
+Why a line of prose rather than a field somewhere: the charter is already being
+written and already becomes the lane's first transcript message, which
+`npm run cost:collect` already reads. So this adds no store, no extra write and
+no runtime cost — it records what is already in your head at the one moment it
+is known.
+
+For a dispatch that goes through the CLI rather than an in-process agent, pass
+the same four as flags and the line is composed for you, validated by
+round-tripping through the reader's own grammar:
+
+    node scripts/dispatch.mjs --provider openai --ticket BUG-123 --phase verifying \
+      --round 2 --class verify --meta-out <file> …
+
+Read it back with `npm run cost:collect` (coverage + the per-ticket
+finding/fixing/verifying split) or `node scripts/cost-collect.mjs --ticket=BUG-123`
+for one ticket lane by lane. Grammar and both directions live in one place,
+`scripts/lib/cost-model.mjs`.
+
+Both rules come from the same failure shape seen repeatedly here: a check that
+passed while the thing it guarded was wrong.
+
+Everything in this section looks like a bug in isolation. Each item is here
+because a reader who "fixed" it would split the transcript store, prune the
+user's history, or silently disarm a data-loss guard.
+
+- **Expensive** scratch. A clean room (`scripts/independent-verify.mjs`) exports
+  the tree and copies this project's 374 MB / ~10,900-file `node_modules`.
+- **Long-lived** scratch. A room kept with `--keep-cleanroom`, and the record dir
+  holding `manifest.jsonl` + `<id>.out`, are the artifacts a verdict CITES — read
+  when the ticket is closed, possibly days and one boot later.
+
+Deliberately **not** age-swept: a sweeper here would re-invent what we just
+escaped, and could delete a directory a still-running process is using. Kept
+rooms are yours to remove; every caller prints the path it used.
+
+Proof: `node scripts/verify-scratch-root.mjs` (28/28).
+
+Three commits here carry the user's personal address in both author and committer
+fields, the most recent on 2026-08-25 — days after global config was corrected —
+and every one of them was an agent explicitly passing `-c user.email=` on the
+command line. None of them had read `git config` first. The address came from the
+agent's own context: the Claude Code harness injects a `userEmail` line (the
+**account** email) into the system prompt of every session and subagent, so an
+agent reaching for "the identity to commit under" finds a personal address sitting
+right there and helpfully supplies it — overriding the repo identity that exists
+specifically to keep that address out of the history.
+
+**Why it was collapsed, so nobody helpfully restores it.** Those 369 commits
+contain real, unremovable leaks — at a commit from that same day the leak gate
+fails with 12 hits across 3 files, including two real Codex session paths and a
+client's product terms. The leaks are in the *history*, which no later commit
+can fix. Collapsing is what makes local match published and is the only thing
+stopping that history being pushed later by someone treating this as a normal
+repo. If you find yourself about to publish "the full history", this paragraph
+is the answer to why you must not.
+
+**The old history is preserved, not lost:** local branch
+`local-history-before-collapse-20260825` (369 commits, tip `9e74119`), plus the
+bundle and `.git` copy under `~/scratch/orchard-backup-20260825/`, plus remote
+branch `backup-before-publish-20260825`. Do not delete any of these.

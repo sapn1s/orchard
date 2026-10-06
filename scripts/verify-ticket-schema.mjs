@@ -636,13 +636,15 @@ try {
   const target = path.join(onboardRoot, 'a-project');
   fs.mkdirSync(target, { recursive: true });
   execFileSync('node', [path.join(repoRoot, 'scripts', 'onboard.mjs'), target], { encoding: 'utf8', stdio: 'pipe' });
-  const copied = path.join(target, 'scripts', 'lib', 'ticket-schema.mjs');
-  check('(H) onboard copies scripts/lib/ticket-schema.mjs into the target', fs.existsSync(copied));
+  // FEAT-106: onboard flattens the lib closure into .orchard/lib/ and puts the
+  // board tool at .orchard/board.mjs (board over .orchard/bugs).
+  const copied = path.join(target, '.orchard', 'lib', 'ticket-schema.mjs');
+  check('(H) onboard copies .orchard/lib/ticket-schema.mjs into the target', fs.existsSync(copied));
   check('(H) the copy is byte-identical to source', fs.existsSync(copied) && fs.readFileSync(copied, 'utf8') === schemaSrc);
 
   const runBoard = () => {
     try {
-      execFileSync('node', [path.join(target, 'scripts', 'board.mjs'), 'check', `--dir=${path.join(target, 'docs', 'bugs')}`],
+      execFileSync('node', [path.join(target, '.orchard', 'board.mjs'), 'check', `--dir=${path.join(target, '.orchard', 'bugs')}`],
         { encoding: 'utf8', stdio: 'pipe' });
       return { code: 0, out: '' };
     } catch (e) { return { code: e.status ?? 1, out: `${e.stdout ?? ''}${e.stderr ?? ''}` }; }

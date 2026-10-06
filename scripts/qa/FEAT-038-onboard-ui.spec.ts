@@ -31,14 +31,16 @@ import * as path from 'node:path';
 
 const ROOT = path.resolve(import.meta.dirname, '..', '..');
 
-// The 6 on-disk artifacts onboard.mjs's core creates (mirror of its own list).
+// The on-disk artifacts onboard.mjs's core creates (mirror of its own list).
+// FEAT-106: everything Orchard generates is consolidated under .orchard/ (the
+// way .claude/ works); only CLAUDE.md stays at the target root.
 const ARTIFACTS = [
-  'docs/bugs/README.md',
-  'docs/bugs/INDEX.md',
-  'docs/bugs/TEMPLATE.md',
+  '.orchard/bugs/README.md',
+  '.orchard/bugs/INDEX.md',
+  '.orchard/bugs/TEMPLATE.md',
   'CLAUDE.md',
-  'docs/CONVENTIONS.md',
-  'scripts/board.mjs',
+  '.orchard/CONVENTIONS.md',
+  '.orchard/board.mjs',
 ];
 
 async function freePort(): Promise<number> {
@@ -154,7 +156,7 @@ test('one click onboards a project to Orchard; a re-run is idempotent; a bad tar
     expect(fs.existsSync(path.join(WORK, rel)), `post-onboard, ${rel} must exist on disk`).toBe(true);
   }
   // The copied board guard actually runs against the fresh (ticket-less) board.
-  const board = spawn(process.execPath, [path.join(WORK, 'scripts', 'board.mjs'), 'check', `--dir=${path.join(WORK, 'docs', 'bugs')}`], { stdio: 'ignore' });
+  const board = spawn(process.execPath, [path.join(WORK, '.orchard', 'board.mjs'), 'check', `--dir=${path.join(WORK, '.orchard', 'bugs')}`], { stdio: 'ignore' });
   const boardOk = await new Promise<boolean>((res) => board.on('exit', (code) => res(code === 0)));
   expect(boardOk, 'the copied board:check must PASS on the freshly onboarded board').toBe(true);
 

@@ -19,12 +19,19 @@
  * Safety: everything is keyed to a random projectId under the `t-feat112-`
  * prefix; the finally block removes only what this script created, by name/label.
  * The user's real containers are never touched. Not part of `npm run gate`
- * (needs docker + network); run explicitly:  node scripts/verify-feat-112-services.mjs
+ * (needs docker + network); run explicitly, in the FEAT-158 sandbox:
+ *   eval "$(npm run -s sandbox:docker -- env)" && node scripts/verify-feat-112-services.mjs
  */
 import { spawn, spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { assertIsolatedDocker } from './lib/docker-sandbox.mjs';
+
+// FEAT-158: section C calls reapOrphanServiceInfra(new Set()), which treats every
+// service network/volume on the daemon as an orphan. Refuse the host daemon.
+// Run it in the standing sandbox: eval "$(npm run -s sandbox:docker -- env)"
+assertIsolatedDocker('verify-feat-112-services');
 
 // Bound the pull timeout low BEFORE importing the module, so the timeout case is
 // provable in seconds. Set the isolation data dir too, for the decisions store.
@@ -33,6 +40,10 @@ process.env.CLAUDE_STATION_DATA = DATA;
 process.env.CLAUDE_STATION_SERVICE_PULL_TIMEOUT_MS = process.env.CLAUDE_STATION_SERVICE_PULL_TIMEOUT_MS ?? '4000';
 
 const svc = await import('../src/server/service-manager.ts');
+// ARCH-022: direct manager calls run inside lifecycle operations of a booted authority (scripts/lib/lifecycle-harness.mjs).
+const { bootAuthority } = await import('./lib/lifecycle-harness.mjs');
+const H = await bootAuthority(path.resolve(import.meta.dirname, '..'));
+const { ownerKey } = await import('../src/server/instance-owner.ts');
 const decisions = await import('../src/server/decisions.ts');
 const { validateServices } = await import('../src/server/validate.ts');
 
@@ -76,7 +87,7 @@ async function main() {
 
   console.log('\n=== A. lifecycle + REAL in-container connect ===');
   const redis = { name: 'redis', image: SVC_IMAGE, env: [], dataPath: '/data' };
-  await svc.ensureServices(projectWith([redis]), (s) => process.stdout.write(`    ${s}`));
+  await H.op(PID, () => svc.ensureServices(projectWith([redis]), (s) => process.stdout.write(`    ${s}`)));
 
   const svcName = svc.serviceContainerName(PID, 'redis');
   const netName = svc.networkName(PID);
@@ -90,7 +101,7 @@ async function main() {
   // default bridge like the real one, then joined to the service network.
   d(['rm', '-f', sessionName]);
   const created = d(['run', '-d', '--name', sessionName,
-    '--label', 'claude-station=1', '--label', `claude-station.project=${PID}`,
+    '--label', 'claude-station=1', '--label', `claude-station.project=${PID}`, '--label', `claude-station.owner=${ownerKey()}`,
     BASE_IMAGE, 'sleep', '600']);
   check('scratch session container started', created.code === 0, created.code === 0 ? sessionName : created.err.slice(0, 200));
 
@@ -102,10 +113,10 @@ async function main() {
   check('BEFORE joining the network, the session CANNOT reach "redis" (must-fail baseline)',
     preProbe.code !== 0 || !preProbe.out.includes('PONG'), `code=${preProbe.code} out=${(preProbe.out || preProbe.err).slice(0, 120)}`);
 
-  svc.connectSessionToServices(PID, (s) => process.stdout.write(`    ${s}`));
+  await H.op(PID, () => svc.connectSessionToServices(PID, (s) => process.stdout.write(`    ${s}`)));
   // Idempotency: a second connect must not throw.
   let secondConnectOk = true;
-  try { svc.connectSessionToServices(PID); } catch { secondConnectOk = false; }
+  try { await H.op(PID, () => svc.connectSessionToServices(PID)); } catch { secondConnectOk = false; }
   check('connectSessionToServices is idempotent (second call no-op)', secondConnectOk, `ok=${secondConnectOk}`);
 
   // THE CLAIM: from INSIDE the session container, a real client call to redis,
@@ -124,7 +135,7 @@ async function main() {
   let e1 = null;
   const t1 = Date.now();
   try {
-    await svc.ensureServices(projectWith([{ name: 'nope', image: 'redis:this-tag-does-not-exist-999x', env: [], dataPath: null }]));
+    await H.op(PID, () => svc.ensureServices(projectWith([{ name: 'nope', image: 'redis:this-tag-does-not-exist-999x', env: [], dataPath: null }])));
   } catch (e) { e1 = e; }
   const b1ms = Date.now() - t1;
   check('a bad image tag throws ServiceError naming the service + image',
@@ -132,24 +143,22 @@ async function main() {
       && /nope/.test(e1.message) && /this-tag-does-not-exist/.test(e1.message),
     e1 ? `code=${e1.code} msg=${e1.message.slice(0, 140)}` : 'no error thrown');
   // Reconcile away the failed/leftover 'nope' before continuing.
-  svc.teardownServices(PID, { removeVolumes: false });
+  await H.op(PID, () => svc.teardownServices(PID, { removeVolumes: false }));
 
   // B2 — unreachable registry: bounded pull timeout ABORTS, does not hang.
   let e2 = null;
   const t2 = Date.now();
   try {
-    await svc.ensureServices(projectWith([{ name: 'slow', image: '10.255.255.1:5000/nope:latest', env: [], dataPath: null }]));
+    await H.op(PID, () => svc.ensureServices(projectWith([{ name: 'slow', image: '10.255.255.1:5000/nope:latest', env: [], dataPath: null }])));
   } catch (e) { e2 = e; }
   const b2ms = Date.now() - t2;
   check('an unreachable registry is ABORTED by the bounded timeout (did not hang)',
     !!e2 && b2ms < 30_000, e2 ? `code=${e2.code} after ${b2ms}ms: ${e2.message.slice(0, 120)}` : `no error after ${b2ms}ms`);
-  svc.teardownServices(PID, { removeVolumes: false });
+  await H.op(PID, () => svc.teardownServices(PID, { removeVolumes: false }));
 
   console.log('\n=== C. cleanup leaves nothing of ours ===');
   // Re-establish a full service so teardown has real things to remove.
-  await svc.ensureServices(projectWith([redis]));
-  svc.connectSessionToServices(PID);
-  svc.teardownServices(PID, { removeVolumes: true });
+  await H.op(PID, async () => { await svc.ensureServices(projectWith([redis])); svc.connectSessionToServices(PID); svc.teardownServices(PID, { removeVolumes: true }); });
   // Also remove the scratch session container (the manager would, on its own path).
   d(['rm', '-f', sessionName]);
 
@@ -161,8 +170,9 @@ async function main() {
   check('the data volume is gone (removeVolumes purge)', leftVol === '', `left: ${JSON.stringify(leftVol)}`);
 
   // Orphan reap: create infra then reap as if the project vanished from registry.
-  await svc.ensureServices(projectWith([redis]));
-  const reaped = svc.reapOrphanServiceInfra(new Set()); // no known projects → all orphan
+  await H.op(PID, () => svc.ensureServices(projectWith([redis])));
+  // ARCH-022: the orphan reap is per project, inside that project's (sweep) operation.
+  const reaped = await H.op(PID, () => (svc.reapProjectServiceInfra ? svc.reapProjectServiceInfra(PID) : svc.reapOrphanServiceInfra(new Set())));
   const afterReapNet = d(['network', 'ls', '--filter', `name=${netName}`, '--format', '{{.Name}}']).out;
   const afterReapVol = d(['volume', 'ls', '--filter', `label=claude-station.project=${PID}`, '--format', '{{.Name}}']).out;
   const afterReapC = d(['ps', '-a', '--filter', `label=claude-station.project=${PID}`, '--format', '{{.Names}}']).out;
@@ -171,6 +181,7 @@ async function main() {
     `reaped=${JSON.stringify(reaped)} net=${JSON.stringify(afterReapNet)} vol=${JSON.stringify(afterReapVol)} c=${JSON.stringify(afterReapC)}`);
 
   console.log('\n=== D. an agent cannot apply its own proposal (real server) ===');
+  H.dispose(); // the scratch server below claims this data dir (one server per data dir, BUG-220)
   const PORT = await freePort();
   const BASE = `http://127.0.0.1:${PORT}`;
   const projDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-f112-proj-'));

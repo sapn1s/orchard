@@ -1,6 +1,6 @@
 # FEAT-091 — split a reply into what is addressed to you and what is me narrating
 
-- **Status:** OPEN — spec + enforcement half BUILT (`0354e5b`); renderer half BUILT (`8ab4cb9`). TENTH clean-room verdict was BROKEN, in the WRONGLY-LITERAL direction: a LINK REFERENCE DEFINITION can span LINES (label, destination and title may each sit on their own), so `[ref]:` / `/url` / `===` resolves out of the paragraph to the reference, leaves it OPEN, and keeps the fence LIVE — while a one-line notion of a definition made `===` a setext heading, closed the paragraph, let condition 7 fire, and LOST a well-formed `orchard-notes` fold: `blocks: []`, its narration exposed in the real accessibility tree, and `inert-html:orchard-notes` reported as uncertainty on VALID input. Fixed as the CLASS: the paragraph now carries its accumulated content and definitions are resolved off it by a PORT of the reference's own `parseReference`, at the one place the reference runs it. Every other multi-line construct enumerated and accounted for; no new documented limitation. The randomised differential now generates multi-line constructs (0 hiding / 0 over-recognition / 0 lost at 1,000,000 documents, where round-9 scores 8,930) and its non-vacuity calibration is a TABLE over every prior generation. See the 2026-08-19 TENTH-verdict entry at the foot of this ticket. ELEVENTH clean-room verdict was **HOLDS** with one residual — the randomised fuzz corpus was graded in node only, never rendered, and the theme dimension was unprobed. That residual is now CLOSED and STANDING: the fuzz generator moved into the shared corpus module (proven byte-identical, 80,000 documents), leg **[R]** renders a 20,000-document stratified sample of it per run (measured 0.13 ms/document) graded against the CommonMark reference in BOTH directions and against a real accessibility tree, non-vacuity proven by serving `91b35ab` and `52807b9` parser bytes over CDP interception (F3=53 and F1=1,758 where current scores 0), and leg **[T]** proves a closed fold is closed in PIXELS in both themes. Truncated/partial messages probed for the first time: 169,828 prefixes, 0 violations. Independent clean-room verify still REQUIRED before VERIFIED — this round's leg was written and graded green by the same author, and that is the only thing still blocking it. **ROUND 12 (2026-08-19): the VOCABULARY was replaced.** The two presentation-era names encoded where a passage appears, not what it is, which is why narration kept landing in the visible block. Layer 2 is now six SEMANTIC categories derived from a labelled random sample of 155 real passages — `orchard-finding` / `orchard-outcome` / `orchard-ask` / `orchard-judgment` / `orchard-status` / `orchard-narration` — plus a first-class `orchard-uncategorized <label>` whose label the metrics cluster so the fallback firing NAMES the missing category. Presentation derives from the category (exactly one folds, so the hiding surface did not widen); `orchard-answer`/`orchard-notes` are frozen legacy names and archived transcripts render unchanged. Suites EXTENDED not replaced: the enumerated corpus is graded twice, under both name families (42,564 cases), renderer 201/0 in a real browser, differential 23/0. See the ROUND 12 entry at the foot.
+- **Status:** VERIFIED — round-15 fold-guard + BUG-201 round-7 proof-hardening independently verified HOLDS on 2026-10-01 (same-provider scoped, grey Anthropic account, run fe2f0871; on top of counted OpenAI run 01a0f2f3 which held the runtime). See the 2026-10-01 entry at the foot. History: spec + enforcement half BUILT (`0354e5b`); renderer half BUILT (`8ab4cb9`). TENTH clean-room verdict was BROKEN, in the WRONGLY-LITERAL direction: a LINK REFERENCE DEFINITION can span LINES (label, destination and title may each sit on their own), so `[ref]:` / `/url` / `===` resolves out of the paragraph to the reference, leaves it OPEN, and keeps the fence LIVE — while a one-line notion of a definition made `===` a setext heading, closed the paragraph, let condition 7 fire, and LOST a well-formed `orchard-notes` fold: `blocks: []`, its narration exposed in the real accessibility tree, and `inert-html:orchard-notes` reported as uncertainty on VALID input. Fixed as the CLASS: the paragraph now carries its accumulated content and definitions are resolved off it by a PORT of the reference's own `parseReference`, at the one place the reference runs it. Every other multi-line construct enumerated and accounted for; no new documented limitation. The randomised differential now generates multi-line constructs (0 hiding / 0 over-recognition / 0 lost at 1,000,000 documents, where round-9 scores 8,930) and its non-vacuity calibration is a TABLE over every prior generation. See the 2026-08-19 TENTH-verdict entry at the foot of this ticket. ELEVENTH clean-room verdict was **HOLDS** with one residual — the randomised fuzz corpus was graded in node only, never rendered, and the theme dimension was unprobed. That residual is now CLOSED and STANDING: the fuzz generator moved into the shared corpus module (proven byte-identical, 80,000 documents), leg **[R]** renders a 20,000-document stratified sample of it per run (measured 0.13 ms/document) graded against the CommonMark reference in BOTH directions and against a real accessibility tree, non-vacuity proven by serving `91b35ab` and `52807b9` parser bytes over CDP interception (F3=53 and F1=1,758 where current scores 0), and leg **[T]** proves a closed fold is closed in PIXELS in both themes. Truncated/partial messages probed for the first time: 169,828 prefixes, 0 violations. Independent clean-room verify still REQUIRED before VERIFIED — this round's leg was written and graded green by the same author, and that is the only thing still blocking it. **ROUND 12 (2026-08-19): the VOCABULARY was replaced.** The two presentation-era names encoded where a passage appears, not what it is, which is why narration kept landing in the visible block. Layer 2 is now six SEMANTIC categories derived from a labelled random sample of 155 real passages — `orchard-finding` / `orchard-outcome` / `orchard-ask` / `orchard-judgment` / `orchard-status` / `orchard-narration` — plus a first-class `orchard-uncategorized <label>` whose label the metrics cluster so the fallback firing NAMES the missing category. Presentation derives from the category (exactly one folds, so the hiding surface did not widen); `orchard-answer`/`orchard-notes` are frozen legacy names and archived transcripts render unchanged. Suites EXTENDED not replaced: the enumerated corpus is graded twice, under both name families (42,564 cases), renderer 201/0 in a real browser, differential 23/0. See the ROUND 12 entry at the foot.
 - **Severity:** medium
 - **Area:** docs/prompts/RESPONSE_FORMAT.md (the spec), scripts/hooks/response-format-gate.mjs (Stop hook), scripts/lib/response-blocks.mjs + scripts/lib/format-metrics.mjs, src/server/templates.ts (injection), scripts/onboard.mjs (delivery). **Renderer (public/*) is a separate lane — the contract it must build to is below.**
 - **Reported:** 2026-08-18 by user
@@ -2248,3 +2248,643 @@ not. The desync is one wrapped prose line, and it is in a prior log entry, so it
 **Status is unchanged and remains OPEN.** Record 12 is a HOLDS on the eleventh pass, and the ROUND 12
 vocabulary replacement that followed it has had no independent pass at all — the ticket says so, and
 that is the honest state.
+
+## 2026-09-29 — ROUND 12 independent clean-room verify (verifying, round 1) — VERDICT: BROKEN (VALID)
+
+The round-12 vocabulary replacement finally got its independent pass. **BROKEN, contract VALID —
+and it needs a HUMAN/ORCHESTRATOR decision, because the defect is a divergence between the round-12
+entry's stated invariant and the shipped code + the author's own suite, not obviously one or the other.**
+
+- **Requirement verified (as WRITTEN in the ROUND 12 entry):** Layer 2 is six semantic categories
+  (`orchard-finding`/`orchard-outcome`/`orchard-ask`/`orchard-judgment`/`orchard-status`/`orchard-narration`)
+  + a first-class `orchard-uncategorized <label>`; **presentation derives from the category and ONLY
+  `orchard-narration` folds** ("A category is collapsed if its value EXPIRES when the turn ends. Only
+  narration does, so COLLAPSED_BLOCKS still holds exactly one category … the hiding surface did not
+  widen"); legacy `orchard-answer`/`orchard-notes` frozen & removed from the injected core; the two
+  fallbacks kept apart with an advisory on an unlabelled declared block; the 11-round hiding-class
+  invariants (I1–I4, C1) carry over. Full text: `/tmp/req-FEAT-091.txt`.
+- **Command (exact):** `CLAUDE_CONFIG_DIR=<grey account> node scripts/independent-verify.mjs
+  --repo ~/projects/orchard --range b11e71f --requirement @/tmp/req-FEAT-091.txt --run "npm run
+  verify:feat-091 && npm run verify:feat-091-commonmark-diff" --test-file scripts/verify-feat-091-response-blocks.mjs
+  --test-file scripts/verify-feat-091-commonmark-diff.mjs --provider anthropic --timeout-min 8`.
+  **Range note (important):** the round-12 change has NO isolatable commit — the 2026-08-25 history
+  collapse absorbed all FEAT-091 rounds into the public-release root `609db5e` (`orchard-finding`
+  first appears only there; the pre-collapse per-round commits `0354e5b`..`c1326a2` top out at round 11
+  and the preserved branch is absent from this checkout). `b11e71f` (an unrelated BUG-183 commit) was
+  used only as a bootable tree carrying the round-12 code; the 6 KB diff is not the round-12 diff and
+  the requirement told the verifier to ignore it and attack `public/lib/response-blocks.js` /
+  `public/lib/digest.js` directly. The fixer node suites were re-run there (`verify:feat-091` 13+/0
+  with 5 calibration legs SKIPPED for want of git history in the export; `verify:feat-091-commonmark-diff`
+  exit 0).
+- **Verdict: BROKEN, contract VALID.** Adversarial case `fold-set-widened-finding-outcome-judgment`
+  (manifest e691556fae06, exit 1) rendered each category through the app's own `renderAssistantText`:
+  - **FINDING (requirement-2 falsifier — the hiding surface WIDENED):** `public/lib/response-blocks.js`
+    (~L481) sets `COLLAPSED_BLOCKS` to **finding, outcome, judgment, narration and the legacy notes
+    alias** — FOUR semantic categories fold, not the one (`narration`) the round-12 entry says. Via
+    `public/lib/digest.js` (~L306) `orchard-finding`/`orchard-outcome`/`orchard-judgment` get
+    preview-fold rows, so a well-formed block of each (empty `malformed`) renders INSIDE a closed
+    `<details>` — authored `finding`/`outcome`/`judgment` content is hidden from the reader until they
+    expand it. `orchard-ask`/`orchard-status`/`orchard-uncategorized` correctly stay expanded.
+  - **FINDING (why the author's suite cannot catch it):** `verify-feat-091-response-blocks.mjs` PINS the
+    widened five-name fold set as the EXPECTED value ("the fold holds … finding + outcome + judgment +
+    narration (+ legacy alias)"), so the suite passes on exactly the widening the round-12 requirement
+    forbids. Generation graded its own blind spot green — the precise failure clean-room exists for.
+  - Second adversarial case `unlabelled-uncategorized-hook-advisory` (manifest b17261d8711c, exit 0)
+    **HELD**: the real Stop hook raises an advisory for an unlabelled declared `orchard-uncategorized`
+    block and stays silent for a labelled one, as required.
+- **THE DECISION THIS FORCES (orchestrator/user, not the verifier):** the round-12 ENTRY says only
+  narration folds and the hiding surface did not widen; the shipped CODE + its own test deliberately
+  fold finding/outcome/judgment behind a preview. Either (A) the code regressed/diverged from the
+  round-12 design and must be brought back to "only narration folds" (findings must be visible — the
+  original complaint was findings buried in narration; hiding them in a fold is the same harm), or
+  (B) a deliberate post-round-12 design change made finding/outcome/judgment preview-foldable and the
+  round-12 entry's "only narration folds" invariant is now STALE prose that must be corrected. This
+  mirrors the earlier "the REQUIREMENT was wrong" resolutions on this ticket and cannot be settled by
+  a verifier. Until settled, the requirement AS DOCUMENTED is breached.
+- **Could-not-test (verifier):** the real-browser/accessibility-tree leg (`verify-feat-091-renderer.mjs`,
+  the 201/0 round-12 evidence) did NOT run — no headless browser in the room; a happy-dom shim was used
+  for the render check instead, so the pixel/AX-tree proof was not reproduced. The randomised-differential
+  CALIBRATION legs vs older parser generations (5) skipped — the export has no git history to load the
+  old shas. The `[5] injection` leg skipped — `docs/prompts/RESPONSE_FORMAT.md` is stripped as
+  contamination, so "answer/notes removed from the injected core" was NOT checked. Legacy answer/notes
+  byte-for-byte vs the pre-round-12 renderer NOT compared (no pre-round-12 tree exists post-collapse).
+- **Status:** left OPEN. This is the FIRST independent pass on round 12 and it is BROKEN on the
+  headline invariant ("only narration folds"). Independent clean-room verify remains required after the
+  divergence is resolved. High-stakes / data-hiding bucket (12th verdict on this grammar).
+- **Verified-by:** dispatch anthropic run bf1737c7-fe35-457c-a620-7c815373630a (clean-room,
+  `scripts/independent-verify.mjs`) — VERDICT: BROKEN. Same-provider fallback, grey account
+  (5a23b2f0…); OpenAI window exhausted, the default and personal accounts parked — decorrelation reduced
+  (author-provider anthropic), noted per VERIFY.md #5.
+
+## 2026-09-29 — ROUND 12 fold-set: correction (round-12 prose superseded) + RE-VERIFY (verifying, round 2) — VERDICT: BROKEN (VALID) on a NEW defect
+
+Two things, in order: first the round-1 verifying pass's OPEN decision (A regression vs
+B stale-prose) is settled from history as **(B) — deliberate**; then a fresh independent
+pass against the CURRENT documented invariant returned **BROKEN, contract VALID**, on a
+NEW hiding defect that has nothing to do with the fold set.
+
+### Correction — the round-12 "only narration folds / hiding surface did not widen" prose is SUPERSEDED
+
+The ROUND 12 entry (this file, the "A category is collapsed if its value EXPIRES when the
+turn ends … `COLLAPSED_BLOCKS` still holds exactly one category … the hiding surface did
+not widen while the vocabulary tripled" passage, echoed in the Status header as
+"exactly one folds, so the hiding surface did not widen") is now **stale**. The fold set
+was deliberately widened past round-12's single `narration`, in two documented steps,
+re-established here from the committed history rather than taken on trust:
+
+- **Round 13 — `orchard-finding` added to `COLLAPSED_BLOCKS`.** Driven by the user
+  ("let's make Finding collapsed by default, it's not really useful for me to read unless
+  I want to"). Has no isolatable commit: the 2026-08-25 history collapse absorbed it into
+  the public-release root **`609db5e`** (2026-08-25), where `COLLAPSED_BLOCKS` already
+  reads `['orchard-finding', 'orchard-narration', 'orchard-notes']`. Rationale is recorded
+  in `docs/prompts/RESPONSE_FORMAT.md` ("Presentation follows from the category" +
+  "round 13 widened it by exactly one name on purpose").
+- **Round 14 / FEAT-136 — `orchard-outcome` and `orchard-judgment` added.** Confirmed
+  commit **`dc1f4ea`** (2026-09-08, batch "land the 2026-09-06/07 batch"), whose body
+  states verbatim: "FEAT-136: `orchard-outcome` and `orchard-judgment` now fold by default
+  with a first-sentence preview (digest.js + COLLAPSED_BLOCKS in response-blocks.js);
+  RESPONSE_FORMAT.md, the feat-091 fold corpus and the feat-091 suite's invariant are
+  updated so only digest/ask/status are must-see-expanded." `git log -S "'orchard-finding',
+  'orchard-outcome'" -- public/lib/response-blocks.js` resolves to exactly `dc1f4ea`.
+
+So the CURRENT invariant is `docs/prompts/RESPONSE_FORMAT.md`'s "Open: digest, `answer`,
+`ask`, `status`. The rest FOLD, each showing its first sentence." — i.e.
+`finding`/`outcome`/`judgment`/`narration` (+ legacy `notes`) fold, and
+finding/outcome/judgment rendering behind a first-sentence preview is INTENDED, not a
+regression. The round-1 verifying pass (run `bf1737c7…`) read this correctly as a
+divergence needing a human/orchestrator decision; that decision is **(B)**. The stale
+prose stays where it is (append-only log), corrected here.
+
+### Re-verify against the CURRENT invariant — BROKEN (VALID), a genuine NEW hiding defect
+
+Requirement `/tmp/req-FEAT-091-v2.txt` stated the CURRENT invariant (open = digest/answer/
+ask/status/uncategorized; fold = finding/outcome/judgment/narration + legacy notes, with
+a first-sentence preview; I1–I4/C1/C2 carry over) and told the verifier the range diff is
+NOT the change under test — attack `public/lib/response-blocks.js` / `public/lib/digest.js`
+directly and re-run the fixer suites.
+
+- **Command:** `CLAUDE_CONFIG_DIR=<grey account> node scripts/independent-verify.mjs
+  --repo ~/projects/orchard --range b11e71f --requirement @/tmp/req-FEAT-091-v2.txt
+  --run "npm run verify:feat-091 && npm run verify:feat-091-commonmark-diff"
+  --test-file scripts/verify-feat-091-response-blocks.mjs
+  --test-file scripts/verify-feat-091-commonmark-diff.mjs --provider anthropic
+  --timeout-min 8`. Carrier tree `b11e71f` (unrelated BUG-183 commit, 2026-09-23) carries
+  `src/server/seed-sources.mjs` + the current widened `COLLAPSED_BLOCKS` and the current
+  RESPONSE_FORMAT invariant; the diff is not the round-12 change. Fixer node suites re-run
+  there: `verify:feat-091` 13+/0 (5 calibration legs SKIP for want of git history in the
+  export), `verify:feat-091-commonmark-diff` exit 0.
+- **The fold-set widening is NOT the defect — the verifier confirmed presentation is
+  correct:** all 9 known non-digest names fold exactly per `COLLAPSED_BLOCKS`, and nothing
+  addressed to the reader (`ask`/`status`/`uncategorized`/`answer`) folds. Decision (B)
+  holds at the presentation layer.
+- **BROKEN on a NEW hiding-class defect — C1/C2 fold guards are blind inside a block
+  quote container.** Adversarial cases `blockquote-contained-fold-c1-c2-parser`
+  (manifest 7cb222d085c8, exit 1) and `blockquote-contained-fold-rendered-plus`
+  (manifest 38a3533e2ee9, exit 1):
+  - **C1 in a quote:** `> ````orchard-narration` / `> narr` / `> ````orchard-ask` /
+    `> MUST-VISIBLE` / `> ````` parses to a single `orchard-narration` block whose body
+    contains the `orchard-ask`, `malformed: []`. The renderer then puts the ask inside a
+    closed `<details>` — authored content the author did NOT put in a fold is hidden.
+    Breaches I1, C1, I3 (unreported).
+  - **C2 in a quote:** `> ````orchard-outcome` / `> A` / `> ``` ` / `> MUST-VISIBLE` /
+    `> ````` keeps `MUST-VISIBLE` inside the fold with no `unpaired-fence-in-fold` flag.
+  - **Root cause (verifier):** in `public/lib/response-blocks.js` `foldUncertainty`, C1's
+    `openerOf(lines[j])` and C2's `isClosingFence` run on the RAW, still-`>`-prefixed
+    lines instead of on the container-stripped `restOfLine(stack, line)`, so the guard
+    sees no reserved opener and no unpaired fence. Same "a rule reads a raw column/line
+    instead of the line's real container context" family as rounds 8–9, reached through a
+    block-quote wrapper the corpus only exercises at top level or in list items.
+- **Could-not-test (verifier):** no real headless browser (happy-dom shim stood in for
+  the pixel/AX-tree leg); the injection leg `[5]` skipped (RESPONSE_FORMAT.md stripped as
+  clean-room contamination); calibration legs vs earlier parser generations skipped (no
+  git history in the export); the unlabelled-`orchard-uncategorized` advisory was only
+  re-run via the fixer's own hook leg, not driven fresh.
+
+### Decision this forces (orchestrator/user)
+
+The fold-set-widening question is CLOSED as (B): correction recorded, presentation
+verified correct. But the re-verify does NOT HOLD — a real, previously-unseen
+data-hiding defect (block-quote-contained fold, C1/C2 on prefixed lines) is live in the
+shipped grammar. This is a FIX lane, not a verify one: `foldUncertainty` must run C1/C2
+on the container-stripped line, and the fold corpus must gain a block-quote-wrapped-fold
+stratum so the class is closed rather than the case patched. **Status stays OPEN.**
+High-stakes / data-hiding bucket (13th verdict on this grammar); an independent
+clean-room pass remains REQUIRED after that fix.
+
+- **Verified-by:** dispatch anthropic run 7c1e3870-d90a-41e3-a3f9-21e3631dd0f2 (clean-room,
+  `scripts/independent-verify.mjs`) — VERDICT: BROKEN (contract VALID). Same-provider
+  fallback, the grey account; noted per VERIFY.md #5 (decorrelation reduced,
+  author-provider anthropic).
+
+## 2026-09-29 — ROUND 15 fix: block-quote-contained fold guard (C1/C2), root-caused (fixing, round 15) — the divergence class closed
+
+The round-2 verifying pass's BROKEN verdict (run 7c1e3870…) is FIXED. The defect: the
+C1/C2 fold guards were blind inside a block-quote container. `foldUncertainty` ran
+`openerOf`/`isClosingFence` on the RAW `>`-prefixed line, where the parser reads the
+container-stripped line (`restOfLine`), so an authored `orchard-ask` inside a quoted
+`orchard-narration` fold rendered in a closed `<details>` with `malformed: []`.
+
+- **Root fix (WA §N — the class, not the case).** Every fold/guard scan now reads
+  each body line through ONE shared producer, `containerView(stack)`, which maps a
+  line through `restOfLine(stack, line)` — the SAME container-stripping the classifier
+  used to recognise the fence. `findClose`, `foldUncertainty` (C1 and C2) and
+  `firstReservedOpener` (both call sites, incl. the inert-HTML swallow) all consume it;
+  none of them can any longer see a different line than the parser. The guards receive
+  a stripped-line accessor, not `lines`+a stack each re-derives — so the mistake is
+  structurally unrepresentable, not re-avoided. digest.js/dom.js were checked: both
+  DELEGATE to response-blocks.js (`parseResponseBlocks` / `COLLAPSED_BLOCKS` /
+  `fenceSegments`) and hold no second block-structure scan, so the one module is the
+  single source.
+- **Invariant:** no fold/guard pass sees a line the parser did not — every consumer
+  reads `restOfLine(stack, line)` from the one `containerView` producer.
+- **Files changed (unstaged):** public/lib/response-blocks.js (the fix),
+  scripts/lib/feat-091-fold-corpus.mjs (new `bqfold` stratum: C1+C2 wrapped in bq d1 /
+  tight / nested bq / list / list-in-quote × both fence chars, and two verbatim reported
+  cases round13/round14), scripts/verify-feat-091-response-blocks.mjs (anti-vacuity for
+  the stratum + a standalone round-13/14 block with the same-depth controls and a
+  no-reserved-opener SILENT control).
+- **Verified (fixer's own runs):**
+  - must-FAIL-before, anchored to `HEAD:public/lib/response-blocks.js` (pre-fix, a fixed
+    baseline): parser suite 270 passed / 17 failed — the 9 new fold-guard checks (I1, I3,
+    and the round-13/14 quote cases) all RED. post-fix: 279 passed / 8 failed.
+  - `verify:feat-091` (parser): 279/8. The 8 failures are ALL in `[6] onboarding delivery`
+    (onboard.mjs not delivering files) — pre-existing, IDENTICAL pre-fix, another lane's
+    in-flight onboard.mjs / FEAT-106 work, not this fix. Every FEAT-091 fold-guard leg
+    (I1/I3/I4, round-13/14 standalone, CONTAINER-WRAPPED FOLD-GUARD anti-vacuity) is green.
+  - `verify:feat-091-commonmark-diff`: 23/0 (the fold guard is not part of the differential;
+    anti-regression only).
+  - renderer suite (scripts/verify-feat-091-renderer.mjs, real headless browser + AX tree +
+    pixel diff): VERDICT PASS 207/0. (A first pass showed 2 fails: one was my reported C2
+    case using `orchard-outcome` — a PREVIEW fold whose first body line leaks into the
+    dropped `<summary>`, which the corpus render-model deliberately does not exercise; fixed
+    by using `orchard-narration`, the corpus's non-preview fold — C2 is name-blind. The other,
+    "LIVE parser bytes restored after calibration", was a flaky CDP Fetch-restore timing issue,
+    same diskHash both runs, PASSED on re-run — BUG-179/BUG-200 class, not this fix.)
+- **Residual FILED, not closed: BUG-201.** The "mixed quote depth" attack found a
+  reserved opener one quote level DEEPER than the fold (`> ````orchard-narration` … `> >
+  ````orchard-ask` …) is still folded away — `restOfLine` strips only the fold's OWN
+  stack, so a deeper `>` prefix hides the opener from `openerOf`. Verified PRE-EXISTING
+  (folds on HEAD too), and it is a policy extension (C1 must out-strip CommonMark at every
+  container depth) with its own over-fire risk, so it is a separate lane. Other attacks
+  run and clean: lazy continuation (degrades to visible fallback), list container (space
+  indent already handled), list-in-quote C2 (correctly cut), 4+ list indent (under-
+  recognised → all visible).
+- **Regression lineage:** same "guard reads a less-stripped line than the parser" family
+  as rounds 8 and 9 (regressed-from: FEAT-091 rounds 8/9 container work — the fold guard
+  was never routed through the container strip those rounds added to the main scan).
+- **Bucket:** high-stakes / data-hiding (14th verdict on this grammar). An independent
+  clean-room verify pass is WARRANTED and remains REQUIRED before VERIFIED — generation
+  must not be its own only verifier, and BUG-201 shows a deeper variant this lane's own
+  fixture did not cover. **Status stays OPEN.**
+
+## 2026-09-29 — ROUND 15 + BUG-201 independent clean-room verify (verifying, round 15) — verdict INVALID (contract); substance = a NEW hiding defect, so the fix does NOT HOLD
+
+Cross-provider clean-room pass (openai; author-provider anthropic) over the UNCOMMITTED
+working tree (`--working-tree`), verifying the round-15 fold-guard fix and the BUG-201
+maximal-strip fix TOGETHER against the CURRENT invariant (open = digest/answer/ask/status/
+uncategorized; fold = finding/outcome/judgment/narration + legacy notes, first-sentence
+preview) and the guard/parser agreement + BUG-201 deeper-depth requirement
+(`/tmp/req-FEAT-091-r15.txt`).
+
+- **Command:** `node scripts/independent-verify.mjs --repo ~/projects/orchard --working-tree
+  --requirement @/tmp/req-FEAT-091-r15.txt --run "npm run verify:feat-091; npm run
+  verify:feat-091-commonmark-diff" --test-file scripts/verify-feat-091-response-blocks.mjs
+  --timeout-min 22`. Working-tree snapshot `a977e76…` → tree `6543ce…` (real index untouched);
+  seed-sources.mjs present so the room boots; docs stripped, 88/137 changed paths allow-listed.
+- **Outcome: INVALID (exit 3) — the verdict does NOT count as HOLDS or BROKEN.** The openai
+  verifier's citation block carried TWO `FIXER-TEST:` lines where exactly one is allowed, and
+  openai threads are non-resumable, so the harness could not re-prompt it to repair the block.
+  Per the executed-evidence contract this is neither a pass nor a fail — it is not-counted.
+  `/tmp/verdict-FEAT-091-r15.txt` records `INVALID — 2 FIXER-TEST lines`.
+- **Substance the (invalid) run surfaced — a genuine NEW data-hiding case the fix does not
+  cover, in the BROKEN direction.** The verifier re-ran both fixer suites (both PASS in the
+  room) and then attacked list-continuation indentation. It reports: when a LIST content column
+  requires FOUR or FIVE spaces, a reserved opener (`orchard-ask`) nested in a deeper quote/list
+  stays INSIDE the `orchard-narration` fold with `malformed: []` — silently hidden — while the
+  same shape at two or three spaces is correctly promoted. Root-cause it names:
+  `innermostContent` stops at RAW indentation before consuming the existing list stack, so it
+  under-strips exactly the 4-5-space (marker+content-column) list geometry. This is the SAME
+  "the strip does not match the container the parser actually built" family as rounds 8/9/15 and
+  BUG-201, one indentation regime deeper — i.e. the class is NOT yet closed. Cited runs:
+  fixer re-runs `fd9b927757ca` / `5c26419ebcd1`; adversarial `list-continuation-depth`
+  `eb7a0710dc50` (12 cases hide across list columns 2-5 × LF/CRLF/CR), `commonmark-indentation-
+  boundary` `c5237afd6a63` (deeper fence vs CommonMark, 3-space vs 4/5-space, escaped-example
+  controls). Not-tested by the verifier (stated): browser/AX render (parser-level evidence only),
+  and historical calibration + injection legs (commits/docs absent in the clean room, expected).
+- **This finding is UNVERIFIED by me** (I am the verify driver; I did not re-run the attack or
+  read the code). It is credible and specific enough that the round-15/BUG-201 claim must not be
+  treated as HOLDS. Because the verdict is contractually INVALID, a clean re-run (or an
+  anthropic-provider verifier, which IS resumable so a malformed citation self-repairs) is still
+  needed to convert this into a counted verdict — but the substance points to more FIX work, not
+  a HOLDS.
+- **Decision this forces (orchestrator/user):** treat as NOT-HOLDS. This is a FIX lane, not a
+  clean VERIFIED: make `innermostContent`'s strip walk the parser's actual list stack
+  (marker+content-column, incl. the 4-5-space regime) rather than raw leading columns, add a
+  list-content-column stratum (columns 2-5 × LF/CRLF/CR) to `scripts/lib/feat-091-fold-corpus.mjs`,
+  and re-verify. **Status stays OPEN.**
+- **Verified-by:** dispatch openai run 01a0ed58-d54b-7b52-a44e-93c19de8b549 (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`, cross-provider — author-provider anthropic)
+  — VERDICT: INVALID (citation contract: 2 FIXER-TEST lines; substance = NEW hiding defect at
+  4-5-space list continuation, fix does NOT HOLD).
+
+## 2026-09-29 — ROUND 15 + BUG-201 independent clean-room verify (verifying, round 15) — COUNTED verdict: BROKEN (VALID). New hiding defect at nested-list CONTINUATION lines
+
+Cross-provider clean-room pass (openai verifier; author-provider anthropic) over the UNCOMMITTED
+working tree (`--working-tree`), verifying the round-15 fold-guard fix and the BUG-201
+`maximalView`/`stripInnerContainers` fix TOGETHER against the CURRENT invariant (open = digest/
+answer/ask/status/uncategorized; fold = finding/outcome/judgment/narration + legacy notes) and the
+guard/parser-agreement + deeper-depth requirement (`/tmp/req-FEAT-091-r15.txt`). This supersedes the
+prior contract-INVALID run: the citation block was VALID this time (one FIXER-TEST line; the concrete
+filled-in citation example was provided in the requirement, as the charter required).
+
+- **Command:** `node scripts/independent-verify.mjs --repo ~/projects/orchard --working-tree
+  --requirement @/tmp/req-FEAT-091-r15.txt --run "npm run verify:feat-091" --test-file
+  scripts/verify-feat-091-response-blocks.mjs --timeout-min 22`. Working-tree snapshot HEAD
+  `a977e76…` → tree `3f01b97…` (real index untouched); docs stripped, 101/162 changed paths
+  allow-listed.
+- **Outcome: BROKEN (exit 1), verdict VALID (counted).** The verifier re-ran the fixer suite
+  (`npm run verify:feat-091` → TOTAL 282 passed, 0 failed, 2 skipped — the 2 skips are `[5] injection`
+  + a container-differential calibration, both expected clean-room strips) and the over-fire gate
+  (`verify:feat-091-commonmark-diff` → 13 passed / 0 failed / 5 skipped, ZERO hiding + ZERO
+  over-recognition over 3968 + 20000 random docs — the maximal strip corrupts no legal input). Both
+  passed. Then a NEW attack broke the safety invariant.
+- **The defect — a reserved opener on a nested-list CONTINUATION line is silently hidden.** Input:
+
+      ````orchard-notes
+      -   item
+          ````orchard-ask
+          SECRET
+          ````
+      ````
+
+  The `-   item` opens a list INSIDE the fold; the `orchard-ask` fence then sits on a CONTINUATION
+  line at the list's content column (4 spaces, marker NOT repeated). CommonMark treats that fence as
+  LIVE (the verifier's reference agrees), but C1 leaves it folded: ONE `orchard-notes` block, `SECRET`
+  inside the closed fold, `malformed: []`. Root cause: `stripInnerContainers` is per-line and only
+  opens containers whose MARKER appears on the current line; a list opened on a PRIOR body line is not
+  in the fold's own stack, so its continuation indent (4 relative columns) reads as indented code and
+  the opener is never reached. Adversarial run `nested-list-continuation` (`73c82ce9ffa6`, exit 1):
+  **240 of 336 cases hide** across 7 marker forms, quote wrapping and LF/CRLF/CR.
+- **Controls confirm it is a genuine defect, not over-strip.** Run `continuation-tabs-and-controls`
+  (`e74d950d242c`, exit 1): across all five collapsed names, the opener on the EXPLICIT marker line
+  (`-   ````orchard-ask`) IS correctly promoted + `ambiguous-fold` reported, and a genuinely
+  4+-relative-column indented-code fence correctly STAYS folded and SILENT — `{controlsPassed:20,
+  continuedListDefects:10}`. So the miss is precisely the list-continuation-column geometry, in the
+  BROKEN (hiding) direction. This is the SAME "the strip does not match the container the parser
+  actually built across lines" family as rounds 8/9/15 and BUG-201, reached one construct deeper: the
+  fold guard's per-line container strip cannot descend into a list whose content column was
+  established on a prior line.
+- **Not-tested (verifier, stated):** browser/AX render + pixel fold (parser-level evidence only);
+  `[5] injection` + historical calibration legs (docs/commits absent in the clean room — expected).
+- **Decision this forces (orchestrator/user):** treat as NOT-HOLDS — this is a FIX lane, not VERIFIED.
+  The fold guard's reserved-opener probe must track containers OPENED WITHIN the fold body across
+  lines (the list/quote a body line opens and its subsequent continuation lines), not only the fold's
+  own stack + the current line's markers — while C2/`findClose` stay on the fold-stack view and the
+  differential + a new nested-list-continuation corpus stratum (marker forms × content columns ×
+  tab/space continuation × LF/CRLF/CR) gate over-fire. High-stakes / data-hiding (15th verdict on this
+  grammar); an independent clean-room re-verify remains REQUIRED before VERIFIED. **Status stays OPEN.**
+- **Verified-by:** dispatch openai run 01a0ee7c-04d6-78b1-9c5e-c6eb0982c7c8 (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`, cross-provider — author-provider anthropic)
+  — VERDICT: BROKEN (VALID/counted; new hiding defect: reserved opener on a nested-list continuation
+  line at the list content column stays folded with `malformed: []`, 240/336 cases).
+
+## 2026-09-30 — ROUND 15 + BUG-201 ROUND 3 independent clean-room re-verify (verifying, round 15) — COUNTED verdict: BROKEN (VALID). New C2 over-fire ejects visible content
+
+Cross-provider clean-room pass (openai verifier; author-provider anthropic) over the UNCOMMITTED
+working tree (`--working-tree`), verifying the round-15 fold-guard fix TOGETHER with the BUG-201
+round-3 redesign (C1 = `firstReservedOpenerBelow` runs `advanceLineState` over the fold-body
+sub-document; `innermostContent`/`stripInnerContainers`/heuristic `maximalView` DELETED;
+C2/`findClose` stay on the fold-STACK `containerView`). Verified against the CURRENT invariant
+(open = digest/answer/ask/status/uncategorized; fold = finding/outcome/judgment/narration + legacy
+notes), the guard/parser-agreement, and the deeper-container requirement
+(`/tmp/req-FEAT-091-r15r3.txt`, which carried a concrete filled-in one-FIXER-TEST citation example
+— the prior citation-INVALID cause was addressed).
+
+- **Provider note (infra, resolved).** The OpenAI dispatch was flagged TWICE as "possible
+  cybersecurity risk" (OpenAI Daybreak gating, newly stricter as of 2026-09-30) and aborted before
+  answering — even though a near-identical requirement passed OpenAI days earlier (run 01a0ee7c). A
+  verification-framed (non-exploit) rewrite of the SAME requirement — same code, tests and safety
+  invariant — passed and produced the counted verdict. (Same family as the untracked BUG-211.)
+- **Outcome: BROKEN (exit 1), verdict VALID (counted).** Fixer suite `npm run verify:feat-091`
+  re-run in the room: TOTAL 286 passed / 0 failed / 2 skipped (`[5] injection` + one container-diff
+  calibration — expected clean-room `docs/`/shallow-clone strips). Over-fire gate
+  `verify:feat-091-commonmark-diff`: 13/0/5, ZERO hiding + ZERO over-recognition over 3968 + 20000
+  random docs. Both passed — then a NEW attack broke the property in the OVER-FIRE (false-flag)
+  direction.
+- **The defect — a well-formed paired inner fence inside a list opened WITHIN the fold is
+  mis-flagged, corrupting a legal document.** Input (four-backtick `orchard-notes` fold):
+
+      ````orchard-notes
+      - ```js
+        const x = 1;
+        ```
+
+      AFTER
+      ````
+
+  CommonMark confirms `- ```js` / `  ``` ` is ONE paired code fence inside a list item (the verifier
+  cross-checked with the reference: body fence `{info:"js", sourcepos [[1,3],[3,5]]}`). C1 (round 3)
+  hides nothing, but C2 reports `unpaired-fence-in-fold@line4`, TRUNCATES the fold before the inner
+  closer, and EJECTS the trailing visible `AFTER`: parse = ONE `orchard-notes` block whose content
+  is only `- ```js\n  const x = 1;`, `malformed:[ambiguous-fold:orchard-notes@line1(unpaired-fence-in-fold@line4)]`.
+  Control — replace the list marker with two spaces — preserves the whole fold with `malformed:[]`.
+  So the flag is spurious and the document is altered.
+- **Root cause (the C1/C2 SEAM the charter named).** The redesign taught C1 the sub-document
+  container machine so it descends into a list opened within the fold body, but DELIBERATELY left
+  C2 on the fold-STACK view. For an inner fence PAIR that opens on a list-marker line (`- ```js`)
+  and closes at the list content column (`  ``` `), C2 — reading the raw fold-stack line — misses
+  the opener behind the `- ` marker and then reads the real closer as a fresh unpaired opener. C1
+  and C2 now DISAGREE about the same body's container geometry: the asymmetry that is safe for
+  `findClose` (a fence deeper than the fold cannot be the fold's close) is NOT safe for C2's
+  PAIRING, which must see the same inner-list container C1 sees.
+- **Class:** this is NOT another C1 hiding miss (rounds 1/2/3); it is a C2 OVER-FIRE surfaced by the
+  redesign's C1/C2 asymmetry — same "a guard reads a less-stripped line than the parser" family,
+  now on the pairing side. It ejects author-visible content (`AFTER`), so it is a data-corruption
+  defect, not merely a cosmetic flag; it also fails the suite's own "a longer-than-opener close
+  pairs SILENTLY / nothing ejected" contract for the list-nested case.
+- **UNVERIFIED by me** (verify DRIVER; did not re-run the attack or read the code). The verdict is
+  contractually VALID and counted, and the finding is specific and reproducible from the cited run,
+  so the round-15/BUG-201-round-3 claim must be treated as NOT-HOLDS.
+- **Decision this forces (orchestrator/user):** treat as NOT-HOLDS — a FIX lane, not VERIFIED. C2's
+  fence-pairing must track containers opened WITHIN the fold body across lines (the same
+  sub-document container view C1 now uses), while `findClose` may stay on the fold-stack view. Add a
+  paired-inner-fence-in-nested-list stratum (marker forms x content columns x tab/space x LF/CRLF/CR:
+  an ejection/truncation check AND a `malformed:[]` well-formed control) and re-run the CommonMark
+  differential as the over-fire gate, then re-verify. High-stakes / data-hiding+corruption (16th
+  verdict on this grammar); an independent clean-room re-verify remains REQUIRED before VERIFIED.
+  **Status stays OPEN.**
+- **Verified-by:** dispatch openai run 01a0efa4-6695-74d0-976b-ef5f88a5d26c (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`, cross-provider — author-provider anthropic)
+  — VERDICT: BROKEN (VALID/counted; C2 over-fire on a paired inner fence inside a list opened within
+  the fold body ejects visible trailing content and reports a spurious `ambiguous-fold`).
+
+## 2026-09-30 — ROUND 15 + BUG-201 ROUND 4 independent clean-room re-verify (verifying, round 15) — COUNTED verdict: BROKEN (VALID). New C2 hiding miss at a container-boundary fence transition
+
+Cross-provider clean-room pass (openai verifier; author-provider anthropic) over the UNCOMMITTED
+working tree (`--working-tree`), verifying the round-15 fold-guard fix TOGETHER with the BUG-201
+round-4 unification (`foldUncertainty` is ONE pass of `advanceLineState` over the fold-body
+sub-document; C1 and C2 read the IDENTICAL per-line `(container, fence)` state;
+`firstReservedOpenerBelow` REMOVED; `findClose` the SOLE fold-stack reader). Verified against the
+CURRENT invariant (open = digest/answer/ask/status/uncategorized; fold = finding/outcome/judgment/
+narration + legacy notes, first sentence shown), the guard/parser-agreement, and the
+container-depth requirement (`/tmp/req-FEAT-091-r15r4.txt`, which supplied a concrete filled-in
+one-FIXER-TEST citation example and framed the task as a software-fix review — the citation block
+was VALID and the OpenAI dispatch was NOT cyber-gated this time).
+
+- **Command:** `node scripts/independent-verify.mjs --repo ~/projects/orchard --working-tree
+  --requirement @/tmp/req-FEAT-091-r15r4.txt --run "npm run verify:feat-091" --test-file
+  scripts/verify-feat-091-response-blocks.mjs --timeout-min 22`. Working-tree snapshot HEAD
+  `a977e76…` → tree `7865dee…` (real index untouched); docs stripped, 143/213 changed paths
+  allow-listed.
+- **Outcome: BROKEN (exit 1), verdict VALID (counted).** The round-4 unification CLOSES the round-3
+  C2 over-fire: the fixer suite `npm run verify:feat-091` re-run in the room is 292 passed / 0
+  failed / 2 skipped (`[5] injection` + a container-diff calibration — expected clean-room strips),
+  and the over-fire gate `verify:feat-091-commonmark-diff` is 13/0/5 with ZERO hiding + ZERO
+  over-recognition over 3968 + 20000 random docs. Both passed. Then a NEW attack hid content.
+- **The defect — a reserved/unpaired fold-depth fence is missed at a container boundary, hiding
+  content.** Input (five-backtick `orchard-notes` fold):
+
+      `````orchard-notes
+      > ```js
+      > nested
+      ```js
+      MUST-BE-VISIBLE
+      `````
+
+  CommonMark: `> ```js` is a code fence INSIDE the block quote, closing at the quote boundary
+  (literal `nested`); line 4 `` ```js `` then opens a NEW document-level (fold-depth) fence holding
+  `MUST-BE-VISIBLE`. That fold-depth fence is unpaired-as-the-fold's-close, so C2 should end the
+  fold and `MUST-BE-VISIBLE` should be visible. Instead: ONE `orchard-notes` block,
+  `MUST-BE-VISIBLE` inside the closed fold, `malformed: []`. The list-container variant (`- ```js` /
+  `  nested`) hides identically; both paired controls stay silent + `malformed: []` correctly.
+- **Root cause.** C2 detects a fold-depth fence OPEN only on a `!prevFence && nowFence` leaf
+  transition (null → fence). Here `advanceLineState` steps from "fence open inside the quote/list"
+  straight to "fence open at fold depth" — `prevFence && nowFence` both true — so neither the open
+  nor the close branch fires and the fresh fold-depth fence is never counted. The one-pass
+  unification removed the C1/C2 DISAGREEMENT (round 3's seam) but C2's fence-open detection still
+  assumes the leaf passes through null between two fences; a container boundary that closes one fence
+  and opens another on the same step defeats that. Same "the guard's fence bookkeeping does not match
+  the container the parser actually built across lines" family as rounds 8/9/15 and BUG-201 rounds
+  1-3, now at the fence-to-fence container-boundary transition.
+- **Not-tested (verifier, stated):** browser/AX render + pixel fold (parser-level evidence only);
+  `[5] injection` + historical calibration legs (docs/commits absent in the clean room — expected).
+- **Decision this forces (orchestrator/user):** treat as NOT-HOLDS — a FIX lane, not VERIFIED. C2
+  must count a fold-depth fence OPEN whenever the fence's container is the fold's OWN depth
+  (`st.stack.length === 0`), not only on a null→fence leaf transition — tracking the fence's
+  container at open time so a fence closing at a container boundary and a fresh fold-depth fence on
+  the same line are both seen; keep `findClose` on the fold-stack view; add a
+  container-boundary-fence-transition corpus stratum (fence inside quote/list ending at the boundary
+  + a new fold-depth fence on the boundary line × fence char/length × LF/CRLF/CR; HIDE + paired
+  NO-FIRE control) and re-run the differential as the over-fire gate. High-stakes / data-hiding
+  (17th verdict on this grammar); an independent clean-room re-verify remains REQUIRED before
+  VERIFIED. **Status stays OPEN.**
+- **Verified-by:** dispatch openai run 01a0f0b8-6d57-7c41-81d3-bc29ce3a80aa (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`, cross-provider — author-provider anthropic)
+  — VERDICT: BROKEN (VALID/counted; C2 misses a fold-depth fence that opens as a deeper-container
+  fence closes on the same line, so an unpaired fold-depth fence stays folded and hides
+  `MUST-BE-VISIBLE` with `malformed: []`; 2/2 boundary cases hide, paired controls silent).
+
+## 2026-09-30 — ROUND 15 + BUG-201 ROUND 5 independent clean-room re-verify (verifying, round 15) — COUNTED verdict: BROKEN (VALID). Round-5 fence-events do NOT hold — C1 misses a reserved opener behind a container marker inside an open inner fence
+
+Cross-provider clean-room pass (openai verifier; author-provider anthropic) over the UNCOMMITTED
+working tree (`--working-tree`), verifying the round-15 fold-guard fix TOGETHER with the BUG-201
+round-5 change (`advanceLineState` EMITS ordered fence-lifecycle `events`; C2 CONSUMES the events
+instead of diffing successive per-line states; C1 still reads innermost content directly;
+`findClose` unchanged). Verified against the CURRENT invariant (open = digest/answer/ask/status/
+uncategorized; fold = finding/outcome/judgment/narration + legacy notes, first sentence shown), the
+guard/parser-agreement, and the event-based-design requirement (`/tmp/req-FEAT-091-r15r5.txt`, which
+supplied a concrete filled-in one-FIXER-TEST citation example and framed the task as a software-fix
+review — the citation block was VALID and the OpenAI dispatch was NOT cyber-gated this time). The
+requirement asked the verifier to confirm three seams of the event design: event completeness, the
+ordering of two events on one line, and C1/C2 agreement.
+
+- **Command:** `node scripts/independent-verify.mjs --repo ~/projects/orchard --working-tree
+  --requirement @/tmp/req-FEAT-091-r15r5.txt --run "npm run verify:feat-091" --test-file
+  scripts/verify-feat-091-response-blocks.mjs --timeout-min 22`. Working-tree snapshot HEAD
+  `a977e76…` → tree `cf21b8…` (real index untouched); docs stripped, 181/257 changed paths
+  allow-listed.
+- **Outcome: BROKEN (exit 1), verdict VALID (counted).** The round-5 events CLOSE the round-4 C2
+  container-boundary miss: the fixer suite `npm run verify:feat-091` re-run in the room is 298 passed
+  / 0 failed / 2 skipped (`[5] injection` + a container-diff calibration — expected clean-room
+  strips), and the over-fire gate passes with zero hiding + zero over-recognition. Both passed. Then a
+  NEW attack hid content — on the C1 (content) side round 5 did not touch, not the C2 (event) side it
+  did.
+- **The defect — a reserved opener behind a container marker, INSIDE an open inner fence, is missed
+  and hides content.** Input (five-backtick `orchard-narration` fold):
+
+      `````orchard-narration
+      ~~~markdown
+      > ```orchard-ask
+      > VISIBLE
+      > ```
+      ~~~
+      `````
+
+  The `~~~markdown` opens a paired code fence at the fold's own depth; inside it a `> ```orchard-ask`
+  sits behind a blockquote marker. The fold stays closed with `VISIBLE` inside it, `malformed: []`
+  (silently hidden). Removing EITHER wrapper prevents the hide: `> ```orchard-ask` alone → C1 fires,
+  `orchard-ask` promoted, `reserved-opener-in-fold` reported; `~~~markdown`/```` ```orchard-ask ````
+  with no `>` → degrades to visible fallback. Only the combination hides.
+- **Root cause.** On the `advanceLineState` return path where an inner fence (`~~~`) is OPEN, the
+  container markers are not stripped, so `foldUncertainty`'s C1 reads `> ```orchard-ask` with the `>`
+  still attached and `openerOf` sees a leading `>` (not a fence), never recognising the reserved
+  opener — despite C1's fence-depth-free contract (BUG-108). Same "the guard reads a less-stripped
+  line than the parser built" family as rounds 8/9/15 and BUG-201 rounds 1-4, now at the
+  open-inner-fence + container-marker seam on the C1/content side (round 5 fixed the analogous C2/event
+  seam).
+- **UNVERIFIED by me** (verify DRIVER; did not re-run the attack or read the code). Verdict is
+  contractually VALID and counted; the finding is specific and reproducible from the cited run, so the
+  round-15/BUG-201-round-5 claim must be treated as NOT-HOLDS.
+- **Cited runs.** Fixer `a2f7e0ad2b3d` (exit 0, 298/0/2). Adversarial
+  `quoted-reserved-inside-paired-code-with(-controls)` `01eb305843bf` (exit 1): combined case hides
+  (`hidden:true`, `malformed:[]`), both single-wrapper controls promote/degrade to visible.
+- **Not-tested (verifier, stated):** browser/AX render + pixel fold (parser-level evidence only);
+  `[5] injection` + historical calibration legs (docs/commits absent in the clean room — expected);
+  exhaustive event-transition coverage.
+- **Decision this forces (orchestrator/user):** treat as NOT-HOLDS — a FIX lane, not VERIFIED. C1's
+  innermost-content read must strip container markers on EVERY return path, including the open-inner-
+  fence path, so a reserved opener behind a `>`/list marker inside an open inner fence is still reached
+  by `openerOf`; keep C2 on events and `findClose` on the fold-stack view; add an open-inner-fence +
+  container-marker corpus stratum (paired inner fence × `>`/list marker × fence char/length ×
+  LF/CRLF/CR; HIDE + NO-FIRE + the bare-no-`>` over-fire control) and re-run the differential as the
+  over-fire gate. High-stakes / data-hiding (18th verdict on this grammar); an independent clean-room
+  re-verify remains REQUIRED before VERIFIED. **Status stays OPEN.**
+- **Verified-by:** dispatch openai run 01a0f249-d59e-72e0-867d-57472f402f7f (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`, cross-provider — author-provider anthropic)
+  — VERDICT: BROKEN (VALID/counted; C1 misses a reserved opener behind a container marker while an
+  inner fence is open, so `VISIBLE` stays folded with `malformed: []`; both single-wrapper controls
+  promote).
+
+## 2026-09-30 — ROUND 15 + BUG-201 ROUND 6 independent clean-room re-verify (verifying, round 15) — COUNTED verdict: BROKEN (VALID). Parser HOLDS on substance; the fix's STRUCTURAL SOURCE CHECK is sidesteppable
+
+Verified TOGETHER with the round-15 fold-guard fix and BUG-201 round 6 over the UNCOMMITTED
+working tree (`--working-tree`), cross-provider (openai verifier; author-provider anthropic),
+against the CURRENT invariant (open = digest/answer/ask/status; the rest FOLD, first sentence
+shown) and the round-6 one-`content`-per-return design (`/tmp/req-FEAT-091-r15r6.txt`; a concrete
+filled-in one-FIXER-TEST citation example was supplied and the task framed as a software-fix
+review — the citation block was VALID and the OpenAI dispatch was not cyber-gated). The round-6
+change — `advanceLineState` computes ONE `content` field (every container marker consumed
+as-if-live, `openContainers` the one owner) attached to EVERY return via a single `finish(obj)`;
+C1 reads only `st.content`, the round-5 fallback deleted — is CONFIRMED on all runtime substance.
+It does NOT close the round: the fix's own SOURCE CHECK (the test forbidding bare returns) is
+bypassable.
+
+- **Outcome: BROKEN (exit 1), verdict VALID (counted).** The counted re-verify the round-6 build
+  called for. The verifier states plainly: **"a source-check hole, not a demonstrated defect in the
+  unmodified parser."** The shipped parser held on every over-fire and P1 control it ran.
+- **What HELD (unmodified parser).** All over-fire controls stay folded with `malformed: []`, each
+  cross-checked against a real CommonMark reference: an indented code block behind a `>`/list marker
+  (`quote-indented`, `list-indented`), a 4-space-escaped example (`escape`), lazy-continuation
+  paragraph text (`lazy`), a NON-reserved `> ```js` behind a marker (`nonreserved`), a 4-space-escaped
+  opener inside a paired fence (`infence-escaped`). P1 promotion controls fire correctly: both wrappers
+  together (`both`, `fence`) end the fold `ambiguous-fold:...(unpaired-fence-in-fold)`; a reserved
+  opener behind a marker (`marker`) promotes `orchard-ask` VISIBLE with `reserved-opener-in-fold`; the
+  deeper `> > ` case (`deep`) promotes. Fixer suite `npm run verify:feat-091` re-run in the room
+  (exit 0) and the CommonMark differential 13/0/5 (ZERO hiding + ZERO over-recognition; 5 SKIP =
+  shallow-clone calibration commits absent, expected clean-room behaviour).
+- **What is BROKEN (the fix's proof machinery, not its runtime).** The STRUCTURAL SOURCE CHECK
+  asserting "every `advanceLineState` return goes through `finish`" is a TEXT/regex count of
+  whitespace-followed return keywords, not a real return-path analysis. Two executable return forms
+  EVADE the count while shipping a state whose `content` was NOT set by `finish`, and the mutated
+  parser then silently hides `SECRET` inside an `orchard-notes` fold with `malformed: []`:
+  `return(unowned(prev));` (parenthesized — `returns` stayed 4, check `ok:true`) and
+  `try { throw unowned(prev); } catch (state) { return(state); }` (throw/catch — check `ok:true`). The
+  plain `return unowned(prev);` variant WAS caught (`ok:false`), so the guard is real but incomplete.
+  Adversarial run `191b775712e2` (exit 1) asserts the check accepted 2 content-hiding mutations it
+  should have rejected. A FUTURE edit introducing a non-`finish` return in either form would
+  reintroduce the round-5 hiding class undetected — the guard does not actually guarantee the property
+  it claims.
+- **UNVERIFIED by me** (verify DRIVER; did not re-run the attack or read the code). The verdict is
+  contractually VALID and counted, and the finding is specific and reproducible from the cited runs, so
+  the round-15/BUG-201-round-6 claim must be treated as NOT-HOLDS: the runtime holds on every case
+  tested, but the fix's non-regression PROOF is bypassable and must be hardened before VERIFIED.
+- **Handoff:** replace the text-count source check with a real return-path analysis (parse
+  `advanceLineState`'s body / AST, or restructure so `content` cannot be set anywhere but `finish` —
+  a single `return finish(...)` funnel a non-`finish` return is syntactically unable to bypass) so
+  `return(...)`, throw/catch and returned-helper forms are all detected. The runtime is already clean,
+  so re-run the CommonMark differential as the over-fire gate, then re-verify. High-stakes /
+  data-hiding / regression-prone (19th verdict on this grammar); an independent clean-room re-verify
+  remains REQUIRED before VERIFIED. **Status stays OPEN.**
+- **Verified-by:** dispatch openai run 01a0f2f3-2039-7782-8b31-99a7e80a5ab6 (clean-room,
+  `scripts/independent-verify.mjs`, `--working-tree`, cross-provider — author-provider anthropic)
+  — VERDICT: BROKEN (VALID/counted; unmodified parser HOLDS on every over-fire and P1 control, but the
+  structural source check forbidding bare returns is a text count that a parenthesized `return(...)`
+  and a throw/catch return both sidestep while silently hiding content — the non-regression proof is
+  bypassable).
+
+### 2026-09-30 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a0f2f3-2039-7782-8b31-99a7e80a5ab6 — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-01 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run fe2f0871-c66a-4e81-8c94-5fd0afb89abe — VERDICT: HOLDS — round-15 fold-guard + BUG-201 r7; same-provider scoped (grey) on counted OpenAI run 01a0f2f3; runtime byte-identical, proof sound by construction. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+## 2026-10-01 — ROUND 15 + BUG-201 ROUND 7 independent clean-room verify (verifying) — COUNTED verdict: HOLDS (VALID). Both scoped claims hold → FEAT-091 CLOSED
+Same-provider SCOPED confirmation (grey Anthropic account) over the UNCOMMITTED working tree
+(`--working-tree`), on top of the counted OpenAI run 01a0f2f3 (round 6) that found the RUNTIME holds on
+every over-fire + P1 control. Scoped to exactly two claims (`/tmp/req-FEAT-091-r7.txt`): (1) round-7's
+proof-hardening leaves parser runtime byte-identical to round 6; (2) no path out of `advanceLineState`
+can skip `finishContent`. Author-provider anthropic — this is a scoped same-provider confirmation, not a
+cross-provider pass.
+
+- **Outcome: HOLDS (exit 0), verdict VALID (counted).** Both claims survived the verifier's attack.
+- **CLAIM 1 (runtime byte-identical).** Verifier rebuilt a prior-round parser and diffed it against the
+  round-7 wrapper over 85,763 inputs (45,752 corpus + 40,000 CR/CRLF fuzz + 11 over-fire/P1 controls):
+  ZERO differences in blocks/malformed/fallback/counts. Fixer suite `npm run verify:feat-091` 308/0/2 in
+  the room; CommonMark differential 13/0/5 (zero hiding + zero over-recognition).
+- **CLAIM 2 (finishContent unforgeable).** Lexical structural check (comments/strings/regex stripped) +
+  349,665 instrumented `advanceLineState` calls: every returned state carried a fresh `content` set by
+  `finishContent`; impl never set it, never returned `prev`; wrapper is the sole exit; impl has no second
+  caller. The round-6 regex-evasion (`return(...)`, throw/catch) is now structurally impossible.
+- **UNTESTED (verifier residuals, acceptable):** clean-room export has no git history, so the "prior"
+  parser was reconstructed from the requirement description, not the real prior commit; structural check
+  is a lexical stripper + brace matching, not a full AST (runtime instrumentation backs it, reached paths
+  only); P1 controls report `ambiguous-fold:...(unpaired-fence-in-fold)` not `reserved-opener-in-fold`
+  (content still promoted visible, identical to rebuilt prior).
+- **Decision:** both claims HOLD. Runtime was already counted-HELD (OpenAI run 01a0f2f3); round 7 changed
+  no runtime by construction and this run confirms byte-identical outputs + an unforgeable proof. The
+  round-15 fold-guard fix and the BUG-201 round-1..7 deeper-container class are both closed. Recorded via
+  `board-tool.mjs verified` (typed entry in verification-ledger.json, run
+  fe2f0871-c66a-4e81-8c94-5fd0afb89abe, HOLDS). **Status → VERIFIED.** BUG-201 flipped VERIFIED in the
+  same pass.
+- **Symptom of a deeper design flaw?** no — the FEAT-091 guard-vs-parser stripping recurrence is closed
+  at its root (one pass → one per-line `content` + one event stream). No new ARCH ticket.

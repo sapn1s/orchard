@@ -240,12 +240,13 @@ const EFFORT = `(() => {
   const rb = row.getBoundingClientRect();
   return { found: true,
     level: chip?.dataset.level ?? null, fill: chip?.dataset.fill ?? null, chipText: chip?.textContent ?? null,
-    value: row.querySelector('.v')?.textContent.trim() ?? null,
+    // FEAT-159 — the value is a real control now: read what it SHOWS as selected.
+    value: (row.querySelector('select.ssel')?.selectedOptions[0]?.textContent ?? row.querySelector('.v')?.textContent ?? '').trim() || null,
     dim: !!row.querySelector('.v')?.classList.contains('dim'),
     rev: !!rev, revLabel: rev?.getAttribute('aria-label') ?? null,
-    label: row.querySelector('.set-main')?.getAttribute('aria-label') ?? null,
+    label: row.querySelector('select.ssel')?.getAttribute('aria-label') ?? null,
     geo: { h: Math.round(rb.height), w: Math.round(rb.width),
-      l: rect(row.querySelector('.l')), v: rect(row.querySelector('.v')), gut: rect(row.querySelector('.sgut')) } };
+      l: rect(row.querySelector('.l')), v: rect(row.querySelector('.v, .ssel, .smoney')), gut: rect(row.querySelector('.sgut')) } };
 })()`;
 
 async function main() {
@@ -384,8 +385,8 @@ async function main() {
     subgrid: CSS.supports('grid-template-columns', 'subgrid'),
     has: CSS.supports('selector(:has(*))'),
   })`);
-  check('the browser under test supports subgrid and :has (the cycle row spans columns 1-3 as a subgrid)',
-    cssOk.subgrid === true && cssOk.has === true, JSON.stringify(cssOk));
+  check('the browser under test supports :has (the gutter and focus rules use it)',
+    cssOk.has === true, JSON.stringify(cssOk));
 
   /* ══════════ 1. THE HAZARD ASSERTION ══════════ */
   section('1. the hazard rule: every load-bearing sentence is visible on first paint and behind NO toggle');
@@ -432,8 +433,8 @@ async function main() {
   await seedAccounts();
   await openCat('model');
   const builtIn = await cdp.eval(EFFORT);
-  check('BUILT-IN — nothing set at any level: NO chip at all, and the value dims and says so',
-    builtIn.found && builtIn.level === null && builtIn.dim === true && builtIn.value === 'built-in' && builtIn.rev === false,
+  check('BUILT-IN — nothing set at any level: NO chip at all, and the control says the built-in default applies',
+    builtIn.found && builtIn.level === null && builtIn.value === 'Use built-in default' && builtIn.rev === false,
     JSON.stringify({ level: builtIn.level, value: builtIn.value, dim: builtIn.dim, rev: builtIn.rev }));
 
   /* MACHINE: a real machine-wide default, written through the product's own
@@ -449,7 +450,7 @@ async function main() {
   await openCat('model');
   const machine = await cdp.eval(EFFORT);
   check('MACHINE — inherited from the machine default: a HOLLOW "machine" chip, the machine value shown, no reset',
-    machine.level === 'machine' && machine.fill === 'false' && machine.value === 'medium' && machine.rev === false,
+    machine.level === 'machine' && machine.fill === 'false' && machine.value === 'Use machine default (Medium)' && machine.rev === false,
     JSON.stringify({ level: machine.level, fill: machine.fill, value: machine.value, rev: machine.rev }));
 
   /* PROJECT: set at the project, which IS the current write target → filled. */
@@ -459,7 +460,7 @@ async function main() {
   await openCat('model');
   const projFilled = await cdp.eval(EFFORT);
   check('PROJECT under the project lens — set at the current write target: a FILLED "project" chip, and a reset appears',
-    projFilled.level === 'project' && projFilled.fill === 'true' && projFilled.value === 'low' && projFilled.rev === true,
+    projFilled.level === 'project' && projFilled.fill === 'true' && projFilled.value === 'Low' && projFilled.rev === true,
     JSON.stringify({ level: projFilled.level, fill: projFilled.fill, value: projFilled.value, rev: projFilled.rev, revLabel: projFilled.revLabel }));
 
   /* The SAME row, the lens flipped: the level did not change, but whose decision
@@ -471,8 +472,9 @@ async function main() {
     projHollow.level === 'project' && projHollow.fill === 'false' && projHollow.rev === false,
     JSON.stringify({ level: projHollow.level, fill: projHollow.fill, rev: projHollow.rev }));
 
-  /* SESSION: click the row under the session lens — a local override. */
-  await cdp.eval(`[...document.querySelectorAll('#dBody .view.on .set')].find((r) => r.querySelector('.l')?.textContent.startsWith('Effort')).click()`);
+  /* SESSION: pick a different value in the row's dropdown under the session lens — a local override.
+     (FEAT-159: the row itself no longer writes on click; its <select> does.) */
+  await cdp.eval(`(() => { const s = document.querySelector('#sel-effort'); s.value = [...s.options].find((o) => o.textContent === 'Medium').value; s.dispatchEvent(new Event('change', { bubbles: true })); })()`);
   await sleep(450);
   const sess = await cdp.eval(EFFORT);
   const regAfterSession = await readProj(containerId);
@@ -527,7 +529,7 @@ async function main() {
   const beforeReset = await cdp.eval(EFFORT);
   const regBeforeReset = await readProj(containerId);
   check('PRECONDITION: the project value is set, the machine default differs, and the chip is filled',
-    regBeforeReset.settings?.effort === 'low' && beforeReset.fill === 'true' && /machine value \(medium\)/.test(beforeReset.revLabel ?? ''),
+    regBeforeReset.settings?.effort === 'low' && beforeReset.fill === 'true' && /machine value \(medium\)/i.test(beforeReset.revLabel ?? ''),
     JSON.stringify({ registry: regBeforeReset.settings?.effort, fill: beforeReset.fill, label: beforeReset.revLabel }));
   await cdp.eval(`[...document.querySelectorAll('#dBody .view.on .set')].find((r) => r.querySelector('.l')?.textContent.startsWith('Effort')).querySelector('.rev').click()`);
   await sleep(900);
@@ -535,7 +537,7 @@ async function main() {
   const regAfterReset = await readProj(containerId);
   check('clicking reset CLEARS the project value on the server and the row falls back to the machine default',
     (regAfterReset.settings?.effort ?? null) === null && afterReset.level === 'machine'
-      && afterReset.fill === 'false' && afterReset.value === 'medium' && afterReset.rev === false,
+      && afterReset.fill === 'false' && afterReset.value === 'Use machine default (Medium)' && afterReset.rev === false,
     JSON.stringify({ registry: `${JSON.stringify(regBeforeReset.settings?.effort)} → ${JSON.stringify(regAfterReset.settings?.effort ?? null)}`,
       row: { level: afterReset.level, fill: afterReset.fill, value: afterReset.value, rev: afterReset.rev } }));
 
@@ -564,7 +566,7 @@ async function main() {
     const rect = (n) => { if (!n) return null; const b = n.getBoundingClientRect();
       return { left: Math.round(b.left - p.left), right: Math.round(b.right - p.left), w: Math.round(b.width) }; };
     return { rev: !!row.querySelector('.rev'), w: Math.round(p.width),
-      l: rect(row.querySelector('.l')), v: rect(row.querySelector('.v')), gut: rect(row.querySelector('.sgut')) };
+      l: rect(row.querySelector('.l')), v: rect(row.querySelector('.v, .ssel, .smoney')), gut: rect(row.querySelector('.sgut')) };
   })()`);
   check('a row WITH a reset and a row WITHOUT one share the same column rails to the pixel',
     !!sibling && sibling.rev === false && withRev.rev === true
@@ -591,7 +593,7 @@ async function main() {
     const row = [...document.querySelectorAll('#dBody .view.on .set')].find((r) => r.querySelector('.l')?.textContent.startsWith('Model'));
     const sel = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
     const all = [...document.querySelectorAll('#smodal ' + sel)];
-    const main = row.querySelector('.set-main');
+    const main = row.querySelector('select.ssel');
     const why = row.querySelector('.why');
     return { hasMain: !!main, hasWhy: !!why, afterControl: all.indexOf(why) === all.indexOf(main) + 1,
       mainLabel: main?.getAttribute('aria-label') ?? null, whyTag: why?.tagName, whyType: why?.getAttribute('type') };
@@ -599,10 +601,10 @@ async function main() {
   check('the ⓘ is a real <button type="button">, and it is next in tab order after the row\'s own control',
     order.hasMain && order.hasWhy && order.afterControl === true && order.whyTag === 'BUTTON' && order.whyType === 'button',
     JSON.stringify(order));
-  check('the cycle row announces itself plainly (the mono flag text no longer pollutes the computed name)',
-    /^Model: .+\. Activate to change\.$/.test(order.mainLabel ?? ''), String(order.mainLabel));
+  check('the row control announces itself plainly (FEAT-159: a <select> named just "Model", no flag text in its name)',
+    order.mainLabel === 'Model', String(order.mainLabel));
 
-  await cdp.eval(`[...document.querySelectorAll('#dBody .view.on .set')].find((r) => r.querySelector('.l')?.textContent.startsWith('Model')).querySelector('.set-main').focus()`);
+  await cdp.eval(`[...document.querySelectorAll('#dBody .view.on .set')].find((r) => r.querySelector('.l')?.textContent.startsWith('Model')).querySelector('select.ssel').focus()`);
   await cdp.tab();
   const afterTab = await cdp.eval(`(() => ({ id: document.activeElement?.id ?? null, cls: document.activeElement?.className ?? null }))()`);
   check('a REAL Tab from the row control lands on that row\'s ⓘ',
@@ -613,7 +615,7 @@ async function main() {
   const opened = await cdp.eval(`(() => {
     const b = document.querySelector('#whyb-model');
     const blk = document.querySelector('#why-model');
-    const main = b?.closest('.set')?.querySelector('.set-main');
+    const main = b?.closest('.set')?.querySelector('select.ssel');
     return { expanded: b?.getAttribute('aria-expanded'), controls: b?.getAttribute('aria-controls'),
       blockVisible: blk ? blk.checkVisibility({ checkVisibilityCSS: true }) : false,
       describedBy: main?.getAttribute('aria-describedby') ?? null,
@@ -649,7 +651,7 @@ async function main() {
   const collapsed = await cdp.eval(`(() => {
     const b = document.querySelector('#whyb-model');
     const blk = document.querySelector('#why-model');
-    const main = b?.closest('.set')?.querySelector('.set-main');
+    const main = b?.closest('.set')?.querySelector('select.ssel');
     return { expanded: b?.getAttribute('aria-expanded'),
       blockVisible: blk ? blk.checkVisibility({ checkVisibilityCSS: true }) : false,
       describedBy: main?.getAttribute('aria-describedby') ?? null,

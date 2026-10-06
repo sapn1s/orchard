@@ -1279,7 +1279,17 @@ export const RETIRED_KEYS = {
     + '(public/lib/ticket-record.js) as the one rule over it.',
 };
 
-const DECISION_KEYS = ['mode', 'question', 'options', 'recommendation', 'recommendation_reason', 'prerequisite'];
+// `id` (FEAT-166 r2) — the decision's OWN identity, minted once by `board-tool
+// decide` and never reconstructed (ARCH-010). A user answer records which
+// decision id it answers, so answer state is bound by construction instead of
+// inferred from Activity-log text order. OPTIONAL and backward-compatible: a
+// decision written before r2 (and every prose `## Decision`) carries no id, which
+// reads as the legacy/unidentified decision — existing records are never rewritten.
+// `answers` (FEAT-166 r3) — the user's TYPED answers to THIS decision, written only
+// by the server's answer route (src/server/board.ts recordAnswer) and read only by
+// boundAnswers. OPTIONAL: absent on every decision nobody has answered since r3.
+const DECISION_KEYS = ['id', 'mode', 'question', 'options', 'recommendation', 'recommendation_reason', 'prerequisite', 'answers'];
+const ANSWER_ENTRY_KINDS = ['decision', 'question', 'counter'];
 const DECISION_MODE_KEYS = { multi: [], staged: ['stages'] };
 const OPTION_KEYS = ['key', 'label', 'what_changes', 'benefit', 'cost', 'why_not_obvious'];
 
@@ -1381,6 +1391,24 @@ export function validateTicket(record, opts = {}) {
       bad('"decision" must be null or an object');
     } else {
       enumOf('decision.mode', d.mode, DECISION_MODES);
+      // FEAT-166 r2 — the decision's own identity. OPTIONAL: present (a non-empty
+      // string minted by `board-tool decide`) or ABSENT (legacy / prose decision).
+      // Never null — absence is expressed by omitting the key, not by `null`.
+      if (Object.prototype.hasOwnProperty.call(d, 'id')) str('decision.id', d.id);
+      // FEAT-166 r3 — typed answers: shape-checked as data. `by: user` and
+      // `recorded_by: server` are what the one writer stamps.
+      if (Object.prototype.hasOwnProperty.call(d, 'answers')) {
+        if (!Array.isArray(d.answers)) bad('"decision.answers" must be an array of typed answers');
+        else d.answers.forEach((a, i) => {
+          if (a === null || typeof a !== 'object' || Array.isArray(a)) { bad(`"decision.answers[${i}]" must be an object`); return; }
+          str(`decision.answers[${i}].answer_id`, a.answer_id);
+          enumOf(`decision.answers[${i}].kind`, a.kind, ANSWER_ENTRY_KINDS);
+          if (a.by !== 'user') bad(`"decision.answers[${i}].by" must be "user"`);
+          if (a.recorded_by !== 'server') bad(`"decision.answers[${i}].recorded_by" must be "server"`);
+          str(`decision.answers[${i}].decision_key`, a.decision_key);
+          if (typeof a.log_k !== 'number') bad(`"decision.answers[${i}].log_k" must be a number`);
+        });
+      }
       if (str('decision.question', d.question, { cap: WORD_CAPS['decision.question'] }) && !/\?$/.test(d.question.trim())) {
         bad('"decision.question" must end in "?"');
       }

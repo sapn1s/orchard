@@ -2355,3 +2355,18 @@ Typecheck was clean on arrival, and no half-applied edit was found.
   - `verify-bug-191-adopt-window-send.mjs` **39/39, exit 0.**
 - **Classification.** ZERO real defects. The single non-green result (A13.3, run 2) is an environmental browser render-timing flake under self-induced concurrent load, reproduced-clean in isolation. No product code touched.
 - **Safety.** No credential modified, rotated, logged out, or printed; only `expiresAt` compared to now. Servers isolated (free ports, scratch dataDirs); :4317 and live brokers untouched; no git write.
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch anthropic/claude-fable-5-1 run dc3f692d-ad58-4d06-8fce-b61f0cfa9980 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 1540, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch anthropic/claude-fable-5-1 run 5b4aaff6-38b0-4498-945c-3cdb32582426 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: HOLDS (transcribed by BUG-225 verify from this ticket's line 1868, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0e4d9-9575-7fd2-99ad-032fb2ee893e (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 2123, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0e69e-a8e9-7000-9b07-40310a031512 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 2225, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch anthropic/claude-fable-5-1 run be533992-fdfc-49c4-81b5-79c6a2f3b9cd (clean-room, `scripts/independent-verify.mjs`) — VERDICT: HOLDS (transcribed by BUG-225 verify from this ticket's line 2342, whose shape the shared reader cannot parse)

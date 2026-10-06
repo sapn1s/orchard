@@ -176,6 +176,18 @@ async function main() {
       const head = headerFor(NB);
       return [...(head?.nextElementSibling?.querySelectorAll('button.row:not(.pending)') ?? [])];
     };
+    // One of the two projects is folded into the "N inactive projects" group and
+    // its header does not render until the group is opened: the neighbor A carries
+    // real on-disk sessions that can be >14d old (INACTIVE_AFTER_DAYS), so
+    // isActiveProject(A) is false and renderTree() hides A behind the `.inactive-l`
+    // toggle. (A fresh project B is the opposite — its registration time is recent,
+    // so it renders active.) Drive the REAL toggle click to reveal the folded
+    // header before waiting, rather than loosening the wait. This does NOT touch any
+    // BUG-106 assertion below; it only makes both project headers reachable.
+    await waitFor('project tree to render (both headers or the inactive group)',
+      () => (headerFor(NB) && headerFor(PB)) || doc.querySelector('.inactive-l'), 20000);
+    const inactiveToggle = doc.querySelector('.inactive-l');
+    if (inactiveToggle && inactiveToggle.getAttribute('aria-expanded') !== 'true') inactiveToggle.click();
     await waitFor('both project headers', () => headerFor(NB) && headerFor(PB), 20000);
     // Expand A and wait for its real session rows.
     if (!st.expanded.has(A_ID)) headerFor(NB).click();

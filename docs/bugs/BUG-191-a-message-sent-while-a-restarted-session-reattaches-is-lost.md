@@ -391,3 +391,12 @@ The re-review found R1 (correlated acceptance) and R3 (per-attempt ownership) so
 
 ### 2026-09-28 — real-CLI suites after re-login (pointer)
 - The default `~/.claude` OAuth was re-logged-in; the BUG-187 round-7 `--real` arms and the survivor/adopt suites re-ran GREEN. `verify-bug-191-adopt-window-send.mjs` = 39/39 exit 0; `verify-restart-reconnect-race.mjs` = 10/10; `verify-health-survivor.mjs` = 14/14; BUG-187 `--real` = 117/117 (run 1) / 116/117 (run 2, the sole miss A13.3 a browser render-timing flake reproduced-clean in isolation, 9/9). ZERO real defects. Full detail: BUG-187 Activity "2026-09-28 — BUG-187 round 7 — real-CLI suites after re-login".
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0e4d9-9575-7fd2-99ad-032fb2ee893e (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 338, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch openai run 01a0e69e-a8e9-7000-9b07-40310a031512 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 352, whose shape the shared reader cannot parse)
+
+### 2026-09-30 — BUG-225 verify lane (transcription)
+- **Verified-by:** dispatch anthropic/claude-fable-5-1 run be533992-fdfc-49c4-81b5-79c6a2f3b9cd (clean-room, `scripts/independent-verify.mjs`) — VERDICT: HOLDS (transcribed by BUG-225 verify from this ticket's line 389, whose shape the shared reader cannot parse)

@@ -34,12 +34,12 @@ import type {
   StationEvent,
 } from './events.ts';
 import type { Project } from './registry.ts';
-import { composeInstructions, appendToSystemPrompt, type ComposedPrompt } from './templates.ts';
+import { composeInstructions, appendToSystemPrompt, containerBuildSection, type ComposedPrompt } from './templates.ts';
 import { recordSessionConfig, type SessionConfigSource } from './session-config.ts';
 import { boardStateSection, boardAnswerBriefing, answeredAwaitingKeys } from './board.ts';
 import { OpenToolCalls } from './open-tool-calls.ts';
 import type { InstructionRef, ProjectSettings } from './registry.ts';
-import { browserSettingsOf, orchestratorProfileOf, responseDigestOf, toolSettingsOf } from './registry.ts';
+import { browserSettingsOf, orchestratorProfileOf, responseDigestOf, toolSettingsOf, getProject } from './registry.ts';
 import * as browser from './browser.ts';
 import { MCP_SERVER_NAME } from './browser.ts';
 import * as dispatchBroker from './dispatch-broker.ts';
@@ -51,8 +51,9 @@ import {
   CONTAINER_CLAUDE_BIN,
   ContainerError,
   containerName,
+  containerStoreDirName,
   containerWorkdir,
-  ensureContainer,
+  admitContainer,
   execInContainer,
   memoryStatus,
   oomExplanation,
@@ -60,10 +61,14 @@ import {
   reapExec,
   type ContainerLiveness,
   type MemoryStatus,
+  baseBriefingFor,
+  imageSourceOf,
 } from './container-manager.ts';
-import { ensureServices, connectSessionToServices, ServiceError } from './service-manager.ts';
-import { applyGlobalDefaults, resolveModelForProvider } from './global-settings.ts';
+import { ServiceError } from './service-manager.ts';
+import { newExecTag, attachLease, drainLease } from './lifecycle.ts';
+import { applyGlobalDefaults, resolveModelForProvider, modelProviderOf } from './global-settings.ts'; // BUG-196 round 6: modelProviderOf
 import { resolveLaunchAccountDir } from './claude-accounts.ts';
+import { getSessionAccount } from './session-accounts.ts'; // FEAT-160 — the server-owned session→account binding wins over a stale override on resume.
 import { brokerLifetimeForClose, reapHost, spawnSurvivable, survivalEnabled, type AttachHandle, type HostStatus, type SpawnedProcessLike, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
 /*
  * ARCH-001: the bridge no longer decides its own liveness. It supplies the
@@ -81,10 +86,12 @@ import { livenessOfBridge, REAP_SWEEP_MS, type EndProviderError, type Liveness }
 import { snapshotOfSession, type RunningSnapshot } from './running-set.ts';
 import * as outcomes from './outcomes.ts';
 import * as requests from './requests.ts';
-import { TranscriptRecorder, resolveOrchardSessionFile, mirrorClaudeStore } from './orchard-transcripts.ts';
+import { ensureUnifiedMemoryDir } from './memories.ts';
+import { TranscriptRecorder, resolveOrchardSessionFile, resumeProviderOf, mirrorClaudeStore, CLAUDE_MIRROR_PROVIDER } from './orchard-transcripts.ts';
 import { encodeCwd } from '../lib/session-history.ts';
 import { recordSessionProvenance } from '../lib/session-provenance.mjs';
 import { parseDispatchDeclaration } from '../../scripts/lib/cost-model.mjs';
+import { laneDockerEnv, requireSandboxUp, adoptedDockerMismatch } from '../../scripts/lib/lane-docker.mjs';
 
 /* ---------------------------------------------------------- slash commands */
 /*
@@ -94,7 +101,7 @@ import { parseDispatchDeclaration } from '../../scripts/lib/cost-model.mjs';
  * so it is kept server-side and persisted across restarts.
  */
 
-import { dataDir } from '../lib/paths.ts';
+import { dataDir, projectRoot } from '../lib/paths.ts';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -160,6 +167,11 @@ function rememberModels(provider: string, models: KnownModel[]): void {
 export interface StartOptions {
   project: Project;
   firstPrompt: string;
+  /**
+   * ARCH-022 — internal: the container exec tag `startSession` allocated BEFORE admission, so the
+   * lifecycle authority's lease for it exists before the exec does. Callers never set it.
+   */
+  execTag?: string;
   /** Resume an existing session id (works for sessions started in the plain CLI). */
   resumeSessionId?: string;
   /** With resumeSessionId: branch into a new session instead of continuing. */
@@ -609,10 +621,31 @@ export class AgentSession {
    * briefing names each NEW answer once, riding the user's next message.
    */
   #answerBriefSeen = new Set<string>();
+  /** FEAT-157 — base-update notices this session has been told (key id@rev). */
+  #baseBriefSeen = new Set<string>();
 
   /** Real SDK session id — the thing resume/fork need. Null until system:init. */
   sdkSessionId: string | null = null;
+  /**
+   * BUG-217 round 5 — the session this bridge was started to RESUME (not a
+   * fork), declared at construction. Until system:init fills `sdkSessionId`,
+   * this is the only record that the bridge already holds that session — see
+   * `bridgeForSession`.
+   */
+  resumeOf: string | null = null;
   cwd: string;
+  /**
+   * FEAT-155 — for a container session, the HOST store dir its history lands
+   * in, as DECLARED by container-manager (`containerStoreDirName`) at launch.
+   * It is not `encodeCwd(this.cwd)`: `cwd` may be bare `/workspace` (and is
+   * overwritten from `system:init`), which encodes to a dir shared by every
+   * such project. Null for direct sessions, whose store is the encoded cwd.
+   */
+  #containerStoreDir: string | null = null;
+  /** The host store dir this session's transcript lives in. Read this; do not re-encode `cwd`. */
+  get storeEncodedDir(): string {
+    return this.#containerStoreDir ?? encodeCwd(this.cwd);
+  }
   /** Set only for isolation "container" — the container this session executes in. */
   containerName: string | null = null;
   /** True when the stealth-browser MCP server was attached to this session. */
@@ -981,6 +1014,16 @@ export class AgentSession {
    */
   #levelRaw = new Map<string, 'agent' | 'tool'>();
   /**
+   * FEAT-154 (round 6) — what the owner knows about each lane in the engine's
+   * level beyond its kind: the engine's own `description` (level frames carry
+   * it) and when this bridge first saw it listed (or the broker's declared
+   * `since` on adoption). Read only to publish a level-listed lane that has no
+   * `#agents` row into the running strip, so a background command that keeps a
+   * session alive is VISIBLE and stoppable rather than invisible. Same REPLACE
+   * lifetime as `#levelRaw`: an id the latest frame omits is dropped.
+   */
+  #levelMeta = new Map<string, { description: string; since: number | null }>();
+  /**
    * BUG-105 (2nd follow-up, the `b0dfaf6` REGRESSION; 3rd and 4th clean-room
    * verdicts) — THE OUTCOME A TERMINAL FRAME ESTABLISHED, held for the row this
    * bridge does not have yet.
@@ -1150,6 +1193,16 @@ export class AgentSession {
       unavailableReason: pwUnavailable,
     });
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, pwNote) };
+    /*
+     * FEAT-157 — a container project's agent is told what its image may do, generated
+     * from the tables the enforcing code reads (templates.ts `containerBuildSection`).
+     * Static, so the cached system prefix stays byte-stable; the volatile half (which
+     * base runs, a pending release) is a first-turn `[station]` briefing (#withBriefing).
+     */
+    if (opts.project.isolation === 'container') {
+      const guide = containerBuildSection({ imageSource: imageSourceOf(opts.project), answerCmd: dispatchOn ? dispatchBroker.DISPATCH_COMMAND : null });
+      this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, guide) };
+    }
     for (const missing of this.composed.missingIds) {
       this.#emit({ t: 'error', message: `instruction template not found: ${missing}`, fatal: false });
     }
@@ -1225,6 +1278,26 @@ export class AgentSession {
     }
     this.permissionModeSource = permissionModeSource;
 
+    /*
+     * FEAT-160 — the server-owned session→account binding WINS over the client's
+     * per-launch override on a RESUME. This is the single reader of that fact
+     * (session-accounts.ts owns it, the account switch writes it): every resume
+     * spawn — the ws `start` resume, the outbox pump's `resume` route, a "Send
+     * anyway" on an uncertain row, a boot re-pump, a fork — flows through this
+     * one constructor, so a session that was switched can never be run on the old
+     * account by a stale override on another tab or a row frozen before the
+     * switch. A session that was never switched has no binding and keeps its
+     * override exactly as FEAT-145 defines. Keyed by `opts.resumeSessionId` (the
+     * parent sid for a fork, so a fork of a switched session continues on it).
+     */
+    if (opts.resumeSessionId) {
+      const bound = getSessionAccount(opts.resumeSessionId);
+      if (bound !== undefined && bound.account !== (effective.claudeAccount ?? null)) {
+        effective.claudeAccount = bound.account;
+        if (!overridden.includes('claudeAccount')) overridden.push('claudeAccount');
+      }
+    }
+
     this.effective = effective;
     this.overriddenFields = overridden;
     this.ignoredOverrides = [];
@@ -1249,19 +1322,6 @@ export class AgentSession {
      */
     let provider = s.provider ?? 'anthropic';
     /*
-     * BUG-188 round 2 — a SESSION OVERRIDE model must go through the same owner
-     * that guards the project/global model (resolveModelForProvider, ARCH-010).
-     * The override merge above wrote `opts.overrides.model` straight onto
-     * `effective.model`, bypassing that coupling; a stale `claude-*` override the
-     * UI cached for an openai session (from the pre-fix leak) would then reach the
-     * CodexRuntime and 400 at every turn. Re-resolving here drops an override that
-     * belongs to a different engine and is idempotent for a compatible one (an
-     * explicit gpt-* on openai, or the anthropic default already resolved by
-     * pickOverridable). The resume-provider-override branch below re-resolves again
-     * against the final engine if the transcript flips the provider.
-     */
-    (this.effective as { model: string | null }).model = resolveModelForProvider(this.effective.model, provider);
-    /*
      * FEAT-037 P2b — ON RESUME, THE TRANSCRIPT PICKS THE ENGINE. A session id
      * is meaningful only to the engine that minted it: a Codex thread id can
      * only continue via thread/resume, a Claude session file only via the
@@ -1269,22 +1329,27 @@ export class AgentSession {
      * overrides the configured provider — an Orchard-owned transcript names
      * its engine (its provider directory), anything else vetted resumable is
      * the Claude store. Announced, never silent, when it differs.
+     *
+     * BUG-196 round 5 — the ENGINE IS SETTLED FIRST, the model second. This block
+     * used to run AFTER the model had already been resolved against the
+     * CONFIGURED provider, so under a project whose default is the other engine a
+     * user's legitimate model pick (gpt-5-codex on an OpenAI-pinned session under
+     * a Claude-default project, or the Claude mirror) was dropped to null before
+     * the transcript flipped the engine — the project default silently decided an
+     * existing session's model. Now nothing reads the model until `provider` is
+     * final. (regressed-from: BUG-188 round 2, which added the pre-flip resolve.)
      */
     if (opts.resumeSessionId) {
       const rid = opts.resumeSessionId; // the ORIGINAL id the user clicked (fork staging never applies to Orchard-owned transcripts — see startSession's refusal)
-      const dirCandidates = [
-        ...(opts.resumeEncodedDir ? [opts.resumeEncodedDir] : []),
-        encodeCwd(opts.project.hostPath),
-        ...(opts.project.isolation === 'container' ? [encodeCwd(containerWorkdir(opts.project.id))] : []),
-      ];
-      let resumeProvider: string | null = null;
-      for (const d of new Set(dirCandidates)) {
-        const hit = resolveOrchardSessionFile(d, rid);
-        if (hit) { resumeProvider = hit.provider; break; }
-      }
-      // Not Orchard-owned → startSession's explainUnresumable already vetted it
-      // against the CLAUDE store, so the engine must be Claude.
-      const wanted = resumeProvider ?? 'anthropic';
+      // BUG-196 round 3 — the SAME candidate list the start-frame door check uses.
+      const dirCandidates = resumeDirCandidates(opts.project, opts.resumeEncodedDir);
+      // BUG-196 — the transcript is the SINGLE owner of the resume engine
+      // (resumeProviderOf, ARCH-010); the UI's per-session provider indicator
+      // reads the SAME resolver via the transcript route, so no surface can imply
+      // a switch this resume won't honor. Not Orchard-owned → startSession's
+      // explainUnresumable already vetted it against the CLAUDE store, so the
+      // engine defaults to Claude, which resumeProviderOf returns.
+      const wanted = resumeProviderOf(dirCandidates, rid);
       if ((wanted === 'openai' || wanted === 'anthropic') && wanted !== provider) {
         this.#emit({
           t: 'status',
@@ -1292,19 +1357,70 @@ export class AgentSession {
         });
         provider = wanted;
         (this.effective as Record<string, unknown>).provider = wanted; // effectiveConfig() must keep telling the truth
-        /*
-         * The model must follow the engine the transcript just picked. `effective.model`
-         * was resolved for the CONFIGURED provider (the guard just above), so a Claude
-         * session resumed as a Codex thread still carries a `claude-*` model here — which
-         * would reach the CodexRuntime and 400. Re-resolve the CURRENT effective model
-         * (an explicit session/project override included) against the final provider, so:
-         * a Claude default that only an anthropic session inherited is dropped to null; a
-         * cross-engine override is dropped; and an override compatible with the new engine
-         * survives (BUG-188 round 2 — one owner, no per-branch special-casing).
-         */
-        (this.effective as { model: string | null }).model = resolveModelForProvider(this.effective.model, wanted);
       }
     }
+    /*
+     * BUG-188 round 2 — a SESSION OVERRIDE model must go through the same owner
+     * that guards the project/global model (resolveModelForProvider, ARCH-010).
+     * The override merge above wrote `opts.overrides.model` straight onto
+     * `effective.model`, bypassing that coupling; a stale `claude-*` override the
+     * UI cached for an openai session (from the pre-fix leak) would then reach the
+     * CodexRuntime and 400 at every turn. Re-resolving drops an override that
+     * belongs to a different engine and is idempotent for a compatible one.
+     *
+     * BUG-196 round 5 — resolved ONCE, against the FINAL engine (after the P2b
+     * flip above), from the right source: the user's explicit session pick when
+     * there is one, else the PROJECT's own model re-resolved for the engine the
+     * session really runs on (a Claude default only an anthropic session inherits
+     * becomes null on a Codex thread; a Codex project's null becomes the machine
+     * Claude default on a Claude thread). An explicit pick the final engine cannot
+     * run is NOT dropped silently: it is announced as a status and reported in
+     * `ignoredOverrides`, and `model` stops being listed as overridden.
+     */
+    /*
+     * BUG-196 round 6 — "did the user pick a model" is read from the PICK ITSELF
+     * (presence in opts.overrides), never from `overridden`. The merge above drops
+     * an override equal to `base.model` — but `base` was resolved against the
+     * CONFIGURED provider, before the engine was final, so a pick that equals the
+     * project default (claude-opus-4-1 under a Claude-default project whose model is
+     * claude-opus-4-1) vanished before this block could judge it against the REAL
+     * engine, and an OpenAI-pinned resume dropped it with no word. Every explicit
+     * pick is judged here, once, against the final engine, whatever it equals.
+     * The judge is modelProviderOf (global-settings), the ONE model→engine
+     * classifier; the client no longer carries a copy (it reads the verdict back
+     * from `ignoredOverrides`).
+     */
+    {
+      const picked = opts.overrides != null && 'model' in opts.overrides ? (opts.overrides.model ?? null) : null;
+      const explicit = typeof picked === 'string' && picked ? picked : null;
+      // An ignored pick is treated exactly as NO pick: the project's own model when
+      // it belongs to this engine, else the engine's default (the matrix caught the
+      // first draft falling straight to the engine default, where the client-side
+      // drop it replaced had let the project default apply).
+      const fallback = resolveModelForProvider(opts.project.settings.model ?? null, provider);
+      const pickedOk = explicit != null ? resolveModelForProvider(explicit, provider) : null;
+      const resolved = explicit != null && pickedOk === explicit ? explicit : fallback;
+      (this.effective as { model: string | null }).model = resolved;
+      const runs = provider === 'openai' ? 'OpenAI Codex' : 'Claude';
+      if (explicit != null && resolved !== explicit) {
+        const reason = `not a ${runs} model — this session runs on ${runs}, so ${resolved != null ? `the project default (${resolved})` : 'the engine\'s default model'} is used instead`;
+        this.#emit({ t: 'status', status: `ignored your model pick (${explicit}): ${reason}` });
+        this.ignoredOverrides.push({ field: 'model', value: explicit, reason });
+        const i = overridden.indexOf('model');
+        if (i >= 0) overridden.splice(i, 1);
+      } else if (explicit != null && modelProviderOf(explicit) == null) {
+        // An id no catalog and no known prefix/alias places: it is passed through
+        // (never over-drop a model we cannot place — a brand-new id is legitimate),
+        // but SAID, so a pick the engine then refuses was never a silent guess.
+        this.#emit({ t: 'status', status: `model pick (${explicit}) is not a recognised ${runs} model — passing it to the engine as-is; the engine will refuse it if it cannot run it` });
+      }
+    }
+    // BUG-196 — the bridge OWNS the engine this session dispatches on; declare the
+    // FINAL resolved provider once on this.effective (project ∘ override ∘ any resume
+    // flip above). session-init reads it back so the client learns the locked engine
+    // the moment a new session becomes real, and it equals what resumeProviderOf
+    // returns on the next reopen (ARCH-010 — one owner, read everywhere).
+    (this.effective as Record<string, unknown>).provider = provider;
     if (provider === 'openai') {
       if (!process.env.CLAUDE_STATION_CODEX_BIN) {
         const det = detectCodex();
@@ -1388,12 +1504,14 @@ export class AgentSession {
       // honestly ENOENT (with the PROVIDERS.md hint baked into the runtime's
       // spawn-error message) until an image ships it.
       pathToExecutable = provider === 'openai' ? 'codex' : CONTAINER_CLAUDE_BIN;
-      this.#execId = `${id}-${Math.random().toString(36).slice(2, 10)}`.replace(/[^A-Za-z0-9_-]/g, '-');
+      // ARCH-022: the tag admission leased (a fresh one only for a caller that bypassed startSession, whose exec the authority then refuses).
+      this.#execId = opts.execTag ?? `${id}-${Math.random().toString(36).slice(2, 10)}`.replace(/[^A-Za-z0-9_-]/g, '-');
       spawnProcess = (o) =>
         execInContainer(project, { command: o.command, args: o.args, env: o.env, execId: this.#execId! });
       // Reported before system:init arrives, so the UI never briefly shows the
       // host path for a containerised session.
-      this.cwd = containerWorkdir(project.id);
+      this.cwd = containerWorkdir(project);
+      this.#containerStoreDir = containerStoreDirName(project);
       this.containerName = containerName(project.id);
       /*
        * OOM honesty. The container is already running (startSession awaited
@@ -1468,6 +1586,7 @@ export class AgentSession {
     // A cross-OS fork resumes the STAGED copy id, not the original — see fork.ts.
     this.#forkPlan = opts.forkPlan ?? null;
     this.#forkFrom = opts.fork && opts.resumeSessionId ? opts.resumeSessionId : null;
+    this.resumeOf = !opts.fork && opts.resumeSessionId ? opts.resumeSessionId : null;
     this.#stagedFile = this.#forkPlan?.stagedFile ?? null;
 
     /*
@@ -1577,6 +1696,7 @@ export class AgentSession {
       this.#recorder = new TranscriptRecorder({
         provider,
         cwd: this.cwd,
+        encodedDir: this.storeEncodedDir,
         onError: (message) => this.#emit({ t: 'error', message, fatal: false }),
       });
       if (s.model) this.#recorder.setModel(s.model);
@@ -1606,7 +1726,12 @@ export class AgentSession {
       this.#turnUserInitiated = false;
       this.lastFrameAt = Date.now();
       for (const t of st.backgroundTasks ?? []) {
-        if (t && typeof t.id === 'string' && t.id) this.#levelRaw.set(t.id, t.type === 'local_bash' ? 'tool' : 'agent');
+        if (t && typeof t.id === 'string' && t.id) {
+          this.#levelRaw.set(t.id, t.type === 'local_bash' ? 'tool' : 'agent');
+          // FEAT-154 (round 6) — the broker's declared start, so the strip row has an honest age.
+          const since = typeof t.since === 'string' ? Date.parse(t.since) : NaN;
+          this.#levelMeta.set(t.id, { description: '', since: Number.isFinite(since) ? since : null });
+        }
       }
       for (const id of st.startedTasks ?? []) if (typeof id === 'string' && id && !this.#levelRaw.has(id)) this.#levelRaw.set(id, 'agent');
       this.#rebuildBackgroundLevel();
@@ -1658,9 +1783,38 @@ export class AgentSession {
         ORCHARD_DISPATCH_CMD: dispatchRoute,
         ORCHARD_DISPATCH_UNAVAILABLE_REASON: opts.dispatchUnavailableReason!,
       } : { ORCHARD_DISPATCH_ENTITLED: '0' };
+      /*
+       * BUG-223 — THE LANE'S DOCKER DAEMON, decided at launch. A direct session on
+       * a project carrying the sandbox tooling gets DOCKER_HOST at the FEAT-158
+       * sandbox, so its Bash, its in-process subagents (same CLI process, same
+       * env), dispatch.mjs, independent-verify and any scratch server they boot
+       * can only see the sandbox. The host is reachable only through the logged
+       * opt-out (useHostDocker). A container session is excluded: its `docker
+       * exec` runs with the server's env and DOCKER_HOST never crosses into it.
+       * The server never starts the sandbox (ARCH-022 b-i): startSessionAdmitting refused the launch if it is down.
+       */
+      const laneDocker = opts.project.isolation === 'direct'
+        // BUG-223 residual (via ARCH-022): decided from THIS project's row, re-read BY ID — never from whichever row sits at its path.
+        ? laneDockerEnv({ projectPath: opts.project.hostPath, project: getProject(opts.project.id) ?? null })
+        : null;
+      if (laneDocker?.decision === 'host-optout') console.warn(`[orchard] BUG-223: session ${this.id} keeps the HOST Docker daemon (${laneDocker.reason})`);
+      /*
+       * An ADOPTED CLI is already running: its environment was fixed at its birth
+       * and cannot be changed. If it was born before this rule (or under another
+       * daemon), say so, loudly and to the session, instead of claiming coverage.
+       */
+      const adoptedMismatch = opts.adopt && laneDocker?.decision === 'sandbox'
+        ? adoptedDockerMismatch(opts.adopt.st.claudePid, laneDocker.env)
+        : null;
+      if (adoptedMismatch) {
+        const msg = `this session's CLI was launched before the BUG-223 lane Docker rule (DOCKER_HOST ${adoptedMismatch}), so its docker calls still reach the HOST daemon until the session is restarted`;
+        console.warn(`[orchard] BUG-223: session ${this.id}: ${msg}`);
+        this.#emit({ t: 'status', status: `Docker: ${msg}.` });
+      }
       this.#runtime.start({
         cwd: opts.project.hostPath,
         env: { ...dispatchEnv, ...accountEnv },
+        dockerEnv: laneDocker?.env,
         firstPrompt,
         permissionMode: s.permissionMode,
         onApproval: (req) => this.#onCanUseTool(req.toolName, req.input, req.meta),
@@ -1679,6 +1833,8 @@ export class AgentSession {
         // project id (stable across isolation, unlike cwd).
         gitGrantKey: opts.project.id,
         gitRepoPath: opts.project.hostPath,
+        // BUG-231 — only a direct session's CLI sees the host git shim on its PATH.
+        gitShimReachesCli: opts.project.isolation === 'direct',
         sessionLabel: this.id,
         // FEAT-129 — the file-lock heartbeat's liveness ground truth: the agent_ids
         // of the lanes this session has running RIGHT NOW (the same running-set
@@ -1731,11 +1887,21 @@ export class AgentSession {
     // starts one — send() is what invokes it, and only when the user is sending).
     let answer: string | null = null;
     try { answer = boardAnswerBriefing(this.project.hostPath, this.#answerBriefSeen); } catch { answer = null; }
+    // FEAT-157 — Orchard's base-update notice for a container project: on the first
+    // turn of every launch, and once more whenever it changes (seen-set keyed id@rev).
+    // Rides a turn the user is sending; never starts one.
+    let baseNote: string | null = null;
+    if (this.project.isolation === 'container') {
+      try {
+        const b = baseBriefingFor(this.project.id, { answerCmd: toolSettingsOf(this.project).openaiDispatch ? dispatchBroker.DISPATCH_COMMAND : null });
+        if (b && !this.#baseBriefSeen.has(b.key)) { this.#baseBriefSeen.add(b.key); baseNote = b.text; }
+      } catch { baseNote = null; }
+    }
     // The `[station]` briefings (both start with that sentinel — the ONLY prefix
     // the client's harnessNotice recognises). `extraPrefix` is the first-turn board
     // snapshot (FEAT-113) — injected context, but it leads with `# Project state`,
     // not a sentinel.
-    const briefings = [answer, brief].filter((s): s is string => !!s && !!s.trim());
+    const briefings = [baseNote, answer, brief].filter((s): s is string => !!s && !!s.trim());
     const prefixParts = [...briefings, extraPrefix].filter((s): s is string => !!s && !!s.trim());
     if (!prefixParts.length) return prompt;
     // BUG-168 — when a `[station]` briefing leads the prefix, terminate the whole
@@ -2158,6 +2324,15 @@ export class AgentSession {
      * (`#armDetachedClose` no-ops if a timer is already pending).
      */
     this.#armDetachedClose();
+  }
+
+  /**
+   * BUG-217 round 5 — the server-owned outbox handed this session a turn; tell
+   * whoever is attached (a driving tab paints the prompt and goes busy). A
+   * detached session's sink drops it: the transcript is the record.
+   */
+  announce(e: StationEvent): void {
+    this.#emit(e);
   }
 
   /** A returning socket takes over the event stream of a detached session. */
@@ -2779,6 +2954,57 @@ export class AgentSession {
   }
 
   /**
+   * FEAT-154 (round 6) — is a background AGENT (a subagent, not a shell) alive in
+   * this session right now? Same two owner sources as `hasLiveBackgroundLane()`,
+   * restricted by the kind the owner already records for every lane
+   * (`'agent' | 'tool'`). This is what the session list's "working" fact reads:
+   * the user's definition is "actual running agents/subagents", so a background
+   * `local_bash` — a dev server, a poll loop — keeps the process alive but does
+   * NOT make the session read as working. (It is shown in the running strip
+   * instead — see `levelOnlyLanes()`.)
+   */
+  hasLiveBackgroundAgent(): boolean {
+    for (const k of this.#backgroundTasks.values()) if (k === 'agent') return true;
+    for (const k of this.#bgBornTasks.values()) if (k === 'agent') return true;
+    return false;
+  }
+
+  /**
+   * FEAT-154 (round 6) — background lanes the ENGINE'S LEVEL lists as live that
+   * have no running `#agents` row. The shape this surfaces is an adopted bridge
+   * (BUG-187 B1): its level is seeded from the broker's declarations, but the
+   * lanes were born under the previous server, so no `task_started` ever built a
+   * row — the session is kept alive by work the running strip could not show.
+   * Owner-declared (the level), never inferred.
+   */
+  levelOnlyLanes(): { id: string; kind: 'agent' | 'tool'; description: string; since: number | null }[] {
+    const out: { id: string; kind: 'agent' | 'tool'; description: string; since: number | null }[] = [];
+    for (const [id, kind] of this.#backgroundTasks) {
+      const row = this.#agents.get(id);
+      if (row && row.status === 'running') continue; // already a strip row
+      const meta = this.#levelMeta.get(id);
+      out.push({ id, kind, description: meta?.description ?? '', since: meta?.since ?? null });
+    }
+    return out;
+  }
+
+  /**
+   * FEAT-154 (round 6) — stop ONE background lane through the engine's own
+   * `stop_task` control (the SDK's `Query.stopTask`). Refused for an id this
+   * session does not currently list as running work, so a stale client cannot
+   * aim it at anything else. The engine answers with a terminal
+   * `task_notification`, which retires the lane through the normal path.
+   */
+  async stopTask(taskId: string): Promise<void> {
+    if (this.closed) throw new Error('session is closed');
+    const known = this.#backgroundTasks.has(taskId) || this.#bgBornTasks.has(taskId)
+      || this.#agents.get(taskId)?.status === 'running';
+    if (!known) throw new Error('that task is not running in this session');
+    if (typeof this.#runtime.stopTask !== 'function') throw new Error('this engine cannot stop a single task');
+    await this.#runtime.stopTask(taskId);
+  }
+
+  /**
    * BUG-178 — is THIS lane a background lane? TRI-STATE, and the third state is
    * the whole round-2 fix.
    *
@@ -3180,6 +3406,9 @@ export class AgentSession {
     // Released here, not only at shutdown: the map used to retain every session
     // ever started for the life of the process.
     sessions.delete(this.id);
+    // ARCH-022: the session is gone from the map, but its exec may still be draining a tool call — the
+    // lease keeps the container protected until the authority proves none of its processes remain.
+    if (this.#execId) drainLease(this.#execId);
     /*
      * BUG-034 — the empty snapshot, pushed SYNCHRONOUSLY. `close()` awaits the
      * pump below and a half-dead stream is precisely a pump that never settles
@@ -4390,7 +4619,7 @@ export class AgentSession {
          */
         if (this.#runtime.capabilities.persistedTranscript && this.sdkSessionId) {
           try {
-            mirrorClaudeStore(encodeCwd(this.cwd), this.sdkSessionId, {
+            mirrorClaudeStore(this.storeEncodedDir, this.sdkSessionId, {
               onError: (message) => this.#emit({ t: 'error', message, fatal: false }),
             });
           } catch { /* the durable mirror must never break a turn */ }
@@ -4697,6 +4926,20 @@ export class AgentSession {
             ])
             .filter(([id]: [string, 'agent' | 'tool']) => Boolean(id)),
         );
+        // FEAT-154 (round 6) — keep the engine's description + first-seen time per
+        // listed lane (REPLACE lifetime, like `#levelRaw`).
+        {
+          const meta = new Map<string, { description: string; since: number | null }>();
+          const seenAt = Date.now();
+          for (const t of tasks) {
+            const id = String(t?.task_id ?? '');
+            if (!id) continue;
+            const prev = this.#levelMeta.get(id);
+            const description = typeof t?.description === 'string' && t.description ? t.description : (prev?.description ?? '');
+            meta.set(id, { description, since: prev ? prev.since : seenAt });
+          }
+          this.#levelMeta = meta;
+        }
         this.#rebuildBackgroundLevel();
         // BUG-043: any level frame supersedes the dispatch-observed hint — from
         // here on the level itself is the authority (including an empty one).
@@ -4793,6 +5036,9 @@ export class AgentSession {
           model: String(m.model ?? 'unknown'),
           tools: Array.isArray(m.tools) ? m.tools : [],
           permissionMode: m.permissionMode,
+          // BUG-196 — the engine this session dispatches on, so a new session made
+          // real by its first turn locks its provider surfaces immediately.
+          lockedProvider: String(this.effective.provider ?? 'anthropic'),
           // What THIS session's CLI says it answers to — powers the composer's
           // "/" autocomplete. Typed as a prompt, the CLI executes them itself.
           slashCommands: Array.isArray(m.slash_commands) ? m.slash_commands.map(String) : [],
@@ -5208,7 +5454,40 @@ export async function prepareDispatchForSession(opts: Pick<StartOptions, 'projec
   }
 }
 
+/**
+ * BUG-196 round 3 — THE dir list a resume of `project` searches for a session's
+ * transcript: the resume-encoded dir the client named, the project's host dir,
+ * and (container) the declared container store dir. One owner, so the resume's
+ * P2b engine resolution and the server's door check on a `start` frame's
+ * provider override (index.ts) look in exactly the same places and cannot
+ * disagree about which engine a session id is pinned to.
+ */
+export function resumeDirCandidates(
+  project: Pick<Project, 'id' | 'hostPath' | 'isolation'>,
+  resumeEncodedDir?: string | null,
+): string[] {
+  return [
+    ...(resumeEncodedDir ? [resumeEncodedDir] : []),
+    encodeCwd(project.hostPath),
+    ...(project.isolation === 'container' ? [containerStoreDirName(project)] : []),
+  ];
+}
+
 export async function startSession(opts: StartOptions): Promise<AgentSession> {
+  // ARCH-022: a container session's exec tag exists before its admission, so the lease it is granted
+  // covers the exec from the moment it can be submitted. A start that fails after admission drains it:
+  // protection ends only once the authority proves none of its processes run (the constructor may have
+  // spawned before it threw, BUG-217 round 5).
+  const execTag = opts.project.isolation === 'container' ? newExecTag('cs') : undefined;
+  try {
+    return await startSessionAdmitting(execTag ? { ...opts, execTag } : opts);
+  } catch (err) {
+    if (execTag) drainLease(execTag);
+    throw err;
+  }
+}
+
+async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> {
   // Same fail-closed rule as the constructor, applied before anything else runs.
   const iso: string = opts.project.isolation;
   if (iso !== 'direct' && iso !== 'container' && iso !== 'sandbox') {
@@ -5228,6 +5507,21 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
    * in-memory runtime and their already-spawned CLI process — nothing here
    * touches them. Container sessions run a separate baked CLI and are unaffected.
    */
+  /*
+   * ARCH-022 decision (b-i): the SERVER never starts the Docker sandbox (that acts on the host daemon, outside its
+   * claim and its lifecycle authority). A new direct session whose project declares the sandbox, with the sandbox
+   * down, FAILS LOUDLY here — it is never sent to the host and nothing starts the sandbox for it.
+   */
+  if (iso === 'direct' && !opts.adopt) {
+    const ld = laneDockerEnv({ projectPath: opts.project.hostPath, project: getProject(opts.project.id) ?? null });
+    if (ld.decision === 'sandbox') {
+      try { await requireSandboxUp(); } catch (e) {
+        const msg = (e as Error).message;
+        opts.onEvent({ t: 'error', message: msg, fatal: true });
+        throw e;
+      }
+    }
+  }
   if (iso === 'direct') {
     const block = runtimeUpdate.hostSessionBlock();
     if (block) {
@@ -5372,47 +5666,33 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
 
   if (iso === 'container') {
     /*
-     * FEAT-112 — bring declared service sidecars up BEFORE the session container,
-     * so the network exists to join. A service that will not start FAILS session
-     * start loudly and specifically (a silent no-Redis is worse than a refusal);
-     * the pull is bounded so an unreachable registry cannot hang us here.
+     * ARCH-022 — ADMISSION. Services (FEAT-112: before the container, so the network exists to join), the
+     * container and the network join happen inside ONE lifecycle operation in this project's FIFO slot, and
+     * the authority grants this session's LEASE before the slot is released. No stop, remove, rebuild or
+     * delete can run between "the container is ready" and "this session holds it", and every later one
+     * sees the lease. A newly built image never recreates the container under another session's lease
+     * (FEAT-155 r5, BUG-214): that is the authority's decision, not a liveness sample taken here.
      */
     try {
-      await ensureServices(opts.project, (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }));
-    } catch (err) {
-      const e = err as Error;
-      const detail = err instanceof ServiceError && err.detail ? `\n${err.detail}` : '';
-      const msg =
-        err instanceof ServiceError
-          ? `service sidecar unavailable (${err.code}): ${e.message}${detail}`
-          : `service sidecar unavailable: ${e.message}`;
-      opts.onEvent({ t: 'error', message: msg, fatal: true });
-      throw new Error(msg);
-    }
-    try {
-      const st = await ensureContainer(opts.project, { onLog: (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }) });
-      if (st.state !== 'running') {
-        throw new ContainerError('not-running', `container ${st.containerName} is "${st.state}" — refusing to start a session on the host instead`);
-      }
-      // Join the session container to the service network AFTER it is running.
-      connectSessionToServices(opts.project.id, (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }));
+      const pid = opts.project.id;
+      await admitContainer(opts.project, opts.execTag!, {
+        onLog: (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }),
+        // A registered project is re-read under the slot: deleted meanwhile = refused, never re-created (F6).
+        current: getProject(pid) ? () => getProject(pid) : undefined,
+      });
     } catch (err) {
       const e = err as Error;
       /*
-       * BUG-136 (second report) — `detail` is where a ContainerError puts the
-       * only actionable sentence it has, and this message dropped it. A project
-       * whose mount pointed at a deleted directory reported exactly "container
-       * isolation unavailable (bad-mounts): project mounts are invalid" — which
-       * names no mount and no path, so there is nothing the reader can act on.
-       * The offending path was sitting in `detail` the whole time. Same shape as
-       * the turn-end label fixed in the first half of this ticket: the one line
-       * naming the fault was produced and then discarded.
+       * BUG-136 (second report) — `detail` is where a ContainerError puts the only actionable sentence it
+       * has; keep it. A service that will not start fails the start loudly and specifically (FEAT-112).
        */
-      const detail = err instanceof ContainerError && err.detail ? `\n${err.detail}` : '';
+      const detail = (err instanceof ContainerError || err instanceof ServiceError) && err.detail ? `\n${err.detail}` : '';
       const msg =
-        err instanceof ContainerError
-          ? `container isolation unavailable (${err.code}): ${e.message}${detail}`
-          : `container isolation unavailable: ${e.message}`;
+        err instanceof ServiceError
+          ? `service sidecar unavailable (${err.code}): ${e.message}${detail}`
+          : err instanceof ContainerError
+            ? `container isolation unavailable (${err.code}): ${e.message}${detail}`
+            : `container isolation unavailable: ${e.message}`;
       opts.onEvent({ t: 'error', message: msg, fatal: true });
       throw new Error(msg);
     }
@@ -5439,7 +5719,21 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
      * refusal names the alternative.
      */
     const dirs = [opts.resumeEncodedDir, encodeCwd(opts.project.hostPath)].filter((d): d is string => !!d);
-    if (dirs.some((d) => resolveOrchardSessionFile(d, opts.resumeSessionId!))) {
+    /*
+     * BUG-215 round 2 — the refusal must key on the transcript's PROVIDER, not on
+     * the mere presence of an Orchard-owned transcript. Since FEAT-144 a mirrored
+     * CLAUDE session lives in the SAME store under provider `anthropic`
+     * (CLAUDE_MIRROR_PROVIDER), so `resolveOrchardSessionFile` now hits for every
+     * Claude session that has been mirrored too. Only a NON-Claude (Codex) capture
+     * is the unforkable case: a Claude mirror forks via the CLAUDE store exactly
+     * like any Claude session (planFork stages the CLI store file, which is where
+     * the real transcript still lives). Refusing on presence alone misclassified
+     * every mirrored container→direct Claude session as Codex and blocked the fork.
+     */
+    const orchardHit = dirs
+      .map((d) => resolveOrchardSessionFile(d, opts.resumeSessionId!))
+      .find((h): h is NonNullable<typeof h> => !!h);
+    if (orchardHit && orchardHit.provider !== CLAUDE_MIRROR_PROVIDER) {
       const msg =
         `fork failed: ${opts.resumeSessionId} is an Orchard-owned (Codex) transcript — forking a Codex session ` +
         'is not supported yet (FEAT-037 P2b follow-up). Resume it instead, which continues the same thread.';
@@ -5482,6 +5776,32 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
     }
   }
 
+  /*
+   * BUG-215 r3 — UNIFY AGENT MEMORY ACROSS ISOLATION MODES, before the CLI spawns
+   * and reads it. A project's memory is scoped to its session-store dir, whose
+   * name follows the CLI's cwd — the host path when `direct`, `/workspace/<id>`
+   * when in a container. Switching isolation (or forking across it, as the
+   * container→direct fork that reopened this ticket does) otherwise strands the
+   * accumulated memory in the other encoding's dir and the new session starts
+   * "without my notes". `ensureUnifiedMemoryDir` makes the host/direct encoding's
+   * `memory` a symlink to the single canonical dir (merging, never losing, any
+   * files it already held). Runs for every mode: container start funnels prior
+   * direct memory into the canonical dir the container reads; direct start (incl.
+   * the fork) picks up container-recorded memory. INSURANCE MUST NOT BREAK THE
+   * SESSION — a failure here is a non-fatal status, exactly like the snapshot.
+   */
+  try {
+    const u = ensureUnifiedMemoryDir(opts.project);
+    if (u.linkedFrom) {
+      const parts = [`agent memory unified — ${u.linkedFrom} now points at ${u.canonical}`];
+      if (u.merged.length) parts.push(`merged ${u.merged.length} file(s)`);
+      if (u.conflicts.length) parts.push(`kept BOTH copies of ${u.conflicts.length} name clash(es): ${u.conflicts.map((c) => `${c.name}→${c.keptAs}`).join(', ')}`);
+      opts.onEvent({ t: 'status', status: parts.join('; ') });
+    }
+  } catch (err) {
+    opts.onEvent({ t: 'error', message: `agent memory could not be unified across isolation modes (memory may not carry over): ${(err as Error).message}`, fatal: false });
+  }
+
   const id = `cs-${Date.now().toString(36)}-${(++seq).toString(36)}`;
 
   /*
@@ -5507,12 +5827,17 @@ export async function startSession(opts: StartOptions): Promise<AgentSession> {
     s = new AgentSession(id, { ...opts, forkPlan, dispatchUnavailableReason, browserUnavailableReason });
   } catch (err) {
     discardStaged(forkPlan?.stagedFile ?? null);
+    // BUG-217 round 5: the constructor spawns the CLI with the first prompt, so a
+    // throw from here may come AFTER the prompt was handed over — say so, so a
+    // caller never treats it as a clean pre-spawn refusal.
+    if (err && typeof err === 'object') (err as { mayHaveSpawned?: boolean }).mayHaveSpawned = true;
     throw err;
   }
   s.startSnapshotId = snap.meta?.id ?? null;
   s.startSnapshotStatus = snap.status;
   s.startSnapshotError = snap.status === 'failed' ? snap.reason : null;
   sessions.set(id, s);
+  if (opts.execTag) attachLease(opts.execTag, id); // ARCH-022: the lease now belongs to a registered session
   return s;
 }
 
@@ -5544,6 +5869,17 @@ export function getSession(id: string): AgentSession | undefined {
 /** Every session still live. Sessions remove themselves on close(). */
 export function liveSessions(): AgentSession[] {
   return [...sessions.values()].filter((s) => !s.closed);
+}
+
+/**
+ * BUG-217 round 5 — the live bridge that holds SDK session `sid`, declared by
+ * its owner: the id its CLI reported, or — before the CLI's system:init — the
+ * id it was started to resume. Reading only `sdkSessionId` missed a resume in
+ * that window, and a second CLI could be spawned onto the same transcript (the
+ * BUG-022 shape): the outbox did exactly that in testing.
+ */
+export function bridgeForSession(sid: string): AgentSession | undefined {
+  return liveSessions().find((s) => s.sdkSessionId === sid || (s.sdkSessionId == null && s.resumeOf === sid));
 }
 
 /** Live sessions belonging to one project — used to refuse destructive container ops. */

@@ -43,12 +43,21 @@
 /**
  * Index the rail board's split lists into one id → {state, item} map.
  * `state` is the ticket's coarse board state, from WHICH LIST it is in:
- *   done  — board.doneToday (completed; done/verified)
- *   needs — board.needsYou (👤, waiting on the user)
- *   prog  — board.inflight (🤖, a lane assigned)
- *   queued— board.queued (open, unowned backlog)
+ *   done    — board.doneToday (completed; done/verified)
+ *   answered— board.answeredAwaiting (👤 answered, awaiting an agent to act — FEAT-090)
+ *   needs   — board.needsYou (👤, waiting on the user)
+ *   prog    — board.inflight (🤖, a lane assigned)
+ *   queued  — board.queued (open, unowned backlog)
  * A ticket in none of these is absent from the rail board (open tickets and
  * done-today only) — reported honestly as `missing`, never a fabricated status.
+ *
+ * NOTE (FEAT-126 r1 finding, PARTIAL): `answeredAwaiting` is now indexed (it used
+ * to read `missing`). The OTHER half — a ticket VERIFIED/Done more than 24h ago —
+ * is NOT in any list this payload carries (`doneToday` is gated to 24h by
+ * readBoard), so it still reads `missing`. Closing that needs the SERVER board
+ * payload to expose all Done ids regardless of recency (board.ts, off-limits this
+ * lane); the hunk is recorded on the ticket. Once the payload carries e.g.
+ * `board.doneIds`, add `for (const id of board?.doneIds ?? []) …` here.
  */
 export function indexBoardTickets(board) {
   const map = new Map();
@@ -59,19 +68,30 @@ export function indexBoardTickets(board) {
   };
   // done first so a done ticket is never masked by a stale open row of the same id.
   add(board?.doneToday, 'done');
+  add(board?.answeredAwaiting, 'answered');
   add(board?.needsYou, 'needs');
   add(board?.inflight, 'prog');
   add(board?.queued, 'queued');
   return map;
 }
 
-/** Coarse session liveness from the running snapshot (empty is a real answer). */
-function sessionLiveness(snap) {
+/**
+ * Coarse liveness for the EXECUTION fallback, from UNATTRIBUTED running lanes
+ * only — lanes carrying no declared request and no declared ticket. Attributed
+ * lanes are consumed by `attributedLanes`; feeding them into the coarse read too
+ * is what let a lane declared to REQ-8 light REQ-7 as running (FEAT-126 r1
+ * finding). `known` reflects whether a snapshot exists at all: with a snapshot
+ * present but every lane attributed, `live` is 0 (a real "no unattributed motion"
+ * answer), and with NO snapshot `known` is false (liveness UNKNOWN — the fallback
+ * must not then claim motion nothing confirms).
+ */
+function coarseLiveness(snap) {
   const running = snap && Array.isArray(snap.running) ? snap.running : null;
   if (!running) return { known: false, live: 0, stalled: false };
-  const live = running.length;
-  const stalled = running.some((r) => r && r.state === 'stalled');
-  return { known: true, live, stalled };
+  const undeclared = running.filter(
+    (r) => r && !r.request && !(Array.isArray(r.ticket) && r.ticket.length),
+  );
+  return { known: true, live: undeclared.length, stalled: undeclared.some((r) => r.state === 'stalled') };
 }
 
 /**
@@ -136,15 +156,20 @@ export function executionOf(tickets, ticketIndex, live, opts = {}) {
     const stalled = lanes.some((l) => l.state === 'stalled');
     return { state: stalled ? 'stalled' : 'running', count: lanes.length, attributed: true };
   }
-  // Fallback: the board owner cell, gated by session liveness.
+  // Fallback: the board OWNER cell (🤖), gated by UNATTRIBUTED session liveness.
   const ids = Array.isArray(tickets) ? tickets : [];
   let count = 0;
   for (const id of ids) {
     const hit = ticketIndex.get(id);
     if (hit && hit.state === 'prog') count++;
   }
-  if (count === 0 || (live.known && live.live === 0)) return { state: 'idle', count, attributed: false };
-  if (live.known && live.stalled) return { state: 'stalled', count, attributed: false };
+  if (count === 0) return { state: 'idle', count, attributed: false };
+  // No snapshot → liveness UNKNOWN → never claim motion nothing confirms (F5).
+  if (!live.known) return { state: 'idle', count, attributed: false };
+  // Snapshot present but no UNATTRIBUTED live lane → a sibling's attributed lane
+  // must not light this request (F4).
+  if (live.live === 0) return { state: 'idle', count, attributed: false };
+  if (live.stalled) return { state: 'stalled', count, attributed: false };
   return { state: 'running', count, attributed: false };
 }
 
@@ -161,7 +186,7 @@ export function executionOf(tickets, ticketIndex, live, opts = {}) {
 export function joinRequests(bindings, { board = null, snap = null } = {}) {
   const list = Array.isArray(bindings) ? bindings : [];
   const ticketIndex = indexBoardTickets(board);
-  const live = sessionLiveness(snap);
+  const live = coarseLiveness(snap);
   const runningLanes = snap && Array.isArray(snap.running) ? snap.running : [];
   return list.map((b) => {
     const tickets = Array.isArray(b.tickets) ? b.tickets : [];

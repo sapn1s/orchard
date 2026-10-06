@@ -9,6 +9,8 @@ import { spawnSync } from 'node:child_process';
 const tmp=fs.mkdtempSync(path.join(os.tmpdir(),'feat102-')); process.env.CLAUDE_STATION_DATA=path.join(tmp,'data'); process.env.ORCHARD_DISPATCH_SCRIPT=path.resolve('scripts/fixtures/fake-dispatch.mjs');
 const broker=await import('../src/server/dispatch-broker.ts'); const cm=await import('../src/server/container-manager.ts');
 const host=path.join(tmp,'owner'); fs.mkdirSync(host); const project={id:'feat102-owner',name:'owner',hostPath:host,isolation:'container',settings:{tools:{serena:false,playwright:false,openaiDispatch:true}}};
+// BUG-223 r6: the broker re-reads its project by id per lane, so the fixture must be registered.
+const { registerFixtureProjects } = await import('./lib/broker-fixture.mjs'); registerFixtureProjects(process.env.CLAUDE_STATION_DATA, project);
 if(process.argv.includes('--must-fail-proof')){const oldFileBind={hostPath:broker.dispatchSocketPath(project),containerPath:broker.CONTAINER_DISPATCH_SOCKET};assert.throws(()=>assert.equal(oldFileBind.hostPath,broker.dispatchProjectDir(project)));console.log('PASS MUST-FAIL: pre-fix socket-file bind is rejected; restart proof requires the project directory bind');fs.rmSync(tmp,{recursive:true,force:true});process.exit(0)}
 let pass=0,fail=0; function check(name,fn){try{fn();pass++;console.log(`PASS ${name}`)}catch(e){fail++;console.log(`FAIL ${name}: ${e.message}`)}}
 const sock=await broker.start(project); check('socket mode is 0600',()=>assert.equal(fs.statSync(sock).mode&0o777,0o600));

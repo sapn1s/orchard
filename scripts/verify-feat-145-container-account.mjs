@@ -37,6 +37,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { ownerKeyFor, removeOwnedContainer } from './lib/owned-docker.mjs';
 import { spawnSync } from 'node:child_process';
 
 /* ------------------------------------------------------------- harness */
@@ -67,6 +68,8 @@ process.env.CLAUDE_STATION_DATA = path.join(scratch, 'data');
 fs.mkdirSync(process.env.CLAUDE_STATION_DATA, { recursive: true });
 
 const cm = await import('../src/server/container-manager.ts');
+// ARCH-022: container operations run in a booted lifecycle authority (a real claim on this scratch data dir).
+await (await import('./lib/lifecycle-harness.mjs')).bootAuthority(path.resolve(import.meta.dirname, '..'));
 const accounts = await import('../src/server/claude-accounts.ts');
 const paths = await import('../src/lib/paths.ts');
 
@@ -325,7 +328,7 @@ try {
     const idOf = () => dk(['inspect', name, '--format', '{{.Id}}']).stdout.trim();
     const bindsOf = () => JSON.parse(dk(['inspect', name, '--format', '{{json .HostConfig.Binds}}']).stdout.trim() || 'null') ?? [];
     const credBindOf = () => bindsOf().find((b) => b.includes(CRED_IN_CONTAINER)) ?? '';
-    dk(['rm', '-f', name]); // a leftover from an aborted earlier run must not be inherited
+    removeOwnedContainer(name, await ownerKeyFor(process.env.CLAUDE_STATION_DATA)); // a leftover of this data dir only (FEAT-158)
 
     async function ensure(p) {
       let log = '';
@@ -445,14 +448,14 @@ try {
 } finally {
   /* ------------------------------------------------------------- cleanup */
   try {
-    if (dockerProject) spawnSync('docker', ['rm', '-f', cm.containerName(PROJECT_ID)], { encoding: 'utf8', timeout: 60_000 });
+    if (dockerProject) removeOwnedContainer(cm.containerName(PROJECT_ID), await ownerKeyFor(process.env.CLAUDE_STATION_DATA)); // FEAT-158: only this run's
   } catch { /* best effort */ }
   // Remove ONLY this run's own container session-history dir from the real
   // store, under a strict guard: it must be the path containerHistoryDir()
   // derives for THIS random test project id, and nothing else.
   try {
     const hist = cm.containerHistoryDir({ id: PROJECT_ID, settings: {} });
-    const expected = path.join(HOME, '.claude', 'projects', cm.encodeCwdForStore(cm.containerWorkdir(PROJECT_ID)));
+    const expected = path.join(HOME, '.claude', 'projects', cm.containerStoreDirName({ id: PROJECT_ID }));
     if (hist === expected && path.basename(hist).includes(PROJECT_ID) && PROJECT_ID.startsWith('feat145v-')) {
       fs.rmSync(hist, { recursive: true, force: true });
     }

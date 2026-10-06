@@ -44,7 +44,8 @@ import {
   type WorkState, type VerificationState, type LegacyTicketRecord,
 } from '../../scripts/lib/ticket-schema.mjs';
 import {
-  boardDir, ticketFile, composeAnswerEntry, ticketDecision, ticketAnswerState,
+  boardDir, ticketFile, ticketDecision, ticketAnswerState,
+  recordAnswer, StaleAnswerError, normalizeLineEndings,
   type ReplyKind, type TicketDecision, type TicketAnswerState,
 } from './board.ts';
 // FEAT-106 — the template fallback resolves THIS station's own board dir through
@@ -303,7 +304,7 @@ export function readTicket(hostPath: string, id: string): TicketDetail {
     markdown: text,
     relPath: path.relative(hostPath, file),
     decision: ticketDecision(text),
-    answer: ticketAnswerState(text),
+    answer: ticketAnswerState(text, file),
   };
 }
 
@@ -399,7 +400,7 @@ const DATE = () => new Date().toISOString().slice(0, 10);
 export const USER_SIGNATURE = 'user (via dashboard)';
 
 function entryBody(text: string, label = 'Note'): string {
-  const clean = String(text ?? '').replace(/\r\n/g, '\n').trimEnd();
+  const clean = normalizeLineEndings(text).trimEnd();
   const [first, ...rest] = clean.split('\n');
   return [`- **${label}:** ${first}`, ...rest.map((l) => (l.trim() ? `  ${l}` : ''))].join('\n');
 }
@@ -521,15 +522,25 @@ export function answerTicket(hostPath: string, id: string, input: AnswerInput, r
   if (!chose && !note) throw new TicketError('a reply needs a chosen option or some text', 400);
   const { dir, file } = resolveTicket(hostPath, id);
   assertFresh(file, rev);
-  const entry = composeAnswerEntry({
-    kind,
-    question: input.question ?? null,
-    chose,
-    note,
-    via: 'ticket view',
-    followup,
-  });
-  fs.appendFileSync(file, entry);
+  // FEAT-166 r3 — the ONE writer: a typed answer bound to the CURRENT decision
+  // (record `decision.answers[]`, or the board ledger), plus the display heading.
+  // `rev` above already rejects a submission made stale by a decision that changed
+  // after the user read it (decide bumps the file); recordAnswer re-checks the
+  // bytes it read immediately before writing.
+  let entry: string;
+  try {
+    ({ entry } = recordAnswer(file, {
+      kind,
+      question: input.question ?? null,
+      chose,
+      note,
+      via: 'ticket view',
+      followup,
+    }));
+  } catch (err) {
+    if (err instanceof StaleAnswerError) throw new TicketError(err.message, 409, currentRev(file));
+    throw err;
+  }
 
   // A decision leaves Owner 👤 (→ answered-awaiting is derived). A question or
   // counter-proposal hands ownership to the agent: flip the curated INDEX Owner
@@ -544,7 +555,7 @@ export function answerTicket(hostPath: string, id: string, input: AnswerInput, r
     board = recheck(dir, board);
   }
   const after = fs.readFileSync(file, 'utf8');
-  return { id, file, rev: currentRev(file), appended: entry, board, kind, owner, answer: ticketAnswerState(after) };
+  return { id, file, rev: currentRev(file), appended: entry, board, kind, owner, answer: ticketAnswerState(after, file) };
 }
 
 /**

@@ -67,7 +67,7 @@ export const GIT_READONLY = new Set([
   'help', 'version', 'check-ignore', 'check-attr', 'check-mailmap',
   'check-ref-format', 'verify-commit', 'verify-tag', 'verify-pack',
   'get-tar-commit-id', 'annotate', 'range-diff', 'show-branch', 'show-index',
-  'patch-id', 'interpret-trailers', 'stripspace', 'url-parse', 'fmt-merge-msg',
+  'patch-id', 'stripspace', 'url-parse', 'fmt-merge-msg',
   // `git archive` reads a tree and emits a tarball; it mutates no ref, object,
   // index, working tree, config or history in ANY form. It is a pure read and
   // was missing here (BUG-165), which deny-by-default then mis-classified as a
@@ -139,7 +139,30 @@ export const GIT_DUAL_READ = {
   notes: (a) => ['', 'list', 'show'].includes(firstPositional(a)),
   submodule: (a) => ['', 'status', 'summary'].includes(firstPositional(a)),
   bundle: (a) => ['verify', 'list-heads'].includes(firstPositional(a)),
+  // `git interpret-trailers` reads stdin → stdout (a pure read) UNLESS `--in-place`
+  // is given, which REWRITES the named file in the working tree (FEAT-108 round-4
+  // finding 3). The read form is allowed; `--in-place` (any write flag) denies.
+  'interpret-trailers': (a) => !has(a, ['--in-place']),
 };
+
+/* ── GATE_EXEMPT_WRITES: granted writes that need no leak gate (FEAT-108 round 4) ──
+ * The mandatory leak gate exists to stop repo CONTENT reaching git history or a
+ * remote. Most git writes cannot do that: they mutate the index, the working tree,
+ * local refs or config only. This is the CLOSED allowlist of those — the exact
+ * analogue of GIT_READONLY. The grant path (git-grant.mjs) runs the gate on any
+ * granted write whose subcommand is NOT here; so a publish (commit/push), an alias
+ * (`git -c alias.x=commit x` → unknown sub `x`), an unknown/future verb, or a
+ * publish CHAINED after one of these (`git add f && git commit`) all gate — closing
+ * round-4 finding 1 and the alias evasion with ONE rule, not an enumeration of
+ * publishers. Fail-closed: forgetting an entry only makes us stricter (over-gate),
+ * never opens a leak. `add` MUST stay here — a granted `git add` with a failing or
+ * absent gate is allowed by contract (verify-feat-108-git-grant, verify-bug-173).
+ */
+export const GATE_EXEMPT_WRITES = new Set([
+  'add', 'rm', 'mv', 'reset', 'restore', 'checkout', 'switch', 'stash', 'clean',
+  'branch', 'tag', 'config', 'remote', 'notes', 'symbolic-ref', 'submodule',
+  'worktree', 'update-index', 'update-ref', 'sparse-checkout', 'reflog',
+]);
 
 /* ── git's GLOBAL options, which sit BEFORE the subcommand ────────────────────
  * `git -C <path> commit` and `git --git-dir=… commit` are the named evasions
@@ -150,6 +173,51 @@ export const GIT_DUAL_READ = {
  */
 const GIT_GLOBAL_VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree',
   '--namespace', '--exec-path', '--config-env', '--super-prefix', '--attr-source']);
+
+/* ── Config-driven execution is a write on ANY head (FEAT-108 round 5, finding X) ─
+ * `git -c diff.external='git commit …' diff` runs an arbitrary command through a
+ * config option while the SUBCOMMAND (`diff`) reads as inert — so a read head
+ * smuggles a write past the read allowlist. `core.pager`, `core.sshCommand`,
+ * `sequence.editor`, `alias.*`, `*.textconv`, `filter.*`, `core.hooksPath`,
+ * `core.fsmonitor` are all command-executing. Rather than enumerate the dangerous
+ * keys (a losing game), a `-c`/`--config-env`/attached `-cKEY=` on ANY git head is
+ * a WRITE unless the key is on this TINY allowlist of inert display settings —
+ * fail-closed, so a config option nobody thought of denies. */
+const CONFIG_KEY_ALLOWED = (raw) => {
+  const s = String(raw ?? '');
+  const eq = s.indexOf('='); // git splits a `-c key=value` on the FIRST '='
+  const key = (eq >= 0 ? s.slice(0, eq) : s).trim().toLowerCase();
+  if (key === 'core.quotepath' || key.startsWith('color.') || key.startsWith('advice.')) return true;
+  // `diff.submodule` only selects HOW a submodule's changes are DISPLAYED (short |
+  // log | diff per git-config(1)); it executes nothing and writes nothing — same
+  // inert-display class as core.quotepath above, refused before only by omission
+  // (BUG-228). The clean-room verifier (scripts/independent-verify.mjs) forces
+  // `-c diff.submodule=short` so repo config can't inline a submodule's internal
+  // patch into the diff it shows the verifier (BUG-186); without this that whole
+  // path — ALL dispatch self-verification — is blocked. Restricted to its three
+  // documented values, so a value nobody thought of still denies (fail-closed).
+  if (key === 'diff.submodule') {
+    const val = (eq >= 0 ? s.slice(eq + 1) : '').trim().toLowerCase();
+    return val === 'short' || val === 'log' || val === 'diff';
+  }
+  return false;
+};
+
+/** The first non-allowlisted `-c`/`--config-env` config KEY on a git invocation, or null. */
+function offendingConfigKey(tokens) {
+  let i = 1;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (t === '--version' || t === '--help' || t === '-h') return null;
+    if (t === '-c' || t === '--config-env') { const v = tokens[i + 1]; if (!CONFIG_KEY_ALLOWED(v)) return String(v ?? '(missing)').split('=')[0]; i += 2; continue; }
+    if (t.startsWith('--config-env=')) { const v = t.slice(13); if (!CONFIG_KEY_ALLOWED(v)) return v.split('=')[0]; i++; continue; }
+    if (t.startsWith('-c') && t.length > 2) { const v = t.slice(2); if (!CONFIG_KEY_ALLOWED(v)) return v.split('=')[0]; i++; continue; }
+    if (GIT_GLOBAL_VALUE_OPTS.has(t)) { i += 2; continue; }
+    if (t.startsWith('-')) { i++; continue; }
+    return null; // reached the subcommand with no offending config
+  }
+  return null;
+}
 
 /**
  * From the tokens of a `git …` invocation (index 0 == 'git'), return the
@@ -176,6 +244,11 @@ function gitSubcommand(tokens) {
  * shared by the command-string hook and the PATH shim.
  */
 export function offenderForGit(tokens) {
+  // Config-driven execution (round-5 finding X): a `-c <key>` that runs a command
+  // makes even a read head a write. Checked BEFORE the subcommand classification so
+  // `git -c diff.external=… diff` cannot pass as the inert `diff` read.
+  const badKey = offendingConfigKey(tokens);
+  if (badKey != null) return `git -c ${badKey}`;
   const parsed = gitSubcommand(tokens);
   if (!parsed) return null; // bare git / --version / --help
   const { sub, args } = parsed;
@@ -213,6 +286,12 @@ function tokenizeSegments(str) {
     if (ch === '\n' || ch === ';') { pushSeg(); i++; continue; }
     if (ch === '&') { pushSeg(); i += str[i + 1] === '&' ? 2 : 1; continue; }
     if (ch === '|') { pushSeg(); i += str[i + 1] === '|' ? 2 : 1; continue; }
+    // Subshell / grouping parens are segment boundaries: `(git branch x)` must not
+    // fuse `(git` into one token that hides the head (FEAT-108 round-4 finding 2).
+    // `$( )` command substitutions are stripped BEFORE tokenizing, so any paren
+    // left here is a subshell/group or arithmetic — treating it as a break is safe
+    // (an arithmetic operand is never a command head).
+    if (ch === '(' || ch === ')') { pushSeg(); i++; continue; }
     if (ch === '#' && !hasTok) { const nl = str.indexOf('\n', i); if (nl < 0) break; i = nl; continue; }
     tok += ch; hasTok = true; i++;
   }
@@ -225,6 +304,35 @@ const NOOP_HEADS = new Set(['command', 'nohup', 'time', 'builtin', '!', '{', '}'
   'then', 'else', 'elif', 'do', 'done', 'fi', 'in', 'if', 'for', 'while', 'until', 'case', 'esac']);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const EXEC_C = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash']);
+
+/* ── FAIL-CLOSED head handling (FEAT-108 round 5) ─────────────────────────────
+ * Rounds 1-4 tried to ENUMERATE the shells/wrappers a git write can hide behind
+ * (sh -c, env, xargs, eval …) and SKIPPED every other head, so `exec git commit`,
+ * `nice git commit`, `sudo git push`, `timeout 10 git commit`,
+ * `find … -exec git commit`, `git${IFS}commit` and `env -S git commit` all sailed
+ * through — and a MISS here is FAIL-OPEN (a real, ungated commit runs). Round 5
+ * flips the default. A command is proven git-clean ONLY when its head is one that
+ * DOES NOT execute its arguments as a command (NON_RUNNER_HEADS — echo/printf/
+ * grep/…, pure data sinks). EVERY other non-git head is treated as a possible
+ * command RUNNER: if a bare `git` write is reachable in its tokens, or a nested
+ * shell it wraps, that write is refused. So a wrapper nobody enumerated fails
+ * CLOSED. See INVARIANT on classifyTokens.
+ */
+const NON_RUNNER_HEADS = new Set([
+  'echo', 'printf', 'print', 'cat', 'tac', 'less', 'more', 'head', 'tail',
+  'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack', 'man', 'which', 'type', 'whatis',
+  'apropos', 'wc', 'ls', 'stat', 'file', 'base64', 'md5sum', 'sha1sum',
+  'sha256sum', 'cksum', 'dirname', 'basename', 'realpath', 'readlink', 'true',
+  'false', 'test', 'printenv', 'pwd', 'hostname', 'date', 'seq', 'yes', 'tee',
+]);
+
+/* git subcommands that are NOT also ordinary system commands. Seeing one as a bare
+ * command HEAD means the real `git` head was expanded/aliased away
+ * (`$(which git) commit`) — refuse. `rm`/`mv`/`reset`/`config`/`branch`/`tag` are
+ * omitted on purpose: they ARE real commands, so a bare `rm` head is the system rm. */
+const GIT_ONLY_SUBCMDS = new Set(['commit', 'push', 'fetch', 'pull', 'merge',
+  'rebase', 'cherry-pick', 'revert', 'stash', 'checkout', 'switch', 'clone',
+  'am', 'format-patch', 'interpret-trailers']);
 
 /** Strip a `/usr/bin/git`-style path down to the basename so the head is `git`. */
 function basename(word) {
@@ -240,75 +348,288 @@ function headOf(tokens) {
   return { head: basename(rest[0]), args: rest.slice(1), all: [basename(rest[0]), ...rest.slice(1)] };
 }
 
-const MAX_DEPTH = 6;
+const MAX_DEPTH = 8;
+
+/* ── Strip quotes, keeping inner content as splittable text (round 5, finding P) ─
+ * `printf 'git commit' | sh` hides the write in printf's DATA, which `sh` then
+ * executes. To see it we drop the quote CHARACTERS but keep the content, so the
+ * data tokenizes into words a git-write scan can find. */
+function flattenQuotes(text) {
+  let out = ''; let sq = false, dq = false; let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (sq) { if (ch === "'") sq = false; else out += ch; i++; continue; }
+    if (dq) { if (ch === '"') dq = false; else if (ch === '\\') { out += (text[i + 1] ?? ''); i += 2; continue; } else out += ch; i++; continue; }
+    if (ch === "'") { sq = true; i++; continue; }
+    if (ch === '"') { dq = true; i++; continue; }
+    if (ch === '\\') { out += (text[i + 1] ?? ''); i += 2; continue; }
+    out += ch; i++;
+  }
+  return out;
+}
+
+/** Head (first real command word) of a raw text fragment, or '' — used to test a
+ * pipe/redirect consumer or a heredoc consumer without a full parse. */
+function textHead(fragment) {
+  const words = String(fragment).trim().split(/\s+/).filter(Boolean);
+  let i = 0;
+  while (i < words.length && (ASSIGNMENT.test(words[i]) || NOOP_HEADS.has(words[i]))) i++;
+  return words[i] ? basename(words[i]) : '';
+}
+
+/** True if `head` is NOT a proven data sink — i.e. it may execute what it is fed
+ * (a shell, xargs, an unknown command). The fail-closed side of the pipe/redirect
+ * rule: a consumer we cannot prove inert is treated as a runner. */
+const isRunnerConsumer = (head) => head !== '' && !NON_RUNNER_HEADS.has(head);
+
+/* ── Pipe / redirect INTO a runner (FEAT-108 round 5, finding P) ──────────────
+ * A `|` whose downstream head is not a data sink, or a `<`/`<<<` stdin redirect
+ * into a non-data-sink, makes the upstream/redirected DATA executable. Detected on
+ * the QUOTE-FLATTENED text (so an operator inside quotes is not mistaken for a real
+ * one — and conversely a git write inside quoted data becomes visible). */
+function feedsRunner(command) {
+  const flat = flattenQuotes(command);
+  // pipes: protect `||`, then split on single `|`; any stage after the first whose
+  // head is a runner is a runner edge.
+  const stages = flat.replace(/\|\|/g, '\u0001').split('|');
+  for (let s = 1; s < stages.length; s++) if (isRunnerConsumer(textHead(stages[s]))) return true;
+  // stdin redirects (`<`, `<<<`; heredoc `<<` bodies are handled separately): the
+  // consumer is the command that owns the redirect on its simple-command segment.
+  for (const seg of flat.split(/;|\n|&&|\u0001|&|\(|\)/)) {
+    if (/(^|\s)<(?!<)/.test(seg) || /<<</.test(seg)) { if (isRunnerConsumer(textHead(seg))) return true; }
+  }
+  return false;
+}
+
+/* ── Quote-aware heredoc parse (FEAT-108 rounds 4-5, findings B + H) ───────────
+ * Heredoc BODIES are DATA when the consumer is a data sink (`cat <<EOF …`), but
+ * when the consumer is a RUNNER the body IS that runner's script (`sh <<EOF
+ * git commit EOF` — round-5 finding H). So: parse quote-awarely; for each heredoc
+ * whose consumer head is a runner, RETURN its body to be scanned as command text;
+ * for the rest, drop the body. Either way the opener line and everything after the
+ * terminator survive in `stripped` (so a command AFTER the body is still scanned,
+ * round-4 finding). A `<<` inside quotes is not an opener (round-4 finding B).
+ */
+function parseHeredocs(command) {
+  if (!command.includes('<<')) return { stripped: command, runnerBodies: [] };
+  let out = '';
+  let sq = false, dq = false;
+  let lineText = ''; // current logical line up to the current point (for consumer head)
+  const pending = []; // { delim, dash, capture }
+  const runnerBodies = [];
+  let i = 0; const n = command.length;
+  while (i < n) {
+    const ch = command[i];
+    if (ch === '\n') {
+      out += ch; lineText = ''; i++;
+      while (pending.length) {
+        const d = pending.shift();
+        const body = [];
+        while (i < n) {
+          let j = command.indexOf('\n', i);
+          if (j < 0) j = n;
+          const line = command.slice(i, j);
+          const trimmed = d.dash ? line.replace(/^\t+/, '') : line;
+          i = j < n ? j + 1 : n;
+          if (trimmed === d.delim) break; // terminator consumed, not emitted
+          body.push(line);
+        }
+        if (d.capture) runnerBodies.push(body.join('\n'));
+      }
+      continue;
+    }
+    if (sq) { out += ch; lineText += ch; if (ch === "'") sq = false; i++; continue; }
+    if (dq) {
+      if (ch === '\\') { const s = ch + (command[i + 1] ?? ''); out += s; lineText += s; i += 2; continue; }
+      out += ch; lineText += ch; if (ch === '"') dq = false; i++; continue;
+    }
+    if (ch === '\\') { const s = ch + (command[i + 1] ?? ''); out += s; lineText += s; i += 2; continue; }
+    if (ch === "'") { sq = true; out += ch; lineText += ch; i++; continue; }
+    if (ch === '"') { dq = true; out += ch; lineText += ch; i++; continue; }
+    if (ch === '<' && command[i + 1] === '<') {
+      const m = /^<<(-?)\s*(["']?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(command.slice(i));
+      if (m) {
+        // Consumer = the last simple command on this line before the `<<`.
+        const lastCmd = flattenQuotes(lineText).split(/;|&&|\|\||\||&/).pop() ?? '';
+        pending.push({ delim: m[3], dash: m[1] === '-', capture: isRunnerConsumer(textHead(lastCmd)) });
+        out += m[0]; lineText += m[0]; i += m[0].length; continue;
+      }
+    }
+    out += ch; lineText += ch; i++;
+  }
+  return { stripped: out, runnerBodies };
+}
 
 /**
- * Scan a Bash command for any git WRITE reachable at this layer. Returns the
- * offender string (`git <sub>`) or null. Recurses into command substitutions and
- * the code strings of `sh -c` / `bash -c` / `eval`, and looks through `env` and
- * `xargs` — the evasions requirement 3 asks to catch. What it CANNOT see is
- * listed in the ticket: a wrapper script, a non-shell interpreter (`python -c`,
- * `node -e`) that shells out, and shell aliases/functions.
+ * Classify ONE simple command's tokens, calling `sink(offender)` for a git write
+ * (sink returns true to STOP). Returns true once sink stopped.
+ *
+ * INVARIANT (round 5): the tokens are proven git-clean ONLY when the head is `git`
+ * classifying as a read, a data sink (NON_RUNNER_HEADS), or a non-git command with
+ * no reachable git write. A non-git, non-data head is a possible RUNNER: a bare
+ * `git` write in its tokens, a shell it wraps, an expansion-obscured git head, or a
+ * git-only subcommand standing as the head (real head expanded away) are all
+ * refused. Anything git-writeish the parser cannot decide fails CLOSED.
  */
-export function scanForGitWrite(command, depth = 0) {
-  if (typeof command !== 'string' || depth > MAX_DEPTH) return null;
+function classifyTokens(tokens, depth, sink) {
+  if (depth > MAX_DEPTH) return sink('git (undecidable — depth)');
+  const h = headOf(tokens);
+  if (!h) return false;
+  const { head, args, all } = h;
 
-  // Heredoc bodies are DATA — decide the opening line, drop the body.
-  const heredoc = command.search(/<<-?\s*['"]?[A-Za-z_]/);
-  const src = heredoc >= 0 ? command.slice(0, heredoc) : command;
+  // A plain `git …` invocation — the ordinary path. A leading `GIT_CONFIG_PARAMETERS`
+  // / `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*` env assignment
+  // injects arbitrary config inline (the env twin of `-c` — round-5 finding X, rule c),
+  // so it is a WRITE on ANY git head, read or not. (`GIT_CONFIG_GLOBAL`/`_SYSTEM` point
+  // to config FILES and are left alone — the `=/dev/null` isolation idiom is common;
+  // a malicious file path is a documented residual.)
+  if (head === 'git') {
+    if (tokens.some((t) => ASSIGNMENT.test(t) && /^GIT_CONFIG_(PARAMETERS|COUNT|KEY_|VALUE_)/.test(t))) return sink('git (GIT_CONFIG env injection)');
+    const o = offenderForGit(all); return o ? sink(o) : false;
+  }
 
-  // Command substitutions are commands. Recurse into each body, then blank them
-  // so their contents are not re-read as arguments.
+  // A bare git-ONLY subcommand as the head ⇒ the real `git` was expanded/aliased away.
+  if (GIT_ONLY_SUBCMDS.has(head)) return sink(`git ${head}`);
+
+  // A head that CONTAINS `git`, is not literally git, and carries an expansion
+  // (`git${IFS}commit`, `${g}git push`) is an obfuscated git head — fail closed.
+  if (/git/.test(head) && /[$`{}]/.test(head)) return sink('git (obfuscated head)');
+
+  // `env …` — assignments + env's own options, then the command. `-S`/`--split-string`
+  // is transparent: its value + the rest form the command string env splits and runs
+  // (`env -S git commit` and `env -S "git commit"` alike — round-5 finding A).
+  if (head === 'env') {
+    let j = 0;
+    while (j < args.length) {
+      const a = args[j];
+      if (ASSIGNMENT.test(a)) { j++; continue; }
+      if (a === '-i' || a === '--ignore-environment' || a === '-') { j++; continue; }
+      if (a === '-u' || a === '-C') { j += 2; continue; }
+      if (a === '-S' || a === '--split-string') { j++; continue; }
+      if (a.startsWith('--split-string=')) { if (walkGitWrites(a.slice(15), depth + 1, sink)) return true; j++; continue; }
+      if (a.startsWith('-S')) { if (walkGitWrites(a.slice(2), depth + 1, sink)) return true; j++; continue; }
+      if (a.startsWith('-')) { j++; continue; }
+      break;
+    }
+    // Re-tokenize the remainder as ONE string: env's `-S` splits its value on
+    // whitespace, so a QUOTED `-S "git push"` (one token) must be re-split, and a
+    // spaced `-S git push` (already two tokens) joins back to the same command.
+    return walkGitWrites(args.slice(j).join(' '), depth + 1, sink);
+  }
+
+  // `sh -c '…'` / `bash -lc '…'` / `bash -cl '…'` — the command is a code STRING.
+  // The shell's `-c` takes the next word as that string regardless of flag-cluster
+  // order (`-lc`/`-cl`) or attached form (`-cCMD`), plus positional args ($0,$1…).
+  // Recurse into EVERY non-flag argument (and any attached `-cCMD`) so no ordering
+  // or extra positional can hide the write (round-5 finding A — `bash -cl`).
+  if (EXEC_C.has(head)) {
+    for (const a of args) {
+      if (a.startsWith('-')) {
+        const mm = /^-[a-z]*c([^-].*)$/.exec(a);
+        if (mm && walkGitWrites(mm[1], depth + 1, sink)) return true;
+        continue;
+      }
+      if (walkGitWrites(a, depth + 1, sink)) return true;
+    }
+    return false;
+  }
+
+  // `eval "git commit"` / `eval git commit` — the arguments ARE the command.
+  if (head === 'eval') return walkGitWrites(args.join(' '), depth + 1, sink);
+
+  // `xargs [flags] git commit` (or `xargs sh -c '…'`).
+  if (head === 'xargs') {
+    const gi = args.findIndex((a) => basename(a) === 'git');
+    if (gi >= 0) { const o = offenderForGit(['git', ...args.slice(gi + 1)]); if (o && sink(o)) return true; }
+    const si = args.findIndex((a) => EXEC_C.has(basename(a)) || basename(a) === 'env');
+    if (si >= 0 && classifyTokens(args.slice(si), depth + 1, sink)) return true;
+    return false;
+  }
+
+  // A DATA SINK — does not execute its args, so a `git` among them is data. Clean.
+  if (NON_RUNNER_HEADS.has(head)) return false;
+
+  // GENERIC RUNNER (fail-closed): any other head may exec a git write in its args.
+  // (1) a nested shell / env / eval / xargs it wraps (`exec sh -c '…'`, `sudo env …`).
+  for (let k = 0; k < all.length; k++) {
+    const b = basename(all[k]);
+    if (EXEC_C.has(b) || b === 'env' || b === 'eval' || b === 'xargs') {
+      if (classifyTokens(all.slice(k), depth + 1, sink)) return true;
+      break;
+    }
+  }
+  // (2) a bare `git` write token anywhere in its arguments
+  //     (`exec`/`nice`/`sudo`/`timeout`/`find … -exec … git commit`).
+  for (let k = 1; k < all.length; k++) {
+    if (basename(all[k]) === 'git') { const o = offenderForGit(all.slice(k)); if (o && sink(o)) return true; }
+  }
+  return false;
+}
+
+/**
+ * ONE shared walker (ARCH-010): call `sink(offender)` for every git WRITE reachable
+ * at this layer, in source order. `sink` returns true to STOP (scanForGitWrite wants
+ * only the first). Fail-closed per-command head handling lives in classifyTokens.
+ * Recurses into command substitutions; heredoc bodies are stripped quote-awarely.
+ * What it still CANNOT see (documented gaps; the FEAT-135 PATH shim is the backstop):
+ * a non-shell interpreter that shells out (`python -c`, `node -e`), a wrapper SCRIPT,
+ * and a shell alias/function not named `git`.
+ */
+function walkGitWrites(command, depth, sink) {
+  if (typeof command !== 'string' || depth > MAX_DEPTH) return false;
+
+  // Heredocs (round-5 finding H): a body consumed by a RUNNER is that runner's
+  // script — scan it as command text; a body consumed by a data sink is dropped.
+  // Either way the opener line + post-terminator commands survive in `src`.
+  const { stripped: src, runnerBodies } = parseHeredocs(command);
+  for (const body of runnerBodies) if (walkGitWrites(body, depth + 1, sink)) return true;
+
+  // Data flow into a runner (round-5 finding P): a pipe/redirect whose consumer is
+  // not a data sink executes the DATA fed to it, so quoted/redirected data counts as
+  // command text. Emit EVERY git write visible in the flattened line (not just the
+  // first) so collectGitWrites sees a publish hidden in the piped data and still
+  // gates it — rule (a), fail-closed.
+  if (feedsRunner(src)) {
+    const words = flattenQuotes(src).split(/[\s;&|()<>]+/).filter(Boolean);
+    for (let k = 0; k < words.length; k++) {
+      if (basename(words[k]) === 'git') { const o = offenderForGit(words.slice(k)); if (o && sink(o)) return true; }
+    }
+  }
+
+  // Command substitutions are commands. Recurse into each body, then blank them so
+  // their contents are not re-read as arguments.
   const subs = [];
   const flattened = src
     .replace(/\$\(([^()]*)\)/g, (_m, b) => { subs.push(b); return ' '; })
     .replace(/`([^`]*)`/g, (_m, b) => { subs.push(b); return ' '; });
-  for (const body of subs) {
-    const o = scanForGitWrite(body, depth + 1);
-    if (o) return o;
-  }
+  for (const body of subs) if (walkGitWrites(body, depth + 1, sink)) return true;
 
   for (const tokens of tokenizeSegments(flattened)) {
-    const h = headOf(tokens);
-    if (!h) continue;
-    const { head, args, all } = h;
-
-    if (head === 'git') { const o = offenderForGit(all); if (o) return o; continue; }
-
-    // `env GIT_DIR=… git commit` / `env -i git push` — strip env's preamble and re-decide.
-    if (head === 'env') {
-      let j = 0;
-      while (j < args.length) {
-        const a = args[j];
-        if (ASSIGNMENT.test(a)) { j++; continue; }
-        if (a === '-i' || a === '--ignore-environment' || a === '-') { j++; continue; }
-        if (a === '-u' || a === '-C' || a === '-S') { j += 2; continue; }
-        if (a.startsWith('-')) { j++; continue; }
-        break;
-      }
-      const o = scanForGitWrite(args.slice(j).join(' '), depth + 1);
-      if (o) return o;
-      continue;
-    }
-
-    // `sh -c '…git commit…'` — the write is the code string. Recurse into it.
-    if (EXEC_C.has(head)) {
-      const ci = args.indexOf('-c');
-      if (ci >= 0 && args[ci + 1] != null) { const o = scanForGitWrite(args[ci + 1], depth + 1); if (o) return o; }
-      continue;
-    }
-
-    // `eval "git commit"` / `eval git commit` — the arguments ARE the command.
-    if (head === 'eval') { const o = scanForGitWrite(args.join(' '), depth + 1); if (o) return o; continue; }
-
-    // `git … | xargs git commit` — git sits after xargs' own flags.
-    if (head === 'xargs') {
-      const gi = args.findIndex((a) => basename(a) === 'git');
-      if (gi >= 0) { const o = offenderForGit(['git', ...args.slice(gi + 1)]); if (o) return o; }
-      continue;
-    }
+    if (classifyTokens(tokens, depth, sink)) return true;
   }
-  return null;
+  return false;
+}
+
+/**
+ * The FIRST git WRITE reachable in a Bash command (`git <sub>`) or null. Thin
+ * wrapper over the shared walker — the enforcing hook's allow/deny answer.
+ */
+export function scanForGitWrite(command, depth = 0) {
+  let found = null;
+  walkGitWrites(command, depth, (o) => { found = o; return true; });
+  return found;
+}
+
+/**
+ * ALL git-write offenders in a command, in source order (FEAT-108 round 4). The
+ * grant-time leak-gate decision needs EVERY write, not just the first: a publish
+ * chained after a non-publish write (`git add f && git commit`) must not skip the
+ * mandatory gate. Same walker, so the hook's classification and this can't diverge.
+ */
+export function collectGitWrites(command, depth = 0) {
+  const out = [];
+  walkGitWrites(command, depth, (o) => { out.push(o); return false; });
+  return out;
 }
 
 /**
@@ -319,6 +640,71 @@ export function decideGitWrite(command, env = process.env) {
   if (!gitWriteBlockEnabled(env)) return { allow: true, offender: null };
   const offender = scanForGitWrite(typeof command === 'string' ? command : '');
   return offender ? { allow: false, offender } : { allow: true, offender: null };
+}
+
+/* ── BUG-231 — can every git write in this command be PROVEN to reach the shim? ──
+ * The FEAT-135 shim sees a git invocation only when `git` is resolved through the
+ * session's PATH. When the PreToolUse hook can prove that for EVERY write in a Bash
+ * command, it may leave the leak gate to the shim, which runs it at the moment of
+ * the write (and so also catches a leak the command itself creates before it
+ * commits). When it cannot, the hook keeps its pre-exec gate exactly as before.
+ *
+ * Deliberately CONSERVATIVE, and only ever used to choose WHERE the gate runs,
+ * never WHETHER: a false "no" costs one extra gate run; a false "yes" would let a
+ * bypassing write skip the gate. So anything that could change how `git` resolves —
+ * any mention of PATH, a path-qualified head, a wrapper/runner head, a function or
+ * alias definition, sourcing, command substitution, heredocs, process substitution,
+ * piping into a runner — answers false. A user-defined shell function routing a verb
+ * to an absolute git is caught separately by the per-verb reach proof in
+ * git-grant.mjs (a verb defers only after the shim has observed that verb).
+ */
+const SHIM_UNSURE_HEADS = new Set(['env', 'command', 'builtin', 'exec', 'eval', 'source', '.', 'hash',
+  'alias', 'unalias', 'unset', 'enable', 'function', 'sudo', 'doas', 'su', 'xargs', 'export', 'declare',
+  'typeset', 'local', 'readonly', 'set', 'shopt', 'trap', 'nohup', 'time', 'nice', 'timeout', 'find',
+  'stdbuf', 'chroot', 'setsid', 'unshare', 'nsenter', 'flock', 'watch', 'parallel']);
+const SHELL_KEYWORDS = new Set(['!', '{', '}', 'then', 'else', 'elif', 'do', 'done', 'fi', 'in', 'if',
+  'for', 'while', 'until', 'case', 'esac']);
+
+/** BUG-231 — the git writes in a command whose head is a literal bare `git` (after
+ * leading assignments / shell keywords): the invocations that CAN reach the shim, so
+ * the only ones a hook decision opens a redeemable slot for. Source order. */
+export function bareGitWrites(command) {
+  if (typeof command !== 'string' || !command.trim()) return [];
+  const out = [];
+  for (const tokens of tokenizeSegments(command)) {
+    let i = 0;
+    while (i < tokens.length && (ASSIGNMENT.test(tokens[i]) || SHELL_KEYWORDS.has(tokens[i]))) i++;
+    if (tokens[i] !== 'git') continue;
+    const o = offenderForGit(tokens.slice(i));
+    if (o) out.push(o);
+  }
+  return out;
+}
+
+export function gitWritesReachShim(command) {
+  if (typeof command !== 'string' || !command.trim()) return false;
+  if (/PATH/.test(command)) return false;                       // any PATH mention, anywhere
+  if (/\$\(|`|<<|<\(|>\(|\(\s*\)/.test(command)) return false;  // substitutions, heredocs, function defs
+  if (feedsRunner(command)) return false;                      // data piped/redirected into a runner
+  const all = collectGitWrites(command);
+  if (!all.length) return false;
+  let seen = 0;
+  for (const tokens of tokenizeSegments(command)) {
+    let i = 0;
+    while (i < tokens.length && (ASSIGNMENT.test(tokens[i]) || SHELL_KEYWORDS.has(tokens[i]))) i++;
+    const rest = tokens.slice(i);
+    if (!rest.length) continue;
+    const head = rest[0];
+    if (SHIM_UNSURE_HEADS.has(head) || EXEC_C.has(basename(head))) return false;
+    if (head !== 'git' && basename(head) === 'git') return false; // a path-qualified git never meets the shim
+    let found = 0;
+    walkGitWrites(rest.join(' '), 0, () => { found++; return false; });
+    if (!found) continue;
+    if (head !== 'git') return false;                           // a write reached through some other head
+    if (tokens.slice(0, i).some((t) => /^GIT_CONFIG_/.test(t))) return false;
+    seen += found;
+  }
+  return seen === all.length;
 }
 
 /**

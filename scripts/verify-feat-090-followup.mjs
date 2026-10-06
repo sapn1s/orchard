@@ -23,6 +23,7 @@
  *         behind a closed sheet), and the UNANSWERED narrow sheet still lets a user
  *         read the options and record an answer end-to-end.
  */
+import { extractTicketBlock } from './lib/ticket-schema.mjs';
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -71,8 +72,13 @@ const REAL_ARCH = REAL.id;        // a real decision ticket, seeded into answere
 const REAL_FILE = REAL.name;
 // The free-text answer this test owns (no chosen option → chose null, note present).
 const SEEDED_ANSWER = 'seeded free-text answer (owned by this test): on this linux host we CAN track parentage — reconsider detectability before deciding';
-const REAL_ANSWERED_BODY = unanswered(REAL.body)
-  + composeAnswerEntry({ kind: 'decision', note: SEEDED_ANSWER, via: 'ticket view' });
+// FEAT-166 r3 — an answer is a TYPED entry now, so the free-text answer is seeded
+// through the ONE writer (answerTicket, see seedAnswered) onto the unanswered real
+// prose, never by appending a composed heading (which counts for nothing).
+const REAL_ANSWERED_BODY = unanswered(REAL.body);
+function seedAnswered(host) {
+  answerTicket(host, REAL_ARCH, { kind: 'decision', note: SEEDED_ANSWER }, readTicket(host, REAL_ARCH).rev);
+}
 
 function seedBoard(bugs) {
   fs.mkdirSync(bugs, { recursive: true });
@@ -147,6 +153,7 @@ function partA() {
   const bugs = path.join(TMP, 'docs', 'bugs');
   seedBoard(bugs);
   const host = TMP;
+  seedAnswered(host);
 
   // Answer the decision (B + note), then FOLLOW UP on it.
   const rev0 = readTicket(host, DEC_ID).rev;
@@ -169,7 +176,7 @@ function partA() {
       && !bAfter.doneToday.some((x) => x.id === DEC_ID),
     { owner: rFu.owner, awaiting: bAfter.answeredAwaiting.map((x) => x.id) });
 
-  const st = ticketAnswerState(afterFu);
+  const st = ticketAnswerState(afterFu, ticketPath(bugs, DEC_ID));
   check('ticketAnswerState(after follow-up): anchor answer is PRESERVED (chose B, original note), awaiting=true',
     st?.chose?.key === 'B' && st?.note === 'but ship D first' && st?.awaiting === true, st);
   check('ticketAnswerState(after follow-up): the follow-up is listed as its own dated note (original not overwritten)',
@@ -181,13 +188,13 @@ function partA() {
   fs.appendFileSync(ticketPath(bugs, DEC_ID), `\n### ${TODAY} — agent\n- picked it up, starting the shield.\n`);
   const afterAgent = readBoard(host);
   check('after an AGENT dated entry: the ticket LEAVES answered-awaiting (an agent has since acted)',
-    !afterAgent.answeredAwaiting.some((x) => x.id === DEC_ID) && ticketAnswerState(fs.readFileSync(ticketPath(bugs, DEC_ID), 'utf8'))?.awaiting === false,
+    !afterAgent.answeredAwaiting.some((x) => x.id === DEC_ID) && ticketAnswerState(fs.readFileSync(ticketPath(bugs, DEC_ID), 'utf8'), ticketPath(bugs, DEC_ID))?.awaiting === false,
     { awaiting: afterAgent.answeredAwaiting.map((x) => x.id) });
   const rev2 = readTicket(host, DEC_ID).rev;
   answerTicket(host, DEC_ID, { kind: 'decision', followup: true, note: 'wait — hold off, I changed my mind on the timing' }, rev2);
   const afterReFu = readBoard(host);
   check('a follow-up AFTER the agent acted RE-flags awaiting and returns the ticket to answered-awaiting',
-    afterReFu.answeredAwaiting.some((x) => x.id === DEC_ID) && ticketAnswerState(fs.readFileSync(ticketPath(bugs, DEC_ID), 'utf8'))?.awaiting === true,
+    afterReFu.answeredAwaiting.some((x) => x.id === DEC_ID) && ticketAnswerState(fs.readFileSync(ticketPath(bugs, DEC_ID), 'utf8'), ticketPath(bugs, DEC_ID))?.awaiting === true,
     { awaiting: afterReFu.answeredAwaiting.map((x) => x.id) });
 
   // An empty follow-up is refused (the button is disabled client-side; the server
@@ -202,7 +209,7 @@ function partA() {
   // this test owns (chose null, our free-text note, awaiting). Its answered state
   // must parse, and a follow-up must append cleanly to the real file — the exact
   // state the user is in after replying free-text on a real decision.
-  const realState = ticketAnswerState(fs.readFileSync(ticketPath(bugs, REAL_ARCH), 'utf8'));
+  const realState = ticketAnswerState(fs.readFileSync(ticketPath(bugs, REAL_ARCH), 'utf8'), ticketPath(bugs, REAL_ARCH));
   check(`REAL ${REAL_ARCH} parses as an answered free-text decision (chose null, our note present, awaiting) — the state the user was in`,
     realState?.kind === 'decision' && realState?.chose === null && realState?.note === SEEDED_ANSWER && realState?.awaiting === true,
     { note: realState?.note?.slice(0, 40), awaiting: realState?.awaiting });
@@ -210,7 +217,10 @@ function partA() {
   answerTicket(host, REAL_ARCH, { kind: 'decision', followup: true, note: 'follow-up: new evidence in — reconsider detectability on this host' }, readTicket(host, REAL_ARCH).rev);
   const realAfter = fs.readFileSync(ticketPath(bugs, REAL_ARCH), 'utf8');
   check(`a follow-up on the REAL ${REAL_ARCH} is append-only and keeps the original free-text answer`,
-    realAfter.startsWith(realBefore) && ticketAnswerState(realAfter)?.followups.length === 1 && ticketAnswerState(realAfter)?.note === realState.note,
+    // FEAT-166 r3: on a RECORD ticket the typed answer lives in the record block
+    // (rewritten, like every record write); the BODY — the Activity log — stays
+    // strictly append-only, which is the property this leg guards.
+    extractTicketBlock(realAfter).body.startsWith(extractTicketBlock(realBefore).body) && ticketAnswerState(realAfter, ticketPath(bugs, REAL_ARCH))?.followups.length === 1 && ticketAnswerState(realAfter, ticketPath(bugs, REAL_ARCH))?.note === realState.note,
     { grew: realAfter.length - realBefore.length });
 
   fs.rmSync(TMP, { recursive: true, force: true });
@@ -254,6 +264,7 @@ async function partC() {
   const PROFILE = fs.mkdtempSync(path.join(os.tmpdir(), 'f90fu-prof-'));
   const WORK = fs.mkdtempSync(path.join(os.tmpdir(), 'f90fu-proj-'));
   seedBoard(path.join(WORK, 'docs', 'bugs'));
+  seedAnswered(WORK);
 
   const srv = spawn(process.execPath, [ENTRY], {
     cwd: ROOT, env: { ...process.env, PORT: String(PORT), CLAUDE_STATION_DATA: DATA, CLAUDE_PROJECTS_DIR: STORE }, stdio: ['ignore', 'ignore', 'pipe'],

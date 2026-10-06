@@ -1,0 +1,26 @@
+{
+  "_readme": [
+    "FEAT-157 — Orchard's numbered base releases. APPEND-ONLY: never edit or remove an entry.",
+    "Each entry freezes a base recipe: its snapshot is releases/v{version}/{Dockerfile,provision.json},",
+    "and 'hash' is recipeHash() of that snapshot (src/server/provisioning.ts). A project pins a version",
+    "(settings.container.base.pinned) and is told about newer ones on its Needs-You rail; nothing moves",
+    "it silently except a 'security' release, which is applied at the next launch with no live session.",
+    "",
+    "Cut a release with: npm run base:release -- --class=feature|fix|security --summary='…' --adjust='…'",
+    "A security release must also name at least one --verify=<package>:<min-version> (checked with",
+    "dpkg --compare-versions inside the built image), and is built with --no-cache --pull.",
+    "The working-tree definition (src/server/container/{Dockerfile,provision.json}) reaches only",
+    "projects pinned to 'dev' until it is cut as a release."
+  ],
+  "schema": 1,
+  "releases": [
+    {
+      "version": 1,
+      "date": "2026-09-30",
+      "class": "feature",
+      "summary": "First numbered base (Ubuntu 24.04, Node 20, Python 3, uv, Serena 1.7.0, Playwright MCP 0.0.79 + Chromium, docker CLI). The Claude CLI is no longer baked into the base: Orchard adds the host's CLI as a thin layer on top, so a pinned base never freezes an old CLI.",
+      "adjust": "Nothing to change in a project Dockerfile that builds FROM ${ORCHARD_BASE_IMAGE}. Do not install or pin the Claude CLI yourself; Orchard layers the version this host needs on top of your image. Moving from a legacy base to v1 recreates the container once, at the next launch with no live session.",
+      "hash": "7fa41e28f5c6"
+    }
+  ]
+}

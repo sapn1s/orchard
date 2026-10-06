@@ -190,8 +190,8 @@ async function main() {
     Array.isArray(optVals) && optVals.includes('opus[1m]') && optVals.includes('claude-fable-5[1m]'), optVals);
   check('picker offers an explicit "no global default" row',
     Array.isArray(opts) && opts.some((t) => /no global default/i.test(t)), opts);
-  check('picker offers a free-text "Other model id" escape hatch',
-    Array.isArray(opts) && opts.some((t) => /Other model id/i.test(t)), opts);
+  check('picker offers a free-text "Custom model id" escape hatch (FEAT-159 wording)',
+    Array.isArray(opts) && opts.some((t) => /Custom model id/i.test(t)), opts);
 
   console.log('\n=== a BRACKETED catalog value persists (the old MODEL_RE 400 is gone) ===');
   const bracketRes = await fetch(`${BASE}/api/settings`, {
@@ -266,9 +266,11 @@ async function main() {
   await cdp.eval(`window.__station.drawer.open('settings')`);
   await cdp.waitFor('settings model row', `!!document.querySelector('#vSettings .set')`);
   await sleep(300);
-  const modelRow = await cdp.eval(`[...document.querySelectorAll('#vSettings .set')].map(r => r.textContent).find(t => /^Model/.test(t)) ?? ''`);
+  // FEAT-159: the row's value is a dropdown; what it SHOWS is its selected option.
+  const modelRow = await cdp.eval(`(() => { const r = document.querySelector('#vSettings .set[data-field="model"]');
+    return r ? (r.querySelector('.prov')?.dataset.level ?? '') + ' | ' + (r.querySelector('select')?.selectedOptions[0]?.textContent ?? '') : ''; })()`);
   check('alpha Model row shows it inherits the global default (claude-opus-4-8)',
-    /global default/i.test(modelRow) && /claude-opus-4-8/.test(modelRow), modelRow);
+    /^machine \| Use machine default \(claude-opus-4-8\)$/.test(modelRow), modelRow);
   const link = await cdp.eval(`[...document.querySelectorAll('#vSettings .addrow')].map(b => b.textContent).find(t => /machine-wide/i.test(t)) ?? ''`);
   check('settings view links to the machine-wide default (reflecting the current value)',
     /claude-opus-4-8/.test(link), link);

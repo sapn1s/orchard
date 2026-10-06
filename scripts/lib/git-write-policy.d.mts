@@ -11,6 +11,12 @@
 export declare const GIT_READONLY: Set<string>;
 export declare const GIT_DUAL_READ: Record<string, (args: string[]) => boolean>;
 
+/** Granted writes that need no leak gate: provably-non-publishing local ops (round 4). */
+export declare const GATE_EXEMPT_WRITES: Set<string>;
+
+/** EVERY `git <sub>` write reachable in a Bash command, in source order (round 4). */
+export declare function collectGitWrites(command: string, depth?: number): string[];
+
 /** Block ON by default; open the hatch with ORCHARD_ALLOW_GIT_WRITE=1/true/yes/on. */
 export declare function gitWriteBlockEnabled(env?: Record<string, string | undefined>): boolean;
 
@@ -28,3 +34,12 @@ export declare function gitWriteRefusal(offender: string): string;
 
 /** FEAT-108 round 2 — refusal when a GRANTED commit/push fails the mandatory leak gate. */
 export declare function gitWriteGateFailedRefusal(offender: string, gateDetail?: string): string;
+
+/**
+ * BUG-231 — true only when EVERY git write in the command provably resolves `git`
+ * through PATH (so the session's shim sees each invocation). Conservative: any
+ * doubt answers false, which keeps the hook's pre-exec leak gate.
+ */
+export declare function gitWritesReachShim(command: string): boolean;
+/** BUG-231 — writes with a literal bare `git` head (the ones a hook window opens slots for). */
+export declare function bareGitWrites(command: string): string[];

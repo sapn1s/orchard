@@ -31,7 +31,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { readBoard, ticketDecision, boardSummary, boardStateSection } from '../src/server/board.ts';
+import { readBoard, ticketDecision, boardSummary, boardStateSection, appendAnswer, decisionKey } from '../src/server/board.ts';
 import { discoverRealDecisions, setRecommendation, NON_OPTION_KEY } from './lib/real-decisions.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
@@ -53,11 +53,26 @@ function mkProject(name, indexRows, files) {
   fs.writeFileSync(path.join(bugs, 'INDEX.md'),
     `# Board\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     indexRows.map((r) => `| ${r} |`).join('\n') + '\n');
-  for (const [fname, body] of Object.entries(files)) fs.writeFileSync(path.join(bugs, fname), body);
+  // FEAT-166 r3 — a user answer is a TYPED entry written by the ONE writer, never a
+  // prose heading. So an `ans(...)` in a fixture is a marker: the text before it is
+  // written, the answer is recorded through the real rail writer (appendAnswer,
+  // bound to the decision on screen), then the rest is appended. Answers therefore
+  // carry TODAY's date, not the fixture's.
+  for (const [fname, body] of Object.entries(files)) {
+    const file = path.join(bugs, fname);
+    const parts = body.split(/\n<<ANSWER:([\s\S]*?)>>\n/);
+    fs.writeFileSync(file, parts[0]);
+    for (let i = 1; i < parts.length; i += 2) {
+      const id = fname.match(/^[A-Z]+-\d+/)[0];
+      appendAnswer(proj, id, parts[i], decisionKey(fs.readFileSync(file, 'utf8')));
+      fs.appendFileSync(file, parts[i + 1] ?? '');
+    }
+  }
   return proj;
 }
-const ans = (date, body) => `\n### ${date} — you (via Needs-You rail)\n- **Answer:** ${body}\n`;
-const ansNew = (date, body) => `\n### ${date} — you (answered from ticket)\n- **Answer:** ${body}\n`;
+const TODAY = new Date().toISOString().slice(0, 10);
+const ans = (_date, body) => `\n<<ANSWER:${body}>>\n`;
+const ansNew = (_date, body) => `\n<<ANSWER:${body}>>\n`;
 const note = (date, who, body) => `\n### ${date} — ${who}\n- ${body}\n`;
 
 const T = {
@@ -120,7 +135,7 @@ console.log('\n=== STEP 2 — derived answered-awaiting state ===');
     { inflight: b.inflight.map((x) => x.id), awaiting: awaitingIds });
   check('the answered item carries its chosen answer + date (for the snapshot)',
     b.answeredAwaiting.find((x) => x.id === 'BUG-501')?.answer === 'go with five' &&
-      b.answeredAwaiting.find((x) => x.id === 'BUG-501')?.answeredOn === '2026-08-18',
+      b.answeredAwaiting.find((x) => x.id === 'BUG-501')?.answeredOn === TODAY,
     b.answeredAwaiting.map((x) => ({ id: x.id, answer: x.answer, on: x.answeredOn })));
 
   const sum = boardSummary(b);
@@ -226,7 +241,7 @@ console.log('\n=== STEP 3 — launch snapshot: placement + survives truncation =
   check('snapshot states the decided-but-not-dispatched instruction',
     /DECIDED but NOT dispatched/.test(full) && /ask before you begin/.test(full), 'instruction present');
   check('snapshot lists an answered ticket with its chosen answer + date',
-    full.includes('BUG-600') && /chose: chose option B/.test(full) && full.includes('answered 2026-08-18'),
+    full.includes('BUG-600') && /chose: chose option B/.test(full) && full.includes(`answered ${TODAY}`),
     full.slice(idxAnswered, idxAnswered + 160));
 
   // Deliberately OVERFULL: tiny maxChars that would slice the tail hard. The

@@ -31,6 +31,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { appendAnswer, decisionKey } from '../src/server/board.ts';
 
 async function freePort() {
   const net = await import('node:net');
@@ -216,8 +217,13 @@ async function main() {
   console.log('\n=== rail-refresh: resolve one card OUT OF BAND (not via its Respond button) ===');
   // Simulate a chat ack / orchestrator resolution: append the rail's own answer
   // mark directly to the ticket file on disk. The card's button is never touched.
-  fs.appendFileSync(path.join(bugsDir, `${ID_RESOLVED_OOB}-t.md`),
-    `\n### 2026-08-04 — you (via Needs-You rail)\n- **Answer:** resolved in chat, out of band\n`);
+  // FEAT-166 r3: a user answer is a TYPED entry with ONE writer, so "out of band"
+  // means the server's answer writer called directly (not via the card), bound to
+  // the decision on disk — a prose heading appended to the file counts for nothing.
+  {
+    const f = path.join(bugsDir, `${ID_RESOLVED_OOB}-t.md`);
+    appendAnswer(PROJ, ID_RESOLVED_OOB, 'resolved in chat, out of band', decisionKey(fs.readFileSync(f, 'utf8')));
+  }
 
   console.log('\n=== rail-refresh: add a NEW 👤 item OUT OF BAND (orchestrator-style INDEX edit) ===');
   writeTicket(ID_ADDED_OOB, 'a brand new decision the orchestrator just raised');

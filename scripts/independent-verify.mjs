@@ -39,7 +39,8 @@
  * Usage:
  *   node scripts/independent-verify.mjs --requirement @docs/req.txt \
  *     [--repo <dir>] [--range <A..B|rev> | --working-tree] [--run "<command>"]... \
- *     [--test-file <path>]... [--author-provider anthropic|openai] \
+ *     [--test-file <path>]... [--allow-input <repo-rel-path>]... \
+ *     [--author-provider anthropic|openai] \
  *     [--provider anthropic|openai] [--model <m>] [--timeout-min <n>]
  *     [--keep-cleanroom] [--print-prompt] [--verdict-out <file>]
  *   node scripts/independent-verify.mjs --check-only <verdict-file>
@@ -84,7 +85,8 @@ const IS_ENTRY = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLT
 
 const USAGE = `usage: node scripts/independent-verify.mjs --requirement <text|@file>
          [--repo <dir>] [--range <A..B|rev> | --working-tree] [--run "<command>"]...
-         [--test-file <path>]... [--author-provider anthropic|openai]
+         [--test-file <path>]... [--allow-input <repo-rel-path>]...
+         [--author-provider anthropic|openai]
          [--provider anthropic|openai] [--model <m>] [--timeout-min <n>]
          [--max-diff-bytes <n>] [--keep-cleanroom] [--print-prompt]
          [--verdict-out <file>]
@@ -130,6 +132,7 @@ const opts = {
   verdictOut: null,
   checkOnly: null,
   manifest: null,
+  allowInputs: [],
 };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -143,6 +146,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--requirement') opts.requirement = take();
   else if (a === '--run') opts.runs.push(take());
   else if (a === '--test-file') opts.testFiles.push(take());
+  else if (a === '--allow-input') opts.allowInputs.push(take());
   else if (a === '--author-provider') opts.authorProvider = take();
   else if (a === '--provider') opts.provider = take();
   else if (a === '--model') opts.model = take();
@@ -223,15 +227,275 @@ function gitOk(repo, ...args) {
 /* ------------------------------------------------------------- clean room */
 
 /**
- * Ambient-instruction surface that agent CLIs auto-discover, plus this
- * project's own methodology/board. Removed from the clean room so the verifier
- * cannot inherit our framing even by reading the tree it is testing.
+ * THE CONTAMINATION SURFACE — inverted from a deny-list to an ALLOW-list
+ * (BUG-120, ARCH-010). It has two parts, each owned in ONE place, and the SAME
+ * set drives both the room strip AND the diff the verifier is handed (BUG-186):
+ *
+ *   1. AMBIENT_FILE_NAMES / AMBIENT_DIR_NAMES — the files/dirs agent CLIs
+ *      auto-discover on entry (CLAUDE.md, AGENTS.md, .claude, …). This is a
+ *      property of the CLIs, not of any project, so it lives here and applies to
+ *      EVERY repo this script verifies, including a foreign one with no
+ *      declaration of its own.
+ *   2. The project's PROSE ROOTS — methodology, board, architecture notes,
+ *      conventions, analysis. Declared by the project in `src/server/
+ *      cleanroom-surface.mjs` (read OUT OF THE ROOM's own copy — the revision
+ *      under test), so a repo that reorganises its docs is self-describing and
+ *      a newly-added document under a root needs NO edit here. A repo without
+ *      that declaration falls back to DEFAULT_PROSE_ROOTS.
+ *
+ * The old `CONTAMINATION` array was a hand-maintained deny-list that named
+ * `docs/prompts`/`docs/bugs` but missed `docs/CONVENTIONS.md`,
+ * `docs/ARCHITECTURE-REVIEW.md` and `docs/analysis/` — the exact defect BUG-120
+ * records. Naming the ROOT closes that class.
  */
-export const CONTAMINATION = [
-  'CLAUDE.md', 'CLAUDE.local.md', 'AGENTS.md', 'AGENT.md', '.cursorrules',
-  '.claude', '.codex', '.github/copilot-instructions.md',
-  'docs/prompts', 'docs/bugs', 'docs/DEPLOY-CONTEXT.md',
+// Ambient instruction surface, split into files and directories, matched by
+// NAME at ANY DEPTH — a CLI auto-discovers a nested `src/AGENTS.md` or
+// `pkg/.claude` just as it does one at the repo root (BUG-186 round-2). Both the
+// room strip and the diff exclusion walk this SAME recursive rule, so nothing
+// undeclared reaches the verifier by either route. Unconditional: an
+// auto-discovered instruction file is never a legitimate declared input, so the
+// allow-list does not spare it.
+// Ambient instruction surface as case-insensitive PATTERNS (round-7). A CLI
+// auto-loads whole FAMILIES, not fixed names — Codex loads AGENTS.md AND
+// AGENTS.override.md; Claude loads CLAUDE.md and CLAUDE.local.md; Gemini loads
+// GEMINI.md; Cursor loads .cursorrules and .cursor/rules/. A fixed name list
+// misses a variant by construction (round-6: AGENTS.override.md slipped through
+// as "declared code" and shipped). A pattern per family covers the variants.
+// `AGENTS?(\.[^/]*)?\.md` = AGENTS.md / AGENT.md / AGENTS.override.md /
+// AGENTS.local.md, but NOT AGENTSFOO.md (the dot-segment is required).
+export const AMBIENT_FILE_PATTERNS = [
+  /^AGENTS?(\.[^/]*)?\.md$/i,
+  /^CLAUDE(\.[^/]*)?\.md$/i,
+  /^GEMINI(\.[^/]*)?\.md$/i,
+  /^copilot-instructions\.md$/i,
+  /^\.cursorrules$/i,
 ];
+// Directories agent CLIs auto-load rules/config from, matched at any depth.
+export const AMBIENT_DIR_NAMES = ['.claude', '.codex', '.cursor', '.gemini'];
+/** Human-readable description of the ambient surface, for the run record. */
+export const AMBIENT_INSTRUCTION_NAMES = [
+  'AGENTS*.md', 'CLAUDE*.md', 'GEMINI*.md', 'copilot-instructions.md', '.cursorrules',
+  ...AMBIENT_DIR_NAMES.map((d) => `${d}/`),
+];
+// Case-INSENSITIVE (round-4): a CLI's auto-discovery is not reliably
+// case-sensitive, so any case variant of an ambient name is ambient.
+const isAmbientFile = (name) => AMBIENT_FILE_PATTERNS.some((re) => re.test(String(name)));
+const isAmbientDir = (name) => { const n = String(name).toLowerCase(); return AMBIENT_DIR_NAMES.some((d) => d.toLowerCase() === n); };
+/** Prose home assumed for a repo that ships no cleanroom-surface.mjs. */
+export const DEFAULT_PROSE_ROOTS = ['docs'];
+const PROSE_SURFACE_DECL = path.join('src', 'server', 'cleanroom-surface.mjs');
+
+/**
+ * Read the project's declared prose roots OUT OF THE ROOM (the revision under
+ * test), mirroring `declaredBootDocs`. A repo without the declaration is not an
+ * error — it simply gets DEFAULT_PROSE_ROOTS. A declaration that is PRESENT but
+ * broken is loud (a room whose contamination surface cannot be read must not
+ * quietly ship a leak).
+ */
+export async function declaredProseRoots(dir) {
+  const decl = path.join(dir, PROSE_SURFACE_DECL);
+  if (!fs.existsSync(decl)) return [...DEFAULT_PROSE_ROOTS];
+  let mod;
+  try { mod = await import(pathToFileURL(decl).href); }
+  catch (err) {
+    die(`clean room cannot read the prose-surface declaration ${PROSE_SURFACE_DECL}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let roots;
+  try { roots = typeof mod.cleanroomProseRoots === 'function' ? mod.cleanroomProseRoots() : null; }
+  catch (err) {
+    die(`clean room could not evaluate cleanroomProseRoots() in ${PROSE_SURFACE_DECL}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (!Array.isArray(roots) || !roots.every((r) => typeof r === 'string' && r.trim())) {
+    die(`clean room got no usable prose-root list from ${PROSE_SURFACE_DECL} (expected cleanroomProseRoots() to return an array of repo-relative paths).`);
+  }
+  return roots;
+}
+
+/** POSIX-normalise a repo-relative path (the interchange form used everywhere here). */
+function normRel(rel) {
+  return String(rel).split(path.sep).join('/').replace(/^\.\//, '').replace(/\/+$/, '');
+}
+
+/**
+ * Canonicalise a DECLARED path (an `--allow-input`) ONCE at intake (round-4
+ * finding): resolve `.`/`..`/`//`/trailing-slash to a single repo-relative POSIX
+ * form, and REFUSE anything absolute or escaping the repo. Every later
+ * comparison — the ambient hard error, the predicate, the strip, the diff — then
+ * sees the same canonical string, so `docs/a/../keep.json` can no longer pass the
+ * fs existence check (which resolves `..`) while the predicate compares the raw
+ * literal and strips the real `docs/keep.json`.
+ */
+export function canonicalizeDeclared(raw) {
+  const posix = String(raw).split(path.sep).join('/');
+  if (path.posix.isAbsolute(posix)) die(`--allow-input ${raw} must be a repo-relative path, not absolute`);
+  const norm = path.posix.normalize(posix).replace(/\/+$/, '').replace(/^\.\//, '');
+  if (norm === '' || norm === '.') die(`--allow-input ${raw} does not name a file inside the repo`);
+  if (norm === '..' || norm.startsWith('../') || norm.split('/').includes('..')) {
+    die(`--allow-input ${raw} escapes the repository (resolves to ${norm}); a declared input must be a path inside the repo`);
+  }
+  return norm;
+}
+
+/** Does a repo-relative path exist in `dir`, by LSTAT (a symlink counts, dangling or not)? */
+function lexists(dir, rel) { try { fs.lstatSync(path.join(dir, ...rel.split('/'))); return true; } catch { return false; } }
+
+/**
+ * The real LEAF paths (files and symlinks, never dirs) under a repo-relative
+ * path in `dir`, by an lstat walk that never follows a symlink. A file or symlink
+ * leaf returns itself; a directory returns all its leaves; a missing path returns
+ * []. Used to CAPTURE what a declared `--allow-input` actually contains at intake,
+ * so the post-condition can prove every one of those leaves SURVIVED to the final
+ * room (round-5: an emptied declared dir, or a declared file that was itself an
+ * escaping symlink `auditSymlinks` later removed, is a silent loss otherwise).
+ */
+function realLeavesUnder(dir, rel) {
+  let st; try { st = fs.lstatSync(path.join(dir, ...rel.split('/'))); } catch { return []; }
+  if (!st.isDirectory()) return [rel];
+  const out = [];
+  (function rec(r) {
+    let ents; try { ents = fs.readdirSync(path.join(dir, ...r.split('/')), { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const cr = `${r}/${e.name}`;
+      if (e.isDirectory() && !e.isSymbolicLink()) rec(cr);
+      else out.push(cr);
+    }
+  })(rel);
+  return out;
+}
+
+/**
+ * A CONTENT signature of a leaf (round-6): `{kind:'file', sig:<sha256>}` for a
+ * regular file, `{kind:'symlink', sig:<link target>}` for a symlink, or null if
+ * the path is missing. Captured for each declared-input leaf at intake and
+ * re-checked on the FINAL room, so a boot stub (or any writer) standing in for a
+ * declared input with DIFFERENT bytes is caught — mere existence is not enough.
+ */
+function fileSig(dir, leaf) {
+  const p = path.join(dir, ...leaf.split('/'));
+  let st; try { st = fs.lstatSync(p); } catch { return null; }
+  if (st.isSymbolicLink()) { try { return { kind: 'symlink', sig: fs.readlinkSync(p) }; } catch { return null; } }
+  if (st.isDirectory()) return { kind: 'dir', sig: '' };
+  try { return { kind: 'file', sig: createHash('sha256').update(fs.readFileSync(p)).digest('hex') }; } catch { return null; }
+}
+
+/**
+ * Write a file INTO the clean room through the ONE safe helper (round-7): it
+ * refuses to follow a symlink at ANY existing path component (an lstat walk) and
+ * refuses a destination whose real parent is OUTSIDE the room. A writer that
+ * followed a committed symlink (`src/out` → off-tree) used to drop a boot stub
+ * OUTSIDE the room — a containment breach. No room write may bypass this.
+ */
+export function safeWriteInRoom(dir, rel, body, mode) {
+  const roomReal = fs.realpathSync(dir);
+  const parts = normRel(rel).split('/');
+  let cur = dir;
+  for (let i = 0; i < parts.length - 1; i++) {
+    cur = path.join(cur, parts[i]);
+    let st; try { st = fs.lstatSync(cur); } catch { continue; } // missing → will be a real mkdir
+    if (st.isSymbolicLink()) {
+      die(`refusing to write ${rel} into the clean room: path component ${path.relative(dir, cur)} is a SYMLINK — a room writer must never follow a link (it could write OUTSIDE the room). The symlink audit removes escaping links before any writer; a link still here is a hard error.`);
+    }
+  }
+  const p = path.join(dir, ...parts);
+  // Refuse to write THROUGH a symlink leaf too (it could redirect the write).
+  try { if (fs.lstatSync(p).isSymbolicLink()) die(`refusing to write ${rel} into the clean room: the target itself is a SYMLINK.`); } catch { /* absent → fine */ }
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const parentReal = fs.realpathSync(path.dirname(p));
+  if (parentReal !== roomReal && !parentReal.startsWith(roomReal + path.sep)) {
+    die(`refusing to write ${rel}: its parent resolves to ${parentReal}, OUTSIDE the clean room ${roomReal}.`);
+  }
+  fs.writeFileSync(p, body, mode ? { mode } : undefined);
+}
+
+/**
+ * Write a file that MUST NOT follow a symlink at its final component (round-8).
+ * `O_NOFOLLOW` makes `open` fail (ELOOP) rather than write through a symlink, so
+ * a committed OR verifier-planted symlink at a harness-written spool path
+ * (`.vrun/alive`, `.vrun/res/*`) can never redirect the write onto declared code
+ * or out of the room. Returns true on success; callers treat false as "spool
+ * gone / under attack" (fail-safe: the heartbeat goes stale → vrun exits, the
+ * authoritative record stays in memory). Intermediate components are harness-
+ * created (the `.vrun` dir is refused if the export already contains it).
+ */
+export function writeNoFollow(p, data) {
+  let fd;
+  try { fd = fs.openSync(p, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW, 0o600); }
+  catch { return false; }
+  try { fs.writeSync(fd, typeof data === 'string' ? data : String(data)); return true; }
+  catch { return false; }
+  finally { try { fs.closeSync(fd); } catch { /* already closed */ } }
+}
+
+/**
+ * Is a repo-relative path an ambient-instruction path, at ANY depth? True when
+ * ANY path segment is an ambient DIR name (so `.claude` and everything under it,
+ * anywhere), OR the FINAL segment is an ambient FILE name (`src/AGENTS.md`). A
+ * path's TYPE is irrelevant — a symlink, dir or file named `.claude` is ambient
+ * all the same (round-3 finding: a `.claude` symlink used to slip a type check).
+ * Ambient is never a legitimate declared input, so this is unconditional.
+ */
+export function isAmbientPath(rel) {
+  const segs = normRel(rel).split('/').filter(Boolean);
+  if (!segs.length) return false;
+  if (isAmbientFile(segs[segs.length - 1])) return true;
+  return segs.some((s) => isAmbientDir(s));
+}
+
+/**
+ * THE ONE PREDICATE (round-3 redesign). Given the declared surface, decide for a
+ * byte-exact repo-relative path whether the verifier MAY see it. EVERY route —
+ * the room strip, the post-strip assertion, and the diff filter — asks THIS and
+ * nothing else, so a string-built pathspec and a hand walk can no longer
+ * disagree with git's view of the tree on an edge case (that disagreement was
+ * rounds 1–2). The three prior rounds each patched one edge; this removes the
+ * second decision point instead.
+ *
+ *   - ambient (any depth, any type) → NEVER declared (cannot be allow-listed);
+ *   - outside every prose root → declared (code / config / tests);
+ *   - inside a prose root → declared ONLY if it IS an allowed input or under one.
+ */
+export function makeIsDeclared({ proseRoots = [], allowed = [] } = {}) {
+  const allow = [...new Set((allowed ?? []).map(normRel))];
+  const proseSet = (proseRoots ?? []).map(normRel);
+  const inProse = (rel) => proseSet.some((r) => rel === r || rel.startsWith(r + '/'));
+  const underAllowed = (rel) => allow.some((a) => rel === a || rel.startsWith(a + '/'));
+  return (raw) => {
+    const rel = normRel(raw);
+    if (isAmbientPath(rel)) return false;
+    if (!inProse(rel)) return true;
+    return underAllowed(rel);
+  };
+}
+
+/**
+ * Strip everything the verifier may NOT see from an exported clean room, using
+ * `makeIsDeclared` as the sole decision, walked with `withFileTypes` (lstat, so
+ * a symlink is judged as a leaf on its OWN path and NEVER followed). Walks the
+ * WHOLE tree — node_modules included (round-3 finding: `node_modules/pkg/AGENTS.md`
+ * used to survive because the walk skipped it). Returns the nodes removed.
+ * Exported so the boot-stub suite exercises the real strip, not a copy of it.
+ */
+export function stripCleanroom(dir, { proseRoots = [], allowed = [] } = {}) {
+  const isDeclared = makeIsDeclared({ proseRoots, allowed });
+  const allow = [...new Set((allowed ?? []).map(normRel))];
+  const ancestorOfAllowed = (rel) => allow.some((a) => a === rel || a.startsWith(rel + '/'));
+  const stripped = [];
+  const remove = (rel) => {
+    try { fs.rmSync(path.join(dir, ...rel.split('/')), { recursive: true, force: true }); stripped.push(rel); } catch { /* gone */ }
+  };
+  (function walk(relDir) {
+    let ents;
+    try { ents = fs.readdirSync(relDir ? path.join(dir, ...relDir.split('/')) : dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const rel = relDir ? `${relDir}/${e.name}` : e.name;
+      const isRealDir = e.isDirectory() && !e.isSymbolicLink();
+      if (isDeclared(rel)) { if (isRealDir) walk(rel); continue; }   // keep; recurse a real dir to catch nested ambient
+      if (isRealDir && ancestorOfAllowed(rel)) { walk(rel); continue; } // needed ancestor of a declared input → keep, prune inside
+      remove(rel);                                                    // undeclared file / dir / symlink → gone (symlink never followed)
+    }
+  })('');
+  return stripped;
+}
 
 /**
  * Boot stubs. Stripping `docs/prompts` (above) is correct — the verifier must
@@ -319,15 +583,29 @@ const BOOT_STUB_BODY =
  * declares (BUG-182). Exported so the proof script can exercise the real thing
  * rather than a re-implementation of it.
  */
-export async function seedBootStubs(dir) {
+export async function seedBootStubs(dir, { allowed = [] } = {}) {
   const bootDocs = await declaredBootDocs(dir);
+  const allow = [...new Set(allowed.map(normRel))];
+  const collidesAllowed = (rel) => allow.some((a) => rel === a || rel.startsWith(a + '/') || a.startsWith(rel + '/'));
   const seededStubs = [];
-  for (const rel of bootDocs) {
-    const p = path.join(dir, rel);
+  for (const relSep of bootDocs) {
+    const rel = relSep.split(path.sep).join('/');
+    // (round-6 rule b) Boot-stub seeding is a SECOND writer into the room that
+    // runs after the strip. It must NEVER write an ambient-named path — doing so
+    // resurrects an auto-discovered instruction file the strip removed.
+    if (isAmbientPath(rel)) {
+      die(`clean room refuses to seed an ambient-named boot doc ${rel}: writing it would RESURRECT an ambient-instruction file the strip removed. The repo's seed-source declaration (${SEED_SOURCE_DECL}) must not point seedTemplates at an ambient-named path.`);
+    }
+    // (round-6 rule a) …and must NEVER overwrite or stand in for a declared input.
+    if (collidesAllowed(rel)) {
+      die(`clean room refuses to seed boot doc ${rel}: it collides with a declared --allow-input, so a placeholder would stand in for the real declared content. Declare a different input, or move the seed doc.`);
+    }
+    const p = path.join(dir, ...rel.split('/'));
     if (fs.existsSync(p)) continue; // survived the strip (unexpected, but respect it)
     try {
-      fs.mkdirSync(path.dirname(p), { recursive: true });
-      fs.writeFileSync(p, BOOT_STUB_BODY);
+      // Through the ONE safe writer: never follow a symlink component, never
+      // write outside the room (round-7 containment-breach fix).
+      safeWriteInRoom(dir, rel, BOOT_STUB_BODY);
       seededStubs.push(rel);
     } catch (err) {
       die(`clean room could not seed the boot stub ${rel} (the server cannot start without it — seedTemplates reads it): ${(err instanceof Error ? err.message : String(err))}`);
@@ -373,6 +651,11 @@ export async function seedBootStubs(dir) {
 function provisionModules(repo, dir) {
   const nm = path.join(repo, 'node_modules');
   const dest = path.join(dir, 'node_modules');
+  // Round-8 defence: if the exported tree committed a `node_modules` SYMLINK
+  // (gitignored normally, so this needs a forced add — but possible), `cp` could
+  // write THROUGH it outside the room. Remove a symlink at the dest first so the
+  // copy always lands on a real in-room directory.
+  try { if (fs.lstatSync(dest).isSymbolicLink()) fs.rmSync(dest, { force: true }); } catch { /* absent */ }
   if (!fs.existsSync(nm) || fs.existsSync(dest)) return { mode: 'none', ms: 0 };
   // `--reflink=auto` fails SILENTLY across a filesystem boundary: it does a full
   // byte copy and exits 0, so the only symptom is that a 0.4 s copy became a
@@ -433,45 +716,104 @@ function auditSymlinks(dir) {
   return removed;
 }
 
-async function buildCleanroom(repo, rev) {
+/**
+ * ZERO SYMLINKS in the room (round-9). After `auditSymlinks` has removed every
+ * ESCAPING link, this removes every remaining INTERNAL symlink too, so the final
+ * room contains no symlink at all (except under a declared `--allow-input`, which
+ * the verifier asked for). `node_modules/.bin/*` entries — the one class of
+ * internal symlink the verifier legitimately needs to run tools — are
+ * MATERIALISED as tiny `exec` shim scripts that invoke the real (in-room) target,
+ * so tooling keeps working without a symlink. Returns what it did. This is
+ * defence-in-depth now that all harness writes live outside the room: no symlink
+ * remains for any writer to follow.
+ */
+export function materializeSymlinks(dir, { allowed = [] } = {}) {
+  const allow = [...new Set((allowed ?? []).map(normRel))];
+  const underAllowed = (rel) => allow.some((a) => rel === a || rel.startsWith(a + '/'));
+  const roomReal = fs.realpathSync(dir);
+  const inRoom = (p) => p === roomReal || p.startsWith(roomReal + path.sep);
+  const isUnderBin = (rel) => rel.split('/').includes('.bin');
+  const materialized = [], removed = [];
+  (function walk(relDir) {
+    let ents; try { ents = fs.readdirSync(relDir ? path.join(dir, ...relDir.split('/')) : dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const rel = relDir ? `${relDir}/${e.name}` : e.name;
+      if (e.isSymbolicLink()) {
+        if (underAllowed(rel)) continue; // the verifier declared this input; leave it
+        const abs = path.join(dir, ...rel.split('/'));
+        let target = null; try { target = fs.realpathSync(abs); } catch { /* dangling */ }
+        fs.rmSync(abs, { force: true });
+        if (target && inRoom(target) && isUnderBin(rel)) {
+          // a `.bin` tool launcher → an exec shim honouring the target's own shebang
+          safeWriteInRoom(dir, rel, `#!/bin/sh\nexec ${JSON.stringify(target)} "$@"\n`, 0o755);
+          materialized.push(rel);
+        } else {
+          removed.push(rel);
+        }
+        continue;
+      }
+      if (e.isDirectory()) walk(rel);
+    }
+  })('');
+  return { materialized, removed };
+}
+
+async function buildCleanroom(repo, rev, { allowed = [] } = {}) {
   const dir = mkdtempScratch('cleanroom-verify-');
   const tar = spawnSync('sh', ['-c', `git -C ${JSON.stringify(repo)} archive ${JSON.stringify(rev)} | tar -x -C ${JSON.stringify(dir)}`], { encoding: 'utf8' });
   if ((tar.status ?? 1) !== 0) die(`could not export ${rev} into a clean room: ${(tar.stderr || '').trim()}`);
 
-  const stripped = [];
-  for (const rel of CONTAMINATION) {
-    const p = path.join(dir, rel);
-    if (fs.existsSync(p)) { fs.rmSync(p, { recursive: true, force: true }); stripped.push(rel); }
+  // The prose roots the ROOM itself declares (revision under test), plus the
+  // universal ambient set — one surface, read once, that drives BOTH this strip
+  // and the diff the verifier is handed (BUG-186). A declared --allow-input that
+  // the room does not contain is a HARNESS error, never a product FAIL: the
+  // check named an input that is not there, so nothing can be verified honestly.
+  const proseRoots = await declaredProseRoots(dir);
+  // Canonicalise every declared input ONCE, here (round-4): resolve `.`/`..`/
+  // trailing-slash and refuse escapes, so every later comparison sees the same
+  // repo-relative POSIX string.
+  const allowedCanon = allowed.map(canonicalizeDeclared);
+  for (const rel of allowedCanon) {
+    // An ambient-instruction path is stripped UNCONDITIONALLY and can never be
+    // provided — so declaring it as an input is a hard ERROR, never a silent drop
+    // that leaves the run exiting 0 with the "input" absent (round-3 finding).
+    // The ambient match is case-insensitive (round-4), so `.CLAUDE` is caught.
+    if (isAmbientPath(rel)) {
+      die(`--allow-input ${rel} names an ambient-instruction path (a CLI auto-discovers it as instructions), which the clean room strips unconditionally and can never provide as an input. Remove it, or rename the file so it is not ambient.`);
+    }
+    if (!fs.existsSync(path.join(dir, ...rel.split('/')))) {
+      die(`--allow-input ${rel} is not present at the revision under test — a declared clean-room input that does not exist cannot be provided, and a missing input must surface as a harness error, not as a verification failure that looks like a real defect`);
+    }
   }
-  // Belt-and-braces: anything named like an ambient instruction file anywhere
-  // in the exported tree (a nested CLAUDE.md would be read on entry too).
-  const leftovers = [];
-  const AMBIENT = /^(CLAUDE(\.local)?\.md|AGENTS?\.md)$/i;
-  (function walk(d) {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const full = path.join(d, e.name);
-      if (e.isSymbolicLink()) continue;
-      if (e.isDirectory()) { if (e.name !== 'node_modules' && e.name !== '.git') walk(full); continue; }
-      if (AMBIENT.test(e.name)) { fs.rmSync(full, { force: true }); stripped.push(path.relative(dir, full)); }
-    }
-  })(dir);
-  (function scan(d) {
-    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-      const full = path.join(d, e.name);
-      if (e.isSymbolicLink()) continue;
-      if (e.isDirectory()) { if (e.name !== 'node_modules') scan(full); continue; }
-      if (AMBIENT.test(e.name)) leftovers.push(path.relative(dir, full));
-    }
-  })(dir);
-  if (leftovers.length) die(`clean room is NOT clean — ambient instruction files remain: ${leftovers.join(', ')}`);
+  // CAPTURE what each declared input actually contains, NOW (before any
+  // mutation), as its real leaves WITH a content signature (sha256 / symlink
+  // target). The FINAL-stage assertion (after every writer) proves each leaf is
+  // present AND byte-for-byte the captured original — so an emptied declared dir,
+  // a declared escaping symlink the audit removes, OR a boot stub standing in for
+  // a declared input (round-6) are all LOUD, never silent.
+  const declaredCapture = allowedCanon.map((rel) => ({
+    rel,
+    leaves: realLeavesUnder(dir, rel).map((leaf) => ({ leaf, sig: fileSig(dir, leaf) })),
+  }));
 
-  const seededStubs = await seedBootStubs(dir);
-
-  // Dependencies: a verifier that cannot run the tests cannot produce evidence.
+  // THE ROOM PIPELINE: every mutation of the room happens HERE, in order, and the
+  // FINAL stage is the assertion below — nothing may mutate the room after it.
+  // Writes, in code order (round-7: auditSymlinks moved BEFORE any WRITER, so a
+  // writer can never follow an escaping symlink out of the room; every write then
+  // also goes through safeWriteInRoom as a second guard):
+  //   1. git archive | tar          (export the tree — above)
+  //   2. provisionModules              (copy node_modules in)
+  //   3. stripCleanroom                (remove everything undeclared)
+  //   4. auditSymlinks                 (remove escaping symlinks)
+  //   5. materializeSymlinks           (ZERO symlinks: .bin → exec shims, others removed)
+  //   6. seedBootStubs                 (write inert boot placeholders, safely)
+  //   7. recorder: vrun.mjs (spool is OUTSIDE the room, round-9)
+  //   8. assertFinalRoom()             (LAST — the room exactly as handed over)
   const modules = provisionModules(repo, dir);
-
-  // …and then: NOTHING in this room may point OUT of it (see auditSymlinks).
+  const stripped = stripCleanroom(dir, { proseRoots, allowed: allowedCanon });
   const escapes = auditSymlinks(dir);
+  const shims = materializeSymlinks(dir, { allowed: allowedCanon });
+  const seededStubs = await seedBootStubs(dir, { allowed: allowedCanon });
 
   // THE RUN MANIFEST (2026-08-11 re-scope): executed evidence is proven by
   // artifacts the harness itself records, never by prose.
@@ -512,28 +854,42 @@ async function buildCleanroom(repo, rev) {
   // the harness-supplied command.
   const recordDir = mkdtempScratch('cleanroom-record-');
   const manifestFile = path.join(recordDir, 'manifest.jsonl');
-  const spoolDir = path.join(dir, '.vrun');
+  // ROUND-9: ALL harness run-state lives OUTSIDE the room. The spool (the
+  // verifier's request channel + the harness's heartbeat and responses) is a
+  // FRESH mkdtemp under the SYSTEM TEMP dir — a root the codex workspace-write
+  // sandbox permits the verifier to read AND write (the same `$TMPDIR` the
+  // sanctioned GIT_INDEX_FILE-in-tmpdir writes use), and one that NO symlink
+  // inside the room can redirect. The room therefore holds NO harness-write
+  // target at all: a verifier symlink ANYWHERE in the room — committed or planted
+  // mid-run — cannot redirect a harness write, because the harness never writes
+  // inside the room during the run (rounds 1–8 all turned on an in-room harness
+  // write following a symlink; this removes the class). vrun.mjs carries the
+  // absolute spool paths baked in; nothing in the room points at them.
+  const spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cleanroom-spool-'));
   const reqDir = path.join(spoolDir, 'req');
   const resDir = path.join(spoolDir, 'res');
-  fs.mkdirSync(reqDir, { recursive: true });
-  fs.mkdirSync(resDir, { recursive: true });
+  fs.mkdirSync(reqDir);
+  fs.mkdirSync(resDir);
   const entries = []; // authoritative, in-memory, outputs attached
   const aliveFile = path.join(spoolDir, 'alive');
   const MAX_OUTPUT = 64 * 1024 * 1024;
   const handled = new Set();
   // LIVENESS beat: the socket recorder's death was instantly visible to the
   // client (connect → ECONNREFUSED). The file spool restores that: this process
-  // rewrites `.vrun/alive` with a fresh timestamp every poll tick, and vrun
+  // rewrites `<spool>/alive` with a fresh timestamp every poll tick, and vrun
   // treats a STALE heartbeat as "recorder dead" (exit 2), so a verifier can
   // never sit forever against a crashed harness NOR forge a record around one.
   // Execution is ASYNC (not spawnSync) precisely so the beat keeps ticking
   // while a long command runs — otherwise a blocking exec would look like death.
-  const beat = () => { try { fs.writeFileSync(aliveFile, String(Date.now())); } catch { /* spool gone */ } };
+  // The spool is OUTSIDE the room (round-9); writeNoFollow is kept as a leaf
+  // guard regardless.
+  const beat = () => { writeNoFollow(aliveFile, String(Date.now())); };
   const respond = (file, obj) => {
-    // Atomic publish: write a temp then rename, so the verifier's poller never
-    // reads a half-written response.
+    // Atomic publish: write a temp (no-follow) then rename, so the verifier's
+    // poller never reads a half-written response. rename REPLACES a symlink at
+    // the destination rather than following it.
     const tmp = path.join(resDir, `.${file}.tmp`);
-    try { fs.writeFileSync(tmp, JSON.stringify(obj)); fs.renameSync(tmp, path.join(resDir, file)); }
+    try { if (writeNoFollow(tmp, JSON.stringify(obj))) fs.renameSync(tmp, path.join(resDir, file)); }
     catch { /* the verifier may have raced/removed the spool; memory stays authoritative */ }
   };
   const record = (file, cmd, output, code) => {
@@ -579,9 +935,9 @@ async function buildCleanroom(repo, rev) {
   beat();
   const poll = setInterval(drain, 75);
   poll.unref();
-  const recorder = { close: () => { clearInterval(poll); try { fs.rmSync(aliveFile, { force: true }); } catch { /* gone */ } } };
+  const recorder = { close: () => { clearInterval(poll); try { fs.rmSync(spoolDir, { recursive: true, force: true }); } catch { /* gone */ } } };
 
-  fs.writeFileSync(path.join(dir, 'vrun.mjs'), `#!/usr/bin/env node
+  safeWriteInRoom(dir, 'vrun.mjs', `#!/usr/bin/env node
 // vrun.mjs — run-recorder CLIENT for independent verification. The harness
 // executes the command itself and records {id, cmd, exit, output sha256} in
 // its own memory; this client only relays the command (via a file spool the
@@ -624,9 +980,75 @@ const resf = path.join(RES, name);
   if (!alive()) dead(); // recorder died while we waited — never hang, never forge around it
   setTimeout(poll, 40);
 })();
-`, { mode: 0o755 });
+`, 0o755);
 
-  return { dir, stripped, seededStubs, modules, escapes, recordDir, manifestFile, entries, recorder, scratch: scratchRootInfo() };
+  // ===== FINAL PIPELINE STAGE — assert the room EXACTLY as the verifier will
+  // receive it, AFTER every writer (strip, audit, symlink materialisation, boot
+  // seeding, vrun.mjs). NOTHING below this point may mutate the room, and the
+  // harness writes NOTHING inside the room during the run (the spool is OUTSIDE
+  // it, round-9). Evaluating here — not mid-pipeline — is the round-6 fix. =====
+  const isDeclared = makeIsDeclared({ proseRoots, allowed: allowedCanon });
+  const seededSet = new Set(seededStubs.map(normRel));
+  const allowSet = [...new Set(allowedCanon.map(normRel))];
+  const underAllowedInput = (rel) => allowSet.some((a) => rel === a || rel.startsWith(a + '/'));
+  // A seeded boot stub is the ONLY undeclared content allowed to remain — and
+  // only if it is provably INERT (its bytes are exactly BOOT_STUB_BODY) and not
+  // ambient. Anything else undeclared is a leak.
+  const okStub = (rel) => {
+    const r = normRel(rel);
+    if (!seededSet.has(r) || isAmbientPath(r)) return false;
+    try { return fs.readFileSync(path.join(dir, ...r.split('/')), 'utf8') === BOOT_STUB_BODY; } catch { return false; }
+  };
+  const leftovers = [];
+  const symlinks = [];
+  (function scan(relDir) {
+    let ents;
+    try { ents = fs.readdirSync(relDir ? path.join(dir, ...relDir.split('/')) : dir, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const rel = relDir ? `${relDir}/${e.name}` : e.name;
+      if (e.isSymbolicLink()) {
+        // ZERO SYMLINKS invariant (round-9): the only symlink allowed is one the
+        // verifier declared as an input; everything else must be gone/materialised.
+        if (!underAllowedInput(rel)) symlinks.push(rel);
+        if (!isDeclared(rel) && !okStub(rel)) leftovers.push(rel);
+        continue;
+      }
+      if (e.isDirectory()) { scan(rel); continue; }
+      if (!isDeclared(rel) && !okStub(rel)) leftovers.push(rel);
+    }
+  })('');
+  if (symlinks.length) {
+    die(`clean room still contains SYMLINK(s) after materialisation (round-9 invariant: the room has ZERO symlinks outside a declared input): ${symlinks.slice(0, 50).join(', ')}${symlinks.length > 50 ? ` … (+${symlinks.length - 50} more)` : ''}`);
+  }
+  if (leftovers.length) {
+    die(`clean room is NOT clean (final room, as handed to the verifier) — undeclared content survived EVERY stage: ${leftovers.slice(0, 50).join(', ')}${leftovers.length > 50 ? ` … (+${leftovers.length - 50} more)` : ''}`);
+  }
+  // Every declared input is PRESENT and byte-for-byte the captured original — a
+  // boot stub (or any writer) standing in for it with different content is caught.
+  for (const { rel, leaves } of declaredCapture) {
+    if (!leaves.length && !lexists(dir, rel)) {
+      die(`clean room lost a declared input: --allow-input ${rel} is not present in the final room.`);
+    }
+    for (const { leaf, sig } of leaves) {
+      const now = fileSig(dir, leaf);
+      if (!now) die(`clean room lost declared-input content: --allow-input ${rel} — ${leaf} is absent from the final room (stripped, overwritten, or an escaping symlink cleaned up).`);
+      if (sig && (now.kind !== sig.kind || now.sig !== sig.sig)) {
+        die(`clean room altered a declared input: --allow-input ${rel} — ${leaf} in the final room is not the captured original (a boot stub or other writer stood in for it). The verifier must see the real declared bytes, or a loud harness error.`);
+      }
+    }
+  }
+  // Every boot stub we seeded is PRESENT and INERT in the FINAL room (round-7):
+  // a stub dropped through an (audited-away) escaping symlink, or overwritten, is
+  // a missing/altered boot doc — the server would then die opaquely at boot.
+  for (const rel of seededStubs) {
+    const sig = fileSig(dir, rel);
+    if (!sig) die(`clean room boot stub ${rel} is ABSENT from the final room (it was seeded, then lost — e.g. written through an escaping symlink the audit removed). The stripped server would die opaquely at boot.`);
+    if (sig.kind !== 'file' || fs.readFileSync(path.join(dir, ...rel.split('/')), 'utf8') !== BOOT_STUB_BODY) {
+      die(`clean room boot stub ${rel} is not the inert placeholder in the final room (a later writer altered it).`);
+    }
+  }
+
+  return { dir, stripped, proseRoots, allowed: allowedCanon, seededStubs, modules, escapes, shims, recordDir, spoolDir, manifestFile, entries, recorder, scratch: scratchRootInfo() };
 }
 
 /* ------------------------------------------------------------ the prompt */
@@ -728,8 +1150,107 @@ async function main() {
     ({ base, head } = resolveRange(repo, opts.range));
   }
 
-  const fullDiff = gitOk(repo, 'diff', base, head);
-  if (!fullDiff.trim()) die(`range ${base.slice(0, 8)}..${head.slice(0, 8)} has an empty diff — nothing to verify`);
+  // Build the clean room FIRST: the prose surface it strips is declared in the
+  // revision under test (read out of the room's own copy), and that SAME surface
+  // is what the diff below excludes — one source, never a second list (BUG-186).
+  const room = await buildCleanroom(repo, head, { allowed: opts.allowInputs });
+
+  // THE DIFF HANDED TO THE VERIFIER (BUG-186), an ALLOW-LIST over byte-exact
+  // paths driven by the SAME `makeIsDeclared` predicate the room strip uses.
+  //   1. `git diff --name-only -z --no-renames` → the changed paths byte-exact
+  //      (NUL, no quoting; renames decomposed to delete+add so BOTH sides show
+  //      and DELETIONS are included).
+  //   2. Filter in JS with the predicate → the ALLOWED changed paths.
+  //   3. Emit the diff limited to those paths as `:(literal)` pathspecs, batched
+  //      under ARG_MAX.
+  //   4. THE GUARANTEE (round-4): a literal pathspec that names a path which is
+  //      now a DIRECTORY also selects its descendants, so `src/widget` (a deleted
+  //      file, declared) can drag in the ambient `src/widget/AGENTS.md`. So we do
+  //      not trust pathspec semantics as the last line — we read the file list
+  //      the diff ACTUALLY contains and ASSERT it is a subset of the declared
+  //      set. A stray undeclared descendant is excluded by an explicit
+  //      `:(exclude,literal)` and rebuilt once; if anything undeclared still
+  //      remains, we FAIL LOUDLY rather than ship it. Any future pathspec
+  //      surprise is then a hard error, never a leak.
+  const isDeclared = makeIsDeclared({ proseRoots: room.proseRoots, allowed: room.allowed });
+  // `--no-ext-diff --no-textconv` (round-5): the EMITTED patch must be git's own
+  // internal diff, never a repo-configured `diff.external` / `.gitattributes` diff
+  // driver / textconv filter — such a helper can re-expand a declared path and
+  // emit content for UNDECLARED paths in the PATCH while `--name-only` (which does
+  // not invoke it) still reports only the declared set, so the subset check would
+  // pass a patch that leaks. Applied to EVERY diff invocation so the patch and the
+  // checked name-list are produced identically.
+  // `-c diff.submodule=short --submodule=short` (round-7): repo config
+  // `diff.submodule=diff` INLINES a submodule's internal patch — board/ambient
+  // prose from inside a changed submodule gitlink — which the `--name-only`
+  // footing never reproduces, defeating the subset check. Force the short format
+  // (a one-line "Subproject commit X..Y", never content) on every invocation.
+  // `-c core.quotePath=false` keeps non-ASCII header paths byte-exact so the
+  // patch-header backstop below does not false-positive on a declared edge name.
+  const GIT_CFG = ['-c', 'core.quotePath=false', '-c', 'diff.submodule=short'];
+  const DIFF_FLAGS = ['--no-ext-diff', '--no-textconv', '--submodule=short'];
+  const nameOnly = spawnSync('git', ['-C', repo, ...GIT_CFG, 'diff', ...DIFF_FLAGS, '--name-only', '-z', '--no-renames', base, head], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
+  if ((nameOnly.status ?? 1) !== 0) die(`git diff --name-only failed in ${repo}: ${(nameOnly.stderr ? nameOnly.stderr.toString() : '').trim()}`);
+  const changedPaths = (nameOnly.stdout ? nameOnly.stdout.toString('utf8') : '').split('\0').filter(Boolean);
+  const allowedPaths = changedPaths.filter(isDeclared);
+  if (!allowedPaths.length) {
+    die(`range ${base.slice(0, 8)}..${head.slice(0, 8)} has no verifiable diff after excluding the board/methodology surface (${changedPaths.length} changed path(s), none the verifier may see) — nothing for the verifier to attack`);
+  }
+  // Run `git diff` (patch, or --name-only -z) over the allowed paths as
+  // `:(literal)` pathspecs plus any explicit exclude specs, batched under ARG_MAX.
+  const BATCH_BYTES = 100_000;
+  const runDiff = (kind, excludeSpecs) => {
+    const pos = allowedPaths.map((p) => `:(literal)${p}`);
+    const bufs = [];
+    for (let i = 0; i < pos.length;) {
+      const batch = [];
+      let bytes = 0;
+      while (i < pos.length && (batch.length === 0 || bytes + Buffer.byteLength(pos[i]) + 1 < BATCH_BYTES)) {
+        bytes += Buffer.byteLength(pos[i]) + 1; batch.push(pos[i]); i++;
+      }
+      const args = ['-C', repo, ...GIT_CFG, 'diff', ...DIFF_FLAGS, ...(kind === 'names' ? ['--name-only', '-z'] : []), '--no-renames', base, head, '--', ...batch, ...excludeSpecs];
+      const r = spawnSync('git', args, { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
+      if ((r.status ?? 1) !== 0) die(`git diff (allow-listed) failed in ${repo}: ${(r.stderr ? r.stderr.toString() : '').trim()}`);
+      bufs.push(r.stdout || Buffer.alloc(0));
+    }
+    const out = Buffer.concat(bufs).toString('utf8');
+    return kind === 'names' ? out.split('\0').filter(Boolean) : out;
+  };
+  let excludeSpecs = [];
+  let fullDiff = runDiff('patch', excludeSpecs);
+  let actualPaths = runDiff('names', excludeSpecs);
+  let leaked = actualPaths.filter((p) => !isDeclared(p));
+  if (leaked.length) {
+    // A declared path is now a directory (file→dir) and its literal pathspec
+    // prefix-matched an undeclared descendant. Exclude exactly those (few) and
+    // rebuild once — bounded, so no ARG_MAX.
+    excludeSpecs = leaked.map((p) => `:(exclude,literal)${p}`);
+    fullDiff = runDiff('patch', excludeSpecs);
+    actualPaths = runDiff('names', excludeSpecs);
+    leaked = actualPaths.filter((p) => !isDeclared(p));
+  }
+  if (leaked.length) {
+    die(`diff post-condition FAILED — the verifier's diff would contain undeclared path(s) after filtering: ${leaked.slice(0, 20).join(', ')}${leaked.length > 20 ? ` … (+${leaked.length - 20} more)` : ''}. Refusing to ship a diff that is not a subset of the declared surface (a pathspec surprise is a hard error, never a leak).`);
+  }
+  // BACKSTOP (round-7): judge the EMITTED patch's OWN headers, not only the
+  // `--name-only` footing. With `--submodule=short` nothing is inlined, so these
+  // equal the allowed set; if any format expands content past the allow-list (an
+  // inlined submodule diff under `diff.submodule=diff`, a sub-diff section), its
+  // header paths are undeclared and this fails CLOSED. `core.quotePath=false`
+  // keeps non-ASCII header paths byte-exact so a declared edge name is not a
+  // false positive.
+  const allowedSet = new Set(allowedPaths.map(normRel));
+  const patchPaths = new Set();
+  for (const line of fullDiff.split('\n')) {
+    let m;
+    if ((m = /^diff --git a\/(.+?) b\/(.+)$/.exec(line))) { patchPaths.add(m[1]); patchPaths.add(m[2]); }
+    else if ((m = /^Submodule (\S+) /.exec(line))) { patchPaths.add(m[1]); }
+  }
+  const patchLeaked = [...patchPaths].filter((p) => { const n = normRel(p); return !allowedSet.has(n) && !isDeclared(n); });
+  if (patchLeaked.length) {
+    die(`diff post-condition FAILED — the EMITTED patch's own headers name undeclared path(s): ${patchLeaked.slice(0, 20).join(', ')}${patchLeaked.length > 20 ? ` … (+${patchLeaked.length - 20} more)` : ''}. A format that expands content past the allow-list (e.g. an inlined submodule diff) fails closed, never ships.`);
+  }
+  if (!fullDiff.trim()) die(`range ${base.slice(0, 8)}..${head.slice(0, 8)} produced an empty allow-listed diff — nothing for the verifier to attack`);
   const fullDiffBytes = Buffer.byteLength(fullDiff, 'utf8');
   const truncated = fullDiffBytes > opts.maxDiffBytes;
   const diff = truncated ? fullDiff.slice(0, opts.maxDiffBytes) : fullDiff;
@@ -740,7 +1261,22 @@ async function main() {
     return { rel: path.relative(repo, p) || path.basename(p), body: fs.readFileSync(p, 'utf8') };
   });
 
-  const room = await buildCleanroom(repo, head);
+  // RECORD WHAT THE ROOM WAS GIVEN (BUG-120 criterion 3): the stripped surface,
+  // the declared inputs, and the diff exclusions — written beside the manifest
+  // the verdict already cites, so a verdict can be read against its own inputs.
+  const roomManifest = {
+    base, head,
+    proseRoots: room.proseRoots,
+    ambientStripped: AMBIENT_INSTRUCTION_NAMES,
+    allowedInputs: room.allowed,
+    strippedLeaves: room.stripped,
+    diffFilter: 'allow-list: makeIsDeclared() over byte-exact `git diff --name-only -z --no-renames` paths (no exclusion strings, no ARG_MAX, no quoting)',
+    changedPaths: changedPaths.length,
+    diffAllowList: allowedPaths,
+  };
+  try { fs.writeFileSync(path.join(room.recordDir, 'room-manifest.json'), JSON.stringify(roomManifest, null, 2)); }
+  catch { /* the record dir is a human-auditable mirror; the run proceeds regardless */ }
+
   const prompt = composePrompt({
     requirement: readRequirement(opts.requirement),
     diff, truncated, fullDiffBytes, runs: opts.runs, tests, cwd: room.dir,
@@ -749,7 +1285,7 @@ async function main() {
   if (opts.printPrompt) {
     // Seam for the clean-room test: prove the composed prompt carries no
     // methodology/board/routing payload, and show what was stripped.
-    process.stderr.write(`scratch root: ${room.scratch.dir} (${room.scratch.source})${room.scratch.degraded ? ' — DEGRADED: this is a boot-wiped temp dir; set $' + SCRATCH_ENV : ''}\n${room.modules.fsCheck ? room.modules.fsCheck.message + '\n' : ''}clean room: ${room.dir}\nrecord dir: ${room.recordDir}\nstripped: ${room.stripped.join(', ') || '(nothing present to strip)'}\nboot stubs seeded: ${room.seededStubs.join(', ') || '(none needed)'}\nnode_modules: ${room.modules.mode}${room.modules.ms ? ` in ${room.modules.ms}ms` : ''} — NEVER a symlink into the live repo (BUG-112)\nescaping symlinks removed: ${room.escapes.length ? room.escapes.join(', ') : '(none)'}\n`);
+    process.stderr.write(`scratch root: ${room.scratch.dir} (${room.scratch.source})${room.scratch.degraded ? ' — DEGRADED: this is a boot-wiped temp dir; set $' + SCRATCH_ENV : ''}\n${room.modules.fsCheck ? room.modules.fsCheck.message + '\n' : ''}clean room: ${room.dir}\nrecord dir: ${room.recordDir}\nprose roots: ${room.proseRoots.join(', ') || '(none declared)'}\nallowed inputs: ${room.allowed.join(', ') || '(none — the room was given only code, config and tests)'}\nstripped: ${room.stripped.length ? `${room.stripped.slice(0, 30).join(', ')}${room.stripped.length > 30 ? ` … (+${room.stripped.length - 30} more)` : ''}` : '(nothing present to strip)'}\ndiff: allow-list of ${allowedPaths.length}/${changedPaths.length} changed path(s) the verifier may see (byte-exact, predicate-filtered)\nroom manifest: ${path.join(room.recordDir, 'room-manifest.json')}\nboot stubs seeded: ${room.seededStubs.join(', ') || '(none needed)'}\nnode_modules: ${room.modules.mode}${room.modules.ms ? ` in ${room.modules.ms}ms` : ''} — NEVER a symlink into the live repo (BUG-112)\nescaping symlinks removed: ${room.escapes.length ? room.escapes.join(', ') : '(none)'}\n`);
     process.stdout.write(prompt);
     // No dispatch will run against this room, so the recorder is done: stop the
     // heartbeat now, so a kept room's vrun sees a dead recorder at once rather
@@ -767,7 +1303,9 @@ async function main() {
   console.error(`  scratch    ${room.scratch.dir} (${room.scratch.source})${room.scratch.degraded ? ` — DEGRADED: a boot-wiped temp dir; set $${SCRATCH_ENV} to something persistent` : ''}`);
   if (room.modules.fsCheck) console.error(`  ${room.modules.fsCheck.ok ? 'reflink    ' : 'REFLINK LOST '}${room.modules.fsCheck.message}`);
   console.error(`  clean room ${room.dir}`);
-  console.error(`  stripped   ${room.stripped.join(', ') || '(nothing present to strip)'}`);
+  console.error(`  inputs     given: ${room.allowed.join(', ') || 'code, config and tests only (no board/methodology)'} — recorded in ${path.join(room.recordDir, 'room-manifest.json')}`);
+  console.error(`  stripped   ${room.stripped.length} node(s)${room.stripped.length ? `: ${room.stripped.slice(0, 12).join(', ')}${room.stripped.length > 12 ? ` … (+${room.stripped.length - 12} more)` : ''}` : ' (nothing present to strip)'}`);
+  console.error(`  diff       allow-list ${allowedPaths.length}/${changedPaths.length} changed path(s) the verifier may see — board/methodology excluded by predicate, at any depth, byte-exact (BUG-186)`);
   console.error(`  boot stubs ${room.seededStubs.join(', ') || '(none needed)'} (inert placeholders so the stripped server can boot)`);
   console.error(`  node_modules ${room.modules.mode}${room.modules.ms ? ` in ${room.modules.ms}ms` : ''} — copied, never linked, so nothing in the room can write into the live repo (BUG-112)`);
   if (room.escapes.length) console.error(`  contained  removed ${room.escapes.length} symlink(s) pointing OUT of the clean room: ${room.escapes.join(', ')}`);
@@ -925,13 +1463,13 @@ ${CITATION_CONTRACT}`;
   const exit = reportValidation(v);
   if (v.valid) {
     console.log('');
-    console.log('Paste this into the ticket (it names a dispatch run, which an in-process');
-    console.log('Task subagent cannot produce):');
-    console.log(formatVerifiedBy({
-      provider: opts.provider, model: opts.model, verdict: v.verdict,
-      runId: runId ?? 'UNKNOWN-RUN-ID',
-    }));
-    if (!runId) console.log('  WARNING: the dispatch printed no run id — the line above will NOT pass board:check.');
+    // BUG-225 r3: proof is a TYPED entry written by the board tool — a pasted
+    // prose `Verified-by:` line counts for nothing.
+    console.log('Record it on the ticket (a typed entry naming the dispatch run, which an');
+    console.log('in-process Task subagent cannot produce):');
+    console.log(`  node scripts/board-tool.mjs verified --id=<TICKET> --provider=${opts.provider}` +
+      `${opts.model ? ` --model=${opts.model}` : ''} --run=${runId ?? 'UNKNOWN-RUN-ID'} --verdict=${String(v.verdict ?? '').toUpperCase()}`);
+    if (!runId) console.log('  WARNING: the dispatch printed no run id — the board tool will refuse the command above.');
   }
   process.exit(exit);
 }

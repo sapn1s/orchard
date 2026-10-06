@@ -39,7 +39,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { parseVerifiedBy } from './lib/verdict-contract.mjs';
+// BUG-225 r3 — proof of independent verification is a TYPED entry read through
+// the ONE source (record `verification[]` / ledger / frozen legacy snapshot);
+// prose `Verified-by:` lines are never parsed here to decide proof.
+import {
+  ticketVerifications, unfrozenProseVerifications, frozenDrift, loadFrozen, loadLedger,
+  entryProblems, buildFrozenSnapshot, FROZEN_FILE, LEDGER_FILE,
+} from './lib/verification-source.mjs';
+// FEAT-166 r3 — a user's answer is a TYPED entry (record decision.answers[] / the
+// answer ledger / the frozen pre-r3 snapshot); board:check only accounts for the
+// display headings, it never decides "answered".
+import {
+  unaccountedAnswerHeadings, loadAnswerFrozen, loadAnswerLedger, ANSWER_FROZEN_FILE, ANSWER_LEDGER_FILE,
+} from './lib/answer-source.mjs';
 // FEAT-106 — the default board dir is resolved (docs/bugs legacy or .orchard/bugs
 // consolidated) rather than hard-coded, so this tool checks the right board in a
 // migrated project. An explicit --dir still wins. board.mjs is COPIED into
@@ -300,6 +312,7 @@ function readTickets(dir) {
     warnings.push(...parsed.warnings);
 
     const id = t.id;
+    const verification = ticketVerifications(dir, { id, markdown: text });
     tickets.set(id, {
       id,
       file,
@@ -330,7 +343,16 @@ function readTickets(dir) {
       statusWarnings: t.statusWarnings,
       statusAmbiguous: t.statusAmbiguous,
       idMismatch: t.idMismatch,
-      verifiedBy: parseVerifiedBy(text),
+      // BUG-225 r3 — the typed evidence and the ONE rule over it. `verifiedBy`
+      // is truthy only when a HOLDS stands with no outstanding BROKEN.
+      verification,
+      verifiedBy: verification.verified ? verification : null,
+      // Prose `Verified-by:` lines added after the freeze (never counted) and
+      // frozen records whose source line vanished — both named by checkBoard.
+      unfrozenProse: unfrozenProseVerifications(dir, id, text),
+      frozenDrift: frozenDrift(dir, id, text),
+      // FEAT-166 r3 — user-reply-shaped headings no typed/frozen answer accounts for.
+      unaccountedAnswers: unaccountedAnswerHeadings(dir, id, text, parsed.format === 'block' ? parsed.record : null),
       lastEntryDate: lastActivityDate(text),
       verifiedDate: verifiedDate(t.statusRaw, text),
       exemptFromVerify: VERIFY_EXEMPT_RE.test(text),
@@ -475,6 +497,49 @@ function checkBoard(dir) {
   // classifies (ticket-schema.mjs classifyLegacyStatus; ARCH-017 was the live
   // instance). So the AMBIGUOUS STATUS advisory no longer fires.
   const warns = [...parseWarnings];
+  // BUG-225 r3 — the typed-verification stores are part of the board.
+  const frozen = loadFrozen(dir);
+  if (!frozen.present) {
+    // Absent snapshot on a board that HAS dispatch-shaped prose: every legacy
+    // verification silently stops counting — as loud as losing one frozen line
+    // (DRIFT), so FAIL. A board with no such prose has nothing to freeze.
+    const withProse = [...tickets.values()].filter((t) => t.unfrozenProse.length).map((t) => t.id);
+    const msg = `${FROZEN_FILE} is absent, so no prose Verified-by line on this board counts as verification ` +
+      `(${withProse.length} ticket(s) carry one${withProse.length ? `: ${withProse.slice(0, 8).join(', ')}${withProse.length > 8 ? ', …' : ''}` : ''}). ` +
+      'Restore it, or on a board that never froze run `node scripts/board.mjs freeze-verifications` ONCE and pin its hash.';
+    if (withProse.length) fails.push(`FROZEN VERIFICATIONS MISSING: ${msg}`);
+    else warns.push(`NO FROZEN LEGACY VERIFICATIONS (advisory): ${msg}`);
+  } else if (frozen.error) {
+    fails.push(`FROZEN VERIFICATIONS UNREADABLE: ${FROZEN_FILE} — ${frozen.error}`);
+  } else if (!frozen.pinned) {
+    fails.push(`FROZEN VERIFICATIONS UNPINNED: ${FROZEN_FILE} sha256 ${frozen.sha256} is not in FROZEN_LEGACY_PINS ` +
+      '(scripts/lib/verification-source.mjs). The snapshot is written once; an edited or re-frozen file is not trusted and none of it counts.');
+  }
+  // FEAT-166 r3 — the typed-answer stores, mirroring the verification ones above.
+  const answerFrozen = loadAnswerFrozen(dir);
+  const answerFrozenOk = answerFrozen.present && answerFrozen.pinned && !answerFrozen.error;
+  if (answerFrozen.present && answerFrozen.error) {
+    fails.push(`FROZEN ANSWERS UNREADABLE: ${ANSWER_FROZEN_FILE} — ${answerFrozen.error}`);
+  } else if (answerFrozen.present && !answerFrozen.pinned) {
+    fails.push(`FROZEN ANSWERS UNPINNED: ${ANSWER_FROZEN_FILE} sha256 ${answerFrozen.sha256} is not in ANSWER_FROZEN_PINS ` +
+      '(scripts/lib/answer-source.mjs). The snapshot is written once; an edited or re-frozen file is not trusted and no pre-r3 answer counts.');
+  } else if (!answerFrozen.present) {
+    const withHeads = [...tickets.values()].filter((t) => t.unaccountedAnswers.length).map((t) => t.id);
+    if (withHeads.length) {
+      fails.push(`FROZEN ANSWERS MISSING: ${ANSWER_FROZEN_FILE} is absent, so no prose answer on this board counts ` +
+        `(${withHeads.length} ticket(s) carry one: ${withHeads.slice(0, 8).join(', ')}${withHeads.length > 8 ? ', …' : ''}). ` +
+        'Restore it, or on a board that never froze run `node scripts/freeze-answers.mjs` ONCE and pin its hash.');
+    }
+  }
+  const answerLedger = loadAnswerLedger(dir);
+  if (answerLedger.error) fails.push(`ANSWER LEDGER UNREADABLE: ${ANSWER_LEDGER_FILE} — ${answerLedger.error}`);
+  const ledger = loadLedger(dir);
+  if (ledger.error) fails.push(`VERIFICATION LEDGER UNREADABLE: ${LEDGER_FILE} — ${ledger.error}`);
+  ledger.entries.forEach((e, i) => {
+    const probs = entryProblems(e);
+    if (!tickets.has(e?.id)) probs.push(`id ${JSON.stringify(e?.id)} is not a ticket on this board`);
+    if (probs.length) fails.push(`VERIFICATION LEDGER ENTRY INVALID: ${LEDGER_FILE} entries[${i}] — ${probs.join('; ')}`);
+  });
 
   for (const t of tickets.values()) {
     if (t.idMismatch) {
@@ -535,12 +600,50 @@ function checkBoard(dir) {
     // verified today with a stale log silently bypasses the nudge.
     if (t.done && !t.verifiedBy && !t.exemptFromVerify &&
         t.verifiedDate && t.verifiedDate >= VERIFY_RULE_EFFECTIVE) {
+      // BUG-225 r3 (F5): only a HOLDS with no outstanding BROKEN counts. A ticket
+      // whose every verdict is BROKEN/INVALID was checked and did not pass.
+      const got = t.verification.entries.length
+        ? ` (its ${t.verification.entries.length} recorded verdict(s) [${t.verification.entries.map((e) => e.verdict).join(',')}] include no HOLDS that stands)`
+        : '';
       warns.push(
-        `NO INDEPENDENT VERIFICATION (advisory): ${t.id} is ${t.statusRaw} but carries no ` +
-        '`Verified-by: dispatch <provider> run <id>` line — it was verified by whoever fixed it. ' +
-        'Run `node scripts/independent-verify.mjs` and paste the line it prints, or mark the ticket ' +
+        `NO INDEPENDENT VERIFICATION (advisory): ${t.id} is ${t.statusRaw} but carries no standing HOLDS ` +
+        `verification${got} — it was verified by whoever fixed it. Run \`node scripts/independent-verify.mjs\` ` +
+        'and record its verdict with `node scripts/board-tool.mjs verified`, or mark the ticket ' +
         '`Verification-class: trivial` (or `docs-only`) if the threshold genuinely does not apply.'
       );
+    }
+
+    // BUG-225 r3: a prose `Verified-by:` line is NOT proof. One typed after the
+    // freeze is never counted, in any spelling — so name it loudly instead of
+    // letting a lane believe it recorded a verification.
+    // Only against a pinned snapshot: without one, the file-level finding above
+    // already says no prose counts, and a per-line echo of it would be noise.
+    for (const u of frozen.pinned && !frozen.error ? t.unfrozenProse : []) {
+      const msg = `PROSE VERIFIED-BY NOT COUNTED (advisory): ${t.id} (${t.file}) line ${u.lineNo} is a hand-written verification ` +
+        'record; prose is not proof. Record it with `node scripts/board-tool.mjs verified --id ' + t.id +
+        ' --provider … --model … --run … --verdict HOLDS|BROKEN|INVALID` (the typed entry is what the board reads): ' +
+        JSON.stringify(u.line);
+      // WARN, not FAIL (BUG-225 round 4, orchestrator decision): prose is no longer
+      // proof, so a post-freeze line is harmless — it must not block board-tool
+      // commit or another session's lane. It still counts for nothing.
+      warns.push(msg);
+    }
+    // FEAT-166 r3 — a user-answer heading typed after the freeze by anything but the
+    // server's answer route counts for NOTHING (the typed entry is the answer). Named
+    // loudly so a lane that imitated one learns it recorded no answer. WARN, mirroring
+    // BUG-225 r4's prose Verified-by decision: harmless, so it must not block commits.
+    for (const u of answerFrozenOk ? t.unaccountedAnswers : []) {
+      warns.push(`PROSE ANSWER NOT COUNTED (advisory): ${t.id} (${t.file}) line ${u.line} is a user-answer-shaped heading ` +
+        `(${JSON.stringify(u.author)}) that no typed answer accounts for. Only the server's answer route (the Decide card / ` +
+        'Needs-You rail) records a user answer; a heading in the Activity log is display, never the answer.');
+    }
+    for (const d of t.frozenDrift) {
+      fails.push(d.reason === 'changed'
+        ? `FROZEN VERIFICATION DRIFT: ${t.id} (${t.file}) the Verified-by record frozen for run ${d.run_id} ` +
+          `(verdict ${d.verdict}) no longer reads that way — its continuation was edited or its head line moved ` +
+          'under new text. The Activity log is append-only; restore the record.'
+        : `FROZEN VERIFICATION DRIFT: ${t.id} (${t.file}) no longer contains the Verified-by line frozen for run ` +
+          `${d.run_id} — the Activity log is append-only; restore the line.`);
     }
 
     const boardRow = inOpen ? idx.openRows.get(t.id) : inDone ? idx.doneRows.get(t.id) : null;
@@ -1035,12 +1138,31 @@ async function main() {
       console.log(`DRIFT — ${fails.length} problem(s) found`);
       process.exit(1);
     }
+  } else if (cmd === 'freeze-verifications') {
+    // BUG-225 r3 — capture the legacy prose reader's output ONCE. Refuses to
+    // overwrite: re-freezing would bless every prose line typed since.
+    const out = path.join(dir, FROZEN_FILE);
+    if (fs.existsSync(out)) {
+      console.error(`board.mjs freeze-verifications: ${out} already exists — the snapshot is written once and never regenerated.`);
+      process.exit(1);
+    }
+    const files = fs.readdirSync(dir).filter((f) => TICKET_FILE_RE.test(f)).sort()
+      .map((f) => ({ id: `${TICKET_FILE_RE.exec(f)[1]}-${TICKET_FILE_RE.exec(f)[2]}`, file: f }));
+    const snap = buildFrozenSnapshot(dir, files, { today: new Date().toISOString().slice(0, 10) });
+    const bytes = `${JSON.stringify(snap, null, 2)}\n`;
+    fs.writeFileSync(out, bytes);
+    const { createHash } = await import('node:crypto');
+    const sha = createHash('sha256').update(bytes).digest('hex');
+    const nRec = Object.values(snap.tickets).reduce((a, t) => a + t.records.length, 0);
+    console.log(`board:freeze-verifications — ${Object.keys(snap.tickets).length} ticket(s), ${nRec} record(s) → ${out}`);
+    console.log(`PIN IT: add '${sha}' to FROZEN_LEGACY_PINS in lib/verification-source.mjs — until then none of it counts.`);
+    process.exit(0);
   } else if (cmd === 'gen') {
     genBoard(dir);
     console.log(`board:gen — rewrote ${path.join(dir, 'INDEX.md')}`);
     process.exit(0);
   } else {
-    console.error('usage: node scripts/board.mjs <check|gen> [--dir=docs/bugs]');
+    console.error('usage: node scripts/board.mjs <check|gen|freeze-verifications> [--dir=docs/bugs]');
     process.exit(2);
   }
 }

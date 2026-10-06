@@ -25,6 +25,9 @@
  * Env knobs: FAKE_OMIT_HOOKS_APPLIED=1 (an "old CLI" that answers a repeated
  * initialize without the field), FAKE_IGNORE_EOF=1 (stay alive after stdin EOF
  * while any lane lives — the real CLI's posture), FAKE_SDK_ID.
+ * FAKE_TRANSCRIPT_DIR (BUG-217 round 5, opt-in): append each user message and
+ * the turn's reply to `<dir>/<FAKE_SDK_ID>.jsonl`, as the real CLI records what
+ * it took — the receiver's own record the outbox confirms a delivery from.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -182,8 +185,29 @@ function onInitializeNow(m) {
 }
 
 let turn = 0;
+function record(role, text) {
+  const dir = process.env.FAKE_TRANSCRIPT_DIR;
+  if (!dir) return;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const at = new Date().toISOString();
+    const row = role === 'user'
+      ? { type: 'user', uuid: `u-fake-${process.pid}-${turn}`, sessionId: SDK_ID, cwd: process.cwd(), timestamp: at, message: { role: 'user', content: text } }
+      : { type: 'assistant', uuid: `a-fake-${process.pid}-${turn}`, sessionId: SDK_ID, cwd: process.cwd(), timestamp: at, message: { role: 'assistant', model: 'claude-haiku-4-5', content: [{ type: 'text', text }] } };
+    // FEAT-168 r6 (opt-in): the fields CLI >= 2.1.197 writes on a prompt that came
+    // in through stdin (`promptSource:"sdk"`, `promptId`, `version`), so a suite can
+    // grade a reader against the modern record shape. Off by default: other suites
+    // keep the exact rows they were written against.
+    if (process.env.FAKE_TRANSCRIPT_SHAPE === 'modern') {
+      row.version = '2.1.286';
+      if (role === 'user') { row.promptSource = 'sdk'; row.promptId = `p-fake-${process.pid}-${turn}`; row.isSidechain = false; row.userType = 'external'; }
+    }
+    fs.appendFileSync(path.join(dir, `${SDK_ID}.jsonl`), `${JSON.stringify(row)}\n`);
+  } catch { /* the transcript is best-effort in a fake */ }
+}
 async function runTurn(text) {
   turn++;
+  record('user', String(text));
   say({ type: 'system', subtype: 'init', session_id: SDK_ID, cwd: process.cwd(), model: 'haiku', tools: [], slash_commands: [], mcp_servers: [] });
   say({ type: 'assistant', message: { model: 'claude-haiku-4-5', content: [{ type: 'text', text: `turn ${turn}: ${String(text).slice(0, 60)}` }] }, session_id: SDK_ID });
   // A directive in the prompt lets a harness shape the first turn without a command file.
@@ -194,6 +218,7 @@ async function runTurn(text) {
       for (const c of Array.isArray(d) ? d : [d]) await runCommand(c);
     } catch (e) { log({ ev: 'bad-directive', e: String(e) }); }
   }
+  record('assistant', `turn ${turn}: ${String(text).slice(0, 60)}`);
   say({ type: 'result', subtype: 'success', total_cost_usd: 0, session_id: SDK_ID });
 }
 

@@ -414,6 +414,29 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
    the marker column's job (.pin-mark above), not the type's. */
 .row.named { color: color-mix(in srgb, var(--ink) 45%, var(--ink-2)); }
 
+/* FEAT-168 — a CLOSED (done) session. Muted / "set aside", deliberately NOT red
+   (red is reserved for a death/error, --st-high). The archive-box marker carries
+   the meaning (a distinct SHAPE from the pin bookmark and the lifecycle dots), the
+   dimmed tone carries "this is finished". Closed rows are only ever seen in the
+   expanded ("N more") view, so they read as a quiet archived tier beneath the live
+   rows. Works in light and dark because it is built from the shared ink tokens. */
+.row.closed { color: var(--ink-4); }
+.row.closed .when { opacity: .5; }
+.row .closed-mark {
+  float: right; margin-left: 8px; margin-top: 1px;
+  color: var(--ink-4-struct);
+}
+.row .closed-mark svg { display: block; }
+/* On the open row / under the cursor, lift it just enough that the marker and
+   title never fade out exactly where the eye lands — still clearly the quiet tier. */
+.row.closed[aria-current="true"] { color: color-mix(in srgb, var(--ink) 55%, var(--ink-2)); }
+.row.closed:hover .closed-mark,
+.row.closed[aria-current="true"] .closed-mark { color: var(--ink-3); }
+
+/* FEAT-168 — the crown Close/Reopen pill wears an .on state while the session IS
+   closed, so the control reflects the current state the way the pin menu item does. */
+.close-sess-pill.on { color: var(--ink); background: var(--hair-2); }
+
 /* FEAT-073 — the not-yet-sent "New session". It is the open session (so it
    already wears the aria-current highlight), but it has no history behind it
    yet: italic marks it as provisional/draft, so a glance separates "the new
@@ -849,6 +872,94 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .git-dot[data-state="conflict"] { border-radius: 1px; background: var(--danger); transform: rotate(45deg); }
 .seal .readout.git .n { color: var(--ink-4); font-variant-numeric: tabular-nums; }
 .seal .readout.git .n:empty { display: none; }
+/* FEAT-165 — the inline diffstat: "12 files +340 −28". Tabular numerals so a poll
+   that moves a count never shifts the bar; green/red are the same tokens the Git
+   panel uses for its per-file +/− (git-view.css), mixed toward ink so they stay
+   readable as small text on both the light and the dark surface. The sign
+   characters carry the meaning, so colour is reinforcement, never the only cue. */
+.seal .readout.git { gap: 5px; }
+.git-stat { display: inline-flex; gap: 4px; font-variant-numeric: tabular-nums; font-weight: 600; }
+.git-stat[hidden] { display: none; }
+.git-add { color: color-mix(in srgb, var(--st-done) 82%, var(--ink)); }
+.git-del { color: color-mix(in srgb, var(--st-high) 82%, var(--ink)); }
+.seal .readout.git:hover .n, .seal .readout.git:focus-visible .n,
+.seal .readout.git[aria-expanded="true"] .n { color: var(--ink-2); }
+.seal .readout.git[aria-expanded="true"] { border-color: var(--hair); background: var(--window); }
+/* FEAT-163 — not a repository: a dashed hollow ring (no branch, nothing tracked)
+   and a quiet "no git" label; it reads as an offer, not a warning. */
+.git-dot[data-state="none"] { border-radius: 50%; background: transparent; border: 1.5px dashed var(--ink-4); }
+.seal .readout.git[data-repo="false"] .n { font-style: italic; }
+@media (max-width: 1100px) { .seal .readout.git .git-unit { display: none; } }
+
+/* FEAT-165 — the git detail popover. Same .pop chrome as the usage popover: a
+   header (branch, upstream), the diffstat, then the changed files. Rows are
+   letter · path · counts; the directory is quiet and truncates first so the file
+   name survives; the status letter is tinted by kind (added green, deleted red,
+   renamed ochre, untracked quiet) and a staged file's letter is a filled tile. */
+.pop.git-pop { width: 380px; max-width: calc(100vw - 16px); padding: 4px 4px 2px; }
+.pop.git-pop::before { content: ""; position: absolute; left: 0; right: 0; top: -8px; height: 8px; }
+.gp-head { display: flex; align-items: baseline; gap: 8px; padding: 9px 10px 2px; }
+.gp-branch { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.gp-up { margin-left: auto; flex: none; font-size: 11px; color: var(--ink-4); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.gp-last { padding: 0 10px; font-size: 11px; color: var(--ink-4); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-sum {
+  display: flex; align-items: baseline; gap: 8px; margin: 8px 6px 4px; padding: 7px 8px;
+  border-radius: 6px; background: var(--sunken); font-size: 12px; font-variant-numeric: tabular-nums;
+}
+.gp-files { color: var(--ink-2); font-weight: 600; }
+.gp-add { color: color-mix(in srgb, var(--st-done) 82%, var(--ink)); font-weight: 600; }
+.gp-del { color: color-mix(in srgb, var(--st-high) 82%, var(--ink)); font-weight: 600; }
+.gp-conflict { margin-left: auto; color: var(--danger); font-weight: 600; }
+.gp-note { padding: 4px 10px; font-size: 11.5px; line-height: 1.45; color: var(--ink-4); }
+.gp-list {
+  max-height: min(46vh, 360px); overflow-y: auto; scrollbar-width: thin;
+  margin: 2px 2px 4px; padding: 2px 0;
+}
+.gp-list::-webkit-scrollbar { width: 9px; }
+.gp-list::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 9px; border: 3px solid var(--window); }
+.gp-row {
+  display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; align-items: center; gap: 8px;
+  padding: 3px 8px; border-radius: 5px; font-size: 12px; line-height: 1.35;
+}
+.gp-row:hover { background: var(--sunken); }
+.gp-letter {
+  width: 16px; height: 16px; display: inline-grid; place-items: center; border-radius: 4px;
+  font: 600 10px var(--mono); color: var(--ink-3); border: 1px solid var(--hair);
+}
+.gp-row[data-type="added"] .gp-letter { color: color-mix(in srgb, var(--st-done) 85%, var(--ink)); border-color: color-mix(in srgb, var(--st-done) 40%, var(--hair)); }
+.gp-row[data-type="deleted"] .gp-letter { color: color-mix(in srgb, var(--st-high) 85%, var(--ink)); border-color: color-mix(in srgb, var(--st-high) 40%, var(--hair)); }
+.gp-row[data-type="renamed"] .gp-letter { color: color-mix(in srgb, var(--warn) 85%, var(--ink)); border-color: color-mix(in srgb, var(--warn) 40%, var(--hair)); }
+.gp-row[data-type="modified"] .gp-letter { color: var(--ink-2); }
+.gp-row[data-type="untracked"] .gp-letter { color: var(--ink-4); border-style: dashed; }
+.gp-row.staged .gp-letter { background: color-mix(in srgb, var(--ink-3) 16%, transparent); border-style: solid; }
+.gp-path { display: flex; min-width: 0; white-space: nowrap; }
+.gp-dir { color: var(--ink-4); overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
+.gp-base { color: var(--ink); flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.gp-n { display: inline-flex; gap: 6px; font: 11px var(--mono); font-variant-numeric: tabular-nums; }
+.gp-n .gp-add, .gp-n .gp-del { font-weight: 500; }
+.gp-bin { color: var(--ink-4); }
+.gp-more { text-align: center; }
+.git-pop .pop-foot { border-top: 1px solid var(--hair); margin-top: 2px; }
+.gp-where {
+  margin: 2px 10px 6px; padding: 5px 8px; border-radius: 6px; background: var(--sunken);
+  font: 11px var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gp-init { display: flex; align-items: center; gap: 8px; padding: 4px 10px 10px; }
+.gp-ask { font-size: 12px; color: var(--ink-2); margin-right: auto; }
+.gp-btn {
+  padding: 5px 11px; border-radius: 6px; font: 600 11.5px var(--sans); cursor: pointer;
+  color: var(--ink-2); border: 1px solid var(--hair); background: var(--window);
+}
+.gp-btn:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-4); }
+.gp-btn.primary { color: var(--on-solid); background: var(--ink); border-color: var(--ink); }
+.gp-btn.primary:hover:not(:disabled) { color: var(--on-solid); background: var(--ink-2); border-color: var(--ink-2); }
+.gp-btn:disabled { opacity: .55; cursor: default; }
+.gp-btn:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--focus); }
+/* A server refusal can be a paragraph; show four lines, the whole text on hover. */
+.gp-err {
+  margin: 0 10px 10px; font-size: 11.5px; color: var(--danger); line-height: 1.4;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden;
+}
 
 /* Usage window-burn ring — the arc LENGTH is the reading (a near-full ring reads
    near-full at any hue), so state is not colour-alone. Track is a faint constant
@@ -860,6 +971,83 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .seal .readout.usage.warn   .usage-ring .fill { stroke: var(--warn); }
 .seal .readout.usage.danger .usage-ring .fill { stroke: var(--danger); }
 .seal .readout.usage.unknown .usage-ring .track { stroke: var(--ink-4); opacity: .5; }
+
+/* FEAT-161 r2 — the maxed-out face. When the binding window is full the readout
+   becomes a soft brick capsule (tint + ink, no outline) holding the ring and the
+   live countdown, so "blocked, back in 1h 23m" reads as ONE object rather than a
+   hollow red "O" with a stray number beside it. Tabular numerals: the ticking
+   seconds never shift the width. */
+.usage-countdown {
+  font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums;
+  letter-spacing: .01em; color: var(--danger); white-space: nowrap; line-height: 1;
+}
+.usage-countdown[hidden] { display: none; }
+.seal .readout.usage.maxed {
+  gap: 5px; padding: 3px 8px 3px 5px; border-radius: 999px;
+  background: color-mix(in srgb, var(--danger) 11%, transparent);
+  border-color: transparent;
+}
+.seal .readout.usage.maxed:hover, .seal .readout.usage.maxed:focus-visible,
+.seal .readout.usage.maxed[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--danger) 17%, transparent);
+  border-color: transparent;
+}
+.seal .readout.usage.maxed:focus-visible { box-shadow: 0 0 0 2px var(--focus); }
+.seal .readout.usage.maxed .usage-ring .track { stroke: color-mix(in srgb, var(--danger) 30%, transparent); }
+
+/* FEAT-161 r2 — the provider-usage popover. One group per provider: a header
+   (name, quiet plan, and — only when blocked — "Limit reached" on the right), then
+   its windows as label/percent, bar, reset line. The binding window is the
+   emphasised row (full ink label, heavier bar); the others step back. Bars are
+   calm moss < 75%, ochre to 99%, brick only when full. One type family; size and
+   ink tier carry the hierarchy, not tags. */
+.pop.usage-pop { width: 320px; max-width: calc(100vw - 16px); padding: 4px 4px 2px; }
+/* Invisible bridge over the 6px gap to the chip so the pointer never "leaves". */
+.pop.usage-pop::before { content: ""; position: absolute; left: 0; right: 0; top: -8px; height: 8px; }
+.usnap { padding: 10px 12px 12px; }
+.usnap + .usnap { border-top: 1px solid var(--hair); }
+.usnap-h { display: flex; align-items: baseline; gap: 8px; margin-bottom: 12px; }
+.usnap-name { font-size: 13px; font-weight: 600; color: var(--ink); }
+.usnap-plan { font-size: 11.5px; color: var(--ink-4); }
+.usnap-status {
+  margin-left: auto; font-size: 11.5px; font-weight: 600; color: var(--danger);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.usnap.unknown .usnap-h { margin-bottom: 4px; }
+.usnap.unknown .usnap-name { color: var(--ink-2); font-weight: 500; }
+.usnap-note { font-size: 11.5px; color: var(--ink-4); line-height: 1.45; }
+.uwins { display: grid; gap: 13px; }
+.uwin-top { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.uwin-label { font-size: 12px; color: var(--ink-2); }
+.uwin-scope { color: var(--ink-4); margin-left: 6px; }
+.uwin-pct {
+  margin-left: auto; font-size: 12px; color: var(--ink-3);
+  font-variant-numeric: tabular-nums;
+}
+.uwin.binding .uwin-label { color: var(--ink); font-weight: 600; }
+.uwin.binding .uwin-pct { color: var(--ink); font-weight: 600; }
+.uwin.warn .uwin-pct { color: var(--warn); }
+.uwin.full .uwin-pct { color: var(--danger); }
+.ubar {
+  height: 4px; border-radius: 99px; overflow: hidden;
+  background: color-mix(in srgb, var(--ink-4) 18%, transparent);
+}
+.uwin.binding .ubar { height: 6px; }
+.ubar-fill {
+  height: 100%; border-radius: inherit; min-width: 3px;
+  background: var(--live); transition: width .3s ease;
+}
+.uwin.warn .ubar-fill { background: var(--warn); }
+.uwin.full .ubar-fill { background: var(--danger); }
+.uwin-reset {
+  margin-top: 6px; font-size: 11px; color: var(--ink-4); line-height: 1.3;
+  font-variant-numeric: tabular-nums;
+}
+.uwin-reset.unknown { font-style: italic; }
+.usage-foot {
+  border-top: 1px solid var(--hair); padding: 7px 12px 6px;
+  font-size: 10.5px; color: var(--ink-4); text-align: right;
+}
 
 /* The sidebar toggle mirrors its glyph when collapsed so the panel bar sits on
    the side the sidebar will grow toward — reading as "expand", not "collapse". */
@@ -1935,7 +2123,7 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
    row; mixing them is what made the old panel look improvised. */
 .set {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(110px, 200px) 46px;
+  grid-template-columns: minmax(0, 1fr) auto minmax(120px, 260px) 46px;
   align-items: baseline; column-gap: 10px;
   min-height: 34px;
   width: 100%; text-align: left;
@@ -1944,23 +2132,9 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   border-bottom: 1px solid var(--hair-2);
 }
 .set:last-child { border-bottom: 0; }
-/* A cycle row stays a <button> — but its gutter controls must be real buttons
-   too, and a button inside a button is not valid HTML. So the cycle button
-   spans columns 1-3 as a SUBGRID (its label / chip / value land on exactly the
-   same rails as every non-cycle row) and the gutter sits OUTSIDE it, in the
-   row's own column 4. The click handler is on the row, so the whole row —
-   including its padding — still cycles, and keyboard activation of the inner
-   button bubbles to the same handler. */
-.set > .set-main {
-  grid-column: 1 / 4;
-  display: grid; grid-template-columns: subgrid;
-  align-items: baseline; column-gap: 10px;
-  width: 100%; text-align: left; min-width: 0;
-}
-/* The focus ring belongs to the whole row, not to the inner button's box. */
-.set > .set-main:focus-visible { outline: none; }
-.set:has(> .set-main:focus-visible) { outline: 2px solid var(--ink-4); outline-offset: -2px; }
-button.set:hover, .set[data-cycle="true"]:hover { background: var(--window); }
+/* FEAT-159 — there is no "cycle row" any more. A row used to be one big
+   button that wrote the next value of a hidden list on every click; a row is
+   now inert, and only the control in column 3 writes. */
 /* item TITLE — the brightest text in a row, so titles carry the eye */
 /* FEAT-146 round 4 — FOUR type steps in this pane, and only four:
      15    item label (sans, 500)
@@ -1971,7 +2145,7 @@ button.set:hover, .set[data-cycle="true"]:hover { background: var(--window); }
    threshold, so they read as mush rather than hierarchy. Everything the extra
    steps used to carry is carried by weight and colour instead. */
 .set .l { font-size: 15px; color: var(--ink); font-weight: 500; min-width: 0; }
-.set > .l, .set > .set-main > .l { grid-column: 1; }
+.set > .l { grid-column: 1; }
 .set .f {
   font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   margin-top: 3px; display: block; font-weight: 400; letter-spacing: 0;
@@ -1983,17 +2157,76 @@ button.set:hover, .set[data-cycle="true"]:hover { background: var(--window); }
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
-.set > .v, .set > .set-main > .v { grid-column: 3; justify-self: end; }
+.set > .v { grid-column: 3; justify-self: end; }
 /* Row 1 is the scalar row; row 2 is the disclosure. Stated explicitly because
    auto-placement is SPARSE: the full-width `.set-why` is appended before the
    gutter, and a gutter auto-placed after it would be pushed onto row 2 with it
    — which puts the ⓘ half a paragraph below the label it belongs to. */
-.set > .l, .set > .prov, .set > .v, .set > .set-main, .set > .sgut, .set > input.vin { grid-row: 1; }
+.set > .l, .set > .prov, .set > .v, .set > .sgut, .set > input.vin, .set > .ssel, .set > .smoney { grid-row: 1; }
 .set > .set-why { grid-row: 2; }
 /* A value slot holding ACTIONS (stop this process, delete this account) is not
-   a scalar value: it takes the width it needs rather than the 200px value rail. */
+   a scalar value: it takes the width it needs rather than the 260px value rail. */
 .set > .v:has(button) { grid-column: 2 / -1; }
 .set > input.vin { grid-column: 3; }
+
+/* ── FEAT-159: the value controls ────────────────────────────────────────────
+   One field box for every control that lives in the value rail — dropdown,
+   amount, free text — so a row reads as "label … the thing you change" and the
+   column of boxes is itself the affordance. Same hairline + radius + hover as
+   the machine pane's .gsel/.gtext, one step smaller to sit on a 34px row.
+   --window inside a --sunken card lifts in light and recesses in dark: the
+   app's own convention (see .set-why), kept on purpose. */
+.set > .ssel, .set > .smoney, .set > input.vin { grid-column: 3; }
+/* The 30px box sits on the row's text baseline like a plain value would; the
+   negative block margin stops it pushing the label's first line down, so the
+   chip, the value and the gutter stay on one line box (the polish suite measures
+   that spread). */
+.set > .ssel, .set > .smoney, .set > input.vin { margin-block: -6px; }
+.ssel, .snum {
+  width: 100%; min-width: 0; height: 30px; box-sizing: border-box;
+  font: inherit; font-size: 12px; color: var(--ink);
+  background-color: var(--window); border: 1px solid var(--hair); border-radius: 7px;
+}
+.ssel {
+  padding: 0 26px 0 10px; font-family: var(--sans);
+  text-overflow: ellipsis; white-space: nowrap; cursor: pointer;
+  appearance: none; -webkit-appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--ink-3) 50%),
+                    linear-gradient(135deg, var(--ink-3) 50%, transparent 50%);
+  background-position: right 13px top 50%, right 8px top 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+.ssel option { background: var(--window); color: var(--ink); }
+.ssel:hover, .snum:hover { border-color: var(--ink-4); }
+.ssel:disabled { cursor: not-allowed; color: var(--ink-4); }
+.ssel:disabled:hover { border-color: var(--hair); }
+.smoney { position: relative; display: block; }
+.smoney-u {
+  position: absolute; left: 10px; top: 50%; transform: translateY(-50%);
+  font-family: var(--mono); font-size: 12px; color: var(--ink-3); pointer-events: none;
+}
+.snum { padding: 0 10px 0 22px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.snum:focus { outline: none; border-color: var(--ink-3); }
+.snum::placeholder { color: var(--ink-4); font-family: var(--sans); }
+
+/* The "Custom…" editor opens UNDER its dropdown, in the SAME value column
+   (col 3, with the gutter beside it), so the label/value grid is never broken:
+   the field, then Cancel · Save right-aligned, then the reason and the hint. */
+.set > .set-edit { grid-row: 3; grid-column: 3; }
+.set-edit { display: grid; row-gap: 6px; margin-top: 8px; min-width: 0; }
+.set-edit .gtext { width: 100%; height: 30px; box-sizing: border-box; padding-block: 0; }
+.set-edit .gtext:focus { outline: none; border-color: var(--ink-3); }
+.set-edit .gtext[aria-invalid="true"] { border-color: var(--danger); }
+.set-edit-acts { display: flex; justify-content: flex-end; gap: 6px; }
+.set-edit-acts .mini { height: 28px; box-sizing: border-box; padding-block: 0; cursor: pointer; }
+.set-edit-acts .mini:disabled { opacity: .45; cursor: not-allowed; }
+.mini.primary { background: var(--solid); color: var(--on-solid); border-color: var(--solid); }
+.mini.primary:hover { color: var(--on-solid); border-color: var(--solid); opacity: .9; }
+.set-edit-err:empty { display: none; }
+.set-edit-err, .set-edit-hint { font-size: 11.5px; line-height: 1.45; }
+.set-edit-err { color: var(--danger); }
+.set-edit-hint { color: var(--ink-3); }
 /* dim = the built-in default, the quiet case that carries no chip at all */
 .set .v.dim { color: var(--ink-3); }
 
@@ -2014,7 +2247,7 @@ button.set:hover, .set[data-cycle="true"]:hover { background: var(--window); }
   border-radius: 3px; padding: 0 4px;
   border: 1px solid var(--hair); color: var(--ink-3); background: none;
 }
-.set > .prov, .set > .set-main > .prov { grid-column: 2; justify-self: end; }
+.set > .prov { grid-column: 2; justify-self: end; }
 .set .prov[data-fill="true"] {
   background: var(--solid); color: var(--on-solid); border-color: var(--solid);
 }
@@ -2683,6 +2916,17 @@ button.mode:hover { color: var(--ink); text-decoration-color: var(--ink-4); }
 }
 .set input.vin:focus { outline: none; border-bottom-color: var(--ink-4); }
 .set input.vin::placeholder { color: var(--ink-4); }
+/* FEAT-159 — a free-text VALUE (tool lists, image, Dockerfile) sitting in the
+   value rail gets the same field box as the dropdowns beside it. It used to be
+   borderless right-aligned mono, indistinguishable from a read-only "none". */
+.set > input.vin {
+  height: 30px; box-sizing: border-box; padding: 0 10px; text-align: left;
+  background: var(--window); border: 1px solid var(--hair); border-radius: 7px;
+}
+.set > input.vin:hover { border-color: var(--ink-4); }
+.set > input.vin:focus { border-color: var(--ink-3); }
+.set > input.vin:disabled { color: var(--ink-4); cursor: not-allowed; }
+.set > input.vin::placeholder { font-family: var(--sans); }
 
 /* ── appearance row in the sidebar foot ── */
 .side-foot .val { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
@@ -3284,6 +3528,13 @@ button.lag:hover { background: var(--rail); }
   border-left: 1px solid var(--hair); padding: 4px 0 4px 10px; margin: 4px 0 8px;
 }
 .grp-note.inline { display: inline; padding: 0 8px 0 0; }
+/* FEAT-155 round 5 — the project Dockerfile build log, inside the row's .set-why. */
+.set-why .df-logtog { margin-top: 6px; padding: 0; }
+.set-why .buildlog {
+  font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-2);
+  white-space: pre-wrap; word-break: break-all; max-height: 280px; overflow-y: auto;
+  border-left: 1px solid var(--hair); padding: 4px 0 4px 10px; margin: 6px 0 0;
+}
 
 /* ── FEAT-145: Claude accounts + the add-account sign-in panel ──
    Same vocabulary as the rest of the drawer: .set rows for the list, .gtext /
@@ -3344,6 +3595,13 @@ button.lag:hover { background: var(--rail); }
    the user's asked-for cue and pairs with the green so it survives colour-blindness. */
 .row.fresh { color: color-mix(in srgb, var(--ink) 62%, var(--ink-2)); font-weight: 600; }
 .row.fresh .when { color: var(--live); opacity: 1; }
+/* FEAT-168 round 4 — CLOSED outranks unread. Closing is the user saying "done, set
+   aside", so the unread lift (bolder, brighter, a live-green time) must not undo the
+   muted tier: on a busy day a recently-closed session is usually still "fresh", and
+   it rendered exactly like live work (seen in the round-4 busy-state screenshots). */
+.row.closed.fresh { color: var(--ink-4); font-weight: inherit; }
+.row.closed.fresh .when { color: var(--ink-4); opacity: .5; }
+.row.closed.fresh[aria-current="true"] { color: color-mix(in srgb, var(--ink) 55%, var(--ink-2)); }
 
 /* FEAT-118 — session-list LIFECYCLE markers, one per row on the leading rail
    (the column the `.alive` moss dot already owns). Three salience tiers, so a
@@ -3564,49 +3822,91 @@ button.lag:hover { background: var(--rail); }
 
 /* ── mid-turn send queue (dock rows, like the agent strip) ── */
 /* Queued messages wait in the dock — never in the transcript, where a
-   position would claim they were already said. Expand to read/edit. */
+   position would claim they were already said. */
 .qbox {
   border: 1px dashed var(--hair); border-radius: 9px;
   padding: 4px 6px 6px; background: var(--rail);
   /* the label reports the real count; extra rows scroll inside */
-  max-height: 150px; overflow-y: auto; scrollbar-width: thin;
+  max-height: 240px; overflow-y: auto; scrollbar-width: thin;
 }
+/* BUG-217: the dock's one-line summary is a sentence the user reads ("what
+   happens to my message next"), so it is set as prose, not machine text. */
 .qbox .q-l {
-  font-family: var(--mono); font-size: 10px; color: var(--ink-3);
-  letter-spacing: .04em; padding: 3px 4px 5px;
+  font-family: var(--sans); font-size: 12px; color: var(--ink-2);
+  line-height: 1.4; padding: 3px 6px 5px;
 }
 /* BUG-178: the live elapsed of the foreground step holding the boundary — the
    honest "how long may this wait" signal, so it is weighted above the prose. */
 .qbox .q-l .q-el { color: var(--ink-2); font-weight: 600; }
-.qrow summary {
-  display: flex; align-items: baseline; gap: 7px;
-  padding: 3px 4px; border-radius: 6px; cursor: pointer; list-style: none;
+/* BUG-217 — a row shows its words, a plain status and its actions at once.
+   It used to be a collapsed <details> whose summary held a mono status chip
+   ("unsent · restored · next") that read as buttons, with the real actions
+   hidden until expanded. The status is now muted prose with no border, no
+   hover and no pointer — nothing about it says "press me" — and the buttons
+   are the only pressable things in the row. */
+.qrow { padding: 6px 6px; border-radius: 6px; }
+.qrow + .qrow { border-top: 1px solid var(--hair); border-radius: 0; }
+/* BUG-217 r2 (UI review #2): the actions wrap BELOW the text when the row is
+   too narrow for both (a split window, a narrow pane) instead of squeezing the
+   status and clipping "Discard". The text claims ~14rem before the actions are
+   pushed to their own line, where they sit right-aligned; the buttons wrap
+   among themselves too, so nothing is ever clipped. */
+.qrow .qhead { display: flex; align-items: center; gap: 6px 10px; flex-wrap: wrap; }
+.qrow .qrtext { flex: 1 1 14rem; min-width: 0; }
+.qrow .qp {
+  font-family: var(--sans); font-size: 12.5px; color: var(--ink); line-height: 1.4;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.qrow summary::-webkit-details-marker { display: none; }
-.qrow summary:hover { background: var(--sunken); }
-.qrow .tw { font-size: 8px; color: var(--ink-4); transition: transform .1s; }
-.qrow[open] .tw { transform: rotate(90deg); }
-.qrow .qp { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
-.qrow .qs { flex: none; font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); }
+.qrow .qs {
+  font-family: var(--sans); font-size: 11.5px; color: var(--ink-3);
+  line-height: 1.35; margin-top: 1px; cursor: default; user-select: text;
+}
+.qrow .cacts.qracts { flex: 0 1 auto; margin: 0 0 0 auto; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+.qrow .cacts .mini { padding: 3px 8px; font-size: 11.5px; }
+/* An extreme split (the pane narrower than one button): a label breaks onto a
+   second line rather than being cut off. */
+.qrow .cacts.qracts .mini { max-width: 100%; white-space: normal; text-align: center; }
+/* The one primary action in a row (Send now / Send again): the app's solid
+   button, same as every other primary. */
+.qrow .mini.qgo { background: var(--solid); color: var(--on-solid); border-color: var(--solid); font-weight: 500; }
+.qrow .mini.qgo:hover { color: var(--on-solid); opacity: .9; }
+/* BUG-217 r2 (UI review #1): Discard destroys the words, so it does not look
+   like Edit. It is set off by a gap and drawn as a quiet text action in the
+   palette's one severity red, which fills in on hover; it is undoable for a
+   few seconds (.q-undo), so it needs no confirm. */
+.qrow .mini.qdrop {
+  color: var(--danger); border-color: transparent; background: none;
+  margin-left: 6px;
+}
+.qrow .mini.qdrop:hover { color: var(--on-solid); background: var(--danger); border-color: var(--danger); }
+.qrow .mini.qdrop:focus-visible { border-color: var(--danger); }
+.qbox .q-undo {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-family: var(--sans); font-size: 12px; color: var(--ink-2);
+  padding: 4px 6px 6px;
+}
+.qbox .q-undo .q-undo-t { flex: 1 1 12rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qbox .q-undo .q-undo-b { padding: 3px 10px; font-size: 11.5px; font-weight: 500; }
+.qrow.held-elsewhere .qp { color: var(--ink-3); }
+.qrow .qeditbox { margin-top: 6px; }
 .qrow .qedit {
-  width: 100%; margin: 4px 0 2px; min-height: 64px; resize: vertical;
+  width: 100%; margin: 0 0 2px; min-height: 64px; resize: vertical;
   font: inherit; font-size: 12.5px; color: var(--ink);
   background: var(--window); border: 1px solid var(--hair); border-radius: 7px; padding: 7px 9px;
 }
 .qrow .qedit:focus { outline: none; border-color: var(--ink-4); }
-.qrow.dead .qp { text-decoration: line-through; opacity: .7; }
-.qrow.dead .qs { color: var(--ink-2); }
-/* BUG-129: a row that survived a reload and is STILL UNSENT. The whole point of
-   persisting it is that the user can tell it apart from one on its way out, so
-   it is marked on the row itself (a raised surface + a rule down its edge), not
-   only in the dock's one-line label. No new hue — the same greyscale vocabulary
-   as .dead, at a different weight. */
-.qrow.restored > summary {
+.qrow .cacts.qedit-acts { margin-top: 4px; justify-content: flex-end; }
+.qrow.dead .qp { color: var(--ink-2); }
+.qrow.dead .qs { color: var(--warn); }
+.qrow.sending .qs { color: var(--live); }
+/* BUG-129: a row that survived a reload and is STILL UNSENT stays visibly
+   distinct from one on its way out — a rule down its edge on a raised surface,
+   in the same greyscale vocabulary as the rest of the dock. */
+.qrow.restored {
   background: var(--sunken);
   border-left: 2px solid var(--ink-4);
   border-radius: 3px 6px 6px 3px;
 }
-.qrow.restored .qs { color: var(--ink-2); }
 
 /* ═══════════════════════════════════════════════════════════
    Needs-You rail (FEAT-018). Same vocabulary as the rest of the
@@ -3835,6 +4135,38 @@ button.lag:hover { background: var(--rail); }
 }
 .needs-card.services .nc-opt:first-child:hover { opacity: .88; }
 
+/* FEAT-157 — Orchard's base-update notice: which base is pinned / running, the
+   releases between them (class, date, summary, what a Dockerfile may need to
+   adjust), and Adopt / Defer / Skip. A security notice carries the danger accent
+   and no Skip; Adopt is the affirmative. */
+.needs-card.base-update { border-left-color: var(--live); }
+.needs-card.base-update.security { border-left-color: var(--danger); }
+.needs-card.base-update.security .nc-id { color: var(--danger); font-weight: 600; }
+.needs-card.base-update .bu-msg { margin-top: 6px; font-size: 12px; line-height: 1.45; color: var(--ink-2); }
+.needs-card.base-update .bu-where {
+  display: grid; grid-template-columns: max-content 1fr; gap: 2px 8px;
+  margin-top: 7px; font-size: 11px;
+}
+.needs-card.base-update .bu-k { font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); text-transform: uppercase; letter-spacing: .04em; align-self: baseline; }
+.needs-card.base-update .bu-v { font-family: var(--mono); font-size: 11px; color: var(--ink-2); word-break: break-all; }
+.needs-card.base-update .bu-entries { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.needs-card.base-update .bu-entry { padding: 6px 8px; border: 1px solid var(--hair); border-radius: 7px; background: var(--sunken); }
+.needs-card.base-update .bu-line { display: flex; align-items: baseline; gap: 7px; }
+.needs-card.base-update .bu-ver { font-family: var(--mono); font-size: 11px; font-weight: 600; color: var(--ink); }
+.needs-card.base-update .bu-cls {
+  font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 1px 5px; border-radius: 999px; border: 1px solid var(--hair); color: var(--ink-3);
+}
+.needs-card.base-update .bu-entry.cls-security .bu-cls { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, var(--hair)); font-weight: 600; }
+.needs-card.base-update .bu-date { margin-left: auto; font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); }
+.needs-card.base-update .bu-sum { margin-top: 3px; font-size: 11.5px; line-height: 1.4; color: var(--ink-2); }
+.needs-card.base-update .bu-adj { margin-top: 3px; font-size: 11px; line-height: 1.4; color: var(--ink-3); }
+.needs-card.base-update .bu-adj::before { content: 'adjust: '; font-family: var(--mono); font-size: 9.5px; color: var(--ink-4); }
+.needs-card.base-update .nc-opt.bu-adopt { color: var(--on-solid); background: var(--solid); border-color: var(--solid); font-weight: 600; }
+.needs-card.base-update.security .nc-opt.bu-adopt { background: var(--danger); border-color: var(--danger); }
+.needs-card.base-update .nc-opt.bu-adopt:hover { opacity: .88; }
+.needs-card.collapsed .bu-entries { display: none; }
+
 /* Option buttons for a decision that carries choices — greyscale, hairline,
    moss on hover; clicking one submits it as the answer. */
 .needs-card .nc-opts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
@@ -3873,6 +4205,7 @@ button.lag:hover { background: var(--rail); }
 .nc-kind[data-kt="dec"],
 .nc-kind[data-kt="git"],
 .nc-kind[data-kt="svc"]  { border-style: dashed; }                 /* live ask */
+.nc-kind[data-kt="base"] { border-radius: 2px; border-bottom-width: 2px; } /* Orchard's own ask */
 .nc-kind[data-kt="obs"],
 .nc-kind[data-kt="find"],
 .nc-kind[data-kt="stall"] { color: var(--ink-4); border-style: dotted; } /* read-only */
@@ -5886,3 +6219,17 @@ a.digest-ref-link:hover {
 /* The instruction, lifted to the front and given the only emphasis in the row. */
 .rail-sub .brow.problem .bt .fix-first { display: block; color: var(--ink); font-weight: 600; margin-bottom: 3px; }
 .rail-sub .brow.problem .lnk { align-self: flex-start; }
+
+/* FEAT-154 (round 6) — a background command row in the running strip carries a
+   stop control. The wrapper keeps one strip child per row; the row itself is
+   unchanged, with the stop button in a trailing column. */
+.lag-wrap.stoppable { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; border-top: 1px solid var(--hair-2); }
+.lag-wrap.stoppable:first-child { border-top: 0; }
+.lag-wrap.stoppable > .lag { border-top: 0; }
+.lag-stop {
+  margin-right: 8px; padding: 2px 8px;
+  font: 11px var(--mono); color: var(--ink-3);
+  background: transparent; border: 1px solid var(--hair); border-radius: 4px; cursor: pointer;
+}
+.lag-stop:hover:not(:disabled) { color: var(--st-high); border-color: var(--st-high); }
+.lag-stop:disabled { opacity: .5; cursor: default; }

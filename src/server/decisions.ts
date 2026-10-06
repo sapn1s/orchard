@@ -16,10 +16,14 @@
  * The store is written with `writeAtomic` (temp + fsync + rename), so a crash
  * mid-write never truncates the file; the previous state is intact.
  */
-import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
+import { quarantine, readCapped } from './store-io.ts';
+
+/** Largest decisions store, in bytes, a read will accept before treating the file
+ *  as unreadable (bounds a hostile/corrupt file; realistic stores are far under). */
+const MAX_STORE_BYTES = 16 * 1024 * 1024;
 
 /**
  * FEAT-108 round 3 — a git-write PERMISSION request an agent raised. When a
@@ -78,14 +82,45 @@ function storeFile(): string {
   return path.join(dataDir(), 'decisions.json');
 }
 
-function readAll(): DecisionRecord[] {
+interface StoreRead {
+  records: DecisionRecord[];
+  /** false = present but could not be read as a record array (torn / mid-write /
+   *  corrupt / wrong shape). An append writer must NOT clobber it. */
+  ok: boolean;
+}
+
+/**
+ * BUG-202 — read the store, distinguishing "no file yet" (ENOENT — genuinely
+ * empty, safe to create) from "present but unreadable" (torn / corrupt / wrong
+ * shape). This is the DATA-LOSS distinction the old `readAll` collapsed: it
+ * returned `[]` for BOTH, so an append writer then wrote over a corrupt file as
+ * if it were empty and WIPED every prior record (the same shape FEAT-126 fixed
+ * in requests.ts). `ok:false` means "do not clobber — quarantine first".
+ */
+function readStore(): StoreRead {
+  // Bounded read on the fd (store-io.readCapped) — no stat→read TOCTOU; a file
+  // over the cap is refused without being read into memory.
+  const res = readCapped(storeFile(), MAX_STORE_BYTES);
+  if (res.kind === 'absent') return { records: [], ok: true };
+  if (res.kind !== 'ok') return { records: [], ok: false }; // toobig | error — present but unreadable
   try {
-    const raw = fs.readFileSync(storeFile(), 'utf8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as DecisionRecord[]) : [];
+    const parsed = JSON.parse(res.data);
+    if (Array.isArray(parsed)) return { records: parsed as DecisionRecord[], ok: true };
+    return { records: [], ok: false }; // valid JSON but not our shape — corrupt, never clobber
   } catch {
-    return []; // no store yet, or unreadable — an empty ledger, never an error
+    return { records: [], ok: false }; // torn / partial / non-JSON — never clobber
   }
+}
+
+/**
+ * Records only. Read-side callers (`get`, `listOpenForProject`) degrade to an
+ * empty ledger on an unreadable file exactly as before — never an error. The
+ * WRITE path uses `readStore()` so it can refuse to clobber a corrupt file. The
+ * mutating writers below (`resolve`) are clobber-safe by construction: they
+ * `writeAll` only after finding a record, and a corrupt store yields none.
+ */
+function readAll(): DecisionRecord[] {
+  return readStore().records;
 }
 
 function writeAll(records: DecisionRecord[]): void {
@@ -142,7 +177,11 @@ export function raise(input: RaiseInput): DecisionRecord {
     gitWrite: input.gitWrite ?? null,
     services: input.services ?? null,
   };
-  const all = readAll();
+  // BUG-202 — never overwrite a present-but-unreadable store as if it were
+  // empty: preserve its bytes (quarantine), then start fresh with this record.
+  const read = readStore();
+  if (!read.ok) quarantine(storeFile(), 'decisions');
+  const all = read.ok ? read.records : [];
   all.push(rec);
   writeAll(all);
   return rec;

@@ -17,6 +17,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { ownerKeyFor, removeOwnedContainer, refuseTakenName } from './lib/owned-docker.mjs';
 
 /* Never a fixed port: two suites defaulting to the same number collide the
    moment both run (observed: verify-ui + verify-sessions on 4319). The OS
@@ -32,6 +33,8 @@ const PORT = Number(process.env.VERIFY_OOM_PORT ?? await freePort());
 const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.resolve(import.meta.dirname, '..');
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'cs-oom-data-'));
+// FEAT-158: cleanup removes only the container THIS scratch server owns (the name is a fixed slug).
+const OWNER = await ownerKeyFor(DATA);
 
 let pass = 0, fail = 0;
 function check(name, ok, observed) {
@@ -76,6 +79,7 @@ async function main() {
   })).json();
   if (patch.project?.isolation !== 'container') throw new Error(`patch failed: ${JSON.stringify(patch).slice(0, 300)}`);
   const cname = `claude-station-${pid}`;
+  refuseTakenName(cname); // FEAT-158: never adopt another instance's same-named container
   containerToRemove = cname;
 
   console.log('\n=== oom: live session in a 512 MB container ===');
@@ -99,6 +103,11 @@ async function main() {
   while (!turnEnded && Date.now() - t0 < 180_000) await sleep(300);
   check('a real session ran a turn inside the container', turnEnded && !!sdkSession,
     `sdkSession=${sdkSession}, events=${events.length}, last=${JSON.stringify(events.at(-1)?.t)}`);
+
+  // FEAT-158: the memory bomb and the kill loop below act on whatever container has this
+  // fixed name. Only proceed if it is the one THIS run's server created (owner label).
+  const ownerNow = docker(['inspect', '--format', '{{index .Config.Labels "claude-station.owner"}}', cname]).trim();
+  if (ownerNow !== OWNER) throw new Error(`${cname} is not this run's container (owner ${ownerNow || 'absent'}, want ${OWNER}); not running the memory bomb or the kill loop in it`);
 
   console.log('\n=== oom: the kernel really kills inside the cgroup ===');
   const kills0 = Number(/oom_kill (\d+)/.exec(docker(['exec', cname, 'cat', '/sys/fs/cgroup/memory.events']))?.[1] ?? -1);
@@ -139,7 +148,7 @@ main().catch((err) => {
   console.error(`\nFATAL: ${err.message}`);
   process.exitCode = 1;
 }).finally(() => {
-  try { if (containerToRemove) execFileSync('docker', ['rm', '-f', containerToRemove], { timeout: 30_000 }); } catch { /* not created */ }
+  try { removeOwnedContainer(containerToRemove, OWNER); } catch { /* not created */ }
   stopByPid(server);
   setTimeout(() => {
     fs.rmSync(DATA, { recursive: true, force: true });

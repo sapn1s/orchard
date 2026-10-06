@@ -137,7 +137,7 @@ async function main() {
   const onboardedDir = path.join(SCRATCH, 'onboarded-project');
   fs.mkdirSync(onboardedDir, { recursive: true });
   onboard(onboardedDir, {});
-  const stubPath = path.join(onboardedDir, 'docs', 'CONVENTIONS.md');
+  const stubPath = path.join(onboardedDir, '.orchard', 'CONVENTIONS.md'); // FEAT-106: stub lives under .orchard/
   const stubReport = checkScope({ waPath: DEFAULT_WA_PATH, localPaths: [stubPath] });
   check('a freshly onboarded repo\'s docs/CONVENTIONS.md stub is NOT flagged (false positive fixed)',
     !stubReport.localDocs.some((d) => d.file === stubPath), stubReport.localDocs);

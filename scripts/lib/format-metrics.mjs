@@ -168,6 +168,12 @@ export function evaluateLength(parsed) {
  * actually hit — and the report surfaces the rest for a human to read. */
 const CONFIDENCE_RE = /^[ \t>*+-]*confidence[ \t]*:[ \t]*(high|hi|med(?:ium)?|low|lo)\b/im;
 const DECIDER_RE = /^[ \t>*+-]*decider[ \t]*:[ \t]*(\S.*)$/im;
+// WA §A "a recommendation is a claim — vet it like code": what the recommendation
+// rests on (N and source) and whether it was independently refuted. Recognised the
+// SAME way as decider, but OPTIONAL — its absence is never a defect, so older replies
+// that predate the field still parse and still pass the gate. Recorded as telemetry
+// (asksWithEvidence) so uptake is visible without being enforced.
+const EVIDENCE_RE = /^[ \t>*+-]*evidence[ \t]*:[ \t]*(\S.*)$/im;
 
 /** Normalise a declared confidence token to high|med|low, or '' when absent. */
 function confidenceLevel(content) {
@@ -201,6 +207,24 @@ export function askOwnershipDefects(parsed) {
     }
   }
   return out;
+}
+
+/** Does an ask body declare an `evidence:` line? OPTIONAL — absence is never a defect. Pure. */
+export function hasEvidence(content) {
+  return EVIDENCE_RE.test(String(content ?? ''));
+}
+
+/**
+ * Count of `orchard-ask` blocks that carry an `evidence:` line (WA §A). Pure.
+ * Telemetry only — its absence is never flagged, so this never gates a reply.
+ */
+export function asksWithEvidence(parsed) {
+  const blocks = Array.isArray(parsed?.blocks) ? parsed.blocks : [];
+  let n = 0;
+  for (const b of blocks) {
+    if (b && b.name === 'orchard-ask' && hasEvidence(b.content)) n++;
+  }
+  return n;
 }
 
 /* ── completion-claim extraction (FEAT-150) ───────────────────────────────────
@@ -275,6 +299,9 @@ export function buildRecord(parsed, meta = {}) {
     asksMissingConfidence: ownership.filter((d) => d.defect === 'missing-confidence').length,
     asksHighNoDecider: ownership.filter((d) => d.defect === 'high-confidence-no-decider').length,
     asksMissingDecider: ownership.filter((d) => d.defect === 'missing-decider').length,
+    // OPTIONAL field (WA §A): how many asks carry an `evidence:` line. Recorded for
+    // uptake visibility only — its absence is never a defect and never blocks.
+    asksWithEvidence: asksWithEvidence(parsed),
     session_id: typeof meta.session_id === 'string' ? meta.session_id : null,
     cwd: typeof meta.cwd === 'string' ? meta.cwd : null,
     shape: parsed?.shape ?? 'unstructured',

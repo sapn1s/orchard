@@ -11,8 +11,10 @@
  *
  * This is the ONLY file above session-mutations.ts that imports the SDK.
  */
+import { guardConfigFromEnv, subagentStopVerdict, type LaneGuardState, type StopVerdictDeps } from '../park-guard.ts';
 import { randomUUID, randomBytes, createHash } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,14 +28,14 @@ import { decide, stillAvailableHere } from '../../../scripts/lib/orchestrator-pr
 // PreToolUse callback, runs first, gated only by its own escape hatch.
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
 import { installGitShim, gitShimMissingRefusal } from '../../../scripts/lib/git-shim.mjs';
-import { getShimSecret } from '../../../scripts/lib/git-shim-secret.mjs';
+import { getShimSecret, getShimBootId } from '../../../scripts/lib/git-shim-secret.mjs';
 // FEAT-108 round 2 — the git-write decision is now grant-aware: a runtime,
 // per-project, revocable grant (git-grant-store.mjs, host-memory only) can lift
 // the block WITHOUT relaunching, and a granted commit/push still runs the
 // mandatory leak gate. evaluateGitWrite folds all three onto the round-1
 // classifier; the leak-gate runner is injected from here (a real subprocess).
-import { evaluateGitWrite, beginGitWriteToolCall, endGitWriteToolCall, endGitWriteToolCalls, endGitWriteAgent } from '../../../scripts/lib/git-grant.mjs';
-import { hostLeakGatePath, ownProjectArgs, passReport, hostGateBanner, capGateOutput, repoContentFingerprint } from '../leak-gate-host.ts';
+import { evaluateGitWriteAsync, beginGitWriteToolCall, endGitWriteToolCall, endGitWriteToolCalls, endGitWriteAgent } from '../../../scripts/lib/git-grant.mjs';
+import { hostLeakGatePath, ownProjectArgs, ownProjectArgsAsync, passReport, hostGateBanner, capGateOutput, repoContentFingerprintAsync } from '../leak-gate-host.ts';
 // FEAT-124 — an UNJUSTIFIED Fable (`model: fable`) dispatch is rerouted UP to
 // Opus on this same PreToolUse callback. A different axis again: model-keyed, not
 // tool-name-keyed, and it REWRITES (updatedInput) rather than denies, so the lane
@@ -337,7 +339,10 @@ function announceFableTier(
  * granted write is permitted only when the gate can be run AND passes. Returns
  * `{ ok, detail }`; `detail` carries the gate's own capped output on failure.
  */
-export function runLeakGateForRepo(repoPath: string | undefined | null): { ok: boolean; detail: string } {
+export function runLeakGateForRepo(
+  repoPath: string | undefined | null,
+  scope: { narrow?: boolean } = {},
+): { ok: boolean; detail: string } {
   if (!repoPath) return { ok: false, detail: 'no repo path known for this session — cannot verify the leak gate; failing closed' };
   const gate = hostLeakGatePath();
   // FEAT-156 — the repo's registered project (registry, never re-derived here)
@@ -365,10 +370,68 @@ export function runLeakGateForRepo(repoPath: string | undefined | null): { ok: b
       return { ok: false, detail: `${hostGateBanner()}\n${capGateOutput(out)}` };
     }
   };
-  const tree = run(['--summary']);
+  // FEAT-169 — SCOPE. The working-tree pass is NARROWED to the outgoing delta
+  // (--changed: files the commit would add, read from the working tree) ONLY when
+  // every publishing write in this command is a COMMIT. A commit adds a bounded
+  // delta on top of HEAD, so scanning the whole tree needlessly re-blocked a clean
+  // commit on pre-existing hits elsewhere in a real project repo (the FEAT-169
+  // bug). A PUSH (or an unknown/aliased publishing verb — scope.narrow is false
+  // for anything that is not a pure commit) PUBLISHES THE WHOLE HISTORY/TREE, so
+  // it keeps the full-tree scan (--summary): the conservative, destination-
+  // independent choice (the cross-provider plan review showed precise push-range
+  // scanning via `--not --remotes` is destination-blind and can produce a
+  // false-empty range — see FEAT-169). False positives in either scope are waived
+  // per-repo via .leakgate-allow. The --staged index pass runs in BOTH scopes: it
+  // catches the stage-then-clean-worktree bypass regardless.
+  const worktreePass = scope.narrow ? ['--summary', '--changed'] : ['--summary'];
+  const tree = run(worktreePass);
   if (!tree.ok) return tree;
   const staged = run(['--summary', '--staged']);
   // FEAT-156 — a PASS with waivers is logged, never silent.
+  if (staged.ok && /\bwaived\b/.test(`${tree.detail}\n${staged.detail}`)) {
+    console.warn(`[orchard] agent git-write leak gate PASSED with waivers (${repoPath}):\n${tree.detail}\n${staged.detail}`);
+  }
+  return staged;
+}
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * BUG-249 — the ASYNC twin of runLeakGateForRepo, awaited by the runtime git-write
+ * decision (the PreToolUse hook and /api/git-shim/decide). Byte-for-byte the same scans,
+ * args, own-project exemption, SCOPE rule, 30s-per-scan timeout and FAIL-CLOSED semantics
+ * as the synchronous version above — the ONLY difference is that each leak-gate scan runs
+ * as `execFile` (non-blocking) instead of `execFileSync`, so the ~4.6s full-tree scan on a
+ * large repo no longer freezes the single-process event loop. Any scan error/timeout/
+ * non-zero still denies; no write is approved before its own scan has fully completed
+ * (the caller awaits this before spending the grant).
+ */
+export async function runLeakGateForRepoAsync(
+  repoPath: string | undefined | null,
+  scope: { narrow?: boolean } = {},
+): Promise<{ ok: boolean; detail: string }> {
+  if (!repoPath) return { ok: false, detail: 'no repo path known for this session — cannot verify the leak gate; failing closed' };
+  const gate = hostLeakGatePath();
+  // BUG-249 r2 — resolve own-project OFF the loop too (the sync `ownProjectArgs` spawns
+  // `git rev-parse` synchronously). O(1), but it belongs off the hot path like the scan.
+  const own = await ownProjectArgsAsync(repoPath);
+  const run = async (args: string[]): Promise<{ ok: boolean; detail: string }> => {
+    try {
+      const { stdout } = await execFileAsync(process.execPath, [gate, ...args, ...own], { cwd: repoPath, timeout: 30_000 });
+      return { ok: true, detail: passReport(String(stdout)) };
+    } catch (err) {
+      const e = err as { stdout?: string | Buffer; stderr?: string | Buffer; message?: string };
+      const out = `${e.stdout ? String(e.stdout) : ''}${e.stderr ? String(e.stderr) : ''}`.trim() || e.message || 'leak gate failed';
+      return { ok: false, detail: `${hostGateBanner()}\n${capGateOutput(out)}` };
+    }
+  };
+  // Same two-pass union + SCOPE rule as runLeakGateForRepo (see its comment): working-tree
+  // scan (narrowed to the outgoing delta only for a pure commit), then the --staged index
+  // scan in both scopes. Sequential awaits: a non-ok working-tree pass short-circuits.
+  const worktreePass = scope.narrow ? ['--summary', '--changed'] : ['--summary'];
+  const tree = await run(worktreePass);
+  if (!tree.ok) return tree;
+  const staged = await run(['--summary', '--staged']);
   if (staged.ok && /\bwaived\b/.test(`${tree.detail}\n${staged.detail}`)) {
     console.warn(`[orchard] agent git-write leak gate PASSED with waivers (${repoPath}):\n${tree.detail}\n${staged.detail}`);
   }
@@ -937,8 +1000,19 @@ export class ClaudeRuntime implements AgentRuntime {
           hostUrl: `http://127.0.0.1:${process.env.PORT ?? 4317}`,
           // BUG-173 round 3 — baked into the shim source (not env) and required by
           // /api/git-shim/decide, so the consult cannot be redirected to a forged host.
-          shimAuth: getShimSecret(),
+          // BUG-242 — pass the PROVIDER functions, not their values: the shim file is
+          // (re)written with the CURRENT per-boot secret/nonce at write time, so a
+          // reused dir and every ensure() carry this process's live secret.
+          shimAuth: getShimSecret,
+          shimBootId: getShimBootId,
           windowKey: gitWindowKey ?? undefined,
+          // BUG-242 — restart-adopt: RE-BAKE the surviving CLI's existing shim dir
+          // (dead secret from the previous boot) in place, baking THIS process's
+          // secret AND this start's fresh gitWindowKey — the SAME key the PreToolUse
+          // hook below opens its decision window under, so the shim redeems that one
+          // decision instead of taking the independent path (review #1). All coords
+          // are recomputed here; nothing is read from the reused file (review #2).
+          reuseDir: config.attach && config.adoptShimDir ? config.adoptShimDir : undefined,
         })
       : null;
     /** BUG-231 — end one Bash call's git decision window (no-op when there is none). */
@@ -1193,12 +1267,13 @@ export class ClaudeRuntime implements AgentRuntime {
                     const cmd = i.tool_input && typeof i.tool_input === 'object'
                       ? (i.tool_input as { command?: unknown }).command
                       : '';
-                    const g = evaluateGitWrite({
+                    const g = await evaluateGitWriteAsync({
                       command: typeof cmd === 'string' ? cmd : '',
                       projectKey: config.gitGrantKey ?? null,
                       sessionLabel: config.sessionLabel ?? null,
-                      runLeakGate: () => runLeakGateForRepo(config.gitRepoPath),
-                      repoFingerprint: () => repoContentFingerprint(config.gitRepoPath),
+                      // BUG-249 — the async gate runs the leak scan off the event loop.
+                      runLeakGate: (scope) => runLeakGateForRepoAsync(config.gitRepoPath, scope),
+                      repoFingerprint: () => repoContentFingerprintAsync(config.gitRepoPath),
                       // BUG-231 — this decision is THE decision for this Bash call: the
                       // shim redeems it per invocation instead of deciding again.
                       window: gitWindowKey && i.tool_use_id
@@ -1333,12 +1408,52 @@ export class ClaudeRuntime implements AgentRuntime {
           PostToolUse: [...(options.hooks.PostToolUse ?? []), { hooks: [settle] }],
           PostToolUseFailure: [...(options.hooks.PostToolUseFailure ?? []), { hooks: [settle] }],
           PermissionDenied: [...(options.hooks.PermissionDenied ?? []), { hooks: [settle] }],
-          // A subagent that ended cannot still be inside one of its tool calls.
-          SubagentStop: [...(options.hooks.SubagentStop ?? []), { hooks: [async (input: unknown) => {
-            const a = (input as { agent_id?: unknown } | undefined)?.agent_id;
-            if (typeof a === 'string' && a) endGitWriteAgent(gitWindowKey, a);
-            return {};
-          }] }],
+        };
+      }
+    }
+    /*
+     * BUG-239 (B) — THE NO-PARKING GUARD, installed for EVERY Claude session this
+     * server launches (any project; nothing to install per project). A subagent
+     * may not end its turn while background work it started is still running or
+     * unread: the CLI would kill a foreground lane's shells/Monitors right after
+     * this hook, and a nested agent's result would go past it. Bounded (ignored
+     * attempts, awake-time ceiling, judgement budget) and fail-open with a
+     * recorded incident — see park-guard.ts. ONE callback so the BUG-231 git
+     * window ends only when the stop is really allowed (a blocked lane goes on
+     * working and may still be inside a git decision window — plan review
+     * finding 8).
+     */
+    {
+      const parkCfg = guardConfigFromEnv();
+      const deps = {
+        cfg: parkCfg,
+        states: new Map<string, LaneGuardState>(),
+        expiryNudged: new Set<string>(),
+        permissionExpired: (a: string) => config.laneBounds?.permissionExpiredFor(a) ?? false,
+        onParked: (r: Parameters<StopVerdictDeps['onParked']>[0]) => {
+          try { config.laneBounds?.onParked(r); } catch { /* recording must never break a stop */ }
+        },
+      };
+      const onSubagentStop = async (input: unknown) => {
+        // Switched off (CLAUDE_STATION_PARK_GUARD=0): no judgement and no records — only the BUG-231 end below.
+        const v: { decision?: 'block'; reason?: string } = parkCfg.enabled ? await subagentStopVerdict(input, deps) : {};
+        if (v.decision === 'block') {
+          const a = (input as { agent_id?: unknown } | undefined)?.agent_id;
+          console.log(`[orchard] BUG-239 park guard: held lane ${String(a)} at its turn end (${config.sessionLabel ?? declaredSessionId}): ${String(v.reason).split('\n').slice(1, 4).join(' | ')}`);
+        }
+        // A subagent that ended cannot still be inside one of its tool calls.
+        if (v.decision !== 'block' && gitBlockOn && gitWindowKey) {
+          const a = (input as { agent_id?: unknown } | undefined)?.agent_id;
+          if (typeof a === 'string' && a) endGitWriteAgent(gitWindowKey, a);
+        }
+        return v.decision === 'block' ? { decision: 'block' as const, reason: v.reason } : {};
+      };
+      // Registered when the guard is on, or when BUG-231 needs its per-agent end (as before BUG-239);
+      // a session with neither carries no SubagentStop hook at all.
+      if (parkCfg.enabled || (gitBlockOn && gitWindowKey)) {
+        options.hooks = {
+          ...(options.hooks ?? {}),
+          SubagentStop: [...(options.hooks?.SubagentStop ?? []), { hooks: [onSubagentStop] }],
         };
       }
     }

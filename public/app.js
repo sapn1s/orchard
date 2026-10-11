@@ -671,6 +671,16 @@ function projectHasLive(p, s) {
   return false;
 }
 
+/* FEAT-171 — was the last pointer a finger? A tap emulates mouseenter right
+   before its click, so hover-to-preview behaviour skips a touch-driven
+   mouseenter. Per-event rather than a `(hover:hover)` media query: a laptop with
+   a touch screen AND a mouse hovers fine with the mouse, and a headless browser
+   driven by a synthetic mouse reports `hover:none` while really hovering. */
+let lastPointerType = 'mouse';
+document.addEventListener('pointerdown', (e) => { lastPointerType = e.pointerType || 'mouse'; }, true);
+document.addEventListener('pointermove', (e) => { if (e.pointerType === 'mouse') lastPointerType = 'mouse'; }, true);
+const touchDriven = () => lastPointerType === 'touch';
+
 const node = {
   win: $('#win'),
   tree: $('#tree'),
@@ -755,6 +765,13 @@ const node = {
   rail: $('#rail'),
   railBadge: $('#railBadge'),
   railBadgeN: $('#railBadgeN'),
+  // FEAT-171 — phone-only crown controls (display:none outside the phone layout)
+  side: $('#side'),
+  navBtn: $('#navBtn'),
+  navScrim: $('#navScrim'),
+  crownMore: $('#crownMore'),
+  crownRail: $('#crownRail'),
+  crownRailN: $('#crownRailN'),
   railCount: $('#railCount'),
   railBoardLink: $('#railBoardLink'), // FEAT-066 — in-context entry to the board
   boardBtn: $('#boardBtn'),           // FEAT-066 — persistent topbar board entry
@@ -1163,6 +1180,9 @@ const currentProject = () => state.projects.find((p) => p.id === state.current.p
  * the next transcript render with no server restart.
  */
 const digestEnabled = () => currentProject()?.settings?.responseDigest?.enabled !== false;
+// BUG-234 r7: reading routes always deliver FULL text (no caller-supplied cap),
+// so an assistant text block is never `truncated` in the reading view — there is
+// no truncation flag to pass and no client-side note to place.
 const assistantProse = (text) => renderAssistantText(text, {
   enabled: digestEnabled(),
   projectId: state.current.projectId ?? null,
@@ -5477,6 +5497,9 @@ function closeGitPopSoon() {
   }, 220);
 }
 node.gitBtn.addEventListener('mouseenter', () => {
+  // FEAT-171 — a tap emulates mouseenter then click; on a touch screen the hover
+  // preview would open under a click that is already navigating away.
+  if (touchDriven()) return;
   clearTimeout(gitHoverTimer);
   if (node.gitPop.classList.contains('open')) return;
   gitHoverTimer = setTimeout(openGitPop, 150);
@@ -5742,6 +5765,7 @@ function closeUsagePopSoon() {
   }, 220);
 }
 node.usageBtn.addEventListener('mouseenter', () => {
+  if (touchDriven()) return; // FEAT-171 — see gitBtn
   clearTimeout(usageHoverTimer);
   if (node.usagePop.classList.contains('open')) return;
   usageHoverTimer = setTimeout(openUsagePop, 120);
@@ -6301,8 +6325,15 @@ function diffElementFor(name, input) {
 function renderMessages(th, messages) {
   let shown = 0;
   for (const m of messages) {
+    // A block renders if it carries content; tool_use is always kept. An empty or
+    // whitespace-only text/thinking block is DROPPED. BUG-234 r7 removed the whole
+    // truncation-note class: reading routes always deliver full text (no cap), so a
+    // text/thinking block is never `truncated` here and there is no message-level
+    // note to place — the r3/r4/r5/r6 note-placement breaks are gone by construction.
     const useful = (m.blocks ?? []).filter(
-      (b) => (b.type === 'text' && b.text?.trim()) || b.type === 'tool_use' || (b.type === 'thinking' && b.text?.trim()),
+      (b) => (b.type === 'text' && b.text?.trim())
+        || b.type === 'tool_use'
+        || (b.type === 'thinking' && b.text?.trim()),
     );
     if (!useful.length) continue;
     shown++;
@@ -6316,60 +6347,66 @@ function renderMessages(th, messages) {
       if (n && typeof m.uuid === 'string' && m.uuid) n.dataset.uuid = m.uuid;
       return n;
     };
-    if (m.role === 'user') {
-      for (const b of useful) {
-        if (b.type !== 'text') continue;
-        // BUG-028: a shutdown-cut interrupt marker is NOT the user's message —
-        // caption it with its real cause instead of putting words (a stop) in
-        // the user's mouth. Checked before commandCaption; both return captions.
-        const cap = shutdownBreakCaption(m, b.text) ?? commandCaption(b.text);
-        if (cap) { th.paneEl.append(mark(cap)); th.claudeBody = null; }
-        else {
-          // BUG-067: harness-injected notices (task-notification / [station] /
-          // <system-reminder> / SYSTEM NOTIFICATION) are not the user's words —
-          // render a collapsed system notice, not a user bubble.
-          // BUG-168: when the notice PREFIXES a real user message (a "[station]"
-          // briefing prepended to the human's typed prompt), peel the prefix into
-          // the chip and render the user's own words (notice.body) as their bubble.
-          // An empty body (pure briefing, no user prompt) stays chip-only.
-          const notice = harnessNotice(b.text);
-          if (notice) {
-            mark(noticeChip(th, notice));
-            if (notice.body) stampTime(mark(youBubble(th, notice.body)), m.timestamp);
-          }
-          else {
-            // FEAT-072: a real user message wearing a queued-metadata prefix —
-            // peel the prefix into a dim caption, keep the words in the bubble.
-            const q = queuedCaption(b.text);
-            if (q) {
-              mark(queuedCap(th, q.caption));
-              if (q.body) stampTime(mark(youBubble(th, q.body)), m.timestamp);
-            } else {
-              stampTime(mark(youBubble(th, b.text)), m.timestamp);
-            }
-          }
-        }
-      }
-      continue;
-    }
-    const body = claudeBody(th);
-    for (const b of useful) {
-      if (b.type === 'text') { body.append(stampTime(mark(assistantProse(b.text)), m.timestamp)); continue; }
-      if (b.type === 'thinking') {
-        mark(historyChip(th, 'thinking', '', `${b.text.length.toLocaleString()} chars`, b.text));
-        continue;
-      }
-      // tool_use: `text` is the JSON-serialised input. Show the same one-line
-      // summary the live path shows, with the raw input available on expand.
-      let input = null;
-      try { input = JSON.parse(b.text ?? 'null'); } catch { input = b.text ?? null; }
-      const name = b.toolName ?? 'tool';
-      let pretty = b.text ?? '';
-      try { pretty = JSON.stringify(input, null, 2); } catch { /* keep raw */ }
-      mark(historyChip(th, name, toolArg(name, input), b.truncated ? 'truncated' : '', pretty || 'No recorded input.', b.truncated ? null : input));
-    }
+    for (const b of useful) renderBlockEntry(th, m, b, mark);
   }
   return shown;
+}
+
+/**
+ * The ONE place a stored transcript block becomes DOM. Every kind — user bubble,
+ * harness notice, command caption, queued-prefix bubble, assistant prose, thinking
+ * chip, tool_use chip — passes through here. It returns the PRIMARY node it created
+ * or null when the block produced nothing. Reading routes always deliver full text
+ * (BUG-234 r7), so assistant text/thinking blocks are never `truncated`. The one
+ * remaining `truncated` case is a tool_use whose serialised JSON input exceeded the
+ * 16 KiB chip cap (jsonl.ts); its unparseable tail is hidden from expand below.
+ */
+function renderBlockEntry(th, m, b, mark) {
+  if (m.role === 'user') {
+    if (b.type !== 'text') return null;
+    // BUG-028: a shutdown-cut interrupt marker is NOT the user's message —
+    // caption it with its real cause instead of putting words (a stop) in
+    // the user's mouth. Checked before commandCaption; both return captions.
+    const cap = shutdownBreakCaption(m, b.text) ?? commandCaption(b.text);
+    if (cap) { th.paneEl.append(mark(cap)); th.claudeBody = null; return cap; }
+    // BUG-067: harness-injected notices (task-notification / [station] /
+    // <system-reminder> / SYSTEM NOTIFICATION) are not the user's words —
+    // render a collapsed system notice, not a user bubble.
+    // BUG-168: when the notice PREFIXES a real user message (a "[station]"
+    // briefing prepended to the human's typed prompt), peel the prefix into
+    // the chip and render the user's own words (notice.body) as their bubble.
+    // An empty body (pure briefing, no user prompt) stays chip-only.
+    const notice = harnessNotice(b.text);
+    if (notice) {
+      const chip = mark(noticeChip(th, notice));
+      return notice.body ? stampTime(mark(youBubble(th, notice.body)), m.timestamp) : chip;
+    }
+    // FEAT-072: a real user message wearing a queued-metadata prefix — peel the
+    // prefix into a dim caption, keep the words in the bubble.
+    const q = queuedCaption(b.text);
+    if (q) {
+      const capEl = mark(queuedCap(th, q.caption));
+      return q.body ? stampTime(mark(youBubble(th, q.body)), m.timestamp) : capEl;
+    }
+    return stampTime(mark(youBubble(th, b.text)), m.timestamp);
+  }
+  const body = claudeBody(th);
+  if (b.type === 'text') {
+    const node = stampTime(mark(assistantProse(b.text)), m.timestamp);
+    body.append(node);
+    return node;
+  }
+  if (b.type === 'thinking') {
+    return mark(historyChip(th, 'thinking', '', `${b.text.length.toLocaleString()} chars`, b.text));
+  }
+  // tool_use: `text` is the JSON-serialised input. Show the same one-line summary
+  // the live path shows, with the raw input available on expand.
+  let input = null;
+  try { input = JSON.parse(b.text ?? 'null'); } catch { input = b.text ?? null; }
+  const name = b.toolName ?? 'tool';
+  let pretty = b.text ?? '';
+  try { pretty = JSON.stringify(input, null, 2); } catch { /* keep raw */ }
+  return mark(historyChip(th, name, toolArg(name, input), b.truncated ? 'truncated' : '', pretty || 'No recorded input.', b.truncated ? null : input));
 }
 
 /* ---------------------------------------------- recorded subagent threads */
@@ -6476,6 +6513,9 @@ async function loadRecordedAgents(th, sessionId) {
 /* ---------------------------------------------------------- open a session */
 
 async function openSession(p, sess, opts = {}) {
+  // FEAT-171 — opening a session (from the drawer, the finder, a route…) puts
+  // the phone drawer away so the conversation is what the user sees.
+  if (node.win.classList.contains('nav-open')) setNavOpen(false);
   // BUG-083 — keep the outgoing session's unsent draft before state.current is
   // reassigned below, so it can be restored if the user returns here.
   saveDraft(state.current);
@@ -7823,6 +7863,9 @@ function renderRail() {
   setHidden(node.railCount, true);
   setText(node.railBadgeN, String(needs.length));
   node.railBadge.classList.toggle('none', needs.length === 0);
+  // FEAT-171 — the phone crown's board button shows the same count.
+  setText(node.crownRailN, String(needs.length));
+  node.crownRail.classList.toggle('none', needs.length === 0);
 
   // FEAT-066: the persistent board entries (topbar pill + rail-head link) — a
   // board is reachable from anywhere in the UI, not just a deep link. Shown for
@@ -9087,7 +9130,7 @@ node.railBadge.addEventListener('click', () => {
 });
 document.addEventListener('click', (e) => {
   if (!node.rail.classList.contains('open')) return;
-  if (node.rail.contains(e.target) || node.railBadge.contains(e.target)) return;
+  if (node.rail.contains(e.target) || node.railBadge.contains(e.target) || node.crownRail.contains(e.target)) return;
   node.rail.classList.remove('open');
 });
 
@@ -9153,6 +9196,8 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('focus', () => { void refreshRail(true); });
 
 function startNew(projectId) {
+  // FEAT-171 — a new session, like an opened one, puts the phone drawer away.
+  if (node.win.classList.contains('nav-open')) setNavOpen(false);
   saveDraft(state.current); // BUG-083 — keep the outgoing session's draft before we leave it
   selectProject(projectId, { quiet: true });
   // No override — model, effort, budget, permissionMode, allowed/disallowed
@@ -10270,7 +10315,7 @@ function isDriving() {
 
 function connect() {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://${location.host}/ws`);
+    const ws = new WebSocket(api.wsUrl());
     const fail = () => reject(new Error('the session socket would not open'));
     ws.addEventListener('open', () => {
       state.ws = ws;
@@ -10341,7 +10386,7 @@ const WATCH_BACKOFF_MS = [1000, 2000, 5000, 10_000, 30_000];
 function watch() {
   if (state.watchWs) return;
   let ws;
-  try { ws = new WebSocket(`ws://${location.host}/ws`); } catch { return; }
+  try { ws = new WebSocket(api.wsUrl()); } catch { return; }
   state.watchWs = ws;
   ws.addEventListener('open', () => {
     state.watchTries = 0;
@@ -14998,8 +15043,162 @@ function paintFold() {
   node.fold.setAttribute('aria-expanded', String(!collapsed));
   node.fold.classList.toggle('is-collapsed', collapsed);
 }
-node.fold.addEventListener('click', () => { node.win.classList.toggle('collapsed'); paintFold(); });
+node.fold.addEventListener('click', () => {
+  // FEAT-171 — on a phone the sidebar is a drawer: its fold button closes it,
+  // and never toggles the desktop icon-strip state.
+  if (phoneLayout()) { setNavOpen(false); return; }
+  node.win.classList.toggle('collapsed'); paintFold();
+});
 paintFold();
+
+/* ------------------------------------------------ FEAT-171: phone layout */
+/*
+ * Whether the phone layout is active is declared ONCE, by styles.css, as the
+ * `--layout` custom property inside the phone media query. This reads it rather
+ * than repeating the query, so the CSS and the JS can never disagree about which
+ * layout is on screen.
+ */
+function phoneLayout() {
+  try {
+    return getComputedStyle(document.documentElement).getPropertyValue('--layout').trim() === 'phone';
+  } catch { return false; } // a DOM without computed styles (the node UI harness) is never a phone
+}
+function setNavOpen(open) {
+  open = !!open && phoneLayout();
+  if (open) setDetailsOpen(false);
+  node.win.classList.toggle('nav-open', open);
+  node.navBtn.setAttribute('aria-expanded', String(open));
+  node.navBtn.setAttribute('aria-label', open ? 'Hide sessions' : 'Show sessions');
+  if (open) {
+    node.rail.classList.remove('open');
+    node.fold.title = 'Hide sessions';
+    node.fold.setAttribute('aria-label', 'Hide sessions');
+    // focus into the drawer so a keyboard / screen-reader user lands in it
+    requestAnimationFrame(() => node.fold.focus({ preventScroll: true }));
+  } else {
+    paintFold();
+    if (node.side?.contains(document.activeElement)) node.navBtn.focus({ preventScroll: true });
+  }
+}
+function setDetailsOpen(open) {
+  open = !!open && phoneLayout();
+  $('.crown').classList.toggle('details-open', open);
+  node.crownMore.setAttribute('aria-expanded', String(open));
+}
+node.navBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setNavOpen(!node.win.classList.contains('nav-open'));
+});
+node.navScrim.addEventListener('click', () => setNavOpen(false));
+node.crownMore.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setDetailsOpen(!$('.crown').classList.contains('details-open'));
+});
+// The board button proxies the floating badge, which must stay a sibling of
+// .rail (BUG-160) and is hidden on a phone because it covered the composer.
+node.crownRail.addEventListener('click', () => { setNavOpen(false); setDetailsOpen(false); node.railBadge.click(); });
+$('#railClose').addEventListener('click', () => { node.rail.classList.remove('open'); node.crownRail.focus({ preventScroll: true }); });
+// Outside tap closes the details strip. Taps inside a popover (git, usage,
+// model…) opened FROM the strip must not close it — the popover is placed
+// against its pill, which would vanish under it.
+document.addEventListener('click', (e) => {
+  if (!$('.crown').classList.contains('details-open')) return;
+  if (e.target.closest('.crown') || e.target.closest('.pop')) return;
+  setDetailsOpen(false);
+}, true);
+// The "more" button carries a marker when anything it hides needs attention —
+// hiding the strip must never hide a warning (skip-permissions risk, usage
+// warn/danger/maxed, an unacknowledged model switch, a merge conflict).
+function paintCrownAlert() {
+  const reasons = [];
+  if (node.seal.querySelector('.perm[data-risk="true"]')) reasons.push('permission prompts are skipped');
+  if (node.seal.querySelector('.readout.usage.warn, .readout.usage.danger, .readout.usage.maxed')) reasons.push('usage is running low');
+  if (node.modelChip && !node.modelChip.hidden && node.modelChip.dataset.flag) reasons.push('the model changed');
+  if (node.seal.querySelector('.readout.git:not([hidden]) #gitDot[data-state="conflict"]')) reasons.push('the repository has a merge conflict');
+  if (reasons.length) node.crownMore.dataset.alert = '1'; else delete node.crownMore.dataset.alert;
+  node.crownMore.setAttribute('aria-label', reasons.length ? `Session details — attention: ${reasons.join(', ')}` : 'Session details');
+}
+if (typeof MutationObserver === 'function') { // absent in the node UI harness's DOM
+  new MutationObserver(paintCrownAlert).observe(node.seal, { subtree: true, childList: true, attributes: true, attributeFilter: ['class', 'data-risk', 'data-state', 'hidden'] });
+  if (node.modelChip) new MutationObserver(paintCrownAlert).observe(node.modelChip, { attributes: true, attributeFilter: ['data-flag', 'hidden'] });
+}
+paintCrownAlert();
+// Entering / leaving the phone layout (rotation, a resized window): the drawer
+// and strip never survive the switch, and the desktop fold state is set aside
+// while the phone layout is on (so `.collapsed` rules cannot reach the drawer)
+// and handed back when it ends.
+let wasPhone = null;
+let foldBeforePhone = false;
+function syncLayout() {
+  const phone = phoneLayout();
+  if (phone === wasPhone) return;
+  if (phone) {
+    foldBeforePhone = node.win.classList.contains('collapsed');
+    node.win.classList.remove('collapsed');
+  } else if (wasPhone) {
+    node.win.classList.toggle('collapsed', foldBeforePhone);
+    node.win.classList.remove('nav-open');
+    $('.crown').classList.remove('details-open');
+    node.navBtn.setAttribute('aria-expanded', 'false');
+    node.crownMore.setAttribute('aria-expanded', 'false');
+  }
+  wasPhone = phone;
+  paintFold();
+}
+syncLayout();
+window.addEventListener('resize', syncLayout);
+// The VISIBLE viewport. iOS Safari does not resize the layout (or dvh) when the
+// on-screen keyboard opens, it shrinks only the visual viewport — so the app's
+// height follows visualViewport, and the transcript re-sticks to the bottom so
+// the newest message is not left behind the keyboard.
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  const syncViewport = () => {
+    const root = document.documentElement.style;
+    if (!phoneLayout()) { root.removeProperty('--app-h'); root.removeProperty('--app-top'); return; }
+    root.setProperty('--app-h', `${Math.round(vv.height)}px`);
+    root.setProperty('--app-top', `${Math.round(vv.offsetTop)}px`);
+    const th = viewedThread();
+    if (th.stick !== false) scrollToBottom(th);
+  };
+  vv.addEventListener('resize', syncViewport);
+  vv.addEventListener('scroll', syncViewport);
+  syncViewport();
+}
+// Long-press on a session row / project opens its menu. Android Chrome fires a
+// native contextmenu on long-press; iOS Safari never does, which left rename /
+// pin / close / delete unreachable on an iPhone. A press that already produced
+// a native contextmenu is left alone, and the click that ends a synthetic
+// long-press is swallowed so it does not also open the row.
+(() => {
+  let timer = null, start = null, fired = 0;
+  const cancel = () => { clearTimeout(timer); timer = null; };
+  node.tree.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch') return;
+    const target = e.target.closest('.row, .proj');
+    if (!target) return;
+    start = { x: e.clientX, y: e.clientY };
+    cancel();
+    timer = setTimeout(() => {
+      timer = null;
+      fired = Date.now();
+      target.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: start.x, clientY: start.y, button: 2 }));
+    }, 550);
+  });
+  node.tree.addEventListener('pointermove', (e) => {
+    if (timer && start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 10) cancel();
+  });
+  node.tree.addEventListener('pointerup', cancel);
+  node.tree.addEventListener('pointercancel', cancel);
+  node.tree.addEventListener('contextmenu', (e) => {
+    if (!e.isTrusted) return;
+    if (timer) { cancel(); return; } // the native long-press menu arrived first
+    if (Date.now() - fired < 1200) { e.preventDefault(); e.stopImmediatePropagation(); } // ours already opened it
+  }, true);
+  node.tree.addEventListener('click', (e) => {
+    if (Date.now() - fired < 1200) { fired = 0; e.preventDefault(); e.stopImmediatePropagation(); }
+  }, true);
+})();
 // FEAT-070 — restore the saved sort and wire the toggle.
 state.projSort = loadProjSort();
 paintProjSort();
@@ -15107,6 +15306,10 @@ document.addEventListener('keydown', (e) => {
   const hadPop = document.querySelector('.pop.open');
   closePops();
   if (hadPop) return;
+  // FEAT-171: the phone drawer and the crown's details strip close before Esc
+  // walks out of a subagent thread.
+  if (node.win.classList.contains('nav-open')) { setNavOpen(false); return; }
+  if ($('.crown').classList.contains('details-open')) { setDetailsOpen(false); return; }
   backToMain(); // last: Esc walks out of a subagent thread
 });
 
@@ -15140,20 +15343,27 @@ node.jump.addEventListener('click', () => {
        control), reusing the pin ribbon glyph the user's "a bookmark like book"
        maps to. */
 (() => {
-  const dock = node.jump.parentNode;
-  if (!dock) return;
+  // #jump lives inside the right-corner control stack (.dock-ctl); that stack
+  // and #leftoff are both flex children of ONE full-width row (.dock-float,
+  // BUG-246), so no control can overlap another however wide it grows. The
+  // bookmark joins the right stack; #leftoff is prepended as the row's leading
+  // (left) child.
+  const ctl = node.jump.parentNode;
+  const float = ctl?.parentNode;
+  if (!ctl || !float) return;
   const leftoff = el('button', { class: 'leftoff', id: 'leftoff', type: 'button', hidden: '', title: 'Jump to where you left off' },
     el('span', { class: 'a', text: '↑' }),
     el('span', { class: 'lbl', text: 'You left off here' }),
     el('span', { class: 'g', text: '' }));
   leftoff.addEventListener('click', jumpToReadLine);
-  dock.append(leftoff);
+  float.prepend(leftoff);
   node.leftoff = leftoff;
 
   const bookmark = el('button', { class: 'bkmk', id: 'bookmark', type: 'button', hidden: '', 'aria-pressed': 'false', 'aria-label': 'Set bookmark', title: 'Bookmark this spot — drop a marker here you can jump back to (sets → jumps → clears)' },
     svg(MENU_ICON.pin, 12));
   bookmark.addEventListener('click', toggleBookmark);
-  dock.append(bookmark);
+  // After #jump in the stack, so the bookmark is the rightmost (corner) child.
+  ctl.append(bookmark);
   node.bookmark = bookmark;
 })();
 node.historyLatestBtn.addEventListener('click', () => reopenAtLatest());
@@ -17370,6 +17580,8 @@ function onHashRoute() {
   return false;
 }
 window.addEventListener('hashchange', onHashRoute);
+// FEAT-171 — any navigation puts the phone drawer and details strip away.
+window.addEventListener('hashchange', () => { setNavOpen(false); setDetailsOpen(false); });
 
 /* ------------------------------------------------------------------- boot */
 

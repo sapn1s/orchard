@@ -216,6 +216,12 @@ try {
     const preTarget = path.join(tmpRoot, 'prechange');
     fs.mkdirSync(preTarget, { recursive: true });
     fs.writeFileSync(path.join(preTarget, 'package.json'), JSON.stringify({ name: 'pre', version: '0', scripts: {} }, null, 2) + '\n');
+    // BUG-227: this pinned pre-change onboard predates the onboard() self-target
+    // guard and so BYPASSES it — assert its destructive target is a scratch dir,
+    // never this checkout (the 2026-09-30 incident onboarded the live repo).
+    check('BUG-227 confinement: pinned pre-change onboard target is a scratch dir, not the repo it runs from',
+      path.resolve(preTarget) !== path.resolve(repoRoot) && !path.resolve(preTarget).startsWith(path.resolve(repoRoot) + path.sep),
+      `preTarget=${preTarget} repoRoot=${repoRoot}`);
     const pre = runOnboard(prechangeScript, preTarget);
     check('F pinned pre-change onboard runs', pre.code === 0, pre.out);
     // The whole point: the pre-change producer does NOT satisfy the new bar.

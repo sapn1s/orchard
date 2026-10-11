@@ -270,8 +270,12 @@ _resetGitGrantsForTest();
 
 /* ═══ 6. WIRING PINS — the runtime + the routes actually use this ══════════ */
 const runtimeSrc = fs.readFileSync(path.join(REPO, 'src/server/runtime/claude-runtime.ts'), 'utf8');
-ok('PIN: the runtime evaluates the grant-aware decision per Bash call', /evaluateGitWrite\(/.test(runtimeSrc));
-ok('PIN: the runtime injects the real leak-gate runner for granted publishes', /runLeakGateForRepo\(/.test(runtimeSrc));
+// BUG-249 r2 — the runtime wiring is now the ASYNC grant-aware decision, AWAITED (the
+// leak-gate scan + repo fingerprint run off the event loop). Anti-tamper: require the
+// `await` too — a fire-and-forget call would spend the grant before the gate resolved —
+// so dropping the await, the call, or reverting to a bare name all fail this PIN.
+ok('PIN: the runtime evaluates the grant-aware decision per Bash call (async, awaited)', /await\s+evaluateGitWriteAsync\(/.test(runtimeSrc));
+ok('PIN: the runtime injects the real (async, off-loop) leak-gate runner for granted publishes', /runLeakGateForRepoAsync\(/.test(runtimeSrc));
 ok('PIN: the runtime passes the project grant key + session label',
   /gitGrantKey/.test(runtimeSrc) && /sessionLabel/.test(runtimeSrc));
 const indexSrc = fs.readFileSync(path.join(REPO, 'src/server/index.ts'), 'utf8');
@@ -280,6 +284,47 @@ ok('PIN: the route revokes (revokeGitWrite) and reads (grantView)',
   /revokeGitWrite\(/.test(indexSrc) && /grantView\(/.test(indexSrc));
 ok('PIN: the health payload surfaces gitWriteGrant per session', /gitWriteGrant:/.test(indexSrc));
 ok('PIN: an audit sink persists permitted writes to a host-side log', /setGitWriteAuditSink\(/.test(indexSrc) && /git-write-audit\.jsonl/.test(indexSrc));
+
+/* ─── BUG-249 round 3 — source-wiring anti-tamper PINs for the two async hot
+ * callers. The round-2 clean-room re-verify surfaced two UNPINNED gaps:
+ *   (a) the `/api/git-shim/decide` redeem in index.ts was not pinned at all — a
+ *       dropped `await` (fire-and-forget: the grant spends before the gate
+ *       resolves) or a revert to the sync `redeemGitWrite` would both go
+ *       uncaught, reintroducing the freeze on the /decide path.
+ *   (b) the PreToolUse hook's leak-gate INJECTION could be reverted to the sync
+ *       `runLeakGateForRepo` and still pass the bare-name PIN at line 278,
+ *       because this same file also DEFINES `runLeakGateForRepoAsync` — so the
+ *       bare-name regex matches the definition regardless of what the injection
+ *       uses. (Demonstrated below: the mutated source still satisfies the old
+ *       PIN; only the precise injection-site PIN catches the revert.)
+ * Each PIN is proven anti-tamper against a synthesized IN-MEMORY mutation of the
+ * real source (not HEAD): it MUST FAIL on the mutated string and PASS on the
+ * real one, and each mutation is asserted to actually change the source. */
+
+// (a) /api/git-shim/decide must AWAIT the async redeem.
+const REDEEM_PIN = /await\s+redeemGitWriteAsync\(/;
+ok('PIN: /api/git-shim/decide awaits the async git-write redeem', REDEEM_PIN.test(indexSrc));
+const redeemDropAwait = indexSrc.replace('await redeemGitWriteAsync(', 'redeemGitWriteAsync(');
+ok('MUST-FAIL(mutated): dropping the await on the /decide redeem fails the PIN',
+  redeemDropAwait !== indexSrc && !REDEEM_PIN.test(redeemDropAwait));
+const redeemSyncRevert = indexSrc.replace('await redeemGitWriteAsync(', 'await redeemGitWrite(');
+ok('MUST-FAIL(mutated): reverting /decide to the sync redeemGitWrite fails the PIN',
+  redeemSyncRevert !== indexSrc && !REDEEM_PIN.test(redeemSyncRevert));
+
+// (b) the PreToolUse hook must INJECT the async (off-loop) leak-gate runner.
+const HOOK_GATE_PIN = /runLeakGate:\s*\(scope\)\s*=>\s*runLeakGateForRepoAsync\(/;
+ok('PIN: the PreToolUse hook injects the async (off-loop) leak-gate runner', HOOK_GATE_PIN.test(runtimeSrc));
+const hookGateSyncRevert = runtimeSrc.replace(
+  '(scope) => runLeakGateForRepoAsync(config.gitRepoPath, scope)',
+  '(scope) => runLeakGateForRepo(config.gitRepoPath, scope)');
+ok('MUST-FAIL(mutated): reverting the hook injection to the sync runLeakGateForRepo fails the PIN',
+  // the mutation fires, the precise PIN rejects it, AND the bare-name line-278 PIN would
+  // STILL pass on the mutated source (the async definition remains) — which is exactly why
+  // this injection-site PIN is the one that closes the gap.
+  hookGateSyncRevert !== runtimeSrc
+  && !HOOK_GATE_PIN.test(hookGateSyncRevert)
+  && /runLeakGateForRepoAsync\(/.test(hookGateSyncRevert));
+
 const bridgeSrc = fs.readFileSync(path.join(REPO, 'src/server/agent-bridge.ts'), 'utf8');
 ok('PIN: agent-bridge passes the project id + hostPath + session id',
   /gitGrantKey: opts\.project\.id/.test(bridgeSrc) && /gitRepoPath: opts\.project\.hostPath/.test(bridgeSrc));

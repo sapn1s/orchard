@@ -19,7 +19,19 @@
  * refuses the gate would also have refused, and anything that passes the guard
  * passes the gate — the guard adds no new false-positive surface, it only moves
  * the same decision earlier (to the moment of writing).
+ *
+ * BUG-236 (round 5 redesign) — DETECTION IS NEVER SUPPRESSED. Rounds 1–4 tried to
+ * teach the matcher that a credential-shaped right-hand side "is really code" (a
+ * value-shape rule, a code-vs-config file split, an expression grammar with a
+ * literal residue) and every one was broken by a new route. All of it is DELETED:
+ * the detection below is HEAD's (FEAT-130/156) VERBATIM plus purely ADDITIVE
+ * literal forms (template and triple-quoted literals, appended after every HEAD
+ * form so they can only add hits). A false positive is resolved by a reviewed,
+ * single-LINE waiver in `.leakgate-allow` (see credentialFingerprint), never by
+ * the matcher guessing.
  */
+
+import { createHash } from 'node:crypto';
 
 export const TOKENS = [
   { kind: 'project', name: 'private project A (bot)',      re: new RegExp('saa' + 'sis', 'i') },
@@ -306,6 +318,19 @@ const GENERIC_SECRET_KEY_SRC =
   '(?<![A-Za-z0-9_])(token|auth|pwd|passphrase|credentials?|cred|cookie|session|api[_-]?secret|secret[_-]?token|private[_-]?token|session[_-]?(?:token|key|secret)|client[_-]?key|access[_-]?secret)';
 const ASSIGN_GENERIC_BARE = new RegExp(GENERIC_SECRET_KEY_SRC + KV_SEP + '([^\\s"\'`#,;<>{}()\\[\\]]{18,})', 'ig');
 const ASSIGN_GENERIC_QUOTED = new RegExp(GENERIC_SECRET_KEY_SRC + KV_SEP + '(["\'])([^"\']{18,})\\2', 'ig');
+// BUG-236 — ADDITIVE literal forms (detection only ever grows). HEAD's quoted form
+// needs a single `"`/`'` delimiter and its bare form stops at a backtick/quote, so a
+// secret written as a TEMPLATE literal (`` password = `…` ``) or a TRIPLE-quoted
+// literal (`password = """…"""`) was matched by NO form. These are judged by exactly
+// the floor of the quoted form for the same key class. A template that carries an
+// UNESCAPED `${` is a runtime expression and is skipped (an escaped `\${` is constant
+// text, so it does not skip). They are evaluated AFTER every HEAD form in scanSecrets,
+// so a line's HEAD hits are reported unchanged and these can only add to them.
+const ASSIGN_TEMPLATE = new RegExp(SECRET_KEY_SRC + KV_SEP + '`([^`]{6,})`', 'ig');
+const ASSIGN_GENERIC_TEMPLATE = new RegExp(GENERIC_SECRET_KEY_SRC + KV_SEP + '`([^`]{18,})`', 'ig');
+const ASSIGN_TRIPLE = new RegExp(SECRET_KEY_SRC + KV_SEP + '("""|\'\'\')([\\s\\S]{6,}?)\\1', 'ig');
+const ASSIGN_GENERIC_TRIPLE = new RegExp(GENERIC_SECRET_KEY_SRC + KV_SEP + '("""|\'\'\')([\\s\\S]{18,}?)\\2', 'ig');
+const isInterpolated = (v) => String(v ?? '').replace(/\\\$/g, '').includes('${');
 // proto://user:password@host — the inline password is the leak. FEAT-130 round 5:
 // the userinfo user part is `*` not `+`, so a PASSWORD-ONLY URL (`redis://:pass@host`,
 // the common redis/amqp shape where the username is empty) is matched too — the
@@ -540,6 +565,13 @@ export function scanSecrets(line) {
     out.push({ token: 'connection string password', match: c[0].replace(c[1], '…') });
   }
   for (const m of scanAll(EMAIL_RE, s, (x) => !emailAllowed(x[0]))) out.push({ token: 'personal email', match: m[0] });
+  // BUG-236 — the ADDITIVE literal forms, strictly after every HEAD form above: they
+  // only push labels HEAD did not already report, so HEAD's output is a prefix of this.
+  const extraLabel = (m) => `${m[0].split(/[:=]/)[0].replace(/["'`]/g, '').trim()}=…`;
+  for (const a of scanAll(ASSIGN_TEMPLATE, s, (x) => !isInterpolated(x[1]) && isHighSignalSecretValue(x[1]))) pushAssign(extraLabel(a));
+  for (const a of scanAll(ASSIGN_TRIPLE, s, (x) => isHighSignalSecretValue(x[2]))) pushAssign(extraLabel(a));
+  for (const a of scanAll(ASSIGN_GENERIC_TEMPLATE, s, (x) => !isInterpolated(x[2]) && looksHighEntropySecret(x[2]) && !valueMatchesKnownShape(x[2]))) pushAssign(`${a[1]}=…`);
+  for (const a of scanAll(ASSIGN_GENERIC_TRIPLE, s, (x) => looksHighEntropySecret(x[3]) && !valueMatchesKnownShape(x[3]))) pushAssign(`${a[1]}=…`);
   return out;
 }
 
@@ -713,17 +745,104 @@ export function globToRegExp(glob) {
 
 export const ALLOWLIST_FILE = '.leakgate-allow';
 const MIN_REASON = 10;
+const REASON_CONTENT_RE = /[\p{L}\p{N}]/u;
+
+/* ────────────────────────────────────────────────────────────────────────
+ * BUG-236 — the credential waiver is ONE LINE in ONE file, nothing else.
+ *
+ * Detection is never suppressed (see the header), so a credential-shaped false
+ * positive (code that merely LOOKS like a secret assignment, a documented example,
+ * a test fixture) is resolved here: a reviewed `.leakgate-allow` entry
+ *
+ *   token:<credential label> line:sha256:<64 hex> in:<exact repo path> because: <reason>
+ *
+ * where the fingerprint is sha256(normalised path + NUL + the FULL line content).
+ * There is no value extraction anywhere on this path (every round-2/3 break was an
+ * extraction break) and no multi-line material (the round-4 PEM block hash was
+ * broken twice): the waiver covers that exact line, so editing the line, appending
+ * to it, or moving it to another path voids it. Normalisation is only what an
+ * editor changes without meaning to: CRLF→LF and trailing whitespace. Paths are
+ * normalised only for `./` / `//` / `/./` spelling; case is NOT folded (exact match).
+ *
+ * NEVER waivable, whatever the entry says:
+ *   - private-key material: the PEM header hit itself, and ANY hit on a line inside
+ *     a BEGIN…PRIVATE KEY … END block (header and END lines included; an
+ *     unterminated block runs to end of file) — see privateKeyLines;
+ *   - anything found inside `.leakgate-allow` itself (scanned with zero credential
+ *     waivers; an entry whose `in:` targets it is refused at parse time);
+ *   - identity tokens (FEAT-156, unchanged).
+ * A drafted entry (leak-gate.mjs --draft-waivers) starts with the DRAFT marker and is
+ * refused by structure until a human deletes the marker and writes a reason.
+ * ──────────────────────────────────────────────────────────────────────── */
+export const PEM_TOKEN = 'private key (PEM header)';
+export const CRED_FP_RE = /^sha256:[0-9a-f]{64}$/;
+/**
+ * A drafted entry is refused by STRUCTURE, never by reading its reason text (round-5 IV
+ * 01a11662: `review_pending_TODO` slipped a placeholder-word regex — placeholder detection is
+ * an enumeration). --draft-waivers prints every entry with this leading marker and an EMPTY
+ * reason; parseAllowlist refuses ANY line whose first word is the marker, whatever follows.
+ * A human approves an entry by deleting the marker and writing a reason; any non-empty reason
+ * (≥ MIN_REASON chars) is then accepted — judging it is the reviewer's job.
+ */
+export const DRAFT_MARKER = 'DRAFT';
+const DRAFT_LINE_RE = /^draft(?:\s|:|$)/i;
+
+/** A repo-relative posix path in canonical spelling, or null if it is not one. */
+export function normalizeWaiverPath(p) {
+  let s = String(p ?? '');
+  if (!s || /[\0\\]/.test(s)) return null;
+  s = s.replace(/\/{2,}/g, '/');
+  const segs = s.split('/').filter((seg) => seg !== '.');
+  if (!segs.length || segs[0] === '') return null;               // absolute
+  if (segs.some((seg) => seg === '' || seg === '..')) return null; // trailing slash / parent hop
+  return segs.join('/');
+}
+/** One line, CRLF→LF and trailing whitespace trimmed; null if it spans lines. */
+export function normalizeWaiverLine(line) {
+  const s = String(line ?? '').trimEnd();
+  return s.includes('\n') ? null : s;
+}
+/** `sha256:<hex>` of (normalised path + NUL + normalised line), or null. */
+export function credentialFingerprint(rel, line) {
+  const p = normalizeWaiverPath(rel);
+  const l = normalizeWaiverLine(line);
+  if (p === null || l === null) return null;
+  return 'sha256:' + createHash('sha256').update(`${p}\u0000${l}`, 'utf8').digest('hex');
+}
+/**
+ * The 0-based indices of every line that is private-key material: a line carrying a
+ * BEGIN or END …PRIVATE KEY… marker, and every line while a BEGIN is open (no END
+ * yet — unterminated runs to end of file). Markers are processed left to right, so a
+ * line ending in a fresh BEGIN keeps the block open. The marker is deliberately looser
+ * than the detection shape (any `[A-Z0-9 ]` words around PRIVATE KEY, e.g. PGP's
+ * `… PRIVATE KEY BLOCK`): more lines unwaivable, never fewer. No cap.
+ */
+const PEM_MARK_RE = /-----(BEGIN|END) [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----/g;
+export function privateKeyLines(lines) {
+  const out = new Set();
+  let open = false;
+  (lines ?? []).forEach((raw, i) => {
+    const line = String(raw ?? '');
+    let marked = open;
+    for (const m of line.matchAll(PEM_MARK_RE)) { marked = true; open = m[1] === 'BEGIN'; }
+    if (marked) out.add(i);
+  });
+  return out;
+}
+const isAllowlistPath = (p) => String(p ?? '').replace(/\\/g, '/').split('/').pop() === ALLOWLIST_FILE;
 
 /**
- * Parse a `.leakgate-allow` (FEAT-156). One waiver per line:
+ * Parse a `.leakgate-allow` (FEAT-156 / BUG-236). One waiver per line:
  *   token:<hit label> [match:<exact matched text>] [in:<path glob>] because: <reason>
  *   match:<exact matched text> [in:<path glob>] because: <reason>
+ *   token:<credential label> line:sha256:<64 hex> in:<exact path> because: <reason>
  * `#` comments and blank lines are ignored. Returns `{ entries, errors }`; ANY
  * error makes the gate exit 2 (fail closed) — a malformed allowlist is never
- * half-applied. Refused (error): no reason / short reason; unknown key or label;
- * an identity or credential label; `personal email` without an exact `match:`;
- * a `match:` value that is itself a credential or identity token; a bare
- * `*`/`**` glob (omit `in:` to mean everywhere).
+ * half-applied. Refused (error): a DRAFT-marked line; no reason / short reason; unknown key or label; an identity label; `personal email` without an exact
+ * `match:`; a `match:` value that is itself a credential or identity token; a bare
+ * `*`/`**` glob; an `in:` that targets the allowlist file; a credential label without
+ * an exact `in:` path + `line:` fingerprint, or with `match:`; the PEM label (never
+ * waivable); the retired `value:` key.
  */
 export function parseAllowlist(text) {
   const entries = [];
@@ -733,14 +852,19 @@ export function parseAllowlist(text) {
     const line = raw.trim();
     if (!line || line.startsWith('#')) return;
     const err = (m) => errors.push(`${ALLOWLIST_FILE}:${lineNo}: ${m}`);
+    if (DRAFT_LINE_RE.test(line)) return err(`a ${DRAFT_MARKER} entry (printed by --draft-waivers) never takes effect — review the line, write the reason after \`because:\`, then delete the leading ${DRAFT_MARKER} marker`);
     const bi = line.search(/(^|\s)because:/);
     if (bi < 0) return err('every entry needs a reason — end the line with `because: <why this is not a leak>`');
     const reason = line.slice(line.indexOf('because:', bi) + 'because:'.length).trim();
     if (reason.length < MIN_REASON) return err(`the reason is too short (${reason.length} chars; need ≥ ${MIN_REASON}) — say why this hit is not a leak`);
+    // A reason must CONTAIN words: at least one Unicode letter or digit. Structural, not a
+    // list of whitespace code points — `trim()` misses e.g. U+0085 NEL, so a reason of only
+    // invisible/separator/punctuation characters was accepted (IV 74fe2bdd).
+    if (!REASON_CONTENT_RE.test(reason)) return err('the reason has no letter or digit — write why this hit is not a leak');
     const sel = line.slice(0, bi).trim();
-    const keyRe = /(^|\s)(token|match|in):/g;
+    const keyRe = /(^|\s)(token|match|in|line|value):/g;
     const marks = [...sel.matchAll(keyRe)].map((m) => ({ key: m[2], at: m.index + m[1].length, valAt: m.index + m[0].length }));
-    if (!marks.length || marks[0].at !== 0) return err('expected `token:<label>` or `match:<text>` at the start of the line (keys: token:, match:, in:, because:)');
+    if (!marks.length || marks[0].at !== 0) return err('expected `token:<label>` or `match:<text>` at the start of the line (keys: token:, match:, line:, in:, because:)');
     const e = { lineNo, reason };
     for (let k = 0; k < marks.length; k++) {
       const { key, valAt } = marks[k];
@@ -749,46 +873,69 @@ export function parseAllowlist(text) {
       if (!val) return err(`\`${key}:\` has no value`);
       e[key] = val;
     }
+    if (e.value !== undefined) return err('`value:` is retired — a credential waiver is `line:sha256:<64 hex>` of the exact path + full line; copy the form the gate prints next to the hit');
     if (!e.token && !e.match) return err('an entry needs `token:<label>` and/or `match:<text>`');
     if (e.in !== undefined) {
       if (/\s/.test(e.in)) return err('`in:` glob must not contain whitespace');
       if (e.in === '*' || e.in === '**' || e.in === '**/*') return err('a bare `*`/`**` glob is refused — omit `in:` to mean every file, deliberately');
-      e.glob = globToRegExp(e.in);
+      if (isAllowlistPath(e.in)) return err(`\`in:${e.in}\` targets the allowlist file itself — nothing written in ${ALLOWLIST_FILE} can be waived`);
     }
-    if (e.token) {
-      const kind = tokenKindOf(e.token);
-      if (kind === null) return err(`unknown token label [${e.token}] — copy the label exactly as the gate printed it inside [ ]`);
-      if (kind === 'credential') return err(`[${e.token}] is a credential class and can NEVER be allowlisted — remove the secret instead`);
-      if (kind === 'identity') return err(`[${e.token}] is a personal-identity token (home path / username / handle / email) and cannot be allowlisted`);
-      if (kind === 'email' && !e.match) return err('[personal email] can only be allowlisted for one exact address — add `match:<the address>`');
+    const kind = e.token ? tokenKindOf(e.token) : null;
+    if (e.token && kind === null) return err(`unknown token label [${e.token}] — copy the label exactly as the gate printed it inside [ ]`);
+    if (e.line !== undefined && kind !== 'credential') return err('`line:` is only for a credential waiver — it needs the credential `token:<label>` printed with the hit');
+    if (kind === 'credential') {
+      if (e.token === PEM_TOKEN) return err(`[${e.token}] is private-key material and can NEVER be waived — remove the key`);
+      if (e.match !== undefined) return err('a credential waiver uses `line:<fingerprint>`, never `match:` — copy the `token:… line:… in:…` form the gate prints');
+      if (e.line === undefined || !CRED_FP_RE.test(e.line)) return err(`[${e.token}] is a credential class — it can be waived only for ONE line: \`line:sha256:<64 lowercase hex>\` (printed by the gate next to the hit) plus an exact \`in:<path>\``);
+      if (e.in === undefined || /[*?]/.test(e.in) || normalizeWaiverPath(e.in) === null) return err(`[${e.token}] line waiver needs an exact repo-relative \`in:<path>\` (no glob, no absolute path, no \`..\`)`);
+      e.inPath = normalizeWaiverPath(e.in);
+      entries.push(e);
+      return;
     }
+    if (e.in !== undefined) e.glob = globToRegExp(e.in);
+    if (kind === 'identity') return err(`[${e.token}] is a personal-identity token (home path / username / handle / email) and cannot be allowlisted`);
+    if (kind === 'email' && !e.match) return err('[personal email] can only be allowlisted for one exact address — add `match:<the address>`');
     if (e.match) {
       const bad = [...scanLine(e.match), ...scanKeyShapes(e.match)]
         .filter((h) => { const k = tokenKindOf(h.token); return k === 'credential' || k === 'identity'; });
-      if (bad.length) return err(`the \`match:\` value is itself a ${bad.map((h) => `[${h.token}]`).join(', ')} hit — credentials and personal identity can never be allowlisted`);
+      if (bad.length) return err(`the \`match:\` value is itself a ${bad.map((h) => `[${h.token}]`).join(', ')} hit — credentials and personal identity can never be allowlisted by match:`);
     }
     entries.push(e);
   });
   return { entries, errors };
 }
 
-/** Is this hit class waivable by an allowlist entry at all? (credentials/identity: never.) */
-function allowlistable(hit, entry) {
+/**
+ * Is this hit waivable by this entry? Non-credential: FEAT-156 unchanged. Credential:
+ * only a `line:` entry for the same label whose exact path equals this file and whose
+ * fingerprint equals sha256(path + THIS line), and never private-key material.
+ * `ctx` = { line: the full source line, pem: true if the line is private-key material };
+ * without it (binary chunk, commit message, identity) a credential is never waivable.
+ */
+function allowlistable(hit, entry, rel, ctx) {
   const kind = tokenKindOf(hit.token);
   if (kind === 'project' || kind === 'client') return true;
   if (kind === 'email') return Boolean(entry.match); // one exact address, never the class
+  if (kind === 'credential') {
+    if (hit.token === PEM_TOKEN || !ctx || ctx.pem !== false || typeof ctx.line !== 'string') return false;
+    if (entry.line === undefined || entry.token !== hit.token) return false;
+    const fp = credentialFingerprint(rel, ctx.line);
+    return fp !== null && entry.inPath === normalizeWaiverPath(rel) && entry.line === fp;
+  }
   return false;
 }
 
 /**
  * The allowlist entry that waives ONE hit `{ token, match }` in file `rel`, or
  * undefined. Per HIT, never per line: every other hit on the same line is
- * judged on its own.
+ * judged on its own. `ctx` (see allowlistable) is required for a credential.
  */
-export function allowlistEntryFor(entries, rel, hit) {
+export function allowlistEntryFor(entries, rel, hit, ctx) {
+  const credential = tokenKindOf(hit.token) === 'credential';
+  if (credential && isAllowlistPath(rel)) return undefined; // the allowlist file: zero credential waivers
   return (entries ?? []).find((e) =>
     (!e.token || e.token === hit.token)
-    && (!e.match || e.match === hit.match)
-    && (!e.glob || e.glob.test(rel))
-    && allowlistable(hit, e));
+    && (credential || !e.match || e.match === hit.match)
+    && (credential || !e.glob || e.glob.test(rel))
+    && allowlistable(hit, e, rel, ctx));
 }

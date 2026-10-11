@@ -148,6 +148,13 @@ async function main() {
   } catch (e) { oldOnboardOk = false; console.log(`        (could not extract pinned pre-fix onboard: ${e.message})`); }
   if (oldOnboardOk) {
     const preDir = makeFixture('prefix');
+    // BUG-227: this pinned pre-fix onboard predates the onboard() self-target
+    // guard and so BYPASSES it — the test itself must prove its destructive
+    // target is a scratch dir, never this checkout (the 2026-09-30 incident
+    // onboarded the live repo through a bad target).
+    check('BUG-227 confinement: pinned pre-fix onboard target is a scratch dir, not the repo it runs from',
+      path.resolve(preDir) !== path.resolve(ROOT) && !path.resolve(preDir).startsWith(path.resolve(ROOT) + path.sep),
+      `preDir=${preDir} ROOT=${ROOT}`);
     execFileSync('node', [oldOnboard, preDir], { encoding: 'utf8' });
     check('PRE-FIX onboard did NOT install .claude/settings.json (hook)',
       !fs.existsSync(path.join(preDir, '.claude', 'settings.json')), 'absent as expected');

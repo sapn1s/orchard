@@ -46,6 +46,12 @@
  *   node scripts/independent-verify.mjs --check-only <verdict-file>
  *
  * By default only COMMITTED work is visible (range → rev-parse → git archive).
+ * `--candidate <TICKET|hash>` (FEAT-170) verifies a FROZEN candidate: the ticket's files
+ * exactly as frozen at fix-handoff, overlaid on the freeze-time HEAD and nothing else
+ * (scripts/lib/candidate-store.mjs). Edits made to the live tree after the freeze —
+ * another lane's, a whole-file restore (BUG-224) — cannot reach the room or the diff,
+ * and the verdict's record command carries the candidate hash it is bound to.
+ *
  * `--working-tree` (FEAT-134, mutually exclusive with --range) snapshots the
  * CURRENT dirty tree — tracked edits + untracked-not-ignored files — into a
  * dangling commit via a throwaway index and verifies that; the real repo state is
@@ -75,6 +81,8 @@ import { mkdtempScratch, scratchRootInfo, checkSameFilesystem, SCRATCH_ENV } fro
 // FEAT-134: verify the CURRENT dirty tree, not only committed objects. The
 // snapshot is a dangling commit built via a throwaway index — real repo untouched.
 import { snapshotWorkingTree } from './lib/tree-snapshot.mjs';
+// FEAT-170: verify an immutable, content-hashed candidate instead of the shared tree.
+import { materializeCandidate, CandidateError } from './lib/candidate-store.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -83,9 +91,48 @@ const DISPATCH = path.join(ROOT, 'scripts', 'dispatch.mjs');
 // verify script pulling in argvSafePrompt) must NOT arg-parse, validate or dispatch.
 const IS_ENTRY = !!process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
+/* ----------------------------------------------- BUG-250: crash-safe cleanup
+ * The clean room and record dir live under the PERSISTENT scratch root (not
+ * /tmp — they are evidence a verdict cites days later). The only cleanup used
+ * to be an `rmSync` on the two NORMAL exit paths, so a crash, a `die()`, an
+ * uncaught exception, or a SIGINT/SIGTERM between room creation and those lines
+ * leaked the room forever (865 leaked dirs measured). Fix: every scratch dir is
+ * REGISTERED at its `mkdtemp` call site and removed by a single `exit` handler
+ * plus signal handlers, so an abnormal exit no longer leaks. A `--keep-cleanroom`
+ * room is deliberately NEVER registered — a crashed kept run must still keep its
+ * evidence. SIGKILL / power-loss cannot be handled and is NOT covered here: a
+ * room leaked that way is reclaimed by the OPERATOR via the read-only report tool
+ * (scripts/scratch-report.mjs), which emits `rm` commands for review — there is
+ * no autonomous sweep (BUG-250 round 2 retired it; it broke four times). This
+ * handler deletes ONLY the exact dirs THIS process created — never a foreign dir.
+ */
+const _scratchToClean = new Set();
+let _cleanupDone = false;
+let _activeDispatchChild = null;
+function trackScratch(dir) { if (dir) _scratchToClean.add(dir); }
+function untrackScratch(dir) { if (dir) _scratchToClean.delete(dir); }
+function cleanupScratch() {
+  if (_cleanupDone) return; _cleanupDone = true;
+  for (const d of _scratchToClean) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } }
+  _scratchToClean.clear();
+}
+if (IS_ENTRY) {
+  process.on('exit', cleanupScratch);
+  const SIGNUM = { SIGINT: 2, SIGQUIT: 3, SIGHUP: 1, SIGTERM: 15 };
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT']) {
+    process.on(sig, () => {
+      // Stop the verifier child FIRST (it runs with --cwd room.dir): deleting the
+      // room out from under a live child lets its writes recreate fragments.
+      try { if (_activeDispatchChild && _activeDispatchChild.pid) _activeDispatchChild.kill('SIGKILL'); } catch { /* already gone */ }
+      cleanupScratch();
+      process.exit(128 + (SIGNUM[sig] ?? 0));
+    });
+  }
+}
+
 const USAGE = `usage: node scripts/independent-verify.mjs --requirement <text|@file>
-         [--repo <dir>] [--range <A..B|rev> | --working-tree] [--run "<command>"]...
-         [--test-file <path>]... [--allow-input <repo-rel-path>]...
+         [--repo <dir>] [--range <A..B|rev> | --working-tree | --candidate <TICKET|hash>]
+         [--run "<command>"]... [--test-file <path>]... [--allow-input <repo-rel-path>]...
          [--author-provider anthropic|openai]
          [--provider anthropic|openai] [--model <m>] [--timeout-min <n>]
          [--max-diff-bytes <n>] [--keep-cleanroom] [--print-prompt]
@@ -119,6 +166,7 @@ const opts = {
   repo: process.cwd(),
   range: null,
   workingTree: false,
+  candidate: null,
   requirement: null,
   runs: [],
   testFiles: [],
@@ -143,6 +191,7 @@ for (let i = 0; i < argv.length; i++) {
   if (a === '--repo') opts.repo = path.resolve(take());
   else if (a === '--range') opts.range = take();
   else if (a === '--working-tree') opts.workingTree = true;
+  else if (a === '--candidate') opts.candidate = take();
   else if (a === '--requirement') opts.requirement = take();
   else if (a === '--run') opts.runs.push(take());
   else if (a === '--test-file') opts.testFiles.push(take());
@@ -205,6 +254,7 @@ if (IS_ENTRY) {
 
   if (!opts.requirement) die(`--requirement is required\n${USAGE}`);
   if (opts.workingTree && opts.range) die('--working-tree and --range are mutually exclusive: one verifies the dirty tree, the other a committed range');
+  if (opts.candidate && (opts.workingTree || opts.range)) die('--candidate is mutually exclusive with --range and --working-tree: it verifies one frozen candidate, nothing else');
   if (opts.authorProvider !== 'anthropic' && opts.authorProvider !== 'openai') die('--author-provider must be anthropic|openai');
   if (opts.provider && opts.provider !== 'anthropic' && opts.provider !== 'openai') die('--provider must be anthropic|openai');
   // Cross-provider by default: decorrelated blind spots (ROUTING.md).
@@ -760,6 +810,10 @@ export function materializeSymlinks(dir, { allowed = [] } = {}) {
 
 async function buildCleanroom(repo, rev, { allowed = [] } = {}) {
   const dir = mkdtempScratch('cleanroom-verify-');
+  // BUG-250: register for crash cleanup the instant it exists (before the tar
+  // below, which can `die()`). A `--keep-cleanroom` room is simply NOT registered,
+  // so it is never auto-deleted — nothing else needs doing to preserve it.
+  if (!opts.keepCleanroom) trackScratch(dir);
   const tar = spawnSync('sh', ['-c', `git -C ${JSON.stringify(repo)} archive ${JSON.stringify(rev)} | tar -x -C ${JSON.stringify(dir)}`], { encoding: 'utf8' });
   if ((tar.status ?? 1) !== 0) die(`could not export ${rev} into a clean room: ${(tar.stderr || '').trim()}`);
 
@@ -853,6 +907,7 @@ async function buildCleanroom(repo, rev, { allowed = [] } = {}) {
   // `RAN:` (visible on the verdict face) and the FIXER-TEST's RAN is pinned to
   // the harness-supplied command.
   const recordDir = mkdtempScratch('cleanroom-record-');
+  if (!opts.keepCleanroom) trackScratch(recordDir);
   const manifestFile = path.join(recordDir, 'manifest.jsonl');
   // ROUND-9: ALL harness run-state lives OUTSIDE the room. The spool (the
   // verifier's request channel + the harness's heartbeat and responses) is a
@@ -866,6 +921,7 @@ async function buildCleanroom(repo, rev, { allowed = [] } = {}) {
   // write following a symlink; this removes the class). vrun.mjs carries the
   // absolute spool paths baked in; nothing in the room points at them.
   const spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cleanroom-spool-'));
+  trackScratch(spoolDir); // BUG-250: disposable, but crash-clean it like the rest (7 leaked today)
   const reqDir = path.join(spoolDir, 'req');
   const resDir = path.join(spoolDir, 'res');
   fs.mkdirSync(reqDir);
@@ -935,7 +991,7 @@ async function buildCleanroom(repo, rev, { allowed = [] } = {}) {
   beat();
   const poll = setInterval(drain, 75);
   poll.unref();
-  const recorder = { close: () => { clearInterval(poll); try { fs.rmSync(spoolDir, { recursive: true, force: true }); } catch { /* gone */ } } };
+  const recorder = { close: () => { clearInterval(poll); untrackScratch(spoolDir); try { fs.rmSync(spoolDir, { recursive: true, force: true }); } catch { /* gone */ } } };
 
   safeWriteInRoom(dir, 'vrun.mjs', `#!/usr/bin/env node
 // vrun.mjs — run-recorder CLIENT for independent verification. The harness
@@ -1134,7 +1190,30 @@ async function main() {
   if (git(opts.repo, 'rev-parse', '--git-dir').code !== 0) die(`not a git repo: ${opts.repo}`);
   const repo = gitOk(opts.repo, 'rev-parse', '--show-toplevel').trim();
   let base, head;
-  if (opts.workingTree) {
+  let candidate = null;
+  if (opts.candidate) {
+    // FEAT-170: the room is the candidate's own tree — HEAD at freeze + exactly the
+    // frozen files, re-materialised from the STORE (never the live tree) and asserted
+    // equal to the tree recorded at freeze. base..tree is then exactly those files.
+    try { candidate = materializeCandidate(repo, opts.candidate); }
+    catch (e) { die(e instanceof CandidateError ? `--candidate ${opts.candidate}: ${e.message}` : String(e?.stack || e)); }
+    base = candidate.base;
+    head = candidate.tree;
+    // Plan review point 9: node_modules is copied from the LIVE repo. If another lane
+    // changed the lockfile, the room would run dependencies the candidate does not
+    // declare — refuse rather than verify against them silently.
+    for (const lock of ['package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock']) {
+      const inCand = spawnSync('git', ['-C', repo, 'cat-file', 'blob', `${head}:${lock}`], { encoding: 'buffer' });
+      const livePath = path.join(repo, lock);
+      const liveExists = fs.existsSync(livePath);
+      if ((inCand.status ?? 1) !== 0 && !liveExists) continue;
+      const same = (inCand.status ?? 1) === 0 && liveExists && Buffer.compare(inCand.stdout, fs.readFileSync(livePath)) === 0;
+      if (!same) die(`--candidate: ${lock} in the candidate differs from the live repo's, so the node_modules this room would copy was not installed from the candidate's dependencies. Re-freeze after the lockfile settles (or include ${lock} in the candidate and install it).`);
+    }
+    const m = candidate.manifest;
+    console.error(`  candidate ${m.ticket} ${m.hash.slice(0, 12)} — base ${m.base.slice(0, 12)} → tree ${m.tree.slice(0, 12)}, ${m.files.length} frozen file(s)${m.deps.length ? `, group with ${m.deps.map((d) => d.ticket).join(', ')}` : ''}; live-tree edits after the freeze cannot reach this room`);
+  } else if (opts.workingTree) {
+    console.error('  note       --working-tree hands the verifier EVERY in-flight ticket\'s code; freeze the ticket and use --candidate <TICKET> to verify only its own frozen files (FEAT-170)');
     // FEAT-134: base = HEAD, head = the snapshot TREE sha (NOT the dangling commit
     // — a commit is gc-collectable, the tree is the durable id the range line and
     // any record then carries). git diff / git archive both accept a bare tree, so
@@ -1154,6 +1233,19 @@ async function main() {
   // revision under test (read out of the room's own copy), and that SAME surface
   // is what the diff below excludes — one source, never a second list (BUG-186).
   const room = await buildCleanroom(repo, head, { allowed: opts.allowInputs });
+
+  // BUG-250 TEST SEAM — never active in a real run. When
+  // CLAUDE_STATION_IV_CRASH_AFTER_ROOM is set, crash in the requested way right
+  // after the room exists, so the verify suite can prove the crash-safe handlers
+  // actually remove the room on an abnormal exit (throw / die / signal).
+  if (process.env.CLAUDE_STATION_IV_CRASH_AFTER_ROOM) {
+    const mode = process.env.CLAUDE_STATION_IV_CRASH_AFTER_ROOM;
+    process.stderr.write(`IV-CRASH-SEAM room=${room.dir} record=${room.recordDir} spool=${room.spoolDir}\n`);
+    if (mode === 'throw') throw new Error('crash seam: uncaught throw after room build');
+    if (mode === 'die') die('crash seam: die() after room build', 7);
+    if (mode === 'exit') process.exit(9);
+    if (mode === 'hang') { await new Promise(() => {}); } // park until the test signals us
+  }
 
   // THE DIFF HANDED TO THE VERIFIER (BUG-186), an ALLOW-LIST over byte-exact
   // paths driven by the SAME `makeIsDeclared` predicate the room strip uses.
@@ -1253,6 +1345,10 @@ async function main() {
   if (!fullDiff.trim()) die(`range ${base.slice(0, 8)}..${head.slice(0, 8)} produced an empty allow-listed diff — nothing for the verifier to attack`);
   const fullDiffBytes = Buffer.byteLength(fullDiff, 'utf8');
   const truncated = fullDiffBytes > opts.maxDiffBytes;
+  // FEAT-170 round 2: a candidate is exactly what is under attack, so a verifier handed
+  // a truncated candidate diff verifies only part of it (run 64ff5cb8 saw 60000 of 123317
+  // bytes). Refuse loudly and name the size instead of truncating silently.
+  if (candidate && truncated) die(`--candidate: the candidate's diff is ${fullDiffBytes} bytes, which exceeds --max-diff-bytes ${opts.maxDiffBytes}; a truncated diff hides part of the candidate from the verifier. Re-run with --max-diff-bytes ${Math.ceil(fullDiffBytes * 1.25 / 1000) * 1000} or more.`);
   const diff = truncated ? fullDiff.slice(0, opts.maxDiffBytes) : fullDiff;
 
   const tests = opts.testFiles.map((rel) => {
@@ -1266,6 +1362,7 @@ async function main() {
   // the verdict already cites, so a verdict can be read against its own inputs.
   const roomManifest = {
     base, head,
+    candidate: candidate ? { hash: candidate.manifest.hash, ticket: candidate.manifest.ticket, deps: candidate.manifest.deps, files: candidate.manifest.files.map((f) => ({ path: f.path, owner: f.owner, sha256: f.sha256, deleted: f.deleted })) } : null,
     proseRoots: room.proseRoots,
     ambientStripped: AMBIENT_INSTRUCTION_NAMES,
     allowedInputs: room.allowed,
@@ -1292,6 +1389,7 @@ async function main() {
     // than waiting out the staleness window.
     room.recorder.close();
     if (!opts.keepCleanroom) {
+      untrackScratch(room.dir); untrackScratch(room.recordDir);
       fs.rmSync(room.dir, { recursive: true, force: true });
       fs.rmSync(room.recordDir, { recursive: true, force: true });
     }
@@ -1339,6 +1437,8 @@ async function main() {
       ...(resumeId ? ['--resume', resumeId] : []),
       ...(viaStdin ? ['--prompt-stdin'] : ['--', safePrompt]),
     ], { stdio: [viaStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    _activeDispatchChild = child; // BUG-250: a signal handler kills it before deleting the room it runs in
+    child.once('exit', () => { if (_activeDispatchChild === child) _activeDispatchChild = null; });
     if (viaStdin) {
       child.stdin.on('error', () => { /* EPIPE if dispatch dies early; exit handler reports */ });
       child.stdin.end(safePrompt);
@@ -1405,6 +1505,7 @@ ${CITATION_CONTRACT}`;
   const manifest = room.entries;
 
   if (!opts.keepCleanroom) {
+    untrackScratch(room.dir); untrackScratch(room.recordDir);
     fs.rmSync(room.dir, { recursive: true, force: true });
     fs.rmSync(room.recordDir, { recursive: true, force: true });
   } else console.error(`  clean room KEPT at ${room.dir} (manifest at ${room.manifestFile})`);
@@ -1468,7 +1569,9 @@ ${CITATION_CONTRACT}`;
     console.log('Record it on the ticket (a typed entry naming the dispatch run, which an');
     console.log('in-process Task subagent cannot produce):');
     console.log(`  node scripts/board-tool.mjs verified --id=<TICKET> --provider=${opts.provider}` +
-      `${opts.model ? ` --model=${opts.model}` : ''} --run=${runId ?? 'UNKNOWN-RUN-ID'} --verdict=${String(v.verdict ?? '').toUpperCase()}`);
+      `${opts.model ? ` --model=${opts.model}` : ''} --run=${runId ?? 'UNKNOWN-RUN-ID'} --verdict=${String(v.verdict ?? '').toUpperCase()}` +
+      `${candidate ? ` --candidate=${candidate.manifest.hash}` : ''}`);
+    if (candidate) console.log(`  (bound to candidate ${candidate.manifest.hash.slice(0, 12)}: a later edit to its files makes a new candidate, which needs its own verdict)`);
     if (!runId) console.log('  WARNING: the dispatch printed no run id — the board tool will refuse the command above.');
   }
   process.exit(exit);

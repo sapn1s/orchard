@@ -38,6 +38,10 @@ const ROOT = path.resolve(HERE, '..');
 // rev-parse` with cwd: ROOT, which resolves at any nesting.
 const LEAK_GATE = path.join(HERE, 'leak-gate.mjs');
 const CHECK_NUL = path.join(HERE, 'check-nul.mjs');
+// FEAT-172 — optional sibling: a repo that ships it (Orchard) gets the
+// operator-privacy regression guard; one that does not (an onboarded target
+// without it) simply skips it. Run only when the sibling file is present.
+const PROMPT_PRIVACY = path.join(HERE, 'check-prompt-privacy.mjs');
 
 /** Repo root (so the gate scans the right tree even when invoked from a subdir). */
 function repoRoot() {
@@ -69,6 +73,19 @@ const results = [];
   const ok = r.status === 0;
   const out = ((r.stdout || '') + (ok ? '' : (r.stderr || ''))).trim();
   results.push({ name: 'check-nul', ok, detail: out });
+}
+
+/* 2b. prompt-privacy (FEAT-172) — OPTIONAL. Guards against an operator-specific
+ *     fact (capacity/subscription, OS setup) leaking back into the published,
+ *     injected docs, or the gitignored operator overlay being committed. Only
+ *     runs where the sibling script ships; absent → skipped, not failed. */
+if (fs.existsSync(PROMPT_PRIVACY)) {
+  const r = spawnSync(process.execPath, [PROMPT_PRIVACY], {
+    cwd: REPO, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  });
+  const ok = r.status === 0;
+  const out = ((r.stdout || '') + (ok ? '' : (r.stderr || ''))).trim();
+  results.push({ name: 'prompt-privacy', ok, detail: out });
 }
 
 /* 3. typecheck, if the repo declares one (mirrors gatekeeper's mechanical set). */

@@ -169,6 +169,16 @@ export interface HostStatus {
   pendingUnowned?: number;
   lanes?: BrokerLane[];
   acceptingInput?: boolean;
+  /**
+   * BUG-242 — the session's git-shim dir (ORCHARD_GIT_SHIM_DIR), echoed by the
+   * broker from its own env on every status write. A restarted server reads it to
+   * RE-BAKE the surviving CLI's shim with the new per-boot secret at adoption
+   * (claude-runtime installGitShim({ reuseDir })), so a git write authenticates
+   * again without a relaunch. A tmp dir path, not the secret; kept out of any
+   * outward-facing serialization (review #7). Optional: an older broker's record,
+   * or a session launched with the git-write block off, simply lacks it.
+   */
+  gitShimDir?: string | null;
 }
 
 /** BUG-187 H5 — one lane's floor state, as the broker declares it. */

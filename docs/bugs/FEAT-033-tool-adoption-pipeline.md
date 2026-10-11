@@ -198,3 +198,101 @@ are now actually USED via WA §I.
 - Not done here (left for the next Playwright-touching agent): migrating any EXISTING hand-CDP
   verify-*.mjs script to `.spec.ts` — FEAT-033's adoption path says migrate incrementally as
   touched, not all at once; none were touched by this dispatch.
+
+### 2026-10-10 — agent (built the missing test runner + manifest + CI; ran the suites for real)
+Problem (measured): 298 npm scripts, 260 `verify:*`, no `test` script, no runner, no CI — `npm run
+gate` runs only leak/NUL/privacy/typecheck, so nothing proved the verify suites still pass.
+
+Hypothesis VERIFIED first: 405/405 physical verify scripts signal failure by exit code
+(`process.exit`/`throw`/`node:assert`) — a single runner is viable. Confirmed by inspection, not assumed.
+
+Built (all unstaged):
+- `scripts/gen-test-manifest.mjs` + generated `scripts/test-manifest.json` — ONE owner (ARCH-010) of
+  each suite's tier. 261 suites classified by static signal: pure 128, browser 90 (inline Brave/CDP or
+  Playwright), scratch-server 23, host-live 13, docker-sandbox 7. 45 flagged `needsGit` (spawn a
+  scratch-repo git write). `--check` guards drift.
+- `scripts/test-runner.mjs` = `npm test` — bounded parallelism, docker-sandbox serialized, per-suite
+  timeout, logs to scratch, summary table, true aggregate exit. Refuses host-live without
+  `--include-host-live`; FAILS LOUD on any unclassified `verify*` script; detects a git-write-blocked
+  lane and SKIPs `needsGit` suites (so a lane artifact is not scored as a regression).
+- `.github/workflows/test.yml` — Node 23 / ubuntu, runs the PORTABLE (pure) tier + gate +
+  manifest:check. CI cannot run browser (no browser), docker-sandbox (needs the standing sandbox),
+  scratch-server (excluded for port/proc flakiness), or host-live (needs the live service).
+
+Proven: runner summary table real; a synthesized failing suite made `npm test` exit 1 (then removed);
+`npm run gate` PASS (exit 0).
+
+Real run (this git-write-blocked dispatched lane, shared tree carrying other lanes' uncommitted edits):
+- Full default (pure+scratch-server, 229): 124 pass / 105 fail-timeout — DOMINATED by lane artifacts:
+  ~12 git-write-block refusals, 21+ browser suites under concurrency, 10 timeouts.
+- Clean pure tier (needsGit auto-skipped): 95 ran → 66 pass, 23 fail, 6 timeout, 33 git-skip.
+Failing-suite CLASSES (not product-fixed here, per charter):
+- ENV / lane: 33 needsGit (blocked git) + git-write-block refusals; pass in a normal shell.
+- MIS-TIER / heavy: timeouts on session-lifecycle suites that boot a server my signal missed
+  (verify:detach, :reattach-approval, :close-busy-detach, :bug-044-restart-background, :bug-123, :triage).
+- STALE / board-state-coupled (already documented in CONVENTIONS §Testing): verify:feat-090,
+  :reachability, :feat-082-digest redden when the live board/in-flight tree differs from pinned values;
+  likewise the board-mutating :board-tool (33/34), :round-ceiling (13/14), :bug-125 (123/126),
+  :gatekeeper, :bug-119, :feat-097.
+- NEEDS TRIAGE (small real/stale deltas, fail individually too): verify:session-provenance-fold,
+  :bug-138, :feat-071-project-dir, :bug-144, :tool-toggle, :mcp-ready, :feat-085-independent,
+  :liveness-conformance, :bug-074-ghost-drain, :orchestrator-profile-registry, :feat-145-usage.
+
+HANDOFF: (1) a clean-room / normal-shell run (git-writes allowed, pinned tree) is needed to separate
+real regressions from lane+board-coupling noise — this lane cannot. (2) scratch-server signal still
+under-detects session-lifecycle suites that spawn the server indirectly; widen it or raise their
+timeout. (3) the STALE board-coupled suites are a pre-existing class (CONVENTIONS names three) — worth
+a follow-up to assert invariants rather than pinned board values. No product code touched.
+
+### 2026-10-10 — agent (round 2: de-contaminated health run + manifest tier/timeout fixes)
+Re-measured the verify suites' TRUE health; the previous 124/105 was contaminated (git blocked
+in-process, shared mutating tree, mis-tiering). Method: pinned the CURRENT working tree (143
+uncommitted files) to a reflink scratch copy, PRESERVED the real `.git` (full history) with a
+synthetic identity, and ran with the git-shim stripped from `$PATH` so `needsGit` suites write
+fixture repos via real git (sanctioned scratch exception). One runner per tree (concurrent runners
+race the shared board). Full table + per-suite classification:
+`~/.local/state/claude-station/scratch/feat-033-health/report.md`.
+
+Counts (default = pure + scratch-server):
+- real-history, OLD manifest: 90 pass / 61 fail-timeout of 151.
+- real-history, FIXED manifest: **91 pass / 57 fail-timeout of 148** (pure 81/44/2,
+  scratch-server 10/6/5).
+- Discarded a first attempt that SQUASHED the repo to one commit — it broke every history-reading
+  suite; restoring real history fixed feat-049, feat-089, bug-128, diff-size.
+- Browser tier (separate tree, Brave): 33 / 57 of 90 — dominated by the same scratch-server
+  session-init readiness cause under concurrency; not separately triaged (needs warm server / conc-1).
+
+Classification of the 61 (real-history): ENV ~34 (harness shim-PATH 3; scratch-server cold
+boot-probe readiness ~16 — SESSION-LIFECYCLE; FLAKY 2 (triage, bug-044 flipped between identical
+runs); docker-sandbox/confined 2; filesystem 2; git-history-the-collapsed-repo-lacks ~4; registered-
+project 1; other 4). STALE ~13 (committed-API 4 — clearest is `verify:orchestrator-enforcement`, a
+HARD import crash on the removed export `ENFORCE_DENIED_GIT_SUBCOMMANDS` after the profile moved
+deny-list -> allow-list; board/real-corpus-coupled ~9, the class CONVENTIONS §Testing already names).
+REAL candidate ~10 — ALL reddening against UNCOMMITTED working-tree edits, not committed main:
+- public/app.js (M): verify:session-provenance-fold (live/open agent sessions not fold-exempt),
+  verify:feat-071-project-dir (no Directory line in settings drawer), verify:feat-145-usage
+  (paintUsageChip throws).
+- scripts/hooks/response-format-gate.mjs (M) + .orchard/lib/response-blocks.js (deleted):
+  verify:feat-085-independent (41/18), verify:feat-085-adversarial (G5), verify:feat-083-adversarial
+  (contract BROKEN — non-leading fence matched).
+- README.md (M): verify:feat-049-licence (C9).
+- repoint+UI: verify:bug-138 (missing-dir repoint emits a fatal error, not a clean 400),
+  verify:bug-138-ui.
+
+Hypothesis (most env, ~10-15 real) CONFIRMED, with the nuance that the "real" set tracks the
+mid-change working tree, not committed main.
+
+Manifest/runner fixes (REAL repo, UNSTAGED; backups in scratch/feat-033-r2-backup/):
+- scripts/test-runner.mjs — per-suite `timeoutSec` (global --timeout is the floor; only raises).
+- scripts/gen-test-manifest.mjs + regenerated scripts/test-manifest.json — OVERRIDES moved
+  verify:live, verify:feat-154-open, verify:mcp-ready to host-live (all need a real artifact / live
+  server, precondition-fail locally); TIMEOUTS gave bug-247/bug-239-bound-hangs/bug-123 600 s.
+  HONEST: the raise let bug-123 finish (then it FAILs on corpus -> STALE); bug-247 and
+  bug-239-bound-hangs STILL time out at 600 s (genuinely slow/hang in cold isolated boot).
+
+Handoff: (1) the scratch-server session-init readiness cluster (~16) + the REAL working-tree
+candidates (~10) warrant an INDEPENDENT clean-room / warm-live-server confirm before any is called a
+product regression (session-lifecycle + regression-prone). (2) `verify:orchestrator-enforcement` is a
+genuinely broken (STALE) committed test — crashes on import; worth fixing the test to the allow-list
+API. (3) scratch-server tier is intrinsically FLAKY here; pure tier is stable. No product code
+touched; only the three runner/manifest files + this ticket.

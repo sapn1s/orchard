@@ -37,7 +37,25 @@ export interface OnboardOptions {
    * its reviewers. Opt-in; idempotent (an existing file is never touched).
    */
   deployContext?: boolean;
+  /** Apply the guarded cleanup of the legacy scattered layout (dry-run unless set). */
+  migrate?: boolean;
+  /**
+   * BUG-227 escape hatch: permit onboarding even when the resolved target is
+   * this tool's own source repo. Off by default — onboard() throws on a
+   * self-target (writing nothing) unless this is explicitly true.
+   */
+  allowSelfTarget?: boolean;
 }
 
-/** Idempotently onboard `targetDir` to Orchard. Throws only on a bad dir / I/O. */
+/** Idempotently onboard `targetDir` to Orchard. Throws only on a bad dir / I/O / self-target. */
 export function onboard(targetDir: string, opts?: OnboardOptions): OnboardReport[];
+
+/**
+ * BUG-227: a human-readable reason if `resolved` is this tool's own source repo
+ * — the same DIRECTORY as repoRoot by inode (st_dev,st_ino), which collapses
+ * every accidental aliasing alike (cwd/empty default, relative path, `.`,
+ * trailing slash, symlink, bind mount) — else null. onboard() refuses when this
+ * is non-null. (r4 removed a second file-identity signal that only ever caused
+ * false refusals of distinct hardlink copies; directory identity IS the contract.)
+ */
+export function selfTargetReason(resolved: string): string | null;

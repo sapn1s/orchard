@@ -1454,19 +1454,63 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 /* ── composer ──────────────────────────────── */
 .dock { flex: none; padding: 3px 32px 9px; position: relative; }
 
+/* ONE absolutely-positioned full-width row for every floating dock control
+   (BUG-246). Its flex children — #leftoff (leading) and the right stack
+   .dock-ctl (trailing, via margin-left:auto) — can NEVER overlap one another
+   however wide either grows, because flex siblings are laid out in sequence,
+   not stacked. No child may shrink below its own min-content (only #leftoff's
+   `.lbl` text span, which has overflow:hidden + ellipsis and whose box fully
+   contains its text, gives way) — so no control's content can ever paint
+   outside its box over a neighbour. When the controls' combined min-content
+   exceeds the width, `flex-wrap:wrap-reverse` moves the overflow onto a line
+   ABOVE (the row is anchored by its BOTTOM edge, `bottom:100%`, so wrapped
+   lines grow UP into the transcript, never DOWN onto the composer), rather
+   than overlapping or clipping. Replaces the old per-control magic left:/right:
+   offsets that collided three different ways (BUG-246 r1/r2/r3). pointer-events:
+   the row spans the whole dock, so only the controls themselves catch clicks. */
+.dock-float {
+  position: absolute; left: 32px; right: 32px; bottom: 100%; margin-bottom: 8px; z-index: 3;
+  display: flex; flex-wrap: wrap-reverse; align-items: center; gap: 8px;
+  pointer-events: none;
+}
+.dock-float > * { pointer-events: auto; }
+/* The right-corner stack: the "Latest" pill and the FEAT-118 bookmark toggle,
+   side-by-side with a gap. margin-left:auto keeps it pinned to the trailing
+   edge whether or not #leftoff is present. `flex:0 1 auto` + `max-width:100%`
+   apply the SAME containment rule #leftoff uses (BUG-246 r4): the stack may give
+   way when the row is tight, but only #jump's own `.lbl` text span truncates
+   inside its box (overflow:hidden + ellipsis) — #bookmark is `flex:none` and
+   #jump's dot/arrow stay, so no non-shrink child ever paints outside the stack.
+   No bare `min-width:0` here: the stack keeps its min-content (which #jump's
+   truncatable label already makes small), capped at the row width, so a wide
+   #jump label can never overflow past the viewport edge the way it did pre-r4. */
+.dock-ctl {
+  display: flex; align-items: center; gap: 8px;
+  margin-left: auto; flex: 0 1 auto; max-width: 100%;
+}
 /* "Latest" — the way back down when you have scrolled up to read. A hairline
    pill, no fill, no shadow; the moss dot appears only when something new
    actually arrived while you were away. */
 .jump {
-  position: absolute; right: 32px; top: -34px; z-index: 3;
   display: flex; align-items: center; gap: 7px;
   height: 26px; padding: 0 11px; border-radius: 13px;
   border: 1px solid var(--hair); background: var(--window);
   color: var(--ink-2); font-family: var(--mono); font-size: 11px; letter-spacing: .02em;
   cursor: pointer; transition: color .14s, border-color .14s, background .14s;
+  /* overflow:hidden (BUG-246 r4) makes #jump a box whose content truncates
+     INSIDE it: it zeroes #jump's flex automatic-minimum so the stack can shrink
+     it when the row is tight (its `.lbl` then ellipsizes), and it guarantees the
+     dot/arrow can never paint outside #jump onto a neighbour. This is the same
+     containment rule #leftoff uses — NOT a bare min-width:0 (which would let the
+     non-shrink children overflow, the exact pattern that caused break 3). */
+  overflow: hidden;
 }
 .jump:hover { color: var(--ink); border-color: var(--ink-4); }
-.jump .g { font-size: 12px; line-height: 1; }
+/* Only the label gives way when the right stack is tight (BUG-246 r4) — the dot
+   and arrow stay. The label truncates INSIDE its own box so it can never paint
+   outside #jump over a neighbour. */
+.jump .lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jump .g { font-size: 12px; line-height: 1; flex: none; }
 .jump .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--idle); flex: none; }
 .jump.new .dot { background: var(--live); }
 .jump[hidden] { display: none; }
@@ -1505,10 +1549,19 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 }
 
 /* The "you left off here" jump pill — the one-action return. Twin of `.jump`,
-   mounted on the OPPOSITE (leading) side of the dock so the two never overlap,
-   and amber-accented to match the read-line it returns to. */
+   the leading (left) child of the .dock-float row so the two never overlap, and
+   amber-accented to match the read-line it returns to. `flex:0 1 auto` lets it
+   shrink, but NO explicit min-width:0 (BUG-246 r3): the flex default min-width:auto
+   keeps the BUTTON at its own min-content (arrow + full label + "N new" badge +
+   padding), so the non-shrinkable badge can never underflow and paint outside the
+   button over #jump. In practice the whole row WRAPS (.dock-float) before the
+   label truncates — at narrow/phone widths the right stack drops to a line above.
+   `max-width:100%` caps that auto-minimum at the row width, so below ~250px,
+   where even #leftoff alone is wider than the row, the button stays inside the
+   row and `.lbl` truncates (overflow:hidden + ellipsis) as a last resort instead
+   of overflowing and being clipped by the viewport. */
 .leftoff {
-  position: absolute; left: 32px; top: -34px; z-index: 3;
+  flex: 0 1 auto; max-width: 100%;
   display: flex; align-items: center; gap: 7px;
   height: 26px; padding: 0 11px; border-radius: 13px;
   border: 1px solid color-mix(in srgb, var(--st-needs) 45%, var(--hair));
@@ -1517,10 +1570,15 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   cursor: pointer; transition: color .14s, border-color .14s, background .14s;
 }
 .leftoff:hover { border-color: var(--st-needs); }
-.leftoff .a { font-size: 12px; line-height: 1; }
+.leftoff .a { font-size: 12px; line-height: 1; flex: none; }
+/* Only the label gives way when space is tight; the arrow and the "N new" badge
+   stay. */
+.leftoff .lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .leftoff .g {
+  flex: none;
   font-size: 9.5px; padding: 0 5px; line-height: 14px;
   border: 1px solid color-mix(in srgb, var(--st-needs) 45%, transparent); border-radius: 999px;
+  white-space: nowrap;
 }
 .leftoff .g:empty { display: none; }
 .leftoff[hidden] { display: none; }
@@ -1528,9 +1586,8 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 /* The bookmark toggle — a small ribbon-glyph button beside "Latest". Hollow
    when no bookmark, filled moss when one is set (the pin's own language). */
 .bkmk {
-  position: absolute; right: 96px; top: -34px; z-index: 3;
   display: flex; align-items: center; justify-content: center;
-  width: 26px; height: 26px; border-radius: 13px;
+  width: 26px; height: 26px; border-radius: 13px; flex: none;
   border: 1px solid var(--hair); background: var(--window);
   color: var(--ink-4); cursor: pointer; transition: color .14s, border-color .14s;
 }
@@ -2722,16 +2779,11 @@ button.mode:hover { color: var(--ink); text-decoration-color: var(--ink-4); }
 @media (max-width: 900px) {
   .col { margin-left: 0; width: 100%; }
 }
-@media (max-width: 720px) {
-  .window { inset: 0; border-radius: 0; grid-template-columns: 54px minmax(0,1fr); }
-  .window .finder, .window .proj .nm, .window .proj .n,
-  .window .proj .plus, .window .proj .tw, .window .kids { display: none; }
-  .window .side-chrome { flex-direction: column; padding: 12px 6px 6px; gap: 4px; }
-  .window .proj { justify-content: center; padding: 9px 0; margin: 0; }
-  .crown { padding: 14px 16px 10px; }
-  .scroll { padding: 0 16px; }
-  .dock { padding: 4px 16px 12px; }
-}
+/* FEAT-171: the old max-width:720px icon-strip block lived here. It never took
+   effect — the later max-width:1040px rail block re-set .window's columns and
+   won by source order, so a phone got the full 272px sidebar — and it hid the
+   session rows, so a session could not be picked on a phone at all. The phone
+   layout is now ONE block at the very end of this file ("FEAT-171 — phone"). */
 
 /* ═══════════════════════════════════════════════════════════
    Additions for surfaces the mockup did not cover.
@@ -6233,3 +6285,217 @@ a.digest-ref-link:hover {
 }
 .lag-stop:hover:not(:disabled) { color: var(--st-high); border-color: var(--st-high); }
 .lag-stop:disabled { opacity: .5; cursor: default; }
+
+/* ═══════════════════════════════════════════════════════════
+   FEAT-171 — phone. The user drives Orchard from a phone over
+   tailscale, so on a phone the conversation gets the screen:
+   the sidebar is an off-canvas drawer behind a menu button, the
+   crown is ONE row (menu · title · status · more · board), the
+   seal strip and model chip drop down from "more", and the
+   composer survives the on-screen keyboard.
+
+   This block is deliberately LAST in the file: the old phone rule
+   lost to a later breakpoint by source order (see the note where
+   it used to live). Selectors that must beat `.window.collapsed`
+   name it explicitly; app.js also lifts `.collapsed` while the
+   phone layout is active, so desktop fold state cannot leak in.
+
+   `--layout` is the ONE declaration of "is this the phone layout":
+   app.js reads it (phoneLayout()) instead of repeating the query.
+   Outside the query the phone-only controls are display:none and
+   nothing else here applies, so desktop and tablet are unchanged.
+   ═══════════════════════════════════════════════════════════ */
+:root { --layout: desktop; }
+.nav-btn, .crown-more, .crown-rail, .nav-scrim, .rail-close { display: none; }
+
+@media (max-width: 720px), (max-height: 480px) and (pointer: coarse) {
+  :root { --layout: phone; }
+  html, body { overscroll-behavior: none; }
+
+  /* the app fills the VISIBLE viewport — app.js writes --app-h/--app-top from
+     visualViewport so the iOS keyboard (which does not resize dvh) cannot hide
+     the composer; 100dvh is the no-JS fallback */
+  .window, .window.collapsed {
+    position: fixed; inset: auto;
+    top: var(--app-top, 0px); left: 0; right: 0;
+    height: var(--app-h, 100dvh);
+    border-radius: 0; box-shadow: none;
+    grid-template-columns: minmax(0, 1fr);
+    transition: none;
+  }
+
+  /* ── the sidebar becomes a drawer ── */
+  .side {
+    position: absolute; top: 0; left: 0; bottom: 0; z-index: 58;
+    width: min(320px, 86vw);
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) env(safe-area-inset-left);
+    transform: translateX(-100%);
+    /* visibility (not just the transform) so a closed drawer is out of the tab
+       order and the accessibility tree; delayed on close so it slides out */
+    visibility: hidden;
+    transition: transform var(--panel-dur) var(--panel-ease), visibility 0s linear var(--panel-dur);
+    box-shadow: 20px 0 44px -28px rgba(27,31,29,.45);
+  }
+  .window.nav-open .side {
+    transform: none; visibility: visible;
+    transition: transform var(--panel-dur) var(--panel-ease), visibility 0s;
+  }
+  .nav-scrim {
+    display: block; position: absolute; inset: 0; z-index: 57;
+    background: rgba(14, 17, 15, .34);
+    opacity: 0; pointer-events: none;
+    transition: opacity var(--panel-dur) var(--panel-ease);
+  }
+  .window.nav-open .nav-scrim { opacity: 1; pointer-events: auto; }
+  /* touch-sized rows; the hover-only affordances are always shown (no hover) */
+  .side-chrome { padding: 8px 8px 4px; }
+  .side-chrome .ic { width: 40px; height: 40px; }
+  .row { padding: 10px 10px 10px 22px; font-size: 14px; }
+  .row, .proj { -webkit-touch-callout: none; user-select: none; }
+  .proj .n, .proj .plus, .proj .cog, .row .when { opacity: 1; }
+  /* no hover on a phone: the project's + (new session) and cog are always
+     there; the recency figure yields their room (the unseen badge never does) */
+  .proj .plus, .proj .cog { display: grid; width: 32px; height: 32px; }
+  .proj .ago { display: none; }
+  /* a tap sets :hover/:focus-within, and the desktop hover rule hides the count
+     — the row reflowed under the finger and the tap meant for + landed on the
+     project head. On a phone the row holds still. */
+  .proj:hover .n, .proj:focus-within .n { display: block; }
+  .side-foot button { min-height: 40px; }
+  /* menus opened from inside the drawer (row menu, project menu) sit above it */
+  .pop { z-index: 70; max-width: calc(100vw - 16px); }
+
+  /* ── the crown: one row ── */
+  .crown {
+    padding: env(safe-area-inset-top) max(4px, env(safe-area-inset-right)) 0 max(4px, env(safe-area-inset-left));
+    border-bottom: 1px solid var(--hair-2);
+  }
+  .crown .col {
+    display: flex; flex-wrap: nowrap; align-items: center; gap: 0;
+    margin: 0; width: 100%; min-height: 46px;
+  }
+  .crown .where { display: none; }
+  /* basis 0: the title takes what is left and never pushes a control off the
+     row; display:block (not the crumbs' flex) so a long title ends in "…" */
+  .crown h1, .crown h1.crumbs {
+    display: block; flex: 1 1 0; min-width: 0; margin: 0 8px 0 6px;
+    font-size: 16px; line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-wrap: nowrap;
+  }
+  .crown h1.crumbs .desc { font-size: 15px; }
+  .nav-btn, .crown-more, .crown-rail {
+    display: grid; place-items: center; flex: none;
+    min-width: 44px; height: 44px; border-radius: 10px;
+    color: var(--ink-2); position: relative;
+  }
+  /* an inset ring: the row is flush with the screen edge, an outset one clips */
+  .nav-btn:focus-visible, .crown-more:focus-visible, .crown-rail:focus-visible { outline-offset: -4px; }
+  /* the pressed / open state is an INSET tile, so it never runs into the screen
+     edge or reads taller than its neighbours (the 44px hit area stays) */
+  .nav-btn, .crown-more, .crown-rail { isolation: isolate; }
+  .nav-btn:active::before, .crown-more:active::before, .crown-rail:active::before,
+  .crown-more[aria-expanded="true"]::before {
+    content: ""; position: absolute; inset: 6px 3px; z-index: -1;
+    border-radius: 9px; background: var(--hair);
+  }
+  .crown-more[aria-expanded="true"] { color: var(--ink); }
+  .crown .sess-status { margin: 0 4px 0 0; flex: none; }
+  /* idle is the only state that may read as nothing — every other state keeps
+     its words (FEAT-040), so a reconnect never hides behind a coloured dot */
+  .crown .sess-status[data-state="idle"] .lbl { display: none; }
+  .crown-more .alert { display: none; }
+  .crown-more[data-alert] .alert {
+    display: grid; place-items: center;
+    position: absolute; top: 6px; right: 5px;
+    width: 14px; height: 14px; border-radius: 7px;
+    font: 700 10px/1 var(--sans); color: var(--window); background: var(--warn);
+  }
+  .crown-rail { display: inline-flex; align-items: center; gap: 4px; padding: 0 8px; }
+  .crown-rail .g { font-size: 13px; }
+  .crown-rail .n {
+    font-family: var(--mono); font-size: 10px;
+    min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--live) 20%, transparent);
+    border: 1px solid color-mix(in srgb, var(--live) 45%, transparent);
+  }
+  .crown-rail.none .n { background: none; border-color: var(--hair); color: var(--ink-4); }
+  .crown .model-chip, .crown .seal { display: none; }
+  /* "more" open: the model chip and the seal strip drop below the row, in flow */
+  .crown.details-open .col { flex-wrap: wrap; padding-bottom: 10px; }
+  /* a forced line break after the row's own controls (a pseudo-element is a flex
+     item; order 9 places it after them and before the chip and strip) */
+  .crown.details-open .col::before { content: ""; order: 9; flex-basis: 100%; height: 0; }
+  .crown.details-open .model-chip:not([hidden]) { display: inline-flex; order: 10; margin: 4px 8px 0; }
+  .crown.details-open .seal {
+    display: flex; order: 11; flex-basis: 100%;
+    margin: 8px 8px 0; max-height: 45vh; overflow-y: auto;
+  }
+  .crown.details-open .seal .pill { min-height: 36px; }
+  .crown.details-open .seal .readout { min-width: 36px; justify-content: center; }
+  /* the floating rail badge is replaced by the crown button (it covered the composer) */
+  .rail-badge, .rail-badge[hidden] { display: none; }
+  .rail-close {
+    display: grid; place-items: center; flex: none;
+    width: 40px; height: 40px; margin: -10px -8px -10px auto; border-radius: 10px;
+    color: var(--ink-3);
+  }
+  .rail-close:active { background: var(--hair); color: var(--ink); }
+  .rail-head { align-items: center; }
+  /* the rail opens above the same scrim as the drawer, so the page behind it is
+     visibly set aside; a tap on the scrim closes it (the outside-click handler) */
+  .rail { z-index: 59; }
+  .window:has(.rail.open) .nav-scrim { opacity: 1; pointer-events: auto; }
+  .bg-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rail { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  /* FEAT-171 — a closed rail is out of view AND out of the tab order; its
+     box-shadow no longer bleeds a grey band down the right edge of the chat */
+  .rail {
+    visibility: hidden; box-shadow: none;
+    transition: transform var(--panel-dur) var(--panel-ease), visibility 0s linear var(--panel-dur);
+  }
+  .rail.open {
+    visibility: visible; box-shadow: -20px 0 44px -28px rgba(27,31,29,.45);
+    transition: transform var(--panel-dur) var(--panel-ease), visibility 0s;
+  }
+
+  /* ── the transcript: tighter gutters, more words per line ── */
+  .scroll { padding: 0 12px; }
+  .pane { padding: 10px 0 6px; }
+  .you { margin: 0 0 18px; }
+  .you p { max-width: 88%; padding: 9px 13px; }
+  .claude { grid-template-columns: 18px minmax(0, 1fr); gap: 8px; margin: 0 0 20px; }
+  .av { width: 18px; height: 18px; }
+  .prose { line-height: 1.6; }
+
+  /* ── the composer ── */
+  .dock { padding: 4px max(8px, env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left)); }
+  .box { padding: 8px 10px 4px; }
+  /* iOS zooms the page on focus of any field under 16px */
+  input, textarea, select { font-size: max(16px, 1em); }
+  .box textarea { font-size: 16px; max-height: calc(var(--app-h, 100dvh) * .3); overflow-y: auto; }
+  .tray { margin-top: 2px; }
+  .tray .ic { width: 36px; height: 36px; }
+  .go { width: 40px; height: 40px; flex: none; }
+  .fine { margin-top: 4px; }
+  /* the calm permission line ("skipped · container is the boundary") is also
+     shown by the pressed shield in the tray; on a phone only the RISKY state
+     keeps its full-width line */
+  .permline:not([data-risk="true"]) { display: none; }
+  .asks { max-height: calc(var(--app-h, 100dvh) * .42); }
+  /* the floating controls above the composer, re-placed for the narrow gutters.
+     One offset moves the whole row (BUG-246); leftoff and the right stack ride
+     inside it and shrink to fit rather than overlap. */
+  .dock-float { left: 12px; right: 12px; }
+
+  /* landscape phone: height is the scarce axis — the plain status line yields
+     (an error line stays) */
+  @media (max-height: 480px) {
+    .fine:not(.err) { display: none; }
+    .pane { padding-top: 4px; }
+    /* one-row composer: the tools sit beside the input instead of under it */
+    .box { display: flex; align-items: flex-end; gap: 6px; padding: 4px 6px 4px 12px; }
+    .box textarea { flex: 1 1 auto; min-width: 0; align-self: center; }
+    .tray { margin-top: 0; flex: none; }
+  }
+}

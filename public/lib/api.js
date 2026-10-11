@@ -414,7 +414,8 @@ export const deleteClaudeAccount = (id) =>
  * no second channel — a login just isn't a session, so it never shares the
  * session-driving socket.
  */
-export const wsUrl = () => `ws://${location.host}/ws`;
+// wss when the page itself is https (e.g. behind `tailscale serve`): browsers block ws:// from a secure page.
+export const wsUrl = () => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 
 /** FEAT-116: per-provider rate-limit window usage snapshots. null = route absent. */
 export const usage = () => optional('/api/usage').then((r) => r?.providers ?? null);

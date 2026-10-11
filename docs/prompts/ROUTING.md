@@ -1,15 +1,18 @@
 # ROUTING.md — provider/model dispatch guidance (mixed Claude + GPT fleet)
 
-> **STALENESS:** researched 2026-08-05 (FEAT-043 Phase R; web-sourced, every claim dated+cited in
-> the research log — claude-station `docs/bugs/FEAT-043-mixed-provider-fleet.md`). Re-verify after
-> ANY major model release from either provider. If this table is older than **~3 months**, treat it
-> as expired and re-research before trusting it. Undated model folklore is banned as a routing
-> input.
+> # ⚠ STALENESS BANNER — READ FIRST
+> **The model names, prices and benchmarks below were researched 2026-08-05 and go stale fast.**
+> If today is more than **~3 months** after that date, or ANY major model has shipped from either
+> provider since, treat this entire table as **EXPIRED** — re-research before trusting a single
+> routing line. Undated model folklore is banned as a routing input. (Research log, if your
+> project keeps one: Orchard `docs/bugs/FEAT-043-mixed-provider-fleet.md`.)
 
-Both subscriptions (Anthropic Max + ChatGPT) are meant to be sweated **together**, not as
-alternates. A Claude orchestrator's in-process subagents can never be GPT — the mixed fleet's
-dispatch unit is the **orchestrated task**: route whole tasks to the stronger/cheaper provider via
-the dispatch runner (below), and keep premium hours for work whose mistakes are expensive.
+When you have more than one provider available (e.g. a Claude *and* a GPT subscription), they are
+meant to be sweated **together**, not as alternates. A Claude orchestrator's in-process subagents
+can never be GPT — the mixed fleet's dispatch unit is the **orchestrated task**: route whole tasks
+to the stronger/cheaper provider via a dispatch runner (below), and keep premium hours for work
+whose mistakes are expensive. **With only one provider configured, ignore the cross-provider rules
+entirely and route by SKILL within that provider's ladder.**
 
 <!-- routing-inject:start -->
 ## Top routing rules (condensed core — benchmark evidence for each line is in the full doc below)
@@ -22,23 +25,32 @@ the dispatch runner (below), and keep premium hours for work whose mistakes are 
   runner-up for implementation passes.
 - **Long-context sweeps (500K–1M token reads)** → GPT-5.6 Sol.
 - **Terminal-heavy repo chores** → GPT-5.6 Sol/Terra; browser/OS/multi-step agentic → Claude.
-- **Bulk / parallel / low-stakes** → the ABUNDANT side's ladder (see budget note) — for this user
-  that is Claude (Sonnet 5 / Haiku 4.5), not GPT.
-- **Verification / adversarial review → CROSS-PROVIDER by default:** have the OTHER provider's
-  model review finished work, so correlated blind spots differ.
-- **`plan+review` dispatches (WA §I) are cross-provider by default** — the plan's reviewer is the
-  OTHER provider than the implementer. `explore` may be cross-provider; optional.
-- **BUDGET (per-user capacity fact, 2026-08-10 — configuration, not physics):** Claude capacity is
-  effectively ABUNDANT here; the OpenAI side is a $20 ChatGPT Plus plan on rolling 5-hour windows
-  and is the SCARCE resource. Spend GPT where its DECORRELATION value is highest — plan review,
-  adversarial review of finished work, a second opinion on a contested call — NOT on bulk/parallel
-  volume, which goes to the abundant Claude side. Fable 5 stays availability-fragile (50% weekly
-  cap) — never hard-depend on it. When one provider's window is exhausted mid-task, degrade WITHIN
-  the other provider's ladder — don't upgrade tiers.
-- **Dispatching from a claude-station session:**
+- **Bulk / parallel / low-stakes** → the ABUNDANT side's ladder (see budget note). *Which* provider
+  is abundant is a per-operator fact, not a model property — read it from your operator-local
+  capacity overlay if one is injected; absent one, use the cheapest adequate tier of whatever
+  provider you have.
+- **Verification / adversarial review → CROSS-PROVIDER by default (when a second provider is
+  available):** have the OTHER provider's model review finished work, so correlated blind spots
+  differ. With one provider, still use an independent reviewer — same provider, separate clean-room
+  process.
+- **`plan+review` dispatches (WA §I) are cross-provider by default** when you have two providers —
+  the plan's reviewer is the OTHER provider than the implementer. `explore` may be cross-provider;
+  optional.
+- **BUDGET (per-operator capacity — configuration, not physics):** which provider is ABUNDANT and
+  which is SCARCE depends on the operator's actual subscriptions/billing, *not* on the models. Your
+  machine's real holdings are supplied by an operator-local overlay if one is injected (see the
+  "Operator-local context" section, if present, and `OPERATOR.local.md.example`). Absent that
+  overlay, treat **neither** side as free and route by SKILL alone. When you DO know which side is
+  scarce: spend it where its DECORRELATION value is highest — plan review, adversarial review of
+  finished work, a second opinion on a contested call — NOT on bulk/parallel volume, which goes to
+  the abundant side. Fable 5 stays availability-fragile (50% weekly cap) — never hard-depend on it.
+  When one provider's window is exhausted mid-task, degrade WITHIN the other provider's ladder —
+  don't upgrade tiers.
+- **Dispatching a whole task to the other provider** (if your harness provides a dispatch runner —
+  Orchard's is `npm run dispatch`):
   `npm run dispatch -- --provider openai [--model <m>] [--sandbox workspace-write] "task"` —
-  final result on stdout, progress on stderr, run recorded into Orchard history. Sandbox defaults
-  to read-only.
+  final result on stdout, progress on stderr, run recorded into the dispatch history. Sandbox
+  defaults to read-only.
 <!-- routing-inject:end -->
 
 ## Ladder (cost-of-mistake tiers)
@@ -68,32 +80,32 @@ the dispatch runner (below), and keep premium hours for work whose mistakes are 
   Sol noted as buying accuracy "at the cost of higher hallucination"). Cross-provider review is the
   real win regardless of direction.
 - **Bulk / parallel / low-stakes** → on raw API PRICE, GPT-5.6 Luna/Terra win (Luna is ~5–15×
-  cheaper than anything in the Claude ladder above Haiku). On this user's SUBSCRIPTIONS the
-  binding constraint is not price but window capacity, and it points the other way — see
-  Budget-pressure rules below.
+  cheaper than anything in the Claude ladder above Haiku). On a SUBSCRIPTION plan (vs raw API
+  billing) the binding constraint is often window capacity rather than price, which can point the
+  other way — see Budget-pressure rules below.
 - **Speed-critical interactive** → Sol on Cerebras (up to ~750 tok/s) or Opus 5 Fast Mode
   (~150 tok/s at 2× price).
 
 ## Budget-pressure rules
 
-> **PER-USER CAPACITY FACT — dated 2026-08-10, corrected from the inverse.** This section is
-> CONFIGURATION, not physics: it describes which subscriptions this operator actually holds, and
-> it changes the moment the plans change. Re-check it whenever a plan is upgraded/downgraded (and
-> at the same cadence as the staleness re-research above). The skill-based routing above is
-> evidence-backed and independent of this; only the *spend* guidance below depends on it.
->
-> **Current holdings:** Anthropic capacity is effectively ABUNDANT for this operator. The OpenAI
-> side is a **$20 ChatGPT Plus** plan on rolling 5-hour windows — it is the **SCARCE** resource.
-> (This file previously said the opposite; that guidance was wrong for this user and any routing
-> decision made under it should be re-examined.)
+> **PER-OPERATOR CAPACITY FACT — CONFIGURATION, not physics.** Which subscriptions/plans an
+> operator holds — and therefore which provider is ABUNDANT and which is SCARCE — is not a property
+> of the models and is not recorded in this shared doc. It belongs in an **operator-local capacity
+> overlay**, injected per machine and never published (see `OPERATOR.local.md.example` for the
+> shape, and the "Operator-local context" section of your system prompt if one is present). It
+> changes the moment the plans change, so it is kept with the operator, not here. The skill-based
+> routing above is evidence-backed and independent of this; only the *spend* guidance below depends
+> on knowing which side is scarce — and absent an overlay you do not know, so route by skill and
+> treat neither side as free.
 
-- **Spend GPT on DECORRELATION, not on volume.** The scarce provider's marginal hour is worth most
-  where a second, differently-biased mind changes the outcome: reviewing a PLAN before a build
-  (WA §I `plan+review`), adversarial review of finished work, and a second opinion on a contested
-  call. Those are the GPT budget's intended consumers.
-- **Bulk, parallel, high-fan-out and long-running grind go to the ABUNDANT side** — Claude
-  Sonnet 5 / Haiku 4.5 — even when a GPT tier would be cheaper per token. Burning a 5-hour window
-  on volume work means the decorrelated review is unavailable when it actually matters.
+- **Spend the SCARCE provider on DECORRELATION, not on volume.** Once your overlay tells you which
+  side is scarce: its marginal hour is worth most where a second, differently-biased mind changes
+  the outcome — reviewing a PLAN before a build (WA §I `plan+review`), adversarial review of
+  finished work, and a second opinion on a contested call. Those are the scarce budget's intended
+  consumers.
+- **Bulk, parallel, high-fan-out and long-running grind go to the ABUNDANT side** — even when the
+  scarce side's tier would be cheaper per token. Burning a scarce capacity window on volume work
+  means the decorrelated review is unavailable when it actually matters.
 - Route by SKILL first (the evidence above), then break ties with this budget rule. A genuine
   skill edge (e.g. a 1M-token sweep) still justifies spending the scarce side — deliberately.
 - Fable 5 remains availability-fragile (50% weekly cap, historically yanked with zero notice) —

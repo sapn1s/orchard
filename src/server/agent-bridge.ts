@@ -102,6 +102,8 @@ import { laneDockerEnv, requireSandboxUp, adoptedDockerMismatch } from '../../sc
  */
 
 import { dataDir, projectRoot } from '../lib/paths.ts';
+import { approvalDeadlineConfig, expiryMessage, retryRefusalMessage, requestKey, inputSummary, fmtMinutes } from './approval-deadline.ts';
+import { recordIncident } from './lane-incidents.ts';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -363,6 +365,24 @@ interface PendingApproval {
    * and settles the promise once (BUG-008).
    */
   event: StationEvent;
+  /** BUG-239 — the lane that asked (null = main thread / unattributed: never expired). */
+  agentId?: string | null;
+  /** BUG-239 — server clock when the card was raised, and the escalation/expiry state. */
+  raisedAt?: number;
+  escalated?: boolean;
+  expiresAt?: number | null;
+}
+
+/** BUG-239 — one escalated (overdue) card, for the Needs-You rail. */
+export interface OverdueApproval {
+  requestId: string;
+  agentId: string | null;
+  lane: string | null;
+  kind: 'approval' | 'question' | 'plan';
+  what: string;
+  waitedMs: number;
+  /** Wall-clock ms at which a lane card will be refused; null = never (main thread). */
+  expiresAt: number | null;
 }
 
 /** The tools whose "permission" prompt is really a question to the human. */
@@ -1001,8 +1021,17 @@ export class AgentSession {
    * decision asks. This set is that separate liveness signal: a revived id is
    * live work until its own next terminal frame clears it (or the TTL expires).
    * It NEVER touches `#backgroundTasks`/`#establishedOutcomes`/`#retiredTasks`,
-   * so BUG-105's guarantees are untouched; it is read only by `workLifetime()`
-   * and the container-close quiet check.
+   * so BUG-105's guarantees are untouched; it is read by `workLifetime()`, the
+   * container-close quiet check, and — so the session list and running strip do
+   * not call a revived session "finished" while its agent runs (BUG-237) —
+   * `hasLiveBackgroundAgent()` and `levelOnlyLanes()`.
+   *
+   * It holds ids of ALL kinds: the sole writer (the task_started handler) records
+   * any established-outcome id that is re-announced, agent or tool, without a kind
+   * check. The kind is NOT stored here — each reader looks it up from the id's
+   * `#agents` row (built in the same task_started frame). FEAT-154: only agent-kind
+   * revivals count toward `hasLiveBackgroundAgent()`; a re-announced background
+   * `local_bash` (kind 'tool') is shown in the running strip but never as working.
    */
   #revivedTasks = new Map<string, number>();
   /**
@@ -1064,6 +1093,10 @@ export class AgentSession {
   /** BUG-043 — the close-on-detach fuse timer (a re-checking loop, not one shot). */
   #detachedCloseTimer: ReturnType<typeof setTimeout> | null = null;
   #approvals = new Map<string, PendingApproval>();
+  /** BUG-239 — requests (lane+tool+input) that already timed out unanswered: a repeat is refused at once. */
+  #expiredRequests = new Set<string>();
+  /** BUG-239 — lanes that had a permission refused for no answer (the park guard reads this). */
+  #expiredAgents = new Set<string>();
   /**
    * True between interrupt() and the resulting `result` message. The SDK reports
    * an interrupted turn as `error_during_execution`, which is byte-identical to
@@ -1150,6 +1183,10 @@ export class AgentSession {
     this.composed = composeInstructions(refs, {
       hostPath: opts.project.hostPath,
       routing: true,
+      // FEAT-172 — inject the gitignored per-operator overlay (capacity/env
+      // facts the public ROUTING.md / WA deliberately omit) when present; a
+      // clean checkout without it injects nothing.
+      operatorLocal: true,
       responseFormat: digest.enabled ? { guidance: digest.guidance ?? null } : false,
     });
     const dispatchOn = toolSettingsOf(opts.project).openaiDispatch;
@@ -1818,6 +1855,11 @@ export class AgentSession {
         firstPrompt,
         permissionMode: s.permissionMode,
         onApproval: (req) => this.#onCanUseTool(req.toolName, req.input, req.meta),
+        // BUG-239 — the no-parking guard reads expired permissions and records parks here.
+        laneBounds: {
+          permissionExpiredFor: (agentId) => this.permissionExpiredFor(agentId),
+          onParked: (r) => this.#recordParked(r),
+        },
         pathToExecutable,
         spawnProcess,
         model: s.model || undefined,
@@ -1835,6 +1877,10 @@ export class AgentSession {
         gitRepoPath: opts.project.hostPath,
         // BUG-231 — only a direct session's CLI sees the host git shim on its PATH.
         gitShimReachesCli: opts.project.isolation === 'direct',
+        // BUG-242 — on re-adopt, the surviving CLI's existing shim dir (baked with
+        // the dead previous-boot secret). The runtime re-bakes it in place with this
+        // process's current secret so a re-granted write authenticates post-restart.
+        adoptShimDir: opts.adopt?.st.gitShimDir ?? undefined,
         sessionLabel: this.id,
         // FEAT-129 — the file-lock heartbeat's liveness ground truth: the agent_ids
         // of the lanes this session has running RIGHT NOW (the same running-set
@@ -2966,6 +3012,23 @@ export class AgentSession {
   hasLiveBackgroundAgent(): boolean {
     for (const k of this.#backgroundTasks.values()) if (k === 'agent') return true;
     for (const k of this.#bgBornTasks.values()) if (k === 'agent') return true;
+    // A SendMessage-revived retired task is kept OUT of #backgroundTasks by
+    // BUG-105 (the re-announced id stays vetoed), so neither loop above sees it —
+    // yet it is live again until its own terminal frame or the TTL clears it. An
+    // unexpired revived AGENT makes the session read as working exactly as a
+    // level-listed agent does. But the sole writer (#revivedTasks.set in the
+    // task_started handler) fires for ANY established-outcome id that is
+    // re-announced, regardless of kind — so a settled background `local_bash`
+    // (kind 'tool') that is re-announced lands there too. FEAT-154: a shell NEVER
+    // counts toward working (it keeps the process alive but is not "an agent"), so
+    // only agent-kind revivals count here; tool-kind revivals are shown in the
+    // running strip (levelOnlyLanes) instead. The revival's #agents row (built in
+    // the same task_started frame, before the #revivedTasks.set) carries the kind.
+    // Gated by `live` in liveness.ts, so a dead process never resurrects it, and
+    // the TTL means it cannot hold "working" forever.
+    for (const id of this.#liveRevivedTasks()) {
+      if (this.#agents.get(id)?.kind !== 'tool') return true;
+    }
     return false;
   }
 
@@ -2984,6 +3047,28 @@ export class AgentSession {
       if (row && row.status === 'running') continue; // already a strip row
       const meta = this.#levelMeta.get(id);
       out.push({ id, kind, description: meta?.description ?? '', since: meta?.since ?? null });
+    }
+    // A SendMessage-revived retired task is filtered out of #backgroundTasks by
+    // BUG-105, so the loop above never emits it — but it is live background work
+    // the user must still see in the running strip (its own row is settled, so
+    // the strip's `liveAgents()` pass drops it too). Surface each unexpired
+    // revival that has no live strip row, labelled with its REAL kind from its
+    // settled #agents row (built in the same task_started frame). A revival may be
+    // a tool-kind lane (a re-announced background `local_bash`); it belongs in the
+    // strip like any background tool, but must NOT be mislabelled 'agent' — the
+    // list's working fact (hasLiveBackgroundAgent) already excludes tool-kind
+    // revivals per FEAT-154, and the strip would lie if a shell showed as an agent.
+    const already = new Set(out.map((l) => l.id));
+    for (const id of this.#liveRevivedTasks()) {
+      if (already.has(id)) continue;
+      const row = this.#agents.get(id);
+      if (row && row.status === 'running') continue; // a live row already shows it
+      out.push({
+        id,
+        kind: row?.kind ?? 'agent',
+        description: row?.description ?? this.#levelMeta.get(id)?.description ?? '',
+        since: row?.startedAt ?? this.#levelMeta.get(id)?.since ?? null,
+      });
     }
     return out;
   }
@@ -4183,12 +4268,23 @@ export class AgentSession {
       const requestId = o.requestId;
       const toolUseId = o.toolUseID ?? '';
       const agentId = o.agentID ?? null;
+      const timers: NodeJS.Timeout[] = [];
+      let onAbort: (() => void) | null = null;
       let settled = false;
-      const once = (r: ApprovalResult) => {
-        if (settled) return;
+      /*
+       * BUG-239 — `once` reports whether THIS call won, so a side effect (the
+       * expiry record, a rail card) happens only for the transition that actually
+       * settled the request. Every settle path clears the deadline timers and the
+       * abort listener (plan review finding 12).
+       */
+      const once = (r: ApprovalResult): boolean => {
+        if (settled) return false;
         settled = true;
+        for (const t of timers) clearTimeout(t);
+        if (onAbort) o.signal.removeEventListener('abort', onAbort);
         this.#approvals.delete(requestId);
         resolve(r);
+        return true;
       };
 
       const questions = toolName === QUESTION_TOOL ? parseQuestionInput(input) : [];
@@ -4197,6 +4293,17 @@ export class AgentSession {
       // rather than rendering an empty one — the user still sees the raw input
       // and can let it through, which is strictly better than a blank prompt.
       const kind: PendingKind = questions.length ? 'question' : plan ? 'plan' : 'approval';
+
+      /*
+       * BUG-239 — a lane asking AGAIN for exactly what already timed out
+       * unanswered is refused at once, without a second card: re-asking would
+       * just buy another full deadline of the same nobody-answering.
+       */
+      const key = agentId ? requestKey(agentId, toolName, input) : null;
+      if (key && this.#expiredRequests.has(key)) {
+        once({ behavior: 'deny', message: retryRefusalMessage() });
+        return;
+      }
 
       // Build the announce event ONCE and keep it on the pending entry, so a
       // re-attaching socket can be shown the very same card (BUG-008). The
@@ -4209,17 +4316,117 @@ export class AgentSession {
             ? { t: 'plan-request', requestId, toolUseId, plan, input, agentId }
             : { t: 'approval-request', requestId, toolName, input, title: o.title, description: o.description, agentId };
 
-      this.#approvals.set(requestId, { kind, resolve: once, toolName, toolUseId, input, event });
+      /*
+       * BUG-239 — the deadline. ESCALATE every card after `escalateMs`; EXPIRE
+       * (always DENY — never allow, never a fabricated answer) only a card a
+       * subagent lane raised, after `deadlineMs`. setTimeout = awake time.
+       */
+      const dl = approvalDeadlineConfig();
+      const raisedAt = Date.now();
+      const expires = !!agentId && dl.deadlineMs > 0;
+      const pending: PendingApproval = {
+        kind, resolve: (r) => { once(r); }, toolName, toolUseId, input, event,
+        agentId, raisedAt, escalated: false, expiresAt: expires ? raisedAt + dl.deadlineMs : null,
+      };
+      this.#approvals.set(requestId, pending);
+      if (dl.escalateMs > 0) {
+        timers.push(setTimeout(() => {
+          if (settled) return;
+          pending.escalated = true;
+          const lane = this.#laneLabel(agentId);
+          this.#emit({
+            t: 'status',
+            status: `Waiting ${fmtMinutes(dl.escalateMs)} for your answer: ${lane} — ${inputSummary(toolName, input)}`
+              + (expires ? ` (refused, not approved, in ${fmtMinutes(dl.deadlineMs - dl.escalateMs)} if unanswered)` : ''),
+          });
+        }, dl.escalateMs));
+      }
+      if (expires) {
+        timers.push(setTimeout(() => {
+          if (!once({ behavior: 'deny', message: expiryMessage(dl.deadlineMs, kind) })) return;
+          if (key) this.#expiredRequests.add(key);
+          this.#expiredAgents.add(agentId!);
+          const lane = this.#laneLabel(agentId);
+          const what = inputSummary(toolName, input);
+          recordIncident({
+            kind: 'permission-expired',
+            projectId: this.project?.id ?? null,
+            sessionId: this.id,
+            agentId,
+            lane,
+            tool: toolName,
+            summary: `${lane} wanted ${what} — no answer in ${fmtMinutes(dl.deadlineMs)}, so it was refused (not approved)`,
+            detail: 'A timeout, not your decision. The lane was told to report it as BLOCKED-ON-PERMISSION; grant it and re-dispatch if you want it.',
+          });
+          this.#emit({ t: 'status', status: `Refused for no answer after ${fmtMinutes(dl.deadlineMs)} (not approved): ${lane} — ${what}` });
+        }, dl.deadlineMs));
+      }
       /*
        * Abort = the turn was interrupted or the query died while this was
        * pending. Deny is the only safe resolution: the tool must not run, and
        * for a question there is no answer to give. The UI learns the card never
        * settled from the tool-result that follows.
        */
-      o.signal.addEventListener('abort', () => once({ behavior: 'deny', message: 'aborted' }), { once: true });
+      onAbort = () => { once({ behavior: 'deny', message: 'aborted' }); };
+      if (o.signal.aborted) { onAbort(); return; }
+      o.signal.addEventListener('abort', onAbort, { once: true });
 
       this.#emit(event);
     });
+  }
+
+  /** BUG-239 — a human-readable lane name for a card / incident. */
+  #laneLabel(agentId: string | null): string {
+    if (!agentId) return 'this session';
+    const a = this.#agents.get(agentId);
+    const d = a?.description?.trim();
+    return d ? `lane "${d.length > 80 ? `${d.slice(0, 80)}…` : d}"` : `lane ${agentId.slice(0, 8)}`;
+  }
+
+  /** BUG-239 — escalated (overdue) cards still waiting, for the Needs-You rail. */
+  overdueApprovals(now: number = Date.now()): OverdueApproval[] {
+    const out: OverdueApproval[] = [];
+    for (const [requestId, p] of this.#approvals) {
+      if (!p.escalated) continue;
+      out.push({
+        requestId,
+        agentId: p.agentId ?? null,
+        lane: this.#laneLabel(p.agentId ?? null),
+        kind: p.kind,
+        what: inputSummary(p.toolName, p.input),
+        waitedMs: now - (p.raisedAt ?? now),
+        expiresAt: p.expiresAt ?? null,
+      });
+    }
+    return out;
+  }
+
+  /** BUG-239 — the guard let a lane end with background work outstanding (or could not judge): record it. */
+  #recordParked(r: { agentId: string; why: string; children: { id: string; type: string; status: string; what: string }[]; detail: string }): void {
+    const lane = this.#laneLabel(r.agentId);
+    const kids = r.children.map((c) => `${c.id} (${c.type}${c.status === 'finished-unread' ? ', finished, never read' : ''})`).join(', ');
+    const why = r.why === 'ignored' ? 'it declined to wait'
+      : r.why === 'ceiling' ? 'it reached the guard\'s time ceiling'
+        : r.why === 'permission-expired' ? 'a permission it needed timed out unanswered'
+          : r.why === 'disabled' ? 'the guard is switched off (CLAUDE_STATION_PARK_GUARD=0)'
+            : 'the guard could not check it';
+    recordIncident({
+      kind: r.why === 'cannot-judge' ? 'park-guard-error' : 'lane-parked',
+      projectId: this.project?.id ?? null,
+      sessionId: this.id,
+      agentId: r.agentId,
+      lane,
+      summary: r.why === 'cannot-judge'
+        ? `${lane} ended while background work was live, and the guard could not check whether it was the lane's`
+        : `${lane} ended with background work outstanding (${kids}) because ${why}`,
+      detail: r.detail || 'A foreground lane\'s background shells and monitors are killed when it ends; a background agent\'s result goes to the orchestrator. Check whether the result you needed arrived.',
+    });
+    this.#emit({ t: 'status', status: `${lane} ended with background work outstanding — see the Needs-You rail` });
+  }
+
+  /** BUG-239 — did this lane have a permission refused for no answer? (park guard) */
+  permissionExpiredFor(agentId: string): boolean {
+    return this.#expiredAgents.has(agentId);
   }
 
   /** Resolve `parent_tool_use_id` to a known agent id where possible. */

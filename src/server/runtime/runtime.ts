@@ -235,6 +235,16 @@ export interface RuntimeStartConfig {
   permissionMode: string;
   /** Called for every tool the engine wants to run; resolves to allow/deny. */
   onApproval: (req: RuntimeApprovalRequest) => Promise<ApprovalResult>;
+  /**
+   * BUG-239 — the no-parking guard's link back to the session owner: whether a
+   * lane had a permission refused for no answer, and where to record a lane the
+   * guard let end with background work outstanding. Absent = the guard still
+   * runs, records nothing, and treats no lane as permission-expired.
+   */
+  laneBounds?: {
+    permissionExpiredFor: (agentId: string) => boolean;
+    onParked: (r: { agentId: string; why: string; children: { id: string; type: string; status: string; what: string }[]; detail: string }) => void;
+  };
   /** Isolation: path to the in-container engine binary, when spawning elsewhere. */
   pathToExecutable?: string;
   /** Isolation/survival: override how the engine's process is spawned. */
@@ -270,6 +280,15 @@ export interface RuntimeStartConfig {
    * never leaves the leak gate or the grant spend to the shim.
    */
   gitShimReachesCli?: boolean;
+  /**
+   * BUG-242 — on the restart-adopt path ONLY: the surviving session's existing git
+   * shim dir (from its broker's status record, `HostStatus.gitShimDir`). The CLI
+   * survived the restart with this dir on its PATH, baked with the PREVIOUS server
+   * process's now-dead secret. `installGitShim({ reuseDir })` re-bakes THAT dir with
+   * this process's current secret (and this start's fresh windowKey), so the
+   * surviving CLI authenticates again without a relaunch. Absent for a fresh launch.
+   */
+  adoptShimDir?: string | null;
   sessionLabel?: string;
   /**
    * FEAT-129 — the harness's own running-set, as agent_ids of the lanes that are

@@ -21,7 +21,7 @@
  * registered project on it) yields NO names — i.e. no exemption, never a wider
  * one. It can only ever make the gate stricter.
  */
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -64,6 +64,45 @@ export function ownProjectNamesFor(repoPath: string | null | undefined): string[
 /** The `--own-project=` args for a repo (empty when it has no unambiguous owner). */
 export function ownProjectArgs(repoPath: string | null | undefined): string[] {
   return ownProjectNamesFor(repoPath).map((n) => `--own-project=${n}`);
+}
+
+/**
+ * BUG-249 r2 — `git`, async. A promisified `execFile` that optionally writes `input` to the
+ * child's stdin, so every git read on the git-write decide/hook hot path (fingerprint +
+ * own-project resolution) runs OFF the event loop, exactly as the leak-gate scan now does.
+ * Same cwd / timeout / maxBuffer as the synchronous `git` in `repoContentFingerprint`.
+ */
+function gitAsync(repoPath: string, args: string[], input?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const cp = execFile('git', args, {
+      cwd: repoPath, encoding: 'utf8', timeout: 10_000, maxBuffer: 256 * 1024 * 1024,
+    }, (err, stdout) => { if (err) reject(err); else resolve(stdout as string); });
+    // End stdin either way: feed `hash-object --stdin-paths`, and keep a git that ignores
+    // stdin from ever waiting on an open pipe.
+    try { cp.stdin?.end(input === undefined ? '' : input); } catch { /* child already gone */ }
+  });
+}
+
+/** BUG-249 r2 — async twin of `ownProjectNamesFor`: the single `git rev-parse` runs
+ * off-loop. The registry/realpath lookups are O(1), fs-metadata only (not tree-size
+ * dependent), so they stay synchronous. Same [] -on-any-doubt fail-safe. */
+export async function ownProjectNamesForAsync(repoPath: string | null | undefined): Promise<string[]> {
+  if (!repoPath) return [];
+  try {
+    const top = (await gitAsync(repoPath, ['rev-parse', '--show-toplevel'])).trim();
+    const realTop = top ? realOrNull(top) : null;
+    if (!realTop) return [];
+    const owners = listProjects().filter((p) => p.hostPath && realOrNull(p.hostPath) === realTop);
+    if (owners.length !== 1) return [];
+    return owners[0].name ? [owners[0].name] : [];
+  } catch {
+    return [];
+  }
+}
+
+/** BUG-249 r2 — async twin of `ownProjectArgs`. */
+export async function ownProjectArgsAsync(repoPath: string | null | undefined): Promise<string[]> {
+  return (await ownProjectNamesForAsync(repoPath)).map((n) => `--own-project=${n}`);
 }
 
 /**
@@ -161,6 +200,67 @@ export function repoContentFingerprint(repoPath: string | null | undefined): { h
     // skip is gated on BOTH being unchanged since the hook gated (git-grant.mjs
     // fingerprintCovered). A null key forces a re-gate.
     return { head, entries, gateKey: gateVerdictKey(repoPath) };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * BUG-249 r2 — async twin of `gateVerdictKey`. Byte-for-byte the SAME digest as the sync
+ * version for the same state (same inputs, same order), so a fingerprint captured on the
+ * async path compares equal to one captured on the sync path. The two small config-file
+ * reads and the own-project `git rev-parse` all run off the event loop.
+ */
+export async function gateVerdictKeyAsync(repoPath: string | null | undefined): Promise<string | null> {
+  try {
+    const h = createHash('sha256');
+    h.update('gate\0');
+    h.update(await fs.promises.readFile(hostLeakGatePath()));
+    h.update('\0list\0');
+    h.update(await fs.promises.readFile(path.join(ORCHARD_ROOT, 'scripts', 'lib', 'leak-tokens.mjs')));
+    h.update('\0own\0');
+    for (const a of await ownProjectArgsAsync(repoPath)) { h.update(a); h.update('\0'); }
+    return h.digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * BUG-249 r2 — async twin of `repoContentFingerprint`, the heavy read on the git-write
+ * decide/hook hot path. The original ran `git ls-files -s`, `git diff`, `git ls-files -o`
+ * and `git hash-object --stdin-paths` (hashing every changed/untracked file) PLUS an
+ * `fs.*Sync` stat per candidate — all synchronously, so on a large repo it froze the single
+ * process ~930ms PER CAPTURE, and the hook/shim capture it pre- AND post-gate (BUG-249 r1
+ * break: the scan went async but this did not). This twin produces the IDENTICAL
+ * `{ head, entries, gateKey }` with every git read via `gitAsync` and every stat via
+ * `fs.promises.lstat` (candidates stat'd in parallel, order preserved so the hash-object
+ * zip stays consistent), so none of it blocks the loop. Read-only; any failure → null.
+ */
+export async function repoContentFingerprintAsync(repoPath: string | null | undefined): Promise<{ head: string; entries: string[]; gateKey: string | null } | null> {
+  if (!repoPath) return null;
+  try {
+    let head = '';
+    try { head = (await gitAsync(repoPath, ['rev-parse', '-q', '--verify', 'HEAD'])).trim(); } catch { head = ''; }
+    const entries: string[] = [];
+    for (const line of (await gitAsync(repoPath, ['ls-files', '-s', '-z'])).split('\0')) {
+      const m = /^\d+ ([0-9a-f]+) \d+\t(.*)$/s.exec(line);
+      if (m) entries.push(`${m[2]}:${m[1]}`);
+    }
+    const candidates = [
+      ...(await gitAsync(repoPath, ['diff', '--name-only', '-z'])).split('\0'),
+      ...(await gitAsync(repoPath, ['ls-files', '-o', '--exclude-standard', '-z'])).split('\0'),
+    ].filter((p) => p);
+    const isFile = await Promise.all(candidates.map(async (p) => {
+      try { return (await fs.promises.lstat(path.join(repoPath, p))).isFile(); } catch { return false; }
+    }));
+    const changed = candidates.filter((_, k) => isFile[k]);
+    if (changed.length) {
+      const hashes = (await gitAsync(repoPath, ['hash-object', '--stdin-paths'], `${changed.join('\n')}\n`)).trim().split('\n');
+      if (hashes.length !== changed.length) return null;
+      changed.forEach((p, k) => entries.push(`${p}:${hashes[k]}`));
+    }
+    return { head, entries, gateKey: await gateVerdictKeyAsync(repoPath) };
   } catch {
     return null;
   }

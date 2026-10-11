@@ -47,7 +47,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import WebSocket from 'ws';
 import { shotLedger } from './lib/shot-luma.mjs';
-import { scratchRoot } from './lib/scratch.mjs';
+import { scratchRoot, mkdtempScratch } from './lib/scratch.mjs';
 
 const ARGS = process.argv.slice(2);
 const NO_RED = ARGS.includes('--no-red');
@@ -56,7 +56,12 @@ const ROOT = path.resolve(import.meta.dirname, '..');
 // resolver ($CLAUDE_STATION_SCRATCH, else $XDG_STATE_HOME/…, else ~/.local/state),
 // so this file carries no home directory and no username. A leak in a test
 // script is one careless `git add` away from a public commit.
-const SCRATCH = process.env.ARCH004_SCRATCH ?? path.join(scratchRoot(), 'arch-004-ui');
+// BUG-250: a UNIQUE dir this process created, not a fixed `arch-004-ui` name —
+// a fixed name under the shared scratch root is a foreign dir to the NEXT run,
+// which rmSyncs SCRATCH at setup. An explicit ARCH004_SCRATCH override stays the
+// operator's own responsibility. (`scratchRoot` import kept for path provenance.)
+const SCRATCH = process.env.ARCH004_SCRATCH ?? mkdtempScratch('arch-004-ui-');
+void scratchRoot;
 const WORK = path.join(SCRATCH, 'project');
 const BUGS = path.join(WORK, 'docs', 'bugs');
 const BASE_TREE = path.join(SCRATCH, 'base-tree');

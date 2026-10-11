@@ -166,6 +166,8 @@ export interface TranscriptBlock {
   isError?: boolean;
   /** true when `text` was cut to `maxTextChars`. */
   truncated?: boolean;
+  /** Original length of a `truncated` text/thinking/tool_result block (BUG-234). */
+  fullLength?: number;
 }
 
 export interface TranscriptMessage {
@@ -267,9 +269,38 @@ export function defaultRoot(): string {
 /**
  * Reproduce Claude Code's directory encoding: every non-alphanumeric character
  * becomes '-'. Verified against 17/18 real directories.
+ *
+ * NOTE (BUG-243): this is the PLAIN char-replacement only. It equals the SDK's
+ * actual on-disk project-dir name ONLY while the result is <= 200 chars; beyond
+ * that the SDK truncates and appends a hash (see `sdkEncodeDir`). For listing,
+ * where a near-miss just hides a dir, plain encoding is tolerable; for a
+ * MUTATION's safety guard — "does this address resolve to the dir the file sits
+ * in?" — the plain encoding is WRONG for long paths and must never be the
+ * authority (it let a long-hostPath DELETE target a same-id foreign dir). Use
+ * `sdkEncodeDir` wherever the answer has to match where the SDK will actually go.
  */
 export function encodeCwd(cwd: string): string {
   return cwd.replace(/[^a-zA-Z0-9]/g, '-');
+}
+
+/**
+ * THE SDK's REAL project-dir encoder — the single authority for "which store dir
+ * does the Agent SDK resolve this cwd to?" (BUG-243). A byte-for-byte reproduction
+ * of the SDK's `Vl()` (sdk.mjs): plain-encode, and if that exceeds 200 chars,
+ * truncate to 200 and append `-<hash36>`, where the hash is the SDK's `b_()` — a
+ * 32-bit `(h<<5)-h+c` rolling hash of the ORIGINAL cwd, `Math.abs`, base-36.
+ *
+ * Pinned against the SDK's actual behaviour by scripts/verify-bug-243 (a real
+ * `renameSession` at a >200-char cwd lands in exactly this dir); if a future SDK
+ * changes the algorithm, that test fails loudly rather than the guard silently
+ * addressing the wrong directory.
+ */
+export function sdkEncodeDir(cwd: string): string {
+  const plain = encodeCwd(cwd);
+  if (plain.length <= 200) return plain;
+  let h = 0;
+  for (let i = 0; i < cwd.length; i++) h = ((h << 5) - h + cwd.charCodeAt(i)) | 0;
+  return `${plain.slice(0, 200)}-${Math.abs(h).toString(36)}`;
 }
 
 /**
@@ -892,7 +923,9 @@ export function readSession(
 
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
   const limit = Math.min(MAX_LIMIT, Math.max(1, Math.floor(opts.limit ?? 200)));
-  const maxTextChars = Math.max(0, Math.floor(opts.maxTextChars ?? 4000));
+  // BUG-234: absent cap = full fidelity (not 4000). A cap applies only when a
+  // caller asks; delivery goes through deliverText (plain cut + metadata).
+  const maxTextChars = opts.maxTextChars == null ? undefined : Math.max(0, Math.floor(opts.maxTextChars));
   const includeToolResults = opts.includeToolResults === true;
   const includeMeta = opts.includeMeta === true;
   const maxBytes = opts.maxBytes ?? DEFAULT_READ_MAX_BYTES;
@@ -977,9 +1010,52 @@ export function readSession(
   };
 }
 
-function toBlocks(content: unknown, cap: number, includeToolResults: boolean): TranscriptBlock[] {
+/*
+ * ------------------------------------------------------------------------
+ * SINGLE AUTHORITY: transcript text block -> delivered text (BUG-234)
+ * ------------------------------------------------------------------------
+ * Exactly ONE function owns "given a stored text/thinking/tool_result block
+ * and an optional cap, HOW MUCH text do we deliver?": `deliverText`. jsonl.ts
+ * `blocksOf` (main tail / forward / live follow), subagents.ts
+ * `getSubagentMessages` (subagent tail + PAGE routes) and this file's
+ * `readSession` all call it; there is no second `?? 4000` and no second raw
+ * slice of block text anywhere.
+ *
+ *   - DEFAULT is FULL fidelity. `maxTextChars == null` means "all of it"; a
+ *     cap applies ONLY when a caller asks for one.
+ *   - A cap that bites is a PLAIN STRING cut (it only refuses to split a
+ *     UTF-16 surrogate pair) plus METADATA: `truncated: true` and the original
+ *     `fullLength`. Nothing is appended to the text.
+ *
+ * BUG-234 r7: the READING ROUTES NO LONGER PASS A CAP. The main tail/forward,
+ * live follow and subagent tail/page routes all call these with `maxTextChars`
+ * undefined, so a block delivered to the reading view is NEVER `truncated` — the
+ * mid-fence-cut class that rendered a table as raw <pre> is removed by
+ * construction, and the client's old `closeTruncatedFence` / truncation-note
+ * machinery is gone. The only caller that still passes a cap is a NON-reading one:
+ * transcript.ts's emptiness check (`maxTextChars: 1`, used only for `.length > 0`).
+ *
+ * THE SERVER DOES NOT REASON ABOUT MARKDOWN (BUG-234 r3, ARCH-010). Rounds 1-2
+ * closed a dangling code fence here by mirroring the client's fence grammar;
+ * independent verification broke that mirror three times (CRLF, then a
+ * list-nested fence whose column-0 closer the client's container bound rejects).
+ * `deliverText` only ever cuts the string; it adds no fence/markdown repair.
+ */
+export function deliverText(
+  s: string,
+  maxTextChars?: number | null,
+): { text: string; truncated?: boolean; fullLength?: number } {
+  const cap = maxTextChars == null ? Infinity : Math.max(0, Math.floor(maxTextChars));
+  if (s.length <= cap) return { text: s };
+  let cut = cap;
+  // Never leave half a surrogate pair at the end of the delivered string.
+  if (cut > 0 && /[\uD800-\uDBFF]/.test(s[cut - 1]!)) cut -= 1;
+  return { text: s.slice(0, cut), truncated: true, fullLength: s.length };
+}
+
+function toBlocks(content: unknown, cap: number | undefined, includeToolResults: boolean): TranscriptBlock[] {
   if (typeof content === 'string') {
-    return [{ type: 'text', text: content.slice(0, cap), truncated: content.length > cap }];
+    return [{ type: 'text', ...deliverText(content, cap) }];
   }
   if (!Array.isArray(content)) return [];
   const out: TranscriptBlock[] = [];
@@ -999,7 +1075,7 @@ function toBlocks(content: unknown, cap: number, includeToolResults: boolean): T
     const type = typeof b.type === 'string' ? b.type : 'unknown';
     if (type === 'text' || type === 'thinking') {
       const src = type === 'thinking' ? (b.thinking ?? '') : (b.text ?? '');
-      out.push({ type, text: src.slice(0, cap), truncated: src.length > cap });
+      out.push({ type, ...deliverText(src, cap) });
     } else if (type === 'tool_use') {
       let input = '';
       try {
@@ -1007,25 +1083,27 @@ function toBlocks(content: unknown, cap: number, includeToolResults: boolean): T
       } catch {
         input = '<uninspectable input>';
       }
+      // tool_use carries JSON the UI JSON.parses for the chip arg, not a
+      // delivered text block; it keeps its own raw-slice cap (BUG-234).
+      const jsonCap = cap == null ? Infinity : cap;
       out.push({
         type,
         toolName: typeof b.name === 'string' ? b.name : undefined,
         toolUseId: typeof b.id === 'string' ? b.id : undefined,
-        text: input.slice(0, cap),
-        truncated: input.length > cap,
+        text: input.slice(0, jsonCap),
+        truncated: input.length > jsonCap,
       });
     } else if (type === 'tool_result') {
       if (!includeToolResults) {
         out.push({ type, toolUseId: b.tool_use_id, isError: b.is_error === true, text: '' });
         continue;
       }
-      const flat = flattenToolResult(b.content, cap);
+      const flat = flattenToolResult(b.content, cap ?? Infinity);
       out.push({
         type,
         toolUseId: typeof b.tool_use_id === 'string' ? b.tool_use_id : undefined,
         isError: b.is_error === true,
-        text: flat.slice(0, cap),
-        truncated: flat.length > cap,
+        ...deliverText(flat, cap),
       });
     } else {
       out.push({ type });

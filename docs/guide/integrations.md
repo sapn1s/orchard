@@ -135,12 +135,16 @@ stronger/cheaper provider and consume its result. Full guidance:
 
 ### The budget reality
 
-Capacity here is **Claude-abundant, GPT-scarce** (the OpenAI side is a $20 ChatGPT
-Plus plan on rolling 5-hour windows). Spend the scarce GPT hours where a second,
-differently-biased mind changes the outcome — plan review, adversarial review, a
-contested second opinion — **not** on bulk volume, which goes to the abundant Claude
-side. Route by skill first, then break ties with this budget rule. (This is
-configuration, not physics — re-check it when the plans change.)
+Which provider is **abundant** and which is **scarce** depends on your own
+subscriptions/billing, not on the models — so it is a per-operator fact, kept in a
+gitignored operator-local overlay rather than in any published doc (see
+`docs/prompts/OPERATOR.local.md.example`). Once you know which side is scarce, spend
+its hours where a second, differently-biased mind changes the outcome — plan review,
+adversarial review, a contested second opinion — **not** on bulk volume, which goes to
+the abundant side. Route by skill first, then break ties with this budget rule. (This
+is configuration, not physics — re-check it when the plans change.) With only one
+provider configured, the cross-provider rules do not apply; route by skill within that
+provider's ladder.
 
 ### Dispatching to the other provider
 

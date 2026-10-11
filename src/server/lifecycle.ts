@@ -538,6 +538,8 @@ export function scheduleImagesOp(fn: (op: Op) => Promise<void> | void): void {
  * READ-ONLY probes that need an exec (docker has no other way to read inside a container): the exact
  * commands below and nothing else, into a session container. Owned here so the gate can match them.
  */
+/** BUG-244 — prints `W <path>` for each argument path that is WRITABLE (access W_OK); a read-only overlay fails with EROFS. */
+export const GIT_GUARD_PROBE_SCRIPT = 'for p do [ -w "$p" ] && printf "W %s\\n" "$p"; done; true';
 export const MEMORY_PROBE_SCRIPT =
   'echo C:$(cat /sys/fs/cgroup/memory.current 2>/dev/null); ' +
   'echo M:$(cat /sys/fs/cgroup/memory.max 2>/dev/null); ' +
@@ -556,7 +558,12 @@ function authorizeProbe(args: readonly string[]): void {
   const cmd = pos.slice(1);
   const statOk = cmd[0] === 'stat' && cmd[1] === '-c' && cmd[2] === '%i %n' && cmd.slice(3).every((p) => p.startsWith('/') && !p.includes('\n'));
   const memOk = cmd.length === 3 && cmd[0] === 'sh' && cmd[1] === '-c' && cmd[2] === MEMORY_PROBE_SCRIPT;
-  if (!statOk && !memOk) refuse('probe-scope', 'not one of the fixed read-only probes');
+  // BUG-244: the read-only .git overlay check — access(W_OK) on absolute paths only; writes nothing.
+  // Matched on the RAW argv after the container token (`positionals` drops every `-…` word, including `-c`).
+  const tail = pos[0] ? rest.slice(rest.indexOf(pos[0]) + 1) : [];
+  const guardOk = tail.length >= 5 && tail[0] === 'sh' && tail[1] === '-c' && tail[2] === GIT_GUARD_PROBE_SCRIPT && tail[3] === 'sh'
+    && tail.slice(4).every((p) => p.startsWith('/') && !p.includes('\n'));
+  if (!statOk && !memOk && !guardOk) refuse('probe-scope', 'not one of the fixed read-only probes');
   if (rest.some((a) => a === '-u' || a === '--user' || a.startsWith('--user=') || a === '--privileged')) refuse('probe-scope', 'a probe runs as the container default user, unprivileged');
 }
 

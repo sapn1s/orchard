@@ -205,3 +205,14 @@ is the better call.
   log (rounds 1-6) and its five clean-room verification entries.
 - **Still open / handoff:** the user picks A/B/C/D. The orchestrator must flip this
   ticket's INDEX owner to 👤 so the Decide card renders. Recommendation: **D**.
+
+### 2026-10-07 — BUG-240 design-review lane
+- **evidence:** The text/env agent git-write guard has been shown non-airtight by 4 independent routes today (2026-10-07):
+  - BUG-240 plan B (path checks), UNSOUND;
+  - plan A (bwrap scratch confinement), UNSOUND;
+  - an agent-set TMPDIR defeating the temp-index rule;
+  - `read-tree --index-output` writing a real index.
+  Airtight enforcement therefore needs OS-level confinement of the agent session itself. Detail and run ids are in BUG-240.
+
+### 2026-10-08 — BUG-240 decision lane
+- **threat model clarified (user intent):** Threat-model clarification from the user (append-only, recorded while answering BUG-240's venue card A). The agent git-write enforcement exists to stop agents AUTONOMOUSLY committing or pushing to a project's real repo — the failure it prevents is noise commits, a broken main branch and unintended changes (accidental or habitual writes). Quoting the user: "It is NOT a security boundary against a deliberately malicious agent." So this ticket's invariant and options should be read against that intent: the text/hook/shim layers (A/B) are about catching accidental or habitual real-repo writes, not about defeating a same-uid adversary who deliberately routes around them. That reframing does not change the options; it sets the bar they are judged against.

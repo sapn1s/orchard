@@ -6,6 +6,17 @@ import type { GitWriteGrantView, RecordedGitWrite } from './git-grant-store.d.mt
 
 export declare const PUBLISHING_SUBCOMMANDS: Set<string>;
 
+/** A verdict the injected leak-gate runner returns. */
+export interface GateVerdict { ok: boolean; detail?: string }
+/** The injected leak-gate runner. The async decision compositions (…Async) await it,
+ * so it may return a verdict directly OR a promise of one (BUG-249). */
+export type GateRunner = (scope?: { narrow?: boolean }) => GateVerdict | Promise<GateVerdict>;
+/** The injected repo content fingerprint reader. The async decision compositions (…Async)
+ * await it (BUG-249 r2 — the big-repo fingerprint runs off-loop like the gate), so it may
+ * return the fingerprint directly OR a promise of one. */
+export type RepoFingerprint = { head: string; entries: string[]; gateKey?: string | null };
+export type RepoFingerprintReader = (() => RepoFingerprint | null | Promise<RepoFingerprint | null>) | null;
+
 export interface GitWriteEvaluation {
   allow: boolean;
   offender?: string;
@@ -42,31 +53,39 @@ export interface GitWriteToolCallWindow {
  *                 PATH shim, via /api/git-shim/decide).
  * Whichever shape, the same claim (FEAT-164 r4: claimGrant → useClaim, the store asked at the write) / leak-gate tail runs.
  */
-export declare function evaluateGitWrite(opts: {
+export interface EvaluateGitWriteOpts {
   command?: string;
   argv?: string[];
   projectKey?: string | null;
   env?: Record<string, string | undefined>;
   now?: number;
-  runLeakGate?: (() => { ok: boolean; detail?: string }) | null;
+  runLeakGate?: GateRunner | null;
   sessionLabel?: string | null;
   /** BUG-231 — the hook passes its tool call; the decision becomes that call's window. */
   window?: GitWriteToolCallWindow | null;
   /** BUG-231 — the repo content the gate scanned ({head, path:blob entries}); lets the shim skip an unchanged re-gate. */
-  repoFingerprint?: (() => { head: string; entries: string[]; gateKey?: string | null } | null) | null;
-}): GitWriteEvaluation;
+  repoFingerprint?: RepoFingerprintReader;
+}
 
-/** BUG-231 — the shim's decision for one invocation: redeem the session's live window, else decide independently. */
-export declare function redeemGitWrite(opts: {
+export declare function evaluateGitWrite(opts: EvaluateGitWriteOpts): GitWriteEvaluation;
+/** BUG-249 — the async composition used by the runtime: the leak gate is awaited off the event loop. */
+export declare function evaluateGitWriteAsync(opts: EvaluateGitWriteOpts): Promise<GitWriteEvaluation>;
+
+export interface RedeemGitWriteOpts {
   binding?: string | null;
   argv: string[];
   projectKey?: string | null;
   env?: Record<string, string | undefined>;
   now?: number;
-  runLeakGate?: (() => { ok: boolean; detail?: string }) | null;
+  runLeakGate?: GateRunner | null;
   sessionLabel?: string | null;
-  repoFingerprint?: (() => { head: string; entries: string[]; gateKey?: string | null } | null) | null;
-}): GitWriteEvaluation;
+  repoFingerprint?: RepoFingerprintReader;
+}
+
+/** BUG-231 — the shim's decision for one invocation: redeem the session's live window, else decide independently. */
+export declare function redeemGitWrite(opts: RedeemGitWriteOpts): GitWriteEvaluation;
+/** BUG-249 — the async composition used by /api/git-shim/decide: the leak gate is awaited off the event loop. */
+export declare function redeemGitWriteAsync(opts: RedeemGitWriteOpts): Promise<GitWriteEvaluation>;
 
 /** BUG-231 — at every PreToolUse: ends the calling agent's earlier windows (supersession). */
 export declare function beginGitWriteToolCall(opts: { binding: string; toolUseId?: string | null; agentKey?: string; now?: number }): void;

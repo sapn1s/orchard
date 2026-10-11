@@ -7,8 +7,8 @@ Wants=network-online.target
 Type=simple
 # %h = the user's home directory (systemd user-unit specifier). Adjust the
 # repo path if you cloned somewhere else.
-ExecStart=/usr/bin/node %h/projects/claude-station/src/server/index.ts
-WorkingDirectory=%h/projects/claude-station
+ExecStart=/usr/bin/node %h/projects/orchard/src/server/index.ts
+WorkingDirectory=%h/projects/orchard
 Environment=PORT=4317
 Restart=on-failure
 RestartSec=2

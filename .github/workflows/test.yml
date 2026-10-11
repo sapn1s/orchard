@@ -1,0 +1,43 @@
+name: test
+
+# FEAT-033 — CI runs the PORTABLE tier only.
+#
+# What runs here: the `pure` tier (no server, no browser, no Docker, no network,
+# no live claude-station service). That is the only tier a stock GitHub runner
+# can execute honestly.
+#
+# What CI deliberately does NOT run, and why:
+#   scratch-server  boots an isolated local server; could run but is excluded from
+#                   the portable tier to keep CI free of port/process flakiness.
+#   browser         Playwright specs need a browser (locally they reuse system
+#                   Brave); no browser is provisioned here.
+#   docker-sandbox  needs Orchard's standing Docker sandbox + its exclusive lock.
+#   host-live       needs the user's live service / real `claude` CLI / network /
+#                   a provider key — never runnable off the author's machine.
+#
+# Run the rest locally: `npm test` (pure+scratch-server), `npm test -- --all`
+# (adds browser+docker-sandbox), `npm test -- --include-host-live`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '23'
+          cache: npm
+      - run: npm ci
+      # Pre-commit safety gate: private-token leak-gate + NUL + privacy + typecheck.
+      - run: npm run gate
+      # The portable test tier. Non-zero exit on any suite failure fails the job.
+      - run: npm test -- --tier=pure --timeout=240
+      # Guard: the committed manifest must match what the generator produces,
+      # so a new/removed/retiered suite cannot silently drift out of coverage.
+      - run: npm run test:manifest:check

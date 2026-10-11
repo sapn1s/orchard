@@ -7,6 +7,7 @@
  * twice and drifting — the UI renders all three with one renderer.
  */
 import type { TranscriptBlock, TranscriptMessage } from '../lib/session-history.ts';
+import { deliverText } from '../lib/session-history.ts';
 
 export interface BuildOptions {
   maxTextChars?: number;
@@ -52,10 +53,13 @@ function jsonString(input: unknown): string {
 
 /** Blocks for one entry, or [] when nothing renderable survives the filters. */
 export function blocksOf(e: Record<string, any>, opts: BuildOptions = {}): TranscriptBlock[] {
-  const maxTextChars = Math.max(0, Math.floor(opts.maxTextChars ?? 4000));
+  // BUG-234: the DEFAULT is full fidelity (no cap); a cap applies only where a
+  // caller ASKS (passes maxTextChars). The "text block -> delivered text" rule —
+  // no-cap default; a cap is a plain cut + `truncated`/`fullLength` metadata,
+  // never a markdown repair — is owned by ONE function, session-history.deliverText;
+  // this route (and the live `follow` stream) call it rather than restating it.
   const includeToolResults = opts.includeToolResults === true;
-  const clip = (s: string): { text: string; truncated?: boolean } =>
-    s.length > maxTextChars ? { text: s.slice(0, maxTextChars), truncated: true } : { text: s };
+  const clip = (s: string): { text: string; truncated?: boolean; fullLength?: number } => deliverText(s, opts.maxTextChars);
 
   const blocks: TranscriptBlock[] = [];
   const content = e.message?.content;
@@ -78,10 +82,12 @@ export function blocksOf(e: Record<string, any>, opts: BuildOptions = {}): Trans
       const serialized = jsonString(b.input);
       // A separate, LARGER cap than prose: an input clipped mid-JSON is
       // unparseable and the chip goes blank — worse than the wall of text the
-      // maxTextChars prose cap guards against. 16 KiB holds any realistic Bash
-      // command or file path whole; only pathological inputs (a huge inline
-      // file body in Write) get truncated, and those are marked so.
-      const cap = Math.max(maxTextChars, 16384);
+      // prose cap guards against. tool_use text is JSON the UI JSON.parses, so it
+      // keeps its own larger cap rather than deliverText's — justified NON-use,
+      // BUG-234. 16 KiB holds any
+      // realistic Bash command or file path whole; only pathological inputs (a
+      // huge inline file body in Write) get truncated, and those are marked so.
+      const cap = Math.max(opts.maxTextChars ?? 0, 16384);
       const t: TranscriptBlock = { type: 'tool_use', toolName: String(b.name ?? ''), toolUseId: String(b.id ?? '') };
       if (serialized.length > cap) {
         t.text = serialized.slice(0, cap);

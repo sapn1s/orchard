@@ -98,6 +98,8 @@ interface CacheEntry {
   mtimeMs: number;
   ctimeMs: number;
   meta: TitleMeta;
+  /** BUG-248: resume point for the tag fold; null when the last read was a short read. */
+  tagCp: TagCheckpoint | null;
 }
 const cache = new Map<string, CacheEntry>();
 const sameFile = (e: CacheEntry, st: fs.Stats): boolean =>
@@ -184,6 +186,24 @@ function tagOfRecord(rec: Record<string, unknown>): { tag: string | null } | und
 }
 
 /**
+ * THE per-line tag classifier — the ONE place a complete JSONL line becomes a tag
+ * decision. BUG-248 r5: both the full backward scan (scanTagBackward, whose pick is
+ * `tagOfRecord`) and the delta fold (foldTagRegion) MUST apply the identical
+ * per-line parse (parseRecord) and predicate (tagOfRecord) with NO text-shape
+ * prefilter, so the delta can never be stricter than the full scan. Earlier the
+ * fold carried a `line.indexOf('"type":"tag"')` substring prefilter that skipped a
+ * NON-COMPACT (`{"type": "tag", …}`, with a space) or escaped tag record the full
+ * scanBackward accepts — the SDK writer emits compact JSON today (latent), but the
+ * two paths disagreeing on a record the full scan honours is a real divergence.
+ * Routing the fold through this function (and the backward pick through the same
+ * `tagOfRecord`) keeps them from drifting apart again.
+ */
+function tagOfLine(line: string): { tag: string | null } | undefined {
+  const rec = parseRecord(line);
+  return rec ? tagOfRecord(rec) : undefined;
+}
+
+/**
  * THE backward scanner (FEAT-168): walk complete JSONL lines from EOF toward the
  * start, JSON.parse each, and return the first `pick` that is not undefined —
  * `{ found }`, or `{ found: undefined }` when no line matched. Shared by the pin
@@ -260,6 +280,143 @@ function scanTagBackward(fd: number, size: number): TagScan | null {
   return r ? { tag: r.found ? r.found.tag : null } : null;
 }
 
+/* ------------------------------------------------- BUG-248: resumable tag fold */
+
+/*
+ * BUG-248 — the pin tag as a RESUMABLE FOLD, so the session LIST does not rescan a
+ * whole (usually UNTAGGED) transcript on every live reopen. "Last tag record wins",
+ * so for a pure APPEND the answer is `(last tag in the appended bytes) ?? (the tag
+ * already folded over the prefix)` — a grow scans only the new bytes, not the 286
+ * MiB that did not change. A grow with a changed prefix, a shrink, a same-size
+ * in-place rewrite or a replace is a FULL fresh scanTagBackward (correctness over
+ * speed), exactly the BUG-245 r3 count contract applied to the tag slot.
+ *
+ * It is NOT a bounded-region read: FEAT-168 rounds 1–2 proved a tag can live in the
+ * unsummarised MIDDLE of the file, so the SDK's last-64 KiB reader (and any fixed
+ * window) is wrong. The fold still reads the whole prefix ONCE (cold), then only
+ * the delta; the committed-prefix contract is what makes the delta sound.
+ */
+const TAG_FP_BYTES = 4096;
+const shaHex = (b: Buffer): string => createHash('sha256').update(b).digest('hex');
+function readWin(fd: number, offset: number, len: number): Buffer {
+  if (len <= 0) return Buffer.alloc(0);
+  const b = Buffer.alloc(len);
+  const n = fs.readSync(fd, b, 0, len, offset);
+  return n === len ? b : b.subarray(0, Math.max(0, n));
+}
+
+interface TagCheckpoint {
+  /** File size when this checkpoint was built (only a GROWN file may resume). */
+  size0: number;
+  /** Byte just past the last committed (newline-terminated) line folded. */
+  lastNlPos: number;
+  /** Last tag record value in `[0, lastNlPos)` — null = cleared, or no tag record. */
+  tag: string | null;
+  headLen: number;
+  headHash: string;
+  boundLen: number;
+  boundHash: string;
+}
+
+/** Does the fd still hold the checkpoint's head + boundary bytes (prefix unchanged)? */
+function tagCheckpointHolds(fd: number, cp: TagCheckpoint, size: number): boolean {
+  if (cp.lastNlPos > size || cp.headLen > size) return false;
+  const head = readWin(fd, 0, cp.headLen);
+  if (head.length !== cp.headLen || shaHex(head) !== cp.headHash) return false;
+  const bound = readWin(fd, cp.lastNlPos - cp.boundLen, cp.boundLen);
+  return bound.length === cp.boundLen && shaHex(bound) === cp.boundHash;
+}
+
+/** Byte just past the file's last newline (0 = no committed line yet). null on a short read. */
+function lastNewlinePos(fd: number, size: number): number | null {
+  const CH = 1024 * 1024;
+  let pos = size;
+  while (pos > 0) {
+    const start = Math.max(0, pos - CH);
+    const len = pos - start;
+    const b = Buffer.alloc(len);
+    if (fs.readSync(fd, b, 0, len, start) !== len) return null;
+    const nl = b.lastIndexOf(0x0a);
+    if (nl !== -1) return start + nl + 1;
+    pos = start;
+  }
+  return 0;
+}
+
+/**
+ * Fold tag records in `[startByte, size)` forward. Returns the LAST tag record's
+ * value seen (`undefined` = none in this region, so the caller keeps the prefix's
+ * tag) and the new last-newline position. null on a short read (file shrank).
+ * The trailing bytes after the last newline are an uncommitted line, ignored.
+ */
+function foldTagRegion(fd: number, startByte: number, size: number): { tag: string | null | undefined; lastNlPos: number } | null {
+  const CH = 1024 * 1024;
+  let pos = startByte;
+  let lastNlPos = startByte;
+  let found: { v: string | null } | undefined;
+  let carry: Buffer = Buffer.alloc(0);
+  while (pos < size) {
+    const len = Math.min(CH, size - pos);
+    const buf = Buffer.alloc(len);
+    if (fs.readSync(fd, buf, 0, len, pos) !== len) return null;
+    const chunkStart = pos;
+    const carryLen = carry.length;
+    pos += len;
+    const joined = carryLen ? Buffer.concat([carry, buf]) : buf;
+    let from = 0;
+    let nl: number;
+    let lastNlInJoined = -1;
+    while ((nl = joined.indexOf(0x0a, from)) !== -1) {
+      const line = joined.subarray(from, nl).toString('utf8');
+      // EXACTLY the full scan's per-line parse + predicate (tagOfLine), no
+      // text-shape prefilter, so the delta can never be stricter than the full
+      // scanTagBackward (BUG-248 r5). The fold only ever runs over APPENDED bytes
+      // (a resumed grow), so parsing every appended line costs a handful of
+      // JSON.parse calls per live reopen, not a whole-file re-parse.
+      const t = tagOfLine(line);
+      if (t) found = { v: t.tag };
+      lastNlInJoined = nl;
+      from = nl + 1;
+    }
+    if (lastNlInJoined >= 0) lastNlPos = chunkStart - carryLen + lastNlInJoined + 1;
+    carry = from < joined.length ? Buffer.from(joined.subarray(from)) : Buffer.alloc(0);
+  }
+  return { tag: found ? found.v : undefined, lastNlPos };
+}
+
+/**
+ * Resolve the tag slot and a resume checkpoint. A grown file with an unchanged
+ * prefix folds only its appended bytes onto the prior checkpoint; anything else is
+ * a full scanTagBackward. Returns null on a short read (do not cache).
+ */
+function resolveTag(fd: number, size: number, prior: TagCheckpoint | null): { tag: string | null; cp: TagCheckpoint } | null {
+  let tag: string | null;
+  let lastNlPos: number;
+  if (
+    prior && size > prior.size0 &&
+    prior.lastNlPos <= size &&
+    tagCheckpointHolds(fd, prior, size)
+  ) {
+    const region = foldTagRegion(fd, prior.lastNlPos, size);
+    if (!region) return null;
+    tag = region.tag === undefined ? prior.tag : region.tag;
+    lastNlPos = region.lastNlPos;
+  } else {
+    const t = scanTagBackward(fd, size);
+    if (!t) return null;
+    tag = t.tag;
+    const lnp = lastNewlinePos(fd, size);
+    if (lnp === null) return null;
+    lastNlPos = lnp;
+  }
+  const headLen = Math.min(size, TAG_FP_BYTES);
+  const head = readWin(fd, 0, headLen);
+  const boundLen = Math.min(lastNlPos, TAG_FP_BYTES);
+  const bound = readWin(fd, lastNlPos - boundLen, boundLen);
+  if (head.length !== headLen || bound.length !== boundLen) return null;
+  return { tag, cp: { size0: size, lastNlPos, tag, headLen, headHash: shaHex(head), boundLen, boundHash: shaHex(bound) } };
+}
+
 /** Read the custom-title / ai-title / tag entries out of one session file. */
 export function readTitleMeta(filePath: string): TitleMeta {
   let st: fs.Stats;
@@ -273,6 +430,7 @@ export function readTitleMeta(filePath: string): TitleMeta {
 
   const meta: TitleMeta = { customTitle: null, autoTitle: null, tag: null, pinned: false, sampled: false };
   let cacheable = false;
+  let tagCp: TagCheckpoint | null = null;
   let fd: number | null = null;
   try {
     fd = fs.openSync(filePath, 'r');
@@ -298,10 +456,14 @@ export function readTitleMeta(filePath: string): TitleMeta {
       scanLines(head.toString('utf8'), meta);
       scanLines(tail.toString('utf8'), meta);
     }
-    // The tag slot (pin) — a full fresh scan, never from the sampled window above.
-    const t = scanTagBackward(fd, st.size);
-    if (t) {
-      meta.tag = t.tag;
+    // The tag slot (pin) — BUG-248: a RESUMABLE fold. A grown file with an
+    // unchanged prefix (same dev+ino) folds only its appended bytes onto the prior
+    // checkpoint; anything else is a full backward scan. Never the sampled window.
+    const priorCp = hit && hit.dev === st.dev && hit.ino === st.ino ? hit.tagCp : null;
+    const resolved = resolveTag(fd, st.size, priorCp);
+    if (resolved) {
+      meta.tag = resolved.tag;
+      tagCp = resolved.cp;
       cacheable = true;
     }
   } catch {
@@ -317,7 +479,7 @@ export function readTitleMeta(filePath: string): TitleMeta {
   }
   meta.pinned = meta.tag === PIN_TAG;
   // A short read is never cached: the next read retries rather than serving it.
-  if (cacheable) cache.set(filePath, { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, meta });
+  if (cacheable) cache.set(filePath, { dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs, ctimeMs: st.ctimeMs, meta, tagCp });
   else cache.delete(filePath);
   return meta;
 }
@@ -562,7 +724,24 @@ export interface ResolvedSession {
  * or null when no registered project declares it. Supplied by the server,
  * which holds the registry; this module never parses a dir name to guess.
  */
-export type DeclaredStoreLookup = (encodedDir: string) => { address: string; recordedCwds: string[] } | null;
+export interface DeclaredStore {
+  /** A cwd that encodes back to exactly this store dir — what the SDK is handed. */
+  address: string;
+  /** The cwds a session in this store may legitimately record (checked unless ownsDir). */
+  recordedCwds: string[];
+  /**
+   * BUG-243 — the store dir IS a registered project's own store (its current
+   * hostPath encodes to it), so membership in the dir is authoritative: a
+   * session physically filed here belongs to this project whatever cwd it
+   * recorded, and is addressed by `address`. Set for a project RELOCATED on
+   * disk, whose moved transcripts still record the pre-move cwd — an arbitrary
+   * old path that no recordedCwds list could enumerate. Safe because `address`
+   * still encodes to exactly this dir and does not resolve elsewhere, so the SDK
+   * targets THIS dir (the one the file sits in), never the stale recorded cwd.
+   */
+  ownsDir?: boolean;
+}
+export type DeclaredStoreLookup = (encodedDir: string) => DeclaredStore | null;
 
 /** Every encoded store dir that holds a `<sessionId>.jsonl`. */
 export function findDirsForSession(sessionId: string): string[] {
@@ -615,28 +794,45 @@ export function resolveSession(sessionId: string, encodedDir?: string | null, de
     );
   }
   /*
-   * The SDK maps `dir` -> store directory with the same `[^a-zA-Z0-9] -> -`
-   * encoding we do. If the file's own cwd does not encode back to the directory
-   * it is sitting in — which happens to transcripts COPIED between installs —
-   * then handing that cwd to the SDK would address a DIFFERENT directory. For a
-   * rename that is a silent no-op on the wrong file; for a delete it is data
-   * loss. Refuse.
+   * The SDK maps `dir` -> store directory with ITS OWN encoder (sdkEncodeDir):
+   * plain `[^a-zA-Z0-9] -> -`, then — for a result over 200 chars — truncate and
+   * append a hash. If the file's own cwd does not encode (the SDK's way) back to
+   * the directory it is sitting in — which happens to transcripts COPIED between
+   * installs — then handing that cwd to the SDK would address a DIFFERENT
+   * directory. For a rename that is a silent no-op on the wrong file; for a
+   * delete it is data loss. Refuse. BUG-243: this comparison MUST use the SDK's
+   * real encoder, not the plain one — they diverge for long paths, and the plain
+   * one let a long-hostPath delete remove a same-id FOREIGN session.
    */
-  const expected = hist.encodeCwd(cwd);
+  const expected = hist.sdkEncodeDir(cwd);
   if (expected !== dir) {
     /*
-     * FEAT-155 — the one sanctioned mismatch: a DECLARED container store dir
-     * (`-workspace-<id>`) holding a session that ran at bare `/workspace`. The
-     * SDK is then addressed by the store's declared address, which encodes back
-     * to this very dir — never by the recorded cwd (that would reach the shared
-     * `-workspace`). Only accepted when (a) the owner declares the dir, (b) the
-     * recorded cwd is one that store may hold, (c) the address really encodes to
-     * the dir, and (d) the address does not resolve elsewhere on the host (the
-     * SDK realpaths `dir` before encoding it, so a host symlink there would
-     * redirect the mutation to another store).
+     * The sanctioned mismatches, each declared by the store's owner:
+     *  - FEAT-155: a DECLARED container store dir (`-workspace-<id>`) holding a
+     *    session that ran at bare `/workspace`.
+     *  - BUG-243: a store dir that IS a registered project's own store, holding
+     *    a session filed there by a RELOCATION on disk — the transcript still
+     *    records the pre-move cwd (an arbitrary old path), so its encoding no
+     *    longer matches the dir it now sits in. The declaration sets `ownsDir`:
+     *    dir membership is authoritative, so no recordedCwds list is consulted.
+     * In both the SDK is addressed by the store's declared address, which encodes
+     * back to this very dir — never by the recorded cwd (that would reach a
+     * DIFFERENT directory: the shared `-workspace`, or the project's old path).
+     * Accepted only when (a) the owner declares the dir, (b) either the store
+     * owns the dir (ownsDir) or the recorded cwd is one that store may hold,
+     * (c) the address really encodes — the SDK'S WAY (sdkEncodeDir) — to the dir,
+     * so the SDK cannot land on a truncated/hashed dir different from the one the
+     * file sits in (BUG-243), and (d) the address does not resolve elsewhere on
+     * the host (the SDK realpaths `dir` before encoding it, so a host symlink
+     * there would redirect the mutation to another store).
      */
     const decl = declaredStore?.(dir) ?? null;
-    if (decl && decl.recordedCwds.includes(cwd) && hist.encodeCwd(decl.address) === dir && !resolvesElsewhere(decl.address)) {
+    if (
+      decl &&
+      hist.sdkEncodeDir(decl.address) === dir &&
+      !resolvesElsewhere(decl.address) &&
+      (decl.ownsDir || decl.recordedCwds.includes(cwd))
+    ) {
       return { sessionId, encodedDir: dir, filePath, cwd, sdkDir: decl.address };
     }
     throw new SessionMutationError(

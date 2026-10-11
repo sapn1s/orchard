@@ -244,6 +244,20 @@ removes only what its own scratch server owns, via `scripts/lib/owned-docker.mjs
 never a fixed-name `docker rm -f claude-station-<slug>`. Known limits (host `/tmp`
 writable from the sandbox, lock rendezvous) are under "Docker sandbox detail" below.
 
+**The sandbox is not a confinement.** It is privileged dind with host `/tmp` and the scratch
+roots bound rw, so a container there can change host state (BUG-240). A suite or fixture that
+needs scratch git, or writes it should not be able to write, runs in the **confined runner**
+instead. The runner ships the tree in, runs the command, and returns output only:
+
+    npm run confined -- [--ship ~/projects/methodology] [--out <path>] -- node scripts/verify-x.mjs
+    node <orchard>/scripts/confined-run.mjs -- <cmd>      # from any project's directory
+
+Each run is a container on the sandbox daemon with fixed flags: no host mount (the tree arrives as a
+tar copy), `--cap-drop ALL`, no-new-privileges, `--network none`, read-only rootfs, uid 1000. Git
+inside is unshimmed because nothing it reaches is real (`npm run verify:bug-240-confined`).
+`--ship` copies a host dir in; `--out` copies regular files back to a fresh scratch dir. Suites that
+need the host identity, the claude CLI or the network (feat-108's live half) stay host-run.
+
 **Which Docker a project's lanes use is a declared project setting (BUG-223).** Each
 project declares `settings.laneDocker: 'sandbox' | 'host'` (Settings → Isolation & environment).
 The live server reads it when it launches a direct session or a broker-dispatched lane. It never
@@ -315,6 +329,20 @@ recreates the container under every OTHER session on that project. This is the
 same reason `mounts` is project-scope-only. Direct (non-containerised) projects
 get the per-session override; container projects get an explicit refusal, never
 a silent no-op.
+
+**A container's real `.git` is read-only unless the project holds the PERMANENT
+git-write grant (BUG-244).** `desiredBinds()` overlays every real git dir reachable
+through a rw bind (repo at a bind root or one level below, every alias) with `:ro`;
+P's grant never unlocks registered project Q's repo. Timed/once grants cannot flip a
+bind, so inside a container they pass the host hook and then hit "Read-only file
+system". A `gitguard:` drift reason is **informational only**: `doEnsure` never
+recreates, defers or refuses for it, so the overlay applies only when the container
+is next created anyway (none yet, another drift reason, or Rebuild). Do not make it
+a recreate trigger; that is the BUG-214 class. A *lapsed* overlay (host re-cloned a
+guarded repo under a running container; found by the fixed access probe in
+lifecycle.ts) is `gitguard-lapsed:`, deferred like an image swap. Never start or
+`docker cp` a stopped container whose overlay source is gone (`missingGuardSources`):
+Docker would create it root-owned (BUG-136). `npm run verify:bug-244`.
 
 **The store-isolation guard's rule, as a specification: a comparison failure may
 only ARM the guard, never disarm it.** `assertSessionStoreIsolated` concludes

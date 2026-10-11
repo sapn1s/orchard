@@ -1,0 +1,31 @@
+<!-- OPERATOR-LOCAL OVERLAY — TEMPLATE / EXAMPLE (committed, generic, no personal facts).
+
+     Copy this file to `docs/prompts/OPERATOR.local.md` (same directory, drop the `.example`) and
+     fill it in for YOUR machine. The real file is gitignored (`/docs/prompts/*.local.md`) and is
+     NEVER published — it holds facts specific to the person running this machine.
+
+     Orchard injects the real overlay at launch as the "Operator-local context" section
+     (src/server/templates.ts operatorLocalSection, FEAT-172). If the file is absent, nothing is
+     injected and the public ROUTING.md / Working Agreement are used as-is (generic, de-personalised)
+     — that is the correct state for an outsider who just cloned the repo. Create the overlay only if
+     you want the per-operator facts below to steer your own sessions. -->
+
+## Provider capacity (which side is scarce)
+
+State which provider is ABUNDANT and which is SCARCE for YOU — this depends on your actual
+subscriptions/billing, not on the models, and it is what ROUTING.md's budget rules refer to. For
+example:
+
+- **<provider A> (<plan>): ABUNDANT** — use it for bulk / parallel / high-fan-out / low-stakes work.
+- **<provider B> (<plan>, metered how): SCARCE** — spend it only on decorrelation (plan review,
+  adversarial review of finished work, a contested second opinion), never on volume.
+
+If you have only ONE provider, say so — then the cross-provider routing rules do not apply and you
+route by skill within that provider's ladder.
+
+## Environment
+
+Anything machine-specific an agent should know, e.g.:
+
+- Whether this machine runs more than one OS (dual-boot), and what that implies for paths / memory
+  dir encodings / file ownership.

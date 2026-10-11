@@ -54,7 +54,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { gitWriteBlockEnabled } from '../../../scripts/lib/git-write-policy.mjs';
 import { installGitShim, gitShimMissingRefusal } from '../../../scripts/lib/git-shim.mjs';
-import { getShimSecret } from '../../../scripts/lib/git-shim-secret.mjs';
+import { getShimSecret, getShimBootId } from '../../../scripts/lib/git-shim-secret.mjs';
 import type {
   AgentRuntime,
   ApprovalResult,
@@ -434,7 +434,11 @@ export class CodexRuntime implements AgentRuntime {
           sessionLabel: config.sessionLabel ?? undefined,
           // BUG-173 round 3 — baked into the shim source (not env) and required by
           // /api/git-shim/decide, so the consult cannot be redirected to a forged host.
-          shimAuth: getShimSecret(),
+          // BUG-242 — provider functions so ensure() re-bakes the current per-boot
+          // secret/nonce. (A codex session is never adopted across a restart —
+          // persistedTranscript:false — so there is no reuseDir here.)
+          shimAuth: getShimSecret,
+          shimBootId: getShimBootId,
         })
       : null;
     this.#gitShim = gitShim;

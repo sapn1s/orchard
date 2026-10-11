@@ -853,7 +853,8 @@ async function main() {
           askReasons.push(
             'An orchard-ask declares no `confidence:` line. Every ask must state your confidence in '
             + 'the recommendation (`confidence:` high/med/low) and a `decider:` — the user-held thing '
-            + '(taste/priority/spend/risk/direction) that makes it the user\'s call. Add both, or decide it yourself.',
+            + '(taste/priority/spend/risk/direction) that makes it the user\'s call. Add both, or decide it yourself. '
+            + 'Optionally add `evidence:` — what the recommendation rests on (N and source) and whether it was independently refuted (WA §A).',
           );
         }
       }

@@ -38,6 +38,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { mkdtempScratch } from './lib/scratch.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
@@ -53,14 +54,10 @@ function grade(name, ok, detail = '') {
 
 /* ─────────────────────────────────────────────────────────────── scratch root */
 
-function scratchRoot() {
-  const base = process.env.CLAUDE_STATION_TMPDIR
-    || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'orchard-scratch');
-  const dir = path.join(base, `arch-011-${process.pid}`);
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-const ROOT = scratchRoot();
+// BUG-250: a UNIQUE dir this process created (mkdtempScratch), removed on exit —
+// never a fixed/pid-derived name, so a later same-pid run can't delete a foreign
+// dir a dead earlier run left behind (pid reuse).
+const ROOT = mkdtempScratch('arch-011-');
 process.on('exit', () => { try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* best effort */ } });
 
 function run(args, env = {}) {

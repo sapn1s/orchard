@@ -160,6 +160,11 @@ const state = {
     command,
     args,
     ...(meta && typeof meta === 'object' ? meta : {}),
+    // BUG-242 — echo this session's git-shim dir from the broker's own env so a
+    // restarted server can RE-BAKE the surviving CLI's shim with its new per-boot
+    // secret at adoption. The broker inherits ORCHARD_GIT_SHIM_DIR from the session
+    // env installGitShim built. Absent (null) when the git-write block was off.
+    gitShimDir: process.env.ORCHARD_GIT_SHIM_DIR ?? null,
     startedAt: new Date().toISOString(),
     state: 'starting',
     exitCode: null,

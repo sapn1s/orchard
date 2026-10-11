@@ -32,10 +32,27 @@
  * clean room is a throwaway whose only cost is seconds. Wrong-but-slow is worth
  * a loud line; it is not worth refusing to verify.
  *
- * Deliberately NOT age-swept. A sweeper here would be re-inventing the thing we
- * just escaped, and could delete a directory a still-running process is using
- * (see the escaped-host-scope ticket). Kept rooms are the operator's to remove;
- * every caller prints the path it used.
+ * Deliberately NOT auto-swept (BUG-250). This module resolves and creates the
+ * scratch root; it does NOT walk it and delete things. An autonomous reaper that
+ * decides "is this directory safe to delete right now?" from outside the process
+ * that made the directory has no safe construction in a portable `.mjs` tool: a
+ * liveness-gated, lease-based, mount-confined version of exactly that was built
+ * for BUG-250 and broke FOUR times across two independent clean-room rounds —
+ * deleting a live dir (cross-pid-ns liveness; a classify/delete TOCTOU) and
+ * deleting EXTERNAL data through a same-device bind mount left inside a room. The
+ * two-break design review RESCOPED it away. So the rule is restored and now has a
+ * history behind it:
+ *   - RECURRENCE of leaked clean rooms is stopped at the SOURCE: the creator
+ *     (independent-verify.mjs) registers the EXACT dir it made and removes that
+ *     one known path on its own exit/signal (crash-safe self-cleanup). It deletes
+ *     only a path it created — never a foreign dir under a root.
+ *   - BULK reclaim of the legacy backlog, or of a room leaked by a SIGKILL/
+ *     power-loss that outran the creator's handlers, is an OPERATOR action via the
+ *     read-only report tool `scripts/scratch-report.mjs` (`npm run scratch:report`),
+ *     which deletes nothing — it reports true btrfs-exclusive cost and EMITS the
+ *     `rm` commands for a human to review and run. Nothing here deletes autonomously.
+ * Kept rooms (`--keep-cleanroom`) belong to the operator; every caller prints the
+ * path it used.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';

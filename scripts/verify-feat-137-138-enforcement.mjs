@@ -73,7 +73,7 @@ function runHook(transcriptPath, { stopHookActive = false, sid = 'sess-x' } = {}
 }
 
 async function main() {
-  const { evaluateLength, askOwnershipDefects } = await import(path.join(ROOT, 'scripts', 'lib', 'format-metrics.mjs'));
+  const { evaluateLength, askOwnershipDefects, hasEvidence, asksWithEvidence, buildRecord } = await import(path.join(ROOT, 'scripts', 'lib', 'format-metrics.mjs'));
   const { parseResponseBlocks } = await import(path.join(ROOT, 'public', 'lib', 'response-blocks.js'));
 
   /* ---- [1] BUG-192: length budget is now ADVISORY, never a block ----
@@ -101,6 +101,13 @@ async function main() {
   check('a med-confidence ask with NO decider is BLOCKED (protocol engaged, unowned)', runHook(medNoDecider).blocked, 'blocked');
   const owned = tx('owned', `${DIGEST}\n\`\`\`\`orchard-ask\nBlue or green? I recommend blue.\nconfidence: high\ndecider: taste — the brand palette is your call.\n\`\`\`\``);
   check('a fully-owned ask (confidence + decider) is ALLOWED', !runHook(owned).blocked, 'allowed');
+
+  // WA §A "a recommendation is a claim — vet it like code": the OPTIONAL `evidence:`
+  // field. An ask carrying it is still allowed; and — the property that keeps it
+  // optional — an owned ask WITHOUT it is NOT newly blocked (old replies don't fail).
+  const withEvidence = tx('withev', `${DIGEST}\n\`\`\`\`orchard-ask\nAdopt the new retry policy? I recommend yes.\nconfidence: med\ndecider: risk — it changes failure behaviour in prod.\nevidence: 14 sessions / 9 tickets; refuted cross-provider, 2 counter-cases survived.\n\`\`\`\``);
+  check('an owned ask WITH an evidence: line is ALLOWED', !runHook(withEvidence).blocked, 'allowed');
+  check('an owned ask WITHOUT evidence is STILL ALLOWED (evidence is optional)', !runHook(owned).blocked, 'allowed');
 
   // ROUND 2 — the spec is now injected, so the coupling that kept missing-confidence
   // advisory is satisfied: an ask with NO confidence line is a non-compliant ask and
@@ -140,6 +147,20 @@ async function main() {
   check('askOwnershipDefects: no confidence line → missing-confidence (now ENFORCED, round 2)',
     askOwnershipDefects(parseTx(noConfidence))[0]?.defect === 'missing-confidence',
     JSON.stringify(askOwnershipDefects(parseTx(noConfidence))));
+
+  // WA §A evidence field — recognised the SAME way as decider, but optional.
+  check('hasEvidence: true for a body with an evidence: line',
+    hasEvidence('confidence: med\ndecider: risk — prod.\nevidence: 14 sessions, refuted cross-provider.') === true, 'true');
+  check('hasEvidence: false for a body with no evidence: line',
+    hasEvidence('confidence: high\ndecider: taste — your call.') === false, 'false');
+  check('asksWithEvidence: counts only asks that carry evidence',
+    asksWithEvidence(parseTx(withEvidence)) === 1 && asksWithEvidence(parseTx(owned)) === 0,
+    `${asksWithEvidence(parseTx(withEvidence))}/${asksWithEvidence(parseTx(owned))}`);
+  check('absence of evidence is NEVER a defect (optional contract)',
+    askOwnershipDefects(parseTx(owned)).length === 0, JSON.stringify(askOwnershipDefects(parseTx(owned))));
+  check('buildRecord telemetry: asksWithEvidence surfaces in the record',
+    buildRecord(parseTx(withEvidence)).asksWithEvidence === 1,
+    JSON.stringify(buildRecord(parseTx(withEvidence)).asksWithEvidence));
 
   console.log(`\nTOTAL: ${pass} passed, ${fail} failed`);
   if (failures.length) console.log('failing checks:\n  - ' + failures.join('\n  - '));

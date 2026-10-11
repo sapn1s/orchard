@@ -297,7 +297,7 @@ export function deleteTemplate(id: string): boolean {
  * Path, relative to a project's `hostPath`, that — if present — is injected
  * ALONGSIDE the shared Working Agreement for that project's sessions. This is
  * the routing valve the WA's §L talks about: UNIVERSAL rules belong in the
- * one shared WA (`docs/prompts/WORKING_AGREEMENT.v2.md`, injected for every
+ * one shared WA (`docs/prompts/WORKING_AGREEMENT.v4.md`, injected for every
  * project); PROJECT-SPECIFIC rules belong here instead, so they don't leak
  * into the shared doc and pollute every other project's sessions.
  */
@@ -540,10 +540,66 @@ export function routingSection(opts?: { filePath?: string; maxChars?: number }):
     '',
     `_Auto-injected at launch — the condensed core of ROUTING.md${
       researched ? ` (researched ${researched}; STALE after ~3 months or any major model release — re-verify before trusting)` : ''
-    }. Full evidence + dispatch examples: \`${ROUTING_MIRROR_RELPATH}\`. Dispatch a task to the other ` +
-      'provider with `npm run dispatch -- --provider openai|anthropic … "task"` (claude-station repo)._',
+    }. Full evidence + dispatch examples: \`${ROUTING_MIRROR_RELPATH}\`. If your harness provides a ` +
+      'dispatch runner (Orchard\'s is `npm run dispatch -- --provider openai|anthropic … "task"`), ' +
+      'use it to route a whole task to the other provider._',
     '',
     core,
+  ];
+  let text = parts.join('\n');
+  if (text.length > maxChars) text = `${text.slice(0, maxChars - 1).trimEnd()}…`;
+  return text;
+}
+
+/* ------------------------------------------------- operator-local overlay */
+
+/**
+ * FEAT-172 — the per-OPERATOR, never-published overlay.
+ *
+ * ROUTING.md and the Working Agreement are COMMITTED, public, product-agnostic
+ * mirrors (synced from ~/projects/methodology). Facts that are specific to the
+ * person running this machine — which provider subscription is abundant vs
+ * scarce, that the machine dual-boots two OSes — are load-bearing for a launched
+ * session (the orchestrator routes providers by the capacity fact) but MUST NOT
+ * live in a published file. They live here instead: a gitignored overlay
+ * (`docs/prompts/OPERATOR.local.md`, ignored via `/docs/prompts/*.local.md`) that
+ * this function injects as its own section WHEN PRESENT, and that degrades to
+ * NOTHING when absent — so an outsider's clean checkout injects a generic,
+ * de-personalised routing/WA and no private fact, while this machine's sessions
+ * still get the capacity + environment facts they rely on.
+ *
+ * `OPERATOR.local.md.example` (committed) documents the shape for any operator —
+ * including the owner on a fresh clone, where the gitignored real overlay is
+ * absent until re-created. Same opt-in contract as routingSection()/
+ * localConventionsSection(): absent/empty file → null, no section, no error.
+ *
+ * The body is delivered WHOLE (the operator authored it; it is small and not a
+ * runaway-doc risk) under a generous safety cap, so the capacity fact is never
+ * the part silently truncated — the review hazard that a shared budget-knob cap
+ * on this path would re-introduce.
+ */
+export const OPERATOR_LOCAL_RELPATH = path.join('docs', 'prompts', 'OPERATOR.local.md');
+
+export function operatorLocalSection(opts?: { filePath?: string; maxChars?: number }): string | null {
+  const file = opts?.filePath ?? path.join(projectRoot(), OPERATOR_LOCAL_RELPATH);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  const body = normalizeLineEndings(raw).trim();
+  if (!body) return null;
+  const maxChars = Math.max(200, opts?.maxChars ?? 16384);
+  const parts = [
+    '# Operator-local context (this machine only — never published)',
+    '',
+    '_Auto-injected at launch from a gitignored operator overlay. It supplies the per-operator ' +
+      'facts the public ROUTING.md / Working Agreement deliberately do NOT carry (e.g. which ' +
+      'provider is abundant vs scarce, cross-OS specifics). Treat it as authoritative over any ' +
+      'generic placeholder in those docs._',
+    '',
+    body,
   ];
   let text = parts.join('\n');
   if (text.length > maxChars) text = `${text.slice(0, maxChars - 1).trimEnd()}…`;
@@ -710,6 +766,14 @@ export function composeInstructions(
      */
     routing?: boolean | string;
     /**
+     * FEAT-172 opt-in: fold the operator-local overlay section
+     * (`operatorLocalSection()`) after routing. `true` reads the gitignored
+     * repo overlay (docs/prompts/OPERATOR.local.md); a string is an explicit
+     * file path (the verification seam). Absent/empty file → byte-identical
+     * output. The session launch path (agent-bridge) passes `operatorLocal: true`.
+     */
+    operatorLocal?: boolean | string;
+    /**
      * FEAT-084 opt-in: fold the condensed response-format section
      * (`responseFormatSection()`) LAST, after routing. Shapes:
      *   - `false`/absent → nothing injected, byte-identical output (a project
@@ -836,8 +900,26 @@ export function composeInstructions(
     };
   }
 
+  // FEAT-172: operator-local overlay fold, after routing (WA → project-local →
+  // routing → operator-local → response format). Opt-in per the `operatorLocal`
+  // option doc above; a missing/empty overlay injects nothing and the output
+  // stays byte-identical — the clean-checkout / outsider path.
+  const operatorLocalOpt = opts?.operatorLocal;
+  const operatorLocalSec = operatorLocalOpt
+    ? operatorLocalSection(typeof operatorLocalOpt === 'string' ? { filePath: operatorLocalOpt } : undefined)
+    : null;
+  if (operatorLocalSec) {
+    pushSource('operator-local', 'Operator-local', operatorLocalSec);
+    result = {
+      ...result,
+      systemPrompt: appendToSystemPrompt(result.systemPrompt, operatorLocalSec),
+      appliedIds: [...result.appliedIds, 'operator-local'],
+      mode: result.mode === 'none' ? 'append' : result.mode,
+    };
+  }
+
   // FEAT-084: response-format fold, LAST of all (WA → project-local → routing →
-  // response format). Opt-in per the `responseFormat` option doc above; `false`
+  // operator-local → response format). Opt-in per the `responseFormat` option doc above; `false`
   // or a missing/empty doc injects nothing and the output stays byte-identical.
   const rfOpt = opts?.responseFormat;
   const rfSec = rfOpt

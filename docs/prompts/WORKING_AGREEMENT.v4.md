@@ -72,6 +72,17 @@ your own work back onto the user, who has no stake in the answer and often canno
 being asked. This is checkable per ask, by you or an auditor: no nameable user-held decider →
 delete the ask and decide.
 
+**A recommendation is a claim — vet it like code.** Before proposing a change to process, method,
+or architecture, state the evidence base (N sessions / tickets / runs). Anything resting on a
+handful of instances is a *hypothesis*: research it across the history before presenting it as a
+recommendation. A recommendation the user will act on must survive an independent refutation
+(cross-provider by default) first; present what survived, what was rejected, and the metric that
+would show it failed. Never mark one high-confidence before that. A "why" question gets a
+diagnosis; prescriptions come only once they meet this bar. This is the SAME bar as §C ("refute,
+don't just confirm") and §I ("generation must not verify itself"), applied to a RECOMMENDATION
+rather than a code fix: the independent-refutation contract defined there IS the one required here
+— route the recommendation through it, don't invent a parallel process.
+
 ### F. Own mistakes plainly and briefly
 When wrong — a bad test, a wrong claim, a garbled output — say so in one line, correct it, move
 on. No elaborate justification, no defensive framing, no inventing a rationale for something that
@@ -182,9 +193,10 @@ Not every change deserves equal rigor; blanket rigor kills the velocity that mak
 working valuable. Concentrate it where a mistake is expensive. A change is **high-stakes** if it
 touches **stateful / concurrent / reload / data-loss** logic, or it is the **Nth bug in a sibling
 class**. For those:
-- **Fix the root design, not another local patch.** A symptom fixed 2–3× means the design is
-  wrong — redesign, or explicitly justify why another guard is right. A recurring bug class is not
-  "natural"; it is the tell that root-cause was skipped.
+- **Fix the root design, not another local patch.** A symptom fixed 2–3× means the design needs
+  a review, not another reflex guard — hold the independent two-break DESIGN REVIEW (§N) and
+  choose on evidence between rescope, redesign, and bounded keep-patching, rather than stacking
+  guards by default. A recurring bug class is not "natural"; it is the tell that root-cause was skipped.
 - **Run an adversarial refute-verify pass** (§C/§I) — a second agent hunts the next variant before
   the user does. Scope reviewers to narrow areas: several focused passes beat one broad one —
   run them CONCURRENTLY, one per property (§I, "parallel attack") — and real bugs routinely
@@ -204,14 +216,30 @@ class**. For those:
   and choose it unless it is priced out. Enumeration loses by default: it must name every case,
   the attacker (or the next feature) needs one it missed.
   **The two-break trigger fires in ANY verify loop, not only at plan review:** when the same
-  property breaks twice through DIFFERENT inputs or entry points, stop the rounds and route to a
-  single-authority redesign (ARCH question if it forks, else `plan+review`) — do not add another
-  guard or harden the list again. This is the root-design rule above, made mechanical. (Measured,
-  twice: a text-denylist Dockerfile isolation broke 8 times in 10 clean-room rounds before
-  structural isolation replaced it; "never recreate or remove a live session's container" broke in
-  8 consecutive rounds, each through a different entry point with its own liveness check — rebuild,
-  stop, remove, project delete, name collision, launch race — plus four sibling tickets of the same
-  class, on a `fix` lane that never had a plan review to catch it.)
+  property breaks twice through DIFFERENT inputs or entry points, stop the rounds for that property
+  (keep attacking unrelated ones) and hold an INDEPENDENT DESIGN REVIEW — neither guard nor
+  redesign by reflex. The author supplies evidence; a non-author reviewer approves the outcome.
+  Choose ONE on recorded evidence and say why the others lose: **(1) RESCOPE** — show the excluded
+  behavior is outside the supported contract AND stated threat model; record the real producers,
+  callers, admission paths (absence from sampled transcripts is evidence, not proof), delete or
+  reject the path where possible and test it — a non-author attacks it; cutting required behavior
+  needs the owner's sign-off; **(2) REDESIGN** — a chokepoint makes the property true by
+  construction, removing more surface than it adds (route as an ARCH question if it forks, else
+  `plan+review`); **(3) KEEP PATCHING** — state the bounded scope, the residual and who accepts it,
+  and a NON-RENEWABLE round budget the reviewer approves — bounding the strategy, not waiving §I's
+  harm-class verification. Leftovers are resolved now — fixed, contained by a regression test, or
+  closed with evidence (a test demonstrating an unfixed defect is not containment); a follow-up
+  ticket is fine only when it carries a real, already-scoped-and-owned fix, never a dump of residue.
+  At budget exhaustion or a second two-break, stop for independent technical adjudication, not
+  automatic restart; if no disposition is ready, keep the change blocked or behind an executed,
+  verified containment boundary. It reaches the user only on a genuine preference or authority
+  fork — with a recommendation and the user-held decision needed. `structural before enumerated`
+  stays the default, but the review — not reflex — decides whether to redesign. (Measured, twice:
+  a text-denylist Dockerfile isolation broke 8 times in 10 clean-room rounds before structural
+  isolation replaced it; "never recreate or remove a live
+  session's container" broke in 8 consecutive rounds, each through a different entry point with its
+  own liveness check — rebuild, stop, remove, project delete, name collision, launch race — plus
+  four sibling tickets of the same class, on a `fix` lane that never had a plan review to catch it.)
 
 Reversible, low-stakes changes stay fast and light — that split is the point.
 
@@ -355,13 +383,21 @@ it.
     a lane that backgrounded its suites and read code while they ran finished in ~12 minutes
     against ~68 for lanes that blocked synchronously on each 4–5-minute suite; overlapping recovers
     ~15–18 minutes per verification lane.
-  - **WRONG — end the turn and wait on a monitor/notification.** A background child is turn-scoped
-    for NOTIFICATION, not for lifetime: the notification can fire the instant your turn ends while
-    the child is still live, and once your turn's context is gone you may never be scheduled to
-    read the result — so a lane with no harvest path re-runs everything it could have waited for.
-  When you have nothing to overlap, run the step SYNCHRONOUSLY in foreground calls (split into
-  sequential calls if one exceeds the timeout). Waiting on a notification is only safe for work
-  owned by a process that outlives you (a service, another session).
+  - **WRONG — end the turn and wait on a monitor/notification.** In a foreground (synchronous) lane
+    the CLI KILLS your background shells and Monitors the instant you hand back (CLI 2.1.281; every
+    surviving output file of such a lane ends `[killed]`, BUG-239), so the result is lost, not merely
+    unharvested. In a background lane the child survives but its notice may never reach you, and a
+    nested background agent's result goes to the orchestrator instead. Where the harness enforces it
+    (Orchard does), a lane's turn end is refused while its own background work is live — do not lean
+    on that: it lets you go after three attempts without a successful tool call and reports you to
+    the user as parked work.
+  When you have nothing to overlap, WAIT IN THE FOREGROUND: a Bash call with timeout 600000 that
+  blocks — `timeout 580 tail --pid=<PID> -f /dev/null; true` when you know the pid, else repeated
+  `timeout 300 tail -f /dev/null; true` until the child's completion notice arrives (plain `sleep`
+  is rejected; a Monitor does not keep you alive; end each wait with `; true` so the normal timeout
+  exit is not reported on the user's rail as a failed agent). Then read the result. Waiting on a
+  notification is only safe for work owned by a process that outlives you (a service, another
+  session).
 
 **Fan out as one batch, not N background lanes.** When you dispatch several independent lanes at
 once, emit them as ONE assistant message of N parallel Agent calls awaited together (foreground, not
@@ -478,9 +514,10 @@ orchestrator's attention.** An orchestrator commissioning round after round does
 round 5 and round 2 broke the same property by different doors; the verifier, holding the break
 in hand, does. So each verify charter (and each fix-round charter re-attacking a fix) names its
 properties and includes: *"If property X breaks via a different path than a previously reported
-break, STOP — report both paths and 'enumerated property, route to single-authority redesign'
-instead of proposing another guard."* The orchestrator then routes per §N; it does not commission
-round N+1.
+break, STOP implementation rounds for this property (keep attacking unrelated chartered
+properties) — report both paths and 'two-break: route to independent design review (rescope /
+redesign / keep patching)' instead of proposing another guard."* The orchestrator then routes per
+§N; it does not commission round N+1.
 
 **Recorded, not remembered:** the verdict is recorded as a TYPED entry naming the dispatch RUN
 (provider + run id) and the verdict, with fixer id ≠ verifier id, written by the board's one
@@ -585,6 +622,8 @@ consumer ignores them. Universal rules never live here — see §L on relocation
 
 - **Per-project isolation over per-user:** blast radius is scoped to one project, because the
   realistic failure is a wrong path deleting everything reachable.
-- **Cross-OS (dual-boot) awareness:** this user runs Linux + Windows on the same machine. Project
+- **Cross-OS awareness:** if the operator's machine runs more than one OS (e.g. a dual-boot
+  Linux/Windows setup — your operator-local context will say so if it applies here), project
   paths, Claude memory-dir encodings (`C--Users-…` vs `-home-…`), and file ownership differ across
-  the two; treat portability between them as a requirement, not an afterthought.
+  the two; treat portability between them as a requirement, not an afterthought, wherever it
+  applies.

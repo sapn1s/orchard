@@ -492,9 +492,10 @@ provenance is unclear, ask rather than pull.
 
 - **Per-project isolation over per-user**: blast radius is scoped to one project,
   because the realistic failure is a wrong path deleting everything reachable.
-- **Cross-OS (dual-boot) awareness**: this user runs Linux + Windows on the same
-  machine. Project paths, Claude memory-dir encodings (`C--Users-…` vs `-home-…`),
-  and file ownership differ across the two; treat portability between them as a
-  requirement, not an afterthought.
+- **Cross-OS awareness**: if the operator's machine runs more than one OS (e.g. a
+  dual-boot Linux/Windows setup — your operator-local context will say so if it
+  applies here), project paths, Claude memory-dir encodings (`C--Users-…` vs
+  `-home-…`), and file ownership differ across the two; treat portability between
+  them as a requirement, not an afterthought, wherever it applies.
 - **Don't auto-chain**: finish the asked task, then stop and report. Autonomy
   applies *within* the task, not to inventing the next one.

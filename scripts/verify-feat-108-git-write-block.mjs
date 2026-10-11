@@ -111,13 +111,16 @@ ok('DRIVEN: a non-Bash tool passes', hookDecision({ tool_name: 'Read', tool_inpu
 ok('DRIVEN: a read Bash passes', hookDecision({ tool_name: 'Bash', tool_input: { command: 'git status' } }).deny !== true);
 
 const runtimeSrc = fs.readFileSync(path.join(REPO, 'src/server/runtime/claude-runtime.ts'), 'utf8');
-// FEAT-108 round 2 — the runtime now wires the GRANT-AWARE decision
-// (evaluateGitWrite, which calls decideGitWrite internally), evaluated per call.
-ok('PIN: the runtime wires the git-write decision for Bash', /evaluateGitWrite\(/.test(runtimeSrc));
+// FEAT-108 round 2 — the runtime wires the GRANT-AWARE decision (decideGitWrite is called
+// internally), evaluated per call. BUG-249 r2 — that call is now the ASYNC composition,
+// AWAITED (the leak-gate scan + repo fingerprint run off the event loop). Anti-tamper:
+// require `await evaluateGitWriteAsync(` — dropping the await, the call, or reverting to a
+// bare/sync name all fail this PIN.
+ok('PIN: the runtime wires the (async, awaited) git-write decision for Bash', /await\s+evaluateGitWriteAsync\(/.test(runtimeSrc));
 ok('PIN: the runtime runs the git block BEFORE the profile decide()',
   // FEAT-152 moved the profile decide() into evaluateOrchestratorProfileHook (defined
   // above the class), so pin the CALLBACK's call site of it, not the helper body.
-  runtimeSrc.indexOf('evaluateGitWrite(') < runtimeSrc.indexOf('return evaluateOrchestratorProfileHook(i, orchBypass)'));
+  runtimeSrc.indexOf('evaluateGitWriteAsync(') < runtimeSrc.indexOf('return evaluateOrchestratorProfileHook(i, orchBypass)'));
 ok('PIN: the git block is not gated behind config.orchestratorProfile',
   /gitBlockOn \|\| config\.orchestratorProfile/.test(runtimeSrc));
 

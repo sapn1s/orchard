@@ -28,7 +28,7 @@ export interface GitShimDecision {
 export declare function decideGitShim(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { ignoreEnvHatch?: boolean },
+  opts?: { ignoreEnvHatch?: boolean; realGit?: string | null; shadowRoot?: string | null },
 ): GitShimDecision;
 
 /** Bounded timeout (ms) on the host grant consult — the shim must never hang. */
@@ -41,7 +41,7 @@ export declare const HOST_GRANT_TIMEOUT_MS: number;
 export declare function askHostGrant(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string },
 ): Promise<GitShimDecision>;
 
 /**
@@ -51,14 +51,14 @@ export declare function askHostGrant(
 export declare function resolveGitShim(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; ignoreEnvHatch?: boolean },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string; ignoreEnvHatch?: boolean; realGit?: string | null; shadowRoot?: string | null },
 ): Promise<GitShimDecision>;
 
 /** The loud refusal a shimmed subprocess prints before exiting non-zero. */
 export declare function gitShimRefusal(offender: string): string;
 
 /** Called BY the generated shim executable: decide, then exec real git or deny. */
-export declare function runGitShim(argv: string[], opts?: { realGit?: string; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string }): Promise<void>;
+export declare function runGitShim(argv: string[], opts?: { realGit?: string; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string }): Promise<void>;
 
 /**
  * Install the shim onto a COPY of `env` and return the new env. Pure: it does
@@ -66,10 +66,15 @@ export declare function runGitShim(argv: string[], opts?: { realGit?: string; ho
  * the subprocess it launches, scoping the shim to that session. `grantKey` +
  * `hostUrl` (BUG-173) let the shim consult the host grant authority at call time;
  * without them a classified write fails closed with no network call.
+ *
+ * BUG-242 — `shimAuth`/`shimBootId` may be a PROVIDER FUNCTION, resolved at the
+ * moment the file is (re)written so it always carries the current per-boot value.
+ * `reuseDir` re-bakes an EXISTING shim dir in place (the restart-adopt path) rather
+ * than minting a new one.
  */
 export declare function installGitShim(
   env?: Record<string, string | undefined>,
-  opts?: { baseDir?: string; grantKey?: string; hostUrl?: string; sessionLabel?: string; shimAuth?: string; windowKey?: string },
+  opts?: { baseDir?: string; grantKey?: string; hostUrl?: string; sessionLabel?: string; shimAuth?: string | (() => string); windowKey?: string; shimBootId?: string | (() => string); reuseDir?: string; shadowRoot?: string | null },
 ): { env: Record<string, string>; shimDir: string; realGit: string; ensure: () => GitShimEnsure };
 
 /**

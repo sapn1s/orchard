@@ -31,6 +31,11 @@
  *     off the admission path, Orchard runs `claude --version` AND hashes the
  *     binary. Until that proof completes admission fails closed ("runtime check
  *     pending"); if it fails it fails closed forever ("runtime check failed …").
+ *     A proof that was merely CUT SHORT (a timeout or an outside kill) is not a
+ *     failure: admission refuses and the proof is re-run (BUG-247 round 4). A
+ *     re-run's result counts only if it is attributed to the binary the boot
+ *     identified (LOAD_IDENTITY); what some other file on disk did never becomes
+ *     the loaded binary's verdict (BUG-247 round 6, `proveLoadedAgain`).
  *     A binary that merely EXISTS with its exec bit set but does not RUN never
  *     becomes a good baseline (the round-3 break: a broken boot binary was
  *     captured as a coherent {sdk,plat,size} baseline and sessions admitted).
@@ -143,7 +148,8 @@ export function bundledCliVersion(opts: { force?: boolean } = {}): string | null
   const bin = bundledCliPath();
   if (bin) {
     try {
-      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 5_000 });
+      // SIGKILL: a TERM-ignoring child would hold this handler past its timeout (BUG-247).
+      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 5_000, killSignal: 'SIGKILL' });
       const raw = (String(r.stdout ?? '') + String(r.stderr ?? '')).trim();
       const m = raw.match(/(\d+\.\d+\.\d+[-.\w]*)/);
       if (!r.error && r.status === 0 && m) value = m[1]!;
@@ -227,42 +233,138 @@ function readJsonVersion(p: string): string | null {
  */
 function hashFile(p: string): Promise<string | null> {
   return new Promise((resolve) => {
-    try {
-      const h = createHash('sha256');
-      const s = fs.createReadStream(p);
-      s.on('error', () => resolve(null));
-      s.on('data', (d) => h.update(d as Buffer));
-      s.on('end', () => resolve(h.digest('hex')));
-    } catch {
-      resolve(null);
-    }
+    // BUG-247 r7: never open a path whose READ can block — a blocked open() cannot be
+    // cancelled and leaks a libuv pool thread, so a FIFO/socket at the binary path would
+    // wedge single-flight and, across throttled retries, exhaust the pool and stall every
+    // async fs/crypto op server-wide. Open NON-BLOCKING, fstat the fd, and hash ONLY a
+    // regular file (resolve null otherwise, failing closed). Checking the fd — not an
+    // lstat of the path — also closes the lstat→open rename race.
+    fs.open(p, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK, (openErr, fd) => {
+      if (openErr || fd == null) { resolve(null); return; }
+      fs.fstat(fd, (statErr, st) => {
+        if (statErr || !st.isFile()) { fs.close(fd, () => resolve(null)); return; }
+        const h = createHash('sha256');
+        const s = fs.createReadStream('', { fd, autoClose: true });
+        s.on('error', () => resolve(null));
+        s.on('data', (d) => h.update(d as Buffer));
+        s.on('end', () => resolve(h.digest('hex')));
+      });
+    });
   });
 }
 
 /**
- * Async `claude --version` PROOF — resolves the reported version iff the binary
- * actually RUNS (exit 0 + a parseable version), else null. Off any hot path
- * (boot only); a binary that exists with its exec bit but does not run resolves
- * null and never becomes a baseline (round-4 defect #1).
+ * The outcome of one `claude --version` PROOF, CLASSIFIED (BUG-247 round 4):
+ *   - `ok`           — exit 0 and a parseable version: the binary RUNS.
+ *   - `failed`       — DEFINITIVE evidence the binary does not run: it is missing or
+ *                      not executable (ENOENT/EACCES/…), exits non-zero, crashes on
+ *                      its own (SIGSEGV/SIGABRT/…), or exits 0 without a version.
+ *                      A boot check that sees this latches 'failed' (FEAT-151
+ *                      round-4 defect #1: a non-running binary never becomes a
+ *                      baseline).
+ *   - `inconclusive` — the probe was cut short, which says nothing about the
+ *                      binary: our own timeout fired, the child was killed from
+ *                      outside (SIGKILL/SIGTERM/…), or the spawn hit a transient
+ *                      resource error (EAGAIN/ENOMEM). NEVER latched.
+ *
+ * WHY a timeout is inconclusive. Three rounds tried to make the timeout signal
+ * exact and each left a path where a timer fired before an already-exited healthy
+ * child was reaped: r1 an in-loop deadline under a 5.0-5.5 s main-loop block, r2 a
+ * grace timer under a 250-700 ms follow-on block, r3 spawnSync's own private-loop
+ * timer when the whole process is frozen by the OS (SIGSTOP, cgroup throttle, VM
+ * steal) for longer than the timeout. A parent-observed deadline cannot be exact
+ * when the parent can be descheduled, so its consequence is made non-permanent
+ * instead: the state goes to 'inconclusive' and is re-probed.
  */
-function probeVersionAsync(bin: string, timeoutMs = 5_000): Promise<string | null> {
+type ProbeOutcome =
+  | { kind: 'ok'; version: string }
+  | { kind: 'failed'; reason: string }
+  | { kind: 'inconclusive'; reason: string };
+
+const PROBE_TIMEOUT_MS = 5_000;
+/** Signals that mean "something stopped the probe", not "the binary crashed". */
+const EXTERNAL_KILL_SIGNALS = new Set(['SIGKILL', 'SIGTERM', 'SIGINT', 'SIGHUP', 'SIGQUIT']);
+/** spawn errors that are about the machine's momentary state, not the binary. */
+const TRANSIENT_SPAWN_ERRORS = new Set(['EAGAIN', 'ENOMEM', 'EMFILE', 'ENFILE']);
+
+function classifyProbe(
+  r: { error?: Error | null; status: number | null; signal: NodeJS.Signals | null; out: string },
+  timedOut: boolean,
+  timeoutMs: number,
+): ProbeOutcome {
+  const code = (r.error as NodeJS.ErrnoException | null | undefined)?.code;
+  if (timedOut || code === 'ETIMEDOUT') {
+    return { kind: 'inconclusive', reason: `\`--version\` timed out after ${Math.round(timeoutMs / 1000)} s (the machine may have been busy, or Orchard was paused)` };
+  }
+  if (r.error) {
+    if (code && TRANSIENT_SPAWN_ERRORS.has(code)) return { kind: 'inconclusive', reason: `\`--version\` could not be started (${code})` };
+    return { kind: 'failed', reason: `it could not be run: ${code ?? r.error.message}` };
+  }
+  if (r.signal) {
+    if (EXTERNAL_KILL_SIGNALS.has(r.signal)) return { kind: 'inconclusive', reason: `\`--version\` was stopped by ${r.signal} before it finished` };
+    return { kind: 'failed', reason: `it crashed with ${r.signal}` };
+  }
+  if (r.status !== 0) return { kind: 'failed', reason: `exit status ${r.status}` };
+  const m = r.out.match(/(\d+\.\d+\.\d+[-.\w]*)/);
+  if (!m) return { kind: 'failed', reason: 'no version in its output' };
+  return { kind: 'ok', version: m[1]! };
+}
+
+/**
+ * The BOOT proof — SYNCHRONOUS (spawnSync, child-relative timeout, round 3). It
+ * runs during module load, on its own private libuv loop, so main-loop starvation
+ * during startup cannot reach it; on a normal cold boot it completes in tens of
+ * ms. An OS-level freeze of the whole process can still make its timer fire late,
+ * which is why a timeout here is only `inconclusive` (see ProbeOutcome).
+ * `SIGKILL`, not the default SIGTERM: a TERM-ignoring child would otherwise hold
+ * spawnSync past its timeout (measured: 30 s).
+ */
+function probeVersionSync(bin: string, timeoutMs = PROBE_TIMEOUT_MS): ProbeOutcome {
+  try {
+    const r = spawnSync(bin, ['--version'], {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      killSignal: 'SIGKILL',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return classifyProbe(
+      { error: r.error ?? null, status: r.status, signal: r.signal, out: String(r.stdout ?? '') + String(r.stderr ?? '') },
+      false,
+      timeoutMs,
+    );
+  } catch (err) {
+    return classifyProbe({ error: err as Error, status: null, signal: null, out: '' }, false, timeoutMs);
+  }
+}
+
+/**
+ * The RE-probe (after an inconclusive boot proof) — ASYNC, so a binary that hangs
+ * on every retry never freezes the serving event loop for the timeout. Its in-loop
+ * timer can still fire before a healthy child's `close` is seen (the r1/r2 race);
+ * that is harmless now, because the timer only ever yields `inconclusive` and the
+ * next retry runs again. Every `ok`/`failed` verdict comes from the child's own
+ * exit, never from a timer.
+ */
+function probeVersionAsync(bin: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProbeOutcome> {
   return new Promise((resolve) => {
     let done = false;
-    const finish = (v: string | null) => { if (!done) { done = true; resolve(v); } };
+    const finish = (o: ProbeOutcome) => { if (!done) { done = true; resolve(o); } };
     try {
       const c = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
       let out = '';
-      const to = setTimeout(() => { try { c.kill('SIGKILL'); } catch { /* */ } finish(null); }, timeoutMs);
+      const to = setTimeout(() => {
+        try { c.kill('SIGKILL'); } catch { /* */ }
+        finish(classifyProbe({ error: null, status: null, signal: null, out }, true, timeoutMs));
+      }, timeoutMs);
       c.stdout.on('data', (d) => { out += String(d); });
       c.stderr.on('data', (d) => { out += String(d); });
-      c.on('error', () => { clearTimeout(to); finish(null); });
-      c.on('close', (code) => {
+      c.on('error', (err) => { clearTimeout(to); finish(classifyProbe({ error: err, status: null, signal: null, out }, false, timeoutMs)); });
+      c.on('close', (code, signal) => {
         clearTimeout(to);
-        const m = out.match(/(\d+\.\d+\.\d+[-.\w]*)/);
-        finish(code === 0 && m ? m[1]! : null);
+        finish(classifyProbe({ error: null, status: code, signal, out }, false, timeoutMs));
       });
-    } catch {
-      finish(null);
+    } catch (err) {
+      finish(classifyProbe({ error: err as Error, status: null, signal: null, out: '' }, false, timeoutMs));
     }
   });
 }
@@ -365,70 +467,283 @@ export function currentRuntimeIdentity(): RuntimeIdentity | null {
 export const BOOT_SDK_VERSION: string | null = installedSdkVersion();
 
 /**
- * The runtime facts captured ONCE at boot, but ONLY after PROVING the bundled
- * binary actually RUNS (round-4 defect #1). Both are live ESM bindings, `null`
- * until the async boot check completes:
+ * The runtime facts captured ONCE, but ONLY after PROVING the bundled binary
+ * actually RUNS (round-4 defect #1). Both are live ESM bindings, `null` until a
+ * proof succeeds:
  *   - `BOOT_CLI_VERSION` — the `--version` the bundled binary reports (display).
  *   - `BOOT_IDENTITY`     — {sdkVersion, platVersion, sha256 hash}, the fixed
  *     comparison point. Set ONLY when `--version` ran AND the hash + both
  *     versions were read; a binary that exists with its exec bit but does not
  *     run leaves `bootState='failed'` and BOOT_IDENTITY null forever (a failed
  *     check is never promoted to a baseline).
+ *
+ * `bootState` (BUG-247 round 4):
+ *   - 'pending'      — the boot proof has not finished.
+ *   - 'ok'           — proven; BOOT_IDENTITY / BOOT_CLI_VERSION are set. Final.
+ *   - 'failed'       — DEFINITIVE evidence the runtime does not run (or a coherent
+ *                      baseline could not be captured). Final until restart.
+ *   - 'inconclusive' — the proof was cut short (a timeout or an outside kill), which
+ *                      says nothing about the binary. Admission still refuses (fail
+ *                      closed per attempt), but the proof is RE-RUN: on the next
+ *                      admission (at most once per REPROBE_MIN_GAP_MS, single-flight)
+ *                      and once automatically after the server listens
+ *                      (`scheduleRuntimeRecheck`). A re-proof changes the state ONLY
+ *                      if its result is ATTRIBUTED to the load-time identity
+ *                      (`LOAD_IDENTITY`, BUG-247 round 6, see `proveLoadedAgain`); it
+ *                      fills in the version, never the baseline.
  */
 export let BOOT_CLI_VERSION: string | null = null;
 export let BOOT_IDENTITY: RuntimeIdentity | null = null;
-let bootState: 'pending' | 'ok' | 'failed' = 'pending';
+type BootState = 'pending' | 'ok' | 'failed' | 'inconclusive';
+let bootState: BootState = 'pending';
 let bootFailReason: string | null = null;
+let inconclusiveReason: string | null = null;
 
-const bootChecked: Promise<void> = (async () => {
+/**
+ * A proof outcome that is ATTRIBUTED (BUG-247 round 6): `ok` and `inconclusive` carry
+ * the identity of the one file the probe ran against (bound by stat before the probe
+ * and after the hash); `failed` is only produced for a probe whose file did not move.
+ */
+type ProofOutcome =
+  | { kind: 'ok'; cli: string; identity: RuntimeIdentity; binKey: string }
+  | { kind: 'failed'; reason: string }
+  | { kind: 'inconclusive'; reason: string; identity: RuntimeIdentity; binKey: string };
+
+/**
+ * Identify the binary at `bin` as it was at `stBefore`: content hash, then BOTH
+ * package versions, bound to that one file (round-5 TOCTOU fix) — the stat after the
+ * hash must equal `stBefore`, else the hash belongs to a different file ('moved').
+ * When ESTABLISHING the load-time identity (`requireLoadedSdk`, the boot sequence)
+ * the SDK version must be the one this process loaded (BOOT_SDK_VERSION), else it is
+ * definitive. A re-proof passes false: it is judged only by equality with
+ * LOAD_IDENTITY (which carries that SDK version).
+ */
+async function identifyBinary(
+  bin: string,
+  stBefore: fs.Stats,
+  when: string,
+  requireLoadedSdk: boolean,
+): Promise<{ kind: 'ok'; identity: RuntimeIdentity; binKey: string } | { kind: 'moved' } | { kind: 'failed'; reason: string }> {
+  const hash = await hashFile(bin);
+  let stAfter: fs.Stats | null = null;
+  try { stAfter = fs.statSync(bin); } catch { stAfter = null; }
+  // Moved/deleted is checked FIRST: a hash that failed because the file went away
+  // belongs to no file at all, so the caller re-stats instead of latching it.
+  if (stAfter == null || statKey(stBefore) !== statKey(stAfter)) return { kind: 'moved' };
+  if (hash == null) return { kind: 'failed', reason: `the bundled runtime binary could not be hashed ${when}` };
+  const platVersion = readJsonVersion(path.join(path.dirname(bin), 'package.json'));
+  const sdkVersion = installedSdkVersion();
+  if (platVersion == null || sdkVersion == null) return { kind: 'failed', reason: `the runtime package metadata could not be read ${when}` };
+  if (requireLoadedSdk && sdkVersion !== BOOT_SDK_VERSION) {
+    return { kind: 'failed', reason: `the runtime on disk (SDK ${sdkVersion}) is not the SDK Orchard loaded (${BOOT_SDK_VERSION ?? 'unreadable'})` };
+  }
+  return { kind: 'ok', identity: { sdkVersion, platVersion, hash }, binKey: statKey(stAfter) };
+}
+
+function sameIdentity(a: RuntimeIdentity, b: RuntimeIdentity): boolean {
+  return a.sdkVersion === b.sdkVersion && a.platVersion === b.platVersion && a.hash === b.hash;
+}
+
+/**
+ * The BOOT proof: run `--version`, then attribute the result to the file it ran
+ * against. ONE rule for every probe outcome (BUG-247 round 6), so a cut-short boot
+ * pins the load-time identity exactly where a successful one does:
+ *   - `statKey` is taken BEFORE the spawn and must be unchanged AFTER the hash
+ *     (`identifyBinary`), so probe, hash and versions all describe one file (FEAT-151
+ *     round-5 TOCTOU: a binary swapped between proof and hash must never let a
+ *     non-running binary's hash become the baseline);
+ *   - ok and inconclusive are identified identically; a file that moved means the
+ *     probe ran against something no longer there → discard, prove the new file;
+ *   - a definitive failure is latched only if the file did not move during the probe
+ *     (a failure of a file that has since been replaced says nothing about the file
+ *     now on disk → discard, prove the new file).
+ * Bounded at MAX_TRIES, then fail CLOSED ("kept changing"), as before. A successful
+ * boot and a cut-short boot therefore settle on the SAME file; only the latter has to
+ * wait for a re-proof to fill in the version (round 5's `during` divergence: the
+ * inconclusive path had pinned the pre-spawn stat and failed closed where the success
+ * path re-proved the swapped-in file).
+ */
+async function proveRuntime(probe: (bin: string) => ProbeOutcome | Promise<ProbeOutcome>, when: string): Promise<ProofOutcome> {
   const bin = bundledPlatformBin();
-  if (!bin) { bootState = 'failed'; bootFailReason = 'the bundled runtime binary is missing or not executable'; return; }
-  // The run-proof, the content hash and the trusted identity must all bind to ONE
-  // file (round-5 TOCTOU fix). A binary swapped between the proof (T1) and the hash
-  // (T2) would otherwise let a NON-running binary's hash become the baseline: the
-  // proof runs the good (unlinked) inode while the hash reads the swapped path. So
-  // capture `statKey` before the proof and again after the hash and require it
-  // unchanged; if it moved, the two straddled different files — retry a bounded
-  // number of times, then fail CLOSED. statKey (dev:ino:size:mtime:ctime) moves for
-  // both swap classes: a rename-over changes the inode, an in-place write changes
-  // mtime/ctime (ctime cannot be forged with utimes).
+  if (!bin) return { kind: 'failed', reason: 'the bundled runtime binary is missing or not executable' };
   const MAX_TRIES = 3;
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     let stBefore: fs.Stats;
-    try { stBefore = fs.statSync(bin); } catch { bootState = 'failed'; bootFailReason = 'the bundled runtime binary could not be read'; return; }
-    // (1) PROVE it runs — the whole point of round 4's defect #1 fix.
-    const cliVer = await probeVersionAsync(bin);
-    if (cliVer == null) { bootState = 'failed'; bootFailReason = 'the bundled runtime did not run `--version` at boot'; return; }
-    // (2) content hash (once, at boot).
-    const hash = await hashFile(bin);
-    if (hash == null) { bootState = 'failed'; bootFailReason = 'the bundled runtime binary could not be hashed at boot'; return; }
-    // (2b) prove the proof and the hash saw the SAME file: re-stat and require the
-    // full identity unchanged across probe+hash. If it moved, discard and retry.
-    let stAfter: fs.Stats | null = null;
-    try { stAfter = fs.statSync(bin); } catch { stAfter = null; }
-    if (stAfter == null || statKey(stBefore) !== statKey(stAfter)) {
-      continue; // the binary changed under the boot check — the proof and the hash
-                // may be different files; do NOT trust this hash. Retry.
+    try { stBefore = fs.statSync(bin); } catch { return { kind: 'failed', reason: 'the bundled runtime binary could not be read' }; }
+    // The call is made synchronously here, so the boot proof still completes during import.
+    const p = await probe(bin);
+    if (p.kind === 'failed') {
+      let stNow: fs.Stats | null = null;
+      try { stNow = fs.statSync(bin); } catch { stNow = null; }
+      if (stNow == null || statKey(stNow) !== statKey(stBefore)) continue; // not attributable
+      // Keep the long-standing wording for the "did not run" family.
+      return { kind: 'failed', reason: `the bundled runtime did not run \`--version\` ${when} (${p.reason})` };
     }
-    // (3) versions.
-    const platVersion = readJsonVersion(path.join(path.dirname(bin), 'package.json'));
-    const sdkVersion = installedSdkVersion();
-    if (platVersion == null || sdkVersion == null) { bootState = 'failed'; bootFailReason = 'the runtime package metadata could not be read at boot'; return; }
-    BOOT_CLI_VERSION = cliVer;
-    hashCache = { binKey: statKey(stAfter), hash }; // seed so the first admission is a pure cache hit
-    BOOT_IDENTITY = { sdkVersion, platVersion, hash };
-    bootState = 'ok';
-    return;
+    const id = await identifyBinary(bin, stBefore, when, true);
+    if (id.kind === 'moved') continue;
+    if (id.kind === 'failed') return id;
+    return p.kind === 'ok'
+      ? { kind: 'ok', cli: p.version, identity: id.identity, binKey: id.binKey }
+      : { kind: 'inconclusive', reason: p.reason, identity: id.identity, binKey: id.binKey };
   }
   // The binary kept changing across the check — never captured a coherent, proven
   // baseline. Fail closed (permanent until restart), not a torn baseline.
-  bootState = 'failed';
-  bootFailReason = 'the bundled runtime binary kept changing during the boot check';
+  return { kind: 'failed', reason: `the bundled runtime binary kept changing during the ${when === 'at boot' ? 'boot ' : ''}check` };
+}
+
+/** Minimum gap between the END of one proof and the start of the next re-proof. */
+const REPROBE_MIN_GAP_MS = 10_000;
+let lastProofEndedAt = 0;
+let reproofInFlight: Promise<void> | null = null;
+
+/**
+ * The identity of the binary this process LOADED (BUG-247 round 5; ARCH-010: the
+ * "what was loaded" fact is owned by the boot proof and written exactly once, by
+ * `bootChecked`): the identity `proveRuntime` attributed its final probe to, whether
+ * that probe succeeded or was cut short. A failed boot leaves it null (no baseline).
+ * Nothing else writes it; a re-proof is judged against it.
+ */
+let LOAD_IDENTITY: RuntimeIdentity | null = null;
+
+function applyProof(o: ProofOutcome): void {
+  if (bootState === 'ok' || bootState === 'failed') return; // final states never move
+  if (o.kind === 'ok') {
+    BOOT_CLI_VERSION = o.cli;
+    hashCache = { binKey: o.binKey, hash: o.identity.hash }; // seed so the first admission is a pure cache hit
+    identityCache = null;
+    BOOT_IDENTITY = LOAD_IDENTITY;
+    inconclusiveReason = null;
+    bootState = 'ok';
+  } else if (o.kind === 'failed') {
+    bootFailReason = o.reason;
+    inconclusiveReason = null;
+    bootState = 'failed';
+  } else {
+    inconclusiveReason = o.reason;
+    bootState = 'inconclusive';
+  }
+}
+
+const bootChecked: Promise<void> = (async () => {
+  const o = await proveRuntime(probeVersionSync, 'at boot');
+  if (o.kind !== 'failed') {
+    LOAD_IDENTITY = o.identity;
+    hashCache = { binKey: o.binKey, hash: o.identity.hash }; // admission compares disk to it while unproven
+    identityCache = null;
+  }
+  applyProof(o);
+  lastProofEndedAt = Date.now(); // the re-proof throttle counts from here
 })();
 
-/** Resolves once the one-time boot runtime check has completed (ok or failed).
- *  Callers/tests await this before treating a "pending" block as meaningful. */
+/** Resolves once the one-time BOOT proof has completed (ok, failed or
+ *  inconclusive). Callers/tests await this before treating a "pending" block as
+ *  meaningful; an inconclusive result is then re-proved, see `whenRuntimeRechecked`. */
 export function whenRuntimeChecked(): Promise<void> { return bootChecked; }
+
+/* --- re-proof after an inconclusive boot proof (BUG-247 rounds 4-6) --- */
+
+/**
+ * THE attribution chokepoint for a re-proof (BUG-247 round 6). Returns a result only
+ * if it is attributable to LOAD_IDENTITY; null means "this attempt says nothing about
+ * the loaded binary" and the state stays 'inconclusive' (retryable).
+ *   1. PRE  — the file on disk must BE the loaded binary (content hash + both package
+ *             versions equal LOAD_IDENTITY). If it is not (swapped, updated, deleted,
+ *             unreadable), it is not run and nothing is latched: admission
+ *             already refuses it with the success path's own restart block
+ *             (`diskVsBaseline(LOAD_IDENTITY)`), and a rollback is proved and admitted.
+ *   2. probe that file.
+ *   3. POST — its statKey must be unchanged since PRE (nothing swapped between PRE
+ *             and the end of the probe) and the package versions must still be
+ *             LOAD_IDENTITY's. The spawn is by path, so a file swapped in between PRE
+ *             and the spawn CAN run; POST guarantees its result is discarded, i.e. this
+ *             protects what is ACCEPTED, not what is executed.
+ * Round 4 re-baselined whatever the retry proved; round 5 compared only an ok result to
+ * LOAD_IDENTITY, so a transient swapped-in exit-1 binary latched 'failed' for the
+ * healthy loaded runtime and a rollback could not undo it. Here no result reaches
+ * `applyProof` unless it describes the loaded file.
+ */
+async function proveLoadedAgain(): Promise<ProofOutcome | null> {
+  const load = LOAD_IDENTITY;
+  const bin = bundledPlatformBin();
+  if (load == null || bin == null) return null;
+  const versionsNow = (): RuntimeIdentity | null => {
+    const platVersion = readJsonVersion(path.join(path.dirname(bin), 'package.json'));
+    const sdkVersion = installedSdkVersion();
+    return platVersion != null && sdkVersion != null ? { sdkVersion, platVersion, hash: load.hash } : null;
+  };
+  let st: fs.Stats;
+  try { st = fs.statSync(bin); } catch { return null; }
+  const key = statKey(st);
+  let pre: RuntimeIdentity | null;
+  if (hashCache && hashCache.binKey === key) {
+    pre = hashCache.hash === load.hash ? versionsNow() : null;
+  } else {
+    const id = await identifyBinary(bin, st, 'when re-checked', false);
+    pre = id.kind === 'ok' ? id.identity : null;
+  }
+  if (pre == null || !sameIdentity(pre, load)) return null; // not the loaded binary: never run it
+  const p = await probeVersionAsync(bin);
+  let after: fs.Stats;
+  try { after = fs.statSync(bin); } catch { return null; }
+  const post = versionsNow();
+  if (statKey(after) !== key || post == null || !sameIdentity(post, load)) return null; // swapped during the probe
+  if (p.kind === 'ok') return { kind: 'ok', cli: p.version, identity: load, binKey: key };
+  if (p.kind === 'failed') return { kind: 'failed', reason: `the bundled runtime did not run \`--version\` when re-checked (${p.reason})` };
+  return { kind: 'inconclusive', reason: p.reason, identity: load, binKey: key };
+}
+
+/**
+ * Re-run the proof iff the state is 'inconclusive'. Single-flight: concurrent
+ * callers share one probe. Throttled: unless `force`, a new probe starts only when
+ * REPROBE_MIN_GAP_MS has passed since the previous proof ended, so a hung binary
+ * costs one async 5 s probe per ≥10 s however many admissions arrive. Skipped while
+ * an update is installing (half-replaced files prove nothing).
+ */
+function reproveRuntime(opts: { force?: boolean } = {}): Promise<void> {
+  if (reproofInFlight) return reproofInFlight;
+  if (bootState !== 'inconclusive' || updateInProgress) return Promise.resolve();
+  if (!opts.force && Date.now() - lastProofEndedAt < REPROBE_MIN_GAP_MS) return Promise.resolve();
+  reproofInFlight = (async () => {
+    try {
+      const o = await proveLoadedAgain();
+      if (o) applyProof(o);
+    } catch {
+      /* stays inconclusive; the next attempt re-runs */
+    } finally {
+      lastProofEndedAt = Date.now();
+      reproofInFlight = null;
+    }
+  })();
+  return reproofInFlight;
+}
+
+/** Resolves when any in-flight re-proof has finished (immediately if none). */
+export async function whenRuntimeRechecked(): Promise<void> {
+  await bootChecked;
+  if (reproofInFlight) await reproofInFlight;
+}
+
+/**
+ * The one automatic re-proof after the server is listening, so a cold boot whose
+ * proof was cut short heals before anyone clicks. Called from the listen callback.
+ * Bypasses the throttle (it is the scheduled retry), not single-flight. No-op
+ * unless the boot proof ended inconclusive.
+ */
+export function scheduleRuntimeRecheck(delayMs = 3_000): void {
+  void bootChecked.then(() => {
+    if (bootState !== 'inconclusive') return;
+    const t = setTimeout(() => { void reproveRuntime({ force: true }); }, delayMs);
+    t.unref?.();
+  });
+}
+
+/** The runtime check's state as its owner states it, for GET /api/runtime. */
+export function runtimeCheckState(): { state: BootState; reason: string | null } {
+  return {
+    state: bootState,
+    reason: bootState === 'failed' ? bootFailReason : bootState === 'inconclusive' ? inconclusiveReason : null,
+  };
+}
 
 /** Resolves once the current identity has settled — no binary-content hash in
  *  flight. Used after a binary change (an update/revert) to await the async
@@ -476,7 +791,33 @@ function admission(): Admission {
   if (bootState === 'failed') {
     return { blocked: true, reason: `runtime check failed: ${bootFailReason ?? 'the bundled runtime did not pass its boot check'}. ${RESTART_TAIL}` };
   }
-  const boot = BOOT_IDENTITY!; // non-null once bootState === 'ok'
+  if (bootState === 'inconclusive') {
+    // BUG-247 round 4: a cut-short proof is not evidence against the binary. Refuse
+    // THIS attempt (fail closed) and re-prove (throttled, single-flight); a success
+    // admits the next attempt with no restart.
+    void reproveRuntime();
+    // BUG-247 round 5: the binary this process LOADED is known even though its proof
+    // was cut short. A disk that no longer matches it is refused exactly as a
+    // successful boot refuses it (restart required), from the same comparison.
+    if (LOAD_IDENTITY) {
+      const swapped = diskVsBaseline(LOAD_IDENTITY);
+      if (swapped && !swapped.transient) return swapped;
+    }
+    return {
+      blocked: true,
+      transient: true,
+      reason: `runtime check could not finish: ${inconclusiveReason ?? 'the bundled runtime check was cut short'}. This says nothing against the runtime; Orchard is retrying the check automatically, and new host sessions can start once it passes.`,
+    };
+  }
+  return diskVsBaseline(BOOT_IDENTITY!) ?? { blocked: false, reason: null }; // non-null once bootState === 'ok'
+}
+
+/**
+ * The current on-disk identity compared to a baseline, as admission states it: null
+ * when they match, else the block. Used for the proven boot identity and, while a
+ * cut-short boot proof is being retried, for the load-time identity (BUG-247 r5).
+ */
+function diskVsBaseline(boot: RuntimeIdentity): Admission | null {
   const cur = readCurrentIdentity();
   if (cur.checking) {
     return { blocked: true, transient: true, reason: 'checking runtime — the bundled runtime changed on disk and is being re-verified; new host sessions can start once the check completes.' };
@@ -502,7 +843,7 @@ function admission(): Admission {
         RESTART_TAIL,
     };
   }
-  return { blocked: false, reason: null };
+  return null;
 }
 
 /**
@@ -627,6 +968,10 @@ export interface HostRuntimeInfo {
   restartPending: boolean;
   updateInProgress: boolean;
   bin: string | null;
+  /** BUG-247 round 4: the runtime check's own state, so a reader can tell a
+   *  retrying check ('inconclusive') from a definitive failure or an update that
+   *  needs a restart — `restartPending` alone is "new host sessions are blocked". */
+  runtimeCheck: { state: 'pending' | 'ok' | 'failed' | 'inconclusive'; reason: string | null };
 }
 
 export function hostRuntimeInfo(): HostRuntimeInfo {
@@ -645,6 +990,7 @@ export function hostRuntimeInfo(): HostRuntimeInfo {
     restartPending: isRuntimeUpdatePending(),
     updateInProgress,
     bin: bundledCliPath(),
+    runtimeCheck: runtimeCheckState(),
   };
 }
 

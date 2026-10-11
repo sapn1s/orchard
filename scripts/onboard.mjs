@@ -18,7 +18,7 @@
  *      NOT want a durable board in (the tickets skill is explicit that
  *      scratch/ad-hoc-prompt dirs should not get one).
  *   2. Drops a thin project CLAUDE.md that points at the shared Working
- *      Agreement (today `docs/prompts/WORKING_AGREEMENT.v2.md` in the
+ *      Agreement (today `docs/prompts/WORKING_AGREEMENT.v4.md` in the
  *      claude-station repo — FEAT-039 gap #2 is hoisting that to a
  *      project-neutral location; until that lands this pointer is an
  *      absolute path into claude-station, which is the honest state of the
@@ -98,6 +98,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import url from 'node:url';
+import crypto from 'node:crypto';
 // BUG-146 — the scaffold text is owned in one place so the injector's
 // "is this an unedited stub?" test can never drift from what we emit here.
 import { CONVENTIONS_STUB } from './lib/conventions-stub.mjs';
@@ -289,12 +290,12 @@ function bugsTemplateArch() {
  * target into an operator-specific absolute location anyway (`../../home/<user>/…`).
  */
 function waPointerPath() {
-  const waAbs = path.join(repoRoot, 'docs', 'prompts', 'WORKING_AGREEMENT.v3.md');
+  const waAbs = path.join(repoRoot, 'docs', 'prompts', 'WORKING_AGREEMENT.v4.md');
   const home = os.homedir();
   if (home && (waAbs === home || waAbs.startsWith(home + path.sep))) {
     return '~/' + path.relative(home, waAbs).split(path.sep).join('/');
   }
-  return '$ORCHARD_HOME/docs/prompts/WORKING_AGREEMENT.v3.md';
+  return '$ORCHARD_HOME/docs/prompts/WORKING_AGREEMENT.v4.md';
 }
 
 function claudeMd() {
@@ -406,7 +407,10 @@ function appendWaPointer(targetDir) {
   if (r.data.includes(WA_POINTER_MARKER)) {
     return { path: rel, label: 'CLAUDE.md (--wa-pointer)', status: 'exists (pointer already present)' };
   }
-  fs.appendFileSync(file, waPointerSection());
+  // Routed through the write chokepoint (BUG-227 r5): read + concat + atomic
+  // rename, never an in-place append — so a CLAUDE.md that hardlinks the source
+  // repo (or symlinks outside the target) is not written through.
+  atomicWriteFileSync(file, r.data + waPointerSection());
   return { path: rel, label: 'CLAUDE.md (--wa-pointer)', status: 'appended' };
 }
 
@@ -414,14 +418,56 @@ function appendWaPointer(targetDir) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// BUG-227 r5 — the ONE write chokepoint. EVERY byte onboard writes into a
+// target goes through here. It writes to a fresh temp file in the SAME
+// directory as `file`, then renames it over `file`. rename(2) replaces the
+// directory ENTRY: it never opens or writes into whatever inode currently sits
+// at `file`, and it does not follow a symlink located AT `file`. So:
+//   - a target file that HARDLINKS a file in the source repo (a `cp -al` copy)
+//     is replaced by a NEW inode; the source inode — still named in the source
+//     repo — is left byte-untouched. (Plain `writeFileSync` truncated-in-place
+//     that shared inode and corrupted the source repo: the r5 break, adv
+//     83ee76ee53ae.)
+//   - a target file that is a SYMLINK pointing OUTSIDE the target (including a
+//     DANGLING link that an `existsSync`-gated create would otherwise follow out
+//     of the target) is REPLACED IN PLACE by a regular file inside the target;
+//     the write never lands on the link's outside destination.
+// This makes the property "onboarding target T modifies nothing outside T" true
+// BY CONSTRUCTION for the benign-concurrency threat model (a `cp -al`/reflink
+// copy; a symlinked output file). We choose REPLACE-the-link over refuse-the-
+// link because the same rename that fixes the hardlink case neutralises the
+// symlink escape for free, leaves the target fully onboarded, and never
+// clobbers user data (an EXISTING regular file onboard would modify is read
+// through readTargetFile, which already lstat-refuses a symlink, so only a
+// never-user-data path — a fresh create, or a diverged Orchard-owned copy — is
+// ever replaced here). A symlinked ANCESTOR DIRECTORY of `file` is the cleanup
+// section's documented ADVERSARIAL boundary (see its THREAT MODEL note) and is
+// deliberately out of scope. `file`'s directory is created first so temp and
+// target share it → the rename is same-filesystem (atomic, never EXDEV).
+// ---------------------------------------------------------------------------
+function atomicWriteFileSync(file, data) {
+  // BUG-227-ATOMIC-WRITE-START
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.onboard-tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch { /* temp may never have been created; nothing to clean */ }
+    throw e;
+  }
+  // BUG-227-ATOMIC-WRITE-END
+}
+
 /** Write `content` to `file` only if it does not already exist. Returns a report line. */
 function ensureFile(file, content, label) {
   const rel = path.relative(process.cwd(), file);
   if (fs.existsSync(file)) {
     return { path: rel, label, status: 'exists' };
   }
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, content);
+  atomicWriteFileSync(file, content);
   return { path: rel, label, status: 'created' };
 }
 
@@ -526,8 +572,7 @@ function scaffoldRoot(targetDir, { noBoard = false } = {}) {
     // block or be migrated (round-6/7 hang); fall back to the stub and note it.
     const r = readTargetFile(legacyConv);
     const legacyText = r.ok ? r.data : '';
-    fs.mkdirSync(orchardDir, { recursive: true });
-    fs.writeFileSync(orchardConv, legacyText || CONVENTIONS_STUB);
+    atomicWriteFileSync(orchardConv, legacyText || CONVENTIONS_STUB);
     const migratedUser = legacyText && legacyText !== CONVENTIONS_STUB;
     const status = !r.ok
       ? `created (from stub — legacy docs/CONVENTIONS.md not migrated: ${r.reason})`
@@ -700,17 +745,17 @@ function copyOrchardFile(entry, { forceBoardTool = false } = {}) {
     const identical = dr.data.equals(srcBytes);
     if (identical) return { path: path.relative(process.cwd(), dest), label, status: 'exists (identical)' };
     if (resync) {
-      fs.writeFileSync(dest, srcBytes);
+      atomicWriteFileSync(dest, srcBytes);
       return { path: path.relative(process.cwd(), dest), label, status: 're-synced (stale hook replaced)' };
     }
     if (forceBoardTool) {
-      fs.writeFileSync(dest, srcBytes);
+      atomicWriteFileSync(dest, srcBytes);
       return { path: path.relative(process.cwd(), dest), label, status: 're-synced (--force-board-tool)' };
     }
     return { path: path.relative(process.cwd(), dest), label, status: 'exists (diverged — rerun with --force-board-tool to re-sync)' };
   }
   fs.mkdirSync(path.dirname(dest), { recursive: true });
-  fs.writeFileSync(dest, srcBytes);
+  atomicWriteFileSync(dest, srcBytes);
   return { path: path.relative(process.cwd(), dest), label, status: 'created' };
 }
 
@@ -749,7 +794,7 @@ function installClaudeHook(targetDir) {
       $schema: 'https://json-schema.org/draft/2020-12/schema',
       hooks: { Stop: [STOP_HOOK_ENTRY] },
     };
-    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
+    atomicWriteFileSync(file, JSON.stringify(settings, null, 2) + "\n");
     return { path: rel, label, status: 'created (Stop hook)' };
   }
 
@@ -788,14 +833,14 @@ function installClaudeHook(targetDir) {
     }
   }
   if (repointed) {
-    fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
+    atomicWriteFileSync(file, JSON.stringify(settings, null, 2) + "\n");
     return { path: rel, label, status: 're-pointed (legacy Stop-hook command → .orchard/, existing config preserved)' };
   }
   // Merge: add our Stop entry, disturbing nothing else.
   settings.hooks = (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks)) ? settings.hooks : {};
   settings.hooks.Stop = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
   settings.hooks.Stop.push(STOP_HOOK_ENTRY);
-  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + '\n');
+  atomicWriteFileSync(file, JSON.stringify(settings, null, 2) + "\n");
   return { path: rel, label, status: 'merged (Stop hook added, existing config preserved)' };
 }
 
@@ -835,7 +880,7 @@ function wireNpmScripts(targetDir) {
           kept.push(key); // user-customized → never overwrite
         }
       }
-      if (changed) fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+      if (changed) atomicWriteFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
       const parts = [];
       if (added.length) parts.push(`added [${added.join(', ')}]`);
       if (repointed.length) parts.push(`re-pointed to .orchard/ [${repointed.join(', ')}]`);
@@ -854,7 +899,7 @@ function wireNpmScripts(targetDir) {
       private: true,
       scripts: { ...WIRED_NPM_SCRIPTS },
     };
-    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+    atomicWriteFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
     reports.push({
       path: path.relative(process.cwd(), pkgPath),
       label: 'package.json',
@@ -1386,6 +1431,7 @@ function parseArgs(argv) {
   let deployContext = false;
   let verifyOnly = false;
   let migrate = false;
+  let allowSelfTarget = false;
   for (const a of argv) {
     if (a === '--no-board') noBoard = true;
     else if (a === '--force-board-tool') forceBoardTool = true;
@@ -1394,10 +1440,63 @@ function parseArgs(argv) {
     else if (a === '--deploy-context') deployContext = true;
     else if (a === '--verify-only') verifyOnly = true;
     else if (a === '--migrate') migrate = true;
+    else if (a === '--allow-self-target') allowSelfTarget = true;
     else if (a.startsWith('--dir=')) targetDir = a.slice('--dir='.length);
     else if (!a.startsWith('--')) targetDir = a;
   }
-  return { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly, migrate };
+  return { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly, migrate, allowSelfTarget };
+}
+
+// BUG-227 — onboard() must never write into its OWN source repo. The 2026-09-30
+// incident: a suite sweep ran onboard against the live checkout (empty/cwd-defaulted
+// target, or a ROOT/repoRoot mix-up), which created `.orchard/` in the repo root,
+// repointed 5 package.json script values and the `.claude/settings.json` Stop hook —
+// every session in the repo then ran a gate and a hook pointed at an untracked
+// `.orchard/`. This guard refuses STRUCTURALLY (by identity, not a name denylist):
+// the resolved target is the SAME DIRECTORY as this tool's own `repoRoot`, OR the
+// target already carries THIS running `scripts/onboard.mjs` as its own file. Returns
+// a human-readable reason string when the target is the source repo, else null.
+//
+// BUG-227 r3 (REDESIGN): identity is compared by (st_dev, st_ino) — the directory's
+// inode — NOT by realpath string. A realpath-string compare (the r2 guard) missed a
+// bind-mount alias: `mount --bind <repo> <alias>` gives <alias> a DIFFERENT realpath
+// but the SAME underlying inode (verified unprivileged on this machine via
+// `unshare -rm` + `mount --bind`: dev/ino identical, realpath differs). Inode
+// identity collapses EVERY accidental alias form — symlink, bind mount, relative
+// path, trailing slash, `.` — into ONE check, which is exactly the "a test/agent
+// reached the real repo through some alias" threat model. (A `.git`-common-dir
+// compare was considered and rejected: it would over-refuse a legitimate reflink/
+// separate-worktree COPY of the repo, which is a valid onboarding target.)
+export function selfTargetReason(resolved) {
+  // BUG-227-SELFTARGET-REASON-START
+  // ONE identity check: is the target the SAME DIRECTORY as this tool's own
+  // source repo root, by (st_dev, st_ino)? A directory's inode is stable under
+  // every accidental aliasing — an empty/cwd-defaulted target, a ROOT/repoRoot
+  // mix-up, a relative path, `.`, a trailing slash, a symlink, and a bind mount
+  // (verified: `unshare -rm` + `mount --bind` gives the alias the SAME dev/ino
+  // while realpath differs). So directory identity collapses the whole family of
+  // "named the real repo some other way" into one comparison, which is exactly
+  // the contract: refuse the source REPO.
+  //
+  // BUG-227 r4: a SECOND signal (does target/scripts/onboard.mjs share this
+  // running file's inode?) was removed. It caught nothing the directory check
+  // does not — when the target IS the repo (or a dir-alias of it) this check
+  // already fires — and its ONLY unique effect was a FALSE refusal of a DISTINCT
+  // directory that merely shares the onboard.mjs inode, e.g. a `cp -al` hardlink
+  // copy (openai run 01a126ef). Such a copy is not the source repo, so it is
+  // outside this contract; nothing in this repo's tooling makes hardlink copies
+  // (onboard + both verify suites use `cp -a --reflink=auto` → DISTINCT inodes),
+  // and the file check was not even a sound guard against write-through-hardlink
+  // corruption because it inspected onboard.mjs, which onboard() never writes.
+  const ident = (p) => { try { const s = fs.statSync(p); return `${s.dev}:${s.ino}`; } catch { return null; } };
+  const repoIdent = ident(repoRoot);
+  const targetIdent = ident(resolved);
+  if (repoIdent && targetIdent && repoIdent === targetIdent) {
+    return `target (${resolved}) is this tool's own source repo root ${repoRoot} ` +
+      `(same directory inode ${targetIdent})`;
+  }
+  return null;
+  // BUG-227-SELFTARGET-REASON-END
 }
 
 /** FEAT-106 opt-in: `.orchard/DEPLOY-CONTEXT.md`, migrating a filled-in legacy copy. */
@@ -1409,8 +1508,7 @@ function scaffoldDeployContext(targetDir) {
   if (fs.existsSync(legacyDc)) {
     const r = readTargetFile(legacyDc); // guarded — never block on a FIFO/dir
     const text = r.ok ? r.data : '';
-    fs.mkdirSync(path.dirname(orchardDc), { recursive: true });
-    fs.writeFileSync(orchardDc, text || DEPLOY_CONTEXT_STUB);
+    atomicWriteFileSync(orchardDc, text || DEPLOY_CONTEXT_STUB);
     const migratedUser = text && text !== DEPLOY_CONTEXT_STUB;
     const status = !r.ok
       ? `created (from stub — legacy docs/DEPLOY-CONTEXT.md not migrated: ${r.reason})`
@@ -1420,13 +1518,33 @@ function scaffoldDeployContext(targetDir) {
   return ensureFile(orchardDc, DEPLOY_CONTEXT_STUB, label);
 }
 
-export function onboard(targetDir, { noBoard = false, forceBoardTool = false, forceHook = false, waPointer = false, deployContext = false, migrate = false } = {}) {
+export function onboard(targetDir, { noBoard = false, forceBoardTool = false, forceHook = false, waPointer = false, deployContext = false, migrate = false, allowSelfTarget = false } = {}) {
   if (!targetDir) throw new Error('onboard: target dir is required');
   void forceHook; // accepted as a no-op alias (the Stop hook is always resynced)
   const resolved = path.resolve(targetDir);
   if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
     throw new Error(`onboard: not a directory: ${resolved}`);
   }
+
+  // BUG-227-GUARD-START — refuse to onboard this tool's own source repo. This
+  // runs BEFORE any write, so a refusal leaves the repo byte-identical. The
+  // --allow-self-target escape hatch is loud and must be passed explicitly.
+  // BUG-227 r3: the override is a STRICT boolean (`=== true`), not a truthiness
+  // test. The r2 guard used `if (!allowSelfTarget)`, so a programmatic caller
+  // passing a non-boolean truthy value — e.g. the string 'false' — negated to
+  // false and SKIPPED the guard, writing into the real repo. Only a literal
+  // `true` disables the refusal now.
+  if (allowSelfTarget !== true) {
+    const reason = selfTargetReason(resolved);
+    if (reason) {
+      throw new Error(
+        `onboard: refusing to onboard this tool's own source repo — ${reason}. ` +
+          `Nothing was written. Onboarding targets a DIFFERENT project; to override ` +
+          `(you almost never want this) pass --allow-self-target.`
+      );
+    }
+  }
+  // BUG-227-GUARD-END
 
   const reports = [];
   if (!noBoard) {
@@ -1477,9 +1595,9 @@ function reportTag(status) {
 }
 
 function main() {
-  const { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly, migrate } = parseArgs(process.argv.slice(2));
+  const { targetDir, noBoard, forceBoardTool, forceHook, waPointer, deployContext, verifyOnly, migrate, allowSelfTarget } = parseArgs(process.argv.slice(2));
   if (!targetDir) {
-    console.error('usage: node scripts/onboard.mjs <target-dir> [--no-board] [--force-board-tool] [--force-hook] [--wa-pointer] [--deploy-context] [--migrate] [--verify-only]');
+    console.error('usage: node scripts/onboard.mjs <target-dir> [--no-board] [--force-board-tool] [--force-hook] [--wa-pointer] [--deploy-context] [--migrate] [--verify-only] [--allow-self-target]');
     process.exit(2);
   }
 
@@ -1506,7 +1624,7 @@ function main() {
 
   let reports;
   try {
-    reports = onboard(targetDir, { noBoard, forceBoardTool, forceHook, waPointer, deployContext, migrate });
+    reports = onboard(targetDir, { noBoard, forceBoardTool, forceHook, waPointer, deployContext, migrate, allowSelfTarget });
   } catch (e) {
     console.error(`onboard: ${e.message}`);
     process.exit(1);

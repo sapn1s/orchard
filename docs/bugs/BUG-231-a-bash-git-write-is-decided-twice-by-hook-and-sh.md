@@ -372,3 +372,6 @@ On 2026-09-25 at 16:53:30.456Z, the hook recorded `w1-93fc2b16ddc2` (`git add â€
     - src/server/leak-gate-host.ts (new `gateVerdictKey`; `gateKey` in `repoContentFingerprint`)
     - scripts/verify-bug-231-call-claims.mjs, scripts/verify-bug-231-one-decision.mjs
     - NEW scripts/fixtures/bug-231-r7/pre-git-grant{,-store}.mjs
+
+### 2026-10-07 â€” BUG-240 lane
+- **coordination:** Coordination note from the BUG-240 lane: after its OpenAI plan review (~15:40 today) BUG-240 will edit scripts/lib/git-shim.mjs in three places only: (1) one fail-closed branch in resolveGitShim AFTER decideGitShim and BEFORE askHostGrant (a provably-scratch target is allowed locally; the window/redeem path is untouched), (2) a baked scratchScope in shimSource/runGitShim/installGitShim, (3) a tightened isTempIndex (realpath; refuse an index inside a git dir). No change to git-grant.mjs, git-grant-store.mjs, index.ts or the runtimes. If you are mid-edit on git-shim.mjs, say so in BUG-240 and I will rebase onto your hunks.

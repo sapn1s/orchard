@@ -50,27 +50,68 @@ export const PUBLISHING_SUBCOMMANDS = new Set(['commit', 'push']);
  * state (the invariant BUG-173 exists to restore).
  * Returns { allow, offender?, reason?, granted?, gateFailed?, record? }.
  */
-export function evaluateGitWrite({
+export function evaluateGitWrite(opts = {}) {
+  const p = prepareEvaluate(opts);
+  if (p.done) return p.done;
+  // BUG-249 r2 — the repo fingerprint is captured HERE (pre- and post-gate), not inside
+  // prepare/finish, so the async composition below can AWAIT it off the event loop. On the
+  // sync path the reader is sync and this is identical to the old inline capture.
+  const preFp = p.wantsFp ? safeFingerprint(opts.repoFingerprint) : null;
+  const gate = p.needsGate ? runGateSync(opts.runLeakGate, p.gateScope) : null;
+  const postFp = p.wantsFp ? safeFingerprint(opts.repoFingerprint) : null;
+  return p.finish(gate, preFp, postFp);
+}
+
+/**
+ * BUG-249 — the async composition used by the RUNTIME (PreToolUse hook + /api/git-shim
+ * decide), so the ~4.6s leak-gate scan no longer blocks the single-process event loop.
+ * It is the SAME decision as the synchronous `evaluateGitWrite` above: `prepareEvaluate`
+ * does every store mutation synchronously BEFORE the gate (the once-grant RESERVE that
+ * blocks a concurrent claim is taken here, unchanged), `finish` does every store mutation
+ * synchronously AFTER it (the spend + record, atomic — no await between check and spend).
+ * The ONLY difference is that the gate is AWAITED, so the event loop runs other work
+ * while it scans. The injected runner may be sync or async — `runGateAsync` awaits inside
+ * its own error boundary (a sync throw, a rejected promise, a missing runner all fail
+ * closed). The reserved handle lives in the `finish` closure across the await.
+ */
+export async function evaluateGitWriteAsync(opts = {}) {
+  const p = prepareEvaluate(opts);
+  if (p.done) return p.done;
+  // BUG-249 r2 — AWAIT the pre/post fingerprint too (not just the gate). The reserve that
+  // blocks a concurrent claim already happened synchronously in `prepareEvaluate`; the
+  // fingerprint + gate then run off-loop, and the atomic spend is back in sync `finish`.
+  const preFp = p.wantsFp ? await safeFingerprintAsync(opts.repoFingerprint) : null;
+  const gate = p.needsGate ? await runGateAsync(opts.runLeakGate, p.gateScope) : null;
+  const postFp = p.wantsFp ? await safeFingerprintAsync(opts.repoFingerprint) : null;
+  return p.finish(gate, preFp, postFp);
+}
+
+/**
+ * The SYNCHRONOUS head of a git-write decision: everything up to (and NOT including) the
+ * leak gate. Returns `{ done: <result> }` for an early decision (allow a read / env hatch;
+ * deny no-grant / re-entrant id / failed openCallClaim), or `{ needsGate, gateScope,
+ * finish(gate) }` whose `finish` is the synchronous TAIL run after the gate. All grant/
+ * call-store mutations happen in these two synchronous halves; the gate sits between them.
+ */
+function prepareEvaluate({
   command,
   argv,
   projectKey = null,
   env = process.env,
   now = Date.now(),
-  runLeakGate = null,
   sessionLabel = null,
   window = null,
-  repoFingerprint = null,
 } = {}) {
   let offender;
   if (Array.isArray(argv)) {
     // Invocation-layer (shim) path: argv is already isolated git args. Mirror the
     // command-string path's early allows exactly — env hatch open, or a read.
-    if (!gitWriteBlockEnabled(env)) return { allow: true }; // the launch-time env hatch
+    if (!gitWriteBlockEnabled(env)) return { done: { allow: true } }; // the launch-time env hatch
     offender = offenderForGit(['git', ...argv]); // the ONE classifier (ARCH-008)
-    if (!offender) return { allow: true }; // a read / info form
+    if (!offender) return { done: { allow: true } }; // a read / info form
   } else {
     const base = decideGitWrite(typeof command === 'string' ? command : '', env);
-    if (base.allow) return { allow: true }; // a read, or the env hatch is open
+    if (base.allow) return { done: { allow: true } }; // a read, or the env hatch is open
     offender = base.offender ?? 'git';
   }
   const sub = offender.startsWith('git ') ? offender.slice(4) : offender;
@@ -85,7 +126,16 @@ export function evaluateGitWrite({
   const subs = Array.isArray(argv)
     ? [sub]
     : collectGitWrites(typeof command === 'string' ? command : '').map((o) => (o.startsWith('git ') ? o.slice(4) : o));
-  const needsGate = (subs.length ? subs : [sub]).some((s) => !GATE_EXEMPT_WRITES.has(s));
+  const gatingSubs = (subs.length ? subs : [sub]).filter((s) => !GATE_EXEMPT_WRITES.has(s));
+  const needsGate = gatingSubs.length > 0;
+  // FEAT-169 — the leak-gate SCOPE. A narrowed (outgoing-delta) working-tree scan
+  // is safe ONLY when every write that needs the gate is a plain COMMIT: a commit
+  // adds a bounded delta on top of HEAD. A push (or any unknown/aliased publishing
+  // verb) publishes the whole history/tree, so it must keep the full-tree scan —
+  // narrow stays false for anything that is not purely commit(s). Passed to the
+  // injected runLeakGate (runLeakGateForRepo) so this module stays the one place
+  // that knows what each write publishes (ARCH-010).
+  const gateScope = { narrow: needsGate && gatingSubs.every((s) => s === 'commit') };
 
   const win = window && window.binding && window.toolUseId && !Array.isArray(argv) ? window : null;
   // The git write invocations written out in the command, as a multiset of bare-`git`
@@ -94,7 +144,7 @@ export function evaluateGitWrite({
   const slots = win ? bareGitWrites(command) : [];
   // BUG-231 r5 — one call id is decided ONCE: a PreToolUse carrying an id the store
   // already knows (open, withdrawn or ended) is refused before anything is claimed.
-  if (win && callClaimState(win.binding, win.toolUseId, now) !== 'unknown') return { allow: false, offender, reason: gitWriteRefusal(offender) };
+  if (win && callClaimState(win.binding, win.toolUseId, now) !== 'unknown') return { done: { allow: false, offender, reason: gitWriteRefusal(offender) } };
   const claim = projectKey ? claimGrant(projectKey, now) : null;
   if (!claim) {
     // BUG-231 r7 — a call id denied because no grant existed is a TERMINAL outcome and
@@ -103,7 +153,7 @@ export function evaluateGitWrite({
     // and steal it from the next genuine call (verify run 01a10e18). The tombstone keeps
     // the id denied for its life; a post-deny grant reaches only the NEXT Bash call.
     if (win) denyCallClaim({ binding: win.binding, toolUseId: win.toolUseId, agentKey: win.agentKey ?? 'main', projectKey, data: { mode: 'denied', decision: null, slots, view: null, gatedFp: null, hookRecord: null } }, now);
-    return { allow: false, offender, reason: gitWriteRefusal(offender) };
+    return { done: { allow: false, offender, reason: gitWriteRefusal(offender) } };
   }
   const decision = newDecisionId();
 
@@ -125,73 +175,96 @@ export function evaluateGitWrite({
   const deferrable = !!win && win.shimReachesCli === true && slots.length > 0 && gitWritesReachShim(command)
     && slots.every((o) => reachProvenFor(win.binding, o));
   const startedAt = Date.now();
-  const clock = () => now + Math.max(0, Date.now() - startedAt); // the caller's clock, advanced by real elapsed time
+  const clock = () => now + Math.max(0, Date.now() - startedAt); // the caller's clock, advanced by real elapsed time (BUG-249: incl. the awaited gate)
   const grant = claim.view;
   // BUG-231 r5 — the call's claim state is the STORE's, keyed by this call id, from the
   // moment the handle exists (a re-entrant decision for the same id is refused above).
+  // BUG-249 — mode starts 'pending': redeemGitWrite refuses to redeem a call whose hook
+  // gate has not yet completed (finish sets 'decided'/'deferred'). In the synchronous
+  // composition this is unobservable (finish runs in the same tick); it only bites a
+  // concurrent redeem that the async gate now makes possible.
   const data = win ? { mode: 'pending', decision, slots, view: grant, gatedFp: null, hookRecord: null } : null;
   if (win && !openCallClaim({ binding: win.binding, toolUseId: win.toolUseId, agentKey: win.agentKey ?? 'main', projectKey, claim, data }, now)) {
-    return { allow: false, offender, reason: gitWriteRefusal(offender) };
+    return { done: { allow: false, offender, reason: gitWriteRefusal(offender) } };
   }
-  const endCall = () => endCallClaims(win.binding, (c) => c.toolUseId === win.toolUseId, clock());
-  let keepHandle = false;
-  try {
-    if (needsGate) {
-      const gate = runLeakGate ? safeGate(runLeakGate) : { ok: false, detail: 'no leak-gate runner available — failing closed' };
-      if (!gate.ok) {
-        if (win) endCall(); else endClaim(claim); // refused: a reserved use goes back
-        // Refused at decide — this write never runs. Record it as blocked, not as a
-        // permit a later reader could mistake for a landed commit (BUG-184).
-        const rec = recordGitWrite({ projectKey, offender, command, sessionLabel, grantScope: grant.scope, gatePassed: false, outcome: 'blocked-gate', decision, now });
-        return { allow: false, offender, gateFailed: true, reason: gitWriteGateFailedRefusal(offender, gate.detail), record: rec };
+  // BUG-249 — the repo content is fingerprinted BEFORE the gate and AGAIN after it; the
+  // composition (evaluateGitWrite / evaluateGitWriteAsync) captures both and hands them to
+  // `finish`, which caches `gatedFp` only when the two agree, so the shim's skip can never
+  // be certified against content the scan did not actually see (an async scan can overlap
+  // another operation that mutates the tree). BUG-249 r2: the capture moved OUT of here so
+  // the async composition can AWAIT it off-loop; `wantsFp` says whether a window even needs
+  // one. Synchronous composition: identical to the old inline capture.
+  const wantsFp = needsGate && !!win;
+  const release = () => { if (win) endCallClaims(win.binding, (c) => c.toolUseId === win.toolUseId, clock()); else endClaim(claim); };
+
+  const finish = (gate, preFp = null, postFp = null) => {
+    let keepHandle = false;
+    try {
+      if (needsGate) {
+        if (!gate.ok) {
+          release(); // refused: a reserved use goes back
+          // Refused at decide — this write never runs. Record it as blocked, not as a
+          // permit a later reader could mistake for a landed commit (BUG-184).
+          const rec = recordGitWrite({ projectKey, offender, command, sessionLabel, grantScope: grant.scope, gatePassed: false, outcome: 'blocked-gate', decision, now });
+          return { allow: false, offender, gateFailed: true, reason: gitWriteGateFailedRefusal(offender, gate.detail), record: rec };
+        }
+        if (win) { data.gatedFp = fingerprintsAgree(preFp, postFp) ? postFp : null; }
       }
-      if (win) data.gatedFp = safeFingerprint(repoFingerprint);
+      if (deferrable) {
+        // The Bash call may start; the store holds its handle. Each shimmed write in it is
+        // authorised by the store at that write (redeemGitWrite → useCallClaim).
+        data.mode = 'deferred';
+        keepHandle = true;
+        return { allow: true, granted: true, offender, grant, deferred: true, decision };
+      }
+      // FEAT-164 r4 — the store authorises this write NOW (after the gate): a revoke,
+      // expiry or lapse that landed since the claim denies it.
+      if (!(win ? useCallClaim(win.binding, win.toolUseId, clock()) : useClaim(claim, clock()))) return { allow: false, offender, reason: gitWriteRefusal(offender) };
+      keepHandle = !!win; // the call keeps the HANDLE in the store so each later write re-asks it
+    } finally {
+      if (!keepHandle) release(); // an exception or a denial never strands a reservation
     }
-    if (deferrable) {
-      // The Bash call may start; the store holds its handle. Each shimmed write in it is
-      // authorised by the store at that write (redeemGitWrite → useCallClaim).
-      data.mode = 'deferred';
-      keepHandle = true;
-      return { allow: true, granted: true, offender, grant, deferred: true, decision };
+    // BUG-184 — record the DECISION as 'permitted', NOT as executed. The host cannot
+    // observe whether the caller then runs git (over the shim path the exec lives in
+    // another process that may abort or fail). The executor confirms the real outcome
+    // via `confirmGitWrite`; until then the record honestly reads "authorised, not
+    // yet observed to have run", so the audit can never claim a commit HEAD lacks.
+    const rec = recordGitWrite({
+      projectKey, offender, command, sessionLabel, grantScope: grant.scope,
+      gatePassed: needsGate ? true : null, outcome: 'permitted', decision, now,
+    });
+    if (win) {
+      // Decided here; the store's call record lets the shim's invocations of THIS command
+      // redeem this decision (no second claim, no second spend), each one re-asking the
+      // store for this call id, and lets the first matching invocation confirm this record.
+      data.mode = 'decided';
+      data.hookRecord = { id: rec.id, confirmToken: rec.confirmToken, offender, used: false };
     }
-    // FEAT-164 r4 — the store authorises this write NOW (after the gate): a revoke,
-    // expiry or lapse that landed since the claim denies it.
-    if (!(win ? useCallClaim(win.binding, win.toolUseId, clock()) : useClaim(claim, clock()))) return { allow: false, offender, reason: gitWriteRefusal(offender) };
-    keepHandle = !!win; // the call keeps the HANDLE in the store so each later write re-asks it
-  } finally {
-    if (!keepHandle) { if (win) endCall(); else endClaim(claim); } // an exception or a denial never strands a reservation
-  }
-  // BUG-184 — record the DECISION as 'permitted', NOT as executed. The host cannot
-  // observe whether the caller then runs git (over the shim path the exec lives in
-  // another process that may abort or fail). The executor confirms the real outcome
-  // via `confirmGitWrite`; until then the record honestly reads "authorised, not
-  // yet observed to have run", so the audit can never claim a commit HEAD lacks.
-  const rec = recordGitWrite({
-    projectKey, offender, command, sessionLabel, grantScope: grant.scope,
-    gatePassed: needsGate ? true : null, outcome: 'permitted', decision, now,
-  });
-  if (win) {
-    // Decided here; the store's call record lets the shim's invocations of THIS command
-    // redeem this decision (no second claim, no second spend), each one re-asking the
-    // store for this call id, and lets the first matching invocation confirm this record.
-    data.mode = 'decided';
-    data.hookRecord = { id: rec.id, confirmToken: rec.confirmToken, offender, used: false };
-  }
-  return { allow: true, granted: true, offender, grant, record: rec, decision };
+    return { allow: true, granted: true, offender, grant, record: rec, decision };
+  };
+  return { needsGate, gateScope, wantsFp, finish };
 }
 
 /** A repo content fingerprint `{ head, entries[], gateKey }` from the injected reader, or
  * null. `gateKey` (BUG-231 r7) hashes the gate-verdict inputs that are NOT repo content —
  * the gate script, the token list, and the resolved own-project names (see
  * leak-gate-host.ts gateVerdictKey). Never throws. */
+function normalizeFingerprint(f) {
+  return f && typeof f.head === 'string' && Array.isArray(f.entries)
+    ? { head: f.head, entries: new Set(f.entries), gateKey: typeof f.gateKey === 'string' ? f.gateKey : null }
+    : null;
+}
 function safeFingerprint(fn) {
   if (typeof fn !== 'function') return null;
-  try {
-    const f = fn();
-    return f && typeof f.head === 'string' && Array.isArray(f.entries)
-      ? { head: f.head, entries: new Set(f.entries), gateKey: typeof f.gateKey === 'string' ? f.gateKey : null }
-      : null;
-  } catch { return null; }
+  try { return normalizeFingerprint(fn()); } catch { return null; }
+}
+/** BUG-249 r2 — async twin of `safeFingerprint`: AWAIT the injected reader so a big-repo
+ * fingerprint (git ls-files / hash-object over the whole tree, the r1 break) runs off the
+ * event loop, exactly as the leak-gate scan does. A synchronous reader (the verify call
+ * sites) is awaited harmlessly; any throw/rejection → null, which forces a re-gate. */
+async function safeFingerprintAsync(fn) {
+  if (typeof fn !== 'function') return null;
+  try { return normalizeFingerprint(await fn()); } catch { return null; }
 }
 
 /** True when `now` holds no content the gate has not already scanned in `gated`
@@ -255,8 +328,12 @@ function fingerprintCovered(gated, now) {
  * Only a write matching no not-ended call (no binding / Codex, git after the call ended,
  * a verb not written out) decides independently.
  *
- * Everything here is synchronous (the gate runs execFileSync), so two redeems of one
- * window can never interleave between check and spend.
+ * BUG-249 — the RUNTIME now composes this decision asynchronously (evaluateGitWriteAsync /
+ * redeemGitWriteAsync await the off-loop leak-gate scan AND, r2, the off-loop repo
+ * fingerprint), so two redeems of one window CAN now interleave. The store mutations stay
+ * synchronous in prepare/finish with no await between a slot check and its spend, and the
+ * pending-mode guard + the atomic slot re-check at the spend make exactly one of any two
+ * concurrent redeems win. (The sync compositions remain fully sequential, as before.)
  */
 /** binding → Set(offender) the shim has observed for that session (per-verb reach proof; gates the SPEND deferral only, never an allow). */
 const reachProven = new Map();
@@ -300,62 +377,122 @@ export function endGitWriteToolCalls(binding, now = Date.now()) {
  * (Codex sessions, a subprocess git in a command with no git text, background jobs,
  * a verb the command did not write out).
  */
-export function redeemGitWrite({
+export function redeemGitWrite(opts = {}) {
+  const p = prepareRedeem(opts);
+  if (p.independent) return evaluateGitWrite(independentOpts(opts));
+  if (p.done) return p.done;
+  // BUG-249 r2 — the skip-check fingerprint is captured HERE so the async composition can
+  // AWAIT it off-loop. `fingerprintCovered` decides whether the hook's gate still covers
+  // the current content; a null/changed reading forces a re-gate (fail toward the gate).
+  const needsGate = p.rawNeedsGate && !fingerprintCovered(p.gatedFp, safeFingerprint(opts.repoFingerprint));
+  const gate = needsGate ? runGateSync(opts.runLeakGate, p.gateScope) : null;
+  return p.finish(gate, needsGate);
+}
+
+/**
+ * BUG-249 — the async composition of the shim's decision, used by /api/git-shim/decide so
+ * the leak-gate scan does not block the event loop. SAME decision as `redeemGitWrite`:
+ * `prepareRedeem` does every read/guard synchronously, `finish` does the spend + record
+ * synchronously; only the gate is awaited. The independent fallback awaits the async
+ * evaluate so a Codex/subprocess write is decided off-thread too.
+ */
+export async function redeemGitWriteAsync(opts = {}) {
+  const p = prepareRedeem(opts);
+  if (p.independent) return evaluateGitWriteAsync(independentOpts(opts));
+  if (p.done) return p.done;
+  // BUG-249 r2 — AWAIT the skip-check fingerprint off-loop (the r1 break left it sync, so a
+  // big-repo redeem still froze ~930ms here even when it then went on to skip the gate).
+  const needsGate = p.rawNeedsGate && !fingerprintCovered(p.gatedFp, await safeFingerprintAsync(opts.repoFingerprint));
+  const gate = needsGate ? await runGateAsync(opts.runLeakGate, p.gateScope) : null;
+  return p.finish(gate, needsGate);
+}
+
+/** The exact opts the shim's independent path hands to evaluate (unchanged from BUG-231). */
+function independentOpts({ argv, projectKey, env, now, runLeakGate, sessionLabel }) {
+  return { argv, projectKey, env, now, runLeakGate, sessionLabel };
+}
+
+/**
+ * The SYNCHRONOUS head of the shim's redeem decision: findCallFor + all guards, up to (and
+ * NOT including) the gate. Returns `{ independent: true }` (decide afresh), `{ done }` (an
+ * early allow/deny), or `{ needsGate, gateScope, finish(gate) }` whose `finish` spends the
+ * call's handle synchronously AFTER the gate.
+ */
+function prepareRedeem({
   binding = null,
   argv,
   projectKey = null,
   env = process.env,
   now = Date.now(),
-  runLeakGate = null,
   sessionLabel = null,
-  repoFingerprint = null,
 } = {}) {
-  const independent = () => evaluateGitWrite({ argv, projectKey, env, now, runLeakGate, sessionLabel });
-  if (!Array.isArray(argv) || !binding || !projectKey) return independent();
-  if (!gitWriteBlockEnabled(env)) return { allow: true };
+  if (!Array.isArray(argv) || !binding || !projectKey) return { independent: true };
+  if (!gitWriteBlockEnabled(env)) return { done: { allow: true } };
   const offender = offenderForGit(['git', ...argv]);
-  if (!offender) return { allow: true };
+  if (!offender) return { done: { allow: true } };
   // BUG-231 r5 — the STORE says which live call (if any) this written-out write belongs
   // to. No not-ended call with a slot for it → it is no call's write → independent.
   const call = findCallFor(binding, projectKey, offender, now);
-  if (!call) return independent();
+  if (!call) return { independent: true };
   const w = call.data;
 
   // The store withdrew this call (revoke / expiry / replacement / lapse): TERMINAL for
   // the call id. Never a fresh decision — that would decide one Bash call twice.
-  if (call.status !== 'open') return { allow: false, offender, reason: gitWriteRefusal(offender), decision: w.decision };
+  if (call.status !== 'open') return { done: { allow: false, offender, reason: gitWriteRefusal(offender), decision: w.decision } };
+  // BUG-249 — refuse to redeem a call whose hook gate has NOT completed. The hook sets
+  // mode 'decided'/'deferred' in its (post-gate) finish; 'pending' means the hook is still
+  // inside its async gate. In a direct session the Bash tool is suspended during the hook,
+  // so this never fires there; it fail-closes a concurrent /decide that the async gate
+  // newly makes possible. Unobservable on the synchronous composition.
+  if (w.mode === 'pending') return { done: { allow: false, offender, reason: gitWriteRefusal(offender), decision: w.decision } };
   const startedAt = Date.now();
   const clock = () => now + Math.max(0, Date.now() - startedAt); // read AFTER the gate
   const sub = offender.startsWith('git ') ? offender.slice(4) : offender;
-  const needsGate = !GATE_EXEMPT_WRITES.has(sub);
-  // The hook gated this call's content before it ran; re-gate at the write unless the
-  // content is provably unchanged-or-less since (then the gate cannot newly fail).
-  if (needsGate && !fingerprintCovered(w.gatedFp, safeFingerprint(repoFingerprint))) {
-    const gate = runLeakGate ? safeGate(runLeakGate) : { ok: false, detail: 'no leak-gate runner available — failing closed' };
-    if (!gate.ok) {
+  const rawNeedsGate = !GATE_EXEMPT_WRITES.has(sub);
+  // BUG-249 r2 — the skip-check fingerprint (does the hook's gate still cover this
+  // content?) moved to the composition so it can be AWAITED off-loop. prepareRedeem exposes
+  // `rawNeedsGate` (is this a gating verb at all) and the hook's stored `gatedFp`; the
+  // composition computes the resolved `needsGate` via `fingerprintCovered` and passes it to
+  // `finish`. The hook gated this call's content before it ran; the write re-gates unless
+  // the content is provably unchanged-or-less since (then a token-scan gate cannot newly fail).
+  // FEAT-169 — same scope rule as the hook: a lone redeemed COMMIT narrows to the
+  // outgoing delta; a push (or unknown verb) keeps the full-tree scan.
+  const gateScope = { narrow: sub === 'commit' };
+
+  const finish = (gate, needsGate) => {
+    if (needsGate && !gate.ok) {
       const rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: false, outcome: 'blocked-gate', decision: w.decision, now });
       return { allow: false, offender, gateFailed: true, reason: gitWriteGateFailedRefusal(offender, gate.detail), record: rec, decision: w.decision };
     }
-  }
-  // THE allow for this invocation: the store's answer for this call's handle, now. A
-  // deferred once-grant is spent here, once (the store keys the spend by the handle).
-  if (!useCallClaim(binding, call.toolUseId, clock())) {
-    return { allow: false, offender, reason: gitWriteRefusal(offender), decision: w.decision };
-  }
-  w.mode = 'used';
-  w.slots.splice(w.slots.indexOf(offender), 1);
-  let set = reachProven.get(binding);
-  if (!set) { set = new Set(); reachProven.set(binding, set); }
-  set.add(offender);
-  let rec;
-  if (w.hookRecord && !w.hookRecord.used && w.hookRecord.offender === offender) {
-    // The hook already recorded this decision; this invocation is its executor.
-    w.hookRecord.used = true;
-    rec = { id: w.hookRecord.id, confirmToken: w.hookRecord.confirmToken };
-  } else {
-    rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: needsGate ? true : null, outcome: 'permitted', decision: w.decision, now });
-  }
-  return { allow: true, granted: true, offender, grant: w.view, record: rec, decision: w.decision, redeemed: true };
+    // BUG-249 — re-check the slot ATOMICALLY with the spend (finish has no await). Two
+    // concurrent redeems both pass findCallFor above (slot present) before either spends;
+    // this makes exactly ONE of them win the slot. Synchronous/sequential: the slot is
+    // always present here, so this is a no-op. A redeem that LOST the slot denies here —
+    // it must NOT fall to the independent path (it found the call), which is why the
+    // check sits at the spend, not as a slot removal before the gate (that would make the
+    // call undiscoverable to a legitimate concurrent redeem and misroute it to independent).
+    if (!w.slots.includes(offender)) return { allow: false, offender, reason: gitWriteRefusal(offender), decision: w.decision };
+    // THE allow for this invocation: the store's answer for this call's handle, now. A
+    // deferred once-grant is spent here, once (the store keys the spend by the handle).
+    if (!useCallClaim(binding, call.toolUseId, clock())) {
+      return { allow: false, offender, reason: gitWriteRefusal(offender), decision: w.decision };
+    }
+    w.mode = 'used';
+    w.slots.splice(w.slots.indexOf(offender), 1);
+    let set = reachProven.get(binding);
+    if (!set) { set = new Set(); reachProven.set(binding, set); }
+    set.add(offender);
+    let rec;
+    if (w.hookRecord && !w.hookRecord.used && w.hookRecord.offender === offender) {
+      // The hook already recorded this decision; this invocation is its executor.
+      w.hookRecord.used = true;
+      rec = { id: w.hookRecord.id, confirmToken: w.hookRecord.confirmToken };
+    } else {
+      rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: rawNeedsGate ? true : null, outcome: 'permitted', decision: w.decision, now });
+    }
+    return { allow: true, granted: true, offender, grant: w.view, record: rec, decision: w.decision, redeemed: true };
+  };
+  return { rawNeedsGate, gatedFp: w.gatedFp, gateScope, finish };
 }
 
 /** TEST-ONLY: drop reach proofs (call state is the store's: _resetGitGrantsForTest clears it). */
@@ -367,12 +504,43 @@ export function _gitWriteWindowsOf(binding) {
     toolUseId, decision: data.decision, state: status === 'withdrawn' ? 'withdrawn' : data.mode, slots: [...data.slots], agentKey }));
 }
 
-function safeGate(run) {
+/** Normalise a gate verdict object (never throws on a weird shape). */
+function normalizeGate(r) {
+  if (r && typeof r === 'object') return { ok: !!r.ok, detail: String(r.detail ?? '') };
+  return { ok: !!r, detail: '' };
+}
+
+/** Run an injected SYNCHRONOUS gate, fail-closed. A missing runner, a thrown error, or a
+ * runner that unexpectedly returns a promise on this path all deny. */
+function runGateSync(run, scope = {}) {
+  if (typeof run !== 'function') return { ok: false, detail: 'no leak-gate runner available — failing closed' };
   try {
-    const r = run();
-    if (r && typeof r === 'object') return { ok: !!r.ok, detail: String(r.detail ?? '') };
-    return { ok: !!r, detail: '' };
+    const r = run(scope);
+    if (r && typeof r.then === 'function') return { ok: false, detail: 'leak gate returned a promise on the synchronous path — failing closed' };
+    return normalizeGate(r);
   } catch (e) {
     return { ok: false, detail: `leak gate errored: ${(e && e.message) || e}` };
   }
+}
+
+/** BUG-249 — run an injected gate that may be ASYNC, fail-closed. The runner is AWAITED
+ * INSIDE the try, so a synchronous throw, a rejected promise, or a missing runner all
+ * resolve to a deny; the resolved value is normalised exactly as the sync path. */
+async function runGateAsync(run, scope = {}) {
+  if (typeof run !== 'function') return { ok: false, detail: 'no leak-gate runner available — failing closed' };
+  try {
+    return normalizeGate(await run(scope));
+  } catch (e) {
+    return { ok: false, detail: `leak gate errored: ${(e && e.message) || e}` };
+  }
+}
+
+/** BUG-249 — true when two repo fingerprints describe the SAME scanned content+config, so
+ * a `gatedFp` cached after the gate certifies only content the scan actually saw. */
+function fingerprintsAgree(a, b) {
+  if (!a || !b) return false;
+  if (a.head !== b.head || a.gateKey !== b.gateKey) return false;
+  if (a.entries.size !== b.entries.size) return false;
+  for (const e of a.entries) if (!b.entries.has(e)) return false;
+  return true;
 }

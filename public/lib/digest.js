@@ -523,10 +523,21 @@ function renderBody(text, projectId) {
  *   - no digest, has answer/notes     -> the body's layer-2 blocks.
  *   - no blocks at all                -> prose(text), byte-for-byte the old path.
  *
+ * BUG-234 r7: the reading routes always deliver the FULL message text (they no
+ * longer accept a caller-supplied `maxTextChars`), so a block is never flagged
+ * `truncated` on the way to this renderer. The client's old fence-closing
+ * render-safety pass and the truncation note it paired with are gone — there is no
+ * mid-fence cut to repair, so table source can never flip into a <pre>. This
+ * function always renders the whole delivered text.
+ *
  * @param {string} text
  * @param {{ enabled?: boolean, projectId?: string|null }} [opts]
  */
 export function renderAssistantText(text, opts = {}) {
+  return renderAssistantTextWhole(text, opts);
+}
+
+function renderAssistantTextWhole(text, opts) {
   const { enabled = true, projectId = null } = opts;
   // NORMALISE LINE ENDINGS ONCE, AT THIS BOUNDARY — the render half of the rule
   // parseResponseBlocks() applies to the parse half (see its header). Everything

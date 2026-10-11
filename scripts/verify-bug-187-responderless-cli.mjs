@@ -598,7 +598,8 @@ async function armA7() {
 async function armA9b() {
   const k = makeChecker('A9b');
   const w = world('a9b');
-  const NOHOOKS = { ORCHARD_ALLOW_GIT_WRITE: '1', ORCHARD_ALLOW_FABLE: '1', ORCHARD_ALLOW_FILE_CLOBBER: '1' };
+  // BUG-239: the no-parking SubagentStop guard is a hook too — switch it off for a genuinely hookless session.
+  const NOHOOKS = { ORCHARD_ALLOW_GIT_WRITE: '1', ORCHARD_ALLOW_FABLE: '1', ORCHARD_ALLOW_FILE_CLOBBER: '1', CLAUDE_STATION_PARK_GUARD: '0' };
   const srv = await bootServer(w, NOHOOKS);
   const pid = await registerProject(srv, w);
   // FEAT-096: the orchestrator profile (a PreToolUse hook) is on by default — turn it off for this project.

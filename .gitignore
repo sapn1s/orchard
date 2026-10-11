@@ -19,8 +19,22 @@ test-results/
 # elsewhere. (FEAT-090: untracked + home-path leak blocked every commit.)
 /CLAUDE.md
 
-# Claude Code local session state: agent defs + leftover worktrees (never publish)
-.claude/
+# Claude Code local session state (settings.json, session state, leftover worktrees):
+# never publish. EXCEPTION: the committed, leak-free `worker` agent definition, which an
+# outsider needs because Orchard's dispatches/docs name the `worker` agent type (FEAT-172).
+# git will not descend into a fully-ignored directory, so exposing one child requires a
+# REPLACE — ignore `.claude/*`, re-include the agents dir, re-ignore its contents, then
+# re-include worker.md — not a bare negation added under `.claude/`.
+.claude/*
+!.claude/agents/
+.claude/agents/*
+!.claude/agents/worker.md
+
+# Operator-local overlay: per-operator capacity/environment facts injected at launch
+# (src/server/templates.ts operatorLocalSection, FEAT-172). NEVER published — it holds the
+# facts the public ROUTING.md / Working Agreement deliberately omit. The committed
+# `OPERATOR.local.md.example` (ends in `.example`, not matched here) documents the shape.
+/docs/prompts/*.local.md
 
 # Internal ticket screenshots — dashboard captures embedding private UI chrome
 # (home path, session titles, project names). The README's CURATED public
@@ -56,6 +70,9 @@ docs/bugs/.migrated/
 # artifacts, predate this checkout's public history, and are never published.
 # In-tree scratch artifacts (names/telemetry embed a PRIVATE project) — never publish.
 scripts/scratch-*.mjs
+# …except the committed read-only operator report tool (BUG-250 rescope): a
+# generic tool that embeds no private project, resolves the root at runtime.
+!scripts/scratch-report.mjs
 docs/bugs/_scratch-*.md
 docs/bugs/.scratch-*.md
 

@@ -40,6 +40,18 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 let cachedAuth = null;
 
 /**
+ * BUG-242 — a per-HOST-PROCESS NONCE, minted lazily alongside the secret and held
+ * ONLY in this process's memory (never persisted, never on env). It is NOT part of
+ * the auth decision — the secret is — but it lets the decide route DISTINGUISH a
+ * shim baked by a PREVIOUS server boot (whose secret is now stale, because the
+ * boot nonce it presents differs from this process's) from a genuinely foreign
+ * caller, and name the cause in the refusal ("server restarted; secret stale")
+ * instead of the generic failing-closed message. Baked into each shim's source
+ * next to the secret; a fresh boot mints a fresh one.
+ */
+let cachedBootId = null;
+
+/**
  * The host-process shim credential, minted lazily on first use. Called by the
  * runtime at session launch to bake into the shim, and (indirectly) by the decide
  * route's validation. One value for the life of the host process.
@@ -47,6 +59,17 @@ let cachedAuth = null;
 export function getShimSecret() {
   if (cachedAuth == null) cachedAuth = randomBytes(32).toString('hex');
   return cachedAuth;
+}
+
+/**
+ * The host-process boot nonce (BUG-242), minted lazily on first use. Memory-only,
+ * one value for the life of the host process; a fresh server boot mints a fresh
+ * one. Baked into each shim and echoed by the shim to the decide route so a stale
+ * (previous-boot) shim can be told from a foreign caller — see cachedBootId.
+ */
+export function getShimBootId() {
+  if (cachedBootId == null) cachedBootId = randomBytes(8).toString('hex');
+  return cachedBootId;
 }
 
 /**
@@ -68,3 +91,6 @@ export function isShimSecretValid(candidate) {
 
 /** TEST-ONLY: pin or clear the credential so a verifier can assert both branches. */
 export function _setShimSecretForTest(v = null) { cachedAuth = v; }
+
+/** TEST-ONLY: pin or clear the boot nonce so a verifier can simulate a restart. */
+export function _setShimBootIdForTest(v = null) { cachedBootId = v; }

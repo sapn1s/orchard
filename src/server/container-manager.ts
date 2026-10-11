@@ -1143,6 +1143,347 @@ export interface BindSpec {
   why: string;
 }
 
+/*
+ * BUG-244 — THE REAL REPO'S .git IS READ-ONLY INSIDE AN UNGRANTED CONTAINER.
+ *
+ * The project dir is bound rw, and in-container git is not shimmed (the FEAT-135
+ * shim dir is a host temp path), so before this an agent in the container could commit,
+ * `reset --hard`, `update-ref`, `branch -D`, `gc --prune` or `rm -rf .git` against the
+ * user's real repo through any spawn form the host text hook (ARCH-021) does not parse.
+ * The guard is structural: every real git dir at the ROOT of a rw directory bind (the
+ * project dir and every rw user mount) gets a nested `:ro` bind over it, so the kernel
+ * refuses the write (EROFS) however it was spawned. Docker orders mounts by destination,
+ * so the nested overlay applies over its rw parent whatever the list order.
+ *
+ * THE SWITCH is the FEAT-164 PERMANENT grant only (`settings.gitWrite.permanent`): a
+ * project-scope fact declared in the registry, which no container can reach, so it is a
+ * safe drift-oracle input (the same rule that keeps accounts and mounts project-scope).
+ * A granted project's bind list is byte-identical to before. Timed/once grants live in
+ * host memory and expire; a bind cannot follow that clock without recreating containers
+ * under live sessions, so in a container project they still pass the host hook but the
+ * in-container write fails "Read-only file system". The ORCHARD_ALLOW_GIT_WRITE hatch is
+ * deliberately NOT an input: it is a per-process env, and the drift oracle must not flip
+ * with whichever process happens to evaluate it.
+ *
+ * DRIFT: a guard difference is its own `gitguard:` reason and is INFORMATIONAL ONLY:
+ * `doEnsure` never recreates, defers or refuses for it, idle or not (BUG-214 class — the
+ * change itself must never cost a live session its container, nor a container its writable
+ * layer). The overlay applies whenever the container is next created anyway: none exists,
+ * another drift reason recreates it, or the user presses Rebuild. Non-git projects and
+ * granted repos produce no guard bind at all, so their bind lists are unchanged.
+ *
+ * Reach: repos at a rw bind root or one level below it, every alias through which a rw bind
+ * reaches their git dirs, and P's grant never unlocks another registered project Q's repo.
+ * Residuals (BUG-244 ticket): the docker-socket opt-in; a repo nested two or more levels
+ * below a bind root; a user mount declared at/under an overlay path or of .git internals;
+ * pushing needs credentials the container is not given, but no mount can stop a push.
+ */
+export const GIT_GUARD_WHY = 'real repo .git (read-only: no permanent git-write grant)';
+const GIT_GUARD_LABEL = 'claude-station.git-guard';
+
+/** BUG-244 — is the read-only .git guard on for this project? Off only under the permanent grant. */
+export function gitGuardOn(project: Pick<Project, 'settings'>): boolean {
+  const g = (project.settings as { gitWrite?: { permanent?: unknown } | null } | undefined)?.gitWrite;
+  return !(g && typeof g === 'object' && g.permanent === true);
+}
+
+function parseGitGuardLabel(v: unknown): string[] {
+  if (typeof v !== 'string' || !v) return [];
+  try {
+    const a = JSON.parse(v) as unknown;
+    return Array.isArray(a) ? a.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function isInsideDir(root: string, p: string): boolean {
+  const r = path.relative(root, p);
+  return r !== '' && !r.startsWith('..') && !path.isAbsolute(r);
+}
+
+/*
+ * Every direct child directory is checked (one lstat each, no recursion), whatever its name: a real repo
+ * at `dist/` (a gh-pages checkout), `build/` or `venv/` is as much the user's as any other (BUG-244 IV r1).
+ */
+const NESTED_REPO_SKIP = new Set(['.git']);
+
+/**
+ * The real git directories of the repo whose work tree is `repoRoot`: `<root>/.git` as a
+ * directory, a symlink, or a gitfile (`gitdir: X`, worktree/submodule style), plus a linked
+ * worktree gitdir's `commondir`. Realpaths, wherever they live (the caller decides which
+ * binds reach them), so the answer is stable for the drift oracle. Never throws.
+ */
+export function gitDirsOf(repoRoot: string): string[] {
+  let root: string;
+  try { root = fs.realpathSync(repoRoot); } catch { return []; }
+  const out: string[] = [];
+  const add = (d: string): string | null => {
+    try {
+      const r = fs.realpathSync(d);
+      if (!fs.statSync(r).isDirectory()) return null;
+      if (!out.includes(r)) out.push(r);
+      return r;
+    } catch { return null; }
+  };
+  const withCommon = (gd: string | null): void => {
+    if (!gd) return;
+    try {
+      const c = fs.readFileSync(path.join(gd, 'commondir'), 'utf8').trim();
+      if (c) add(path.resolve(gd, c));
+    } catch { /* not a linked worktree gitdir */ }
+  };
+  const dotgit = path.join(root, '.git');
+  let st: fs.Stats;
+  try { st = fs.lstatSync(dotgit); } catch { return out; }
+  if (st.isFile()) {
+    let gd: string | null = null;
+    try {
+      const m = /^gitdir:\s*(.+?)\s*$/m.exec(fs.readFileSync(dotgit, 'utf8'));
+      if (m) gd = add(path.resolve(root, m[1]!));
+    } catch { /* unreadable gitfile: nothing provable to guard */ }
+    withCommon(gd);
+  } else {
+    withCommon(add(dotgit));
+  }
+  return out;
+}
+
+/** Is `d` itself a git directory (a bare repo, or a gitdir): HEAD file + objects/ + refs/? */
+function isGitDirItself(d: string): boolean {
+  try {
+    return fs.statSync(path.join(d, 'HEAD')).isFile() && fs.statSync(path.join(d, 'objects')).isDirectory() && fs.statSync(path.join(d, 'refs')).isDirectory();
+  } catch { return false; }
+}
+
+/** Bare repos a bind root exposes: the root itself or a direct child directory that IS a git dir (BUG-244 IV r2). */
+function bareReposUnder(hostRoot: string): string[] {
+  const out: string[] = [];
+  const add = (d: string) => { try { const r = fs.realpathSync(d); if (!out.includes(r)) out.push(r); } catch { /* gone */ } };
+  if (isGitDirItself(hostRoot)) add(hostRoot);
+  let names: string[] = [];
+  try { names = fs.readdirSync(hostRoot); } catch { return out; }
+  for (const n of names.sort()) {
+    if (n === '.git') continue;
+    const d = path.join(hostRoot, n);
+    try { if (!fs.lstatSync(d).isDirectory()) continue; } catch { continue; }
+    if (isGitDirItself(d)) add(d);
+  }
+  return out;
+}
+
+/**
+ * The git dirs a registered project's FOLDER uses: its own bare repo, or the repo enclosing it — walking
+ * up to the nearest `.git` (a monorepo subfolder uses the monorepo's .git) — with a linked worktree's
+ * shared `commondir` (BUG-244 IV r2: worktree and monorepo-subfolder projects).
+ */
+function gitDirsUsedBy(folder: string): { direct: string[]; indirect: string[] } {
+  let root: string;
+  try { root = fs.realpathSync(folder); } catch { return { direct: [], indirect: [] }; }
+  const direct = new Set<string>();
+  const indirect = new Set<string>();
+  // DIRECT — the repo this folder IS or LIVES IN: its own bare repo, or the repo enclosing it (a monorepo
+  // subfolder), with a linked worktree's commondir.
+  if (isGitDirItself(root)) direct.add(root);
+  else {
+    for (let d = root; ; ) {
+      let has = false;
+      try { fs.lstatSync(path.join(d, '.git')); has = true; } catch { /* keep walking */ }
+      if (has) { for (const g of gitDirsOf(d)) direct.add(g); break; }
+      const up = path.dirname(d);
+      if (up === d) break;
+      d = up;
+    }
+  }
+  // INDIRECT (BUG-244 IV r7) — repos one level below the folder, which its OWN container guards: so a granted
+  // mounter never gets write access Q's own container is denied. A direct user always outranks this (IV r8).
+  for (const repo of repoRootsUnder(root)) if (repo !== root) for (const g of gitDirsOf(repo)) if (!direct.has(g)) indirect.add(g);
+  for (const bare of bareReposUnder(root)) if (!direct.has(bare)) indirect.add(bare);
+  return { direct: [...direct], indirect: [...indirect] };
+}
+
+/** Repo work trees a bind root exposes: the root itself and its direct child directories (depth 1). */
+function repoRootsUnder(hostRoot: string): string[] {
+  const out: string[] = [];
+  const has = (d: string) => { try { fs.lstatSync(path.join(d, '.git')); return true; } catch { return false; } };
+  if (has(hostRoot)) out.push(hostRoot);
+  let names: string[] = [];
+  try { names = fs.readdirSync(hostRoot); } catch { return out; }
+  for (const n of names.sort()) {
+    if (NESTED_REPO_SKIP.has(n)) continue;
+    const d = path.join(hostRoot, n);
+    try { if (!fs.lstatSync(d).isDirectory()) continue; } catch { continue; }
+    if (has(d)) out.push(d);
+  }
+  return out;
+}
+
+/**
+ * The work-tree root that OWNS a git dir: the parent of the nearest `.git` path component
+ * (so `<X>/.git`, `<X>/.git/worktrees/w` and `<X>/.git/modules/m` are all owned by X), else
+ * the work tree that referenced it.
+ */
+function ownerRootOf(gitDir: string, referencedFrom: string): string {
+  const parts = gitDir.split(path.sep);
+  const i = parts.lastIndexOf('.git');
+  return i > 0 ? parts.slice(0, i).join(path.sep) || path.sep : referencedFrom;
+}
+
+/**
+ * BUG-244 — may agents in `project`'s container write git dir `gitDir`, whose owners are the work trees
+ * in `owners` (the work tree that references it, and the work tree whose `.git` encloses it)?
+ * Only when the container's project holds the permanent grant AND no OTHER registered project without
+ * the grant either owns it (its folder is one of `owners`) or uses it (`gitDirsUsedBy` its folder:
+ * enclosing monorepo, linked-worktree commondir, submodule gitdir, bare repo). P's grant is never Q's
+ * grant. An unreadable registry reads as "not granted" (fail closed to read-only).
+ */
+function repoWriteGranted(project: Project, gitDir: string, owners: string[], usedBy: () => UsedBy): boolean {
+  if (gitGuardOn(project)) return false;
+  let u: UsedBy;
+  try { u = usedBy(); } catch { return false; }
+  // DIRECT users (the repo's own work tree, a subfolder of it, a linked worktree of it) decide first: any
+  // other ungranted one refuses. Only when the container's project is not itself a direct user does an
+  // INDIRECT one (an umbrella folder one level up) refuse (IV r8: a granted project nested one level below an
+  // ungranted registered folder keeps its own repo).
+  for (const [folder, d] of u.others) if (owners.includes(folder) || d.direct.includes(gitDir)) return false;
+  const selfDirect = owners.includes(u.self.folder) || u.self.direct.includes(gitDir);
+  if (!selfDirect) for (const [, d] of u.others) if (d.indirect.includes(gitDir)) return false;
+  return true; // only unregistered or granted users: the project's own grant decides
+}
+
+interface UsedBy { self: { folder: string; direct: string[] }; others: Map<string, { direct: string[]; indirect: string[] }> }
+
+/**
+ * BUG-244 IV r12 — the host sources of this container's read-only .git overlays (by its own create-time
+ * label) that no longer exist. STARTING such a stopped container, or `docker cp` out of it, makes the daemon
+ * set up its binds and create each missing source ROOT-OWNED in the user's tree (BUG-136 class), so every path
+ * that would start or copy out of a stopped container asks this first.
+ */
+function missingGuardSources(live: Inspected): string[] {
+  if (live.running) return [];
+  return live.binds
+    .filter((s) => live.gitGuard.includes(bindContainerPath(s)))
+    .map((s) => s.slice(0, s.lastIndexOf(`:${bindContainerPath(s)}`)))
+    .filter((h) => h && !fs.existsSync(h));
+}
+
+/** A container path normalised for comparison: posix-normalised, no trailing '/' (except the root). */
+function normCp(p: string): string {
+  return path.posix.normalize(p).replace(/\/+$/, '') || '/';
+}
+
+/** The container path of a bind string (`host:container[:opts]`). */
+function bindContainerPath(s: string): string {
+  const parts = s.split(':');
+  if (parts.length >= 3 && /^(ro|rw|z|Z|r?shared|r?slave|r?private|nocopy|consistent|cached|delegated)(,[A-Za-z]+)*$/.test(parts[parts.length - 1]!)) return parts[parts.length - 2]!;
+  return parts[parts.length - 1]!;
+}
+
+/**
+ * BUG-244 — the read-only .git overlays for `binds` (the list built so far).
+ *
+ * Every repo whose work tree is a rw directory bind root or a direct child of one is found;
+ * each of its real git dirs (gitdir and commondir, realpaths) is overlaid read-only at EVERY
+ * container path through which a rw directory bind reaches it (so an alias — a parent dir
+ * mounted rw as well — is covered too), unless that repo's write is granted
+ * (`repoWriteGranted`). A git dir already inside a chosen overlay of the same bind is not
+ * overlaid again. A user mount at (or under) an overlay's container path wins: that overlay
+ * is skipped, so the create never fails on a duplicate destination (recorded residual).
+ */
+function gitGuardBinds(project: Project, binds: BindSpec[]): BindSpec[] {
+  const rw: { host: string; containerPath: string }[] = [];
+  for (const b of binds) {
+    if (b.readOnly) continue;
+    if (b.why !== 'project directory' && b.why !== 'project mount') continue;
+    try {
+      if (!fs.statSync(b.hostPath).isDirectory()) continue;
+      rw.push({ host: fs.realpathSync(b.hostPath), containerPath: b.containerPath });
+    } catch { /* absent: nothing to guard */ }
+  }
+  // Folder -> git dirs it uses, for every OTHER registered project without the grant (computed once,
+  // only when this project is granted, since an ungranted project guards everything anyway).
+  let usedCache: UsedBy | null = null;
+  const usedBy = (): UsedBy => {
+    if (usedCache) return usedCache;
+    const others = new Map<string, { direct: string[]; indirect: string[] }>();
+    for (const q of listProjects()) {
+      if (q.id === project.id || !gitGuardOn(q)) continue;
+      let f: string;
+      try { f = fs.realpathSync(q.hostPath); } catch { continue; }
+      others.set(f, gitDirsUsedBy(f));
+    }
+    let self = '';
+    try { self = fs.realpathSync(project.hostPath); } catch { /* keep '' */ }
+    return (usedCache = { self: { folder: self, direct: self ? gitDirsUsedBy(self).direct : [] }, others });
+  };
+  const guarded = new Set<string>();
+  for (const r of rw) {
+    for (const repo of repoRootsUnder(r.host)) {
+      let repoReal = repo;
+      try { repoReal = fs.realpathSync(repo); } catch { /* keep as found */ }
+      for (const gd of gitDirsOf(repo)) {
+        if (!repoWriteGranted(project, gd, [ownerRootOf(gd, repoReal), repoReal], usedBy)) guarded.add(gd);
+      }
+    }
+    for (const bare of bareReposUnder(r.host)) {
+      if (!repoWriteGranted(project, bare, [bare], usedBy)) guarded.add(bare);
+    }
+  }
+  /*
+   * BUG-244 IV r5: a guarded git dir's top-level entries may be SYMLINKS to directories elsewhere
+   * (`objects -> ../.store/objects`), and a write through one lands in the target. Every such directory
+   * target outside the git dir is guarded too (overlaid wherever a rw bind reaches it). A symlinked FILE
+   * entry (packed-refs, config) is a recorded residual: a file bind is inode-checked (`staleFileBinds`),
+   * so host-side git rewriting that file would read as drift.
+   */
+  for (const gd of [...guarded]) {
+    let names: string[] = [];
+    try { names = fs.readdirSync(gd); } catch { continue; }
+    for (const n of names) {
+      const e = path.join(gd, n);
+      try {
+        if (!fs.lstatSync(e).isSymbolicLink()) continue;
+        const t = fs.realpathSync(e);
+        if (fs.statSync(t).isDirectory() && t !== gd && !isInsideDir(gd, t)) guarded.add(t);
+      } catch { /* dangling: nothing to protect */ }
+    }
+  }
+  const dirs = [...guarded].sort((a, b) => a.length - b.length || (a < b ? -1 : 1));
+  const out: BindSpec[] = [];
+  for (const r of rw) {
+    /*
+     * BUG-244 IV r4: the bind ROOT is itself an unauthorized git dir (a bare `origin.git` mounted rw, or a
+     * project dir that is a bare repo). An overlay cannot share its parent's destination, so the bind is
+     * REPLACED by a read-only one at the same container path (`desiredBinds` drops the rw original).
+     */
+    if (guarded.has(r.host)) {
+      if (!/[:,]/.test(r.host) && !/[:,]/.test(r.containerPath)) out.push({ hostPath: r.host, containerPath: r.containerPath, readOnly: true, why: GIT_GUARD_WHY });
+      continue;
+    }
+    const chosen: string[] = [];
+    for (const gd of dirs) {
+      if (!isInsideDir(r.host, gd)) continue;
+      if (chosen.some((c) => c === gd || isInsideDir(c, gd))) continue;
+      const containerPath = normCp(path.posix.join(r.containerPath, path.relative(r.host, gd).split(path.sep).join('/')));
+      // BUG-244 IV r3: a ':' or ',' in either path cannot be written as a `-v` spec ("too many colons"), and
+      // emitting it would make `docker create` fail for the whole project. Skip it (recorded residual).
+      if (/[:,]/.test(gd) || /[:,]/.test(containerPath)) continue;
+      // Container paths are compared NORMALISED (IV r10: a mount spelled `<wd>/data/`, `//data` or `/./data`).
+      const ocp = (o: BindSpec) => normCp(o.containerPath);
+      if (binds.some((o) => ocp(o) === containerPath || ocp(o).startsWith(containerPath + '/'))) continue;
+      // BUG-244 IV r9: another bind mounted DEEPER than this root covers the destination (a user mount at
+      // <workdir>/data shadowing the project's data/ repo). The repo is not reachable through this root there,
+      // and an overlay would be mounted INSIDE that other bind, making Docker create a root-owned `.git` in it.
+      const rcp = normCp(r.containerPath);
+      if (binds.some((o) => ocp(o).length > rcp.length && ocp(o).startsWith(rcp + '/') && containerPath.startsWith(ocp(o) + '/'))) continue;
+      if (out.some((o) => o.containerPath === containerPath)) continue;
+      chosen.push(gd);
+      out.push({ hostPath: gd, containerPath, readOnly: true, why: GIT_GUARD_WHY });
+    }
+  }
+  return out;
+}
+
 /**
  * The full, ordered bind list for a project. This is also the drift oracle:
  * `ensureContainer` compares it against the live container's Binds and
@@ -1270,6 +1611,17 @@ export function desiredBinds(project: Project): BindSpec[] {
       readOnly: m.readOnly !== false,
       why: 'project mount',
     });
+  }
+  // BUG-244 — after every rw directory bind is known (project dir + user mounts).
+  {
+    const guards = gitGuardBinds(project, binds);
+    // A guard at a rw bind's OWN container path replaces that bind (IV r4: a bind root that is a bare repo).
+    const replaced = new Set(guards.map((g) => g.containerPath));
+    for (let i = binds.length - 1; i >= 0; i--) {
+      const b = binds[i]!;
+      if (!b.readOnly && (b.why === 'project directory' || b.why === 'project mount') && replaced.has(b.containerPath)) binds.splice(i, 1);
+    }
+    binds.push(...guards);
   }
   if (cs.dockerSocket) {
     // Opt-in only. On a ROOTFUL daemon this is equivalent to giving the
@@ -1473,6 +1825,8 @@ interface Inspected {
   user: string;
   entrypoint: string[];
   cmd: string[];
+  /** BUG-244 — container paths of the read-only .git overlays it was created with (label); [] when none/unlabelled. */
+  gitGuard: string[];
 }
 
 function inspect(name: string): Inspected | null {
@@ -1510,6 +1864,7 @@ function inspect(name: string): Inspected | null {
     user: String(j.Config?.User ?? ''),
     entrypoint: ((j.Config?.Entrypoint ?? []) as unknown[]).map(String),
     cmd: ((j.Config?.Cmd ?? []) as unknown[]).map(String),
+    gitGuard: parseGitGuardLabel(j.Config?.Labels?.[GIT_GUARD_LABEL]),
   };
 }
 
@@ -1541,6 +1896,38 @@ function refuseForeign(name: string, ins: Inspected | null): void {
  * exact failure this catches — the user edits mounts, sees "running", and gets
  * the old mounts for the rest of the day.
  */
+/**
+ * BUG-244 IV r11 — an overlay can LAPSE while the container runs: if the host deletes and re-creates the
+ * directory that holds a guarded repo (a re-clone), the container's ro mount stays attached to the old,
+ * now-unreachable directory, and the new `.git` is reached through the rw parent — writable, while the bind
+ * strings are still byte-identical. Proven from inside: `[ -w <path> ]` (access W_OK) must FAIL at every guard
+ * path — EROFS while the overlay is in effect. A writable one is a
+ * `gitguard-lapsed:` reason, which doEnsure defers like an image swap (never removed or refused under a live
+ * session, repaired at the next launch with none). Any docker/read surprise reports nothing (it may only add a
+ * reason it can prove), the same rule as `staleFileBinds`.
+ */
+function guardLapses(project: Project, live: Inspected, guardBinds: string[]): string[] {
+  if (!live.running || !guardBinds.length) return [];
+  const paths = [...new Set(guardBinds.map((b) => normCp(bindContainerPath(b))))];
+  let r: RunResult;
+  try {
+    // access(W_OK) fails with EROFS while the ro overlay is in effect; it succeeds when the path is reached
+    // through the rw parent instead (the lapse). mountinfo cannot tell: it still lists the old mount by path.
+    r = lifecycle.withProbe(() => dockerSync(['exec', live.id, 'sh', '-c', lifecycle.GIT_GUARD_PROBE_SCRIPT, 'sh', ...paths], 10_000));
+  } catch {
+    return [];
+  }
+  if (r.code !== 0) return [];
+  const out: string[] = [];
+  for (const line of r.stdout.split('\n')) {
+    const m = /^W (.+)$/.exec(line.trim());
+    if (!m || !paths.includes(m[1]!)) continue;
+    out.push(`gitguard-lapsed: the read-only .git overlay at ${m[1]} is no longer in effect inside ${containerName(project.id)} ` +
+      '(the repo directory was replaced on the host while the container ran), so that repo is writable from the container until it is recreated');
+  }
+  return out;
+}
+
 function driftReasons(project: Project, live: Inspected, useImage?: string): string[] {
   const out: string[] = [];
   // `useImage`: the image this ensure is actually going to run (after a build,
@@ -1567,14 +1954,78 @@ function driftReasons(project: Project, live: Inspected, useImage?: string): str
   }
   const wantWd = containerWorkdir(project);
   if (live.workdir !== wantWd) out.push(`workdir ${live.workdir} != ${wantWd}`);
-  const want = desiredBinds(project).map(bindString).sort();
-  const got = live.binds.slice().sort();
-  if (want.length !== got.length || want.some((b, i) => b !== got[i])) {
-    const missing = want.filter((b) => !got.includes(b));
-    const extra = got.filter((b) => !want.includes(b));
-    if (missing.length) out.push(`missing bind(s): ${missing.join(', ')}`);
-    if (extra.length) out.push(`unexpected bind(s): ${extra.join(', ')}`);
-    if (!missing.length && !extra.length) out.push('bind list differs');
+  /*
+   * BUG-244 — the read-only .git overlays are compared on their own and reported as
+   * `gitguard:`, which doEnsure defers under live leases (never a recreate or a refused
+   * launch). Everything else is compared exactly as before, so a container created before
+   * the guard existed gains no other reason. A live bind is a guard bind if its container
+   * path is one this container was labelled with, or one the guard wants now.
+   */
+  const desired = desiredBinds(project);
+  /*
+   * BUG-244 IV r6 — a BIND ROOT (the workdir, or a declared mount's container path) is compared on its own:
+   * a root that is a bare repo is REPLACED by a read-only guard bind at the same path (IV r4), so the same path
+   * flips between `H:/ctr` and `H:/ctr:ro` with the grant. A difference ONLY in `:ro`, same real host path,
+   * with the guard on either side, is the guard's informational change; any other difference at a root path
+   * (re-pointed, added, removed) is a real bind change, exactly as before.
+   */
+  const rootPaths = new Set<string>([containerWorkdir(project), ...(project.settings.mounts ?? []).map((m) => m.containerPath)]);
+  const atRoot = (s: string) => rootPaths.has(bindContainerPath(s));
+  const hostOfBind = (s: string) => s.slice(0, s.lastIndexOf(`:${bindContainerPath(s)}`));
+  const real = (p: string) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+  const wantGuard = desired.filter((b) => b.why === GIT_GUARD_WHY && !rootPaths.has(b.containerPath)).map(bindString).sort();
+  const wantRest = desired.filter((b) => b.why !== GIT_GUARD_WHY && !rootPaths.has(b.containerPath)).map(bindString);
+  // Provenance, not destination: a live bind is a guard bind if this container's own create-time
+  // label says so, or it is byte-identical to a guard bind wanted now; never if it is a wanted non-guard bind.
+  const isLiveGuard = (s: string) => (live.gitGuard.includes(bindContainerPath(s)) || wantGuard.includes(s)) && !wantRest.includes(s);
+  const liveNonRoot = live.binds.filter((s) => !atRoot(s));
+  const want = wantRest.slice().sort();
+  const got = liveNonRoot.filter((s) => !isLiveGuard(s)).sort();
+  const missingRest = want.filter((b) => !got.includes(b));
+  const extraRest = got.filter((b) => !want.includes(b));
+  const guardMissing: string[] = [];
+  const guardExtra: string[] = [];
+  const liveGuardRoots: string[] = [];
+  for (const cp of rootPaths) {
+    const w = desired.find((b) => b.containerPath === cp);
+    const l = live.binds.find((s) => bindContainerPath(s) === cp);
+    if (l && live.gitGuard.includes(cp)) liveGuardRoots.push(l);
+    const ws = w ? bindString(w) : null;
+    if (!w && !l) continue;
+    if (ws === l) continue;
+    if (w && l) {
+      const lRo = l.endsWith(':ro');
+      if (real(w.hostPath) === real(hostOfBind(l))) {
+        if (w.readOnly === lRo) continue; // same real source, same mode: the same bind, spelled differently
+        if (w.why === GIT_GUARD_WHY) { guardMissing.push(ws!); continue; }
+        if (live.gitGuard.includes(cp)) { guardExtra.push(l); continue; }
+      }
+    }
+    if (ws) missingRest.push(ws);
+    if (l) extraRest.push(l);
+  }
+  if (missingRest.length) out.push(`missing bind(s): ${missingRest.join(', ')}`);
+  if (extraRest.length) out.push(`unexpected bind(s): ${extraRest.join(', ')}`);
+  {
+    const gotGuard = liveNonRoot.filter(isLiveGuard).sort();
+    const missing = [...wantGuard.filter((b) => !gotGuard.includes(b)), ...guardMissing];
+    const extra = [...gotGuard.filter((b) => !wantGuard.includes(b)), ...guardExtra];
+    if (missing.length) out.push(`gitguard: the real repo .git is writable in this container (no permanent git-write grant); read-only overlay missing: ${missing.join(', ')}`);
+    if (extra.length) out.push(`gitguard: read-only .git overlay no longer wanted (permanent git-write grant, or the repo moved): ${extra.join(', ')}`);
+    /*
+     * BUG-244 IV r3 (BUG-136 class): STARTING a stopped container whose overlay source is gone makes the
+     * daemon recreate that source as a ROOT-OWNED directory in the user's tree. So for a stopped container
+     * this is a real reason (recreated, not started). A running container is never started, so nothing
+     * changes under a live session.
+     */
+    if (!live.running) {
+      for (const s of [...gotGuard, ...liveGuardRoots]) {
+        const host = hostOfBind(s);
+        if (host && !fs.existsSync(host)) out.push(`missing bind source ${host} (read-only .git overlay): starting this container would make Docker create it root-owned`);
+      }
+    } else {
+      for (const r of guardLapses(project, live, [...gotGuard.filter((b) => wantGuard.includes(b)), ...liveGuardRoots])) out.push(r);
+    }
   }
   for (const r of staleFileBinds(project, live)) out.push(r);
   const cs = containerSettingsOf(project);
@@ -3454,6 +3905,15 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
       // (attack round 3, d) recovery keeps the BASE, not a mismatched CLI: the CLI is still checked by its bytes.
       // Under a live session a mismatch refuses the launch; idle, the host's CLI is layered onto the very image the
       // container runs (the base is unchanged) and the container is recreated on it.
+      const gone = missingGuardSources(lv);
+      if (gone.length) {
+        // BUG-244 IV r12: neither `docker cp` (the CLI check) nor `start` may touch it; recreate on the very image it runs.
+        opts.onLog?.(`[container] recovery: ${name} is stopped and its read-only .git overlay source ${gone.join(', ')} is gone; recreating it on the image it runs (starting it would make Docker create that directory root-owned)\n`);
+        await removeContainer(name);
+        createAndStart(project, name, lv.imageId, opts);
+        invalidate(project.id);
+        return assertRunning(project);
+      }
       const wantCli = await hostCli();
       const haveCli = containerCliSha(lv.id);
       if (haveCli !== undefined && haveCli !== wantCli.sha256) {
@@ -3519,11 +3979,27 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
     // user owns ~/.local/bin). Its bytes are checked at every launch; a mismatch is image-class drift: recreated at
     // an idle launch, and under a live session the new launch is refused (never started on a foreign CLI).
     // (attack round 2, d) a STOPPED container is checked too: its writable layer survives a stop/start.
-    if (imageSourceOf(project) !== 'custom' && !reasons.some((r) => r.startsWith('image '))) {
+    // BUG-244 IV r11: NOT when a bind source is missing — the container is recreated anyway, and `docker cp`
+    // out of a STOPPED container makes the daemon set up its binds, creating that source ROOT-OWNED (BUG-136).
+    if (imageSourceOf(project) !== 'custom' && !reasons.some((r) => r.startsWith('image ') || r.startsWith('missing bind source '))) {
       const want = hostCliSync();
       const have = want ? containerCliSha(live.id) : undefined;
       if (want && have === undefined) opts.onLog?.(`[container] could not read the Claude CLI inside ${name} to compare it with the host's; keeping the container as it is\n`);
       else if (want && have !== want.sha256) reasons.push(`image ${live.image}: the Claude CLI inside the container is not this host's (replaced from inside, or never matched)`);
+    }
+    /*
+     * BUG-244 — a `gitguard:` difference (the read-only .git overlay wanted but absent, or
+     * present but no longer wanted) is NEVER a reason to act on by itself: not a recreate,
+     * not a deferral, not a refused launch, even with no session live. The overlay is part
+     * of the bind list, so it is applied whenever this container is next created anyway —
+     * no container yet, another drift reason that recreates it, or an explicit Rebuild.
+     * Until then status reports it (the drawer's "until you rebuild" note).
+     */
+    const guardPending = reasons.filter((r) => r.startsWith('gitguard:'));
+    for (let i = reasons.length - 1; i >= 0; i--) if (reasons[i]!.startsWith('gitguard:')) reasons.splice(i, 1);
+    if (guardPending.length && !reasons.length && !opts.forceRecreate) {
+      opts.onLog?.(`[container] ${name}: the read-only .git setting changed (git-write grant, or a repo appeared or moved); ` +
+        'it applies when this container is next created (Rebuild applies it now). Keeping the container as it is.\n');
     }
     if (reasons.length || opts.forceRecreate) {
       /*
@@ -3539,7 +4015,8 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
        * ARCH-022: "sessions are live" is the authority's lease set, and this runs inside the project's
        * slot, where no new lease can appear. The authority's gate re-checks it at the docker call itself.
        */
-      const deferrable = reasons.every((r) => r.startsWith('image ') || r.startsWith('lockdown:'));
+      // BUG-244 IV r11: a lapsed overlay is repaired like an image swap — never under a live session, never a refusal.
+      const deferrable = reasons.every((r) => r.startsWith('image ') || r.startsWith('lockdown:') || r.startsWith('gitguard-lapsed:'));
       const held = lifecycle.hasLeases(op.projectId);
       if (deferrable && live.running && held) {
         /*
@@ -3565,6 +4042,10 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
         }
         const img = reasons.some((r) => r.startsWith('image '));
         const lock = reasons.some((r) => r.startsWith('lockdown:'));
+        if (reasons.some((r) => r.startsWith('gitguard-lapsed:'))) {
+          opts.onLog?.(`[container] WARNING: a read-only .git overlay of ${name} has lapsed (a repo was replaced on the host); sessions are live, so it is ` +
+            'repaired at the next launch with no live session (or press Rebuild). Until then that repo is writable from the container.\n');
+        }
         opts.onLog?.(
           (img
             ? `[container] a new image (${image}) is ready, but other sessions are live in ${name}; this session starts on the current image ` +
@@ -3669,7 +4150,10 @@ export function createArgs(project: Project, name: string, image: string, opts: 
   }
   // Always written (possibly empty), so an image LABEL can never stand in for it.
   args.push('--label', `${ENV_KEYS_LABEL}=${envKeysOf(project)}`);
-  for (const b of desiredBinds(project)) args.push('-v', bindString(b));
+  const binds = desiredBinds(project);
+  // BUG-244: which binds are the read-only .git overlays, so drift can tell them apart later.
+  args.push('--label', `${GIT_GUARD_LABEL}=${JSON.stringify(binds.filter((b) => b.why === GIT_GUARD_WHY).map((b) => b.containerPath))}`);
+  for (const b of binds) args.push('-v', bindString(b));
   args.push(image);
   args.push(...LOCKDOWN_CMD);
   return args;
@@ -3713,6 +4197,11 @@ async function swapContainer(project: Project, name: string, image: string, live
     markImageBad(project, parent, err as Error);
     opts.onLog?.(`[container] could not start a container on ${image} (${(err as Error).message.split('\n')[0]}); keeping ${name} on ${live.image}\n`);
     if (!live.running) {
+      const gone = missingGuardSources(live);
+      if (gone.length) {
+        // BUG-244 IV r12: starting the old container would make Docker create its missing overlay source root-owned.
+        throw new ContainerError('start-failed', `could not start ${name}: the new image failed, and the old container's read-only .git overlay source ${gone.join(', ')} is gone (starting it would make Docker create that directory root-owned). Press Rebuild once the image is fixed.`);
+      }
       const r = dockerSync(['start', name], 60_000);
       if (r.code !== 0) throw new ContainerError('start-failed', `could not start ${name}`, (r.stderr || r.stdout).trim().slice(0, 800));
     }

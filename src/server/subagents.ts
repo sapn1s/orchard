@@ -346,7 +346,6 @@ export function getSubagentMessages(
 
   const offset = Math.max(0, Math.floor(opts.offset ?? 0));
   const limit = Math.min(2000, Math.max(1, Math.floor(opts.limit ?? 200)));
-  const maxTextChars = Math.max(0, Math.floor(opts.maxTextChars ?? 4000));
   const includeToolResults = opts.includeToolResults === true;
 
   const { entries, malformed, bytesRead, truncated } = parseLines(filePath, AGENT_MAX_BYTES);
@@ -354,8 +353,11 @@ export function getSubagentMessages(
   const warnings: string[] = [];
   let scanned = 0;
 
-  const clip = (s: string): { text: string; truncated?: boolean } =>
-    s.length > maxTextChars ? { text: s.slice(0, maxTextChars), truncated: true } : { text: s };
+  // BUG-234: "text block -> delivered text" is owned by session-history.deliverText
+  // (no-cap default; an explicit cap is a plain cut + metadata). The subagent PAGE/tail
+  // routes must NOT restate it — the prior local copy defaulted the cap to 4000
+  // and raw-sliced, cutting `orchard-answer` folds mid-table into a <pre>.
+  const clip = (s: string): { text: string; truncated?: boolean; fullLength?: number } => hist.deliverText(s, opts.maxTextChars);
 
   /*
    * Two passes. Blocks are built BEFORE an index is assigned, because an entry

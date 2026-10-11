@@ -52,7 +52,8 @@ import { fileURLToPath } from 'node:url';
 // its own gate. See scripts/lib/leak-tokens.mjs.
 import {
   scanLine, scanIdentity, scanKeyShapes, scanBinary, allowedHitFor,
-  ownProjectTokens, parseAllowlist, allowlistEntryFor, ALLOWLIST_FILE,
+  ownProjectTokens, parseAllowlist, allowlistEntryFor, ALLOWLIST_FILE, tokenKindOf,
+  credentialFingerprint, privateKeyLines, PEM_TOKEN, DRAFT_MARKER,
 } from './lib/leak-tokens.mjs';
 
 /**
@@ -120,9 +121,31 @@ const SCAN_IDENTITY = rawArgs.includes('--identity');
 // the pre-commit hook, the agent git-write gate) pass this; `npm run gate` does
 // NOT — it stays a working-tree "am I about to be safe" preflight.
 const STAGED = rawArgs.includes('--staged');
+// FEAT-169 — the OUTGOING-DELTA scope for the agent COMMIT guard. REPO mode's
+// default `git ls-files -co` scans EVERY tracked file, so a pre-existing hit
+// anywhere in the tree (a false positive already living in a real project repo)
+// blocked every agent commit even when the commit touched none of it. --changed
+// scans ONLY what a commit would add: files the working tree changes relative to
+// HEAD (staged OR unstaged, `git diff HEAD`) plus untracked-not-ignored files —
+// read from the working tree, so `git add secret && git commit` is still caught
+// at the pre-exec guard (nothing is staged yet; the file is a working-tree
+// change). Deletions carry no outgoing content and are excluded (removing a leak
+// must never be blocked). On an unborn HEAD the whole tree IS the first commit's
+// outgoing content, so --changed falls back to the full `ls-files -co` set — no
+// weaker there. The per-repo allowlist (below) applies here exactly as in every
+// other REPO mode. PUSH keeps the full-tree scan (runLeakGateForRepo): a push
+// publishes the whole history/tree, so scanning all of it is the conservative,
+// destination-independent choice, with false positives waived via .leakgate-allow.
+const CHANGED = rawArgs.includes('--changed') && !STAGED;
 const COMMIT_MSG_PATH = (rawArgs.find((a) => a.startsWith('--commit-msg=')) ?? '').split('=').slice(1).join('=') || null;
+// BUG-236 — `--draft-waivers [<repo>]`: run the REPO-mode scan of <repo> (default: the
+// repo at cwd) and PRINT a draft `.leakgate-allow` line-waiver for every credential hit
+// that still fails. Each draft line starts with the DRAFT marker (empty reason), which parseAllowlist REFUSES by structure, so
+// nothing drafted takes effect until a human/agent writes the real reason (and stages it).
+// It never edits a file. The path arg here names the repo; it does NOT select TREE mode.
+const DRAFT = rawArgs.includes('--draft-waivers');
 const argPath = rawArgs.find((a) => !a.startsWith('--'));
-const TREE_MODE = Boolean(argPath);
+const TREE_MODE = Boolean(argPath) && !DRAFT;
 // FEAT-156 — the registered name(s) of the project the HOST resolved this repo
 // to via the registry (src/server/leak-gate-host.ts). The gate never derives a
 // project identity itself (ARCH-010); it only decides which PROJECT-kind tokens
@@ -148,7 +171,7 @@ if (TREE_MODE) {
   }
   files = walkTree(scanRoot);
 } else {
-  scanRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+  scanRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', cwd: DRAFT && argPath ? path.resolve(argPath) : process.cwd() }).trim();
   if (STAGED) {
     // ENFORCEMENT: the bytes to be committed are the STAGED INDEX. Enumerate the
     // paths git will record (Added/Copied/Modified/Renamed — a Deletion carries
@@ -176,6 +199,47 @@ if (TREE_MODE) {
       .filter((rel) => { const m = modeOf.get(rel); return m === '100644' || m === '100755'; });
     readBuf = (_abs, rel) => execFileSync('git', ['show', `:${rel}`],
       { cwd: scanRoot, encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+  } else if (CHANGED) {
+    // FEAT-169 — OUTGOING DELTA only (the agent commit guard). Fail CLOSED on any
+    // git error here: a scope we cannot enumerate is not one we can clear. We must
+    // also distinguish an UNBORN HEAD (first commit — scan everything, it is all
+    // outgoing) from a genuine rev-parse failure (corruption / not a repo — abort),
+    // because "treat a failure as unborn" would silently narrow to the whole tree
+    // on an error (leak-gate review finding 10).
+    let hasHead = false;
+    try {
+      execFileSync('git', ['rev-parse', '-q', '--verify', 'HEAD'], { cwd: scanRoot, stdio: ['ignore', 'ignore', 'pipe'] });
+      hasHead = true;
+    } catch (e) {
+      // `rev-parse -q --verify HEAD` exits 1 with NO stderr when HEAD is unborn;
+      // any stderr (or another exit code) is a real failure → abort, do not narrow.
+      const stderr = (e && e.stderr ? e.stderr.toString() : '').trim();
+      if (stderr) {
+        console.error(`LEAK GATE: ABORT — cannot resolve HEAD for --changed scope: ${stderr}`);
+        process.exit(2);
+      }
+      hasHead = false;
+    }
+    try {
+      if (!hasHead) {
+        // Unborn branch: the entire tree is the first commit's outgoing content.
+        files = execFileSync('git', ['ls-files', '-z', '-co', '--exclude-standard'], { cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+          .split('\0').filter(Boolean);
+      } else {
+        // Tracked files that differ from HEAD (staged OR unstaged), minus deletions
+        // (--diff-filter=ACMRT), UNION untracked-but-not-ignored. A rename surfaces
+        // the destination path (R); its source is a deletion and is excluded. NUL
+        // delimited so a newline in a path can never split one entry into two.
+        const tracked = execFileSync('git', ['diff', '--name-only', '--diff-filter=ACMRT', '-z', 'HEAD'], { cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+          .split('\0').filter(Boolean);
+        const untracked = execFileSync('git', ['ls-files', '-z', '-o', '--exclude-standard'], { cwd: scanRoot, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+          .split('\0').filter(Boolean);
+        files = [...new Set([...tracked, ...untracked])];
+      }
+    } catch (e) {
+      console.error(`LEAK GATE: ABORT — cannot enumerate the --changed outgoing set: ${e.message}`);
+      process.exit(2);
+    }
   } else {
     // -co --exclude-standard: tracked PLUS untracked-but-not-ignored files, so a
     // new file headed for the public tree is gated before it is ever `git add`ed.
@@ -237,23 +301,31 @@ let allowEntries = [];
   }
   if (text !== null) {
     const { entries, errors } = parseAllowlist(text);
-    if (errors.length) {
+    if (errors.length && DRAFT) {
+      // Drafting is advisory (it never passes anything): an invalid index allowlist is
+      // reported and IGNORED, so every credential hit gets a draft.
+      for (const e of errors) notes.push(`LEAK GATE: ${e}`);
+      notes.push(`LEAK GATE: draft mode — the index ${ALLOWLIST_FILE} is invalid and was ignored; drafting for every hit.`);
+    } else if (errors.length) {
       console.log(RAN_LINE);
       for (const e of errors) console.error(`LEAK GATE: ${e}`);
       console.error(`LEAK GATE: ABORT — ${errors.length} invalid ${ALLOWLIST_FILE} entr${errors.length === 1 ? 'y' : 'ies'}; nothing was waived and nothing passes until it is fixed (fail-closed).`);
       process.exit(2);
     }
-    allowEntries = entries;
-    notes.push(`LEAK GATE: ${ALLOWLIST_FILE} — ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} loaded from the git index.`);
-    if (STAGED && files.includes(ALLOWLIST_FILE)) {
+    if (!errors.length) allowEntries = entries;
+    if (!errors.length) notes.push(`LEAK GATE: ${ALLOWLIST_FILE} — ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'} loaded from the git index.`);
+    if (!errors.length && STAGED && files.includes(ALLOWLIST_FILE)) {
       notes.push(`LEAK GATE: NOTE — this commit ADDS/CHANGES ${ALLOWLIST_FILE}; its entries are part of what you are approving:`);
       for (const e of entries) {
-        notes.push(`LEAK GATE:   line ${e.lineNo}: ${e.token ? `[${e.token}]` : ''}${e.match ? ` match:<${e.match.length} chars>` : ''}${e.in ? ` in:${e.in}` : ' (every file)'} — ${e.reason}`);
+        notes.push(`LEAK GATE:   line ${e.lineNo}: ${e.token ? `[${e.token}]` : ''}${e.match ? ` match:<${e.match.length} chars>` : ''}${e.line ? ` line:${e.line}` : ''}${e.in ? ` in:${e.in}` : ' (every file)'} — ${e.reason}`);
       }
     }
   }
 }
 const allowUsed = new Map();
+
+/** BUG-236 — `--draft-waivers` output: one draft entry (or a NOT-waivable note) per hit. */
+const drafts = [];
 
 let hits = 0;
 let imgHits = 0;
@@ -337,6 +409,9 @@ for (const rel of files) {
     continue;
   }
   const lines = buf.toString('utf8').split('\n');
+  // BUG-236 — private-key material (a BEGIN…PRIVATE KEY block, header to END line,
+  // unterminated = to EOF) is never waivable; computed per file, no cap.
+  const pemLines = privateKeyLines(lines);
   lines.forEach((line, i) => {
     for (const hit of scanLine(line)) {
       const { token } = hit;
@@ -345,14 +420,17 @@ for (const rel of files) {
         allowedHits.push(`${rel}:${i + 1}: [${token}] ALLOWED — ${allowed.why}`);
         continue;
       }
-      // FEAT-156 — judged PER HIT: a waiver covers this one (token, value, path);
-      // every other hit on the same line is judged on its own. Waiver lines name
-      // the label + file:line only, never the matched value.
+      // FEAT-156 — judged PER HIT: a waiver covers this one hit; every other hit on
+      // the same line is judged on its own. Waiver lines name the label + file:line
+      // only, never the matched value. A credential waiver is keyed to this exact
+      // path + this full line (BUG-236), so the lookup gets the line and whether it
+      // is private-key material.
       if (ownTokens.has(token)) {
         ownWaived.push(`${rel}:${i + 1}: [${token}] own-project — this repo is the registered home of that project`);
         continue;
       }
-      const entry = allowlistEntryFor(allowEntries, rel, hit);
+      const pem = pemLines.has(i);
+      const entry = allowlistEntryFor(allowEntries, rel, hit, { line, pem });
       if (entry) {
         allowUsed.set(entry, (allowUsed.get(entry) ?? 0) + 1);
         listWaived.push(`${rel}:${i + 1}: [${token}] ${ALLOWLIST_FILE}:${entry.lineNo} — ${entry.reason}`);
@@ -360,7 +438,33 @@ for (const rel of files) {
       }
       hits++;
       perFile.set(rel, (perFile.get(rel) ?? 0) + 1);
-      emitHit(`${rel}:${i + 1}: [${token}] ${line.trim().slice(0, 160)}`);
+      const isCred = tokenKindOf(token) === 'credential';
+      const neverWaivable = isCred && (pem || token === PEM_TOKEN || rel.split('/').pop() === ALLOWLIST_FILE);
+      const fp = isCred && !neverWaivable ? credentialFingerprint(rel, line) : null;
+      // For a credential hit, print the copyable LINE waiver (sha256 of this exact path +
+      // this full line — never the secret; any edit to the line voids it), or say why it
+      // can never be waived.
+      const waiveHint = !isCred ? ''
+        : fp ? `  [to waive if a fixture (covers exactly this line in this file; any edit voids it): token:${token} line:${fp} in:${rel}]`
+          : '  [NOT waivable: private-key material or the allowlist file itself — remove it]';
+      // The fingerprint covers the WHOLE line, but only an excerpt is printed — so say so
+      // whenever the excerpt is not the whole line (long line / control characters such as
+      // a mid-line `\r` that a terminal would overwrite), so a reviewer never approves bytes
+      // they were not shown (plan review 6a1f32d0, concern 1).
+      const trimmed = line.trim();
+      const partial = isCred && (trimmed.length > 160 || /[\x00-\x08\x0b-\x1f\x7f]/.test(trimmed));
+      const reviewNote = partial ? `  [REVIEW THE FULL LINE: ${trimmed.length} chars, the excerpt above is partial/escaped — the waiver covers every byte]` : '';
+      if (DRAFT) {
+        drafts.push(fp
+          ? `# ${rel}:${i + 1} [${token}]${partial ? ` — LINE IS ${trimmed.length} CHARS / HAS CONTROL CHARS: read it in full before approving` : ''}\n${DRAFT_MARKER} token:${token} line:${fp} in:${rel} because:`
+          : isCred ? `# ${rel}:${i + 1} [${token}] NOT waivable (private-key material / the allowlist file) — remove it`
+            : tokenKindOf(token) === 'identity' ? `# ${rel}:${i + 1} [${token}] personal identity — NEVER waivable; remove it`
+              : `# ${rel}:${i + 1} [${token}] not a credential — if a false positive, waive with the token:/match: forms`);
+      }
+      const excerpt = isCred
+        ? trimmed.slice(0, 160).replace(/[\x00-\x08\x0b-\x1f\x7f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`)
+        : trimmed.slice(0, 160);
+      emitHit(`${rel}:${i + 1}: [${token}] ${excerpt}${waiveHint}${reviewNote}`);
     }
   });
 }
@@ -409,7 +513,17 @@ if (SCAN_IDENTITY) {
   }
 }
 
-const mode = TREE_MODE ? `TREE ${scanRoot}` : STAGED ? 'REPO (staged index)' : 'REPO (git-tracked)';
+if (DRAFT) {
+  // Draft mode prints ONLY the drafts (stdout, paste-ready) + a header; it is not a gate
+  // verdict, but it still exits 1 while any hit remains so it can never stand in for one.
+  console.log(`# ${ALLOWLIST_FILE} DRAFT — ${drafts.length} unwaived hit(s) in ${shown(scanRoot)}. Each credential entry covers exactly ONE line in ONE file.`);
+  console.log(`# Every entry starts with ${DRAFT_MARKER} and has an EMPTY reason: the gate REFUSES it as printed. To approve one, read the line,`);
+  console.log(`# write why it is not a live secret after \`because:\`, and delete the leading ${DRAFT_MARKER}. Then stage the file.`);
+  console.log('# A REAL secret must be removed (and rotated), never waived.');
+  for (const d of drafts) console.log(d);
+  process.exit(hits > 0 ? 1 : 0);
+}
+const mode = TREE_MODE ? `TREE ${scanRoot}` : STAGED ? 'REPO (staged index)' : CHANGED ? 'REPO (changed vs HEAD)' : 'REPO (git-tracked)';
 // Report the sanctioned waivers on EVERY run, pass or fail. A gate that quietly
 // stops looking at something is how the next leak ships.
 // stdout, not stderr: on a PASS this is the only trace of the exemption, and it
@@ -435,7 +549,11 @@ const failFooter = () => {
     `  - a false positive in THIS repo: add one line to ${allowPath} and STAGE it (only the git-index copy counts), e.g.`,
     '      token:<the label shown in [ ] above> in:<path glob> because: <why this is not a leak>',
     '    project and client names (and one exact personal-email address via match:) can be waived;',
-    '    home paths, username, handle and every credential shape can NEVER be waived.',
+    '    a credential shape can be waived ONLY narrowly — copy the `line:sha256:… in:…` form printed',
+    '    next to the hit above (a FINGERPRINT of this exact path + full line, never the secret; any',
+    '    edit to that line voids it) AND add a reason (for a documented example / fixture secret);',
+    `    \`node ${shown(GATE_FILE)} --draft-waivers <repo>\` prints those entries DRAFT-marked; the gate refuses them until the marker is removed and a reason written;`,
+    '    private-key (PEM) material, home paths, username and handle can NEVER be waived.',
     '  - this repo\'s OWN project name is exempt automatically when Orchard runs this gate for the',
     '    project registered at this path (dashboard commit / agent git write). A repo-local',
     '    `npm run gate` copy is only a preflight and does not know its project.',
@@ -448,7 +566,7 @@ if (hits > 0) {
     const CAP = 10;
     for (const l of hitLines.slice(0, CAP)) console.error(l);
     if (hitLines.length > CAP) {
-      console.error(`… (+${hitLines.length - CAP} more hit line(s) — for the full listing run, unpiped, from ${shown(scanRoot)}: node ${shown(GATE_FILE)}${STAGED ? ' --staged' : ''})`);
+      console.error(`… (+${hitLines.length - CAP} more hit line(s) — for the full listing run, unpiped, from ${shown(scanRoot)}: node ${shown(GATE_FILE)}${STAGED ? ' --staged' : ''}${CHANGED ? ' --changed' : ''})`);
     }
   } else {
     console.error('\n--- hits per file ---');

@@ -2,9 +2,12 @@
  * Claude Station server: static UI + JSON API + one WebSocket per live session.
  * Binds 127.0.0.1 only. Single user, no auth tier — deliberately out of scope.
  */
+import { recentIncidents } from './lane-incidents.ts';
+import { fmtMinutes } from './approval-deadline.ts';
 import * as http from 'node:http';
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as zlib from 'node:zlib';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -43,12 +46,12 @@ setPermanentGrantSource(reg.gitWritePermanentOf);
 // BUG-173 — the invocation-layer shim consults the SAME grant authority as the
 // FEAT-108 hook, over loopback, at call time. `evaluateGitWrite` is that one
 // authority; `runLeakGateForRepo` is the one leak gate a granted publish must pass.
-import { redeemGitWrite } from '../../scripts/lib/git-grant.mjs';
+import { redeemGitWriteAsync } from '../../scripts/lib/git-grant.mjs';
 // BUG-173 round 3 — the decide route authenticates the shim caller with a
 // host-minted per-process secret, so it is not an open localhost endpoint.
-import { isShimSecretValid } from '../../scripts/lib/git-shim-secret.mjs';
-import { runLeakGateForRepo } from './runtime/claude-runtime.ts';
-import { repoContentFingerprint } from './leak-gate-host.ts';
+import { isShimSecretValid, getShimBootId } from '../../scripts/lib/git-shim-secret.mjs';
+import { runLeakGateForRepoAsync } from './runtime/claude-runtime.ts';
+import { repoContentFingerprintAsync } from './leak-gate-host.ts';
 import * as rt from './runtime/runtime-update.ts';
 // FEAT-157 — base releases + the one target/notice policy (the container CLI pin left provision.json).
 import { applyBaseUpdate, baseRailItem, baseStatusOf, registerBaseOp } from './base-updates.ts';
@@ -199,8 +202,16 @@ function isCgroupScoped(pid: number): boolean {
 }
 
 function sendJson(res: http.ServerResponse, code: number, body: unknown): void {
-  const buf = Buffer.from(JSON.stringify(body, null, 2));
-  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
+  let buf = Buffer.from(JSON.stringify(body, null, 2));
+  const headers: http.OutgoingHttpHeaders = { 'content-type': 'application/json; charset=utf-8', vary: 'accept-encoding' };
+  // Remote clients (phone via `tailscale serve`) pay for every byte: session lists
+  // run to MBs of indented JSON and gzip ~10x. Local loopback clients are unaffected.
+  if (buf.length > 1024 && /\bgzip\b/.test(String(res.req?.headers['accept-encoding'] ?? ''))) {
+    buf = zlib.gzipSync(buf, { level: 6 });
+    headers['content-encoding'] = 'gzip';
+  }
+  headers['content-length'] = buf.length;
+  res.writeHead(code, headers);
   res.end(buf);
 }
 
@@ -305,9 +316,21 @@ function readGuidePage(file: string, name: string): { title: string; body: strin
  * renamable/deletable. A session in it may have run at that address or at bare
  * `/workspace` (workspaceRoot); handing the SDK the address reaches this very dir.
  */
-const declaredContainerStore: smut.DeclaredStoreLookup = (encodedDir) => {
+const declaredStore: smut.DeclaredStoreLookup = (encodedDir) => {
   const address = cm.containerStoreAddressOfDir(encodedDir);
-  return address ? { address, recordedCwds: [address, cm.CONTAINER_WORKSPACE] } : null;
+  if (address) return { address, recordedCwds: [address, cm.CONTAINER_WORKSPACE] };
+  /*
+   * BUG-243 — a project RELOCATED on disk. Its moved transcripts sit under the
+   * project's CURRENT store dir (`encodeCwd(hostPath)`) but still record the
+   * pre-move cwd, so the mismatch guard refuses pin/rename/delete. The registry
+   * owns the fact "this store dir belongs to project P, addressed by hostPath"
+   * (ARCH-010): when a registered project's current hostPath encodes to this
+   * dir, declare it with `ownsDir` so dir membership — not the stale recorded
+   * cwd — authorizes the mutation. hostPath encodes to the dir by construction,
+   * so the SDK targets exactly this store (the one the file sits in).
+   */
+  const owner = reg.listProjects().find((p) => hist.sdkEncodeDir(p.hostPath) === encodedDir);
+  return owner ? { address: owner.hostPath, recordedCwds: [owner.hostPath, ...reg.pastPathsOf(owner)], ownsDir: true } : null;
 };
 
 function sessionsForProject(p: reg.Project) {
@@ -1297,6 +1320,49 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
               b.hasBoard = true;
             }
           } catch { /* the stall surface must never break the board read */ }
+          /*
+           * BUG-239 — lanes Orchard bounded on the user's behalf, never silently:
+           * (1) a permission card overdue past its escalation (still answerable on
+           * the session — this card says where and when it will be refused), and
+           * (2) the persisted ledger's last 24 h: permissions refused for no answer
+           * and lanes that ended with background work outstanding. Computed fresh
+           * on every read; the ledger survives restarts (lane-incidents.ts).
+           * Rendered as the advisory `stall` kind (no new UI kind yet).
+           */
+          try {
+            const laneCards: board.BoardItem[] = [];
+            for (const s of liveSessionsForProject(id)) {
+              if (s.closed) continue;
+              for (const a of s.overdueApprovals()) {
+                laneCards.push({
+                  id: `perm-wait-${s.id}-${a.requestId}`,
+                  title: `⏳ ${a.lane} has waited ${fmtMinutes(a.waitedMs)} for your answer: ${a.what}`,
+                  owner: '⚠',
+                  status: 'stalled',
+                  sev: '',
+                  kind: 'stall',
+                  detail: a.expiresAt
+                    ? `Answer it in that session. If nobody answers by ${new Date(a.expiresAt).toLocaleTimeString()}, Orchard REFUSES it (never approves) and the lane reports it as blocked.`
+                    : 'Answer it in that session. This is the session\'s own request, so it waits for you and is never refused automatically.',
+                });
+              }
+            }
+            for (const inc of recentIncidents({ projectId: id })) {
+              laneCards.push({
+                id: `lane-incident-${inc.kind}-${inc.sessionId ?? ''}-${inc.agentId ?? ''}-${inc.at}`,
+                title: `${inc.kind === 'permission-expired' ? '⛔ Refused for no answer' : '⚠ Lane ended with work outstanding'}: ${inc.summary}`,
+                owner: '⚠',
+                status: 'stalled',
+                sev: '',
+                kind: 'stall',
+                detail: `${inc.detail ?? ''} (${new Date(inc.at).toLocaleString()}; shown for 24 h)`.trim(),
+              });
+            }
+            if (laneCards.length) {
+              b.needsYou = [...b.needsYou, ...laneCards];
+              b.hasBoard = true;
+            }
+          } catch { /* the lane-bounds surface must never break the board read */ }
           // FEAT-067: attach the rail's status summary LAST — after every merge
           // above — so its `focus` and counts reflect the exact lists the rail
           // will render (needsYou = decisions/asks/stalls; observations =
@@ -2027,7 +2093,6 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         // to match readSession's 916-entry space — which made the main route
         // disagree with the subagent route about what "a message" is and listed
         // empty bubbles. Renderable is what the client actually shows.
-        const counted = tx.countMessages(file, { includeToolResults });
         /*
          * ?before=K — page BACKWARD: the N messages ending just before absolute
          * index K. This is scroll-up on files ?offset cannot reach: skip the
@@ -2050,14 +2115,28 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         // unclamped `before` past the end relabelled the newest messages with indices that do
         // not exist (before=123 on a 3-message file answered 120..122). Only when the count is
         // exact — a lower-bound total on a huge file cannot say where the end is.
-        const before = beforeParam !== null ? intParam(beforeParam, counted.total, 0, counted.isLowerBound ? Number.MAX_SAFE_INTEGER : counted.total) : counted.total;
-        const maxTextChars = intParam(url.searchParams.get('maxTextChars'), 4000, 0, 200_000);
-        const r = beforeBytesParam !== null
-          ? tx.tailMessages(file, { limit: n, startByte: intParam(beforeBytesParam, fs.statSync(file).size, 0, Number.MAX_SAFE_INTEGER), includeToolResults, maxTextChars })
-          : tx.tailMessages(file, { limit: n, skip: Math.max(0, counted.total - before), includeToolResults, maxTextChars });
-        // The collected block sits at [before - len, before) in canonical space.
-        const base = Math.max(0, before - r.messages.length);
-        r.messages.forEach((m, i) => { m.index = base + i; });
+        // Reading view: ALWAYS full message text (BUG-234 r7). This route does not
+        // accept a caller-supplied `maxTextChars`, so it can never return a
+        // `truncated:true` block — the whole class of mid-fence cuts that rendered
+        // table source as raw <pre> is removed by construction. A cap lives only on
+        // non-reading callers (transcript.ts emptiness check), never here.
+        // BUG-245 r3 (F2): count and tail read ONE prefix — the tail is clamped to
+        // the count's snapshot, so `base = before - len` cannot label a message the
+        // count never saw (an append between the two used to shift every index).
+        const { counted, tail: r, extra: before, raced } = tx.countThenTail(file, { includeToolResults }, (c) => {
+          const b = beforeParam !== null ? intParam(beforeParam, c.total, 0, c.isLowerBound ? Number.MAX_SAFE_INTEGER : c.total) : c.total;
+          return {
+            extra: b,
+            tail: beforeBytesParam !== null
+              ? { limit: n, startByte: intParam(beforeBytesParam, c.snapshot.fileBytes, 0, Number.MAX_SAFE_INTEGER), includeToolResults }
+              : { limit: n, skip: Math.max(0, c.total - b), includeToolResults },
+          };
+        });
+        // The collected block sits at [before - len, before) in canonical space —
+        // EXCEPT past the 512 MiB ceiling, where the count is a floor and the newest
+        // messages cannot be numbered; labelBackwardPage marks those unnumbered
+        // rather than fabricating a colliding index (BUG-245 r3 Gap 2).
+        const base = tx.labelBackwardPage(r.messages, before, counted.isLowerBound);
         sendJson(res, 200, {
           sessionId, encodedDir, filePath: file,
           messages: r.messages,
@@ -2084,7 +2163,10 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // WHOLE session by the same count scan — a gate that never ran is
           // otherwise invisible on every turn (BUG-177).
           hookErrors: counted.hookErrors,
-          warnings: r.budgetExhausted ? [`tail scan stopped at its byte ceiling before collecting ${n} messages`] : [],
+          warnings: [
+            ...(r.budgetExhausted ? [`tail scan stopped at its byte ceiling before collecting ${n} messages`] : []),
+            ...(raced ? ['transcript was replaced or truncated during this read; indices may be stale — reopen'] : []),
+          ],
           tookMs: Date.now() - t0,
         });
         return true;
@@ -2097,7 +2179,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
        */
       const offset = intParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
       const limit = intParam(url.searchParams.get('limit'), 300, 1, 1000);
-      const t = tx.readForward(file, { offset, limit, includeToolResults, maxTextChars: intParam(url.searchParams.get('maxTextChars'), 4000, 0, 200_000) });
+      // Reading view: ALWAYS full text (BUG-234 r7). No caller-supplied cap, so a
+      // forward page can never return a truncated block.
+      const t = tx.readForward(file, { offset, limit, includeToolResults });
       const counted = tx.countMessages(file, { includeToolResults });
       // The forward budget caps how far into a huge file paging can reach; the
       // count does a full pass, so total is exact and larger. Say exactly how
@@ -2804,12 +2888,27 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     // lets it call THIS route (which still runs the full grant + leak gate), never
     // mint a grant; see git-shim-secret.mjs for the residual note.
     const shimAuth = typeof body.shimAuth === 'string' ? body.shimAuth : null;
+    // BUG-242 — the shim's per-boot nonce (baked next to the secret). NOT part of the
+    // auth decision; only used, strictly AFTER the fail-closed secret check below, to
+    // name the cause when a secret is rejected because it is STALE (a shim from a
+    // previous server boot) rather than forged.
+    const shimBootId = typeof body.shimBootId === 'string' ? body.shimBootId : null;
     if (!grantKey || !argv) {
       sendJson(res, 200, { allow: false, reason: 'git-shim decide: grantKey and argv[] required — failing closed' });
       return true;
     }
     if (!isShimSecretValid(shimAuth)) {
-      sendJson(res, 200, { allow: false, reason: 'git-shim decide: missing or invalid shim secret — failing closed' });
+      // BUG-242 — fail closed FIRST (the line above already decided deny), then pick
+      // the message. A shim baked by a previous boot presents that boot's nonce,
+      // which differs from this process's: say so, instead of the generic reason,
+      // so the cause (a restart, self-healing on the next tool call) is legible.
+      const stale = shimBootId && shimBootId !== getShimBootId();
+      sendJson(res, 200, {
+        allow: false,
+        reason: stale
+          ? 'git-shim decide: server restarted; this shim\'s secret is stale — it re-bakes to the new secret on the session\'s next tool call (BUG-242), then retry'
+          : 'git-shim decide: missing or invalid shim secret — failing closed',
+      });
       return true;
     }
     const p = reg.getProject(grantKey);
@@ -2819,13 +2918,14 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     // (no second claim, a publish gated once, at the write). Without a key, or with no
     // live window for this verb, it decides independently exactly as before.
     const windowKey = typeof body.windowKey === 'string' && body.windowKey ? body.windowKey : null;
-    const decision = redeemGitWrite({
+    const decision = await redeemGitWriteAsync({
       binding: windowKey,
       argv,
       projectKey: grantKey,
       sessionLabel,
-      runLeakGate: () => runLeakGateForRepo(repoPath),
-      repoFingerprint: () => repoContentFingerprint(repoPath),
+      // BUG-249 — the async gate runs the leak scan off the event loop.
+      runLeakGate: (scope) => runLeakGateForRepoAsync(repoPath, scope),
+      repoFingerprint: () => repoContentFingerprintAsync(repoPath),
     });
     if (decision.allow && decision.granted) {
       console.warn(`[orchard] git-write PERMITTED via invocation shim (subprocess) for project ${grantKey}: \`${decision.offender}\` — grant honoured (BUG-173, recorded PENDING; the shim confirms the real git outcome, BUG-184).`);
@@ -3220,7 +3320,7 @@ function notFound(res: http.ServerResponse, message: string): boolean {
 /**
  * GET /api/sessions/:sessionId/subagents            [?dir=<encodedDir>]
  * GET /api/sessions/:sessionId/subagents/:agentId/messages
- *       [?dir=&limit=&offset=&tools=1&maxTextChars=]
+ *       [?dir=&limit=&offset=&tools=1]
  *
  * Same `intParam` discipline as the main transcript route: `?limit=abc` is a
  * 400, never a silent full dump.
@@ -3291,23 +3391,28 @@ function handleSubagentRoute(
       const n = intParam(tailParam, 100, 1, 2000);
       const t0 = Date.now();
       const tools = url.searchParams.get('tools') === '1';
-      const counted = tx.countMessages(file, { entryFilter: tx.subagentEntryFilter, cacheKeySuffix: 'sub', includeToolResults: tools });
       const beforeParam = url.searchParams.get('before');
       // BUG-190: clamp to the real end. The block is labelled [before - len, before), so an
       // unclamped `before` past the end relabelled the newest messages with indices that do
       // not exist (before=123 on a 3-message file answered 120..122). Only when the count is
       // exact — a lower-bound total on a huge file cannot say where the end is.
-      const before = beforeParam !== null ? intParam(beforeParam, counted.total, 0, counted.isLowerBound ? Number.MAX_SAFE_INTEGER : counted.total) : counted.total;
-      const skip = Math.max(0, counted.total - before);
-      const r = tx.tailMessages(file, {
-        limit: n,
-        skip,
-        includeToolResults: tools,
-        maxTextChars: intParam(url.searchParams.get('maxTextChars'), 4000, 0, 200_000),
-        entryFilter: tx.subagentEntryFilter,
+      // BUG-245 r3 (F2): one prefix for count and tail (see the main tail route).
+      const { counted, tail: r, extra: before, raced } = tx.countThenTail(file, { entryFilter: tx.subagentEntryFilter, cacheKeySuffix: 'sub', includeToolResults: tools }, (c) => {
+        const b = beforeParam !== null ? intParam(beforeParam, c.total, 0, c.isLowerBound ? Number.MAX_SAFE_INTEGER : c.total) : c.total;
+        return {
+          extra: b,
+          tail: {
+            limit: n,
+            skip: Math.max(0, c.total - b),
+            includeToolResults: tools,
+            // Subagent reading view: ALWAYS full text (BUG-234 r7) — no caller cap.
+            entryFilter: tx.subagentEntryFilter,
+          },
+        };
       });
-      const base = Math.max(0, before - r.messages.length);
-      r.messages.forEach((m, i) => { m.index = base + i; });
+      // Past the 512 MiB ceiling the count is a floor; mark the newest messages
+      // unnumbered rather than fabricating a colliding index (BUG-245 r3 Gap 2).
+      const base = tx.labelBackwardPage(r.messages, before, counted.isLowerBound);
       sendJson(res, 200, {
         sessionId, encodedDir, agentId, filePath: file,
         messages: r.messages, mode: 'tail', offset: base, before,
@@ -3315,14 +3420,14 @@ function handleSubagentRoute(
         scannedMessages: counted.total, hasMore: base > 0,
         bytesRead: r.bytesRead, fileBytes: r.fileBytes,
         budgetExhausted: r.budgetExhausted, malformedLines: r.malformedLines,
-        warnings: [], tookMs: Date.now() - t0,
+        warnings: raced ? ['transcript was replaced or truncated during this read; indices may be stale — reopen'] : [], tookMs: Date.now() - t0,
       });
       return true;
     }
     const t = sub.getSubagentMessages(encodedDir, sessionId, agentId, {
       limit: intParam(url.searchParams.get('limit'), 300, 1, 2000),
       offset: intParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER),
-      maxTextChars: intParam(url.searchParams.get('maxTextChars'), 4000, 0, 200_000),
+      // Subagent reading view: ALWAYS full text (BUG-234 r7) — no caller cap.
       includeToolResults: url.searchParams.get('tools') === '1',
     });
     sendJson(res, 200, { ...t, mode: 'page', total: t.scannedMessages, totalIsLowerBound: t.budgetExhausted });
@@ -3447,7 +3552,7 @@ async function handleSessionMutation(
     }
     let target: smut.ResolvedSession;
     try {
-      target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredContainerStore);
+      target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredStore);
     } catch (err) {
       return sessionMutationFail(res, err);
     }
@@ -3489,7 +3594,7 @@ async function handleSessionMutation(
   }
   let target: smut.ResolvedSession;
   try {
-    target = smut.resolveSession(sessionId, patch.dir ?? url.searchParams.get('dir'), declaredContainerStore);
+    target = smut.resolveSession(sessionId, patch.dir ?? url.searchParams.get('dir'), declaredStore);
   } catch (err) {
     return sessionMutationFail(res, err);
   }
@@ -3553,7 +3658,7 @@ async function handleSessionPin(
   }
   let target: smut.ResolvedSession;
   try {
-    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredContainerStore);
+    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredStore);
   } catch (err) {
     return sessionMutationFail(res, err);
   }
@@ -3605,7 +3710,7 @@ async function handleSessionClose(
   }
   let target: smut.ResolvedSession;
   try {
-    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredContainerStore);
+    target = smut.resolveSession(sessionId, url.searchParams.get('dir') ?? (typeof body.dir === 'string' ? body.dir : null), declaredStore);
   } catch (err) {
     return sessionMutationFail(res, err);
   }
@@ -5758,6 +5863,9 @@ ensureDir(dataDir());
   }
   if (lock.waitedMs >= 200) console.log(`[orchard] data dir lock taken after waiting ${(lock.waitedMs / 1000).toFixed(1)}s for the previous server to exit`);
 }
+// BUG-245 r3 (F3): persist transcript fold states under the (now locked) data dir,
+// so a cold open of a previously-counted session resumes instead of re-scanning.
+tx.enableCountPersistence(path.join(dataDir(), 'transcript-index'));
 /*
  * ARCH-022 — container lifecycle RECOVERY, right after the data-dir claim and before anything can admit a
  * session (the outbox below can start one): persisted leases and every session exec still running in a
@@ -5805,6 +5913,10 @@ server.listen(PORT, HOST, () => {
   console.log(`[orchard] data dir: ${dataDir()} (${dataDirMode() === 'isolated' ? 'ISOLATED — explicit CLAUDE_STATION_DATA' : 'SHARED default — this is the real data dir, session hosts here may be the user\'s'})`);
   console.log(`[orchard] templates seeded: ${JSON.stringify(seedResult)}`);
   console.log(`[orchard] projects registered: ${reg.listProjects().length}`);
+  // BUG-247 round 4: if the boot runtime proof was cut short (a timeout under a
+  // frozen/throttled cold boot), re-run it once now that we are serving, so new
+  // host sessions are admitted before anyone clicks. No-op when it already passed.
+  rt.scheduleRuntimeRecheck();
   /*
    * FEAT-015 re-adopt. A prior server may have been restarted while driving
    * `direct` sessions whose CLI was launched to survive (its own systemd scope +

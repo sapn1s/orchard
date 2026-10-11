@@ -118,7 +118,9 @@ sentence — lead with the line they decide on.
   CHANGED in the world: shipped/committed/filed/deployed (never text I wrote you).
 - **a decision** — `orchard-ask` it is YOURS: a choice, question, approval or an
   action only you can take; lead with my recommendation, then `confidence:`
-  high/med/low and `decider:` (taste/priority/spend/risk/direction) · `orchard-judgment` it
+  high/med/low, `decider:` (taste/priority/spend/risk/direction) and optional
+  `evidence:` (what it rests on — N + source, and whether refuted) ·
+  `orchard-judgment` it
   was MINE: the call and why, including where I got it wrong.
 - **the work** — `orchard-status` where it stands as this turn ENDS (running,
   next, blocked, or nothing needs you) · `orchard-narration` what I am doing
@@ -415,6 +417,18 @@ because they are three subordinate clauses of one sentence. Shaped:
 Same argument, same alternatives, same prices. This is the case the shape had to
 survive, and it is the case it helps most: four options with the cost in the same
 slot is the ARCH-005 prototype's own structure.
+
+**The `orchard-ask` header fields.** Below the recommendation, an ask declares
+up to three fields the parser recognises:
+- `confidence:` high/med/low — your confidence in the recommendation.
+- `decider:` the user-held thing (taste/priority/spend/risk/direction) that makes
+  the call theirs. Without a nameable decider it is not an ask (WA §A).
+- `evidence:` (OPTIONAL) — what the recommendation rests on (N and source), and
+  whether it was independently refuted. This is WA §A's "a recommendation is a
+  claim — vet it like code" made legible in the ask itself: a recommendation the
+  user will act on should name its evidence base and whether it survived a
+  refutation. Optional for now, so older replies that omit it still parse and
+  still pass the gate.
 
 **3. `orchard-judgment` — where the reasoning IS the content.** The original
 argues that a cheap model would have relayed four bad reports as successes, in a

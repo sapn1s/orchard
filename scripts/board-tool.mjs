@@ -728,7 +728,7 @@ async function verbUpdate(root, flags) {
 
 /* ────────────────────────────────────────────────────────── verified (record) */
 
-const VERIFIED_FLAGS = ['id', 'provider', 'model', 'run', 'verdict', 'work-state', 'author', 'note', 'rev'];
+const VERIFIED_FLAGS = ['id', 'provider', 'model', 'run', 'verdict', 'work-state', 'author', 'note', 'rev', 'candidate'];
 
 /**
  * `verified` — the ONE writer of an independent-verification entry (BUG-225 r3).
@@ -752,7 +752,7 @@ async function verbVerified(root, flags) {
   const { readTicket, appendNote, assertFresh, currentRev } = api;
   const id = assertId(flags.get('id'), '--id');
 
-  for (const k of ['verdict', 'author', 'model', 'run', 'note', 'provider']) {
+  for (const k of ['verdict', 'author', 'model', 'run', 'note', 'provider', 'candidate']) {
     if (flags.has(k) && /[\r\n\u2028\u2029]/.test(String(flags.get(k)))) {
       throw new Refusal('multi-line', `verified: --${k} must be a single line`);
     }
@@ -776,6 +776,17 @@ async function verbVerified(root, flags) {
   const note = flags.has('note') ? String(flags.get('note')).trim() || null : null;
   if (note && note.length > 300) throw new Refusal('bad-note', 'verified: --note must be at most 300 characters');
   const author = flags.has('author') ? String(flags.get('author')).trim() || null : null;
+  // FEAT-170: the verdict is BOUND to the frozen candidate it verified (the hash
+  // independent-verify --candidate printed). It must be a full hash that THIS repo's
+  // candidate store can reproduce — a typo or a foreign hash binds to nothing.
+  let candidate = null;
+  if (flags.has('candidate')) {
+    candidate = String(flags.get('candidate')).trim().toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(candidate)) throw new Refusal('bad-candidate', `verified: --candidate ${JSON.stringify(flags.get('candidate'))} is not a full 64-hex candidate hash`);
+    const CS = await import('./lib/candidate-store.mjs');
+    try { CS.loadCandidate(CS.repoInfo(root).store, candidate); }
+    catch (e) { throw new Refusal('unknown-candidate', `verified: --candidate ${candidate.slice(0, 12)} cannot be reproduced from this repo's candidate store — ${e.message}`); }
+  }
 
   await assertNoLeak([
     { label: '--model', text: model },
@@ -798,6 +809,7 @@ async function verbVerified(root, flags) {
     author: author ?? `dispatch ${provider}`,
     recorded_by: 'board-tool',
     harness: 'scripts/independent-verify.mjs',
+    ...(candidate ? { candidate } : {}),
     ...(note ? { note } : {}),
   };
   const probs = VS.entryProblems(entry);

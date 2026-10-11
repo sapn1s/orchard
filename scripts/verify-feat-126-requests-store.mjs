@@ -53,6 +53,7 @@ process.env.CLAUDE_STATION_DATA = scratch;
 
 const requests = await import(path.join(ROOT, 'src', 'server', 'requests.ts'));
 const view = await import(path.join(ROOT, 'public', 'lib', 'requests-view.js'));
+const board = await import(path.join(ROOT, 'src', 'server', 'board.ts'));
 
 /* ─────────────────────────── 1. the Dispatch `request=` key ─────────────── */
 
@@ -308,6 +309,48 @@ T('a request with no tickets degrades to "no tickets yet", not an error', () => 
   const [r] = view.joinRequests([{ id: 'REQ-0', title: 'Nothing filed', tickets: [] }], { board: boardWith({}), snap: null });
   assert.equal(r.completion.kind, 'none');
   assert.equal(view.completionLabel(r.completion), 'no tickets yet');
+});
+
+/* ─── FEAT-126 finding 3b — a ticket Done >24h ago reads `done`, NOT `missing`,
+      proven against the REAL board (this repo's docs/bugs/), with the must-FAIL
+      anchored to the fixed PRE-FIX payload shape (a board with no `doneIds`). ─── */
+
+T('FINDING 3b (server half): readBoard exposes EVERY Done id — doneIds ⊇ doneToday, against the real docs/bugs/ board', () => {
+  const real = board.readBoard(ROOT);
+  assert.ok(real.hasBoard, 'the real docs/bugs/ board must load');
+  assert.ok(Array.isArray(real.doneIds), 'readBoard must populate board.doneIds');
+  const doneTodayIds = new Set(real.doneToday.map((x) => x.id));
+  for (const id of doneTodayIds) assert.ok(real.doneIds.includes(id), `doneToday ${id} must also be in doneIds`);
+  const older = real.doneIds.filter((id) => !doneTodayIds.has(id));
+  // The whole point of 3b: there ARE Done tickets older than 24h (not in doneToday).
+  // If the real board ever had none, the finding would be untestable here — fail loudly.
+  assert.ok(older.length > 0, 'the real board must carry Done tickets older than 24h for this finding to be exercised');
+});
+
+T('FINDING 3b (join): a real Done>24h ticket reads `done` WITH doneIds and `missing` WITHOUT it (must-FAIL on the pre-fix payload)', () => {
+  const real = board.readBoard(ROOT);
+  const doneTodayIds = new Set(real.doneToday.map((x) => x.id));
+  const target = real.doneIds.filter((id) => !doneTodayIds.has(id))[0]; // genuinely Done >24h ago
+  assert.ok(target, 'need a real Done>24h ticket to exercise 3b');
+
+  // WITH the fix (the real payload now carries doneIds): the ticket indexes as done.
+  const idx = view.indexBoardTickets(real);
+  assert.equal(idx.get(target)?.state, 'done', `real Done>24h ticket ${target} must index as done`);
+  const [row] = view.joinRequests([{ id: 'REQ-3b', title: 'landed', tickets: [target] }], { board: real, snap: null });
+  assert.equal(row.completion.kind, 'done');
+  assert.equal(row.ticketStates[0].state, 'done');
+
+  // MUST-FAIL baseline: the PRE-FIX board payload carried NO doneIds. Synthesize that
+  // exact shape directly by dropping the field — a fixed baseline, not a moving ref.
+  // The same ticket then falls into no list and reads `missing`, exactly the bug.
+  const preFix = { ...real };
+  delete preFix.doneIds;
+  const preIdx = view.indexBoardTickets(preFix);
+  assert.ok(!preIdx.has(target), `pre-fix (no doneIds) must NOT index ${target} — this is what made the test non-vacuous`);
+  const [preRow] = view.joinRequests([{ id: 'REQ-3b', title: 'pre', tickets: [target] }], { board: preFix, snap: null });
+  assert.notEqual(preRow.completion.kind, 'done');
+  assert.equal(preRow.completion.missing, 1);
+  assert.equal(preRow.ticketStates[0].state, 'missing');
 });
 
 /* ─────────────────────────── 5. PARTIAL / TRUNCATED read tolerance ────────── */

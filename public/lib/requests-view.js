@@ -51,13 +51,11 @@
  * A ticket in none of these is absent from the rail board (open tickets and
  * done-today only) — reported honestly as `missing`, never a fabricated status.
  *
- * NOTE (FEAT-126 r1 finding, PARTIAL): `answeredAwaiting` is now indexed (it used
- * to read `missing`). The OTHER half — a ticket VERIFIED/Done more than 24h ago —
- * is NOT in any list this payload carries (`doneToday` is gated to 24h by
- * readBoard), so it still reads `missing`. Closing that needs the SERVER board
- * payload to expose all Done ids regardless of recency (board.ts, off-limits this
- * lane); the hunk is recorded on the ticket. Once the payload carries e.g.
- * `board.doneIds`, add `for (const id of board?.doneIds ?? []) …` here.
+ * FEAT-126 (finding 3b, LANDED): both halves are now closed. `answeredAwaiting`
+ * is indexed (it used to read `missing`), and a ticket VERIFIED/Done more than 24h
+ * ago — which `doneToday` (24h-gated by readBoard) does not carry — is indexed
+ * from `board.doneIds`, the full Done-id set the server payload now exposes. A
+ * done ticket therefore reads `done`, never a fabricated/`missing` status.
  */
 export function indexBoardTickets(board) {
   const map = new Map();
@@ -68,6 +66,11 @@ export function indexBoardTickets(board) {
   };
   // done first so a done ticket is never masked by a stale open row of the same id.
   add(board?.doneToday, 'done');
+  // FEAT-126 (3b): doneToday is gated to 24h by readBoard, so a ticket verified
+  // >24h ago is in no list above and would read `missing`. board.doneIds carries
+  // every Done id regardless of recency; index them as `done` (ids only, no item
+  // body) so the completion join is honest, never masking a richer doneToday row.
+  for (const id of board?.doneIds ?? []) if (id && !map.has(id)) map.set(id, { state: 'done', item: { id } });
   add(board?.answeredAwaiting, 'answered');
   add(board?.needsYou, 'needs');
   add(board?.inflight, 'prog');

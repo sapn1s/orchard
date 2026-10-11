@@ -185,6 +185,16 @@ export interface Board {
   queued: BoardItem[];
   doneToday: BoardItem[];  // Done rows whose ticket file changed in the last 24h
   /**
+   * FEAT-126 (finding 3b) — the ids of ALL Done rows, regardless of recency.
+   * `doneToday` is gated to the last 24h so a stale Done row does not read as
+   * fresh in the rail; but a reader that only needs to know a ticket IS done
+   * (the "Your requests" completion join, `requests-view.js`) was reading a
+   * ticket verified >24h ago as `missing` because it appeared in no list. This
+   * carries every Done id so that join reports `done` honestly. Ids only — the
+   * rail still renders `doneToday` for the "recently" section. Optional on the
+   * wire so older callers that never set it still typecheck. */
+  doneIds?: string[];
+  /**
    * FEAT-067 — the rail's status summary, DERIVED live from the (fully merged)
    * board by `boardSummary`. Attached by the board GET route AFTER every merge
    * (decisions/findings/stalls folded into needsYou) so it indexes exactly the
@@ -754,7 +764,7 @@ function ticketFileIndex(dir: string): Map<string, string> {
  */
 export function readBoard(hostPath: string): Board {
   const dir = boardDir(hostPath);
-  const empty: Board = { hasBoard: false, needsYou: [], observations: [], answeredAwaiting: [], inflight: [], queued: [], doneToday: [] };
+  const empty: Board = { hasBoard: false, needsYou: [], observations: [], answeredAwaiting: [], inflight: [], queued: [], doneToday: [], doneIds: [] };
   let index: string;
   try {
     if (!fs.statSync(dir).isDirectory()) return empty;
@@ -763,7 +773,7 @@ export function readBoard(hostPath: string): Board {
     return empty; // no docs/bugs/ or no INDEX.md — no board
   }
 
-  const board: Board = { hasBoard: true, needsYou: [], observations: [], answeredAwaiting: [], inflight: [], queued: [], doneToday: [] };
+  const board: Board = { hasBoard: true, needsYou: [], observations: [], answeredAwaiting: [], inflight: [], queued: [], doneToday: [], doneIds: [] };
   let section: 'open' | 'done' | null = null;
   const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
   const files = ticketFileIndex(dir);
@@ -834,6 +844,11 @@ export function readBoard(hostPath: string): Board {
       const file = ticketFile(dir, id);
       let recent = false;
       try { recent = !!file && fs.statSync(file).mtimeMs >= dayAgo; } catch { /* gone */ }
+      // FEAT-126 (3b): record EVERY Done id, regardless of recency, so a reader
+      // that only needs "is this done?" (the requests-view completion join) does
+      // not read a ticket verified >24h ago as `missing`. `doneToday` stays the
+      // 24h-gated list the rail's "Done recently" section renders.
+      board.doneIds!.push(id);
       if (recent) board.doneToday.push({ id, title, owner: '', status: 'done', sev: '' });
     }
   }

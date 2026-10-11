@@ -1754,21 +1754,13 @@ const recencyKey = (x) => {
   return String(submit ?? x?.lastActivityAt ?? '');
 };
 function orderedSessions(s) {
-  // The session the user is CURRENTLY in leads its own group's recency tail, so
-  // opening or switching to a session makes it the top row and it is never
-  // something to re-hunt for on the next switch (the reported "keep refinding
-  // when switching until i page reload"). This is a TRANSIENT ordering tier, not
-  // a durable recency stamp: it follows state.current, so switching away lets the
-  // previous session fall straight back to its true last-user-submit recency (no
-  // accumulation), and an AGENT frame — which never changes state.current — can
-  // never move the list, preserving the "only my own action reorders" property.
-  // It sits BELOW an explicit pin (a pin is a stronger, durable "keep at top"
-  // choice) and is reload-consistent because the open session is restored from
-  // the URL before this runs.
-  const isOpen = (x) => state.current.sessionId != null
-    && x?.sessionId === state.current.sessionId
-    && x?.encodedDir === state.current.encodedDir;
-  const rank = (x) => (api.pinnedOf(x) ? 0 : (isOpen(x) ? 1 : 2));
+  // Order is pinned block first, then everything else by recency (last user
+  // submit) desc. Plain SELECTION never moves a row — the open session keeps its
+  // recency slot rather than being promoted to the top of its group (BUG-180);
+  // the selection highlight is carried independently by `aria-current` in
+  // sessionRow. Only a real human submit (stampUserSubmit) re-sorts; agent frames
+  // leave the order untouched.
+  const rank = (x) => (api.pinnedOf(x) ? 0 : 1);
   return (s.list ?? []).slice().sort((a, b) => rank(a) - rank(b)
     || recencyKey(b).localeCompare(recencyKey(a)));
 }

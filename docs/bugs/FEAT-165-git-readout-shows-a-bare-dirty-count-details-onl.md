@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-10-05",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -44,7 +44,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "8faf47b6-09c0-4f66-afb4-34d35e464760",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:58:57.626Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "git.ts:169-176 prefers worktree code over index: rename RM renders M (not R), add AM renders M (not A); busy popover runs off-screen at 900x420. Author suite could not run in room (no .git); rests on synthetic-git adversarial"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -97,3 +110,6 @@ This reverses part of the FEAT-139 round-3 design, which deliberately moved the 
 ### 2026-10-06 — worker (verifying r1)
 
   - **Live smoke (read-only, Playwright headless, running service on 127.0.0.1:4317).** Git project with changes (claude-station/orchard, 441 changed): chip face shows green +96,466 / red −4,029 and the styled popover lists 200 per-file rows with green add / red del spans (addColor srgb≈0.35,0.43,0.26; delColor srgb≈0.56,0.28,0.21), branch "main · up to date", "Open Git panel". Screenshot docs/bugs/assets/SMOKE-live-git-bar-changes.png. Also captured: FEAT-164 Decide card A/B/C (SMOKE-live-feat164-decide.png). No page errors; nothing clicked that mutates; write + git-write-grant routes blocked at the browser as a safety net.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 8faf47b6-09c0-4f66-afb4-34d35e464760 — VERDICT: BROKEN — git.ts:169-176 prefers worktree code over index: rename RM renders M (not R), add AM renders M (not A); busy popover runs off-screen at 900x420. Author suite could not run in room (no .git); rests on synthetic-git adversarial. Typed entry in the record's verification[]; this line is an echo, not proof.

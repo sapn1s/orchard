@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-09-02",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -25,15 +25,47 @@
     "Verification suites that create sessions and assert on the sidebar keep asserting against a NON-empty list, because provenance is settable/defaulted, not keyed on the caller."
   ],
   "code_refs": [
-    { "path": "src/lib/session-provenance.mjs", "symbol": "resolveStartedBy", "note": "Write-once record store + conservative pre-existing Dispatch-line fallback; self-contained (no .ts import) so the dispatch subprocess can record too." },
-    { "path": "src/server/index.ts", "symbol": "GET /api/projects/:id/sessions", "note": "Joins startedBy onto each row via loadProvenanceMap (once per request)." },
-    { "path": "src/server/agent-bridge.ts", "symbol": "AgentSession system:init", "note": "Records StartOptions.startedBy (default 'user') at init." },
-    { "path": "scripts/dispatch.mjs", "symbol": "dispatchAnthropic/dispatchOpenai", "note": "Records 'agent' when the dispatched session id is known." },
-    { "path": "public/app.js", "symbol": "visibleSessions", "note": "Folds non-live agent-started rows into 'N more'; live/open bypass via alwaysIds." }
+    {
+      "path": "src/lib/session-provenance.mjs",
+      "symbol": "resolveStartedBy",
+      "note": "Write-once record store + conservative pre-existing Dispatch-line fallback; self-contained (no .ts import) so the dispatch subprocess can record too."
+    },
+    {
+      "path": "src/server/index.ts",
+      "symbol": "GET /api/projects/:id/sessions",
+      "note": "Joins startedBy onto each row via loadProvenanceMap (once per request)."
+    },
+    {
+      "path": "src/server/agent-bridge.ts",
+      "symbol": "AgentSession system:init",
+      "note": "Records StartOptions.startedBy (default 'user') at init."
+    },
+    {
+      "path": "scripts/dispatch.mjs",
+      "symbol": "dispatchAnthropic/dispatchOpenai",
+      "note": "Records 'agent' when the dispatched session id is known."
+    },
+    {
+      "path": "public/app.js",
+      "symbol": "visibleSessions",
+      "note": "Folds non-live agent-started rows into 'N more'; live/open bypass via alwaysIds."
+    }
   ],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "a0c4faa8-fd4c-4e34-b73e-6a2ea28417b5",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:01:23.197Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -206,3 +238,9 @@ predicate and every row shows again; the recorded JSON is harmless if left.
   pre-existing stray `.py` files at repo root (adversarial_twosided_*.py mtime
   2026-08-29, verify_brake_adv.py mtime 2026-08-28 — both PREDATE this 2026-09-02
   session, never committed, not in this change's file list). My files scan clean.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run a0c4faa8-fd4c-4e34-b73e-6a2ea28417b5 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify (verifying, round 1): BROKEN run a0c4faa8-fd4c-4e34-b73e-6a2ea28417b5 (two-break)
+BREAK (GENUINE NEW DEFECT — send back to fixing): `looksAgentDispatched` folds+labels 'agent' any no-record HUMAN session whose first message merely starts with "Dispatch:" + one declared field + prose (e.g. a human typing "Dispatch: ticket=BUG-123 please look…") — a real FALSE-HIDE of the user's own conversation, the exact harm this ticket exists to prevent; criterion #5 requires the verbatim four-field line but the code accepts a partial one. Same property breaks via two paths (partial first line; a full machine line quoted on a non-first line) → two-break. Also: a malformed provenance JSON file makes `record` return false forever, silently falling back to the content heuristic. Left OPEN for a fixing round.

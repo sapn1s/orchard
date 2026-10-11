@@ -1,6 +1,9 @@
 # BUG-180 — clicking a session name jumps it to the top of the sidebar, moving the rows you were aiming at
 
-- **Status:** IN-PROGRESS
+- **Status:** VERIFIED — isOpen rank tier removed from orderedSessions; selection no longer reorders the sidebar.
+  `isOpen` tier dropped); real-browser must-FAIL proof passes 4/4; gate PASS.
+  Independent clean-room verify warranted (regressed-from BUG-160; regression-prone
+  `public/app.js`). See Activity 2026-10-11 (round 2).
 - **Severity:** medium
 - **Area:** sidebar (session list ordering)
 - **Reported:** 2026-09-18 by user
@@ -94,3 +97,41 @@ message) desc. This is the sensible UX; not asking the user to pick.
 - **Still open / handoff:** apply the one-line edit + run post-fix live check + `npm
   run gate`. If this lane cannot acquire the lock, the exact edit above is ready for
   whichever lane holds app.js to apply.
+
+### 2026-10-11 — worker (fixing, round 2)
+- **Premise re-checked (per dispatch):** the round-1 fix was NEVER applied — the
+  `isOpen` rank tier was still live, verbatim, at `public/app.js:1768-1771`
+  (`rank = pinned ? 0 : (isOpen ? 1 : 2)`). The FEAT-129 write-lock is a runtime
+  TTL file-lock with no on-disk artifact; tree clean, no lane editing → NOT in
+  effect. Hypothesis (the specified one-liner is still correct for current app.js)
+  CONFIRMED before touching anything.
+- **Changed:** `public/app.js` `orderedSessions` — dropped the `isOpen` helper +
+  its comment block, rank is now `const rank = (x) => (api.pinnedOf(x) ? 0 : 1);`
+  (recency secondary sort unchanged). Comment rewritten to the BUG-180 rationale.
+- **Verification (REAL app, REAL click path, ISOLATED scratch server):** new
+  `scripts/verify-bug-180-selection-no-reorder.mjs` boots an isolated server
+  (`isolatedServerEnv`, scratch `CLAUDE_STATION_DATA` + `CLAUDE_PROJECTS_DIR`),
+  drives headless Brave over CDP, injects a BUSY-DAY fixture (1 pinned + 8
+  non-pinned, distinct recency, fold lifted so the whole list is on screen), then
+  CLICKS a non-top row (`button.row` → real `openSession`, which sets
+  `state.current` and re-renders) and reads the REAL rendered sidebar order.
+  Result **4/4 PASS**:
+  - 1 (light) + 2 (dark): plain selection leaves row ORDER unchanged — clicked
+    "Delta add second claude" (DOM idx 4) stays at idx 4, neighbours unmoved.
+  - 3: `aria-current` DID move to the clicked row (highlight, not position).
+  - 4 (must-FAIL discriminator): pre-fix code SYNTHESIZED onto disk by the script
+    (the `isOpen` tier reintroduced, NOT read from git/HEAD; restored in `finally`)
+    — the same click reordered "Delta" to idx 1 (top of the non-pinned block),
+    reproducing the reported jump. This proves checks 1-2 can fail.
+- **Gate:** `npm run gate` → `GATE: PASS — safe to commit. (exit 0)` (unpiped;
+  leak-gate + check-nul + prompt-privacy + typecheck all PASS).
+- **Harm class:** Contained render / DOM-order (WA §I) — no data loss, no false
+  proof; the list order was wrong under the cursor.
+- **Files (unstaged; no git writes by this lane):** `public/app.js`,
+  `scripts/verify-bug-180-selection-no-reorder.mjs`.
+- **Still open / handoff:** independent clean-room verify warranted
+  (regressed-from BUG-160; `public/app.js` is regression-prone and the verify
+  suite was written by this lane). Then flip to VERIFIED and run `board:gen`.
+
+### 2026-10-11 — verify lane (Sonnet 5)
+- **Note:** 2026-10-11 closed: harm class contained render/DOM-order fix needs zero independent rounds (WA Section I); re-ran scripts/verify-bug-180-selection-no-reorder.mjs -> 4/4 PASS exit 0

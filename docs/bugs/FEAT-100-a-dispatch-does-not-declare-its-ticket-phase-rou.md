@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-08-21",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -29,7 +29,19 @@
   "code_refs": [],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "run_id": "66be7c95-e391-47a7-afbe-41debba34495",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:50:44.721Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -120,3 +132,9 @@ No UI. The concern is spend, and a dashboard to watch spending is the wrong firs
                    Dispatch: ticket=FEAT-100 phase=finding round=2 class=explore
 
   node scripts/cost-collect.mjs --ticket=FEAT-100 reads both back out of the agent CLI own transcripts and resolves all four fields as (declared) on both lanes, with the finding and verifying phases separated. Note the inferred column on both now reads ticket=- : neither charter mentions the id anywhere except the declaration line, and declaration lines are stripped before inference, so there is genuinely nothing a pre-FEAT-100 reader could have concluded. That is the honest answer, and it is what the earlier FEAT-099 pair would have shown too had the strip existed when they ran.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5-5 run 66be7c95-e391-47a7-afbe-41debba34495 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify DRIVER (round 1, class=verify) — VERDICT: BROKEN
+- **Note:** Independent clean-room (anthropic claude-opus-5-5, run 66be7c95-e391-47a7-afbe-41debba34495) over the FEAT-100 diff (seed-sources-injected endpoints to clear the BUG-182 boot-stub refusal on the dangling pre-seed-sources fix commit 327a1e4). Fixer suite verify-feat-100-declared-dispatch.mjs re-run EXIT 0, but 7 defects found OUTSIDE the fixture. TWO-BREAK on parse-robustly: (B1) a Dispatch: line NOT on the first line is still read as a live declaration; (B2) an indented 4-space quoted example below a valid first-line decl creates a conflict that destroys the real decl; (C1) a ~~~ line inside a ``` fence toggles inFence off so a fenced example is read live; (D1) a CRLF charter's decl line fails DECL_LINE_RE (. does not match \r) and is silently dropped; (E1) round=0x3 is coerced to 3 by Number() instead of rejected; (A1) two disagreeing decls merge per-field (keep phase/round) instead of dropping the whole declaration. FUNCTIONAL break (F1): rollUp attributes only by primary_ticket, so a lane declaring ticket=BUG-907,BUG-908 puts ALL cost/hours on BUG-907 and BUG-908 is absent from per-ticket attribution — violates success criterion 'per-ticket attribution, unattributable work its own bucket not dropped'. Left OPEN; fixer (not this lane) to repair.

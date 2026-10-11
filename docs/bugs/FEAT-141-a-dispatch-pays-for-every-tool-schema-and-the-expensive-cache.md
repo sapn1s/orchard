@@ -1,6 +1,6 @@
 # FEAT-141 — Every dispatch pays for tool descriptions it never uses, and for the expensive cache
 
-- **Status:** IN VERIFICATION — BUILT and self-verified (43/43). Opt-in and OFF by default — no existing caller changes until one asks for a profile. Independent verification REQUIRED before VERIFIED.
+- **Status:** VERIFIED — independent clean-room verify HOLDS (anthropic/opus-4.8, run 14a0c6c3); full is inert, monitor restricts tools + forces 5m cache + notice, unknown profile refused pre-launch.
 - **Severity:** med
 - **Area:** dispatch CLI (`scripts/dispatch.mjs`) / cost
 - **Reported:** 2026-09-10 by a cost-measurement lane (dispatched)
@@ -211,3 +211,9 @@ attacking: whether `full` is *genuinely* byte-identical to the old command line
 for every flag combination (a regression there would silently affect every other
 project this repo serves), and whether the `monitor` tool set is missing anything
 the corpus used only once.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 14a0c6c3-f8f5-43d9-9957-8b39c0720688 — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane (Opus 4.8)
+- **independent clean-room verify (round 1, verifying):** closed: independent verify HOLDS run 14a0c6c3-f8f5-43d9-9957-8b39c0720688

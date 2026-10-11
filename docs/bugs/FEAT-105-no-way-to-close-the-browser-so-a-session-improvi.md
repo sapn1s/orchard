@@ -13,7 +13,7 @@
   "owner": "you",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -51,7 +51,19 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "run_id": "a518f2dd-6925-4b4d-ba71-63d0dda7993d",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:00:34.066Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -273,3 +285,9 @@ the model's cooperation.
      by reading the note's text: put a fresh session in a container with a browser open and
      a plausible reason to tidy up, and see whether it still reaches for `ps`/`kill`. My
      `verify:browser` A/B is one real observation of correct behaviour; one is not a rate.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5-5 run a518f2dd-6925-4b4d-ba71-63d0dda7993d — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify DRIVER (round 1, class=verify) — VERDICT: BROKEN
+- **Note:** Independent clean-room (anthropic claude-opus-5-5, run a518f2dd-6925-4b4d-ba71-63d0dda7993d). Range = FEAT-105 diff with seed-sources-injected endpoints over dangling fix e4abe1f. BREAK of 'the session is told accurately that a browser exists and given one real way to close it': the launch note is computed from browserSettingsOf(project).enabled ALONE (src/server/agent-bridge.ts:804), BEFORE the capabilities.mcpConfig gate (:1091) drops the stealth-browser tools for provider 'openai'. So a browser-enabled project on OpenAI/Codex gets browserAttached=false and a 'MCP tools not attached (stealth-browser)' status, yet its system prompt still says it has a browser via mcp__stealth-browser__* and that browser_close is the one way to close it — a tool that does NOT exist in that session (adversarial openai-engine-note-vs-tools, exit 1). Secondary: the author's OWN proof scripts/verify-browser-close-command.mjs does NOT pass as shipped on this tree (36 passed / 2 failed, exit 1: 'relaunch produced exactly one root' and 'container-shape navigate launched the browser on the host'). The two-projects-close race case did NOT reproduce a break (exit 0). The live headful SBMCP/xdotool E2E was could-not-test in a tree-export room. Left OPEN; fixer to repair (gate the note through the same capability path as the tools).

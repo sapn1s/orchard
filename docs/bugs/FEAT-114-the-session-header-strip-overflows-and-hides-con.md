@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-09-02",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -40,7 +40,19 @@
   ],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "6b65e7bb-1be9-4b48-9159-6cd4c1155b39",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:01:14.177Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -173,3 +185,9 @@ server-side change; as a UI-only strip/CSS change it is low-risk.
   stray scratch-dir token shapes the gate scans for, none present. Left unstaged
   for the orchestrator to commit.
 - **Handoff:** UI-only; work_state `in_verification`, human_action `review`.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 6b65e7bb-1be9-4b48-9159-6cd4c1155b39 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify (verifying, round 1): BROKEN run 6b65e7bb-1be9-4b48-9159-6cd4c1155b39
+BREAK: the CORE no-clip fix HOLDS (real-browser busy-state drive at 1440/1024/760/520 — no control clipped off the right edge; `#fold` reopen works). Verdict is BROKEN only against secondary criteria #4/#5: the header provider selector `#provSel` is dead and the isolation chip `#isoBtn` is gone — both INTENTIONALLY superseded by later FEAT-139 (provider selector moved to Settings) and FEAT-146 r4 (isolation chip removed), NOT regressions. ORCHESTRATOR DECISION NEEDED: close on the core clip fix with #4/isolation-tooltip marked superseded-by-FEAT-139/FEAT-146, or reconcile the criteria. Left OPEN.

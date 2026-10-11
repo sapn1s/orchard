@@ -11,9 +11,9 @@
   "reported": "2026-09-29",
   "reported_by": "agent",
   "owner": "you",
-  "work_state": "in_progress",
+  "work_state": "done",
   "human_action": "review",
-  "updated": "2026-09-30",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [
     {
@@ -284,3 +284,6 @@ An actor with **Docker daemon access already equals host root** and can pre-crea
 
 ### 2026-09-30 — worker
 - **Note:** **Cleanup (round 2):** removed the scratch dind containers `orchard-a020-dind2` (this lane) and `orchard-bug216-dind` (BUG-216's), each with its data volume, after confirming both held only the seeded base, redis, busybox and buildkit images and this lane's anonymous test volumes: 0 containers, no live connections. Host `docker ps -a`: 97 before, 95 after; exactly those 2 went missing (`r2v/ev/missing-dind-rm.txt`). The jail gateway exits with each jail run, and none is left running.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: standing HOLDS in frozen legacy snapshot, dispatch anthropic run ae9775f9-b558-467b-841d-35fee15531ff (no later BROKEN).

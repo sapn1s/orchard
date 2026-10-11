@@ -11,9 +11,9 @@
   "reported": "2026-09-29",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "in_progress",
+  "work_state": "done",
   "human_action": "review",
-  "updated": "2026-09-29",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -261,3 +261,6 @@ The same data-loss path was also armed inside a suite. `verify-feat-112-services
 
 ### 2026-09-30 — worker
 - **Note:** **Cleanup (by the ARCH-020 verifying lane):** `orchard-bug216-dind` was removed with its data volume after confirming it held nothing but seeded images and that lane's own test volumes (0 containers, no live connections). ARCH-020 round 2 re-ran `verify-bug-216-sweep-ownership.mjs` on an isolated daemon: 22/22.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: standing HOLDS in frozen legacy snapshot, clean-room round-3 run 0b0c48bd-c20b-4837-a918-adb66ac56309 (no later BROKEN). Needs service restart to be live.

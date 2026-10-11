@@ -1,6 +1,6 @@
 # FEAT-139 — one Settings home, with a Machine · Project · Session scope spine
 
-- **Status:** IN-PROGRESS
+- **Status:** DONE — Settings scope spine shipped; closed under WA §J.
 - **Severity:** medium
 - **Area:** drawer / server (global-settings) / sidebar / styles
 - **Reported:** 2026-09-07 by user (via orchestrator)
@@ -944,3 +944,6 @@ gitignored `feat139-*.png` screenshots at repo root. Runtime CSS/theme tweaks we
 browser-injected and reverted.
 
 **Risk bucket:** routine UI review; no independent clean-room pass warranted.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: user-facing design ticket; independent design-critic round-3 verdict 'ships as-is' (fresh-context), log entry 2026-09-23.

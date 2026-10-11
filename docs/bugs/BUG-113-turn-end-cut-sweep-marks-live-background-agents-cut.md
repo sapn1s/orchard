@@ -11,9 +11,9 @@
   "reported": "2026-08-19",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-08-20",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -54,7 +54,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "c2f36f10-c912-4d56-9a7b-6fe3226b7852",
+      "verdict": "holds",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:32:24.294Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "carrier-tree range over commit 1c2eb52 (settleCutAgents->nominateCutAgents/settleCutAgentsAgainst). No fixer behavioral test existed; verifier built 2 adversarial harnesses incl real server snapshotOfSession, 12+ cases, all PASS."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -186,3 +199,6 @@ Widening the sweep's exclusion too far leaves a genuine zombie row spinning fore
   one named above: that no path settles a row without a qualifying snapshot.
 - **Still open / handoff:** none for this ticket. An independent pass is warranted before closing, since
   this is regression-prone display-of-liveness code (`regressed-from: BUG-030`).
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run c2f36f10-c912-4d56-9a7b-6fe3226b7852 — VERDICT: HOLDS — carrier-tree range over commit 1c2eb52 (settleCutAgents->nominateCutAgents/settleCutAgentsAgainst). No fixer behavioral test existed; verifier built 2 adversarial harnesses incl real server snapshotOfSession, 12+ cases, all PASS.. Typed entry in the record's verification[]; this line is an echo, not proof.

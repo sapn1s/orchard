@@ -111,3 +111,9 @@ the first is the dangerous one.
   spirit — the transcript readers each independently decide "what counts as a
   message" and silently drop everything else, so a NEW record type is invisible
   until someone notices. Worth a look if a third record type gets dropped this way.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 85bc5028-58fd-4b51-841b-e3a87a9fdaa3 — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane
+- **closed:** 2026-10-11 closed: independent verify HOLDS run 85bc5028-58fd-4b51-841b-e3a87a9fdaa3 (anthropic/claude-opus-4-8, clean room). countMessages(file).hookErrors surfaces the roll-up: totalRecords/crash-vs-reported classification, grouping with per-turn counts, capped per-occurrence refs with parentUuid; clean session → 0. Adversarial truncation+delta+cap case passed (partial-read does not throw/miscount). Out-of-scope/untested: >512MiB ceiling-floor, sidecar-persistence cross-process resume, client banner DOM (no browser).

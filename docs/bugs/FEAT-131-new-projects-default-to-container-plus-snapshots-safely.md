@@ -1,6 +1,6 @@
 # FEAT-131 — new projects default to container isolation (+ snapshots), safely
 
-- **Status:** IN VERIFICATION — awaiting independent verify
+- **Status:** VERIFIED — new projects default to container isolation (+snapshots), falling safe to direct; independent clean-room verify HOLDS (run cdc07b6d). Residual: real UI/systemd path untested, judged non-blocking.
 - **Severity:** medium
 - **Area:** server (registry / snapshots / project creation)
 - **Reported:** 2026-09-06 by orchestrator dispatch
@@ -175,3 +175,9 @@ projects are never touched.
 Changed the Status word from the unmappable `IMPLEMENTED` to the recognised
 `IN VERIFICATION` (per orchestrator decision), keeping "awaiting independent verify".
 Fixes a `board:check` UNMAPPABLE STATUS failure; no diagnosis or scope change.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run cdc07b6d-fad5-41c2-babe-227b24d5f49d — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify (verifying, round 1)
+- **Note:** closed: independent verify HOLDS run cdc07b6d-fad5-41c2-babe-227b24d5f49d. Every fail-safe branch forced and proven (cross-device/non-reflink -> direct naming reflink; dead docker socket + missing bin -> direct, no throw, project still created; explicit isolation bypasses preflight; existing projects never re-resolved; new silent project -> container, dockerSocket=false; 0 leftover probe artifacts). RESIDUAL could-not-test (room cannot boot the service): real UI POST /api/projects end-to-end + systemd --user DOCKER_HOST inheritance; optional live-server spot check would close it.

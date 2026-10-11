@@ -142,3 +142,6 @@ calls `.click()` on the `undefined` neighbor header and throws.
   small exit-0 property wrapper (suite reached the full assertion set, no timeout/TypeError) and
   re-dispatch a clean-room verify against that wrapper as `--run`. The SEAL-chip product leak itself
   stays a real BUG-106/BUG-196 finding, routed there. INDEX untouched (orchestrator-owned).
+
+### 2026-10-11 — verify sweep (dispatched)
+- **needs orchestrator decision:** 2026-10-11 verify sweep: confirmed state unchanged — verify-bug-106-crossproject-strip.mjs runs the full assertion set, 32/33, exit 1; the single FAIL is the real BUG-106 SEAL-chip leak (routed to BUG-106), kept red by design. independent-verify cannot emit VALID+HOLDS for a suite that exits 1 by design (two prior INVALIDs on record), so there is no verdict to record. Test-harness-only change (VERIFY.md zero clean-room rounds). NEEDS the orchestrator decision from the 2026-09-29 handoff: accept the test-only zero-round exemption and close on the before/after evidence, or land an exit-0 property wrapper and re-verify. Not closed here.

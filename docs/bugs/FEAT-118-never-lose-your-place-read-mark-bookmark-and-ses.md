@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-09-02",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -40,7 +40,19 @@
   ],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "df53f6c1-4c0a-43a0-a14c-5844807434fb",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:01:25.194Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -321,3 +333,9 @@ See the Activity log for build and verification detail.
   `feat118-r2-set-light.png`, `feat118-r2-context-light-set.png`,
   `feat118-r2-set-dark.png`, `feat118-r2-context-dark-set.png`. Browser closed; the
   test bookmark and dark-theme toggle were reverted, leaving the app as found.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run df53f6c1-4c0a-43a0-a14c-5844807434fb — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify (verifying, round 1): BROKEN run df53f6c1-4c0a-43a0-a14c-5844807434fb
+BREAK: core read-mark/bookmark/unread markers HOLD (round-1 `.set` collision gone — `.marked` 26px pill; bookmark cycle; `.settled.new` distinct; current-project died marker). One load-bearing finding: a session that died in a NON-current expanded project renders `.settled.new` ("just finished, unread") instead of a stopped/died marker, violating criterion #5 ("unknown fate never renders as finished") — but this was ALREADY DISCLOSED as a known follow-up in the round-1 Activity log (`refreshOutcomes`/`outcomes.ts` scope to the current project). Committed marks suite is STALE (`.set`→`.marked`, `.unread`→`.settled.new`) and needs updating regardless. ORCHESTRATOR DECISION NEEDED: accept the disclosed cross-project limitation, or require the fix. Left OPEN.

@@ -1,6 +1,6 @@
 # FEAT-153 — the Needs-You panel is a ticket-board grid, current session first
 
-- **Status:** IN-PROGRESS
+- **Status:** VERIFIED — independent clean-room verify HOLDS (run 1b9a8b63-55d5-43eb-bb00-0260f54a53b1); rail board grid 35/35 + fuzz adversarial 16/16.
 - **Severity:** medium
 - **Area:** rail (public/app.js, public/styles.css, public/index.html)
 - **Reported:** 2026-09-26 by the maintainer
@@ -626,3 +626,9 @@ needs-you item.
   All captured; board `item` is not rendered; `dockIsForeign()` is over-captured
   (harmless, safe direction — extra repaint never a missed one). No omitted input.
 - **Verdict:** claim CONFIRMED. No defects.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 1b9a8b63-55d5-43eb-bb00-0260f54a53b1 — VERDICT: HOLDS — rail board grid: fixer 35/35 + fuzz adversarial 16/16 (seeded random board mutation over real 5s polls); zero-mutation idle, badge snap transitions, poisoned board all clean. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — closed
+- 2026-10-11 closed: independent verify HOLDS run 1b9a8b63-55d5-43eb-bb00-0260f54a53b1

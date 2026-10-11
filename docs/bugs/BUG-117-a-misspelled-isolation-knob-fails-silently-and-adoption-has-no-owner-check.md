@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -95,7 +95,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "openai",
+      "model": "codex-default",
+      "run_id": "01a12af8-6633-7d61-98c7-4dcdb9392478",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:40:54.572Z",
+      "author": "agent",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "CLAUDE_STATON_DATA (1-letter typo, missing I) bypasses misspelledDataDirVars (substring match on 'STATION' fails) and boots healthy into shared mode; confirmed by code read. Also reported: ownerEntitlesAdoption ignores dataDir; symlink escapes cleanupHostFiles confinement. Left open."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -232,3 +245,6 @@ An ownership check that keys on the wrong identity breaks legitimate re-adoption
   - **Anti-regressions:** `npm run verify:hosts-cleanup` 17/17 against a real `claude` CLI — normal open/close cycles still tidy up and `hostsDir()` ends completely empty, so the confinement is not a no-op; it also shows `t-` host keys live. `npm run gate` exit 0 (read directly, unpiped) before each commit.
   - **Still open — NOT closing this.** An independent clean-room pass has still not been run, and today strengthened rather than weakened the case for one: the class of defect fixed here (a destructive path that bypassed the gate) was found only because a sub-agent tripped it against the live session, not because the suite looked for it. What it should attack: other callers that pass attacker/accident-controlled paths from record bodies into destructive calls; whether `ownerEntitlesAdoption`'s owner-less→production-port rule is right for a shared-dir boot that is not the service; and the honesty of the new suite's non-vacuity checks.
   - **Process error to declare:** commit `afdbc6d` staged all of `docs/CONVENTIONS.md` and so swept in a concurrent ARCH-010 lane's uncommitted section under a BUG-117 message. Content is correct and appears exactly once; only the attribution is wrong. Not rewritten, because rewriting shared history while other lanes hold uncommitted work is the larger risk.
+
+### 2026-10-11 — agent
+- **Verification recorded:** dispatch openai/codex-default run 01a12af8-6633-7d61-98c7-4dcdb9392478 — VERDICT: BROKEN — CLAUDE_STATON_DATA (1-letter typo, missing I) bypasses misspelledDataDirVars (substring match on 'STATION' fails) and boots healthy into shared mode; confirmed by code read. Also reported: ownerEntitlesAdoption ignores dataDir; symlink escapes cleanupHostFiles confinement. Left open.. Typed entry in the record's verification[]; this line is an echo, not proof.

@@ -1,6 +1,6 @@
 # BUG-186 — a working-tree clean-room verify shows the verifier the ticket's own refutations
 
-- **Status:** OPEN
+- **Status:** DONE — diff scope-2 route verified; closed under WA §J.
 - **Severity:** high
 - **Area:** verification tooling (`scripts/independent-verify.mjs`)
 - **Reported:** 2026-09-24 by FEAT-152 round-4 fixing lane (from the round-3 commissioner's note)
@@ -589,3 +589,6 @@ defect; `--working-tree` just makes it happen every time.
 
 ### 2026-10-02 — BUG-186 round-8 verifying lane
 - **Verification recorded:** dispatch openai/codex run 01a0f932-dd81-7c23-8eca-f6be0fdb34c2 — VERDICT: HOLDS — scope 2 (diff route) HELD; the earlier BROKEN for this run was BUG-120's room-containment scope in the shared combined dispatch, not the diff route. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: standing HOLDS in board verification-ledger, run 01a0f932-dd81-7c23-8eca-f6be0fdb34c2 (HOLDS after prior BROKENs; verified=true).

@@ -1,6 +1,6 @@
 # BUG-226 — the orchestrator profile blocks ListAgents, the lane-liveness read
 
-- **Status:** IN-PROGRESS — fix built + self-verified; independent clean-room pass warranted (see Activity log). Takes effect at the service's next restart, for newly launched sessions only.
+- **Status:** IN-VERIFICATION — round-4 source (GIT_ALLOWED_SUBCOMMANDS + resolveGitSubcommand) now has a passing enforcement test: `verify-orchestrator-enforcement.mjs` rewritten to the allow-list API (was crashing on the removed ENFORCE_DENIED_GIT_SUBCOMMANDS import), 297/0/0 incl. real-corpus grading. Independent clean-room pass warranted (PreToolUse gate). Takes effect at the service's next restart, for newly launched sessions only. See Activity log 2026-10-11 (test rewrite).
 - **Severity:** medium (it blocks a check the Working Agreement REQUIRES, so the orchestrator cannot confirm a lane's liveness from ground truth)
 - **Area:** hooks / orchestrator profile
 - **Reported:** 2026-10-01 by the orchestrator (via the user)
@@ -549,3 +549,59 @@ ORCH-BYPASS audit ledger at `~/.local/share/claude-station/orch-bypass-audit/`):
 Independent plan review dispatched to a SEPARATE top-tier process before building — its job: find a
 read/search shape (git or curl, quoted or global-option-shielded) this allow-list still permits, or a real
 orchestrator workflow it breaks.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **verify blocked — half-finished:** 2026-10-11 verify sweep: NOT VERIFIED — HALF-FINISHED. Round-4 source landed (GIT_ALLOWED_SUBCOMMANDS + resolveGitSubcommand in scripts/lib/orchestrator-profile.mjs; ENFORCE_DENIED_GIT_SUBCOMMANDS removed) but the designated fixer test scripts/verify-orchestrator-enforcement.mjs still imports the removed ENFORCE_DENIED_GIT_SUBCOMMANDS (line 35) and references zero round-4 symbols, so it crashes on load (SyntaxError: no such export) and cannot run. The round-4 test update described in the fixing-round-4 plan was never landed. A fixer must bring the test to the round-4 API before any clean-room verify. Not verified; left open.
+
+### 2026-10-11 — enforcement-test rewrite to the round-4 allow-list API (Opus 4.8 fix lane)
+- **Context:** the 2026-10-11 verify sweep (entry above) left the suite crashing on
+  load — it still imported the removed `ENFORCE_DENIED_GIT_SUBCOMMANDS` and read it at
+  the old line 373 (`…includes('show') && …includes('diff')`). The round-4 test update
+  the fixing-round-4 plan specified was never landed. This lane landed it.
+- **Changed (one file): `scripts/verify-orchestrator-enforcement.mjs`**
+  1. Import: dropped `ENFORCE_DENIED_GIT_SUBCOMMANDS`; added `GIT_ALLOWED_SUBCOMMANDS`
+     and `resolveGitSubcommand`.
+  2. New section 5b (replaces the old one-line deny-list assertion): the DUAL allow-list
+     property — the content/tree readers (show, cat-file, grep, blame, ls-files, ls-tree,
+     whatchanged, stash, archive, format-patch, reflog, notes, config) are ABSENT from
+     GIT_ALLOWED_SUBCOMMANDS (default-deny refuses them); the status/ref reads and
+     commit-side verbs are PRESENT; `resolveGitSubcommand` resolves past the round-3
+     `-c core.pager=cat` / `-C <dir>` shields to the real subcommand. Asserted against
+     the real `decideBashCommand` end-to-end (show / pager-shield / ls-tree / bare diff /
+     log -p refused; log --oneline / diff --stat allowed).
+  3. MUST-FAIL / non-vacuity: a SYNTHESIZED broken allow-list (readers re-added) is
+     modelled and shown to WOULD-allow `git show HEAD:x` (and the pager-shielded form),
+     proving the real refusal rests on `show`'s ABSENCE and the guard is not vacuous;
+     the broken list still refuses a genuinely-unlisted subcommand.
+  4. Section 6b oracle refinement (this was in round-4's OWN plan — "refine readsViaGit
+     so git diff --stat/summary forms are NOT a read" — and had never landed): `readsViaGit`
+     now classifies `git diff`/`git log` by their flags (content/patch forms = read;
+     content-free `--stat`/`--name-only`/`--oneline` = NOT a read), adds the tree readers,
+     and reuses `resolveGitSubcommand` for shield-robust subcommand detection. This is
+     DISTINCT from BUG-185's oracle shape-robustness ($()/pipe-node-e/echo-arg prose) —
+     a different defect in the same file, left untouched. Added matching section-6c
+     non-vacuity probes.
+- **regressed-from: BUG-226 (round 4).** Round 4 landed the source (content-free `git diff`
+  now allowed) but not the two paired test updates (the allow-list assertion + the
+  `readsViaGit` alignment). The import crash MASKED the oracle drift: once the import was
+  fixed the suite surfaced 8 real-corpus mismatches — all content-free `git diff --stat` /
+  `--cached --name-only` commands the policy correctly allows but the stale oracle flagged
+  as reads. Both are now closed.
+- **Verified (real output, this machine 2026-10-11):**
+  - must-FAIL / non-vacuity: the synthesized broken allow-list WOULD allow `git show`
+    (both bare and pager-shielded) — the guard bites. PASS.
+  - full suite: `node scripts/verify-orchestrator-enforcement.mjs` → **PASS — 297 passed,
+    0 failed, 0 skipped**, exit 0. Real corpus graded: 2631 calls since 2026-08-18, 749
+    Bash (337 allowed / 412 refused); 111 gate/board commands (72 pure, all allowed, 39
+    refused as compound reads/non-gate work); 355 file-read/tree-search commands, all
+    refused. (Before this lane: SyntaxError on load, suite could not run; after the import
+    fix alone: 286/2 — the 2 being the oracle drift fixed in item 4.)
+  - `npm run gate` → PASS, exit 0 (leak-gate + check-nul + prompt-privacy + typecheck).
+- **Verified-by:** (pending) — this is a PreToolUse enforcement gate; independent
+  clean-room verify warranted per the ticket's verification-class. Flag: generation was
+  its own only verifier for this test rewrite.
+- **Still open / handoff:** independent clean-room HOLDS on the round-4 allow-list + this
+  test; then the service restart to take effect for newly launched sessions.
+
+### 2026-10-11 — agent
+- **Verification recorded:** dispatch openai/codex-default run 01a12af2-e490-7f50-a7f4-3c4725fb23bb — VERDICT: BROKEN — decideBashCommand allows git diff --no-index --exit-code (prints content, wrongly treated as summary-only) and curl -s file:sample.txt (scheme-less, bypasses non-http check); confirmed live. Left open.. Typed entry in verification-ledger.json; this line is an echo, not proof.

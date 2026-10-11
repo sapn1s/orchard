@@ -169,3 +169,9 @@ typed text; navigate away and the optimistic node is gone and only the re-read
   briefing tail wording (collapse-whole vs mis-split); a user message containing the literal `⟦ ⟧`
   sentinel chars; a briefing whose tail is truncated by transcript rotation.
 - **Verified-by:** NOT ADDED — harness did not run; no dispatch run id exists to cite.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 3f94972a-8289-43e4-9e7c-b578bf6bafd9 — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane
+- **Note:** 2026-10-11 independent verify BROKEN run 3f94972a-8289-43e4-9e7c-b578bf6bafd9 (anthropic/claude-opus-4-8, clean room, server-half diff): fixer test passes, but legacyBriefingSplit (public/app.js) uses an unguarded lastIndexOf('[station] This is a server-recorded fact'); a legacy follow-up whose OWN words quote that phrase mis-splits — boundary lands inside the user's text, collapsing the entry to a chip with the user's words swallowed and NO bubble (ADV-B body===''). Resurrects the exact symptom, violates expected #1/#3. Fix owed: guard the legacy heuristic. Leaving OPEN; not fixing (verify lane).

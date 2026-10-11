@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-09-05",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -36,7 +36,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "80493c4b-888f-4dc4-a3fd-88c28abf942c",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:27:54.856Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "BROKEN: parseArchiveIndex (migrate-tickets.mjs:1408/1410) stops at the first non-pipe line w/o parseError, so a comment or blank line mid-table silently drops dozens of prior rows (exit 0); same-sha re-promotion overwrites the original archived date. 3-gen incremental merge HOLDS."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -171,3 +184,6 @@ diff at all.
   promotion itself left it in the newly-merged (multi-date) shape — i.e. two
   successive incremental promotions — to confirm the merge is stable across
   generations, not just once. Left at `in_verification`.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 80493c4b-888f-4dc4-a3fd-88c28abf942c — VERDICT: BROKEN — BROKEN: parseArchiveIndex (migrate-tickets.mjs:1408/1410) stops at the first non-pipe line w/o parseError, so a comment or blank line mid-table silently drops dozens of prior rows (exit 0); same-sha re-promotion overwrites the original archived date. 3-gen incremental merge HOLDS.. Typed entry in the record's verification[]; this line is an echo, not proof.

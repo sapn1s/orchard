@@ -155,3 +155,6 @@ Two gaps in the FEAT-116/FEAT-139 provider-usage crown chip (`#usageBtn`):
 - **Still open:** independent verification of r2 owed (class=fix). Not verified: real
   pointer feel in a headed browser (headless CDP only); 12h vs 24h clock follows the
   browser locale (headless shows "3:24 AM").
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run dc5ea043-3fd8-47a7-905f-0aa79d581381 — VERDICT: BROKEN — zero-crossing: tickUsageCountdown->refreshUsage loop floods /api/usage (~3722 req/4s) against the 60s-cached maxed window; also fmtCountdown rounds instead of floors (face 2d 5h vs 2d 4h); post-reset face still renders danger-maxed. Typed entry in verification-ledger.json; this line is an echo, not proof.

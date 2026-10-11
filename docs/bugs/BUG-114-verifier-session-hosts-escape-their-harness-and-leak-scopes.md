@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -87,7 +87,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "94f5a6d9-d5e3-4751-ac74-1d3c18bc283e",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:27:47.693Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "BROKEN: isolated server's ownerEntitlesAdoption (survival.ts:472) blindly entitles every record; dropDeadSurvivorHost/reapHost SIGTERM a shared-owned h- host it never spawned. Fixer suite 17/17 re-run green; adversarial reused-pid guard HOLDS."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -256,3 +269,6 @@ The proof is a real suite run, before and after, counting scopes and `(deleted)`
   - **FINDING, measured and not hidden — the in-suite restart window.** Rebooting a new isolated server on the SAME scratch data dir 257 ms after killing the old one, well inside a 15 s grace, did NOT save a background-holding host: it was force-drained at ~18.0 s (≈ `ABANDON_MS` + `ORPHAN_GRACE_MS`). Mechanism: `adoptSurvivingHosts()` re-adopts via `reapHost()`, which is SIGTERM only and attaches no client; the broker's recorded owner is the dead OLD server's pid, and `orphaned()` keys off (dead recorded owner) + (no client), neither of which a new server booting on the same data dir changes. So the re-adopting server's IDENTITY is not enough — only a real client re-attaching within the grace saves such a host, and re-adoption never attaches one. This cannot bite production, where a shared-owned host returns `orphaned()===false` unconditionally; it is specific to isolated verification servers, whose hosts are test hosts by construction. Recorded as a documented residual of the shipped design.
   - **Could not test:** a live client re-attach to a still-draining survivor, because the design has no such path — the `survivingHostForSdkSession` resume guard deliberately refuses a second resume onto a draining transcript. That arm is proven by the negative measurement plus code reading, not by a positive live attach.
   - **Still open — NOT closing this.** No independent clean-room pass has been run. Per the standing high-stakes rule this is session-lifecycle and data-loss adjacent, and the suite's author is also its only verifier, so it should not be relied on as the regression gate until a fresh-context pass has attacked it. What that pass should probe: whether case 3's "measured and reported" check can ever fail (it passes on either branch by construction, which is defensible for a measurement but must not be mistaken for a guard); whether the `backgroundLifetime` precondition can silently degrade into a vacuous pass if the CLI stops registering background work; and the leak-count assertion's relaxation from exact equality to "count did not increase".
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 94f5a6d9-d5e3-4751-ac74-1d3c18bc283e — VERDICT: BROKEN — BROKEN: isolated server's ownerEntitlesAdoption (survival.ts:472) blindly entitles every record; dropDeadSurvivorHost/reapHost SIGTERM a shared-owned h- host it never spawned. Fixer suite 17/17 re-run green; adversarial reused-pid guard HOLDS.. Typed entry in the record's verification[]; this line is an echo, not proof.

@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "open",
   "human_action": "none",
-  "updated": "2026-10-02",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -53,6 +53,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "legs 2/3/4/5 derive expectations from the same runtime COLLAPSED_BLOCKS the renderer folds by, so a folded-ask/status regression still passes; leg7 caption match vacuous; leg1 regex passes comment-only/shadowed import"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "1a1416db-a7a3-4b55-b2fb-daf977865aca",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:01:10.508Z",
+      "author": "verify sweep (dispatched)",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "leg1 Stop-hook module identity still vacuous: rbCall regex matches a commented-out legacy importFirst line while the hook loads a private copy (13x, suite green); one-module walk only scans response-blocks.* so alt-named copy escapes. Legs 2-7 held vs grammar mutations."
     }
   ],
   "verification_class": "fix",
@@ -178,3 +190,9 @@ Do NOT edit the legs to pass green without first establishing they are stale exp
 - **Gate:** `npm run gate` → PASS (leak-gate PASS, check-nul PASS, typecheck PASS). `npm run board:check` → exit 0 ("OK — no drift").
 - **Not marking VERIFIED.** This is a regression-prone fix already refuted once; per the Working Agreement it needs a fresh independent clean-room pass (not this lane). The attack to re-run: confirm each leg still reddens against a REAL served mutated generation (the suite now does this for folded-ask + wrong-caption; an independent pass should also try status-folded and narration-open, and confirm leg 1 rejects a planted private copy).
 - **Symptom of a deeper design flaw?** Unchanged from round 1 — still the recurring "a check pins/derives a value the product evolves" shape across the FEAT-091 family; round 2 fixes the specific instance by (a) pinning the DOCUMENTED contract as a literal and (b) proving non-vacuity against a real grammar mutation rather than a self-authored data object. Flagging for the human/orchestrator to decide on an ARCH; not filing from this lane.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **verify BROKEN:** 2026-10-11 independent clean-room verify (anthropic, run 1a1416db) VERDICT BROKEN (VALID). Round-2's fixed-oracle partition/caption legs (2-7) HELD against grammar mutations (fold orchard-status, open narration, rename status caption all reddened correctly). But leg1 is STILL a source-text regex, not a module-identity check: a commented-out // legacy: importFirst line satisfies rbCall while the hook imports a private drifted grammar copy (loaded 13x, suite stayed 211/0 exit 0); and the one-grammar-module walk only matches files named response-blocks.* so a private copy under another name is undetected. Left OPEN for a re-fix of leg1 (resolve what the hook process actually imports; ignore comments; detect any filename). Not fixed here.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run 1a1416db-a7a3-4b55-b2fb-daf977865aca — VERDICT: BROKEN — leg1 Stop-hook module identity still vacuous: rbCall regex matches a commented-out legacy importFirst line while the hook loads a private copy (13x, suite green); one-module walk only scans response-blocks.* so alt-named copy escapes. Legs 2-7 held vs grammar mutations.. Typed entry in the record's verification[]; this line is an echo, not proof.

@@ -104,3 +104,9 @@ question, and never files, mutates, or blocks anything.
 - **Symptom of a deeper design flaw?** not closing yet. The class is ARCH-010
   itself (a declared fact read by no one); this is a targeted reader, not a new
   structural pattern, so no ARCH filed.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run a58b0611-3fcd-493c-b858-a2cbd3d7e8e6 — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane (Opus 4.8)
+- **independent clean-room verify (round 1, verifying) — BROKEN:** independent clean-room verify BROKEN (run a58b0611-3fcd-493c-b858-a2cbd3d7e8e6): severityFor bands by (round − minRound) delta, so at --min-round=5 a round-8 ticket reports 'high' instead of the required absolute '8+ critical'; the fixer only exercised the default min-round=3. Fix owed by a later lane.

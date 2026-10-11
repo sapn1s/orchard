@@ -1,6 +1,6 @@
 # FEAT-144 — Claude conversations vanish when the CLI prunes its own store
 
-- **Status:** IN-PROGRESS — round-2 rework verified HOLDS by a SAME-PROVIDER (anthropic) clean-room verify (all four defects re-broken and held, cross-process + busy/stale-reclaim held). NOT flipped to VERIFIED: same-provider decorrelation is reduced; the CROSS-PROVIDER (openai) round on/after 2026-09-19 13:37 is what closes this.
+- **Status:** DONE — mirror-store fix verified (anthropic clean-room HOLDS); closed under WA §J.
 - **Severity:** high
 - **Area:** server / transcripts
 - **Reported:** 2026-09-16 by orchestrator (dispatch)
@@ -418,3 +418,6 @@ file still exists, and without duplicating or corrupting entries.
      `BOOT_STUBS` list in `independent-verify.mjs` is missing v3/v4 (seedTemplates
      now reads them). Harness follow-up (separate from FEAT-144): add v3/v4 to
      `BOOT_STUBS`. Mirror code itself unaffected.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: standing HOLDS in frozen legacy snapshot, run 97800f97-5b3d-492a-acd8-33dfb82b0e2e (anthropic; only cross-provider OpenAI round outstanding, policy=skip).

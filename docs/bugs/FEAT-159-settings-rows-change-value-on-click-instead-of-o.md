@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-09-30",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -43,7 +43,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "c9a6b2a4-5981-405f-afcd-885d3f2f784d",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:51:50.754Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "container dropdowns (Memory/GPU/Repo-at): putContainer (drawer.js:3112) spreads read-only container.base into PATCH -> server 400, stores nothing. Core settings-control acceptance passed 29/3."
+    }
+  ],
   "verification_class": "plan+review",
   "body_slots": {
     "Diagnosis": false,
@@ -103,3 +116,6 @@ _Dispatch: phase=fixing round=1 class=fix._
 - **Declined from the critique (with reason):** a per-row scope toggle and a labelled reset button (the FEAT-146 chip + ↩ gutter are decided design); chip loudness; integration switch placement, Account row, snapshots actions, the New-project defaults intro text, Isolation warning styling — outside the value-control rework, worth their own pass.
 - **Still open / handoff:** BUG-208 still applies — the project-scope Model dropdown lists the Claude catalog even on an OpenAI project (now a visible list instead of a hidden cycle, same data). The machine pane's model picker is still its own markup (`#gModelSel` + always-visible custom row); folding it onto `selectControl` would give one model picker (ARCH-010) but moves ids three suites pin. Needs an independent clean-room verify before VERIFIED.
 - **Symptom of a deeper design flaw?** not closing — not answered yet.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run c9a6b2a4-5981-405f-afcd-885d3f2f784d — VERDICT: BROKEN — container dropdowns (Memory/GPU/Repo-at): putContainer (drawer.js:3112) spreads read-only container.base into PATCH -> server 400, stores nothing. Core settings-control acceptance passed 29/3.. Typed entry in the record's verification[]; this line is an echo, not proof.

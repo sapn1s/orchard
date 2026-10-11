@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-08-22",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -52,7 +52,19 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "run_id": "35e95c2a-f768-4a1c-baf9-c8c965586ed3",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:56:02.660Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "plan+review",
   "body_slots": {
     "Diagnosis": false,
@@ -154,3 +166,9 @@ A second risk is that the existing Git group is small and legible precisely beca
   COST: eleven dispatch rounds to openai/gpt-5.6-sol. The first attempt was ONE mega-brief covering everything; it deleted src/server/git.ts, quit after five tool calls with "Unable to complete FEAT-099 in this turn", and had to be restored from HEAD. Splitting it into server / route+shell / working-tree / branches+stashes+history / verification, then four fix rounds driven by real suite output, worked. Every browser run was the dispatcher's to execute — the Codex sandbox cannot bind a port — which is exactly the tax the brief predicted.
 
   INDEPENDENT VERIFY STILL WARRANTED: this pass changes commit semantics, validates client-supplied paths into argv at 650-path scale, and adds the first checkout in the product. Generation should not be its own only verifier.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5-5 run 35e95c2a-f768-4a1c-baf9-c8c965586ed3 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify DRIVER (round 1, class=verify) — VERDICT: BROKEN
+- **Note:** Independent clean-room (anthropic claude-opus-5-5, run 35e95c2a-f768-4a1c-baf9-c8c965586ed3). Range = FEAT-099 diff with seed-sources-injected endpoints over dangling fix b2bc67d (final round; tree carries the whole feature incl. abbf8f3). DATA-INTEGRITY BREAK of 'choose the files, not the whole tree': stage() in src/server/git.ts passes the chosen path to the add/restore commands as a RAW pathspec (no literal-pathspec marker, no GIT_LITERAL_PATHSPECS), so a tracked status entry literally named star-dot-txt stages/unstages EVERY matching .txt file — the next commit takes in files the user never chose (adversarial glob-named-tracked-file-pathspec, exit 1). Same raw-pathspec pattern in diff() (per-file diff of that name shows other files' changes) and, by code reading, in stashShow and commitDiff. NB verify-git.mjs fixer suite exited 1 in-room (its server/brave-backed sections are not fully clean-room-runnable — partial could-not-test), but the pathspec break is a confirmed code defect. Left OPEN; fixer to repair (use literal pathspecs).

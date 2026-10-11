@@ -1,6 +1,6 @@
 # BUG-228 — the git-write guard refuses `-c diff.submodule=short`, blocking all clean-room verify
 
-- **Status:** IN-PROGRESS — fix built + self-verified; independent verification warranted (low-risk, see Activity log).
+- **Status:** VERIFIED — independent clean-room verify HOLDS (anthropic, run 0d8c29a6, 2026-10-11); diff.submodule=short allowed, command-executing keys still denied
 - **Severity:** medium (it blocks EVERY clean-room independent verification from any guarded agent session — the verification the Working Agreement requires before a ticket is VERIFIED)
 - **Area:** agent git-write enforcement (scripts/lib/git-write-policy.mjs)
 - **Reported:** 2026-10-01 by the verify lane (FEAT-160 / BUG-226 both blocked on it)
@@ -90,3 +90,9 @@ referenced nowhere in the policy's history; git-config(1) documents it as displa
   instance of the shape ARCH-021 already tracks (git-write enforcement is an open-ended
   text classifier; an inert key refused by omission is the benign twin of a dangerous key
   allowed by omission). Same class as BUG-165. No new ARCH ticket warranted.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run 0d8c29a6-263e-4e30-ab01-fc25f3f36ae7 — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **closed:** 2026-10-11 closed: independent verify HOLDS run 0d8c29a6-263e-4e30-ab01-fc25f3f36ae7

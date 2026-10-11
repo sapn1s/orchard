@@ -11,9 +11,9 @@
   "reported": "2026-09-29",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-09-29",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -373,3 +373,6 @@ Another Orchard-managed project reported that Orchard's host leak gate refuses *
 - **Could-not-test (carried to the owed OpenAI round):** the REAL Orchard checkout + its live registered-project state (the room is git-init'd, not the real checkout); the git-shim `/api/git-shim/decide` HTTP route and the PreToolUse classifier that choose WHEN `runLeakGateForRepo` runs; the guard scans the session's configured `gitRepoPath`, not the repo a `git -C <other>` / `cd other && git commit` targets (cross-repo waiver on that route unverified); real submodules (only a subdirectory allowlist was tested); ignored-file force-add gap (older behaviour). **Note, not a break:** the scanner is quadratic on long dotted-email local-parts (~6 s at 80 KB, past both host caps at 300 KB) — a single crafted line blocks every commit, but FAILS CLOSED (DoS, not a leak).
 - **Verified-by:** dispatch anthropic/claude-opus-5-5 run a97be22c-704c-4d8d-8553-d5adc6e79aa1 (clean-room, scripts/independent-verify.mjs) — VERDICT: HOLDS
 - **Routing — Status NOT set to verified.** A cross-provider (OpenAI) clean-room round is STILL OWED (SAME-provider decorrelation is reduced); re-dispatch it once the OpenAI quota window resets (~21:21). This round HOLDS with zero breaks across the whole A–R matrix.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: standing HOLDS run a97be22c-704c-4d8d-8553-d5adc6e79aa1 after prior BROKENs (verified=true via ticketVerifications).

@@ -1,6 +1,6 @@
 # BUG-172 — the git-write backstop mis-classifies `git archive` as a write, silently disabling the entire clean-room verifier
 
-- **Status:** IN-PROGRESS
+- **Status:** VERIFIED 2026-10-11 — independent clean-room verify HOLDS (run 4031addc-cb95-4912-99ac-af728d111aab)
 - **Severity:** high
 - **Area:** server (git-write policy) / verification tooling
 - **Reported:** 2026-09-07 by orchestrator (found while verifying FEAT-139)
@@ -158,3 +158,9 @@ depends on are actually allowed.
   so it cannot satisfy that bar. Orchestrator decision: waive the clean-room gate
   for a one-word read-allowlist add (given 164/164 + classifier proof) → Done, or
   dispatch the cheap clean-room pass. Legal board status until then: IN-PROGRESS.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 4031addc-cb95-4912-99ac-af728d111aab — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane
+- **closed:** 2026-10-11 closed: independent verify HOLDS run 4031addc-cb95-4912-99ac-af728d111aab (clean room, anthropic/claude-opus-4-8; both classifier layers + real-shim e2e; 184/185 git-inventory classified, 1 env-skip)

@@ -1,6 +1,6 @@
 # BUG-250 — Scratch root accumulates unswept reflink clean rooms (du says 282G, real data ~40KiB; cost is 7.7M inodes of metadata + a reflink landmine)
 
-- **Status:** OPEN
+- **Status:** VERIFIED — scratch-report.mjs is a read-only inventory that makes no liveness claim; the creator owns crash-safe self-cleanup. Independent HOLDS on record (run 1152408e, round 5).
 - **Severity:** medium
 - **Area:** server / tooling (scratch lifecycle — `scripts/lib/scratch.mjs`, `scripts/independent-verify.mjs`)
 - **Reported:** 2026-10-11 by finding lane (disk-full investigation)
@@ -1125,3 +1125,6 @@ broader "~50 `mkdtempScratch` callers have no lifecycle owner" surface remains t
 - **Could-not-test / residual:** real init-ns/btrfs-root mounts (tmpfs + user-ns proven); liveness is now
   entirely the operator's own `fuser -m`/mount check per dir (the tool's STDERR banner says so); a
   SIGKILL/power-loss leak is reclaimed only by the operator acting on this inventory (accepted trade).
+
+### 2026-10-11 — verifying lane (round 6)
+- **status reconcile — VERIFIED on standing HOLDS + one-time cleanup:** Moved to VERIFIED. Standing independent HOLDS already on record: dispatch anthropic run 1152408e-7365-4d9d-b393-6ecb4fe4a488, round 5, in docs/bugs/verification-ledger.json. User-approved one-time scratch cleanup ran 2026-10-11: 982 dirs deleted, 468 kept; inode count 8,317,218 -> 3,757,948. Manifest: ~/.local/state/claude-station/BUG-250-cleanup-manifest-20261011T100050.txt. No code change this round; status-only reconcile.

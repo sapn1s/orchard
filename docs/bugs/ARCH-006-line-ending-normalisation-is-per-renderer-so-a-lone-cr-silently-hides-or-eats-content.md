@@ -11,9 +11,9 @@
   "reported": "2026-08-18",
   "reported_by": "bug-hunt workflow",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [
     {
@@ -104,6 +104,18 @@
       "verdict_on": "2026-09-29",
       "harness": "scripts/independent-verify.mjs",
       "note": "Step 1 of the migration only (boundary normalise at bulletLines + entryBody). The ARCH migration as a whole remains incomplete."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "4cba5b17-3ad5-4d6f-ac53-ddcb0344e31d",
+      "verdict": "holds",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:29:42.508Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "step-2 ingest fix re-verified clean-room (working-tree): fixer 14/14 exit0; adversarial 76/76 incl non-prose untouched, 9 real-guide shapes. Migration still incomplete (renderer safeguards not removed)."
     }
   ],
   "verification_class": "arch",
@@ -290,3 +302,53 @@ Boundary normalization fails silently when the inventory misses a source or a ne
   Whether/when to close the ARCH ticket is an orchestrator decision, not implied by this HOLDS.
   Independent clean-room verify of step 1 is now satisfied per the fixer's handoff (append-only
   record, regression-prone class). INDEX untouched (orchestrator-owned).
+
+### 2026-10-11 — fixing lane, round 2 (worker): step 2 of option A landed at the LAST two server ingest points
+
+- **Understood & verified the hypothesis before building.** The design is settled (decision_history
+  A, chosen by the ARCH-010 class decision; `human_action: none`); no design question remained open.
+  The only gap per round-1's handoff and the 2026-10-11 triage was the remaining server ingest
+  points. Reconfirmed the two sites: `src/server/index.ts` `readGuidePage` (~:289) read guide
+  markdown with `/\r\n/g` (CRLF only — a lone CR survived into the guide renderer); and
+  `src/server/orchard-transcripts.ts` recorded session prose into the append-only `.jsonl` with NO
+  CR handling at all (`recordUserPrompt`, `recordRuntimeMessage`), so a lone/bare CR survived into
+  the transcript file every renderer later reads. Both are the SAME class defect ARCH-006 tracks:
+  content after a lone CR is hidden when the record is rendered.
+- **Changed (NO renderer net removed — still too early per the ticket):**
+  - `src/server/index.ts` — `readGuidePage` now ingests with `board.normalizeLineEndings(fs.readFileSync(...))`
+    (was `/\r\n/g`). `board` was already imported.
+  - `src/server/orchard-transcripts.ts` — imported `normalizeLineEndings` from `./board.ts` (the
+    ticket's single owner-declaration, same source `tickets.ts` already reuses); `recordUserPrompt`
+    now normalizes its text; added a module-private `canonicalizeContent()` applied in
+    `recordRuntimeMessage` that normalizes ONLY string `text`/`thinking` prose fields on content
+    blocks and leaves every non-prose field (tool inputs/results, ids) byte-identical.
+  - New test: `scripts/verify-arch-006-ingest-points.mjs`.
+- **Reproduced the harm FIRST (must-FAIL) and proved non-vacuity on the REAL path.** PART 0 is a
+  git-independent must-FAIL anchored to a SYNTHESIZED pre-fix state (not HEAD): the transcript
+  pre-fix rule (verbatim) and the guide pre-fix rule (`/\r\n/g`) both leave a lone CR; the shared
+  normaliser removes it. PART A drives the REAL `TranscriptRecorder` over a scratch data dir
+  (`CLAUDE_STATION_DATA`), recording a user prompt + an assistant message whose paragraphs are
+  separated by LF/CRLF/lone-CR, then re-reads the written `.jsonl`: no CR survives in any
+  text/thinking field, all 4 paragraphs land on their own lines, and the non-prose tool_use input
+  keeps its CR (correctly untouched). PART B writes a REAL guide `.md` on disk with CRLF+lone-CR
+  frontmatter/body and runs the EXACT ingest expression `readGuidePage` now uses, asserting the body
+  is CR-free and the frontmatter pin strips. Command: `npx tsx scripts/verify-arch-006-ingest-points.mjs`
+  → **14 passed, 0 failed** (exit 0). Non-vacuity of the REAL path confirmed by temporarily neutering
+  the two transcript normalisations: PART A then **FAILED 2/14** (CR survived, lone-CR paragraph
+  swallowed); restored → 14/14.
+- **Gate:** `npm run gate` → **GATE: PASS — safe to commit. (exit 0)**, read directly (leak-gate +
+  check-nul + prompt-privacy + typecheck all PASS; the `board.ts`→`orchard-transcripts.ts` import
+  compiles). Anti-regression: round-1's suite `npx tsx scripts/verify-arch-006-boundary-normalise.mjs`
+  still **14 passed, 0 failed** (exit 0).
+- **Still open / handoff:** all server ingest boundaries the migration enumerated are now canonical
+  (board.ts bulletLines, tickets.ts entryBody — step 1; index.ts guide read + orchard-transcripts
+  prose — step 2). The REMAINING migration work is the renderer-safeguard removal: once a verifier
+  confirms every source feeding a given renderer is canonical, drop that renderer's own rule
+  (`public/lib/response-blocks.js` `LINE_ENDINGS_RE`, `public/lib/dom.js`, `public/lib/digest.js`,
+  `public/lib/ticket-record.js`). Do NOT close yet. This is a session-lifecycle / append-only-record,
+  regression-prone change (transcript writer) → warrants an INDEPENDENT clean-room verify pass
+  (`scripts/independent-verify.mjs` / a fresh-context agent); generation must not be its own only
+  verifier. `work_state` set `in_verification`. INDEX untouched + `board:gen` NOT run (orchestrator-owned).
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 4cba5b17-3ad5-4d6f-ac53-ddcb0344e31d — VERDICT: HOLDS — step-2 ingest fix re-verified clean-room (working-tree): fixer 14/14 exit0; adversarial 76/76 incl non-prose untouched, 9 real-guide shapes. Migration still incomplete (renderer safeguards not removed).. Typed entry in the record's verification[]; this line is an echo, not proof.

@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-10-05",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -38,7 +38,20 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "49e4af9d-4546-442e-a737-aa77ef9801fc",
+      "verdict": "invalid",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:01:30.721Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "contract-collision, not a defect: verifier leaned HOLDS but author test exits non-zero by design (real git-init-success blocked by FEAT-135 guard). Needs-you decision on acceptance."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -93,3 +106,6 @@ Verified before building: the project directory is not a git repository (`rev-pa
   - **Real `git init` success path exercised (F163_REAL_INIT=1, isolated scratch server, free port).** `scripts/verify-feat-163-165-git-bar.mjs` → 43 passed, 1 failed; the single FAIL is the REAL init path ("confirm runs the server init … chip flips to a repo", observed `git:false` — no `.git` created). This is the agent-lane git guard CORRECTLY refusing `git init` (BUG-230 fixed → the lane's FEAT-135 shim survived the scratch server boot; a direct `git init` is likewise guard-blocked). Everything else — the non-git init OFFER, confirm/cancel arming, diffstat face/popover on the real busy + moderate checkouts, and the FEAT-164 grant flow — passed 43/43.
   - **Command the USER runs to exercise the real success path** (outside the agent guard, in a plain shell where `git init` is permitted): `F163_REAL_INIT=1 node scripts/verify-feat-163-165-git-bar.mjs`.
   - **Live smoke (read-only, Playwright headless, running service):** non-git project (cl-1) shows "Not a git repository" + "Initialize git repository" offer (NOT clicked). Screenshot docs/bugs/assets/SMOKE-live-nongit-init.png. No page errors; no write route driven.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 49e4af9d-4546-442e-a737-aa77ef9801fc — VERDICT: INVALID — contract-collision, not a defect: verifier leaned HOLDS but author test exits non-zero by design (real git-init-success blocked by FEAT-135 guard). Needs-you decision on acceptance.. Typed entry in the record's verification[]; this line is an echo, not proof.

@@ -1,6 +1,6 @@
 # FEAT-143 — reach for the table rendering that already exists, and stop the digest restating the reply
 
-- **Status:** IN VERIFICATION — implemented and self-verified (real headless render + full FEAT-085 suite baseline diff); awaiting independent clean-room verify (Stop-hook ENFORCE-path behaviour change; I modified the independent + adversarial FEAT-085 suites)
+- **Status:** VERIFIED — independent clean-room verify HOLDS (anthropic/opus-4.8, run 31aad789); table rule + suppressible digest + hook digestOptional confirmed; 39/40-word SHORT boundary and answer+loose-prose-not-single-artifact attacked.
 - **Severity:** medium
 - **Area:** server (response-format inject) / Stop-hook gate (`scripts/hooks/response-format-gate.mjs`)
 - **Reported:** 2026-09-16 by orchestrator (same audit as FEAT-142)
@@ -60,3 +60,9 @@ Note on blast radius: in production `ORCHARD_STOP_HOOK_ENFORCE` is UNSET (grep o
 - **Could NOT test:** GFM table → real `<table>` DOM render (claim 3) — depends on the unchanged markdown renderer; `verify-feat-091-renderer` FATALs (pre-existing) so I could not drive it. `verify:feat-091-commonmark-diff` (23/0) validates the fence scanner vs CommonMark, not table→DOM. Parse layer preserves the table markdown verbatim inside a layer-2 block (probe A3). Model behavioural compliance (does it actually emit tables / omit digest) is unfalsifiable statically; only injected-core presence verified.
 - **High-stakes note:** this IS a Stop-hook (wedge-capable, session-lifecycle) change and the author edited the FEAT-085 policing suites — my clean-HEAD baseline diff satisfies the skeptic requirement for THIS pass; a second fresh-context/cross-provider clean-room dispatch remains warranted if the orchestrator wants full ARCH-grade assurance (I ran the decoupled-execution half of the harness, not the nested-LLM half — degradation noted: deterministic suites carry the signal).
 - **Durable pointer:** verifier report emitted to orchestrator 2026-09-16; all evidence commands re-runnable.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 31aad789-91ab-4ec7-8040-80c211d2f408 — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane (Opus 4.8)
+- **independent clean-room verify (round 1, verifying) — HOLDS:** closed: independent verify HOLDS run 31aad789-91ab-4ec7-8040-80c211d2f408

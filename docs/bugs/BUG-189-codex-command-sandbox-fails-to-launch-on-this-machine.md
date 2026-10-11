@@ -1,6 +1,6 @@
 # BUG-189 — Codex command sandbox fails to launch on this machine
 
-- **Status:** IN VERIFICATION — round-3 fix independently re-verified cross-provider (openai) clean-room, VERDICT **BROKEN** (2026-09-27, run 01a0e320): round-2's real finding-1 (SIGTERM-resistant probe defeating the *timeout*) is CONFIRMED FIXED, and findings 3 (--check both modes) + 4 (cwd-keyed probe) hold; but ONE NEW real gap surfaced — the process-group SIGKILL reaps only on the timeout path, so a probe launcher that exits 0 after forking a SIGTERM-ignoring detached child leaves an orphan while the preflight returns success (claim 4 "no orphan survives" violated on the SUCCESS path; practical impact bounded — see Activity). The central guarantee HELD (no quota on an unlaunchable sandbox; no danger-full-access fallback; forbidden/invalid modes rejected pre-API; mode-disagreement + missing-cwd fail safe; version-change cache-bust works). Orchestrator to adjudicate: fix the exit-path orphan reap (then re-verify) vs accept. Cosmetic finding: helper maps forbidden/unknown modes to read-only success internally (no user-facing bypass — dispatch rejects them first). The machine-level codex pin (0.158.0-alpha.15.2) stands: root cause is a codex 0.157.x btrfs bug (upstream #47968, no stable release yet).
+- **Status:** VERIFIED — independent clean-room verify HOLDS (anthropic, run 1d4603a3, 2026-10-11): zero-token preflight, no danger-full-access fallback, forbidden modes rejected pre-probe, orphan reaped on success+timeout paths, version-change cache-bust, --check both modes. Accepted residual: setsid grandchild (documented). Codex pin 0.158.0-alpha.15.2 stands.
 - **Severity:** high
 - **Area:** server (runtime / codex dispatch)
 - **Reported:** 2026-09-27 by verify lane (dispatched, BUG-187 round 5)
@@ -250,3 +250,9 @@ Host: Arch Linux, kernel 7.1.5-arch1-2, btrfs subvol root
 
 ### 2026-09-30 — BUG-225 verify lane (transcription)
 - **Verified-by:** dispatch openai run 01a0e320-8ce9-72b1-8bed-5929df1d4e54 (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN (transcribed by BUG-225 verify from this ticket's line 230, whose shape the shared reader cannot parse)
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run 1d4603a3-58be-4b06-a4a1-1c6d58a8f044 — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **closed:** 2026-10-11 closed: independent verify HOLDS run 1d4603a3-58be-4b06-a4a1-1c6d58a8f044

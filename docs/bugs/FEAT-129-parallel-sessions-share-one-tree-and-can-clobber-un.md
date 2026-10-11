@@ -507,3 +507,6 @@ verification-class.
 Prefixed the Status header with the recognised state word `IN VERIFICATION` (per
 orchestrator decision) so `board:check` can map it; the prior "OPTION A, ROUND 3 …"
 detail is preserved verbatim as trailing text. No diagnosis or scope change.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 34d17925-8a67-4ff6-8915-a7b70acd5a3d — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.

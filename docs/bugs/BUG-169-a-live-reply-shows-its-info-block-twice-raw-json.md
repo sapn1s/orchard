@@ -250,3 +250,6 @@ Exactly one render of the message, as the digest rail — never the raw JSON.
 Prefixed the Status header with the recognised state word `IN VERIFICATION` (per
 orchestrator decision) so `board:check` can map it; the prior "REOPENED (round 2)"
 detail is preserved verbatim as trailing text. No diagnosis or scope change.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 63b8a765-868a-4f60-aaf1-12dde2bd633e — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.

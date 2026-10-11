@@ -11,9 +11,9 @@
   "reported": "2026-10-06",
   "reported_by": "user",
   "owner": "unassigned",
-  "work_state": "open",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-10-06",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -193,3 +193,6 @@ Leak gate (`node .orchard/leak-gate.mjs --summary`, unpiped): PASS, 0 hits. **`n
 
 ### 2026-10-06 — FEAT-169 verifying lane
 - **Accepted on own scope; three breaks handed to ARCH-023:** User decision 2026-10-07: FEAT-169 is ACCEPTED on its own scope. The clean-room verifier confirmed the --changed commit scope picks the correct outgoing file set and falls back to a full scan on every command it cannot classify; the fixer's suite passed 20/20. The BROKEN verdict (run 01a1137f-1257-76b3-b091-9041aa52ace9) comes from three gate blind spots that PRE-DATE FEAT-169 and each reproduces the same way under a full-tree scan: (a) a secret in a file name or path is never scanned; (b) secret bytes in .png/binary blobs are skipped; (c) the push scan covers the tree and index but not the objects a push transmits, so a secret committed then removed still publishes. These are NOT regressions of the --changed scope. They move to the new ARCH-023 (push gate scans the working tree, not the objects a push transmits), which carries the violated invariant, the verifier's two-break STOP, options with trade-offs, a migration path and a proof bar per WA section N, plus the round-2 destination-set constraint (run 01a11377-fee6-7a82-9ebc-4d6c3267b37a: the host cannot trust its own computation of what the destination already has). No new verification verdict is recorded here and no HOLDS is written: no verifier run produced one.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: explicit user acceptance 2026-10-07 on own scope (log entry '2026-10-06 — FEAT-169 verifying lane'; 3 out-of-scope breaks moved to ARCH-023). Needs service restart to be live.

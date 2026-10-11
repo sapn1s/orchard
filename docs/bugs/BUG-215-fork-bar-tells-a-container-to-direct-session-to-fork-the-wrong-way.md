@@ -240,3 +240,9 @@ case keeps its existing copy.
   a live CLI (the fs-level proof stands in for it here), and (b) a project that ran
   BOTH ways before the fix (real split memory) merged with a genuine name clash.
   `Verified-by:` PENDING.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run 1c7d8842-1b23-42ad-90e6-89a4e16fccc3 — VERDICT: BROKEN — memories.ts data-movement bugs: host memory dir with a subdir => mergeInto moves host .md then returns without symlink, direct session memory dir ends EMPTY (loses own h.md, never sees container c.md); host dir that is a symlink to another store => renames files OUT of that dir, emptying its owner. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **verify BROKEN:** 2026-10-11 independent clean-room verify (anthropic, run 1c7d8842) VERDICT BROKEN (VALID), on the r3 MEMORY carryover (high-stakes/data). Two data-movement defects in src/server/memories.ts ensureUnifiedMemoryDir/mergeInto: (1) :134-141 if the host memory dir has ANY subdirectory, mergeInto moves the host's own .md into canonical then returns WITHOUT creating the symlink => the direct session's memory dir ends up EMPTY (merged=[h.md], linkedFrom=null): it loses its own memory AND never sees the container's. (2) :122-129 if the host memory dir is a SYMLINK to a different dir (e.g. a Windows-origin store), mergeInto renames every file OUT of that dir into canonical, emptying a dir whose memory was meant to stay separate. r1 (forkbar wording) and r2 (codex-misclassify/message) were NOT re-run here (source-read only; their own tests pass). Left OPEN; not fixed here.

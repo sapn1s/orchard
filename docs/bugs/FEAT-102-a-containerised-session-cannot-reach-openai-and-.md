@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -27,7 +27,19 @@
   "code_refs": [],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "run_id": "ef4e23f1-e6d8-41ae-807f-2853b7136095",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:50:47.002Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "arch",
   "body_slots": {
     "Diagnosis": false,
@@ -213,3 +225,9 @@ result back. Not a unit test of the plumbing. Nothing else counts.
 
 ### 2026-08-25 — worker
 - **bookkeeping-sweep:** 2026-08-25 bookkeeping sweep (authorised by the user) — re-checked, NOT closed, and deliberately so. Re-ran all three suites on the host at HEAD b6c0151: `verify-feat-102-static.mjs` 10/0, `verify-feat-102-entitlement.mjs` 3/0, `verify-feat-102-dispatch-broker.mjs` 25/0 — 38/38, each exit 0 read directly. The code is committed (ae46280), not sitting in a worktree, and the ticket own and only success criterion was already proven LIVE: a real Orchard session in a containerised project dispatched to openai and got the result back, with the host-side transcript to show for it. Why this one stays in verification while nine of its neighbours closed today: rounds are now spent by HARM CLASS, and this is the highest class on the board — a new host-to-container trust boundary carrying a credential-backed capability, where the failure mode is one project reaching another project broker or tree. That is precisely the case a fixer own suite cannot settle, because the fixer chose the boundary. One round, scoped to isolation and to partial/truncated frames, and this closes. It is not waiting on the old every-change rule; it is waiting on the one round its harm class actually buys.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5-5 run ef4e23f1-e6d8-41ae-807f-2853b7136095 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify DRIVER (round 1, class=verify) — VERDICT: BROKEN
+- **Note:** Independent clean-room (anthropic claude-opus-5-5, run ef4e23f1-e6d8-41ae-807f-2853b7136095) over the FEAT-102 diff (seed-sources-injected endpoints over dangling fix ae46280). Fixer suite (verify-feat-102-dispatch-broker/entitlement/static) re-run EXIT 0, but THREE real breaks found outside the fixtures on this HIGH-sev security ticket. (1) ISOLATION BREAK: dispatch-broker.ts puts every project's meta files in dataDir/dispatch/scratch, which is ALSO dispatchProjectDir for a project whose id is 'scratch' — that project's container gets a read-only bind of other projects' dispatch metadata (sessionIds) and its broker start() fails 'unexpected entries' whenever another project dispatches (cross-project exposure + DoS). (2) ENTITLEMENT BYPASS — TWO-BREAK on the same property: dispatch-client.mjs checks ORCHARD_DISPATCH_ENTITLED==='0' only in the --check branch, so (a) a direct 'dispatch-client.mjs --provider openai <prompt>' with ENTITLED=0 still runs/sends and exits 0, AND (b) the broker never checks entitlement itself (capabilities always entitled:true, never stopped on toggle-off) so an openaiDispatch:false project is still served at the known host socket. (3) The fixer's own must-FAIL proof in verify-feat-102-entitlement.mjs is VACUOUS — the mutant runs from a tmpdir without scripts/dispatch.mjs so it refuses for an unrelated reason and guard removal goes undetected. Left OPEN; high-stakes security, independent re-verify warranted after fix. Fixer (not this lane) to repair.

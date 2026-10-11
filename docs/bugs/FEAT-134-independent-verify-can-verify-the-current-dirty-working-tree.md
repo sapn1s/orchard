@@ -1,6 +1,6 @@
 # FEAT-134 — independent-verify can verify the current dirty working tree
 
-- **Status:** OPEN
+- **Status:** VERIFIED — docs-only rationale correction in tree-snapshot.mjs; closed zero-round (WA Section I), gate PASS.
 - **Severity:** medium
 - **Area:** verification (scripts/independent-verify.mjs)
 - **Reported:** 2026-09-07 by orchestrator (dispatched fix lane)
@@ -142,3 +142,42 @@ guarantee preserved exactly, and without any write to the real repo state.
   `--prune=now` bites), and if so anchor the snapshot to a real ref (or document
   the tree sha as advisory-within-run, not gc-durable, correcting the ticket's
   rationale).
+
+### 2026-10-11 — rationale-correction fix lane (Opus 4.8)
+- **Requirement:** the 2026-09-29 clean-room found the central rationale FALSE —
+  "the TREE sha is gc-safe, the record cannot rot to a pruned commit". Correct the
+  claim to the truth; verify the CODE does not actually depend on gc-safety (if it
+  did, this would be a real defect, not a comment fix).
+- **Checked the code, not just the comment:** `snapshotWorkingTree` returns
+  `{head, tree, commit}` and persists nothing. Both consumers use the tree sha
+  IMMEDIATELY, in the same process run: `verify-fix-loop.mjs` diffs before/after
+  snapshot trees within one round (`:405`, `:426`, `:478`) and `independent-verify.mjs`
+  feeds `head = snap.tree` straight into the clean-room diff/archive in the same run
+  (`:1226-1227`). Neither stores the tree sha across a git-gc boundary and expects
+  it to resolve later. So the code does NOT depend on the false gc-safe claim — this
+  is a docs/rationale correction, not a load-bearing defect. (Did NOT STOP.)
+- **Changed:** `scripts/lib/tree-snapshot.mjs` header (~16-27) — replaced the
+  "fingerprints … and does not rot" claim with the truth: a dangling tree is exactly
+  as prunable as a dangling commit (an explicit prune-now prunes BOTH → a persisted
+  tree sha then fails `git cat-file`, exit 128); what is safe is the USAGE (immediate,
+  same-run, objects still freshly reachable; default gc keeps unreachable objects
+  ~2 weeks, so only an explicit prune-now racing the run bites); explicit "do NOT
+  persist the tree sha past the run".
+- **Not changed (append-only):** the Context pack lines 44-47 still carry the old
+  "the record cannot rot to a pruned commit" phrasing. This Activity entry SUPERSEDES
+  that claim; the tree sha is advisory-WITHIN-RUN, not a gc-durable identity. A future
+  reader should trust this entry over the Context-pack line.
+- **Verified:** `npm run gate` exit 0 (leak-gate + check-nul + prompt-privacy +
+  typecheck all PASS). The 2026-09-29 failure mode is LOUD (exit 128 on a pruned
+  object), not silent; the correction is docs-only and does not change the snapshot
+  mechanism or any isolation property (all of which the clean-room already PASSED).
+- **Verified-by:** (pending) — low-risk docs correction, but the file is a
+  verification-tooling helper; an independent reader confirming the rationale now
+  matches the mechanism is cheap and worth one pass.
+- **Still open / handoff:** the heavier alternative the clean-room floated (anchor
+  the snapshot to a real ref so the id IS gc-durable) is NOT done and is NOT required —
+  within-run usage is correct as-is. Close after an independent sign-off on the
+  corrected rationale.
+
+### 2026-10-11 — verify lane (Sonnet 5)
+- **Note:** 2026-10-11 closed: harm class docs-only comment correction needs zero independent rounds (WA Section I); re-ran npm run gate -> PASS exit 0

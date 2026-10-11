@@ -13,7 +13,7 @@
   "owner": "you",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -62,11 +62,30 @@
     }
   ],
   "related": [
-    { "id": "FEAT-105", "relation": "see_also" },
-    { "id": "BUG-108", "relation": "see_also" }
+    {
+      "id": "FEAT-105",
+      "relation": "see_also"
+    },
+    {
+      "id": "BUG-108",
+      "relation": "see_also"
+    }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "9278db0c-9861-4b17-bd24-6af64c30a916",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:31:03.874Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "BROKEN: fixer's claimed 61/61 did not reproduce (59/61) -- bind-mounted fixture page 404s inside the container, so the suite's own evidence for the real headless click/scroll check never ran; it passed only when the page was served from inside the image instead."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -101,3 +120,6 @@
 
 ### 2026-08-25 — you
 - **Verification:** MUST-FAIL first, against the REAL pre-fix image: browser_navigate over MCP stdio returned, byte-for-byte, the error from the user transcript — Chromium distribution chrome is not found at /opt/google/chrome/chrome. Then verify:bug-151, 61/61. Section B drives the REAL rebuilt image over REAL MCP stdio against an HTTP-served below-the-fold page and answers the users actual question: click the CTA, scrollY goes 0 -> 1121, screenshot returns 10KB, all headless, with the image proven to carry no DISPLAY and no X socket so a window is impossible by construction. Section B2 is the discriminating one — the OLD arg shape run against the NEW image still returns the incident error, so --browser is load-bearing rather than the image change silently carrying the fix. Section D walks all 8 toggle/isolation combinations to prove the launch-time note can never disagree with the tools actually attached. Anti-regressions: verify:bug-108 playwright-pin 20/20 (it rebuilds the image; its B1 now shows --browser chromium), verify:tool-toggle 16/16, verify:browser-close 42/42, typecheck clean. One FEAT-105 assertion had to change and is called out honestly: it matched the literal source text browserAvailabilityNote(browserSettingsOf(opts.project).enabled), which broke when that value was hoisted into a const so the new Playwright note could share it — replaced with the property (source origin plus a behavioural claim) and a second check added. The new image tag is u1000-g1000-f0a874dd6b04 and has been prebuilt on this machine, so the users containers pick it up on the normal drift/recreate path rather than waiting on a cold build. Independent clean-room verification is warranted: this touches the container image definition and a launch-time prompt surface, and the suite that passes it was written by the lane that built it.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 9278db0c-9861-4b17-bd24-6af64c30a916 — VERDICT: BROKEN — BROKEN: fixer's claimed 61/61 did not reproduce (59/61) -- bind-mounted fixture page 404s inside the container, so the suite's own evidence for the real headless click/scroll check never ran; it passed only when the page was served from inside the image instead.. Typed entry in the record's verification[]; this line is an echo, not proof.

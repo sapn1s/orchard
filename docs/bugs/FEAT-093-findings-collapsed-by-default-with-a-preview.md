@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_progress",
   "human_action": "review",
-  "updated": "2026-08-19",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [
     {
@@ -74,7 +74,31 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "run_id": "e1ca735e-471b-49b8-ac84-3654f36ad0f1",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:55:46.687Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5-5",
+      "run_id": "e1ca735e-471f-49b8-ac84-3654f36ad0f1",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T08:56:00.800Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "corrects run id typo in prior entry (…471b… should be …471f…); same run, same BROKEN verdict"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -241,3 +265,12 @@ Placing findings under the certainty guard widens the set of replies that can re
   watching is that the *stated rule* for what folds has now changed once; if it changes
   again, the rule is being fitted to the set rather than deriving it, and that is an ARCH
   question.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5-5 run e1ca735e-471b-49b8-ac84-3654f36ad0f1 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5-5 run e1ca735e-471f-49b8-ac84-3654f36ad0f1 — VERDICT: BROKEN — corrects run id typo in prior entry (…471b… should be …471f…); same run, same BROKEN verdict. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — clean-room verify DRIVER (round 1, class=verify) — VERDICT: BROKEN
+- **Note:** Independent clean-room (anthropic claude-opus-5-5, run e1ca735e-471f-49b8-ac84-3654f36ad0f1; a prior entry recorded the id with a '471b' typo, same run). Range = FEAT-093 diff with seed-sources-injected endpoints over dangling fix 9c03a1a. Fixer suite verify-feat-091-response-blocks.mjs re-run EXIT 0, but the preview/fold logic (foldPreview + stripMarkupForPreview in public/lib/digest.js) is BROKEN on real shapes — TWO-BREAK on 'preview shows the sentence addressed to the reader, unaltered': (1) a hard-wrapped sentence previews only its first physical line, cut mid-sentence with no ellipsis; (2) stripMarkupForPreview deletes EVERY underscore and asterisk from plain text so the preview changes meaning (parse_response_blocks becomes parseresponseblocks; 2*3*4 becomes 234); (3) a finding opening with a bold label line previews just the label ('Root cause') and never reaches the reader sentence; (4) a code-only finding gets an EMPTY preview (bare 'Finding' caption); (5) a line like a js code-fence with inline backticks is not a fence in CommonMark/openerOf but foldPreview treats it as one, skipping the block so the preview is empty (grammar and preview disagree). Display-only, no content lost, but the preview misrepresents or omits the reader-addressed sentence the ticket promises. Left OPEN; fixer to repair.

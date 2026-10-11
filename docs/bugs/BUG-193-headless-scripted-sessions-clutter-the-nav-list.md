@@ -315,3 +315,9 @@ conversations.
   budget, so it is visible at the bottom. A hidden state could not be reproduced. The "blue after
   opening" half was a real defect, fixed there (FEAT-144 mirror counted as a live writer). Details
   are in FEAT-154's round-8 entry. BUG-193's folds hold: `verify-bug-193-list-fold` 31/31.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run 2d901470-845f-4860-ab57-55dac158556f — VERDICT: BROKEN — over-folds real human sessions: pre-2026-09-02 dashboard sdk-ts have no provenance record so all fold (130 with >=20 msgs incl human); non-cli interactive entrypoints (vscode/desktop) also fold. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **verify BROKEN:** 2026-10-11 independent clean-room verify (anthropic, run 2d901470) VERDICT BROKEN — two-break: real pre-record dashboard sdk-ts sessions (records start 2026-09-02; 130 human sessions >=20 msgs) fold, and non-cli interactive entrypoints (claude-vscode/desktop) fold. Fixer test 31/31 but blind to the real store. Left OPEN for a fixer; not fixed here.

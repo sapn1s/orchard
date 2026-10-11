@@ -53,3 +53,6 @@ This makes the ambiguous "all green" mechanically impossible for a ticket-scoped
   - Anti-regression: `verify:feat-085-stop-hook` 61/61, `verify:feat-091` 278/0, `verify:feat-084` 37/0, `verify:feat-149` 9/0; `npm run gate` PASS (exit 0, unpiped).
 - **Verified-by:** PENDING — independent clean-room verify warranted (blocks the orchestrator's turn; load-bearing hook with a false-block history).
 - **Still open / handoff:** the two forks above (ad-hoc/ticket-less claims; defect (a)); optional injected-core reminder if the byte budget frees.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 736d6c45-95e4-4cd1-9fdf-c465601f7859 — VERDICT: BROKEN — ref-normalization bypass: done-claim with ref FEAT-1. / #FEAT-1 / FEAT 1 / multi-ref, and non-board prefix CHORE-12, skip normalizeID and are ALLOWED (should block). Typed entry in verification-ledger.json; this line is an echo, not proof.

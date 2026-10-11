@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "open",
   "human_action": "none",
-  "updated": "2026-10-01",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -51,6 +51,17 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "clean-room carrier-tree (range 28eb430); 3 findings in harvest-agent.mjs: mid-write partial JSON, per-content-block terminal misread, final record > tail-bytes"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "1d09d68c-7c0c-4d85-9601-45b4a216a604",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:06:36.671Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
     }
   ],
   "verification_class": "fix",
@@ -326,3 +337,6 @@ No git writes; files left unstaged: `scripts/harvest-agent.mjs`,
 warranted (not a Task subagent). Re-attack suggestion: drive REAL (not synthesized)
 subagent transcripts truncated at many offsets, a live concurrent appender, and a
 multi-MB final record; confirm the known residual above is judged acceptable.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 1d09d68c-7c0c-4d85-9601-45b4a216a604 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.

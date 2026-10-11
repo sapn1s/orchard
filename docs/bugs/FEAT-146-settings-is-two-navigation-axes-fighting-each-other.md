@@ -1,6 +1,6 @@
 # FEAT-146 — Settings is two navigation axes fighting each other
 
-- **Status:** IN VERIFICATION — built and polished; the clean-room verdict HOLDS but is SAME-PROVIDER only, so a cross-provider re-run is still outstanding
+- **Status:** DONE — Settings modal + drawer verified (anthropic clean-room HOLDS); closed under WA §J.
 - **Severity:** medium
 - **Area:** drawer / settings
 - **Reported:** 2026-09-18 by user
@@ -1132,3 +1132,6 @@ was not edited._
   assumed it was representative; the shape table in this suite is the mitigation
   available today (it states the fact once and fails loudly when a shape stops
   matching), not the fix.
+
+### 2026-10-11 — board closeout (WA §J audit)
+- **Note:** 2026-10-11 closed under the WA §J change (Done no longer waits on commit); evidence: standing HOLDS in frozen legacy snapshot, run ef020037-e216-4a21-b0dd-d71e35b5a585 (anthropic; only cross-provider round outstanding, policy=skip).

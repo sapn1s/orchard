@@ -215,3 +215,6 @@ declaration to build its stub set, rather than holding its own copy. A newly-add
 - **Symptom of a deeper design flaw?** It is a fresh instance of the project's own ARCH-010
   pattern, now closed at the source rather than topped up: the second place is deleted, not
   synchronised, and no drift-checker was added (CONVENTIONS rejects that shape by name).
+
+### 2026-10-11 — agent
+- **Verification recorded:** dispatch openai/codex-default run 01a12af2-f46a-7a13-aef5-036fbbe8271f — VERDICT: BROKEN — seedBootStubs seeds 8 stubs even with templates.ts absent (violates req 5, confirmed by code read); a pre-existing directory at a declared doc path is silently treated as present then EISDIRs at read, not named loudly. Left open.. Typed entry in verification-ledger.json; this line is an echo, not proof.

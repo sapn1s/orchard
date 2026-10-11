@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -26,7 +26,20 @@
   "code_refs": [],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "2f5c897f-ccd5-4241-beb0-4583c232c553",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:31:06.212Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "BROKEN: adoptSession (post-restart survivor re-adoption) was never threaded with browserUnavailableReason -- it THROWS adapter-not-configured for a direct project w/ browser on + no adapter, and for a configured-but-missing checkout it wrongly reports browserAttached=true."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -82,3 +95,6 @@
   STILL OPEN / HANDOFF. The live server is still running the pre-fix code with no adapter env, so the affected project is still broken IN THE UI until the service is restarted. Restart is owed for this and for other reasons; whoever does it should confirm afterwards that a session in that project both starts and has its browser back.
 
   Symptom of a deeper design flaw? Yes, arguably — an optional per-project tool could veto session start at all, and the same shape exists wherever a start-time capability check throws rather than records. Worth an ARCH ticket on "optional capabilities degrade, never refuse" if it recurs a third time; not filed unilaterally.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 2f5c897f-ccd5-4241-beb0-4583c232c553 — VERDICT: BROKEN — BROKEN: adoptSession (post-restart survivor re-adoption) was never threaded with browserUnavailableReason -- it THROWS adapter-not-configured for a direct project w/ browser on + no adapter, and for a configured-but-missing checkout it wrongly reports browserAttached=true.. Typed entry in the record's verification[]; this line is an echo, not proof.

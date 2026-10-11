@@ -1,6 +1,6 @@
 # FEAT-145 — Two Claude subscriptions cannot both be used
 
-- **Status:** IN VERIFICATION — all 8 build steps LANDED (2026-09-18). Independent clean-room
+- **Status:** VERIFIED — independent clean-room verify HOLDS (anthropic/opus-4.8, run c11f360d); realpath store-isolation guard refuses symlinked-store collisions, forged registry row stays scrubbed and the implicit default single/undeletable. Settings-UI + OAuth login flow not independently exercised (headless-untestable).
   rounds: step 2 (registry) HOLDS, steps 4+5 HOLD, step 0 was BROKEN then re-fixed and wants a
   re-run; the credential-path round is still in flight and every HOLDS so far is SAME-PROVIDER
   (OpenAI quota-windowed). Not VERIFIED: verification is partially outstanding.
@@ -1348,3 +1348,9 @@ record — these are the measurements step 1 made, and they are what decided tha
   conditional, so nothing needed a behavioural fix.
 - **Left unstaged for the user; no git writes performed. INDEX.md not edited.**
 - **Symptom of a deeper design flaw?** no
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run c11f360d-4117-4ae3-a3c5-cd1090ed313b — VERDICT: HOLDS. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane (Opus 4.8)
+- **independent clean-room verify (round 1, verifying) — HOLDS:** closed: independent verify HOLDS run c11f360d-4117-4ae3-a3c5-cd1090ed313b (core realpath store-guard + account overlay/registry + session override). Residual untested (headless): settings-UI drawer and interactive OAuth login flow — fixer self-verified only.

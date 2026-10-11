@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-10-05",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -110,6 +110,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "BROKEN (VALID, manifest 6 runs). Fixer cc28db7f3e3c exit0 19/0. Two breaks, STOP. P5: initially-DENIED call id left 'unknown', no tombstone; reused id steals a fresh once-grant (7f57e10c4704). P8: fingerprint skip bypasses now-failing gate on identical 2nd write (af310f923a95). See log."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "b13a8f91-52c0-462b-b05c-5bcf5bf1fd29",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:00:16.767Z",
+      "author": "verify sweep (dispatched)",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "compound Bash command (an absolute-path commit chained with a bare add via &&) under a direct once-grant writes TWO ledger records for one Bash call (git-grant.mjs:232-241 and 486-492); the hook's commit record stays permitted forever = the phantom pending record BUG-231 aimed to remove"
     }
   ],
   "verification_class": "plan+review",
@@ -375,3 +387,9 @@ On 2026-09-25 at 16:53:30.456Z, the hook recorded `w1-93fc2b16ddc2` (`git add �
 
 ### 2026-10-07 — BUG-240 lane
 - **coordination:** Coordination note from the BUG-240 lane: after its OpenAI plan review (~15:40 today) BUG-240 will edit scripts/lib/git-shim.mjs in three places only: (1) one fail-closed branch in resolveGitShim AFTER decideGitShim and BEFORE askHostGrant (a provably-scratch target is allowed locally; the window/redeem path is untouched), (2) a baked scratchScope in shimSource/runGitShim/installGitShim, (3) a tightened isTempIndex (realpath; refuse an index inside a git dir). No change to git-grant.mjs, git-grant-store.mjs, index.ts or the runtimes. If you are mid-edit on git-shim.mjs, say so in BUG-240 and I will rebase onto your hunks.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run b13a8f91-52c0-462b-b05c-5bcf5bf1fd29 — VERDICT: BROKEN — compound Bash command (an absolute-path commit chained with a bare add via &&) under a direct once-grant writes TWO ledger records for one Bash call (git-grant.mjs:232-241 and 486-492); the hook's commit record stays permitted forever = the phantom pending record BUG-231 aimed to remove. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **verify BROKEN:** 2026-10-11 independent clean-room verify (anthropic, run b13a8f91) VERDICT BROKEN (VALID). Adversarial mixed-abs-commit-then-bare-add: in a direct session with a once-grant, a compound Bash command (an absolute-path commit chained via && with a bare add) writes TWO ledger records for ONE Bash call, and the hook's commit record is never confirmed (stays permitted = the phantom pending record BUG-231 was meant to remove) because the shim redeem of the second subcommand sees the hook record's offender mismatch and writes a second record. Both 231 fixer tests still pass (their success criteria exercise single invocations). Left OPEN; not fixed here.

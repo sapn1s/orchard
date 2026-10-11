@@ -13,7 +13,7 @@
   "owner": "agent",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [
     {
@@ -95,7 +95,20 @@
     "ARCH-009",
     "BUG-118"
   ],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "openai",
+      "model": "codex-default",
+      "run_id": "01a12af6-3066-7171-83d3-c3e53e7922fe",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:41:01.297Z",
+      "author": "agent",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "verbFingerprint rejects completion=false but accepts completion=null: a truncated transcript missing that metadata yields a partial touched-set and routes reuse instead of fresh, violating the absence-of-evidence-is-never-unchanged rule. Left open."
+    }
+  ],
   "verification_class": "arch",
   "body_slots": {
     "Diagnosis": true,
@@ -484,3 +497,6 @@ rejected designs failed.
   **Verified:** 26/26 checks. `npm run gate` exits 0, read unpiped. Feasibility was measured before anything was built, against the REAL CLI transcript store (599 worker lanes, read-only): 512 (85%) yield a touched set; 87 (15%) yield none and 85 of those ran Bash, so an empty set is unmeasurable and routes to fresh rather than reuse. The rule does not collapse into either option it replaced — over the 323 lanes inside this repo's git history, the touched set had changed 24% of the time at 15 minutes after the lane ended, 60% at an hour, 76% at four hours; the suite asserts its own case list holds both verdicts, so a constant router fails it, and two cases (a reverted edit, a bare touch) fail any time- or mtime-based router. A real concurrent lane modified `src/server/survival.ts` eight seconds into the first smoke run and the tool caught it unprompted — the case this exists for, live. Truncation was graded on prefixes of a real 7.9MB lane transcript including mid-line cuts, which is why `fingerprint` REFUSES a lane whose parent session carries no tool_result: a mid-flight fingerprint records a short touched set, and a short touched set routes a stale lane to reuse.
 
   **Still open / handoff:** `package.json` and `docs/bugs/INDEX.md` were deliberately left unstaged — both carry concurrent lanes' uncommitted changes — so the npm alias for the verify script is a one-line follow-up once package.json is quiet. Nothing wires the rule into dispatch yet; it is a check and a decision a coordinator calls, by design. An independent clean-room verify pass is warranted: this is regression-prone territory (it decides whether a context is trusted) and generation must not be its own only verifier.
+
+### 2026-10-11 — agent
+- **Verification recorded:** dispatch openai/codex-default run 01a12af6-3066-7171-83d3-c3e53e7922fe — VERDICT: BROKEN — verbFingerprint rejects completion=false but accepts completion=null: a truncated transcript missing that metadata yields a partial touched-set and routes reuse instead of fresh, violating the absence-of-evidence-is-never-unchanged rule. Left open.. Typed entry in the record's verification[]; this line is an echo, not proof.

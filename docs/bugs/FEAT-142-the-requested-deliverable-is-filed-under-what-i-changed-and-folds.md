@@ -56,3 +56,9 @@ The deprecated legacy block `orchard-answer` is ALREADY exactly the always-open 
 - **091 assertion NOT weakened:** the taught-set check was tightened, not loosened — it still requires `orchard-notes` to be absent from the injected core and now additionally requires `orchard-answer` present (a stronger constraint, verified passing).
 - **Could NOT test:** live DOM render of an always-open answer / old-transcript shape — `verify:feat-091-renderer` FATALs on served-module export `fenceSegments`; I confirmed this is pre-existing (both `response-blocks.js` and the renderer test are byte-identical to HEAD, and `fenceSegments` IS exported at `:1926`), so it is unrelated to this change but blocked me from driving the browser. I did NOT independently reproduce the implementer's Playwright-over-static-server render; verified always-open at the data layer that governs the fold instead.
 - **Durable pointer:** verifier report emitted to orchestrator 2026-09-16; evidence commands above are re-runnable.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 3160b52e-5eda-4a6a-854b-a28d698b8a39 — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane (Opus 4.8)
+- **independent clean-room verify (round 1, verifying) — BROKEN:** independent clean-room verify BROKEN (run 3160b52e): at HEAD responseFormatSection = 6181 bytes, OVER the 5900 pin AND the 6000 maxChars cap FEAT-142 named as a hard constraint (BUG-143); the feat-091 budget check now reads <=6200/<6400 and templates.ts maxChars default is 6400, so 'NET INJECTED BYTES DID NOT GROW' is false at HEAD and a pin was moved to fit. The answer/outcome vocabulary + tightened taught-set claims were NOT refuted. regressed-from: shared RESPONSE_FORMAT.md drift (coupled FEAT-143 + later-batch growth); fixer owed, not this verify lane.

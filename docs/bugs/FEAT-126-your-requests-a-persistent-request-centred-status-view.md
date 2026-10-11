@@ -1,6 +1,6 @@
 # FEAT-126 — "Your requests": a persistent, request-centred status view
 
-- **Status:** OPEN (priority — data-loss) — round-3/4 fixes CONFIRMED to hold (run 2cfc221a); the round-5 wrong-shape fix's declared cases + 2 of 3 not-enumerated variants CONFIRMED to hold (clean-room verify 2026-09-30, run 8e8e3761, VERDICT BROKEN VALID), BUT THREE NEW data-loss/integrity defects remain in `src/server/requests.ts`: (1) quarantine renames onto `<file>.corrupt-<ms>` with no existence check → a same-name pre-existing quarantine file is silently overwritten; (2) two quarantines in the same millisecond destroy the first corrupt evidence; (3) the 4 MB guard is stat-then-unbounded-read (TOCTOU) → a file that grows past 4 MB between stat and read is fully read/parsed, bypassing the guard. NOT VERIFIED; handoff in the latest Activity-log entry. Finding 3b (`board.ts` `doneIds`) still open/off-limits. — design approved by the user; this ticket is the build spec. plan+review round 1 (finding). No product code written this round. Recommended path: the request↔work binding is a DECLARED fact owned by the orchestrator (Dispatch `request=` key + an `orchard-request` block), never derived from chat; the surface holds only that binding and JOINS every status live from the board / liveness / outcomes so it cannot go stale.
+- **Status:** IN-VERIFICATION — all store / data-loss work (round-3 per-session store, round-4 recogniser/attribution, round-5 wrong-shape, round-6 shared store-io quarantine/capped-read) is independently CONFIRMED to HOLD (clean-room verify 2026-10-01, run ccde50b4). Finding 3b — the last open code item, a ticket Done >24h ago read `missing`/`open` in the request row because `readBoard` exposed only `doneToday` (24h-gated) — is now LANDED (2026-10-11): `board.ts` exposes `doneIds` (every Done id, any age) and `requests-view.js` joins it as `done`. Proven against the real board (verify suite 43/43, must-FAIL on a synthesized no-`doneIds` payload) and in a real headless browser over the real styles (the Done>24h request row flips from `open · 1 missing` to `done`). Awaiting one final independent clean-room verify before VERIFIED. — design approved by the user; this ticket is the build spec. plan+review round 1 (finding). No product code written this round. Recommended path: the request↔work binding is a DECLARED fact owned by the orchestrator (Dispatch `request=` key + an `orchard-request` block), never derived from chat; the surface holds only that binding and JOINS every status live from the board / liveness / outcomes so it cannot go stale.
 - **Severity:** high (this is the dominant defect an independent OpenAI review found in the session: the absence of a persistent state surface separate from the chat stream)
 - **Area:** Web UI — the right-hand rail (`public/app.js` renderRail / renderRailSummary, `public/styles.css`) · server store (new `requests.ts`, `src/server/index.ts` board endpoint) · dispatch grammar (`scripts/lib/cost-model.mjs`) · injected declaration surface (`docs/prompts/RESPONSE_FORMAT.md`)
 - **Reported:** 2026-09-05 by user (via an independent OpenAI review of this session)
@@ -964,3 +964,76 @@ module only; the recogniser/attribution fixes of rounds 3–5 were already confi
   from the fixer's); openai window exhausted — decorrelation reduced (author-provider
   anthropic), noted per VERIFY.md #5. (Proof is the typed entry in the board ledger;
   this line is a pointer, not the proof.)
+
+### 2026-10-11 — fix lane (fixing, round 7, class=fix) — finding 3b LANDED (doneIds)
+
+Landed the last open code item, finding 3b: a ticket Done >24h ago read
+`open · 1 missing` in its "Your requests" row because `readBoard` exposed only
+`doneToday` (gated to 24h), so a long-verified ticket was in no list the payload
+carried and the completion join reported `missing`. The pre-written hunk (round-4
+Activity entry) still applied cleanly against the current tree — hypothesis
+CONFIRMED before landing.
+
+- **Fix (two parts, both files that were off-limits to the earlier lanes).**
+  `src/server/board.ts`: added optional `doneIds?: string[]` to the `Board`
+  interface (beside `doneToday`), to both the empty and populated `Board` literals
+  in `readBoard`, and a `board.doneIds!.push(id)` in the Done branch run
+  UNCONDITIONALLY (outside the `if (recent)` that gates `doneToday`) — so every
+  Done id is carried, any age, while `doneToday` stays the 24h list the rail's
+  "Done recently" section renders. `public/lib/requests-view.js`: in
+  `indexBoardTickets`, after `add(board?.doneToday, 'done')`, index every
+  `board.doneIds` id as `done` (ids only, never masking a richer `doneToday` row).
+  The stale NOTE above the function was updated to LANDED.
+
+- **Proof against the REAL board (not a fixture).** `scripts/verify-feat-126-requests-store.mjs`
+  now 43/43 (41 prior + 2 new). The two new tests call the REAL `readBoard` over
+  this repo's `docs/bugs/`: the real board carries 264 Done ids, of which 233 are
+  >24h old (in `doneIds`, not `doneToday`) — exactly the tickets that previously
+  read `missing`. A real Done>24h id now indexes `done` and its request row's
+  completion reads `done`. MUST-FAIL anchored to a synthesized pre-fix payload
+  (the board with its `doneIds` field DELETED — a fixed baseline, not a moving
+  ref): the same ticket falls into no list and reads `missing`, so the test is
+  non-vacuous. Additionally proven by reverting both source files to pre-fix
+  copies: the 2 new tests redden (41 passed, 2 failed), restore → 43/43.
+
+- **User-visible render verified in a real headless browser.** Served the REAL
+  `requests-view.js` + REAL `public/styles.css` over a realistic busy fixture
+  (a Done>24h request, a running lane, an idle-open, a re-filed/ghost ticket),
+  both themes, and drove `renderRequestsInto`. WITH `doneIds` the Done>24h request
+  row renders `IDLE · DONE` (completion chip `req-tk st-done`); WITHOUT it (the
+  pre-fix payload) the identical row renders `IDLE · OPEN · 1 MISSING`
+  (`req-tk missing`) — the exact defect. Reads as a clean hierarchy, DONE (moss/
+  green) distinct from OPEN (ochre) and MISSING, no new tokens. Scratch static
+  server on an ephemeral port + Playwright; temp harness and screenshots removed.
+
+- **Commands + real output.**
+  - `node scripts/verify-feat-126-requests-store.mjs` → `43 passed, 0 failed`.
+  - must-FAIL (pre-fix source swapped in) → `41 passed, 2 failed` (both FINDING 3b
+    tests); restored → `43 passed, 0 failed`.
+  - `npm run gate` → `GATE: PASS — safe to commit. (exit 0)` (leak-gate, check-nul,
+    prompt-privacy, typecheck all PASS).
+  - Anti-regression: `node scripts/verify-feat-153-board-grid.mjs` → `35/35 checks
+    passed` (exercises `observeAssistantText` + the board); `node
+    scripts/verify-feat-067-rail-summary.mjs` → `23/23 checks passed` (the `Board`
+    shape / summary — unaffected by the new optional field).
+
+- **Could-not-run.** `verify-feat-126-e2e.mjs` still FATALs pre-store at
+  `startSession` ("no start ack") — the same pre-existing environment/harness
+  `runtime-check-pending` timing seen since round 1; it aborts before any
+  store/board interaction, so it is unrelated to this change, not a regression.
+
+- **Skeptic flag / high-stakes.** Low-risk data-plumbing (one optional additive
+  field + its consumer; no new DOM/CSS; the `done`/`missing` render states were
+  already visually verified rounds 1–2). But this is the FINAL code item and the
+  whole ticket is a session-lifecycle presentation surface with a long BROKEN
+  history — an independent clean-room verify of 3b (and a confirming pass over the
+  now-complete feature) is warranted before VERIFIED, per the plan's standing
+  skeptic flag. Set to IN-VERIFICATION, not VERIFIED.
+
+- **Left unstaged for the user** (no git writes): `src/server/board.ts`,
+  `public/lib/requests-view.js`, `scripts/verify-feat-126-requests-store.mjs`, and
+  this ticket. Status set to IN-VERIFICATION. `board:gen` NOT run (left to the
+  orchestrator).
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run d0a984fc-4e56-470a-8ba2-4d8b25df98dd — VERDICT: BROKEN — 3b fixer test env-coupled: needs real docs/bugs/ Done>24h ticket, absent in clean room. Hermetic adversarial 7/7 PASS: code (doneIds/indexBoardTickets) correct.. Typed entry in verification-ledger.json; this line is an echo, not proof.

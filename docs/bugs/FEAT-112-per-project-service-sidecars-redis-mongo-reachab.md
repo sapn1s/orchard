@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "open",
   "human_action": "none",
-  "updated": "2026-08-28",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -33,7 +33,19 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "741a35c4-46ad-423c-8125-97ee387d8a57",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:07:00.428Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "plan+review",
   "body_slots": {
     "Diagnosis": false,
@@ -395,3 +407,6 @@ race proofs exercise the mechanism `index.ts` calls, but a live end-to-end
   1. **The fix is SPLIT and only partially committed.** `3ed4f09` contains `service-manager.ts`/`validate.ts`/`registry.ts`/`board.ts`/`decisions.ts`/`drawer.js`, but NOT `src/server/index.ts` (teardown routes, `services-request` route, apply-on-Allow, rebuild rejoin) nor `agent-bridge.ts` (`ensureServices`/`connectSessionToServices` in `startSession`) — the parts the ticket body and round-2 defect-4 fix describe. Those live only in the current uncommitted working tree, mixed with many other in-flight tickets, so no single range captures the whole feature; a `--working-tree` verify would blend it with unrelated changes.
   2. **HIGH-STAKES proof needs a live Docker end-to-end.** `verify-feat-112-services.mjs` creates real networks/containers/volumes and runs a RESP client from inside a session container. A dispatched clean-room CLI cannot safely or reliably do this within a driver's remit (charter: never touch Docker resources the lane did not create; a heavy real-docker end-to-end from an isolated CLI is out of scope for this driver).
 - **Handoff for the orchestrator:** this ticket is HIGH-STAKES (session lifecycle + cross-project isolation + data) and already carries a clean-room round-1 (BROKEN, 4 defects) and a fixer round-2. The remaining independent pass should be commissioned as a **fresh-context agent against a real-docker host after the index.ts/agent-bridge wiring is committed** (so a stable range exists) — not the tree-export clean room, which cannot boot at the recorded commit nor exercise Docker. Status left unchanged; no code touched.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 741a35c4-46ad-423c-8125-97ee387d8a57 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.

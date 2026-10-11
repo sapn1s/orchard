@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-09-02",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -48,7 +48,19 @@
   ],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "bf1e71ee-5b2e-4a6e-a6e6-0f24badf97c7",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:07:02.486Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "plan+review",
   "body_slots": {
     "Diagnosis": false,
@@ -163,3 +175,6 @@ per the UI-visual-review rule.
   files are leak-clean (grepped for home-path / bare-username / token shapes) and
   TS-clean. Left unstaged for the orchestrator to commit.
 - **Handoff:** `work_state` in_verification, `human_action` review.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run bf1e71ee-5b2e-4a6e-a6e6-0f24badf97c7 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.

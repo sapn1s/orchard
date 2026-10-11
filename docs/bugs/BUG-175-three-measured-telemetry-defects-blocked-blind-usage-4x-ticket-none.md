@@ -146,3 +146,9 @@ human reads and acts on:
   fact the async-dispatch/request-timestamp/declaration OWNER already knew), which
   is the ARCH-010 "whoever owns a fact writes it down" class. Not filing an ARCH
   ticket unilaterally; flag for the orchestrator to decide at close.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run d56b220d-65df-40e3-93f0-bd916d714399 — VERDICT: BROKEN. Typed entry in verification-ledger.json; this line is an echo, not proof.
+
+### 2026-10-11 — verify lane
+- **Note:** 2026-10-11 independent verify BROKEN run d56b220d-65df-40e3-93f0-bd916d714399: genuine residual = pairDispatches requireCompleted defaults true so dispatches resolved by a terminal failed/killed/stopped notification (26+27+30 of ~664 real notifications = ~12%) are left unpaired and their wait swept to idle (cost-model.mjs:487-490). NOTE the verifier's headline FINDING (real task-notifications carry no <tool-use-id>) is REFUTED by ground truth: 630 real notifications in ~/.claude-migration-backup DO carry <tool-use-id>toolu_, so NOTIF_TUID_RE matches and the ~84% occupancy recovery is NOT lost. The cleanroom could not test DEFECT 1 on real data because verify-bug-175.mjs looks in ~/.claude/projects, where orchestrator transcripts no longer exist (relocated to .claude-migration-backup) so its LOUD real-transcript check fails even in the real tree. DEFECTS 2 (per-request 7d) + 3 (ticket=none) verified PASS. Contested verdict: orchestrator should re-verify with a real transcript seeded into the room before closing.

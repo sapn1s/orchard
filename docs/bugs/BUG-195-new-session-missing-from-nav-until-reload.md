@@ -111,3 +111,9 @@ existing live event that already marks the session real.
   the closing agent.
 </content>
 </invoke>
+
+### 2026-10-11 — verify sweep (dispatched)
+- **verify BROKEN:** 2026-10-11 independent clean-room verify (anthropic, run a9d18241) VERDICT BROKEN (VALID). Fixer 6/6 but two-break race gaps (public/app.js:11941 / loadSessions:1335), both reproduced in a real headless browser: (1) inflight-load-coalesced — if a loadSessions for the project is already in flight when session-init arrives, loadSessions(force:true) returns the old in-flight promise, so the refetch is coalesced, the list stays 0 rows and the new session has no nav row for the rest of the first turn; (2) transcript-lands-after-init — the fix does a single refetch with no retry, so if the transcript/provenance file is written slightly after session-init (a real CLI may emit system:init before writing — key untested), the refetch reads an empty list and the row stays missing until turn-end. Left OPEN; not fixed here.
+
+### 2026-10-11 — verify sweep (dispatched)
+- **Verification recorded:** dispatch anthropic run a9d18241-844e-4905-bd23-bb1d5a95316b — VERDICT: BROKEN — two-break race: (1) refresh dropped when a loadSessions is already in-flight; (2) single refetch no retry, late transcript write leaves row missing until turn-end; both reproduced in headless browser. Typed entry in verification-ledger.json; this line is an echo, not proof.

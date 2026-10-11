@@ -13,7 +13,7 @@
   "owner": "you",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-08-25",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -26,7 +26,20 @@
   "code_refs": [],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "openai",
+      "model": "codex-default",
+      "run_id": "01a12aef-db78-7b50-9652-bba49a2812b3",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T12:33:18.928Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "independent-verify: fixer test 31/31 PASS. Adversarial pending-toggle-with-drift: 31/4 FAIL - socket block text tracks the TOGGLE's new state, not real container state; pending-ON reads live, pending-OFF drops the rebuild-survival warning. Fixture never covers pending+drift."
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": false,
@@ -79,3 +92,6 @@
 
 ### 2026-08-25 — worker
 - **committed:** Committed as 303f851 (public/lib/drawer.js, scripts/verify-bug-154-socket-consent-wording.mjs). Not pushed.
+
+### 2026-10-11 — dispatch openai
+- **Verification recorded:** dispatch openai/codex-default run 01a12aef-db78-7b50-9652-bba49a2812b3 — VERDICT: BROKEN — independent-verify: fixer test 31/31 PASS. Adversarial pending-toggle-with-drift: 31/4 FAIL - socket block text tracks the TOGGLE's new state, not real container state; pending-ON reads live, pending-OFF drops the rebuild-survival warning. Fixture never covers pending+drift.. Typed entry in the record's verification[]; this line is an echo, not proof.

@@ -610,3 +610,6 @@ re-verify is REQUIRED before VERIFIED (double-switch race and property (d) still
 - **Symptom of a deeper design flaw?** no — this COMPLETES the ARCH-010 single-authority: the server owns
   "which account is this session on," and after this pass no client value reads OR validates it for a bound
   session. No new ARCH ticket.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 00b6d96a-7889-4396-84e3-60e6a490f036 — VERDICT: BROKEN — r4 closed prior r1-3 BROKENs; NEW break: deleting a bound account (deleteAccount claude-accounts.ts:513) never rebinds session-accounts.json, stranding the session permanently on every resume.. Typed entry in verification-ledger.json; this line is an echo, not proof.

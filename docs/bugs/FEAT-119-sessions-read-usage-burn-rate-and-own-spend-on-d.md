@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "review",
-  "updated": "2026-09-02",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -27,7 +27,19 @@
   "code_refs": [],
   "related": [],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "42c2fd45-6b31-426c-9f0b-b6ebcdb943df",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T09:07:04.482Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "plan+review",
   "body_slots": {
     "Diagnosis": false,
@@ -97,3 +109,6 @@ scripts/verify-feat-119-usage-awareness.mjs (26/26): pure burn math (PARK vs OK,
   - **Independent verify warranted:** this is a session-lifecycle + cost-regression-prone change (touches the launch preamble); a fresh-context clean-room pass is advisable before it is treated as settled.
 
 
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 42c2fd45-6b31-426c-9f0b-b6ebcdb943df — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.

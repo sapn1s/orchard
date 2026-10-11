@@ -156,7 +156,7 @@ function buildTicketReport(dir, id, entries) {
     status_matched: cls.matched,
     status_header: oneLine(t.statusRaw),
     severity: t.severity ?? null,
-    board_placement: inOpen && inDone ? 'BOTH (duplicate)' : inDone ? 'Done (committed)' : inOpen ? 'Open' : 'NOT ON BOARD',
+    board_placement: inOpen && inDone ? 'BOTH (duplicate)' : inDone ? 'Done' : inOpen ? 'Open' : 'NOT ON BOARD',
     board_owner: openRow ? oneLine(openRow.owner, 8) : null,
     commit: doneRow ? oneLine(doneRow.commit, 40) : null,
     index_status_cell: openRow ? oneLine(openRow.status) : null,

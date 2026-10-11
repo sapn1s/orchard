@@ -781,7 +781,7 @@ function genBoard(dir) {
   out.push(...openLines);
   if (openTrailer.length) out.push('', ...openTrailer);
   out.push('');
-  out.push('## Done (committed)', '');
+  out.push('## Done', '');
   out.push(...doneLines);
   out.push('');
   out.push(...shippedBlob);

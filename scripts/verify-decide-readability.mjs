@@ -177,7 +177,7 @@ function seedBoard(bugs) {
     `# Board — scratch\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     [...realRows,
      row(ADV, 'adversarial'), row(REACH6, 'six options'), row(REACH12, 'twelve options')].join('\n') +
-    `\n\n## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n## Shipped\n\n- nothing yet\n`);
+    `\n\n## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n## Shipped\n\n- nothing yet\n`);
 }
 
 /* ───────────────────────────────────────────────────────────── infra helpers ── */

@@ -68,7 +68,7 @@ function writeIndex(bugs, openRows, doneRows) {
   fs.writeFileSync(
     path.join(bugs, 'INDEX.md'),
     `${INDEX_HEAD}${openRows.join('\n')}${openRows.length ? '\n' : ''}\n` +
-      `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n${doneRows.join('\n')}${doneRows.length ? '\n' : ''}\n` +
+      `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n${doneRows.join('\n')}${doneRows.length ? '\n' : ''}\n` +
       '## Shipped earlier (pre-tracker)\nNothing.\n',
   );
 }

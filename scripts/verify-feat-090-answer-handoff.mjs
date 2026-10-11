@@ -65,7 +65,7 @@ function seedBoard(bugs) {
     `| ${ARCH_ID} | turn-end parentage: fix or shield | 👤 | needs decision | high |\n` +
     `| ${QUESTION_ID} | rename the widget | 👤 | needs decision | med |\n` +
     `| ${AGENT_ID} | flaky retry loop under load | 🤖 | building | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n` +
     `## Shipped earlier (pre-tracker)\n\n- nothing yet\n`);
   fs.writeFileSync(path.join(bugs, `${NEEDS_ID}-export-button.md`),
     `# ${NEEDS_ID} — export button needs a decision\n\n` +

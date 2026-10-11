@@ -214,7 +214,7 @@ Owner: 🤖 = subagent in flight · 👤 = needs you · — = queued/unassigned.
 | ID | Title | Owner | Status | Sev |
 |----|-------|-------|--------|-----|
 
-## Done (committed)
+## Done
 
 | ID | Title | Commit |
 |----|-------|--------|

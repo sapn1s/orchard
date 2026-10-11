@@ -151,7 +151,7 @@ fs.writeFileSync(path.join(dir, 'INDEX.md'), [
   '# Board', '', '## Open', '',
   '| ID | Title | Owner | Status | Sev |', '|----|-------|-------|--------|-----|',
   ...openRows, '',
-  '## Done (committed)', '', '| ID | Title | Commit |', '|----|-------|--------|',
+  '## Done', '', '| ID | Title | Commit |', '|----|-------|--------|',
   ...doneRows, '', '## Shipped', '',
 ].join('\n'));
 

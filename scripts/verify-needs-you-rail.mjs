@@ -119,7 +119,7 @@ async function seedBoard() {
     `| ${TICKET_ID} | should the importer skip malformed rows or halt? | 👤 | needs decision | high |\n` +
     `| ${STATUS_ID} | waiting on user to review the new billing copy | 👤 | user-owned | low |\n` +
     `| BUG-702 | flaky retry loop under load | 🤖 | building | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
   fs.writeFileSync(path.join(bugs, `${TICKET_ID}-importer-malformed-rows.md`),
     `# ${TICKET_ID} — should the importer skip malformed rows or halt?\n\n` +
     `- **Status:** OPEN\n- **Severity:** high\n\n` +

@@ -111,7 +111,7 @@ function seedBoard(projectDir) {
   fs.writeFileSync(path.join(bugs, 'INDEX.md'),
     `# Board\n\n## Open\n\n` +
     `| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n${openRows}\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n${doneRows}\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n${doneRows}\n`);
   for (const r of BOARD.rows) {
     fs.writeFileSync(path.join(bugs, `${r.id}-${r.id.toLowerCase()}.md`),
       `# ${r.id} — ${r.title}\n\n- **Status:** OPEN\n- **Severity:** ${r.sev}\n\n` +

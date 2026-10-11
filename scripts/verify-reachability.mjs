@@ -139,7 +139,7 @@ function mkBoard(name, openRows, doneRows, files, backdate = {}) {
   const index =
     `# Board\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     openRows.map((r) => `| ${r} |`).join('\n') +
-    `\n\n## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
+    `\n\n## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
     doneRows.map((r) => `| ${r} |`).join('\n') +
     `\n\n## Shipped\n\n(none)\n`;
   fs.writeFileSync(path.join(bugs, 'INDEX.md'), index);

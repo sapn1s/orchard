@@ -55,7 +55,7 @@ function writeBoard(rows) {
     `# Board\n\n## Open\n\n` +
     `| ID | Title | Owner | Status | Sev |\n` +
     `|----|-------|-------|--------|-----|\n${open}\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
   for (const r of rows) {
     fs.writeFileSync(path.join(bugs, `${r.id}-x.md`), `# ${r.id} — ${r.title}\n\n- **Status:** OPEN\n`);
   }

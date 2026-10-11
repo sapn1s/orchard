@@ -124,7 +124,7 @@ function seedProject() {
   fs.writeFileSync(path.join(bugs, 'INDEX.md'),
     `# Board\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     `| ${ASK_ID} | pick a retry ceiling | 👤 | needs decision | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
   fs.writeFileSync(path.join(bugs, `${ASK_ID}-retry-ceiling.md`),
     `# ${ASK_ID} — pick a retry ceiling\n\n- **Status:** OPEN\n\n## Question\nHow many retries before giving up?\n- three\n- five\n\n## Activity log (APPEND-ONLY)\n`);
   // Planted derived arch findings: one BARE (Observation), one PROMOTED (needsYou).

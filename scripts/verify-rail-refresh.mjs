@@ -116,7 +116,7 @@ function writeIndex(rows) {
     `| ID | Title | Owner | Status | Sev |\n` +
     `|----|-------|-------|--------|-----|\n` +
     rows.map((r) => `| ${r.id} | ${r.title} | 👤 | needs decision | med |\n`).join('') +
-    `\n## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `\n## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
 }
 function writeTicket(id, title, { question = false } = {}) {
   // An answerable ticket needs a `## Question` (BUG-025); ID_STAYS carries one so

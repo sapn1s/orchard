@@ -87,7 +87,7 @@ function seedBoard(bugs) {
     `| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     `| ${DEC_ID} | fix or shield | 👤 | needs decision | high |\n` +
     `| ${REAL_ARCH} | ${REAL.decision.question.replace(/\|/g, '/').slice(0, 48)} | 👤 | answered — awaiting | high |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n` +
     `## Shipped earlier (pre-tracker)\n\n- nothing yet\n`);
   fs.writeFileSync(path.join(bugs, `${DEC_ID}-fix-or-shield.md`),
     `# ${DEC_ID} — fix or shield\n\n` +

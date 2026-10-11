@@ -54,7 +54,7 @@ async function main() {
     `| BUG-801 | should the importer skip malformed rows or halt? | 👤 | needs decision | high |\n` +
     `| FEAT-802 | wire the export button to the new endpoint | 👤 | needs decision | med |\n` +
     `| BUG-803 | flaky retry loop under load | 🤖 | building | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
   for (const [id, title] of [
     ['BUG-801', 'should the importer skip malformed rows or halt?'],
     ['FEAT-802', 'wire the export button to the new endpoint'],

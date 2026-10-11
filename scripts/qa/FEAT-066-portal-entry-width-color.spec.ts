@@ -64,7 +64,7 @@ function seedBoard(work: string): void {
     + `| FEAT-902 | export button needs a decision | 👤 | needs decision | high |\n`
     + `| BUG-903 | flaky retry loop under load | 🤖 | building | med |\n`
     + `| FEAT-904 | paginate the audit view | — | queued | low |\n\n`
-    + `## Done (committed)\n\n| ID | Title | Commit |\n|----|----|----|\n`
+    + `## Done\n\n| ID | Title | Commit |\n|----|----|----|\n`
     + `| BUG-901 | pivot table breaks under a Turkish locale | abc1234 |\n`);
   fs.writeFileSync(path.join(bugs, 'BUG-901-pivot-locale.md'),
     `# BUG-901 — pivot table breaks under a Turkish locale\n\n`

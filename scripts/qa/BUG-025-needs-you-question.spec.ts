@@ -80,7 +80,7 @@ test.beforeAll(async () => {
     `| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     `| ${STATUS_ID} | user to sign off the new pricing page copy | 👤 | user-owned | low |\n` +
     `| ${QUESTION_ID} | should retries back off linearly or exponentially? | 👤 | needs decision | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
   fs.writeFileSync(path.join(bugs, `${STATUS_ID}-pricing-copy.md`),
     `# ${STATUS_ID} — user to sign off the new pricing page copy\n\n` +
     `- **Status:** OPEN\n- **Severity:** low\n\n` +

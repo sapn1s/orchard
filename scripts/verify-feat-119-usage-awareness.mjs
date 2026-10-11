@@ -190,7 +190,7 @@ async function main() {
   const proj = fs.mkdtempSync(path.join(os.tmpdir(), 'feat119-proj-'));
   fs.mkdirSync(path.join(proj, 'docs', 'bugs'), { recursive: true });
   fs.writeFileSync(path.join(proj, 'docs', 'bugs', 'INDEX.md'),
-    '# Board\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n| BUG-1 | x | 🤖 | building | low |\n\n## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n');
+    '# Board\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n| BUG-1 | x | 🤖 | building | low |\n\n## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n');
   fs.writeFileSync(path.join(proj, 'docs', 'bugs', 'BUG-1-x.md'), '# BUG-1\n\n- **Status:** OPEN\n');
   const section = boardStateSection(proj);
   check('the board first-turn preamble NAMES the on-demand command (new + resumed sessions learn it exists)',

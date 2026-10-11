@@ -539,8 +539,14 @@ omission is visible.
 ### J. Git safety while subagents hold uncommitted work
 - **Never `git add -A` / `git add .`** when agents may have uncommitted work — it sweeps their
   changes into the wrong commit (learned the hard way). Commit **explicit file lists**.
-- Commit each ticket's own files; move its board row to Done with the hash — the hash ties the row
-  to the exact change and keeps the record auditable (§K).
+- **A ticket closes on verified work, not on a commit.** Move its board row to Done the moment the
+  work is built and verified (§I) — never hold a ticket open waiting for a commit or push. A lane
+  usually can't run git writes, and a project may have no git at all, so gating "Done" on a hash
+  just strands the row and makes someone hunt down which session was waiting. Commit each ticket's
+  own files as an **explicit list** (never `git add -A`, per the bullet above).
+- **The commit hash is optional provenance (§K), recorded later by whoever commits.** When the
+  change *is* committed, put the hash on the row so it ties the row to the exact change; until then
+  (or forever, in a no-git project) the row simply reads `(uncommitted)`. Closing never waits on it.
 
 ### K. Durable, opt-in board for real projects
 A project "has a board" **iff it already contains one** (Orchard: a `docs/bugs/` dir) — real repos

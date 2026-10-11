@@ -62,7 +62,7 @@ function seedBoard(bugs) {
     `| BUG-905 | single choice, the legacy shape | 👤 | needs decision | med |\n` +
     `| BUG-906 | a key that embeds a hyphen | 👤 | needs decision | low |\n` +
     `| BUG-907 | already answered before this fix (single key on disk) | 👤 | answered | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n\n` +
     `## Shipped earlier (pre-tracker)\n\n- nothing yet\n`);
 
   const decisionTicket = (id, title) =>

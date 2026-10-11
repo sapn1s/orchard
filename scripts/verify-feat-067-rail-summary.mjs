@@ -128,7 +128,7 @@ function writeIndex(extraNeeds = '') {
     extraNeeds +
     `| ${INFLIGHT_ID} | flaky retry loop under load | 🤖 | building | med |\n` +
     `| ${QUEUED_ID} | tidy the config loader | — | queued | low |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
     `| ${DONE_ID} | ship the export button | abc1234 |\n`);
 }
 

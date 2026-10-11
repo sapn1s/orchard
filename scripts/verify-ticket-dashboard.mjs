@@ -96,7 +96,7 @@ function seedBoard() {
     `| ${NEEDS_ID} | export button needs a decision | 👤 | needs decision | high |\n` +
     `| ${AGENT_ID} | flaky retry loop under load | 🤖 | building | med |\n` +
     `| ${OPEN_ID} | paginate the audit view | — | queued | low |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
     `| ${DONE_ID} | pivot table breaks under a Turkish locale | abc1234 |\n\n` +
     `## Shipped earlier (pre-tracker)\n\n- nothing yet\n`);
 

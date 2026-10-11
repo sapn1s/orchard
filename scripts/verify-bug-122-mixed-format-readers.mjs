@@ -247,7 +247,7 @@ console.log('\n=== F. truncated & corrupted promotions stay LISTABLE and LOUD ==
   fs.writeFileSync(path.join(bugs, 'INDEX.md'), [
     '# Board', '', '## Open', '',
     '| ID | Title | Owner | Status | Sev |', '|----|-------|-------|--------|-----|', '',
-    '## Done (committed)', '', '| ID | Title | Commit |', '|----|-------|--------|', '',
+    '## Done', '', '| ID | Title | Commit |', '|----|-------|--------|', '',
     '## Shipped', '',
   ].join('\n'));
   const boardRun = (cmd) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'board.mjs'), cmd, `--dir=${bugs}`],
@@ -367,7 +367,7 @@ console.log('\n=== I. the decision-shape guard, on a promoted ticket ===');
   fs.writeFileSync(path.join(bugs, 'INDEX.md'), [
     '# Board', '', '## Open', '',
     '| ID | Title | Owner | Status | Sev |', '|----|-------|-------|--------|-----|', '',
-    '## Done (committed)', '', '| ID | Title | Commit |', '|----|-------|--------|', '',
+    '## Done', '', '| ID | Title | Commit |', '|----|-------|--------|', '',
     '## Shipped', '',
   ].join('\n'));
   const run = (cmd) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'board.mjs'), cmd, `--dir=${bugs}`],
@@ -643,7 +643,7 @@ async function uiLeg() {
       fs.writeFileSync(path.join(sBugs, 'INDEX.md'), [
         '# Board', '', '## Open', '',
         '| ID | Title | Owner | Status | Sev |', '|----|-------|-------|--------|-----|', '',
-        '## Done (committed)', '', '| ID | Title | Commit |', '|----|-------|--------|', '',
+        '## Done', '', '| ID | Title | Commit |', '|----|-------|--------|', '',
         '## Shipped', '',
       ].join('\n'));
       spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'board.mjs'), 'gen', `--dir=${sBugs}`], { cwd: ROOT, encoding: 'utf8' });

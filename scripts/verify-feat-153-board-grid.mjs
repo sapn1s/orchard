@@ -169,7 +169,7 @@ function seedBoard() {
   fs.writeFileSync(path.join(bugs, 'INDEX.md'),
     `# Board\n\n## Open\n\n` +
     `| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n${open}\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n${done}\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n${done}\n`);
   // The answerable needs ticket carries a real ## Question + options + a prior log.
   fs.writeFileSync(path.join(bugs, `${ANSWERABLE_ID}-importer-rows.md`),
     `# ${ANSWERABLE_ID} — importer drops rows silently under load\n\n` +
@@ -194,7 +194,7 @@ function writeBoardIndex(rows) {
   fs.writeFileSync(path.join(WITH, 'docs', 'bugs', 'INDEX.md'),
     `# Board\n\n## Open\n\n` +
     `| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n${open}\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n${done}\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n${done}\n`);
 }
 
 async function registerProject(hostPath, name) {

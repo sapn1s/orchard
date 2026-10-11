@@ -199,7 +199,7 @@ function seedOtherProject() {
   fs.writeFileSync(path.join(bugs, 'INDEX.md'),
     `# Board\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     `| ${Q_ID} | pick a retry ceiling | 👤 | needs decision | med |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`);
   fs.writeFileSync(path.join(bugs, `${Q_ID}-retry-ceiling.md`),
     `# ${Q_ID} — pick a retry ceiling\n\n- **Status:** OPEN\n\n## Question\nHow many retries before giving up?\n- three\n- five\n\n## Activity log (APPEND-ONLY)\n`);
 }

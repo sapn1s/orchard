@@ -1833,7 +1833,7 @@ console.log('\n(D) board:check warns on VERIFIED with no Verified-by');
   fs.writeFileSync(path.join(dir, 'BUG-905-old.md'),
     '# BUG-905 — closed before the rule existed\n\n- **Status:** VERIFIED\n- **Severity:** low\n\n## Activity log\n### 2026-08-04 — builder\n- did the thing\n');
   fs.writeFileSync(path.join(dir, 'INDEX.md'),
-    '# Board\n\n## Open\n\n| ID | Sev | Title | Owner | Status |\n|---|---|---|---|---|\n\n## Done (committed)\n\n| ID | Sev | Title | Commit |\n|---|---|---|---|\n' +
+    '# Board\n\n## Open\n\n| ID | Sev | Title | Owner | Status |\n|---|---|---|---|---|\n\n## Done\n\n| ID | Sev | Title | Commit |\n|---|---|---|---|\n' +
     ['BUG-901|med|self verified', 'BUG-902|med|independently verified', 'BUG-903|med|trivial exempt', 'BUG-904|med|subagent claim', 'BUG-905|low|closed before the rule existed', 'BUG-906|med|prose only']
       .map((r) => `| ${r.split('|').join(' | ')} | — |`).join('\n') +
     '\n\n## Shipped earlier (pre-tracker)\n\n(nothing)\n');

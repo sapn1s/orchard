@@ -93,7 +93,7 @@ function seedBoard() {
     `| BUG-707 | flaky retry loop under load | 🤖 | building | med |\n` +
     `| FEAT-708 | tickets written in agent dialect | — | OPEN | med |\n` +
     `| FEAT-709 | enforce structural readability | — | OPEN | low |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
     `| BUG-710 | pivot table breaks under a Turkish locale | abc1234 |\n` +
     `| FEAT-711 | in-app guide reader | def5678 |\n\n` +
     `## Shipped earlier (pre-tracker)\n\n- nothing yet\n`);
@@ -184,7 +184,7 @@ function seedZeroBoard() {
   fs.writeFileSync(path.join(ZBUGS, 'INDEX.md'),
     `# Board — clear\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|-------|-------|--------|-----|\n` +
     `| FEAT-800 | a quiet queued item | — | OPEN | low |\n\n` +
-    `## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
+    `## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n` +
     `| BUG-801 | already fixed | aaa0001 |\n\n## Shipped earlier (pre-tracker)\n\n- nothing yet\n`);
   fs.writeFileSync(path.join(ZBUGS, 'FEAT-800-quiet.md'),
     `# FEAT-800 — a quiet queued item\n\n- **Status:** OPEN\n- **Severity:** low\n- **Area:** misc\n\n` +

@@ -122,7 +122,7 @@ try {
     check(
       '(c) restored row lands in the Done table (ticket Status: VERIFIED)',
       afterGen.split('## Done')[1]?.includes(restoredLine) ?? false,
-      'expected the restored row under "## Done (committed)"'
+      'expected the restored row under "## Done"'
     );
   }
 

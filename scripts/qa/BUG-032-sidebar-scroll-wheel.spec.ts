@@ -131,7 +131,7 @@ test.beforeAll(async () => {
       `## Question\nPick an option for filler ticket #${i}?\n- yes\n- no\n\n` +
       `## Activity log (APPEND-ONLY)\n\n### 2026-08-06 — bug032 spec\n- seeded to overflow the rail.\n`);
   }
-  index += `\n## Done (committed)\n\n| ID | Title | Commit |\n|----|-------|--------|\n`;
+  index += `\n## Done\n\n| ID | Title | Commit |\n|----|-------|--------|\n`;
   fs.writeFileSync(path.join(bugs, 'INDEX.md'), index);
   const railReg = await (await fetch(`${BASE}/api/projects`, {
     method: 'POST',

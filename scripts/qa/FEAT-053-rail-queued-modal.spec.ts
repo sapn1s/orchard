@@ -100,7 +100,7 @@ function seedBoard(work: string, opts: { queued: boolean } = { queued: true }): 
   }
   fs.writeFileSync(path.join(bugs, 'INDEX.md'),
     `# Board — scratch\n\n## Open\n\n| ID | Title | Owner | Status | Sev |\n|----|----|----|----|----|\n`
-    + `${openRows.join('\n')}\n\n## Done (committed)\n\n| ID | Title | Commit |\n|----|----|----|\n${doneRows.join('\n')}\n`);
+    + `${openRows.join('\n')}\n\n## Done\n\n| ID | Title | Commit |\n|----|----|----|\n${doneRows.join('\n')}\n`);
 }
 
 test.beforeAll(async () => {

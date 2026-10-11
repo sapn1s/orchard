@@ -13,9 +13,17 @@
  *   - `.gitignore`d files are EXCLUDED (again `git add -A` policy).
  *   - The REAL index is never touched (a throwaway index file), no branch moves,
  *     and the commit stays unreferenced (dangling / advisory bookkeeping).
- *   - The TREE sha is the identity a caller should persist: a dangling commit is
- *     garbage-collectable, but the tree fingerprints commits AND working-tree
- *     movement uniformly and does not rot.
+ *   - The TREE sha is the id a caller uses to diff/compare — but it is advisory
+ *     WITHIN THE RUN, not a durable cross-gc identity. A dangling tree is just as
+ *     garbage-collectable as a dangling commit: `git gc --prune=now` prunes BOTH,
+ *     after which a persisted tree sha fails `git cat-file` (exit 128). The claim
+ *     this comment once made — that the tree "does not rot" — was false. What is
+ *     actually safe is the usage: both consumers (verify-fix-loop.mjs and
+ *     independent-verify.mjs) use the returned tree IMMEDIATELY, in the same run,
+ *     while the objects are still freshly reachable from this process; default gc
+ *     keeps unreachable objects ~2 weeks, so only an explicit `--prune=now` racing
+ *     the run could bite. Do NOT persist the tree sha past the run and expect it
+ *     to resolve later.
  *
  * NOTE on the FEAT-108 git-write block: that block is a Bash-TOOL PreToolUse hook
  * that scans a shell command string; it cannot see git spawned by a node

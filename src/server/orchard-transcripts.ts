@@ -46,6 +46,7 @@ import { asOrchardWrite } from './own-writes.ts';
 // (which itself uses the module's pidAlive ground-truth rung) + the shared TTL
 // decide when a held lock is dead/stale and may be reclaimed.
 import { reclaimReason, FILE_LOCK_TTL_MS } from '../../scripts/lib/file-lock.mjs';
+import { normalizeLineEndings } from './board.ts';
 
 /** Root of all Orchard-owned transcripts. */
 export function orchardTranscriptsRoot(): string {
@@ -485,6 +486,24 @@ interface PendingEntry {
 }
 
 /**
+ * ARCH-006 (option A) — canonicalize the line endings of the renderable prose a
+ * content block carries. Only string `text`/`thinking` fields hold rendered
+ * prose; every other field (tool inputs/results, ids) is left byte-identical.
+ * Returns a new array only, never mutating the caller's content.
+ */
+function canonicalizeContent(content: unknown[]): unknown[] {
+  return content.map((block) => {
+    if (!block || typeof block !== 'object') return block;
+    const b = block as Record<string, unknown>;
+    if (typeof b.text !== 'string' && typeof b.thinking !== 'string') return block;
+    const out: Record<string, unknown> = { ...b };
+    if (typeof out.text === 'string') out.text = normalizeLineEndings(out.text);
+    if (typeof out.thinking === 'string') out.thinking = normalizeLineEndings(out.thinking);
+    return out;
+  });
+}
+
+/**
  * Per-session append-only writer. Entries recorded before the engine reports
  * its session/thread id (`system:init`) are buffered and flushed the moment
  * `adoptSessionId` names the file; a session that never inits leaves no file,
@@ -546,7 +565,8 @@ export class TranscriptRecorder {
 
   /** A prompt the user (or the autonomous nudge) sent INTO the engine. */
   recordUserPrompt(text: string): void {
-    this.#push('user', { role: 'user', content: [{ type: 'text', text }] });
+    // ARCH-006 (option A) — canonicalize at the transcript ingest boundary.
+    this.#push('user', { role: 'user', content: [{ type: 'text', text: normalizeLineEndings(text) }] });
   }
 
   /**
@@ -561,10 +581,14 @@ export class TranscriptRecorder {
     if (m.parent_tool_use_id != null) return; // sidechain — none expected (subagents:false)
     const content = m.message?.content;
     if (!Array.isArray(content) || content.length === 0) return;
+    // ARCH-006 (option A) — canonicalize line endings in the renderable prose a
+    // content block carries, the moment the message is INGESTED, so a lone/bare
+    // CR never reaches a line-shaped renderer downstream.
+    const canon = canonicalizeContent(content);
     const message: Record<string, unknown> =
       m.type === 'assistant'
-        ? { role: 'assistant', ...(this.#model ? { model: this.#model } : {}), content }
-        : { role: 'user', content };
+        ? { role: 'assistant', ...(this.#model ? { model: this.#model } : {}), content: canon }
+        : { role: 'user', content: canon };
     this.#push(m.type, message);
   }
 

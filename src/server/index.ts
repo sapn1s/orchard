@@ -286,7 +286,9 @@ const GUIDE_DIR = path.join(projectRoot(), 'docs', 'guide');
 
 /** Split a guide page into its title (first `# heading`) and frontmatter-free body. */
 function readGuidePage(file: string, name: string): { title: string; body: string } {
-  const raw = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  // ARCH-006 (option A) — canonicalize at the file ingest boundary (was CRLF-only
+  // `/\r\n/g`, which let a lone/bare CR survive into the guide renderer).
+  const raw = board.normalizeLineEndings(fs.readFileSync(file, 'utf8'));
   // Drop a leading YAML frontmatter block (the `sources:` pin) so the reader
   // shows prose, not the machine-readable header the freshness checker uses.
   const fm = /^---\n[\s\S]*?\n---\n?/.exec(raw);

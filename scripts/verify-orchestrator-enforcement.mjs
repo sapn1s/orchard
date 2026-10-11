@@ -32,7 +32,8 @@ import {
   restrictedBashHeads,
   ENFORCE_ALLOWED_TOOLS,
   ENFORCE_ALLOWED_BASH,
-  ENFORCE_DENIED_GIT_SUBCOMMANDS,
+  GIT_ALLOWED_SUBCOMMANDS,
+  resolveGitSubcommand,
   KNOWN_DENIED,
 } from './lib/orchestrator-profile.mjs';
 
@@ -370,7 +371,78 @@ ok('bashSegmentHead strips a leading env assignment', bashSegmentHead('FOO=1 npm
 ok('bashSegmentHead strips a shell keyword', bashSegmentHead('then npm run gate') === 'npm');
 ok('bashSegmentHead resolves a path-qualified head', bashSegmentHead('/usr/bin/grep -rn x') === 'grep');
 ok('bashSegmentHead on an empty segment returns empty', bashSegmentHead('   ') === '');
-ok('git content subcommands are declared, not inlined', ENFORCE_DENIED_GIT_SUBCOMMANDS.includes('show') && ENFORCE_DENIED_GIT_SUBCOMMANDS.includes('diff'));
+
+/* ═══ 5b. git is ALLOW-KNOWN-GOOD, default-deny (BUG-226 round 4) ═══════════
+ * Round 4 replaced the old DENY-list (ENFORCE_DENIED_GIT_SUBCOMMANDS, which this
+ * assertion used to read) with an ALLOW-list — GIT_ALLOWED_SUBCOMMANDS plus
+ * resolveGitSubcommand. A deny-list was leaky three ways (`git -c core.pager=cat
+ * show`, `git stash show -p`, `git ls-files`, `git ls-tree` all slipped it); an
+ * allow-list fails SAFE because a reader nobody enumerated is refused by default.
+ * The property now is DUAL: (A) the content/tree readers are ABSENT from the
+ * allow-list, so default-deny refuses them; (B) the status/commit-side verbs are
+ * PRESENT. `diff` is present but only in content-free forms (the flag gate).
+ */
+// (A) the readers/dumpers are NOT in the allow-list → default-deny refuses them.
+for (const reader of ['show', 'cat-file', 'grep', 'blame', 'ls-files', 'ls-tree', 'whatchanged', 'stash', 'archive', 'format-patch', 'reflog', 'notes', 'config']) {
+  ok(`git ${reader} is NOT allow-listed (default-deny refuses the reader)`,
+    !GIT_ALLOWED_SUBCOMMANDS.includes(reader));
+}
+// (B) the status/ref reads and the commit-side verbs ARE allow-listed.
+for (const kept of ['status', 'rev-parse', 'branch', 'log', 'diff', 'commit', 'add', 'worktree']) {
+  ok(`git ${kept} is allow-listed`, GIT_ALLOWED_SUBCOMMANDS.includes(kept));
+}
+// resolveGitSubcommand sees past the round-3 shields, so a shielded reader is
+// still classified as its real subcommand (not as the `-c k=v` / `-C <dir>` pair).
+ok('resolveGitSubcommand resolves `git show`', resolveGitSubcommand(['git', 'show', 'HEAD:x']) === 'show');
+ok('resolveGitSubcommand sees past `-c core.pager=cat` to `show` (round-3 defeat)',
+  resolveGitSubcommand(['git', '-c', 'core.pager=cat', 'show', 'HEAD:x']) === 'show');
+ok('resolveGitSubcommand sees past `-C <dir>` to `show`',
+  resolveGitSubcommand(['git', '-C', '/tmp/x', 'show', 'HEAD:x']) === 'show');
+ok('resolveGitSubcommand returns status for a plain status read', resolveGitSubcommand(['git', 'status']) === 'status');
+ok('resolveGitSubcommand returns "" for bare `git --version` (harmless, allowed)',
+  resolveGitSubcommand(['git', '--version']) === '');
+
+/* The decision modelled over an EXPLICIT allow-list, so a BROKEN list reddens
+ * (non-vacuity). A git command is admitted iff resolveGitSubcommand lands on a
+ * name the list contains (content-free flag gating is a separate, stricter check
+ * handled by decideBashCommand — asserted below). */
+const gitSubAllowedBy = (list, cmd) => {
+  const sub = resolveGitSubcommand(cmd.trim().split(/\s+/));
+  return sub === '' || list.includes(sub);
+};
+// The REAL allow-list refuses a blob read, even behind the round-3 pager shield.
+ok('real allow-list refuses `git show HEAD:x`', gitSubAllowedBy(GIT_ALLOWED_SUBCOMMANDS, 'git show HEAD:x') === false);
+ok('real allow-list refuses `git -c core.pager=cat show HEAD:x`',
+  gitSubAllowedBy(GIT_ALLOWED_SUBCOMMANDS, 'git -c core.pager=cat show HEAD:x') === false);
+ok('real allow-list admits `git status` and `git commit`',
+  gitSubAllowedBy(GIT_ALLOWED_SUBCOMMANDS, 'git status --porcelain') === true &&
+  gitSubAllowedBy(GIT_ALLOWED_SUBCOMMANDS, 'git commit -m x') === true);
+{
+  /*
+   * MUST-FAIL / non-vacuity — a SYNTHESIZED broken allow-list that re-admits the
+   * readers (NOT read from HEAD; this is a deliberately-wrong list). It WOULD
+   * allow `git show HEAD:x`, proving the real refusal rests on `show`'s ABSENCE
+   * from the allow-list and the guard above is not vacuously true. The same
+   * broken list must still refuse a genuinely-unlisted verb (`frobnicate`), so
+   * the model is a real allow-list, not an always-allow.
+   */
+  const BROKEN_ALLOWED = [...GIT_ALLOWED_SUBCOMMANDS, 'show', 'cat-file', 'grep', 'blame', 'ls-tree'];
+  ok('MUST-FAIL: the broken allow-list (readers re-added) WOULD allow `git show HEAD:x`',
+    gitSubAllowedBy(BROKEN_ALLOWED, 'git show HEAD:x') === true);
+  ok('MUST-FAIL: …and even behind the pager shield', gitSubAllowedBy(BROKEN_ALLOWED, 'git -c core.pager=cat show HEAD:x') === true);
+  ok('MUST-FAIL non-vacuity: the broken list still refuses a genuinely-unlisted subcommand',
+    gitSubAllowedBy(BROKEN_ALLOWED, 'git frobnicate x') === false);
+}
+// And the real authority, decideBashCommand, agrees end-to-end: the shielded
+// reader and the tree readers are refused; content-free status/log/diff pass.
+ok('decideBashCommand refuses `git show HEAD:src/a.ts`', decideBashCommand('git show HEAD:src/a.ts').allow === false);
+ok('decideBashCommand refuses the pager-shielded read `git -c core.pager=cat show HEAD:x` (round-3 defeat)',
+  decideBashCommand('git -c core.pager=cat show HEAD:src/a.ts').allow === false);
+ok('decideBashCommand refuses `git ls-tree -r HEAD`', decideBashCommand('git ls-tree -r HEAD').allow === false);
+ok('decideBashCommand refuses bare `git diff package.json` (content dump)', decideBashCommand('git diff package.json').allow === false);
+ok('decideBashCommand refuses `git log -p -3` (emits a patch)', decideBashCommand('git log -p -3').allow === false);
+ok('decideBashCommand allows `git log --oneline -3` (content-free)', decideBashCommand('git log --oneline -3').allow === true);
+ok('decideBashCommand allows `git diff --stat` (summary-only)', decideBashCommand('git diff --stat').allow === true);
 
 /* ═══ 6. Robustness — a policy bug must never take a session down ══════════
  * The hook wrapping this fails open, but decide() itself must not throw on a
@@ -479,12 +551,47 @@ const READ_HEADS = new Set(['rg', 'grep', 'egrep', 'fgrep', 'cat', 'find', 'ls',
   'python', 'python3', 'perl', 'xargs', 'sh', 'bash', 'wc', 'jq', 'du', 'tree', 'diff', 'stat', 'file',
   'strings', 'od', 'xxd', 'less', 'more', 'comm', 'column']);
 
-// `git show` / `git diff` / `git grep` / `git log -p` print file bodies — reads
-// wearing a git prefix, which the policy refuses. Tested against the DATA-stripped
-// command so a "git diff" sitting in a quoted dispatch prompt is not mistaken for
-// a real read (BUG-185 offender B).
-const readsViaGit = (stripped) => /\bgit\s+(?:show|diff|grep|blame|cat-file)\b/.test(stripped)
-  || /\bgit\s+log\b[^;&|\n]*(?:\s-p\b|--patch)/.test(stripped);
+// `git show`/`grep`/`blame`/`cat-file`/`ls-files`/`ls-tree`/`whatchanged` print
+// file bodies or the tree — reads wearing a git prefix, which the allow-list
+// refuses. `git diff`/`git log` print content TOO, but only in their content/
+// patch forms: the round-4 allow-list (BUG-226) deliberately KEEPS the content-
+// free summaries (`git diff --stat`, `--cached --name-only`, `git log --oneline`),
+// so the oracle must classify diff/log by their flags, exactly as git itself
+// behaves — else it mislabels a summary the policy correctly allows as a read
+// (the 8 corpus commands that reddened this suite once the round-4 source landed
+// but the oracle was left on the old "all git diff is a read" rule). Mirrors the
+// policy's GIT_CONTENT_FLAG / GIT_DIFF_SUMMARY_FLAG semantics while staying an
+// INDEPENDENT re-derivation (it models git's behaviour, not decideBashCommand).
+// resolveGitSubcommand is reused so a `git -c k=v <sub>` shield resolves to the
+// real subcommand. Scanned on the DATA-stripped command so a "git diff" sitting
+// in a quoted dispatch prompt is not mistaken for a real read (BUG-185 offender B).
+const GIT_READER_SUBS = new Set([
+  'show', 'grep', 'blame', 'cat-file', 'ls-files', 'ls-tree', 'whatchanged', 'archive', 'format-patch', 'reflog',
+]);
+const GIT_LOG_DIFF_PATCH = (w) =>
+  w === '-p' || w === '-u' || w === '--patch' || /^--patch-with-/.test(w) ||
+  w === '-U' || /^-U\d/.test(w) || /^--unified(?:=|$)/.test(w) ||
+  w === '-W' || w === '--function-context' ||
+  /^--word-diff(?:=|$)/.test(w) || /^--color-words(?:=|$)/.test(w) ||
+  w === '-G' || /^-G./.test(w) || w === '-S' || /^-S./.test(w) || /^-L/.test(w);
+const GIT_DIFF_SUMMARY = (w) =>
+  /^--stat(?:=|$)/.test(w) || w === '--numstat' || w === '--shortstat' || w === '--summary' ||
+  w === '--name-only' || w === '--name-status' || w === '--compact-summary' ||
+  /^--dirstat(?:=|$)/.test(w) || w === '--raw' || w === '--check' || w === '--quiet' ||
+  w === '--exit-code' || w === '--cumulative';
+const readsViaGit = (stripped) => {
+  // Each git invocation runs from `git` to the next shell separator / pipe.
+  for (const m of stripped.matchAll(/\bgit\b[^;&|\n]*/g)) {
+    const words = m[0].trim().split(/\s+/).filter(Boolean);
+    const sub = resolveGitSubcommand(words);
+    if (GIT_READER_SUBS.has(sub)) return true;
+    if (sub === 'diff' || sub === 'log') {
+      if (words.some(GIT_LOG_DIFF_PATCH)) return true;         // emits a patch → content
+      if (sub === 'diff' && !words.some(GIT_DIFF_SUMMARY)) return true; // bare diff dumps content
+    }
+  }
+  return false;
+};
 
 const readsAFile = (cmd) => {
   const stripped = decidableForOracle(cmd);
@@ -513,6 +620,19 @@ ok('oracle flags a bare file read', readsAFile('cat src/server/board.ts') === tr
 ok('oracle flags a tree search', readsAFile('grep -rn secret src/') === true);
 ok('oracle flags `git show` as a read', readsAFile('git show HEAD:src/a.ts') === true);
 ok('oracle flags `git diff | head` as a read', readsAFile('git diff package.json | head -20') === true);
+// Round-4 allow-list alignment (BUG-226): content-FREE diff/log are NOT reads;
+// content/patch forms and the tree readers still ARE. Keeps the oracle in step
+// with the policy that KEEPS `git diff --stat` and refuses `git ls-tree`.
+ok('oracle: `git diff --stat` is NOT a read (content-free summary)', readsAFile('git diff --stat') === false);
+ok('oracle: `git diff --cached --name-only` is NOT a read', readsAFile('git diff --cached --name-only') === false);
+ok('oracle: bare `git diff <path>` IS a read (dumps content)', readsAFile('git diff package.json') === true);
+ok('oracle: `git log --oneline -3` is NOT a read', readsAFile('git log --oneline -3') === false);
+ok('oracle: `git log -p -3` IS a read (emits a patch)', readsAFile('git log -p -3') === true);
+ok('oracle: `git ls-tree -r HEAD` IS a read', readsAFile('git ls-tree -r HEAD') === true);
+ok('oracle: `git ls-files src` IS a read', readsAFile('git ls-files src') === true);
+ok('oracle: a `git status; git diff --stat` cluster is NOT a read', readsAFile('git status --short && git diff --stat | tail -1') === false);
+ok('oracle: the pager-shielded `git -c core.pager=cat show` resolves to a read',
+  readsAFile('git -c core.pager=cat show HEAD:x') === true);
 ok('oracle flags a read that trails a gate command',
   readsAFile(`cd ${REPO} && npm run gate && cat src/server/board.ts`) === true);
 ok('oracle flags a read in a later pipeline segment', readsAFile('npm run gate; sed -n 1,5p src/a.ts') === true);

@@ -61,6 +61,7 @@
  */
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -297,6 +298,40 @@ try {
   if (notice) task = `${task}\n\n---\n\n${notice}`;
 }
 
+/*
+ * FEAT-176 — snapshot what this lane wrote when it exits, on EVERY exit path
+ * (die, signal handlers, normal end, no --meta-out). `process.on('exit')` runs
+ * synchronously; spawnLaneSnapshot only starts a detached child and returns, so
+ * the exit is not delayed. The module is loaded lazily and any failure is
+ * ignored: a broken snapshot module must never break a dispatch.
+ */
+const laneSnap = { sessionId: null, transcript: null, recorder: null, spawn: null };
+import('./lib/lane-snapshot.mjs').then((m) => { laneSnap.spawn = m.spawnLaneSnapshot; }, () => {});
+process.on('exit', () => {
+  try {
+    if (!laneSnap.spawn) return;
+    let tickets = opts.ticket ? String(opts.ticket).split(',').map((s) => s.trim()).filter(Boolean) : [];
+    if (!tickets.length) { try { tickets = parseDispatchDeclaration(task).fields?.tickets ?? []; } catch { tickets = []; } }
+    const lane = { laneId: null, source: opts.provider === 'openai' ? 'codex' : 'claude-external', transcripts: [], ticket: tickets, cwd: opts.cwd, endedAt: Date.now() };
+    if (opts.provider === 'openai') {
+      const t = laneSnap.transcript || laneSnap.recorder?.filePath || null;
+      if (!t) return;
+      lane.laneId = laneSnap.sessionId || path.basename(t, '.jsonl');
+      lane.transcripts = [t];
+    } else {
+      const sid = laneSnap.sessionId;
+      if (!sid || !/^[A-Za-z0-9._-]+$/.test(sid)) return;
+      const projRoot = process.env.CLAUDE_PROJECTS_DIR || (process.env.CLAUDE_CONFIG_DIR ? path.join(process.env.CLAUDE_CONFIG_DIR, 'projects') : path.join(os.homedir(), '.claude', 'projects'));
+      let real = opts.cwd; try { real = fs.realpathSync(opts.cwd); } catch { /* as given */ }
+      const enc = [...new Set([opts.cwd, real])].map((c) => c.replace(/[^A-Za-z0-9]/g, '-'));
+      lane.laneId = sid;
+      lane.transcripts = enc.map((e) => path.join(projRoot, e, `${sid}.jsonl`));
+      lane.subagentsDir = path.join(projRoot, enc[0], sid, 'subagents');
+    }
+    laneSnap.spawn({ v: 1, top: opts.cwd, sdkSession: laneSnap.sessionId, lanes: [lane] });
+  } catch { /* never let a snapshot break an exit */ }
+});
+
 /**
  * FEAT-062 (review finding #11): the machine-readable metadata channel. The
  * human-oriented stderr lines (`session <id>`, `thread <id> started`) stay,
@@ -305,6 +340,7 @@ try {
  * the primary contract.
  */
 function writeMeta({ sessionId = null, exitCode, failureKind = null, usage = null }) {
+  if (sessionId) laneSnap.sessionId = sessionId; // FEAT-176: the exit snapshot needs it even without --meta-out
   if (!opts.metaOut) return;
   try {
     fs.writeFileSync(opts.metaOut, JSON.stringify({
@@ -323,6 +359,41 @@ function writeMeta({ sessionId = null, exitCode, failureKind = null, usage = nul
       toolProfile: profile ? { name: profile.name, tools: profile.tools, cacheTtl: profile.cacheTtl } : null,
     }, null, 2) + '\n');
   } catch (e) { progress(`meta-out not written: ${e.message}`); }
+}
+
+/* ---------------------------------------- FEAT-181: the round-ceiling preflight
+ *
+ * The round ceiling (FEAT-148's reader) fires automatically at the one moment it
+ * is most actionable: a dispatch that is about to spend ANOTHER round on a
+ * ticket. We read the durable cost ledger through the ONE canonical reader
+ * (round-ceiling.mjs — never a second count), add THIS dispatch's own declared
+ * round as a synthetic lane so a ticket crosses the ceiling on the round being
+ * launched, not only on history, and if any ticket this dispatch names is at or
+ * over the ceiling we RAISE the WA §N question with a named owner and the
+ * rescope / redesign / stop choices.
+ *
+ * It RAISES, it never ACTS (matches arch-watch / round-ceiling): no block, no
+ * ticket mutation, no auto-file. If the round history is missing or unusable we
+ * RAISE a NAMED gap (never a silent empty success, r1 break d1) — and we render
+ * raises and that gap INDEPENDENTLY (plan review: a raise must not hide the gap).
+ */
+if (declaration) {
+  try {
+    const { preflightRoundCeiling, formatRoundCeilingWarning } = await import('./lib/round-ceiling-preflight.mjs');
+    const pf = preflightRoundCeiling({
+      round: declaration.fields.round,
+      tickets: declaration.fields.ticket,
+      phase: declaration.fields.phase,
+    });
+    for (const line of formatRoundCeilingWarning(pf.raised, declaration.fields.round, pf.minRound)) progress(line);
+    // A named gap, rendered whether or not anything was raised: "I could not check
+    // this ticket's round history, and here is why." Not a block.
+    if (pf.history && pf.history.usable === false) {
+      progress(`⚠ ROUND CEILING: round history NOT CHECKED — ${pf.history.reason}. This ticket's prior rounds could not be verified against the ceiling.`);
+    }
+  } catch (e) {
+    progress(`round-ceiling preflight skipped: ${e?.message ?? e}`);
+  }
 }
 
 /* ------------------------------------------------- anthropic: thin claude -p */
@@ -505,6 +576,7 @@ async function dispatchOpenai() {
     onError: (m) => progress(`transcript: ${m}`),
   });
   recorder.recordUserPrompt(task);
+  laneSnap.recorder = recorder; // FEAT-176
 
   const rt = new CodexRuntime();
   let exitCode = 1;

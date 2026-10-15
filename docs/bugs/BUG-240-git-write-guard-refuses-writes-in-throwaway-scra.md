@@ -13,7 +13,7 @@
   "owner": "you",
   "work_state": "in_verification",
   "human_action": "decide",
-  "updated": "2026-10-08",
+  "updated": "2026-10-14",
   "decision": {
     "id": "a3850757-b019-48cc-bb0a-edabf9406acc",
     "mode": "single",
@@ -473,3 +473,9 @@ Additive. A new module plus one branch in `resolveGitShim`, behind fail-closed r
 
 ### 2026-10-08 — BUG-240 decision lane
 - **decision rationale + threat model:** Decision A recorded through the server answer API (POST /api/projects/claude-station/tickets/BUG-240/answer, chose key A). Quoting the user's stated intent behind the restriction: "It exists so agents don't autonomously commit or push to a project's real repo, which would mean noise commits, a broken main branch and unintended changes. It is NOT a security boundary against a deliberately malicious agent." Threat model (confirming prior lanes, 0 deliberate circumventions in 1,871 transcripts): the write guard defends against ACCIDENTAL or HABITUAL commits and pushes to the real repo, which the FEAT-135 shim covers. A deliberately malicious same-uid agent is explicitly OUT of scope, so direct Docker host-root access is out of scope for this intent and confining it (B/C) would cost efficiency for no in-scope gain. The confined runner (npm run confined) stays available for scratch and destructive suites.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Note:** Owner cell moved off 👤: this decision was answered and an agent has acted since, so the rail already treats it as resolved; the 👤 in INDEX was stale drift (BUG-259 triage). Nothing about the answer or its record changed.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Note:** Correction: the Owner cell is back on 👤. board:check requires 👤 while the record still says human_action decide, and settling that record is outside BUG-259. The earlier note's 'stale drift' stands as an observation only; nothing else changed.

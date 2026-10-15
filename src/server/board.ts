@@ -20,6 +20,13 @@ import {
   activityHeadings, appendLedgerAnswer, canonicalJson, frozenAnswerFor, ledgerAnswersFor, sha256,
 } from '../../scripts/lib/answer-source.mjs';
 import { randomUUID } from 'node:crypto';
+// FEAT-184 — the user's standing delegations and the adoptions made under them.
+import {
+  loadStore as loadDelegationStore, adoptionReceipt, answerReceipt, answerReceiptEntry, appendEntry as appendDelegationEntry,
+  ensureBoardStore, storePresent as delegationStorePresent, userAnswerTrust, withTicketLock, typedAnswerDigest,
+} from '../../scripts/lib/delegation-source.mjs';
+import { recordTypedAnswers, loadAnswerLedger } from '../../scripts/lib/answer-source.mjs';
+import { dataDir as stationDataDir } from '../lib/paths.ts';
 // FEAT-106 — one resolver decides where a project keeps its board, whether that
 // project is on the legacy `docs/bugs` layout or the consolidated `.orchard/`
 // one. boardDir() below is the single door every reader here comes through
@@ -88,6 +95,28 @@ export interface BoardItem {
   answer?: string;
   answeredOn?: string;
   /**
+   * BUG-257 r2, `answeredAwaiting` items only — the answer as STRUCTURE, so both agent
+   * briefings can carry it whole instead of a 60-char cut of the entry's first line:
+   * `answerChose` is the picked option (`B — label`, untruncated) or null for a
+   * free-text answer; `answerNotes` is every word the USER wrote on this decision from
+   * the anchor answer on (the anchor's note or free text, then each follow-up), in
+   * order, verbatim as persisted; `answerLegacy` marks a frozen pre-typed answer whose
+   * stored text may itself be partial; `answerRev` identifies the LATEST answer (its
+   * answer_id), so a same-day follow-up is a new announcement.
+   */
+  answerChose?: string | null;
+  answerNotes?: Array<{ on: string; text: string; followup: boolean }>;
+  answerLegacy?: boolean;
+  answerRev?: string;
+  /**
+   * FEAT-184, `answeredAwaiting` items only: true when the decision was ADOPTED by an
+   * agent under the user's recorded delegation (not answered by the user), with the
+   * delegation it rests on. The rail renders it distinctly ("adopted under your
+   * delegation"), never as "you chose".
+   */
+  adopted?: boolean;
+  adoptedDelegation?: { delegation_id: string; statement: string; by: string };
+  /**
    * FEAT-166 r3 — needsYou ticket items: the `decisionKey` of the decision shown, so
    * the rail's answer can be refused if the decision changed before it was sent.
    */
@@ -145,6 +174,12 @@ export interface BoardItem {
    * rail answers it only through the base-update route (Adopt / Defer / Skip,
    * each naming the notice `rev`), never the generic answer route.
    */
+  /**
+   * FEAT-175 — present iff this card is a git-grant container rebuild notice (failed, blocked by work it
+   * would stop, or an over-run past a grant's end). DERIVED on every read (grant-rebuild.ts); answered
+   * only through POST /api/projects/:id/container/grant-rebuild.
+   */
+  grantRebuild?: { projectId: string; actions: Array<{ id: 'retry' | 'force'; label: string }> } | null;
   baseUpdate?: (import('./base-releases.ts').BaseNotice & {
     entries: { version: number; date: string; class: string; summary: string; adjust: string }[];
   }) | null;
@@ -679,7 +714,16 @@ function entryAnswerText(lines: string[], start: number, end: number): string {
   return answer;
 }
 
-interface AnswerEntry { date: string; author: string; line: number; answer: string; }
+interface AnswerEntry {
+  date: string; author: string; line: number; answer: string;
+  /** BUG-257 r2 — see BoardItem.answerChose / answerNotes / answerLegacy / answerRev. */
+  chose?: string | null;
+  notes?: Array<{ on: string; text: string; followup: boolean }>;
+  legacy?: boolean;
+  rev?: string;
+  /** FEAT-184 — present when the decision was ADOPTED under a delegation, not answered by the user. */
+  adopted?: { delegation_id: string; statement: string; by: string };
+}
 
 /**
  * FEAT-166 r3 — LEGACY PROSE READER, FROZEN. Never called to decide answered state
@@ -812,6 +856,12 @@ export function readBoard(hostPath: string): Board {
           item.file = file ?? undefined;
           item.answer = ans.last.answer;
           item.answeredOn = ans.last.date;
+          // BUG-257 r2 — the structured answer, carried whole into both briefings.
+          item.answerChose = ans.last.chose ?? null;
+          item.answerNotes = ans.last.notes ?? [];
+          if (ans.last.legacy) item.answerLegacy = true;
+          if (ans.last.rev) item.answerRev = ans.last.rev;
+          if (ans.last.adopted) { item.adopted = true; item.adoptedDelegation = ans.last.adopted; }
           board.answeredAwaiting!.push(item);
         } else if (ans && ans.followed) {
           // Answered AND a dated entry followed (agent acted) → resolved; drop,
@@ -900,14 +950,72 @@ export function readBoard(hostPath: string): Board {
  * the model's attention budget (FEAT-026 / WA §H). Both the per-list item count
  * and the total character count are capped; overflow is summarised as "+N more".
  */
+/* ── BUG-257 r2 — one renderer for an answered ticket, shared by both briefings ──
+ * Round 1 rendered `chose: ${short(answer, 60)}` where `answer` was the entry's FIRST
+ * body line: a note on a picked option was dropped (and with an echoed question the
+ * "pick" shown was the Question line), and a long free-text answer was cut — so "CSV"
+ * and "CSV; not yet, wait for my approval" briefed identically. An independent design
+ * review chose STRUCTURE over parsing notes for "wait"/"no" (enumeration an answer can
+ * phrase around): the pick is the go, and every word the user wrote on the decision
+ * travels with it, verbatim and untruncated, for the agent to read under an explicit
+ * precedence rule. Nothing here starts a turn (FEAT-090). */
+export const ANSWERED_GO_RULE =
+  "How to act on these: a picked option with no note is the user's go — start that option's scoped work and report it as started. "
+  + 'A note governs over the pick: if it says to wait, sets a condition not yet met, rejects the option, or asks a question, do NOT start — '
+  + 'do what the note says (answer it, or say what you are waiting on). A free-text answer is a go only if it plainly says to proceed. '
+  + 'Notes are quoted verbatim below; read each in full before acting.';
+/** Default per-list cap of the launch snapshot (BoardSnapshot.answeredKeys carries the shown ones). */
+export const SNAPSHOT_MAX_ITEMS = 5;
+function quoteLines(text: string, indent: string): string[] {
+  return normalizeLineEndings(text).split('\n').map((l) => `${indent}> ${l}`);
+}
+/** The lines for one answered-awaiting ticket. `indent` is the bullet's own indent. */
+export function answeredItemLines(it: BoardItem, indent = ''): string[] {
+  const shortTitle = it.title.length > 72 ? `${it.title.slice(0, 71).trimEnd()}…` : it.title;
+  const sub = `${indent}  `;
+  const out = [`${indent}- ${it.id} — ${shortTitle} (answered ${it.answeredOn ?? '?'})`];
+  const notes = it.answerNotes ?? [];
+  let rest = notes;
+  if (it.adopted) {
+    out.push(`${sub}${it.answer ?? 'adopted under delegation (not a user answer)'}`);
+  } else if (it.answerChose) {
+    out.push(`${sub}picked: ${it.answerChose}`);
+  } else if (it.answerLegacy) {
+    out.push(`${sub}answer (recorded before typed answers; may be partial — read the ticket before acting):`, ...quoteLines(it.answer ?? '', sub));
+  } else if (notes.length && !notes[0].followup) {
+    out.push(`${sub}answer (free text, verbatim):`, ...quoteLines(notes[0].text, sub));
+    rest = notes.slice(1);
+  } else {
+    out.push(`${sub}answer: ${it.answer ?? '(recorded)'}`);
+  }
+  for (const n of rest) {
+    out.push(`${sub}${n.followup ? `follow-up from the user, ${n.on} (verbatim — it governs over the pick)` : "the user's note (verbatim — it governs over the pick)"}:`, ...quoteLines(n.text, sub));
+  }
+  return out;
+}
+
+/**
+ * BUG-257 r3 — the launch snapshot AND the answered-awaiting keys it actually
+ * rendered, read from ONE board read (no window for an answer to land between
+ * "what the snapshot shows" and "what gets marked seen"). The keys are NOT marked
+ * seen here: the caller marks them via markAnswersDelivered only once the snapshot
+ * has been delivered in a turn. A null snapshot (no board, adopt) carries no keys.
+ */
+export interface BoardSnapshot { text: string; answeredKeys: string[] }
 export function boardStateSection(
   hostPath: string,
   opts?: { maxItems?: number; maxChars?: number },
 ): string | null {
+  return boardStateSnapshot(hostPath, opts)?.text ?? null;
+}
+export function boardStateSnapshot(
+  hostPath: string,
+  opts?: { maxItems?: number; maxChars?: number },
+): BoardSnapshot | null {
   const board = readBoard(hostPath);
   if (!board.hasBoard) return null;
 
-  const maxItems = Math.max(1, opts?.maxItems ?? 5);
+  const maxItems = Math.max(1, opts?.maxItems ?? SNAPSHOT_MAX_ITEMS);
   const maxChars = Math.max(200, opts?.maxChars ?? 1200);
 
   const short = (s: string, n = 72) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
@@ -957,15 +1065,21 @@ export function boardStateSection(
   // records the character length THROUGH this section so the cap below is raised
   // to guarantee it survives whole, even when the board is deliberately overfull.
   const answered = board.answeredAwaiting ?? [];
+  const answeredKeys = answered.slice(0, maxItems).map(answerKey);
   let answeredFloor = 0;
   if (answered.length) {
-    const answeredBullet = (it: BoardItem) =>
-      `- ${it.id} — ${short(it.title)} → chose: ${short(it.answer ?? '(recorded)', 60)} (answered ${it.answeredOn ?? '?'})`;
-    const shown = answered.slice(0, maxItems).map(answeredBullet);
-    if (answered.length > maxItems) shown.push(`- …+${answered.length - maxItems} more`);
+    // BUG-257 r2 — each answer whole (pick + every user note, verbatim); see answeredItemLines.
+    const shown = answered.slice(0, maxItems).flatMap((it) => answeredItemLines(it));
+    // Only the shown items' keys are returned (answeredKeys), so the rest stay unseen
+    // and the live briefing delivers them in full on the user's next message.
+    if (answered.length > maxItems) shown.push(`- …+${answered.length - maxItems} more — each is briefed in full with the user's next message`);
     parts.push(
       `✋ **Answered — awaiting action (${answered.length}):**`,
-      'These are DECIDED but NOT dispatched. Do not start work on them silently: report each decision to the user and ask before you begin.',
+      // BUG-257: an answer that picks an option IS the user's go (this line used to say
+      // "ask before you begin", which turned every answered card into a second question;
+      // FEAT-090's own start-or-wait question was never answered). Nothing here starts a
+      // turn — it rides the user's next message, as before.
+      `The user answered these on the board and no agent has started them yet. ${ANSWERED_GO_RULE}`,
       ...shown,
       '',
     );
@@ -989,7 +1103,7 @@ export function boardStateSection(
   const cap = Math.max(maxChars, answeredFloor ? answeredFloor + 1 : 0);
   let text = parts.join('\n');
   if (text.length > cap) text = `${text.slice(0, cap - 1).trimEnd()}…`;
-  return text;
+  return { text, answeredKeys };
 }
 
 /**
@@ -1203,6 +1317,18 @@ export interface TicketAnswerState {
    * rewritten. Empty when there are none.
    */
   followups: TicketAnswerFollowup[];
+  /**
+   * FEAT-184 — who decided: 'user', or 'agent-under-delegation' (an adoption, which
+   * the Decide card shows as such and the user can override). Absent = 'user' for
+   * older callers.
+   */
+  by?: 'user' | 'agent-under-delegation';
+  /**
+   * FEAT-184, adoptions only: the delegation the adoption rests on. `revoked` is true
+   * when the user has SINCE revoked it — the adoption stands (never rolled back), but
+   * the card marks it so and no new adoption is accepted under it.
+   */
+  delegation?: { id: string; statement: string; adopted_by: string; revoked: boolean };
 }
 // FEAT-090 / BUG-104 — the `- **Chose:** <keys> — <labels>` line, read back for
 // the answered card's echo. `composeAnswerEntry` writes the key group and the
@@ -1316,7 +1442,17 @@ export interface TypedAnswer {
   chose: { key: string; label: string } | null;
   note: string;
   question: string | null;
-  by: 'user';
+  /**
+   * FEAT-184 — WHO decided. 'user' = the server's answer route, from the user.
+   * 'agent-under-delegation' = an agent adopted the decision's own recommendation
+   * under a delegation the user recorded (the server's adopt route). An adoption is
+   * never a user answer and is never displayed as one.
+   */
+  by: 'user' | 'agent-under-delegation';
+  /** FEAT-184, adoptions only: the delegation it rests on, the user's words, and the agent. */
+  delegation_id?: string;
+  delegation_statement?: string;
+  adopted_by?: string;
   via: string;
   on: string;
   recorded_at: string;
@@ -1389,8 +1525,9 @@ export function boundAnswers(markdown: string, file: string | null): { typed: Ty
     const id = idOfFile(file);
     typed = id ? (ledgerAnswersFor(path.dirname(file), id) as TypedAnswer[]) : [];
   }
-  typed = typed.filter((a) => a && typeof a === 'object' && a.by === 'user' && a.recorded_by === 'server'
-    && a.decision_key === key && ['decision', 'question', 'counter'].includes(a.kind));
+  typed = typed.filter((a) => a && typeof a === 'object' && a.recorded_by === 'server'
+    && a.decision_key === key && ['decision', 'question', 'counter'].includes(a.kind)
+    && ((a.by === 'user' && userAnswerAuthenticated(file, a)) || (a.by === 'agent-under-delegation' && adoptionVerified(file, a))));
   let frozen: FrozenAnswer | null = null;
   if (file) {
     const id = idOfFile(file);
@@ -1398,6 +1535,98 @@ export function boundAnswers(markdown: string, file: string | null): { typed: Ty
     if (f && f.decision_key === key && (f.state || f.lane)) frozen = f;
   }
   return { typed, frozen, key };
+}
+
+/**
+ * FEAT-184 — an adoption counts ONLY when the server-sealed delegation store for
+ * this board holds its receipt (same answer, ticket, decision, option, delegation).
+ * A hand-written `agent-under-delegation` entry, an unverifiable store (no key, a
+ * clone on another machine) or a damaged one → it does not count, and the card goes
+ * back to asking the user (fails toward pending).
+ */
+function adoptionVerified(file: string | null, a: TypedAnswer): boolean {
+  if (!file || a.kind !== 'decision' || a.followup) return false;
+  const id = idOfFile(file);
+  if (!id) return false;
+  try {
+    const store = loadDelegationStore(stationDataDir(), path.dirname(file));
+    return !!adoptionReceipt(store, id, a);
+  } catch { return false; }
+}
+
+/**
+ * FEAT-184 (fixing r2) — has the user SINCE revoked the delegation an adoption rests
+ * on? A revoke never rolls back or rewrites an adoption already made under it (that
+ * adoption still counts); the display marks it "delegation since revoked" and the
+ * adopt route refuses any NEW adoption under a revoked delegation. Returns false when
+ * there is no store context to consult (fails toward "not revoked" — it stays shown
+ * exactly as it was recorded).
+ */
+function adoptionDelegationRevoked(file: string | null, delegationId: string | undefined): boolean {
+  if (!file || !delegationId) return false;
+  try {
+    const store = loadDelegationStore(stationDataDir(), path.dirname(file));
+    if (!store.ok) return false;
+    return store.entries.some((e: { kind?: string; delegation_id?: string }) => e.kind === 'revoke' && e.delegation_id === delegationId);
+  } catch { return false; }
+}
+
+/** FEAT-184 (fixing r2) — does the board carry any adoption (by:agent-under-delegation)? The deletion-detection evidence for ensureBoardStore's fail-loud. */
+export function boardHasAdoptions(dir: string): boolean {
+  let names: string[] = [];
+  try { names = fs.readdirSync(dir).filter((f) => /^[A-Z]+-\d+.*\.md$/.test(f)); } catch { return false; }
+  for (const f of names) {
+    let rec: Record<string, unknown> | null = null;
+    try { const pt = parseTicket(fs.readFileSync(path.join(dir, f), 'utf8'), { mode: 'auto' }); rec = pt.format === 'block' ? pt.record as Record<string, unknown> : null; } catch { /* unreadable */ }
+    if (rec) for (const a of recordTypedAnswers(rec) as unknown as TypedAnswer[]) if (a && a.by === 'agent-under-delegation') return true;
+  }
+  for (const e of loadAnswerLedger(dir).entries as Array<TypedAnswer>) if (e && e.by === 'agent-under-delegation') return true;
+  return false;
+}
+
+/**
+ * FEAT-184 r2 — a typed USER answer counts only when the board's sealed store holds
+ * its receipt (written by recordAnswer), except in 'legacy' trust (no key on this
+ * machine, or a board whose store was never created — nothing to verify against;
+ * see delegation-source.mjs). A damaged store counts nothing. `file` null (no board
+ * context) keeps the pre-FEAT-184 behaviour.
+ */
+function userAnswerAuthenticated(file: string | null, a: TypedAnswer): boolean {
+  if (!file) return true;
+  const id = idOfFile(file);
+  if (!id) return false;
+  try {
+    const dd = stationDataDir();
+    const dir = path.dirname(file);
+    const present = delegationStorePresent(dd, dir);
+    const store = present ? loadDelegationStore(dd, dir) : null;
+    if (!present) {
+      // No store for this board. With no key anywhere, that is the pre-FEAT-184 world.
+      return true;
+    }
+    const trust = userAnswerTrust(store!, present);
+    if (trust === 'damaged') return false;
+    if (trust === 'legacy') return true; // a migration a crash interrupted (see delegation-source.mjs)
+    return !!answerReceipt(store!, id, a);
+  } catch { return false; }
+}
+
+/** Every typed USER answer already on a board (records + ledger) — the one-time migration input. */
+export function legacyTypedUserAnswers(dir: string): Array<{ ticket: string; answer: TypedAnswer }> {
+  const out: Array<{ ticket: string; answer: TypedAnswer }> = [];
+  let names: string[] = [];
+  try { names = fs.readdirSync(dir).filter((f) => /^[A-Z]+-\d+.*\.md$/.test(f)); } catch { return out; }
+  for (const f of names) {
+    const id = idOfFile(f);
+    if (!id) continue;
+    let rec: Record<string, unknown> | null = null;
+    try { const pt = parseTicket(fs.readFileSync(path.join(dir, f), 'utf8'), { mode: 'auto' }); rec = pt.format === 'block' ? pt.record as Record<string, unknown> : null; } catch { /* unreadable */ }
+    if (rec) for (const a of recordTypedAnswers(rec) as unknown as TypedAnswer[]) if (a.by === 'user' && a.answer_id) out.push({ ticket: id, answer: a });
+  }
+  for (const e of loadAnswerLedger(dir).entries as Array<TypedAnswer & { id: string }>) {
+    if (e && e.by === 'user' && e.answer_id && e.id) out.push({ ticket: e.id, answer: e });
+  }
+  return out;
 }
 
 /** Real Activity-log heading count — the "has anything been appended since" basis. */
@@ -1426,13 +1655,37 @@ export function answerEntries(markdown: string, file: string | null): { last: An
   const n = headingCount(markdown);
   const lastTyped = dec.length ? dec[dec.length - 1] : null;
   if (lastTyped) {
+    // FEAT-184 — the anchor decides who decided: a later user answer overrides an adoption.
+    let anchor: TypedAnswer | null = null;
+    let anchorIdx = -1;
+    for (let i = dec.length - 1; i >= 0; i--) if (!dec[i].followup) { anchor = dec[i]; anchorIdx = i; break; }
+    const adopted = anchor?.by === 'agent-under-delegation';
+    // BUG-257 r2 — the answer as structure. The pick is the anchor's option; the notes
+    // are every word the USER wrote on this decision from the anchor on (an adoption's
+    // own note is the agent's, not the user's, so it is not one of them). A replaced
+    // anchor's follow-ups belong to the old answer and are excluded by the slice.
+    const choseText = anchor?.chose ? `${anchor.chose.key} — ${anchor.chose.label}`.trim() : null;
+    const notes = dec.slice(Math.max(0, anchorIdx))
+      .filter((a) => a.by === 'user' && String(a.note ?? '').trim())
+      .map((a) => ({ on: a.on, text: String(a.note), followup: !!a.followup }));
+    const legacyAnchor = !anchor && !!frozen?.lane;
     return {
-      last: { date: lastTyped.on, author: 'you', line: -1, answer: typedLaneText(lastTyped) },
+      last: {
+        date: lastTyped.on, author: adopted ? 'agent-under-delegation' : 'you', line: -1,
+        answer: adopted
+          ? `adopted under delegation ${String(anchor!.delegation_id).slice(0, 8)} (not a user answer): ${anchor!.chose ? `${anchor!.chose.key} — ${anchor!.chose.label}` : ''}`.trim()
+          : choseText ?? (anchor ? String(anchor.note ?? '') : legacyAnchor ? frozen!.lane!.answer : typedLaneText(lastTyped)),
+        ...(adopted ? { adopted: { delegation_id: anchor!.delegation_id!, statement: anchor!.delegation_statement ?? '', by: anchor!.adopted_by ?? 'agent' } } : {}),
+        chose: choseText,
+        notes,
+        legacy: legacyAnchor,
+        rev: lastTyped.answer_id,
+      },
       followed: lastTyped.log_k < n - 1,
     };
   }
   const lane = frozen!.lane!;
-  return { last: { date: lane.answeredOn, author: 'you', line: -1, answer: lane.answer }, followed: lane.last_k < n - 1 };
+  return { last: { date: lane.answeredOn, author: 'you', line: -1, answer: lane.answer, chose: null, notes: [], legacy: true }, followed: lane.last_k < n - 1 };
 }
 
 /**
@@ -1451,11 +1704,15 @@ export function ticketAnswerState(markdown: string, file: string | null): Ticket
   if (anchorIdx >= 0) {
     const a = typed[anchorIdx];
     base = { on: a.on, kind: a.kind, chose: a.chose, note: a.note, followups: [] };
+    if (a.by === 'agent-under-delegation') {
+      base.by = 'agent-under-delegation';
+      base.delegation = { id: a.delegation_id ?? '', statement: a.delegation_statement ?? '', adopted_by: a.adopted_by ?? 'agent', revoked: adoptionDelegationRevoked(file, a.delegation_id) };
+    } else base.by = 'user';
     lastUserK = a.log_k;
     for (const f of typed.slice(anchorIdx + 1)) base.followups.push({ on: f.on, note: f.note });
   } else if (frozen?.state) {
     const { last_you_k, ...st } = frozen.state;
-    base = { ...st, followups: [...st.followups] };
+    base = { ...st, by: 'user', followups: [...st.followups] };
     lastUserK = last_you_k;
     for (const f of typed) base.followups.push({ on: f.on, note: f.note });
   } else {
@@ -1464,7 +1721,11 @@ export function ticketAnswerState(markdown: string, file: string | null): Ticket
   for (const t of typed) lastUserK = Math.max(lastUserK, t.log_k);
   const agentActed = lastUserK < n - 1;
   const { on, kind, chose, note, followups } = base;
-  return { on, kind, chose, note, awaiting: kind === 'decision' && !agentActed, followups };
+  return {
+    on, kind, chose, note, awaiting: kind === 'decision' && !agentActed, followups,
+    // Only an adoption carries `by` (absent = the user, as every reader before FEAT-184 saw it).
+    ...(base.by === 'agent-under-delegation' ? { by: base.by, delegation: base.delegation } : {}),
+  };
 }
 
 /** A stale answer: the decision changed (or the file moved) between read and write. */
@@ -1486,6 +1747,11 @@ export interface RecordAnswerInput extends Omit<AnswerEntryInput, 'decisionId'> 
  * appended in the SAME write (record tickets) or right after the ledger write.
  */
 export function recordAnswer(file: string, input: RecordAnswerInput): { entry: string; typed: TypedAnswer } {
+  // FEAT-184 r2 — one writer at a time per ticket file (board-tool's record writers
+  // take the same lock), and a sealed receipt for the answer before the ticket write.
+  return withTicketLock(file, () => recordAnswerLocked(file, input));
+}
+function recordAnswerLocked(file: string, input: RecordAnswerInput): { entry: string; typed: TypedAnswer } {
   const text = fs.readFileSync(file, 'utf8');
   const key = decisionKey(text);
   if (input.expectDecisionKey != null && input.expectDecisionKey !== key) {
@@ -1520,15 +1786,119 @@ export function recordAnswer(file: string, input: RecordAnswerInput): { entry: s
     const next = formatTicket(record, body) + entry;
     // As late as possible: nothing else wrote the file since we read it.
     if (fs.readFileSync(file, 'utf8') !== text) throw new StaleAnswerError('the ticket changed while your answer was being recorded — reload and retry');
+    sealAnswerReceipt(file, typed);
     fs.writeFileSync(file, next);
   } else {
     const id = idOfFile(file);
     if (!id) throw new Error(`not a ticket file: ${file}`);
     typed.log_k = headingCount(text + entry) - 1;
+    sealAnswerReceipt(file, typed);
     appendLedgerAnswer(path.dirname(file), id, typed);
     fs.appendFileSync(file, entry);
   }
   return { entry, typed };
+}
+
+/* ═══════════════ FEAT-184 — an ADOPTION under a recorded delegation ══════════
+ *
+ * The second writer of a typed decision entry, and deliberately a different one:
+ * it writes `by: 'agent-under-delegation'` (never 'user'), names the delegation and
+ * the user's words it rests on, and composes a display heading authored by the
+ * AGENT (`<author> (adopted under delegation <id8>)`) — never a `you (…)` heading.
+ * Called only by the server's adopt route (src/server/delegations.ts), which has
+ * already checked that the delegation is live, in scope, and that the option is
+ * the decision's own recommendation; `receipt` seals the matching store entry
+ * BEFORE the ticket is written (a crash between leaves a receipt with no entry,
+ * which validates nothing).
+ */
+export interface AdoptionInput {
+  chose: { key: string; label: string };
+  note?: string;
+  delegation: { delegation_id: string; statement: string; recorded_at: string };
+  adoptedBy: string;
+  expectDecisionKey?: string | null;
+  /** Re-run INSIDE the ticket lock, just before the write (the delegation is still live). Throws to refuse. */
+  precheck?: () => void;
+  receipt: (r: { answer_id: string; ticket: string; decision_key: string; chose: { key: string; label: string }; delegation_id: string; adopted_by: string; recorded_at: string; digest: string }) => void;
+}
+
+export function composeAdoptionEntry(input: { chose: { key: string; label: string }; note?: string; question?: string | null; delegation: { delegation_id: string; statement: string; recorded_at: string }; adoptedBy: string; decisionId?: string | null }): string {
+  const date = new Date().toISOString().slice(0, 10);
+  const id8 = String(input.delegation.delegation_id).slice(0, 8);
+  // FEAT-184 (fixing r2) — WHO decided is rendered ONLY from the entry KIND, never
+  // from agent-supplied text. The heading actor is the fixed token "an agent" (an
+  // adoption is always an agent's act); the agent's self-named label is recorded
+  // below as QUOTED, agent-attributed content, so even a lookalike ("you", a
+  // Cyrillic/zero-width spoof) can never render as the heading's deciding actor.
+  const author = String(input.adoptedBy).replace(/[\r\n\u2028\u2029]+/g, ' ').trim() || 'agent';
+  const lines = [`### ${date} — an agent (adopted under delegation ${id8}${input.decisionId ? ` · decision ${input.decisionId}` : ''})`];
+  if (input.question) lines.push(`- **Question:** ${String(input.question).trim()}`);
+  lines.push(`- **Adopted:** ${input.chose.key} — ${input.chose.label}`.trimEnd());
+  lines.push(`- **Adopted by (the agent's own label, not you):** "${author}"`);
+  lines.push(`- **Under delegation:** ${input.delegation.delegation_id}, recorded by you on ${String(input.delegation.recorded_at).slice(0, 10)}: "${input.delegation.statement}"`);
+  const note = String(input.note ?? '').trim();
+  if (note) lines.push(...bulletLines('Note', note));
+  lines.push('- **State:** adopted by an agent under your standing delegation — NOT your answer; override it on the Decide card.');
+  return `\n${lines.join('\n')}\n`;
+}
+
+export function recordAdoption(file: string, input: AdoptionInput): { entry: string; typed: TypedAnswer } {
+  return withTicketLock(file, () => recordAdoptionLocked(file, input));
+}
+function recordAdoptionLocked(file: string, input: AdoptionInput): { entry: string; typed: TypedAnswer } {
+  const text = fs.readFileSync(file, 'utf8');
+  const key = decisionKey(text);
+  if (input.expectDecisionKey != null && input.expectDecisionKey !== key) {
+    throw new StaleAnswerError('the decision on this ticket changed — re-read it and adopt the current one');
+  }
+  const rd = recordDecision(text);
+  if (!rd) throw new Error('adopt: the ticket has no record decision');
+  // Inside the lock: a user answer (or another adoption) that landed after the
+  // route's own check wins — never stack an adoption on top of it.
+  if (ticketAnswerState(text, file)) throw new StaleAnswerError('this decision was answered or adopted meanwhile — nothing to adopt');
+  input.precheck?.();
+  const id = idOfFile(file);
+  if (!id) throw new Error(`not a ticket file: ${file}`);
+  const question = typeof rd.decision.question === 'string' ? rd.decision.question : null;
+  const entry = composeAdoptionEntry({ chose: input.chose, note: input.note, question, delegation: input.delegation, adoptedBy: input.adoptedBy, decisionId: currentDecisionId(text) });
+  const heading = entry.split('\n')[1] ?? '';
+  const typed: TypedAnswer = {
+    answer_id: randomUUID(),
+    kind: 'decision',
+    followup: false,
+    chose: { key: input.chose.key, label: input.chose.label },
+    note: String(input.note ?? '').trim(),
+    question,
+    by: 'agent-under-delegation',
+    delegation_id: input.delegation.delegation_id,
+    delegation_statement: input.delegation.statement,
+    adopted_by: String(input.adoptedBy).trim() || 'agent',
+    via: 'adopt route',
+    on: heading.match(/^###\s+(\d{4}-\d\d-\d\d)/)?.[1] ?? new Date().toISOString().slice(0, 10),
+    recorded_at: new Date().toISOString(),
+    recorded_by: 'server',
+    decision_key: key,
+    log_k: -1,
+    heading_sha: sha256(heading.trim()),
+  };
+  const { body } = extractTicketBlock(text);
+  typed.log_k = headingCount(formatTicket(rd.record, body) + entry) - 1;
+  const prior = Array.isArray(rd.decision.answers) ? rd.decision.answers : [];
+  const next = formatTicket({ ...rd.record, decision: { ...rd.decision, answers: [...prior, typed] } }, body) + entry;
+  if (fs.readFileSync(file, 'utf8') !== text) throw new StaleAnswerError('the ticket changed while the adoption was being recorded — re-read and retry');
+  input.receipt({ answer_id: typed.answer_id, ticket: id, decision_key: key, chose: typed.chose!, delegation_id: typed.delegation_id!, adopted_by: typed.adopted_by!, recorded_at: typed.recorded_at, digest: typedAnswerDigest(typed) });
+  fs.writeFileSync(file, next);
+  return { entry, typed };
+}
+
+/** FEAT-184 r2 — the sealed receipt for a user answer (server only; migrates the board's store on first use). */
+function sealAnswerReceipt(file: string, typed: TypedAnswer): void {
+  const id = idOfFile(file);
+  if (!id) return;
+  const dd = stationDataDir();
+  const dir = path.dirname(file);
+  const key = ensureBoardStore(dd, dir, () => legacyTypedUserAnswers(dir), { hasAdoptions: () => boardHasAdoptions(dir) });
+  appendDelegationEntry(dd, dir, key, answerReceiptEntry(id, typed));
 }
 
 /**
@@ -1590,33 +1960,56 @@ export function appendAnswer(hostPath: string, id: string, answer: string, expec
  * message. It must NEVER start a turn on its own — the caller only invokes it
  * while composing a turn the user is already sending.
  *
- * Dedup is per (ticketId, answerDate): the caller owns the seen-set (an in-memory
- * Set on the session), so a fresh answer to the same ticket (new date) is a new
+ * Dedup is per (ticketId, latest answer): the caller owns the seen-set (an in-memory
+ * Set on the session), so a fresh answer OR follow-up to the same ticket is a new
  * announcement, but the same answer is never repeated. Empty lane → null (a
  * healthy session is never spammed — same contract as takeBriefing).
+ *
+ * BUG-257 r2 (plan review, OpenAI 01a13974-b46f): the key was `id@date`, so a
+ * SAME-DAY follow-up ("hold off") after a briefed pick was silently suppressed; it is
+ * now the latest typed answer's id (a frozen legacy answer keeps `id@date`).
  */
 function answerKey(it: BoardItem): string {
-  return `${it.id}@${it.answeredOn ?? ''}`;
+  return `${it.id}@${it.answerRev ?? it.answeredOn ?? ''}`;
 }
-/** The answered-awaiting keys as they stand now — used to SEED a session's seen-set at launch. */
-export function answeredAwaitingKeys(hostPath: string): string[] {
-  return (readBoard(hostPath).answeredAwaiting ?? []).map(answerKey);
+/**
+ * BUG-257 r3 — THE one writer of answer seen-state. An answer is marked seen ONLY
+ * here, and only by a caller that has actually delivered a briefing (live briefing
+ * or launch snapshot) carrying it. Nothing pre-seeds: r2's launch seeding
+ * (answeredAwaitingKeys) marked up to 5 answers seen on an ADOPT launch whose
+ * snapshot was null, so they reached neither briefing (clean room 8c15031e).
+ */
+export function markAnswersDelivered(seen: Set<string>, keys: Iterable<string>): void {
+  for (const k of keys) seen.add(k);
 }
-export function boardAnswerBriefing(hostPath: string, seen: Set<string>): string | null {
+/**
+ * The live `[station]` answered briefing and the keys it renders. PURE: it reads
+ * `seen` and never writes it — the caller marks `keys` via markAnswersDelivered
+ * once the turn carrying `text` is actually handed to the runtime.
+ */
+export function answerBriefingFor(hostPath: string, seen: ReadonlySet<string>): { text: string; keys: string[] } | null {
   let board: Board;
   try { board = readBoard(hostPath); } catch { return null; }
-  const fresh = (board.answeredAwaiting ?? []).filter((it) => !seen.has(answerKey(it)));
-  if (!fresh.length) return null;
-  for (const it of fresh) seen.add(answerKey(it));
-  const short = (s: string, n = 80) => (s.length > n ? `${s.slice(0, n - 1).trimEnd()}…` : s);
-  const lines = fresh.map(
-    (it) => `  - ${it.id} — ${short(it.title)} → chose: ${short(it.answer ?? '(recorded)', 60)} (answered ${it.answeredOn ?? '?'})`,
+  // FEAT-184 — an adoption is an agent's act, not "the user just recorded a decision".
+  // BUG-257 r2 — unless the USER then wrote on it (a follow-up such as "hold it"): that
+  // is the user's instruction and is briefed, with the adoption still named as such.
+  const fresh = (board.answeredAwaiting ?? []).filter(
+    (it) => (!it.adopted || (it.answerNotes ?? []).length > 0) && !seen.has(answerKey(it)),
   );
-  return [
-    `[station] The user just recorded a decision on the board — DECIDED but NOT dispatched, awaiting your go:`,
-    ...lines,
-    `[station] This is a server-recorded fact from the ticket board, not a request. Report each decision back and ask before you begin — do not start work on it silently.`,
+  if (!fresh.length) return null;
+  const text = [
+    `[station] The user just recorded a decision on the board — answered, not started yet:`,
+    ...fresh.flatMap((it) => answeredItemLines(it, '  ')),
+    `[station] This is a server-recorded fact from the ticket board (BUG-257). ${ANSWERED_GO_RULE}`,
   ].join('\n');
+  return { text, keys: fresh.map(answerKey) };
+}
+/** Render-and-deliver in one step (a caller that delivers `text` immediately). */
+export function boardAnswerBriefing(hostPath: string, seen: Set<string>): string | null {
+  const b = answerBriefingFor(hostPath, seen);
+  if (!b) return null;
+  markAnswersDelivered(seen, b.keys);
+  return b.text;
 }
 
 /* ═══════════════ FEAT-047 — WA consolidation needs-human findings ═══════════

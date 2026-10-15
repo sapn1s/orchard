@@ -670,7 +670,7 @@ export function responseFormatSection(opts?: {
   // in a rules document is worse than the tokens it saves, and a truncated
   // "close the fence" rule would teach exactly the failure it warns about. The
   // doc's own comment holds the core under ~4.6 KB (round 14 added the in-block
-  // prose shape); verify:feat-084 pins the composed section at <= 6200, so this
+  // prose shape); verify:feat-084 pins the composed section at <= 6300, so this
   // leaves real headroom and the core is never truncated mid-rule. Raised from
   // 6000 by FEAT-149 (the re-state-the-handoff-after-cleanup clause, +~197 bytes)
   // so the whole core is still delivered rather than truncated mid-rule.

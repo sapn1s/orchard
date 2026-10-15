@@ -5,41 +5,71 @@
   "title": "Tickets with a record block below the top read as never migrated",
   "summary": "A ticket file whose record block has any text above it is read as having no record at all. The page then announces the ticket was never migrated and shows a work state taken from the board index, both false about a file that visibly contains a record. Corrupt, unterminated and whitespace-preceded blocks were already fixed separately.",
   "impact_if_we_wait": "A reader is told a migrated ticket is unmigrated and shown a state pulled from elsewhere. Bounded: this is display-correctness only. The file on disk is untouched, and the record still renders as a plain code block in the body.",
-  "current_need": "Decide whether a record block below the top should be accepted or refused with a visible message saying it was found out of position.",
+  "current_need": "Build B: the reader still requires the block at the top and the page reports a record found out of position.",
   "severity": "medium",
   "area": "Ticket record extraction",
   "reported": "2026-08-19",
   "reported_by": "agent",
   "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-19",
-  "decision": {
-    "mode": "single",
-    "question": "Should a record block that is not at the top of the file be accepted, or refused out loud?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Accept a block anywhere",
-        "what_changes": "The reader scans the whole file and treats the first record block it finds as the record, wherever it sits.",
-        "benefit": "A file with a stray line above the block renders its human layer normally.",
-        "cost": "A record block quoted inside prose, as an example, would be read as the file's own record.",
-        "why_not_obvious": "Widening the grammar makes a documentation example indistinguishable from a real record, and the page would show that example's state as the ticket's."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "34e1dd79-8478-4e2c-82cf-13bdd06ff1d9",
+      "asked_on": "2026-08-19",
+      "question": "Should a record block that is not at the top of the file be accepted, or refused out loud?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "B",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — judgement: Parser strictness with no user value at stake; B keeps the grammar and says out loud where a misplaced record was found.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "judgement",
+        "ref": null,
+        "why": "Parser strictness with no user value at stake; B keeps the grammar and says out loud where a misplaced record was found.",
+        "on": "2026-10-14",
+        "next": "Build B: the reader still requires the block at the top and the page reports a record found out of position.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether a record block below the top should be accepted or refused with a visible message saying it was found out of position."
+        }
       },
-      {
-        "key": "B",
-        "label": "Refuse out of position and say so",
-        "what_changes": "The reader still requires the block at the top, but the page reports that a record was found in an unexpected position.",
-        "benefit": "The false claim disappears without loosening what counts as a record.",
-        "cost": "A file with one stray line above the block still shows no human layer until someone edits the file.",
-        "why_not_obvious": "It leaves a real record unreadable, so a reader who cannot edit the file gets an accurate message and nothing else."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should a record block that is not at the top of the file be accepted, or refused out loud?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Accept a block anywhere",
+            "what_changes": "The reader scans the whole file and treats the first record block it finds as the record, wherever it sits.",
+            "benefit": "A file with a stray line above the block renders its human layer normally.",
+            "cost": "A record block quoted inside prose, as an example, would be read as the file's own record.",
+            "why_not_obvious": "Widening the grammar makes a documentation example indistinguishable from a real record, and the page would show that example's state as the ticket's."
+          },
+          {
+            "key": "B",
+            "label": "Refuse out of position and say so",
+            "what_changes": "The reader still requires the block at the top, but the page reports that a record was found in an unexpected position.",
+            "benefit": "The false claim disappears without loosening what counts as a record.",
+            "cost": "A file with one stray line above the block still shows no human layer until someone edits the file.",
+            "why_not_obvious": "It leaves a real record unreadable, so a reader who cannot edit the file gets an accurate message and nothing else."
+          }
+        ],
+        "recommendation": null,
+        "recommendation_reason": null,
+        "prerequisite": "Establish whether a record block is ever legitimately quoted inside a ticket's prose. If it is, accepting any block anywhere stops being safe."
       }
-    ],
-    "recommendation": null,
-    "recommendation_reason": null,
-    "prerequisite": "Establish whether a record block is ever legitimately quoted inside a ticket's prose. If it is, accepting any block anywhere stops being safe."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A file with one line of text above the record block does not report the ticket as unmigrated",
     "No work-state pill is drawn from the board index for a file that contains a record block",
@@ -173,3 +203,6 @@ Accepting a block anywhere in the file widens what counts as a record, and a blo
   touching the regex — relaxing the anchor changes what counts as a record for
   every node consumer too, not just the view, and `verify:ticket-schema` and
   `verify:migrate-tickets` both encode the current answer.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: judgement. Chose: B. Why: Parser strictness with no user value at stake; B keeps the grammar and says out loud where a misplaced record was found. Next: Build B: the reader still requires the block at the top and the page reports a record found out of position. You can reopen this decision from the ticket view.

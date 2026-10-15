@@ -99,6 +99,16 @@ export function createDrawer(ctx) {
     restore: null,
     confirmDelete: null,
     git: undefined,      // undefined = unfetched, null = route absent, {…} = status
+    /* FEAT-164 — the Agent git policy panel (Settings → Workspace → Agent git).
+       `gitPolicy` undefined = unfetched, null = route absent, {policy,summary,timedGrant,release}.
+       `gitDraft` is the explicit-save edit buffer (never auto-saved); it survives
+       repaints so a half-typed scope note / cadence is not wiped by a background
+       fetch, and is reset from the server after every Save/Revoke and on open. */
+    gitPolicy: undefined,
+    gitDraft: null,
+    gitPolicyBusy: false,
+    gitPolicyErr: '',
+    gitReleaseMsg: null, // the last "Cut release now" result (reason), per-visit
     procs: undefined,    // undefined = unfetched, null = route absent, [] = answer
     procConfirm: null,   // pid with an armed stop
     gitArm: null,        // 'push' | 'create' | 'init' — armed confirm
@@ -238,6 +248,7 @@ export function createDrawer(ctx) {
     services: 'isolation',
     laneDocker: 'isolation',
     git: 'workspace',
+    agentGit: 'workspace',
     processes: 'workspace',
     instructions: 'instructions',
     responseDigest: 'instructions',
@@ -857,6 +868,21 @@ export function createDrawer(ctx) {
   }
 
   /**
+   * BUG-254 — the account list caches, but the LIVE sign-in status must stay
+   * honest: an account whose credential expired while the page was open would
+   * otherwise keep showing its login-time status. Re-probe (forced, bypassing
+   * the server's cache) when the Accounts pane is shown, throttled so a repaint
+   * storm cannot spin it and the paint it triggers cannot re-trigger itself.
+   */
+  let acctHealthAt = 0;
+  function refreshAccountHealth() {
+    const now = Date.now();
+    if (now - acctHealthAt < 4000) return;
+    acctHealthAt = now;
+    Promise.resolve(ctx.refreshAccounts?.({ force: true })).then(() => { if (isOpenNow) paint(); });
+  }
+
+  /**
    * A themed section of the settings view: a native <details> so expand/
    * collapse needs no state of its own and is free for screen readers and
    * keyboard users alike. `opened` sets the default state on first paint —
@@ -1091,7 +1117,7 @@ export function createDrawer(ctx) {
       case 'permissions': wrap.append(permissionsPane(p, sessionScope)); break;
       case 'instructions': wrap.append(instructionsPane(p, sessionScope)); break;
       case 'isolation': wrap.append(isolationPane(p, sessionScope, isContainer)); break;
-      case 'workspace': wrap.append(workspacePane(p)); break;
+      case 'workspace': wrap.append(workspacePane(p, sessionScope)); break;
       case 'advanced': wrap.append(advancedPane(p, sessionScope)); break;
       default: wrap.append(modelPane(p, sessionScope)); break;
     }
@@ -1281,13 +1307,13 @@ export function createDrawer(ctx) {
 
   /* ---- Workspace: the directory this project maps to, its git state, and what
      is running out of it. Everything here is about the real files on disk. ---- */
-  function workspacePane(p) {
+  function workspacePane(p, sessionScope) {
     /* FEAT-071 — which host directory this project maps to. After a rename or a
        relocation the display name and the path can diverge (name "orchard", path
        elsewhere), so a quiet reference line says which directory is actually in
        play. shortPath for display, full path on hover (title) — leak-hygiene and
        discoverability in one line. */
-    return catWrap(null, p.hostPath ? directoryBlock(p) : null, gitGroup(p), processesGroup(p));
+    return catWrap(null, p.hostPath ? directoryBlock(p) : null, gitGroup(p), agentGitGroup(p, sessionScope), processesGroup(p));
   }
 
   /* ---- Advanced: rare maintenance that earns its collapse — methodology
@@ -2406,6 +2432,177 @@ const WIRING_STATE = {
     return t;
   }
 
+  /* ------------------------------------------------- FEAT-164: Agent git
+
+     Whether an AGENT's work may reach this project's REAL repo, and how. ONE
+     writer route (PUT /git-write-policy); the mode is derived server-side:
+       · none    no commit grant (the default) — agents never write the real repo;
+       · scoped  commit + a scope note — agents commit (and push if granted) per it;
+       · release commit + a BLANK note — work reaches the repo only as batched,
+                 verified, versioned release commits (soft releases).
+     The panel is explicit-save (a draft buffer, a Save / Revoke button) rather
+     than the per-field auto-save the rest of the drawer uses, because commit/push/
+     scope/cadence are one decision the user composes and then commits. */
+
+  async function refreshGitPolicy(id) {
+    try { d.gitPolicy = await api.gitWritePolicy(id); }
+    catch { d.gitPolicy = null; }
+    if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
+  }
+
+  /** The server policy → the edit buffer the controls mutate. */
+  function draftFromPolicy(pol) {
+    const r = (pol && pol.release) || {};
+    return {
+      commit: !!(pol && pol.commit),
+      push: !!(pol && pol.push),
+      scope: (pol && typeof pol.scope === 'string') ? pol.scope : '',
+      minTickets: r.minTickets == null ? '' : String(r.minTickets),
+      maxWaitHours: r.maxWaitHours == null ? '' : String(r.maxWaitHours),
+      minIntervalHours: r.minIntervalHours == null ? '' : String(r.minIntervalHours),
+      checksText: Array.isArray(r.checks) ? r.checks.join('\n') : '',
+      tagPrefix: r.tagPrefix == null ? '' : String(r.tagPrefix),
+    };
+  }
+  /** The edit buffer → the PUT body (the server is the validator; see validatePolicyInput). */
+  function gitDraftPayload() {
+    const dr = d.gitDraft;
+    const int = (s) => { const n = Number(s); return s !== '' && Number.isFinite(n) ? n : undefined; };
+    const release = { checks: dr.checksText.split('\n').map((s) => s.trim()).filter(Boolean) };
+    for (const k of ['minTickets', 'maxWaitHours', 'minIntervalHours']) { const v = int(dr[k]); if (v !== undefined) release[k] = v; }
+    if (dr.tagPrefix.trim()) release.tagPrefix = dr.tagPrefix.trim();
+    return { commit: dr.commit, push: dr.commit && dr.push, scope: dr.scope.trim() || null, release };
+  }
+
+  async function saveGitPolicy(id, body, okMsg) {
+    d.gitPolicyBusy = true; d.gitPolicyErr = ''; paint();
+    try {
+      if (body === null) await api.deleteGitWritePolicy(id);
+      else await api.putGitWritePolicy(id, body);
+      d.gitPolicy = undefined; // refetch (release status recomputes)
+      d.gitDraft = null;       // reset the buffer from the server's new truth
+      d.gitReleaseMsg = null;
+      ctx.notify(okMsg);
+    } catch (err) {
+      d.gitPolicyErr = err.message || String(err);
+    }
+    d.gitPolicyBusy = false;
+    if (d.gitPolicy === undefined) void refreshGitPolicy(id); else paint();
+  }
+
+  async function cutReleaseNow(id) {
+    d.gitPolicyBusy = true; d.gitPolicyErr = ''; d.gitReleaseMsg = null; paint();
+    try {
+      const r = await api.cutRelease(id);
+      d.gitReleaseMsg = r.released
+        ? `Cut ${r.version} — ${(r.tickets || []).join(', ') || 'no tickets'}${r.pushed ? ' (pushed)' : ''}`
+        : `Nothing released: ${r.reason || r.error || 'not due'}`;
+      d.gitPolicy = undefined; // the plan/last-release line moves
+    } catch (err) {
+      d.gitReleaseMsg = `Could not cut a release: ${err.message || err}`;
+    }
+    d.gitPolicyBusy = false;
+    if (d.gitPolicy === undefined) void refreshGitPolicy(id); else paint();
+  }
+
+  function agitToggle(label, flag, on, disabled, onToggle) {
+    const row = el('div', { class: 'risk agit-toggle', 'data-on': String(on), 'data-flag': flag });
+    const sw = el('button', { class: `sw agit-${flag}`, type: 'button', 'aria-pressed': String(on), 'aria-label': `Toggle: ${label}` }, el('i'));
+    sw.disabled = !!disabled;
+    if (!disabled) sw.addEventListener('click', onToggle);
+    row.append(el('div', { class: 'top' }, el('span', { class: 'l', text: label }), sw));
+    return row;
+  }
+
+  function agitReleaseStatus(rel) {
+    const box = el('div', { class: 'agit-rel' });
+    if (!rel || rel.error) { box.append(note(`Release status unavailable: ${rel?.error ?? 'no repo or no release tooling'}.`)); return box; }
+    const c = rel.cadence ?? {};
+    const dueRow = el('div', { class: 'agit-rel-row' },
+      el('span', { class: `agit-due ${c.due ? 'on' : ''}`, text: c.due ? 'Release due' : 'Not due yet' }),
+      el('span', { class: 'agit-why', text: c.why ? ` — ${c.why}` : '' }));
+    box.append(dueRow);
+    const ver = el('div', { class: 'agit-rel-row grp-note' });
+    ver.append(document.createTextNode(`Next version ${rel.nextVersion ?? '?'}`));
+    if (rel.previousVersion) ver.append(el('span', { class: 'u', text: `from ${rel.previousVersion}` }));
+    box.append(ver);
+    box.append(el('div', { class: 'agit-rel-row grp-note', text: `Eligible: ${rel.tickets && rel.tickets.length ? rel.tickets.join(', ') : 'none yet'}` }));
+    box.append(el('div', { class: 'agit-rel-row grp-note', text: rel.last ? `Last release ${rel.last.version} · ${when(rel.last.at)}${rel.last.tickets ? ` · ${rel.last.tickets.length} ticket${rel.last.tickets.length === 1 ? '' : 's'}` : ''}` : 'No release cut yet' }));
+    const ex = Array.isArray(rel.excluded) ? rel.excluded : [];
+    if (ex.length) {
+      const det = el('details', { class: 'agit-excl' });
+      det.append(el('summary', { text: `${ex.length} candidate${ex.length === 1 ? '' : 's'} excluded` }));
+      for (const e of ex) det.append(el('div', { class: 'grp-note agit-excl-row' }, el('b', { text: e.ticket }), document.createTextNode(`: ${(e.reasons || []).join('; ')}`)));
+      box.append(det);
+    }
+    return box;
+  }
+
+  /**
+   * 2026-10-13 — the "soft releases can never happen here" warning. Read from the
+   * server's own plan (`release.verdictSource`, scripts/lib/release.mjs
+   * boardVerdictSource) — the UI does not re-derive it. `onScope` null = session
+   * scope: the warning without the choices (they are project settings).
+   * The three choices are the user's; none is taken automatically.
+   */
+  function agitNeverReleasesWarning(p, payload, onScope) {
+    const vs = payload?.release?.verdictSource;
+    if (!vs || vs.ok !== false) return null;
+    const box = el('div', { class: 'agit-never', role: 'alert', 'data-code': vs.code || '' });
+    box.append(el('strong', { text: 'Soft releases can never happen in this project. ' }));
+    box.append(document.createTextNode(`Release mode only ships tickets with a recorded independent verdict, but ${vs.reason}. Choose one:`));
+    if (onScope === null) { box.append(note('Change it in this project’s settings.')); return box; }
+    const acts = el('div', { class: 'cacts agit-never-acts' });
+    const scope = el('button', { class: 'mini primary agit-never-scope', type: 'button', text: 'Write a scope note (agents commit directly)' });
+    scope.addEventListener('click', () => onScope());
+    const off = el('button', { class: 'mini agit-never-off', type: 'button', text: 'Turn agent commits off' });
+    off.disabled = d.gitPolicyBusy;
+    off.addEventListener('click', () => void saveGitPolicy(p.id, null, 'agent commits turned off (the note and cadence are kept)'));
+    const keep = el('button', { class: 'mini agit-never-keep', type: 'button', text: 'Keep soft releases' });
+    keep.addEventListener('click', () => {
+      d.gitReleaseMsg = 'Kept soft releases. A ticket becomes releasable once it has a frozen candidate and an independent HOLDS recorded with `board-tool verified … --candidate <hash>`.';
+      paint();
+    });
+    acts.append(scope, off, keep);
+    box.append(acts);
+    return box;
+  }
+
+  function agentGitGroup(p, sessionScope) {
+    const grp = el('div', { class: 'grp agit', 'data-focus': 'agentGit' }, groupLabel('Agent git'));
+    if (d.gitPolicy === undefined) { void refreshGitPolicy(p.id); grp.append(note('Reading agent git policy…')); return grp; }
+    if (d.gitPolicy === null) { grp.append(note('This server does not report an agent git policy yet.')); return grp; }
+    const payload = d.gitPolicy;
+    const saved = payload.policy ?? {};
+    const mode = saved.mode ?? 'none';
+
+    // The status line is the server's own one-line summary (ARCH-010 — the owner
+    // of the fact writes it; the UI does not re-derive the mode text).
+    const status = el('div', { class: 'agit-status', 'data-mode': mode },
+      el('span', { class: 'agit-dot' }),
+      el('b', { class: 'agit-summary', text: payload.summary ?? 'No agent commits (default)' }));
+    grp.append(status);
+
+    if (sessionScope) {
+      if (mode !== 'none' && saved.scope) grp.append(el('div', { class: 'set-why', text: saved.scope }));
+      if (mode === 'release') { const w = agitNeverReleasesWarning(p, payload, null); if (w) grp.append(w); }
+      if (mode === 'release') grp.append(agitReleaseStatus(payload.release));
+      grp.append(projectOnlyNote('Agent git'));
+      return grp;
+    }
+
+    // FEAT-190 — the agent-git CONTROLS moved to the Git page (the GitHub-Desktop-style page where
+    // git is granted), so granting and policy are one surface. The drawer is read-only now: it
+    // shows the current state and links to the Git page to change it.
+    if (mode !== 'none' && saved.scope) grp.append(el('div', { class: 'set-why', text: saved.scope }));
+    if (mode === 'release') { const w = agitNeverReleasesWarning(p, payload, null); if (w) grp.append(w); grp.append(agitReleaseStatus(payload.release)); }
+    grp.append(note('Agent git is managed on the Git page now — grant commit/push, the optional scope note, soft releases, and which other repos the grant reaches. Your own commits are never affected by this.'));
+    const manage = el('button', { class: 'mini primary agit-manage', text: 'Manage on the Git page' });
+    manage.addEventListener('click', () => ctx.openGit?.(p.id));
+    grp.append(el('div', { class: 'cacts agit-acts' }, manage));
+    return grp;
+  }
+
   /* ---------------------------------------------------- processes group */
 
   async function refreshProcs(id) {
@@ -3501,9 +3698,20 @@ const WIRING_STATE = {
       frag.append(el('div', { class: 'set-why img-refused', text: `Refused: ${c.imageRefused}. Sessions cannot start until the image is fixed; the existing container is left as it is.` }));
     }
     if (c.lockdownPending) frag.append(el('div', { class: 'set-why lockdown-pending', text: c.lockdownPending }));
+    /* FEAT-175 — a git-write grant change is being applied: the server's sentence, plus who it waits on. */
+    if (c.grantRebuild) {
+      const g = c.grantRebuild;
+      const head = g.phase === 'rebuilding' ? 'Rebuilding for git grant…' : g.phase === 'failed' ? 'Rebuild for git grant failed' : g.phase === 'unknown' ? 'Container git mode unknown' : 'Rebuild for git grant pending';
+      frag.append(el('div', { class: `set-why grant-rebuild gr-${g.phase}`, 'data-phase': g.phase },
+        el('strong', { text: `${head} ` }),
+        el('span', { text: g.message })));
+    }
     return frag;
   }
 
+  /* FEAT-175 — while a git-grant rebuild is pending/running the container block re-reads its status, so the
+     line moves from "pending" to "rebuilding" to gone without the user pressing Check again. */
+  let grantPoll = null;
   async function refreshContainer(id) {
     try {
       d.container = await api.containerStatus(id);
@@ -3512,6 +3720,9 @@ const WIRING_STATE = {
       ctx.notify(`container status: ${err.message}`, true);
     }
     if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
+    clearTimeout(grantPoll);
+    grantPoll = null;
+    if (d.container?.grantRebuild && isOpenNow) grantPoll = setTimeout(() => { if (isOpenNow) void refreshContainer(id); }, 3000);
   }
 
   /* --------------------------------------------------- instructions view */
@@ -3996,6 +4207,10 @@ const WIRING_STATE = {
     const L = {
       accountId: account.id,
       label: account.label,
+      // BUG-254 — re-authenticating an already-ready account (in place, same id)
+      // vs a first login of a freshly-added one. Changes the cancel/failure
+      // wording: a reauth never removes the established account.
+      reauth: account.state === 'ready',
       url: null,
       status: null,       // { message, urlFound, raw } — the degradation report
       done: null,         // the single verdict event
@@ -4119,10 +4334,12 @@ const WIRING_STATE = {
 
     if (L.done) {
       box.append(note(L.done.ok
-        ? `Signed in. “${L.label}” is ready to use${L.done.subscriptionType ? ` on the ${L.done.subscriptionType} plan` : ''}.`
+        ? `Signed in. “${L.label}” is ready to use${L.done.subscriptionType ? ` on the ${L.done.subscriptionType} plan` : ''}.${L.reauth ? ' Running sessions on this account resume under the new credential on your next message — no restart needed.' : ''}`
         : `Not signed in. ${L.done.reason}`));
       if (!L.done.ok && !L.done.accountRemoved) {
-        box.append(note('The account was kept as “not logged in yet” so you can try again; delete it below if you would rather start over.'));
+        box.append(note(L.reauth
+          ? 'The account is unchanged — it still has its previous credential. Try signing in again, or delete it below to start over.'
+          : 'The account was kept as “not logged in yet” so you can try again; delete it below if you would rather start over.'));
       }
       const acts = el('div', { class: 'cacts' });
       const close = el('button', { class: 'mini', text: 'Close' });
@@ -4183,9 +4400,31 @@ const WIRING_STATE = {
       if (L.ws && L.ws.readyState === WebSocket.OPEN) L.ws.send(JSON.stringify({ type: 'claude-login-cancel' }));
       else { closeLoginSocket(L); d.acctLogin = null; void refreshAccounts(); paint(); }
     });
-    acts.append(el('span', { class: 'grp-note inline', text: 'Stops the CLI and removes the half-made account.' }), cancel);
+    acts.append(el('span', { class: 'grp-note inline', text: L.reauth ? 'Stops the sign-in; the account keeps its current credential.' : 'Stops the CLI and removes the half-made account.' }), cancel);
     box.append(acts);
     return box;
+  }
+
+  /**
+   * The live, HONEST status line for one account (BUG-254). It reads the
+   * server's live-probed `a.health.state`, NOT the login-time `a.state`, so an
+   * expired or revoked credential reads "needs re-login" instead of "signed in"
+   * forever. A probe that could not report is "status unknown" — never a guessed
+   * "signed in". Falls back to the old login-time wording only if an older
+   * server sent no `health` field at all.
+   */
+  function acctHealth(a) {
+    const h = a.health || null;
+    const sub = (h && h.subscriptionType) || a.lastStatus?.subscriptionType || null;
+    const plan = sub ? ` · ${sub} plan` : '';
+    const state = h ? h.state : (a.state === 'ready' ? 'signed-in' : 'setup-pending');
+    switch (state) {
+      case 'signed-in': return { text: `signed in${plan}`, cls: 'f ok', needsLogin: false };
+      case 'needs-relogin': return { text: 'needs re-login — the credential expired or was revoked', cls: 'f warn', needsLogin: true };
+      case 'unknown': return { text: `sign-in status unknown${h && h.error ? ` — ${h.error}` : ''}`, cls: 'f warn', needsLogin: true };
+      case 'setup-pending': return { text: 'not signed in yet', cls: 'f', needsLogin: true };
+      default: return { text: 'not signed in yet', cls: 'f', needsLogin: true };
+    }
   }
 
   /** The account list + its delete ceremony + the add/login surface. */
@@ -4193,12 +4432,25 @@ const WIRING_STATE = {
     const box = el('div', { class: 'grp acctlist', 'data-focus': 'accounts' }, el('div', { class: 'grp-l sub', text: 'Accounts on this machine' }));
     for (const a of accounts) {
       const row = el('div', { class: 'set' });
+      const hv = acctHealth(a);
+      // The default (~/.claude) is never probed (the server omits its health),
+      // so it keeps its static descriptive text and plain styling; named
+      // accounts show their live, colour-coded health.
       row.append(el('span', { class: 'l' },
         document.createTextNode(a.id === 'default' ? 'Default (~/.claude)' : a.label),
-        el('span', { class: 'f', text: a.id === 'default'
-          ? 'the credential this machine already had'
-          : `${a.state === 'ready' ? 'signed in' : 'not signed in yet'}${a.lastStatus?.subscriptionType ? ` · ${a.lastStatus.subscriptionType} plan` : ''}` })));
+        el('span', { class: a.id === 'default' ? 'f' : hv.cls,
+          text: a.id === 'default' ? 'the credential this machine already had' : hv.text })));
       if (a.id !== 'default') {
+        const actions = [];
+        // BUG-254 — re-authenticate IN PLACE, keeping the same account id, so
+        // every project pinned to it keeps working. Hidden while a login panel
+        // is already open (it renders below).
+        if (!d.acctLogin) {
+          const reauth = a.state === 'ready';
+          const signin = el('button', { class: 'mini', text: reauth ? 'Sign in again' : 'Sign in' });
+          signin.addEventListener('click', () => { d.acctConfirm = null; startLogin(a); paint(); });
+          actions.push(signin);
+        }
         if (d.acctConfirm === a.id) {
           row.dataset.armed = 'true';
           const no = el('button', { class: 'mini', text: 'Keep' });
@@ -4219,7 +4471,8 @@ const WIRING_STATE = {
         } else {
           const del = el('button', { class: 'mini x', text: 'Delete…' });
           del.addEventListener('click', () => { d.acctConfirm = a.id; paint(); });
-          row.append(el('span', { class: 'v' }, del));
+          actions.push(del);
+          row.append(el('span', { class: 'v' }, ...actions));
         }
       }
       /* The default row gets NO `.v` value: that column is a narrow mono slot
@@ -4262,6 +4515,7 @@ const WIRING_STATE = {
    */
   function accountsPane() {
     ensureAccounts();
+    refreshAccountHealth();
     const ag = el('div', { class: 'grp', 'data-focus': 'globalAccount' }, groupLabel('Default Claude account'));
     const st = accountsState();
     if (st === undefined) {
@@ -5180,6 +5434,13 @@ const WIRING_STATE = {
     d.customEdit = null; // FEAT-159: a half-typed custom value is per-visit too
     d.runtime = undefined; // FEAT-151 — refetch runtime versions on each open (like snaps/wiring)
     d.runtimeError = null;  // a prior failure note is per-visit
+    /* FEAT-164 — the agent git policy (and its live release plan: eligible
+       tickets, due state) is a true-source read that moves as tickets get
+       verified, so refetch it and drop the edit buffer on every open. */
+    d.gitPolicy = undefined;
+    d.gitDraft = null;
+    d.gitPolicyErr = '';
+    d.gitReleaseMsg = null;
 
     /* FEAT-146 — resolve the CATEGORY first, then the view.
        `{scope:'machine'}` was the sidebar-foot door into the machine panel;

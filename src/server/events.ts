@@ -8,6 +8,7 @@
 import type { ProjectSettings, Provider } from './registry.ts';
 import type { ProviderError, RuntimeCapabilities } from './runtime/runtime.ts';
 import type { RunningSnapshot } from './running-set.ts';
+import type { AttachmentRef } from './attachments.ts';
 
 export type Isolation = 'direct' | 'container' | 'sandbox';
 
@@ -171,7 +172,11 @@ export type StationEvent =
   // the bridge (this.effective.provider — the same fact the transcript is pinned to
   // and resumeProviderOf returns on reopen). The client records it so a session made
   // real by its first turn locks its provider surfaces, without a transcript refetch.
-  | { t: 'session-init'; sessionId: string; cwd: string; model: string; tools: string[]; permissionMode?: string; slashCommands?: string[]; lockedProvider?: string }
+  // BUG-255 — account: the Claude account this launch ACTUALLY runs under (the
+  // server-owned launch fact, FEAT-160 binding applied). `null` = the implicit
+  // default account; a string = a minted account id; absent = not declared
+  // (a non-Claude engine, or an older server). The indicator renders from this.
+  | { t: 'session-init'; sessionId: string; cwd: string; model: string; tools: string[]; permissionMode?: string; slashCommands?: string[]; lockedProvider?: string; encodedDir?: string; account?: string | null }
   /**
    * Emitted once, before the first SDK message: what this session is really
    * running with. `overridden` is the authoritative answer to "did my session
@@ -350,6 +355,11 @@ export type StationEvent =
    */
   | { t: 'error'; message: string; fatal: boolean; budgetStopped?: boolean; retryable?: boolean;
       /**
+       * BUG-253 — a new session's start failed before it began, and its first message is KEPT on disk: the
+       * project's dock lists it (GET /api/outbox/starts) with Send again / Discard. The tab need not keep a copy.
+       */
+      kept?: { box: string; id: string };
+      /**
        * BUG-090 — the resume was refused ONLY because the session lives under a
        * different (pre-isolation) encoded-cwd store dir than this project now
        * resolves to (e.g. a session recorded before the container was enabled).
@@ -410,8 +420,13 @@ export type StationEvent =
        *
        * 'client-outdated' (BUG-217 round 5): the frame came from a round-3/4
        * client (it carried `queueIds`). Nothing was sent; the tab must reload.
+       *
+       * 'rebuild-hold' (FEAT-175): retryable — the project's container is being
+       * (or is about to be) recreated for a git-write grant change. Nothing was
+       * sent or started; the tab hands the prompt to the outbox, which delivers
+       * it once the container is ready.
        */
-      code?: 'live-elsewhere' | 'nothing-to-reattach' | 'runtime-check-pending' | 'outbox-pending' | 'client-outdated' }
+      code?: 'live-elsewhere' | 'nothing-to-reattach' | 'runtime-check-pending' | 'outbox-pending' | 'client-outdated' | 'rebuild-hold' }
   /**
    * A `send` carried `targetAgentId`, and the Agent SDK has no channel for it.
    *
@@ -483,7 +498,9 @@ export type StationEvent =
       accountRemoved?: boolean;
     }
   /** Bridge lifecycle, not an SDK message. */
-  | { t: 'session-closed'; reason: string }
+  /** FEAT-175: `resumable` — Orchard closed an IDLE session to recreate its container; the same session id
+   *  resumes from its transcript on the next message (the tab re-arms resume-on-next-send). */
+  | { t: 'session-closed'; reason: string; resumable?: boolean }
   /** FEAT-168 — a new message auto-reopened this session's CLOSED label (Orchard's own store). */
   /**
    * BUG-187 B6 — the server's AUTHORITATIVE list of pending approval/question/
@@ -524,10 +541,14 @@ export type ClientCommand =
        * an invalid or project-scope-only field fails the start loudly.
        */
       overrides?: Partial<Pick<ProjectSettings, SessionOverridable>>;
+      /** FEAT-177 — attachment references for the first turn (bytes already uploaded to the blob store). */
+      attachments?: AttachmentRef[];
     }
   | {
       type: 'send';
       prompt: string;
+      /** FEAT-177 — attachment references for this turn (bytes already uploaded to the blob store). */
+      attachments?: AttachmentRef[];
       /**
        * Route this turn to a specific running subagent.
        *
@@ -598,7 +619,14 @@ export type ClientCommand =
    * the server resolves `inherit` exactly as a fresh session would; `account` is
    * ignored when `inherit` is true.
    */
-  | { type: 'switch-account'; requestId?: string; account: string | null; inherit?: boolean }
+  // BUG-255 — `sessionId`/`encodedDir`/`projectId` name the target session for a
+  // pick made when NO live session drives this socket (a resumable session the
+  // user re-opened). The server resolves the authoritative project, classifies
+  // the session via its own lifecycle authorities, and either rebinds a proven-
+  // stopped session durably or refuses visibly — it never trusts the client's
+  // view-predicate to authorize an offline rebind. Absent for the classic
+  // live-socket switch, which still targets this socket's own session.
+  | { type: 'switch-account'; requestId?: string; account: string | null; inherit?: boolean; sessionId?: string; encodedDir?: string; projectId?: string }
   /**
    * Follow a session file the dashboard did not spawn. Sent when the user opens
    * a session; the server watches from the file's CURRENT end, so it never

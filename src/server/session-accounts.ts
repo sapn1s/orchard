@@ -15,14 +15,14 @@
  * THE REMEDY (ARCH-010): one owner, written once, read once.
  *   - WRITER: the `switch-account` handler calls `setSessionAccount` durably
  *     BEFORE it reaps the old CLI.
- *   - READER: the `AgentSession` constructor — the single spawn chokepoint every
- *     resume flows through — forces the resumed session's effective account to
- *     the bound value, so NO resume route can run a switched session on the old
- *     account, whatever override a client carries.
+ *   - READER: launch-account.ts `effectiveLaunchAccount` (BUG-255 r4) — the one
+ *     authority every spawn (the AgentSession constructor) and the indicator's
+ *     declared fact call. A binding decides a `direct` session's account; a
+ *     container project's sessions use the project account.
  *
  * A session that was never switched has NO binding (`getSessionAccount` →
- * `undefined`), so its account stays the per-launch override exactly as FEAT-145
- * defines. This module is purely additive to that model.
+ * `undefined`) and launches on its project's account. A NEW session's pick is
+ * written here as its binding at `system:init` (agent-bridge).
  *
  * Durability: the binding is written before the reap and persists across a
  * server restart (a crash between the reap and the client's re-resume must still
@@ -90,40 +90,74 @@ export function getSessionAccount(sid: string | null | undefined): { account: Bo
   return { account: map.get(sid)! };
 }
 
-/** Bind this session to an account, durably, so every later resume reads it. */
+/**
+ * Bind this session to an account, durably, so every later resume reads it.
+ *
+ * BUG-255 — PERSIST BEFORE PUBLISH. The disk write is the commit; the in-memory
+ * cache is only a read-through copy of it. If we mutated the cache first and the
+ * persist then threw, the handler would REFUSE the switch (it rethrows) while
+ * every later in-process `getSessionAccount` read saw the new account — the
+ * binding would be "live" in memory but absent on disk, so a restart would lose
+ * it and, worse, the switch's own caller reported failure while the fact changed.
+ * So: write the file first (on a COPY), and only publish the new value into the
+ * cache once the write has succeeded. A throw leaves both disk and cache on the
+ * old value, which is exactly what a refused switch must preserve.
+ */
 export function setSessionAccount(sid: string, account: BoundAccount): void {
   if (!validSessionId(sid)) throw new Error(`setSessionAccount: not a valid session id: ${String(sid)}`);
   const map = load();
-  map.set(sid, account);
-  persist(map);
+  const next = new Map(map);
+  next.set(sid, account);
+  persist(next); // the commit — may throw (disk full, EACCES); if it does, the cache is untouched below
+  map.set(sid, account); // publish into the live cache ONLY after the durable write succeeded
+  // BUG-255 r2 — tell the owner of the declared account fact that the binding
+  // changed, so every open tab is pushed the new fact (never only the requester).
+  for (const cb of bindingObservers) {
+    try { cb(sid); } catch (err) { console.error(`[orchard] BUG-255: binding observer failed: ${(err as Error).message}`); }
+  }
 }
 
 /**
- * FEAT-160 round 4 — for a RESUME or an outbox enqueue of a session the server
- * already owns the account for (a binding exists), the client-carried
- * `claudeAccount` is NOT a request: the binding decides at the single spawn
- * chokepoint (the `AgentSession` constructor reads it). So the server must
- * neither READ nor VALIDATE the client value for a bound session — a stale tab
- * still carrying an account that has since been DELETED would otherwise fatally
- * strand the resume on `validateSessionOverrides` ("claudeAccount must be null or
- * the id of an existing account"), even though the server owns the account for
- * that session. This is the exact reason a resume already DROPS the client's
- * `provider` (BUG-196): a fact the server owns must not be killable by a stale
- * client value. An UNBOUND session is returned untouched — its per-launch
- * `claudeAccount` is the legitimate FEAT-145 launch override and is validated as
- * before. Returns the overrides with `claudeAccount` removed (or `undefined` if
- * nothing is left), so every resume/enqueue site strips it the same way.
+ * BUG-255 r3 — put a session's binding BACK to what it was before a switch that
+ * did not happen (a live switch whose stop failed). `prev` is what
+ * `getSessionAccount` returned before the switch: `undefined` removes the binding
+ * (the session was never bound), `{account}` re-binds to it. Same discipline as
+ * setSessionAccount: persist first, publish into the cache only after the write,
+ * then notify the observers so every tab is pushed the restored fact.
  */
-export function dropBoundAccountOverride(
-  sid: string | null | undefined,
-  overrides: Record<string, unknown> | null | undefined,
-): Record<string, unknown> | undefined {
-  if (!overrides || !('claudeAccount' in overrides) || getSessionAccount(sid) === undefined) {
-    return overrides && Object.keys(overrides).length ? overrides : undefined;
+export function restoreSessionAccount(sid: string, prev: { account: BoundAccount } | undefined): void {
+  if (prev !== undefined) { setSessionAccount(sid, prev.account); return; }
+  if (!validSessionId(sid)) throw new Error(`restoreSessionAccount: not a valid session id: ${String(sid)}`);
+  const map = load();
+  if (!map.has(sid)) return;
+  const next = new Map(map);
+  next.delete(sid);
+  persist(next);
+  map.delete(sid);
+  for (const cb of bindingObservers) {
+    try { cb(sid); } catch (err) { console.error(`[orchard] BUG-255: binding observer failed: ${(err as Error).message}`); }
   }
-  const { claudeAccount: _dropped, ...rest } = overrides;
-  return Object.keys(rest).length ? rest : undefined;
 }
+
+/**
+ * BUG-255 r2 — observers of a COMMITTED binding change (called after the durable
+ * write and the cache publish). The server's account-fact publisher subscribes so
+ * a rebind from any path reaches every tab, not just the request that made it.
+ */
+const bindingObservers = new Set<(sid: string) => void>();
+export function onBindingChange(cb: (sid: string) => void): () => void {
+  bindingObservers.add(cb);
+  return () => { bindingObservers.delete(cb); };
+}
+
+/*
+ * BUG-255 r4 — `dropBoundAccountOverride` is DELETED. It stripped a client's
+ * `claudeAccount` only for BOUND sessions, so an unbound resume still launched on
+ * the client's pick while the indicator showed the project account (verify r3).
+ * A client pick is now never a launch override for an existing session:
+ * launch-account.ts `takeAccountPick` removes it unread on every resume/enqueue
+ * path, and `effectiveLaunchAccount` is the only decider.
+ */
 
 /** Test seam: drop the in-memory cache so the next read reloads from disk. */
 export function _resetSessionAccountsCache(): void {

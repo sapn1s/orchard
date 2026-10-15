@@ -95,6 +95,15 @@ export interface RuntimeCapabilities {
    * closed sessions whose background agents were still working.
    */
   backgroundLifetime: 'reported' | 'absent';
+  /**
+   * FEAT-177 — can this engine receive image / document attachments as vision
+   * input on a user turn (Claude: yes, as `image`/`document` content blocks;
+   * Codex app-server: no — its wire vocab has no `input_image`). An engine with
+   * `false` makes the send path REFUSE a message carrying an image/PDF loudly
+   * rather than drop the attachment and send text-only. Text-file attachments
+   * are inlined as text and ride on every engine regardless.
+   */
+  imageAttachments: boolean;
 }
 
 /**
@@ -232,6 +241,12 @@ export interface RuntimeStartConfig {
    */
   dockerEnv?: Record<string, string>;
   firstPrompt: string;
+  /**
+   * FEAT-177 — the full `message.content` block array for the first turn when
+   * it carries attachments (text + image/document/inlined-file blocks). Omitted
+   * for a text-only first turn, which then rides as a bare string unchanged.
+   */
+  firstContent?: ReadonlyArray<Record<string, unknown>>;
   permissionMode: string;
   /** Called for every tool the engine wants to run; resolves to allow/deny. */
   onApproval: (req: RuntimeApprovalRequest) => Promise<ApprovalResult>;
@@ -273,6 +288,14 @@ export interface RuntimeStartConfig {
    */
   gitGrantKey?: string;
   gitRepoPath?: string;
+  /**
+   * FEAT-129 round 4 — the repo path as the CLI itself sees it, when that differs
+   * from `gitRepoPath` (a container session's `/workspace/<id>`). The file lock
+   * maps targets under it back onto the host repo before keying, so container and
+   * host sessions of one project share ONE lock-key namespace. Declared by the
+   * bridge (the owner of isolation); absent for a direct session.
+   */
+  fileLockPathAliases?: string[];
   /**
    * BUG-231 — declared by the bridge (the owner of isolation): true only when the
    * CLI runs on THIS host with the session env, so the session's git shim is on the
@@ -352,8 +375,14 @@ export interface AgentRuntime {
   readonly capabilities: RuntimeCapabilities;
   /** Spawn the engine and enqueue the first turn. Synchronous, like `query()`. */
   start(config: RuntimeStartConfig): void;
-  /** Queue a follow-up turn into the same session. */
-  send(text: string): void;
+  /**
+   * Queue a follow-up turn into the same session. `content`, when supplied
+   * (FEAT-177), is the full provider `message.content` block array (text +
+   * image/document/inlined-file blocks) and REPLACES the bare-string body;
+   * omitted, the turn carries `text` as a bare string exactly as before (so
+   * text-only sends are byte-for-byte unchanged).
+   */
+  send(text: string, content?: ReadonlyArray<Record<string, unknown>>): void;
   /** Interrupt the in-flight turn. */
   interrupt(): Promise<void>;
   /**

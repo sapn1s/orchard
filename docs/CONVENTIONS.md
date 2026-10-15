@@ -82,6 +82,26 @@ The user's answer is a typed entry (record `decision.answers[]`, or the board's
 heading is display and counts for nothing. Never write one — `board:check` names any typed
 after the 2026-10-05 freeze (`answers-legacy.frozen.json`).
 
+### A decision the user delegated is ADOPTED with `board-tool adopt`, never answered for them (FEAT-184, 2026-10-14)
+
+Never write a user answer — not through the API, not by editing the record. The answer routes
+refuse an agent caller (403 `agent-not-user`); a hand-written `by: user` entry has no sealed
+receipt and counts for nothing (`board:check` FAILs it). When the USER has recorded a
+delegation covering the ticket (Decide card → "Delegate to agents"; listed at
+`GET /api/projects/<id>/delegations`), adopt the decision's own recommendation:
+
+    node scripts/board-tool.mjs adopt --id FEAT-182 --delegation <id> --author "worker (…)"
+
+It is recorded as `agent-under-delegation`, names the delegation and the user's words, shows
+as "adopted under your delegation", and the user can override it. A delegation is scoped to
+explicit ticket ids, expires, can be revoked, and covers only the recommended option. Chat
+words ("do whatever u recc") are NOT a delegation: an agent can produce a user-shaped turn
+(BUG-258). With no recorded delegation, leave the card to the user.
+
+### Taking back a card that is actually the agent's own (BUG-259 `own`, BUG-263 `withdraw`)
+
+A decision that was never the user's — an engineering option, a sequencing call, which-when-recommended, bookkeeping, verification owed — is recorded as the agent's with `board-tool own` (it refuses a card that declares a hard stop). If a lane filed a HARD-STOP card in error — the decision was the agent's own call, already made and built, and neither option matches what shipped — take it back with `board-tool withdraw --id <T> --reason "…" --decided "what shipped" --author "…"`. Both record the agent's decision in `decision_history` (never a user answer), close the card, and leave the user a one-click Reopen. `withdraw` is refused once the user has answered, adopted, or reopened the decision.
+
 ## Declare the dispatch — one line at the top of every charter (FEAT-100, 2026-08-21)
 
 Put this as the **first line of the charter**, before anything else:
@@ -105,6 +125,45 @@ rather than resolved, so do not paste a second one.
 
 **Quoting the syntax is safe** — a `Dispatch:` line inside a fenced code block is
 ignored, which is why the example above is indented instead of fenced.
+
+## Frozen candidates: verify and commit exactly the frozen bytes (FEAT-170)
+
+**Verify lanes default to `node <orchard>/scripts/independent-verify.mjs --ticket <T>`** — it
+verifies the ticket's files AS THEY ARE. It uses T's frozen candidate while every file is still
+current; otherwise it falls back by itself to a mixed-tree freeze of T's files in the shared tree
+(other tickets' hunks are shown to the verifier, attributed, and the verdict binds to that hash).
+Pass `--files a,b` when T has no candidate or claim; `--mixed` skips the candidate attempt. **Never
+hand-build a candidate** (an exported HEAD plus re-applied hunks, untangle scripts, a scratch
+two-commit repo): one verify lane spent 34 min doing that (measured 2026-10-14). `--range` is only
+for already-committed work.
+
+The candidate tools stay: freeze a ticket's files with
+`node <orchard>/scripts/candidate.mjs freeze --id <T> --files … [--check "<cmd>"]`, verify with
+`independent-verify --ticket <T>` (it picks up the current candidate), and the user promotes with
+`node <orchard>/scripts/candidate.mjs commit <T> --repo <project>`. Any later change to a
+frozen file invalidates the verdict until it is re-frozen and re-verified.
+
+The shadow-repo pilot (a private repo per lane, `shadow.mjs`) was REMOVED on 2026-10-13. In 45
+days of history it would have prevented no loss on its own, lock waits cost 0.6% of lane
+time, and it needed a write exception in the shim. Agent writes to any repo are governed
+only by FEAT-164's policy again. The evidence is in FEAT-170.
+
+## A finished lane's files are snapshotted; restore them with one command (FEAT-176, 2026-10-12)
+
+When a lane ends, Orchard keeps every file it wrote with Write, Edit, MultiEdit,
+NotebookEdit or fileChange under `dataDir()/lane-snapshots/`, for 14 days. A file
+whose history starts with a Write is rebuilt byte-exact from the transcript. Any
+other file keeps only its lane-end copy, which is UNVERIFIED. A file with neither
+is named unrecoverable with a reason. To restore (it backs up the live file first
+and prints the undo):
+
+    node <orchard>/scripts/lane-snapshot.mjs restore <TICKET | lane id | snapshot id> --repo <project> [--force]
+
+Exact files restore by default. UNVERIFIED copies restore only with `--force`.
+Restore writes only real paths inside the project and refuses any symlinked
+component. `independent-verify`, `candidate freeze`/`commit`, `board-tool commit`
+and the pre-commit hook print a best-effort `LANE WORK CHANGED?` warning. It may
+over-report and it never refuses anything.
 
 ## Testing — added 2026-08-18
 
@@ -330,15 +389,24 @@ same reason `mounts` is project-scope-only. Direct (non-containerised) projects
 get the per-session override; container projects get an explicit refusal, never
 a silent no-op.
 
-**A container's real `.git` is read-only unless the project holds the PERMANENT
-git-write grant (BUG-244).** `desiredBinds()` overlays every real git dir reachable
+**A container's real `.git` is read-only unless the project holds a permanent or
+live duration git-write grant (BUG-244, FEAT-175).** `desiredBinds()` overlays every real git dir reachable
 through a rw bind (repo at a bind root or one level below, every alias) with `:ro`;
-P's grant never unlocks registered project Q's repo. Timed/once grants cannot flip a
-bind, so inside a container they pass the host hook and then hit "Read-only file
-system". A `gitguard:` drift reason is **informational only**: `doEnsure` never
-recreates, defers or refuses for it, so the overlay applies only when the container
-is next created anyway (none yet, another drift reason, or Rebuild). Do not make it
-a recreate trigger; that is the BUG-214 class. A *lapsed* overlay (host re-cloned a
+P's grant never unlocks registered project Q's repo. The switch is the permanent
+grant or (FEAT-175) a live 30-minute/duration grant; a once grant cannot be a mount,
+so in a container it passes the host hook and then hits "Read-only file system". A
+`gitguard:` drift reason is **informational only in `doEnsure`**: it never recreates,
+defers or refuses there. The ONE actor on it is FEAT-175's reconciler
+(`src/server/grant-rebuild.ts`), LEVEL-based over two declared facts: DESIRED
+(`desiredGitMode`, read live) and ACTUAL (the `claude-station.git-mode` label every
+create writes and reports synchronously; cache starts `unknown`, any docker/registry
+error resets it to `unknown`). `hold = desired≠rw ∧ actual∉{ro,none}` (plus a running
+or failed rebuild) is read at the chokepoints (`AgentSession.send/sendGated`,
+`startSessionAdmitting`, the outbox probe) as a retryable `rebuild-hold` and fails
+CLOSED. It recreates whenever desired≠actual, only when every session is idle, closes
+them resumably, and never passes forceOver unless the user pressed "Rebuild now". No
+edge detection (fingerprints, change sets, persisted pending): IV 01a12c66 broke that
+twice. Do not add a second recreate trigger or a per-path hold (BUG-214 class). `verify:feat-175`. A *lapsed* overlay (host re-cloned a
 guarded repo under a running container; found by the fixed access probe in
 lifecycle.ts) is `gitguard-lapsed:`, deferred like an image swap. Never start or
 `docker cp` a stopped container whose overlay source is gone (`missingGuardSources`):
@@ -501,7 +569,7 @@ leak and the public repo.
 - **Separate process, not a subagent.** An orchestrator's in-process subagents inherit
   that session's instructions, board snapshot and framing — contaminated by construction.
   Verification goes out through the project's dispatch CLI (Orchard:
-  `scripts/independent-verify.mjs`, which wraps `scripts/dispatch.mjs`).
+  `scripts/independent-verify.mjs --ticket <ID>`, which wraps `scripts/dispatch.mjs`).
 
 <!-- conventions-inject:end -->
 

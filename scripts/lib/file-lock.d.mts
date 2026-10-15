@@ -32,16 +32,22 @@ export interface MutationClass {
   tree?: boolean;
   /** A short label for the mutation (`write`, `edit`, `git checkout`, …). */
   kind?: string;
+  /**
+   * Round 4 — targets built from shell syntax that could not be resolved
+   * statically. `dir` is the static directory prefix (repo-relative or absolute);
+   * `null` means the root itself is unknown (checked against the whole tree).
+   */
+  scopes?: Array<{ dir: string | null; raw: string }>;
 }
 
 /** Classify a tool call into the path(s)/tree it mutates. Pure (no fs). */
 export declare function classifyMutation(call?: { toolName?: string; toolInput?: unknown }): MutationClass;
 
 /** Scan a Bash command string for whole-file / git-tree mutations and their targets. Pure. */
-export declare function scanBashMutation(command: string, depth?: number): MutationClass;
+export declare function scanBashMutation(command: string, depth?: number, ctx?: unknown): MutationClass;
 
 /** Normalise a raw target to its lock KEY (repo-relative when under the repo, else absolute). */
-export declare function lockKeyFor(rawPath: string, repoRoot?: string | null): string;
+export declare function lockKeyFor(rawPath: string, repoRoot?: string | null, aliases?: string[]): string;
 
 export interface LockHolder {
   owner: string;
@@ -60,6 +66,9 @@ export interface FileLockResult {
   reason?: string;
   kind?: string;
   tree?: boolean;
+  /** Round 4 — set when an unresolvable target's conservative scope check refused ('' = whole tree). */
+  scope?: string;
+  unresolved?: string;
   mode?: 'acquired' | 'refresh' | 'reclaimed';
 }
 
@@ -69,6 +78,13 @@ export declare function evaluateFileLock(input: {
   toolInput?: unknown;
   lockDir?: string | null;
   repoRoot?: string | null;
+  /**
+   * Round 4 — the repo path(s) as the CLI sees them when that differs from
+   * `repoRoot` (a container session's `/workspace/<id>`). Targets under an alias
+   * are mapped onto `repoRoot` before keying, so container and host sessions of
+   * one project share one key namespace.
+   */
+  pathAliases?: string[];
   owner?: string | null;
   ownerPid?: number;
   now?: number;
@@ -105,5 +121,5 @@ export declare function refreshOwnedLocks(input: {
 export declare function busyRefusal(
   kind: string | undefined,
   holder: LockHolder | null,
-  opts?: { tree?: boolean; exhausted?: boolean; error?: string | null },
+  opts?: { tree?: boolean; exhausted?: boolean; error?: string | null; scope?: string | null; unresolved?: string | null },
 ): string;

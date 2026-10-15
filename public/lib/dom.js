@@ -317,6 +317,25 @@ function tryTable(lines) {
   return el('div', { class: 'md-table-wrap' }, table);
 }
 
+/**
+ * The index of the first GFM pipe-table header WITHIN a block, or -1. A table is
+ * a line containing a `|` immediately followed by a valid separator row (every
+ * cell matches `cellAlign`) — the same strict separator test `tryTable` uses, so
+ * a lone `|` in prose (whose next line is not an all-separator row) never trips
+ * it. This lets a table that was NOT preceded by a blank line (so it shares a
+ * `\n{2,}`-split block with a lead-in line, e.g. a bold caption) still be found,
+ * instead of collapsing the whole block to a run-on paragraph (BUG-251).
+ */
+function findTableStart(lines) {
+  for (let i = 0; i + 1 < lines.length; i += 1) {
+    if (!lines[i].includes('|')) continue;
+    const sep = tableCells(lines[i + 1]);
+    if (!sep.length) continue;
+    if (sep.every((c) => cellAlign(c) !== undefined)) return i;
+  }
+  return -1;
+}
+
 const BULLET = /^\s*([-*+]|\d+\.)\s+/;
 
 /**
@@ -379,8 +398,23 @@ export function prose(text, cls = 'prose') {
         continue;
       }
 
-      const table = tryTable(lines);
-      if (table) { wrap.append(table); continue; }
+      // A GFM pipe table anywhere in the block, not only at lines[0] (BUG-251).
+      // Lead-in lines before it (a bold caption the model put on the line right
+      // above the header, with no blank line) render through the normal prose
+      // path; the table body ends at the first line without a `|`; and anything
+      // after it is re-run as prose, which re-enters here for a second table in
+      // the same block.
+      const tStart = findTableStart(lines);
+      if (tStart >= 0) {
+        if (tStart > 0) wrap.append(...prose(lines.slice(0, tStart).join('\n'), cls).childNodes);
+        let end = tStart + 2;
+        while (end < lines.length && lines[end].includes('|')) end += 1;
+        const table = tryTable(lines.slice(tStart, end));
+        if (table) wrap.append(table);
+        const rest = lines.slice(end).join('\n').trim();
+        if (rest) wrap.append(...prose(rest, cls).childNodes);
+        continue;
+      }
 
       if (BULLET.test(lines[0])) {
         /* Fold continuation lines into the item they belong to, so a wrapped

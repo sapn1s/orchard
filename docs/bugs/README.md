@@ -34,7 +34,8 @@ touches the issue MUST:
    ticket also touches, run that ticket's test too.
 5. **Do not verify your own fix into VERIFIED.** For anything above `trivial`/docs-only,
    the ticket needs a recorded HOLDS verdict from a clean-room verification DISPATCH
-   (`node scripts/independent-verify.mjs` → `dispatch <provider> run <id>`, never a Task
+   (`node scripts/independent-verify.mjs --ticket <ID>`, which verifies the ticket's files as they
+   are → `dispatch <provider> run <id>`, never a Task
    subagent, which shares the fixer's context) that ran a case your own fixture does not
    cover — you wrote the fixture, so it can only test what you already thought of
    (`docs/prompts/patterns/VERIFY.md`; `npm run board:check` warns if it is missing).
@@ -91,7 +92,48 @@ sets Owner `👤`, appends the log entry and regenerates INDEX in one step:
 
     node scripts/board-tool.mjs decide --id FEAT-123 --question "Which … ?" \
       --option "A=label | what changes | gains | costs | why it is not obviously best" \
-      --option "B=…" --recommend A --why "…"
+      --option "B=…" --recommend A --why "…" \
+      --decider live --consequence "restarting the service ends your three running sessions"
+
+**`--decider` and `--consequence` are required (BUG-259).** A card goes on the
+Needs-You rail only when the decision needs exactly one of the WA §A hard stops
+(`irreversible`, `outward`, `live`, `git`, `access`, `money`, `taste`, `direction`,
+`info`, `blocked`) and says the consequence in at least three words. The list and grammar are the ones the turn-end ask check uses
+(`deciderOf`/`hardStopDefect` in `scripts/lib/format-metrics.mjs`). The card shows it as "Why this
+is yours". Anything else is the agent's own call: decide it and continue, or record
+it with
+
+    node scripts/board-tool.mjs own --id FEAT-123 --basis recommendation --chose A \
+      --why "…" --author "worker (FEAT-123 fixing r1)" [--next "the work it implies"] \
+      [--ref sc:1|BUG-240] [--handoff "what stays the user's"]
+
+`own` moves the open decision to `decision_history` as `chosen_by: agent` with who,
+basis (`recommendation`, `judgement`, `criteria` + `--ref sc:N`, `settled` + `--ref`,
+`verify-owed`), why and a full snapshot. It writes no answer, flips the Owner cell
+off 👤, and refuses a card that declares a hard stop or that the user reopened.
+The user reopens it from the ticket view (a user-only route), which restores the
+decision as an open card. `update --owner`/`--human-action` refuses to move a
+ticket with an open decision off the rail: hiding a card is not deciding it.
+This is not FEAT-184's `adopt`, which takes a USER-owned decision under a
+delegation the user recorded.
+
+`own` refuses a card that declares a hard stop — that card was filed as the
+user's, so only the user clears it. But if a lane filed such a card in ERROR (the
+decision was actually the agent's own call, already made and built, and neither
+option matches what shipped), take it back with
+
+    node scripts/board-tool.mjs withdraw --id FEAT-123 \
+      --reason "why this was the agent's own call, not yours" \
+      --decided "what was actually decided and built" --author "orchestrator"
+
+`withdraw` records the agent's decision as a `withdrawn`-basis `owned` entry in
+`decision_history` (chosen_by `agent`, with the reason, what was decided, and a
+full snapshot of the withdrawn card), closes the card from the Decide rail, and —
+exactly like `own` — leaves the user a one-click Reopen on the ticket view that
+restores the card intact. It is allowed ONLY while the card has no user answer:
+a decision you answered or adopted, or one you reopened, is refused. It writes NO
+answer (`board:check` still rejects a hand-written `by:user`), and `board:status`
+then reads the ticket's real state, not "NEEDS A HUMAN DECISION".
 
 It refuses fewer than two options, duplicate keys, a recommendation that names no
 option, and an open (unanswered) decision unless you pass `--replace`. It never

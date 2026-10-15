@@ -101,6 +101,11 @@ function prepareEvaluate({
   now = Date.now(),
   sessionLabel = null,
   window = null,
+  // FEAT-190 r9 — the ONE resolved target repo { toplevel, commonDir } + the session's project key,
+  // recorded on the audit entry so the ledger names the repo the write actually reached (the same
+  // repo the permission decision, leak gate and reach log use). Additive; defaulted null.
+  targetRepo = null,
+  sourceProjectKey = null,
 } = {}) {
   let offender;
   if (Array.isArray(argv)) {
@@ -205,7 +210,7 @@ function prepareEvaluate({
           release(); // refused: a reserved use goes back
           // Refused at decide — this write never runs. Record it as blocked, not as a
           // permit a later reader could mistake for a landed commit (BUG-184).
-          const rec = recordGitWrite({ projectKey, offender, command, sessionLabel, grantScope: grant.scope, gatePassed: false, outcome: 'blocked-gate', decision, now });
+          const rec = recordGitWrite({ projectKey, offender, command, sessionLabel, grantScope: grant.scope, gatePassed: false, outcome: 'blocked-gate', decision, targetRepo, sourceProjectKey, now });
           return { allow: false, offender, gateFailed: true, reason: gitWriteGateFailedRefusal(offender, gate.detail), record: rec };
         }
         if (win) { data.gatedFp = fingerprintsAgree(preFp, postFp) ? postFp : null; }
@@ -231,7 +236,7 @@ function prepareEvaluate({
     // yet observed to have run", so the audit can never claim a commit HEAD lacks.
     const rec = recordGitWrite({
       projectKey, offender, command, sessionLabel, grantScope: grant.scope,
-      gatePassed: needsGate ? true : null, outcome: 'permitted', decision, now,
+      gatePassed: needsGate ? true : null, outcome: 'permitted', decision, targetRepo, sourceProjectKey, now,
     });
     if (win) {
       // Decided here; the store's call record lets the shim's invocations of THIS command
@@ -408,8 +413,8 @@ export async function redeemGitWriteAsync(opts = {}) {
 }
 
 /** The exact opts the shim's independent path hands to evaluate (unchanged from BUG-231). */
-function independentOpts({ argv, projectKey, env, now, runLeakGate, sessionLabel }) {
-  return { argv, projectKey, env, now, runLeakGate, sessionLabel };
+function independentOpts({ argv, projectKey, env, now, runLeakGate, sessionLabel, targetRepo = null, sourceProjectKey = null }) {
+  return { argv, projectKey, env, now, runLeakGate, sessionLabel, targetRepo, sourceProjectKey };
 }
 
 /**
@@ -425,6 +430,9 @@ function prepareRedeem({
   env = process.env,
   now = Date.now(),
   sessionLabel = null,
+  // FEAT-190 r9 — the ONE resolved target repo recorded on the audit entry (see prepareEvaluate).
+  targetRepo = null,
+  sourceProjectKey = null,
 } = {}) {
   if (!Array.isArray(argv) || !binding || !projectKey) return { independent: true };
   if (!gitWriteBlockEnabled(env)) return { done: { allow: true } };
@@ -461,7 +469,7 @@ function prepareRedeem({
 
   const finish = (gate, needsGate) => {
     if (needsGate && !gate.ok) {
-      const rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: false, outcome: 'blocked-gate', decision: w.decision, now });
+      const rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: false, outcome: 'blocked-gate', decision: w.decision, targetRepo, sourceProjectKey, now });
       return { allow: false, offender, gateFailed: true, reason: gitWriteGateFailedRefusal(offender, gate.detail), record: rec, decision: w.decision };
     }
     // BUG-249 — re-check the slot ATOMICALLY with the spend (finish has no await). Two
@@ -488,7 +496,7 @@ function prepareRedeem({
       w.hookRecord.used = true;
       rec = { id: w.hookRecord.id, confirmToken: w.hookRecord.confirmToken };
     } else {
-      rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: rawNeedsGate ? true : null, outcome: 'permitted', decision: w.decision, now });
+      rec = recordGitWrite({ projectKey, offender, command: null, sessionLabel, grantScope: w.view?.scope ?? null, gatePassed: rawNeedsGate ? true : null, outcome: 'permitted', decision: w.decision, targetRepo, sourceProjectKey, now });
     }
     return { allow: true, granted: true, offender, grant: w.view, record: rec, decision: w.decision, redeemed: true };
   };

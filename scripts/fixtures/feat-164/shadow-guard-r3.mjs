@@ -1,3 +1,5 @@
+/* PINNED FIXTURE (FEAT-164 r4 must-FAIL baseline): shadow-guard.mjs WITHOUT alias expansion (round 3),
+ * synthesized from its exact prior lines. */
 /**
  * shadow-guard.mjs — FEAT-170 shadow-repo pilot: the ONE place that decides whether a
  * git WRITE is inside an agent's own shadow repo (allowed) or anywhere else (today's
@@ -174,6 +176,158 @@ function initTarget(rest) {
     return a;
   }
   return null;
+}
+
+/* ─────────────── FEAT-164 r4: aliases, expanded by git's own config resolution ─────────────── */
+
+const builtinCache = new Map(); // realGit → Set | null
+/** git's builtin commands (`git --list-cmds=builtins`); builtins take precedence over aliases. */
+export function gitBuiltins(realGit) {
+  if (builtinCache.has(realGit)) return builtinCache.get(realGit);
+  let set = null;
+  try {
+    const r = spawnSync(realGit, ['--list-cmds=builtins'], { encoding: 'utf8', timeout: 10000 });
+    if ((r.status ?? 1) === 0) set = new Set(String(r.stdout).split('\n').map((s) => s.trim()).filter(Boolean));
+  } catch { set = null; }
+  if (set && set.size) builtinCache.set(realGit, set);
+  return set && set.size ? set : null;
+}
+
+/** git's split_cmdline: whitespace-separated words, '…' and "…" quoting, backslash escapes.
+ * Returns null on an unbalanced quote (git refuses such an alias too). */
+export function splitGitCmdline(s) {
+  const out = []; let cur = ''; let has = false; let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (q === "'") { if (ch === "'") q = null; else cur += ch; continue; }
+    if (ch === '\\') { if (i + 1 >= s.length) return null; cur += s[++i]; has = true; continue; }
+    if (q === '"') { if (ch === '"') q = null; else cur += ch; continue; }
+    if (ch === '"' || ch === "'") { q = ch; has = true; continue; }
+    if (/\s/.test(ch)) { if (has || cur) { out.push(cur); cur = ''; has = false; } continue; }
+    cur += ch; has = true;
+  }
+  if (q) return null;
+  if (has || cur) out.push(cur);
+  return out;
+}
+
+export const ALIAS_MAX_DEPTH = 10;
+
+/**
+ * Expand `parsed` ({ globals, sub, rest }) through git aliases, the way git does: a builtin is
+ * never an alias; otherwise `git <globals> config --get alias.<sub>` (so -c, --config-env,
+ * includes and every config scope apply). Returns { state, globals, sub, rest, chain, detail }:
+ *   none        not an alias (a builtin, or an external git-<cmd> / unknown command)
+ *   expanded    one or more aliases expanded; globals/sub/rest are the resulting command
+ *   shell       a `!…` shell alias — arbitrary commands, refused by the host
+ *   unresolved  config unreadable, unparsable value, a loop, or deeper than ALIAS_MAX_DEPTH
+ */
+export function expandGitAliases(parsed, env, { realGit, cwd }) {
+  let globals = parsed.globals; let sub = parsed.sub; let rest = parsed.rest;
+  const chain = [];
+  const builtins = gitBuiltins(realGit);
+  const done = (state, detail = null) => ({ state, globals, sub, rest, chain, detail });
+  for (let depth = 0; depth <= ALIAS_MAX_DEPTH; depth++) {
+    if (builtins && builtins.has(sub)) return done(chain.length ? 'expanded' : 'none');
+    let r;
+    try { r = spawnSync(realGit, [...globals.flat(), 'config', '--get', `alias.${sub}`], { encoding: 'utf8', env, cwd, timeout: 15000 }); }
+    catch (e) { return done('unresolved', `alias lookup for "${sub}" failed: ${e.message}`); }
+    if (r.status === 1 && !String(r.stderr || '').trim()) {
+      // Not an alias. Without the builtin list we cannot tell a builtin from an unknown name.
+      return builtins ? done(chain.length ? 'expanded' : 'none') : done('unresolved', 'git could not list its builtin commands');
+    }
+    if ((r.status ?? 1) !== 0) return done('unresolved', `git config --get alias.${sub} failed: ${String(r.stderr || '').trim().split('\n')[0]}`);
+    const value = String(r.stdout).replace(/\n$/, '');
+    chain.push(`${sub} = ${value}`);
+    if (value.trimStart().startsWith('!')) return done('shell', `alias "${sub}" is a shell command`);
+    const words = splitGitCmdline(value);
+    if (!words || !words.length) return done('unresolved', `alias "${sub}" cannot be parsed`);
+    const p2 = parseGlobals([...words, ...rest]);
+    if (!p2) return done('unresolved', `alias "${sub}" expands to options this guard cannot parse`);
+    if (chain.some((c) => c.startsWith(`${p2.sub} = `))) return done('unresolved', `alias loop at "${p2.sub}"`);
+    globals = [...globals, ...p2.globals]; sub = p2.sub; rest = p2.rest;
+  }
+  return done('unresolved', `aliases nest deeper than ${ALIAS_MAX_DEPTH}`);
+}
+
+/** Options of `git push` that take a SEPARATE value (so the value is not the repository). */
+const PUSH_VALUE_OPTS = new Set(['-o', '--push-option', '--receive-pack', '--exec', '--repo']);
+
+/**
+ * FEAT-164 — WHAT a git write is aimed at, resolved by the REAL git with the
+ * invocation's own global options and env (the same rule as the shadow decision: never
+ * from command text). Sent by the shim to the host, whose real-repo guard
+ * (agent-git-policy.mjs decideByTarget) picks the policy of the project that owns the target.
+ *   { cwd, commonDir|null, creating?, verb, push?: { urls } }
+ * Best-effort and bounded: anything unresolvable is left null and the host's rule
+ * decides what null means (fail closed inside a registered work tree / for a push).
+ */
+export function resolveWriteTarget(argv, env = process.env, { realGit, cwd = process.cwd() } = {}) {
+  const baseCwd = realOrNull(cwd) ?? cwd;
+  const t = { cwd: baseCwd, commonDir: null, verb: null };
+  const parsed = parseGlobals(argv);
+  if (!parsed || !realGit) {
+    if (argv.includes('push')) t.verb = 'push'; else if (argv.includes('send-pack')) t.verb = 'send-pack';
+    return t;
+  }
+  const { globals, sub, rest } = parsed;
+  t.verb = sub;
+  const c = cwdAfter(globals, baseCwd);
+  t.cwd = realOrNull(c) ?? c;
+  if (sub === 'init' || sub === 'clone') { t.creating = true; return t; }
+  const g = globals.flat();
+  const out = run(realGit, [...g, 'rev-parse', '--path-format=absolute', '--git-common-dir'], env, baseCwd);
+  const line = out ? out.split('\n').find(Boolean) : null;
+  if (line && path.isAbsolute(line)) t.commonDir = realOrNull(line);
+  if (sub === 'push' || sub === 'send-pack') {
+    let repo = null;
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === '--') { repo = rest[i + 1] ?? null; break; }
+      if (a.startsWith('--repo=')) { repo = a.slice(7); continue; }
+      if (a === '--repo') { repo = rest[i + 1] ?? null; i++; continue; }
+      if (a.startsWith('-')) { if (PUSH_VALUE_OPTS.has(a)) i++; continue; }
+      if (repo === null) repo = a;
+      break;
+    }
+    // FEAT-164 r3 (verify 01a12c67): the destination is resolved BY GIT, exactly as push resolves
+    // it — url.<base>.insteadOf / pushInsteadOf / includes / pushurl are git's to apply, never
+    // re-implemented here. Anything git cannot resolve for us leaves `urls` EMPTY, which the
+    // host refuses (fail closed).
+    //   - a configured remote NAME → `git remote get-url --push --all <name>` (applies insteadOf,
+    //     pushInsteadOf and pushurl exactly as push does; measured, git 2.39);
+    //   - a URL/path ARGUMENT → `git ls-remote --get-url <arg>` applies insteadOf; git offers no
+    //     read-only resolver that applies pushInsteadOf to a raw URL, so when ANY pushInsteadOf is
+    //     in effect (any scope, incl. -c and includes) such a push is unresolvable → refused;
+    //   - a remote defined where `get-url` cannot see it (e.g. only via -c remote.<n>.url) →
+    //     unresolvable → refused.
+    const cfgGrep = (re) => (run(realGit, [...g, 'config', '--get-regexp', re], env, baseCwd) || '').split('\n').filter(Boolean);
+    const getUrl = (name) => {
+      const o = run(realGit, [...g, 'remote', 'get-url', '--push', '--all', name], env, baseCwd);
+      return o ? o.split('\n').filter(Boolean) : null;
+    };
+    const absolutize = (u) => (path.isAbsolute(u) || /^[a-z][a-z0-9+.-]*:/i.test(u) || (/^[^/\\]+:/.test(u) && !/^[A-Za-z]:[\\/]/.test(u)) ? u : path.resolve(t.cwd, u));
+    let urls = [];
+    let name = repo;
+    if (!name) {
+      const br = (run(realGit, [...g, 'symbolic-ref', '--quiet', '--short', 'HEAD'], env, baseCwd) || '').trim();
+      const cfg = (k) => (run(realGit, [...g, 'config', '--get', k], env, baseCwd) || '').trim();
+      name = (br && cfg(`branch.${br}.pushRemote`)) || cfg('remote.pushDefault') || (br && cfg(`branch.${br}.remote`)) || 'origin';
+    }
+    const named = getUrl(name);
+    if (named) urls = named.map(absolutize);
+    else {
+      const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const remoteDefined = cfgGrep(`^remote\\.${esc}\\.(url|pushurl)$`).length > 0;
+      const pushRewrites = cfgGrep('^url\\..*\\.pushinsteadof$').length > 0;
+      if (!remoteDefined && !pushRewrites) {
+        const u = (run(realGit, [...g, 'ls-remote', '--get-url', name], env, baseCwd) || '').split('\n').find(Boolean);
+        if (u) urls = [absolutize(u)];
+      }
+    }
+    t.push = { urls };
+  }
+  return t;
 }
 
 /**

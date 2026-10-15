@@ -372,6 +372,8 @@ export const outboxEdit = (session, id, text) => api('/api/outbox/edit', { metho
 export const outboxDiscard = (session, id) => api('/api/outbox/discard', { method: 'POST', body: JSON.stringify({ session, id }) });
 export const outboxSend = (session, id, opts = {}) => api('/api/outbox/send', { method: 'POST', body: JSON.stringify({ session, id, ...opts }) });
 export const outboxDismissDamage = (session) => api('/api/outbox/dismiss-damage', { method: 'POST', body: JSON.stringify({ session }) });
+// BUG-253: a project's first messages that did not start a session (edit/discard/send take the row's `box` as the session).
+export const outboxStarts = (project) => api(`/api/outbox/starts?project=${encodeURIComponent(project)}`);
 
 /**
  * FEAT-132 — the session-configuration record (what was injected into this
@@ -400,13 +402,33 @@ export const patchSettings = (patch) =>
   api('/api/settings', { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
     .then((r) => r.settings);
 
-/** FEAT-145: Claude account registry. The implicit default is first. null = route absent. */
-export const getClaudeAccounts = () => optional('/api/claude-accounts').then((r) => r?.accounts ?? null);
+/** FEAT-145: Claude account registry. The implicit default is first. null = route absent.
+ *  BUG-254: `force` bypasses the server's short live-status probe cache. */
+export const getClaudeAccounts = (opts = {}) =>
+  optional(`/api/claude-accounts${opts.force ? '?force=1' : ''}`).then((r) => r?.accounts ?? null);
 export const createClaudeAccount = (label) =>
   api('/api/claude-accounts', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ label }) })
     .then((r) => r.account);
 export const deleteClaudeAccount = (id) =>
   api(`/api/claude-accounts/${encodeURIComponent(id)}`, { method: 'DELETE' });
+/**
+ * BUG-255 — switch the Claude account of a session that is NOT live on a socket
+ * (a re-opened resumable session, which on the client has no ws). The server
+ * rebinds a proven-stopped session durably and refuses visibly for anything still
+ * running. Returns { ok, account, rebound } or { ok:false, error, retryable }.
+ */
+/** BUG-255 r2 — the server's declared, versioned account fact for a session. */
+// BUG-255 r3 — `hint` ({projectId, dir}) says where this tab opened the session, so the server can
+// place it (and declare the account its resume launches under). A hint only places; it never sets.
+export const getSessionAccountFact = (sid, hint = {}) => {
+  const q = new URLSearchParams();
+  if (hint.projectId) q.set('projectId', hint.projectId);
+  if (hint.dir) q.set('dir', hint.dir);
+  const qs = q.toString();
+  return api(`/api/sessions/${encodeURIComponent(sid)}/account${qs ? `?${qs}` : ''}`);
+};
+export const rebindSessionAccount = (sid, body) =>
+  api(`/api/sessions/${encodeURIComponent(sid)}/account`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) });
 /**
  * FEAT-145 step 3 — the URL of the ONE WebSocket endpoint this app already
  * uses. The "Add account" login relay opens its own connection to it (the same
@@ -502,6 +524,21 @@ export const gitWriteGrant = (id) => optional(gwBase(id));
 export const grantGitWrite = (id, body) =>
   api(gwBase(id), { method: 'POST', body: JSON.stringify(body ?? {}) });
 export const revokeGitWrite = (id) => api(gwBase(id), { method: 'DELETE' });
+
+/* --- FEAT-164: the AGENT GIT POLICY (Settings → Agent git). The ONE writer of
+ * whether agent work may reach a project's real repo (commit), its remote (push),
+ * under what scope note (blank = soft releases), with the release cadence.
+ *   GET    → { policy, summary, timedGrant, release }   (null = route absent)
+ *   PUT    { commit, push, scope, release? } → { ok, policy, summary }  (throws on 400)
+ *   DELETE → clears commit/push, keeps the note + cadence → { ok, policy }
+ * `cutRelease` cuts a soft release under the grant (body MUST be {}). */
+const gwpBase = (id) => `/api/projects/${encodeURIComponent(id)}/git-write-policy`;
+export const gitWritePolicy = (id) => optional(gwpBase(id));
+export const putGitWritePolicy = (id, body) =>
+  api(gwpBase(id), { method: 'PUT', body: JSON.stringify(body ?? {}) });
+export const deleteGitWritePolicy = (id) => api(gwpBase(id), { method: 'DELETE' });
+export const cutRelease = (id) =>
+  api(`/api/projects/${encodeURIComponent(id)}/release`, { method: 'POST', body: '{}' });
 
 /* -------------------------------------------------------------- processes */
 /* What is running FROM this project's directory. null = route absent. */
@@ -625,6 +662,12 @@ export const ticketReopen = (id, ticketId, reason, rev) =>
     method: 'POST', body: JSON.stringify({ reason, rev }),
   });
 
+/** BUG-259 — reopen a decision an agent took itself (user-only route). */
+export const ticketReopenDecision = (id, ticketId, decision, rev, note = '') =>
+  api(`${proj(id)}/${encodeURIComponent(ticketId)}/reopen-decision`, {
+    method: 'POST', body: JSON.stringify({ decision, rev, note }),
+  });
+
 /** Flag / unflag 👤 needs-you (the curated INDEX Owner cell). */
 export const ticketOwner = (id, ticketId, needsYou) =>
   api(`${proj(id)}/${encodeURIComponent(ticketId)}/owner`, {
@@ -646,6 +689,16 @@ export const ticketAnswer = (id, ticketId, reply, rev) =>
   api(`${proj(id)}/${encodeURIComponent(ticketId)}/answer`, {
     method: 'POST', body: JSON.stringify({ ...reply, rev }),
   });
+
+/**
+ * FEAT-184 — record / revoke a STANDING DELEGATION (user-only routes: an agent
+ * caller is refused 403). `body` = { statement, tickets: [ids], days }. A delegation
+ * lets an agent adopt only each covered ticket's recommended option.
+ */
+export const recordDelegation = (id, body) =>
+  api(`/api/projects/${encodeURIComponent(id)}/delegations`, { method: 'POST', body: JSON.stringify(body) });
+export const revokeDelegation = (id, delegationId) =>
+  api(`/api/projects/${encodeURIComponent(id)}/delegations/${encodeURIComponent(delegationId)}/revoke`, { method: 'POST', body: '{}' });
 
 /* -------------------------------------------------------------- templates */
 
@@ -785,6 +838,10 @@ export async function liveBridges() {
     .map((x) => ({
       sdkSessionId: x?.sdkSessionId ?? null,
       stationSessionId: x?.stationSessionId ?? x?.id ?? null,
+      // BUG-252 — the owner's answer to "which project, which store dir" for a
+      // live session, read by the deep-link resolver (null on an older server).
+      projectId: typeof x?.projectId === 'string' ? x.projectId : null,
+      storeEncodedDir: typeof x?.storeEncodedDir === 'string' && x.storeEncodedDir ? x.storeEncodedDir : null,
       busy: x?.busy === true,
       // BUG-033: the honest start of the in-flight turn (epoch ms), or null on
       // an older server / when no turn is running. Never defaulted to "now".
@@ -947,6 +1004,9 @@ export const containerBuild = async (id) => {
     return { problem: err.message };
   }
 };
+// FEAT-175 — retry a pending/failed git-grant container rebuild now, or force it over the work that blocks it.
+export const grantRebuild = (id, force = false) =>
+  api(`/api/projects/${encodeURIComponent(id)}/container/grant-rebuild${force ? '?force=1' : ''}`, { method: 'POST', body: '{}' });
 export const containerAction = (id, action) =>
   containerCall(`/api/projects/${encodeURIComponent(id)}/container/${action}`, { method: 'POST', body: '{}' });
 

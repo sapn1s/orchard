@@ -39,6 +39,15 @@ export interface SearchHit {
   /** Offsets of the query inside `snippet`, for highlighting. */
   matchStart: number;
   matchEnd: number;
+  /**
+   * FEAT-189 — relevance of this match's immediate context, lower is better:
+   * 0 = the query is a number sitting in a ticket id (`FEAT-164`); 1 = a clean
+   * standalone match (a line number `:164`, or any non-numeric query); 2 = a
+   * number buried inside a longer number (`164` inside `164790`/`4164`) — the
+   * noise the user cannot act on. Orders hits WITHIN a kind so a bare ticket
+   * number finds the ticket, not every number that contains its digits.
+   */
+  score: number;
 }
 
 export interface SearchResult {
@@ -100,6 +109,133 @@ function snippetAround(text: string, at: number, qLen: number): { snippet: strin
   return { snippet: pre + mid + post, matchStart: pre.length, matchEnd: pre.length + mid.length };
 }
 
+/**
+ * FEAT-189 — score a ticket-number query by the characters AROUND the match, so
+ * `164` ranks a hit inside `FEAT-164` above a bare line number above `164790`.
+ * `q` is a fixed string already found at `at` in `text`. A non-numeric query is
+ * neutral (1): there is no number-embedding noise to demote.
+ */
+// The ticket-query grammar. This is a MIRROR of the client's canonical grammar
+// in public/lib/search-ranking.js (parseTicketQuery / TICKET_PREFIXES) — the two
+// surfaces MUST agree on what counts as a ticket query and a ticket ref, or one
+// scores `ticket=FEAT-164`/`feat164`/`page-164` as a ticket and the other does
+// not (independent-verify r8, r12). They cannot share a runtime module (browser
+// public/ vs node src/ with a strict tsconfig), so they are kept in lockstep the
+// way session-provenance mirrors dataDir: verify-feat-189.mjs FUZZES both over
+// many query forms and strings and FAILS on any divergence.
+const TICKET_PREFIXES = ['feat', 'bug', 'arch', 'deploy'];
+const PREFIX_ALT = TICKET_PREFIXES.join('|');
+// A known ticket prefix + '-' immediately before a bare-number match (`FEAT-164`).
+// NOT any `<word>-164` (`page-164`, `adv-164-x`), which the client also rejects.
+const TICKET_REF_BEFORE = new RegExp(`(?:^|[^a-z0-9])(?:${PREFIX_ALT})-$`, 'i');
+
+/** Parse a finder query into a ticket reference, else null. MIRROR of the client. */
+function parseTicketQuery(q: string): { num: string; prefix: string | null } | null {
+  const t = String(q ?? '').trim().toLowerCase();
+  let m = /^(\d{1,6})$/.exec(t);
+  if (m) return { num: m[1], prefix: null };
+  // ONLY the canonical dashed form — MIRROR of the client (r14): adorned/dashless
+  // variants are not ticket queries, so the two surfaces never diverge on them.
+  m = new RegExp(`^(${PREFIX_ALT})-(\\d{1,6})$`).exec(t);
+  if (m) return { num: m[2], prefix: m[1] };
+  return null;
+}
+
+/**
+ * Is this query a ticket number (`164`) or a prefixed ticket id (`FEAT-164`,
+ * `ticket=FEAT-164`, `feat164`)? These are the ONLY queries whose relevance score
+ * varies by WHERE in a message the match sits — so the only ones worth scanning
+ * past the first occurrence for (bestMatch). Every other query scores a constant 1.
+ */
+export function isTicketNumberQuery(q: string): boolean {
+  return parseTicketQuery(q) !== null;
+}
+
+export function matchRelevance(text: string, at: number, q: string): number {
+  const tq = parseTicketQuery(q);
+  if (!tq) return 1;
+  const ql = String(q ?? '').trim().toLowerCase();
+  const before = at > 0 ? text[at - 1] : '';
+  const after = text[at + ql.length] ?? '';
+  const isDigit = (c: string) => c >= '0' && c <= '9';
+  // Buried in a longer number — the token is not really this ticket's number.
+  if (isDigit(after) || (tq.prefix === null && isDigit(before))) return 2;
+  if (tq.prefix === null) {
+    // A bare number is a ticket id ONLY when a KNOWN prefix + '-' precedes it.
+    return TICKET_REF_BEFORE.test(text.slice(0, at)) ? 0 : 1;
+  }
+  // A prefixed query is a ticket ref ONLY when the matched text contains the
+  // DASHED token (`FEAT-164`, not `FEAT164`) on a word boundary. The boundary is
+  // checked before the TOKEN itself, not before any `ticket=`/`#` adornment the
+  // user typed — matching the client, whose ticket regex anchors on the token
+  // (independent-verify r13). `aticket=FEAT-164` is still a ref (token sits after
+  // `=`); `xfeat-164` is not (token glued to a letter).
+  const token = `${tq.prefix}-${tq.num}`; // always dashed
+  const idx = ql.lastIndexOf(token);
+  if (idx === -1) return 1; // dashless query form (`feat164`): no dashed token matched
+  const tokenAt = at + idx;
+  const beforeToken = tokenAt > 0 ? text[tokenAt - 1] : '';
+  return beforeToken === '' || !/[a-z0-9]/i.test(beforeToken) ? 0 : 1;
+}
+
+/**
+ * The BEST (lowest-scoring) occurrence of `ql` in `text`, or null if absent.
+ * FEAT-189 r2 — a message can hold the query more than once (`164790 … then
+ * ticket=FEAT-164`): scoring only the FIRST hit demoted whole-ticket messages
+ * behind an earlier embedded-number match (independent-verify BROKEN, 17/315
+ * real ticket messages). Scan occurrences and keep the best; stop at score 0,
+ * which nothing can beat. The chosen position is what the snippet is cut around,
+ * so the highlight lands on the match that earned the rank.
+ */
+/**
+ * Map an offset in `text.toLowerCase()` back to the corresponding offset in the
+ * ORIGINAL `text`. Needed because a length-changing lowercase (İ → two units,
+ * ß → ss) makes the two strings misalign, so a lowercased offset fed straight
+ * into the original text highlights the wrong characters (independent-verify r7).
+ * Walks by code point, accumulating each point's lowercased length.
+ */
+function lowerOffsetToOrig(text: string, lowerAt: number): number {
+  let li = 0;
+  for (let oi = 0; oi < text.length; ) {
+    if (li >= lowerAt) return oi;
+    const cp = text.codePointAt(oi) as number;
+    const ch = String.fromCodePoint(cp);
+    li += ch.toLowerCase().length;
+    oi += ch.length;
+  }
+  return text.length;
+}
+
+function bestMatch(text: string, ql: string, q: string): { at: number; score: number } | null {
+  const lower = text.toLowerCase();
+  let at = lower.indexOf(ql);
+  if (at === -1) return null;
+  // Score against the LOWERCASED text at the lowercased-match offset. A
+  // length-changing lowercase (Turkish İ → two code units, ß → ss) would shift
+  // the offset so reading the ORIGINAL text at it lands on the wrong neighbour
+  // and mis-scores (independent-verify r6). matchRelevance's adjacency checks are
+  // case-insensitive, and a ticket-number query is ASCII (ql.length === q.length),
+  // so scoring on `lower`/`ql` is both safe and exact.
+  let bestAt = at;
+  let bestScore = matchRelevance(lower, at, ql);
+  // The returned offset must index the ORIGINAL text (for snippet/highlight), so
+  // map it back when a length-changing lowercase made the two misalign; the 1:1
+  // common case costs nothing.
+  const origOf = (lowerAt: number) => lower.length === text.length ? lowerAt : lowerOffsetToOrig(text, lowerAt);
+  // Only a ticket-number query scores differently across occurrences; for any
+  // other query matchRelevance is a constant 1, so the first hit is already the
+  // best and scanning the rest is pure cost (a 1.9x regression on common prose
+  // queries — independent-verify r3). Short-circuit it.
+  if (!isTicketNumberQuery(q)) return { at: origOf(bestAt), score: bestScore };
+  while (bestScore > 0) {
+    at = lower.indexOf(ql, at + 1);
+    if (at === -1) break;
+    const sc = matchRelevance(lower, at, ql);
+    if (sc < bestScore) { bestScore = sc; bestAt = at; }
+  }
+  return { at: origOf(bestAt), score: bestScore };
+}
+
 /** Judge one rg-matched line. Returns null for noise. */
 export function judgeLine(lineText: string, q: string): Omit<SearchHit, 'encodedDir' | 'sessionId' | 'line'> | null {
   let e: Record<string, any>;
@@ -110,12 +246,12 @@ export function judgeLine(lineText: string, q: string): Omit<SearchHit, 'encoded
   const ql = q.toLowerCase();
 
   const prose = proseOf(e);
-  let at = prose.toLowerCase().indexOf(ql);
-  if (at !== -1) return { role, timestamp, kind: 'prose', ...snippetAround(prose, at, q.length) };
+  const pm = bestMatch(prose, ql, q);
+  if (pm) return { role, timestamp, kind: 'prose', score: pm.score, ...snippetAround(prose, pm.at, q.length) };
 
   const tool = toolTextOf(e);
-  at = tool.toLowerCase().indexOf(ql);
-  if (at !== -1) return { role, timestamp, kind: 'tool', ...snippetAround(tool, at, q.length) };
+  const tm = bestMatch(tool, ql, q);
+  if (tm) return { role, timestamp, kind: 'tool', score: tm.score, ...snippetAround(tool, tm.at, q.length) };
 
   return null; // matched only uuids/paths/scaffolding — not something a user said or saw
 }
@@ -166,6 +302,12 @@ export async function searchStore(q: string, targets: Array<string | SearchTarge
     let raw = 0;
     let truncated = false;
     let settled = false;
+    // FEAT-189 r5 — only a ticket-number query scores differently across matches,
+    // so only IT needs every match judged before the cap (to rank them). For any
+    // other query every score is a constant 1, so stopping collection at maxHits —
+    // the behaviour that predates this ticket — is both correct and fast; expanding
+    // it regressed the common neutral query "the" 3.1x on the real store (r4→r5).
+    const rankAcrossAll = isTicketNumberQuery(q);
     const abandon = () => {
       if (settled) return;
       rg.kill('SIGTERM');
@@ -175,8 +317,18 @@ export async function searchStore(q: string, targets: Array<string | SearchTarge
       if (settled) return;
       settled = true;
       opts.signal?.removeEventListener('abort', abandon);
-      // Prose above tool output, then newest first — the ranking the TODO settled on.
-      hits.sort((a, b) => (a.kind === b.kind ? String(b.timestamp ?? '').localeCompare(String(a.timestamp ?? '')) : (a.kind === 'prose' ? -1 : 1)));
+      // Prose above tool output; WITHIN a kind, ticket-id matches above clean
+      // matches above numbers-inside-numbers (FEAT-189); then newest first.
+      hits.sort((a, b) =>
+        (a.kind === b.kind ? 0 : (a.kind === 'prose' ? -1 : 1))
+        || (a.score - b.score)
+        || String(b.timestamp ?? '').localeCompare(String(a.timestamp ?? '')));
+      // FEAT-189 — the maxHits cut happens AFTER ranking the whole collected set,
+      // never during collection: capping collection at maxHits would rank only the
+      // first-scanned matches and could drop the best-scoring (ticket-id) hit before
+      // it was ever judged (independent-verify r4). Returning fewer than we judged is
+      // itself a truncation the UI should flag.
+      if (hits.length > maxHits) truncated = true;
       resolve({ hits: hits.slice(0, maxHits), tookMs: Date.now() - t0, truncated, filesScanned: files.size });
     };
     if (opts.signal?.aborted) return abandon();
@@ -189,7 +341,11 @@ export async function searchStore(q: string, targets: Array<string | SearchTarge
       try { ev = JSON.parse(l); } catch { return; }
       if (ev.type !== 'match') return;
       raw++;
-      if (raw > MAX_RAW_MATCHES || hits.length >= maxHits) {
+      // For a ticket-number query, stop only on the RAW-match budget so the sort
+      // in done() ranks the whole set before the maxHits cut (a cap DURING
+      // collection would rank only a scan-order prefix and miss the best hit — r4).
+      // For any other query, keep the original early-stop at maxHits (r5 perf).
+      if (raw > MAX_RAW_MATCHES || (!rankAcrossAll && hits.length >= maxHits)) {
         truncated = true;
         rg.kill('SIGTERM');
         return done();

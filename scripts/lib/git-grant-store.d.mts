@@ -16,6 +16,8 @@ export interface GitWriteGrantView {
   grantedAt: string | null;
   grantedVia: string;
   note: string;
+  /** FEAT-164 grant binding — the repo identity a TIMED grant was given for (null: unbound → inert at the guard). */
+  repo?: { toplevel: string; commonDir: string | null; remotes?: Array<{ toplevel: string; commonDir: string | null }>; networkKeys?: string[] } | null;
   /** null for a permanent grant — it does not expire. */
   expiresAt: string | null;
   expiresInMs: number | null;
@@ -44,6 +46,10 @@ export interface GitWriteRecord {
   /** BUG-231 — the one grant decision this write was authorised under (shared by every record of one Bash call). */
   decision: string | null;
   gatePassed: boolean | null;
+  /** FEAT-190 — the resolved TARGET repo this write reached (cross-repo), or null. */
+  targetRepo: { toplevel: string | null; commonDir: string | null; label: string | null } | null;
+  /** FEAT-190 — the SOURCE project whose grant covered a cross-repo write, or null. */
+  sourceProjectKey: string | null;
   /** What actually happened, owned by the executor (BUG-184). */
   outcome: GitWriteOutcome;
   /** The git exit status the executor observed, or null until confirmed. */
@@ -73,7 +79,7 @@ export declare const DEFAULT_GRANT_MS: number;
 
 export declare function grantGitWrite(
   projectKey: string,
-  opts?: { scope?: 'once' | 'duration'; ttlMs?: number; grantedVia?: string; note?: string; now?: number },
+  opts?: { scope?: 'once' | 'duration'; ttlMs?: number; grantedVia?: string; note?: string; repo?: { toplevel: string; commonDir: string | null; remotes?: Array<{ toplevel: string; commonDir: string | null }>; networkKeys?: string[] } | null; now?: number },
 ): GitWriteGrantView;
 
 export declare function revokeGitWrite(projectKey: string): boolean;
@@ -117,8 +123,25 @@ export declare function claimSettled(claim: GitWriteClaim): boolean;
 export declare function recordGitWrite(rec: {
   projectKey?: string | null; offender?: string | null; command?: string | null;
   sessionLabel?: string | null; grantScope?: string | null; gatePassed?: boolean | null;
-  outcome?: GitWriteOutcome; decision?: string | null; now?: number;
+  outcome?: GitWriteOutcome; decision?: string | null;
+  targetRepo?: { toplevel?: string | null; commonDir?: string | null; label?: string | null } | null;
+  sourceProjectKey?: string | null; now?: number;
 }): RecordedGitWrite;
+
+/** FEAT-190 r8 — a cross-repo reach entry (git-page display / opt-out list; NO decision role). */
+export interface CrossRepoReachEntry {
+  sourceProjectKey: string;
+  targetCommonDir: string;
+  targetToplevel: string | null;
+  networkKeys: string[];
+  localCommonDirs: string[];
+  at: string;
+}
+export declare function setCrossRepoReachSink(fn: ((e: CrossRepoReachEntry) => void) | null): void;
+export declare function loadCrossRepoReach(rec: (Partial<CrossRepoReachEntry> & { grantedAt?: string | null }) | null | undefined): void;
+export declare function recordCrossRepoReach(sourceProjectKey: string, opts: { targetCommonDir: string; targetToplevel?: string | null; resolved?: { network?: string[]; local?: Array<{ commonDir?: string | null }> } | null }, now?: number): CrossRepoReachEntry | null;
+export declare function crossRepoReachOf(sourceProjectKey: string, targetCommonDir: string): CrossRepoReachEntry | null;
+export declare function crossRepoReachFor(sourceProjectKey: string): CrossRepoReachEntry[];
 /** BUG-184 — the executor reports the observed git exit; moves a 'permitted' record
  * to 'executed' (status 0) / 'failed'. Round 3: requires the single-use capability
  * `token` + owner `projectKey`; a wrong/absent capability, foreign owner, unknown
@@ -129,6 +152,8 @@ export declare function confirmGitWrite(
 ): GitWriteConfirmResult;
 export declare function listGitWrites(projectKey?: string | null, limit?: number): GitWriteRecord[];
 export declare function grantView(projectKey: string, now?: number): GitWriteGrantView | null;
+/** FEAT-164 — display read of the live timed/once grant alone, or null. */
+export declare function timedGrantView(projectKey: string, now?: number): GitWriteGrantView | null;
 export declare function setGitWriteAuditSink(fn: ((rec: GitWriteRecord) => void) | null): void;
 export declare function _resetGitGrantsForTest(): void;
 /** FEAT-164 — register the reader of the declared permanent grant (the registry). */

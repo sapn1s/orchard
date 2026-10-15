@@ -831,18 +831,56 @@ async function main() {
       // spec deployed is still running the old prompt; its asks would be blocked
       // once — bounded by the one-correction cap upstream — until it relaunches.)
       // See FEAT-137's Activity log (round 2).
+      // BUG-256 — the decider is a CLOSED list of hard stops plus its consequence.
+      // FEAT-137 accepted any decider text, and `priority`/`spend`/`risk`/`none`
+      // carried agent-owned asks through (measured: docs/research/unnecessary-asks-2026-10-14.md).
+      // r3: the decider value must EQUAL one code exactly; the consequence is its own line.
+      const STOPS = fm.HARD_STOPS.join(', ');
       for (const d of fm.askOwnershipDefects(parsed)) {
         if (d.defect === 'high-confidence-no-decider') {
           askReasons.push(
-            'An orchard-ask declares HIGH confidence but names no user-held decider '
-            + '(taste/priority/spend/risk/direction). If you are confident and cannot name what '
-            + 'makes this the user\'s call, it is YOUR decision — make it and move on, do not ask.',
+            'An orchard-ask declares HIGH confidence but names no `decider:`. If you are confident and '
+            + `none of the hard stops applies (${STOPS}), it is YOUR decision — make it, say what you `
+            + 'picked, and continue the work; do not ask.',
           );
         } else if (d.defect === 'missing-decider') {
           askReasons.push(
-            'An orchard-ask declares a `confidence:` level but names no `decider:` — the user-held '
-            + 'thing (taste/priority/spend/risk/direction) that makes this the user\'s call. Name it, '
-            + 'or decide it yourself.',
+            'An orchard-ask declares a `confidence:` level but names no `decider:`. Name the hard stop '
+            + `that makes this the user's call (exactly one of: ${STOPS}) and a \`consequence:\` line, or decide it yourself and continue.`,
+          );
+        } else if (d.defect === 'decider-not-hard-stop') {
+          askReasons.push(
+            `An orchard-ask names \`decider: ${String(d.decider ?? '').slice(0, 60)}\`, which is not a hard stop. `
+            + `The decider line must be EXACTLY one of these codes and nothing else: ${STOPS} (e.g. \`decider: live\`), `
+            + 'with the concrete consequence on its own `consequence:` line. Priority, agent effort or '
+            + 'spend, a generic risk, "another round?", and whether to fix or file a problem inside the work '
+            + 'already asked for are YOUR call: decide it, say what you picked, and continue the work.',
+          );
+        } else if (d.defect === 'decider-no-consequence') {
+          askReasons.push(
+            `An orchard-ask names a hard stop (\`decider: ${String(d.decider ?? '').slice(0, 40)}\`) but not its `
+            + 'consequence. Add it on its own line, e.g. `consequence: restarting ends every running '
+            + 'session, including this one`. If you cannot state one, it is your call: decide and continue.',
+          );
+        } else if (d.defect === 'ask-agent-owned') {
+          // Ask subject × decider: what the ask is ABOUT, not its prose. An
+          // agent-owned subject passes only under an action stop (irreversible,
+          // outward, money, live, git, access) — measured: session 20ed61fc idled ~420 min on
+          // "I recommend one more round", declared `decider: spend`.
+          askReasons.push(
+            `An orchard-ask is \`about: ${d.about}\` — ${fm.AGENT_OWNED_SUBJECTS.join(', ')} are YOUR call, not the user's. `
+            + 'Do not ask: make the decision (apply your own recommendation, run the next round, pick the approach), '
+            + 'state it in an `orchard-judgment`, and continue the work. The only exception is a recommendation that is itself '
+            + `an act you may not take alone (\`decider:\` one of ${fm.OWNED_SUBJECT_EXEMPT_STOPS.join(', ')}, with its \`consequence:\`). `
+            + 'A real fork in what the user gets, or a policy they live under, is `about: goal`, not implementation.',
+          );
+        } else if (d.defect === 'ask-missing-about' || d.defect === 'ask-about-unknown') {
+          askReasons.push(
+            (d.defect === 'ask-missing-about'
+              ? 'An orchard-ask has no `about:` line. '
+              : `An orchard-ask names \`about: ${String(d.about ?? '').slice(0, 40)}\`, which is not a subject code. `)
+            + `Declare what the ask is about, EXACTLY one of: ${fm.ASK_SUBJECTS.join(', ')}. `
+            + `${fm.AGENT_OWNED_SUBJECTS.join(', ')} are your own call — if that is what this is, decide it and continue instead.`,
           );
         } else if (d.defect === 'missing-confidence') {
           // FEAT-137 round 2 — PROMOTED to a block. The confidence/decider spec is
@@ -852,8 +890,8 @@ async function main() {
           // it is a non-compliant ask, and it is corrected in one re-send.
           askReasons.push(
             'An orchard-ask declares no `confidence:` line. Every ask must state your confidence in '
-            + 'the recommendation (`confidence:` high/med/low) and a `decider:` — the user-held thing '
-            + '(taste/priority/spend/risk/direction) that makes it the user\'s call. Add both, or decide it yourself. '
+            + 'the recommendation (`confidence:` high/med/low) and a `decider:` — the hard stop that makes it '
+            + `the user's call (exactly one of: ${STOPS}) with a \`consequence:\` line. Add both, or decide it yourself and continue. `
             + 'Optionally add `evidence:` — what the recommendation rests on (N and source) and whether it was independently refuted (WA §A).',
           );
         }

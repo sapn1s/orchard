@@ -67,6 +67,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { dataDir } from '../lib/paths.ts';
 import { isWriter, holdsLock, onWriterLost, writerDataDir } from './lanes.ts';
+import { attachmentManifest, type AttachmentRef } from './attachments.ts';
 
 export type OutboxState = 'queued' | 'sending' | 'delivered' | 'uncertain' | 'failed' | 'discarded';
 
@@ -84,6 +85,14 @@ export interface OutboxRow {
   /** Delivery order — assigned by the server when the row is made. */
   seq: number;
   text: string;
+  /**
+   * FEAT-177 — durable attachment REFERENCES (not bytes). The blob store holds
+   * the bytes, content-addressed; the ledger carries only references, so a
+   * message queued behind a busy session is redelivered with its attachments
+   * intact. Optional + absent-defaults-to-none, so every legacy text-only row
+   * loads and delivers byte-for-byte unchanged.
+   */
+  attachments?: AttachmentRef[];
   /** `queued`: typed while Claude was working. `direct`: a typed send the session could not take at once. */
   origin: 'queued' | 'direct';
   state: OutboxState;
@@ -107,6 +116,14 @@ export interface OutboxRow {
   payload: string;
   /** A second record of the row with this id's nonce (a write that failed part-way): kept, never delivered. */
   duplicateOf?: string;
+  /** BUG-253: a START row (a new session's first message) — the sdk session id of the session it started. */
+  startedAs?: string;
+  /** BUG-253: a start row the user sent again (Send again / Send anyway) — its new attempt is shown while it runs. */
+  retried?: boolean;
+  /** BUG-253: which attempt of a start row is current (1 at mint, +1 per Send again) — an older attempt's outcome never lands on it. */
+  attempt?: number;
+  /** BUG-253: a session an OLDER attempt started after the row had moved on (recorded, never a state change). */
+  alsoStartedAs?: string[];
 }
 
 export interface OutboxHold { kind: string; text: string; drain?: unknown }
@@ -115,7 +132,7 @@ export interface ProbeWait { kind: 'wait'; hold: OutboxHold; retryMs?: number }
 export interface ProbeGo { kind: 'go'; route: string; ctx?: unknown }
 export type Probe = ProbeWait | ProbeGo;
 export type HandOutcome =
-  | { kind: 'delivered'; via: string }
+  | { kind: 'delivered'; via: string; startedAs?: string }
   | { kind: 'refused'; hold: OutboxHold; retryMs?: number }
   | { kind: 'uncertain'; reason: string }
   | { kind: 'failed'; reason: string };
@@ -125,15 +142,15 @@ export interface OutboxWiring {
   probe(sessionId: string, resume: ResumeSettings, opts: { overrideExternal: boolean; forced: boolean }): Probe;
   /** Take / release the session's delivery reservation (shared with the socket paths). */
   reserve(sessionId: string): () => void;
-  /** Hand the prompt over. Must not throw synchronously before it has either handed over or refused. */
-  handOver(sessionId: string, go: ProbeGo, prompt: string, resume: ResumeSettings): Promise<HandOutcome>;
+  /** Hand the prompt over. Must not throw synchronously before it has either handed over or refused. FEAT-177: `attachments` ride with it. */
+  handOver(sessionId: string, go: ProbeGo, prompt: string, resume: ResumeSettings, attachments?: AttachmentRef[]): Promise<HandOutcome>;
   /** The receiver's record: does the session transcript contain `needle` after `from` bytes? null = unreadable. */
   transcriptHas(sessionId: string, resume: ResumeSettings, needle: string, from: number): boolean | null;
   transcriptSize(sessionId: string, resume: ResumeSettings): number | null;
   /** Interrupt a busy bridge (FEAT-031); resolves once the interrupt has been sent. */
   interrupt(sessionId: string): Promise<void> | null;
   /** Something changed that a driving tab should see at once (the outbox-turn event etc.). */
-  announce(sessionId: string, e: { t: 'outbox-turn'; sessionId: string; text: string; ids: string[] }): void;
+  announce(sessionId: string, e: { t: 'outbox-turn'; sessionId: string; text: string; ids: string[]; attachments?: AttachmentRef[] }): void;
 }
 
 interface Box {
@@ -154,6 +171,8 @@ interface Box {
   /** Consecutive refusals of a resume, for backoff. */
   refusals: number;
   interrupting: Promise<void> | null;
+  /** BUG-253: a finished start box whose journal was removed — dropped from memory once its `recent` window passes. */
+  gcAt: number | null;
 }
 
 const SID_RE = /^[A-Za-z0-9._-]{1,128}$/;
@@ -218,13 +237,15 @@ function fsyncDir(dir: string): void {
 /* ------------------------------------------------------------------ loading */
 
 function blankBox(sid: string): Box {
-  return { sid, rows: new Map(), byNonce: new Map(), seq: 0, lsn: 0, lines: 0, damaged: null, damagePending: false, unsaved: new Map(), hold: null, nextTryAt: 0, reserved: false, refusals: 0, interrupting: null };
+  return { sid, rows: new Map(), byNonce: new Map(), seq: 0, lsn: 0, lines: 0, damaged: null, damagePending: false, unsaved: new Map(), hold: null, nextTryAt: 0, reserved: false, refusals: 0, interrupting: null, gcAt: null };
 }
 
 function isRow(v: unknown): v is OutboxRow {
   const r = v as OutboxRow;
   return !!r && typeof r.id === 'string' && typeof r.nonce === 'string' && typeof r.text === 'string'
-    && typeof r.seq === 'number' && typeof r.state === 'string' && !!r.resume && typeof r.resume.projectId === 'string';
+    && typeof r.seq === 'number' && typeof r.state === 'string' && !!r.resume && typeof r.resume.projectId === 'string'
+    // FEAT-177: a persisted attachments field, when present, must be an array (a malformed one fails loudly via damage mode, never a silent drop).
+    && (r.attachments === undefined || Array.isArray(r.attachments));
 }
 
 function load(sid: string): Box {
@@ -365,7 +386,7 @@ function load(sid: string): Box {
   }
   for (const r of box.rows.values()) {
     if (r.state === 'sending') {
-      const f: OutboxRow = { ...r, state: 'uncertain', updatedAt: now, reason: 'Orchard stopped while sending this, so it may or may not have arrived — check the conversation, then Send anyway or Discard' };
+      const f: OutboxRow = { ...r, state: 'uncertain', updatedAt: now, reason: isStartBox(sid) ? START_RESTART_REASON : 'Orchard stopped while sending this, so it may or may not have arrived — check the conversation, then Send anyway or Discard' };
       box.rows.set(f.id, f);
       fixes.push(f);
     }
@@ -392,7 +413,7 @@ function load(sid: string): Box {
 
 /** Recovery for rows a crash may have left mid-flight: the transcript is the receiver's record. */
 function recover(box: Box): void {
-  if (!wiring) return;
+  if (!wiring || isStartBox(box.sid)) return; // BUG-253: a start box has no transcript of its own
   const now = Date.now();
   const out: OutboxRow[] = [];
   for (const r of box.rows.values()) {
@@ -628,6 +649,8 @@ export function outboxRow(sid: string, id: string): OutboxRow | null {
 export interface CreateRequest {
   nonce: string;
   text: string;
+  /** FEAT-177 — resolved attachment references (server-validated before enqueue). */
+  attachments?: AttachmentRef[];
   origin?: 'queued' | 'direct';
   /** A client may only make a row MORE cautious: `uncertain` or `failed` rows are never sent by themselves. */
   initial?: 'queued' | 'uncertain' | 'failed';
@@ -642,13 +665,21 @@ export interface CreateRequest {
 }
 
 function payloadOf(req: CreateRequest): string {
-  return crypto.createHash('sha256').update(JSON.stringify([req.text, req.origin ?? 'queued', req.initial ?? 'queued', req.reason ?? null])).digest('hex').slice(0, 24);
+  // FEAT-177 (review #4): the attachment manifest is part of the request identity,
+  // so a replayed nonce with the same text but a DIFFERENT image is detected as a
+  // different request (409) rather than returning the original row.
+  return crypto.createHash('sha256').update(JSON.stringify([req.text, req.origin ?? 'queued', req.initial ?? 'queued', req.reason ?? null, attachmentManifest(req.attachments)])).digest('hex').slice(0, 24);
 }
 
 export function createOutboxRow(sid: string, req: CreateRequest): { row: OutboxRow; created: boolean; view: OutboxView } {
   if (!validSessionId(sid)) throw new OutboxError('bad session id', 400);
+  // BUG-253: a start box is minted only by the start route (mintStartRow), never by a client.
+  if (isStartBox(sid)) throw new OutboxError('a new session’s first message is recorded by the start itself', 400);
   if (typeof req.nonce !== 'string' || !NONCE_RE.test(req.nonce)) throw new OutboxError('a nonce (8–128 chars of [A-Za-z0-9._:-]) is required', 400);
-  if (typeof req.text !== 'string' || !req.text.trim()) throw new OutboxError('text is required', 400);
+  // FEAT-177 (review #9): a message is valid with nonblank text OR at least one attachment.
+  const hasAttachments = Array.isArray(req.attachments) && req.attachments.length > 0;
+  if (typeof req.text !== 'string') throw new OutboxError('text is required', 400);
+  if (!req.text.trim() && !hasAttachments) throw new OutboxError('text is required', 400);
   if (req.text.length > MAX_TEXT) throw new OutboxError(`text is longer than ${MAX_TEXT} characters`, 413);
   const box = boxOf(sid);
   const payload = payloadOf(req);
@@ -679,6 +710,7 @@ export function createOutboxRow(sid: string, req: CreateRequest): { row: OutboxR
     nonce: req.nonce,
     seq: box.seq + 1,
     text: req.text,
+    ...(hasAttachments ? { attachments: req.attachments } : {}),
     origin: req.origin === 'direct' ? 'direct' : 'queued',
     state,
     reason,
@@ -728,6 +760,7 @@ export function discardOutboxRow(sid: string, id: string): OutboxView {
   const row = mutable(box, id, 'discard', ['queued', 'uncertain', 'failed']);
   append(box, [{ ...row, state: 'discarded', updatedAt: Date.now() }]);
   crashPoint('discarded');
+  gcStartBox(box); // BUG-253: a discarded first message leaves nothing to keep
   kick(sid);
   return view(box);
 }
@@ -744,6 +777,18 @@ export function discardOutboxRow(sid: string, id: string): OutboxView {
 export function sendOutboxRow(sid: string, id: string, { interrupt = false, now = false }: { interrupt?: boolean; now?: boolean } = {}): OutboxView {
   const box = boxOf(sid);
   const row = box.rows.get(id);
+  if (isStartBox(sid)) {
+    // BUG-253: Send again / Send anyway on a first message re-queues it ONCE; the pump starts a new session with it.
+    // There is no running turn to interrupt and nothing to push past.
+    if (row && row.state === 'queued') throw new OutboxError('this message is already waiting to start a new session', 409, { row: { id: row.id, state: row.state } });
+    const r = mutable(box, id, 'send', ['uncertain', 'failed']);
+    append(box, [{ ...r, state: 'queued', reason: null, forced: false, overrideExternal: true, retried: true, attempt: (r.attempt ?? 1) + 1, updatedAt: Date.now() }]);
+    crashPoint('requeued');
+    box.nextTryAt = 0;
+    holdNow(box);
+    kick(sid);
+    return view(box);
+  }
   if (row && row.state === 'queued') {
     if (!interrupt && !now) throw new OutboxError('this message is already waiting to be sent', 409, { row: { id: row.id, state: row.state } });
     // A second Interrupt & send for a row already forced asks nothing more: a late second
@@ -773,7 +818,201 @@ export function sendOutboxRow(sid: string, id: string, { interrupt = false, now 
 export function dismissOutboxDamage(sid: string): OutboxView {
   const box = boxOf(sid);
   if (box.damaged) append(box, [], { damaged: null });
+  gcStartBox(box);
   return view(box);
+}
+
+/* ------------------------------------------------------- BUG-253: start boxes */
+
+/*
+ * A NEW session's first message has no session id to be filed under until the
+ * engine names one at `system:init` — and before BUG-253 it lived only in
+ * memory until then, so an admission failure, a closed tab, a restart or a CLI
+ * that died first lost it without a trace. Each new-session start now gets its
+ * own box, `start.<hex>`, holding exactly ONE row, minted `sending` and fsync'd
+ * BEFORE anything is spawned (`mintStartRow`). It ends one of two ways:
+ *
+ *   - the session it started reaches `system:init` → `delivered` with
+ *     `startedAs` = that session's id (`settleStartRow`); the box's journal is
+ *     then removed — a finished start has nothing left to protect;
+ *   - anything else → `failed` (it was never handed to a CLI) or `uncertain`
+ *     (it was, and no init proved the session started), shown in the project's
+ *     dock (`startsView`) with Send again / Send anyway / Edit / Discard. A
+ *     restart reloads a `sending` row as `uncertain` like any other.
+ *
+ * Send again re-queues it ONCE (the existing rule); the pump then starts a new
+ * session with it through the same wiring chokepoint (`route: 'new'`). Nothing
+ * else ever makes a start row `queued`, so the pump never touches the original
+ * attempt — one writer per attempt.
+ */
+const START_PREFIX = 'start.';
+const START_RESTART_REASON = 'Orchard restarted before the new session for this message confirmed it had started — if no new session with this message is in the list, press Send anyway, otherwise Discard';
+export function isStartBox(sid: string | null | undefined): boolean {
+  return typeof sid === 'string' && sid.startsWith(START_PREFIX);
+}
+
+const TERMINAL = (s: OutboxState) => s === 'delivered' || s === 'discarded';
+/**
+ * Start boxes whose first attempt a live tab is still WATCHING (the socket that sent it is open, showing its own
+ * "starting…"). Memory only: such a row is left out of the dock so the starting tab does not show it twice. The
+ * moment that socket closes (`unwatchStartRow`) — or after a restart, when nothing watches anything — a row still
+ * `sending` is listed (IV 268766ea: a tab closed while the CLI sat before init left it invisible).
+ */
+const watchedStarts = new Set<string>();
+export function unwatchStartRow(sid: string): void { watchedStarts.delete(sid); }
+
+/** A finished start box loses its journal (best effort); the box stays in memory for its `recent` window. True when finished. */
+function gcStartBox(box: Box): boolean {
+  if (!isStartBox(box.sid) || box.reserved || box.unsaved.size || box.damagePending || box.damaged) return false;
+  const rows = [...box.rows.values()];
+  if (rows.length && !rows.every((r) => TERMINAL(r.state))) return false;
+  if (box.gcAt != null) return true;
+  if (!mayWrite()) return false;
+  for (const f of [journalOf(box.sid), headOf(box.sid)]) {
+    try { fs.unlinkSync(f); } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') { console.error(`[orchard] BUG-253: outbox ${box.sid}: could not remove a finished start's file (${errText(err)}) — harmless, retried at the next boot`); return false; } }
+  }
+  fsyncDir(root());
+  // A later write (none is expected) would start a fresh journal at line 1.
+  box.lsn = 0;
+  box.lines = 0;
+  box.gcAt = Date.now();
+  watchedStarts.delete(box.sid);
+  return true;
+}
+
+export interface StartRowRequest {
+  projectId: string;
+  text: string;
+  attachments?: AttachmentRef[]; // FEAT-177 — first-message attachments, durable across a restart/Send-again
+  overrides: Record<string, unknown> | null;
+  templateIds: string[] | null;
+}
+
+/**
+ * Record a new session's first message, on disk, before the start may proceed.
+ * Throws (and nothing is recorded) when it cannot be saved — the caller must then
+ * refuse the start: a message Orchard could not save is a message it must not run.
+ */
+export function mintStartRow(req: StartRowRequest, { watched = false }: { watched?: boolean } = {}): { box: string; id: string; attempt: number } {
+  // FEAT-177: a first message is valid with text OR an attachment.
+  if (typeof req.text !== 'string' || (!req.text.trim() && !(req.attachments && req.attachments.length))) throw new OutboxError('text is required', 400);
+  if (typeof req.projectId !== 'string' || !req.projectId) throw new OutboxError('a project is required', 400);
+  const sid = `${START_PREFIX}${crypto.randomBytes(8).toString('hex')}`;
+  const box = blankBox(sid);
+  const now = Date.now();
+  const row: OutboxRow = {
+    id: `q${crypto.randomBytes(8).toString('hex')}`,
+    nonce: `start:${sid}`,
+    seq: 1,
+    text: req.text,
+    ...(req.attachments && req.attachments.length ? { attachments: req.attachments } : {}),
+    origin: 'direct',
+    state: 'sending',
+    reason: null,
+    createdAt: now,
+    updatedAt: now,
+    forced: false,
+    overrideExternal: false,
+    via: 'start',
+    confirmed: false,
+    sentAt: now,
+    sizeAtSend: null,
+    resume: { projectId: req.projectId, encodedDir: null, overrides: req.overrides ?? null, templateIds: req.templateIds ?? null },
+    payload: payloadOf({ nonce: `start:${sid}`, text: req.text, resume: { projectId: req.projectId, encodedDir: null, overrides: null, templateIds: null } }),
+    attempt: 1,
+  };
+  try { append(box, [row]); } catch (err) {
+    // Refused, so the tab keeps the words. A write that failed "unsure" may still have left the line on disk, where a
+    // reboot would bring it back as a second copy — this box is brand new, so its files are removed outright.
+    for (const f of [journalOf(sid), headOf(sid)]) { try { fs.unlinkSync(f); } catch { /* never made */ } }
+    throw err;
+  }
+  boxes.set(sid, box);
+  if (watched) watchedStarts.add(sid);
+  crashPoint('start-minted');
+  return { box: sid, id: row.id, attempt: 1 };
+}
+
+export type StartSettle =
+  | { kind: 'started'; sdkSessionId: string }
+  | { kind: 'failed'; reason: string }
+  | { kind: 'uncertain'; reason: string };
+
+/**
+ * The start route's outcome for its row. FIRST SETTLE WINS: it applies only to a
+ * row still `sending` (a `started` may also lift an `uncertain` — only ever toward
+ * delivered). Never throws: a write that fails after the decision is held in
+ * memory and carried by the next write, and a restart reloads the `sending` line as
+ * `uncertain` — never lost, never sent by itself.
+ */
+export function settleStartRow(sid: string, id: string, attempt: number, o: StartSettle): OutboxRow | null {
+  const box = boxes.get(sid);
+  const row = box?.rows.get(id);
+  if (!box || !row) return null;
+  const now = Date.now();
+  if ((row.attempt ?? 1) !== attempt) {
+    // An OLDER attempt reporting after the user sent it again: never a state change on the current attempt. A
+    // session it started is recorded, so the user can be told two sessions may hold the message.
+    if (o.kind === 'started') {
+      const late: OutboxRow = { ...row, alsoStartedAs: [...(row.alsoStartedAs ?? []), o.sdkSessionId], updatedAt: now };
+      try { append(box, [late]); } catch { box.rows.set(id, late); box.unsaved.set(id, late); }
+      console.error(`[orchard] BUG-253: outbox ${sid}: attempt ${attempt} started session ${o.sdkSessionId} after the row moved on to attempt ${row.attempt ?? 1} — recorded, the row is unchanged`);
+      return late;
+    }
+    return row;
+  }
+  if (row.state !== 'sending' && !(o.kind === 'started' && row.state === 'uncertain')) return row;
+  const next: OutboxRow = o.kind === 'started'
+    ? { ...row, state: 'delivered', confirmed: true, startedAs: o.sdkSessionId, reason: null, updatedAt: now }
+    : { ...row, state: o.kind, reason: (o.reason || (o.kind === 'failed' ? 'the new session did not start' : 'it may or may not have started a session')).slice(0, 600), ...(o.kind === 'failed' ? { sentAt: null } : {}), updatedAt: now };
+  try { append(box, [next]); } catch (err) {
+    console.error(`[orchard] BUG-253: outbox ${sid}: the start's outcome (${o.kind}) could not be written (${(err as Error).message}) — held in memory; a restart before the next write shows it as not confirmed`);
+    box.rows.set(id, next);
+    box.unsaved.set(id, next);
+  }
+  crashPoint(`start-${o.kind}`);
+  gcStartBox(box);
+  return next;
+}
+
+export interface StartsView {
+  projectId: string;
+  rows: Array<OutboxView['rows'][number] & { box: string }>;
+  recent: Array<OutboxView['recent'][number] & { box: string; startedAs: string | null; retried: boolean }>;
+  /** Start boxes whose saved record was damaged (their row may be missing — then the project is unknown, so every project lists it). */
+  damaged: Array<{ box: string; at: number; detail: string }>;
+}
+
+/** The one live row of a start box (the pump's Send again needs its id and attempt to settle a late init). */
+export function startRowOf(sid: string): { id: string; attempt: number } | null {
+  const box = boxes.get(sid);
+  if (!box || !isStartBox(sid)) return null;
+  const r = [...box.rows.values()].find((x) => !x.duplicateOf);
+  return r ? { id: r.id, attempt: r.attempt ?? 1 } : null;
+}
+
+/** Every first message of this project the user must act on or watch (dock), and the ones that just finished. */
+export function startsView(projectId: string): StartsView {
+  const rows: StartsView['rows'] = [];
+  const recent: StartsView['recent'] = [];
+  const damaged: StartsView['damaged'] = [];
+  const now = Date.now();
+  for (const box of boxes.values()) {
+    if (!isStartBox(box.sid)) continue;
+    const mine = [...box.rows.values()].some((r) => r.resume.projectId === projectId);
+    if (box.damaged && (mine || !box.rows.size)) damaged.push({ box: box.sid, at: box.damaged.at, detail: box.damaged.detail });
+    for (const r of box.rows.values()) {
+      if (r.duplicateOf || r.resume.projectId !== projectId) continue;
+      const { id, nonce, seq, text, origin, state, reason, createdAt, updatedAt, forced, via } = r;
+      if (state === 'queued' || state === 'uncertain' || state === 'failed' || (state === 'sending' && (r.retried || !watchedStarts.has(box.sid)))) {
+        rows.push({ id, nonce, seq, text, origin, state, reason, createdAt, updatedAt, forced, via, box: box.sid });
+      } else if (TERMINAL(state) && now - updatedAt < RECENT_MS) {
+        recent.push({ id, nonce, state, via, updatedAt, box: box.sid, startedAs: r.startedAs ?? null, retried: !!r.retried });
+      }
+    }
+  }
+  rows.sort((a, b) => a.createdAt - b.createdAt);
+  return { projectId, rows, recent, damaged };
 }
 
 /* ------------------------------------------------------------------ delivery */
@@ -806,15 +1045,25 @@ export function composeOutboxPrompt(rows: OutboxRow[], now = Date.now()): string
 
 const settingsKey = (r: OutboxRow) => JSON.stringify([r.resume.projectId, r.resume.encodedDir, r.resume.overrides ?? null, r.resume.templateIds ?? null]);
 
-/** What goes next: a forced row alone; else every queued row in order, cut where the resume settings change. */
+const hasAttachments = (r: OutboxRow): boolean => Array.isArray(r.attachments) && r.attachments.length > 0;
+
+/**
+ * What goes next: a forced row alone; else every queued row in order, cut where
+ * the resume settings change. FEAT-177 (review #5): a row carrying attachments
+ * is delivered ALONE — never coalesced with another row — so the per-message
+ * count/size caps and the text↔image association of each message are preserved
+ * (two valid 12-image messages must not become one 24-image delivery).
+ */
 function nextBatch(box: Box): OutboxRow[] {
   const queued = [...box.rows.values()].filter((r) => r.state === 'queued').sort((a, b) => a.seq - b.seq);
   if (!queued.length) return [];
   const forced = queued.find((r) => r.forced);
   if (forced) return [forced];
-  const key = settingsKey(queued[0]);
+  const first = queued[0];
+  if (hasAttachments(first)) return [first];
+  const key = settingsKey(first);
   const out: OutboxRow[] = [];
-  for (const r of queued) { if (settingsKey(r) !== key) break; out.push(r); }
+  for (const r of queued) { if (settingsKey(r) !== key || hasAttachments(r)) break; out.push(r); }
   return out;
 }
 
@@ -839,7 +1088,9 @@ async function pump(sid: string): Promise<void> {
   try { box = boxOf(sid); } catch { return; }
   if (box.reserved || box.interrupting) return;
   if (Date.now() < box.nextTryAt) return;
-  const batch = nextBatch(box);
+  // BUG-253: a start box holds one first message; it goes alone, as typed (a header would become the new session's first line).
+  const start = isStartBox(sid);
+  const batch = start ? nextBatch(box).slice(0, 1) : nextBatch(box);
   if (!batch.length) { box.hold = null; return; }
   const head = batch[0];
   const p = wiring.probe(sid, head.resume, { overrideExternal: batch.every((r) => r.overrideExternal), forced: head.forced });
@@ -854,8 +1105,8 @@ async function pump(sid: string): Promise<void> {
   const release = wiring.reserve(sid);
   try {
     const now = Date.now();
-    const prompt = composeOutboxPrompt(batch, now);
-    const size = wiring.transcriptSize(sid, head.resume);
+    const prompt = start ? head.text : composeOutboxPrompt(batch, now);
+    const size = start ? null : wiring.transcriptSize(sid, head.resume);
     try {
       append(box, batch.map((r) => ({ ...r, state: 'sending' as const, sentAt: now, sizeAtSend: size, updatedAt: now })));
     } catch (err) {
@@ -882,14 +1133,16 @@ async function pump(sid: string): Promise<void> {
     }
     box.hold = { kind: 'sending', text: 'sending…' };
     let out: HandOutcome;
-    try { out = await wiring.handOver(sid, p, prompt, head.resume); }
+    // FEAT-177: an attachment-bearing row is delivered alone (nextBatch), so the
+    // batch head carries the message's attachments.
+    try { out = await wiring.handOver(sid, p, prompt, head.resume, head.attachments); }
     catch (err) { out = { kind: 'uncertain', reason: `the handover failed part-way (${(err as Error).message}) — it may or may not have arrived. Check the conversation, then Send anyway or Discard` }; }
     crashPoint('handed-over');
     const t = Date.now();
     const cur = batch.map((r) => box.rows.get(r.id)!).filter(Boolean);
     let next: OutboxRow[];
     if (out.kind === 'delivered') {
-      next = cur.map((r) => ({ ...r, state: 'delivered' as const, via: out.via, reason: null, updatedAt: t }));
+      next = cur.map((r) => ({ ...r, state: 'delivered' as const, via: out.via, reason: null, updatedAt: t, ...(start ? { confirmed: true, ...(out.startedAs ? { startedAs: out.startedAs } : {}) } : {}) }));
       box.refusals = 0;
       box.hold = null;
     } else if (out.kind === 'refused') {
@@ -912,18 +1165,19 @@ async function pump(sid: string): Promise<void> {
     }
     if (out.kind === 'delivered') {
       crashPoint('delivered');
-      try { wiring.announce(sid, { t: 'outbox-turn', sessionId: sid, text: prompt, ids: batch.map((r) => r.id) }); } catch { /* a tab that misses it reads the transcript */ }
+      try { wiring.announce(sid, { t: 'outbox-turn', sessionId: sid, text: prompt, ids: batch.map((r) => r.id), ...(head.attachments ? { attachments: head.attachments } : {}) }); } catch { /* a tab that misses it reads the transcript */ }
     }
   } finally {
     box.reserved = false;
     release();
   }
+  if (start) gcStartBox(box); // BUG-253: after the reservation is released (a reserved box is never collected)
   kick(sid);
 }
 
 /** Confirm recent deliveries and settle uncertain rows from the receiver's record. Only ever moves toward delivered. */
 function confirmFromTranscript(box: Box): void {
-  if (!wiring) return;
+  if (!wiring || isStartBox(box.sid)) return; // BUG-253: settled at the new session's init, never from a transcript
   const now = Date.now();
   const out: OutboxRow[] = [];
   for (const r of box.rows.values()) {
@@ -942,7 +1196,9 @@ function confirmFromTranscript(box: Box): void {
 let tickN = 0;
 function tick(): void {
   tickN++;
-  for (const box of boxes.values()) {
+  const now = Date.now();
+  for (const box of [...boxes.values()]) {
+    if (box.gcAt != null) { if (now - box.gcAt > RECENT_MS) boxes.delete(box.sid); continue; }
     const rows = [...box.rows.values()];
     if (rows.some((r) => r.state === 'queued')) void pump(box.sid);
     // Transcript reads are cheaper than they look but not free: every 2 s is plenty for a confirmation.
@@ -962,7 +1218,11 @@ export function startOutbox(w: OutboxWiring): void {
   for (const n of names) {
     const m = /^(.+)\.jsonl$/.exec(n);
     if (!m || !validSessionId(m[1])) continue;
-    try { boxOf(m[1]); } catch (err) { console.error(`[orchard] BUG-217: outbox ${m[1]} could not be loaded: ${(err as Error).message}`); }
+    try {
+      const b = boxOf(m[1]);
+      // BUG-253: a start box that finished (or never held a saved row) is not carried across restarts.
+      if (isStartBox(b.sid) && gcStartBox(b)) boxes.delete(b.sid);
+    } catch (err) { console.error(`[orchard] BUG-217: outbox ${m[1]} could not be loaded: ${(err as Error).message}`); }
   }
   if (!timer) { timer = setInterval(tick, TICK_MS); timer.unref?.(); }
   for (const sid of boxes.keys()) kick(sid);

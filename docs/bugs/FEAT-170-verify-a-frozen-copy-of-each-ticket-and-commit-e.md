@@ -5,7 +5,7 @@
   "title": "Verify a frozen copy of each ticket and commit exactly that",
   "summary": "Lanes share one uncommitted tree, so a verifier sees every ticket's edits and a later lane can revert a finished fix before it is verified. Freeze each ticket's files into a hashed candidate, verify it, bind the verdict to the hash, and commit exactly the frozen bytes; any later change invalidates the verdict.",
   "impact_if_we_wait": "Verifiers keep hand-building isolated copies (86 of 211 verify lanes in 30 days), a whole-file restore can again turn a finished fix into a false BROKEN (BUG-224 cost about an hour), and commits keep mixing verified and broken tickets because nobody can split a shared file.",
-  "current_need": "FIXED, not VERIFIED: the shadow-repo pilot (final verify faa119a9 BROKEN, two-break adjudicated, mode fix made). No more verify rounds; next check is the pilot's own metrics (shadow.mjs metrics) after 4 weeks or 10 landings, once a service restart activates it.",
+  "current_need": "Shadow-repo pilot REMOVED by user decision (2026-10-13); candidate tools kept. Next: the user deletes the leftover ~/.local/state/claude-station/shadow/ (listed in the body) and an independent verify of the removal.",
   "severity": "high",
   "area": "lane process and commit workflow",
   "reported": "2026-10-07",
@@ -13,7 +13,7 @@
   "owner": "you",
   "work_state": "in_verification",
   "human_action": "decide",
-  "updated": "2026-10-08",
+  "updated": "2026-10-14",
   "decision": {
     "id": "102eac2d-bfd1-4624-9fff-df3e4329d40c",
     "mode": "single",
@@ -46,7 +46,28 @@
     ],
     "recommendation": "A",
     "recommendation_reason": "Rescope meets the stated need (verify and commit the exact frozen bytes) with no new surface. Measure how often a foreign line actually reaches a candidate before buying B or C; the OpenAI review says redesign is not yet earned.",
-    "prerequisite": null
+    "prerequisite": null,
+    "answers": [
+      {
+        "answer_id": "05f56143-9c01-41ce-8192-3cc0e64baa54",
+        "kind": "decision",
+        "followup": false,
+        "chose": {
+          "key": "A",
+          "label": "Rescope to frozen-byte integrity"
+        },
+        "note": "Orchestrator decided A (rescope to frozen-byte integrity) on 2026-10-07; recorded via decision-answer API per dispatch.",
+        "question": "Must a frozen candidate guarantee it holds ONLY its own ticket lines, or only that the exact frozen, verified bytes are what gets committed?",
+        "by": "user",
+        "via": "ticket view",
+        "on": "2026-10-11",
+        "recorded_at": "2026-10-11T13:09:14.198Z",
+        "recorded_by": "server",
+        "decision_key": "rec:9763893329d915d5659e32f96986fe49a84eb0ad43176772e2afa5fa71a9bb15",
+        "log_k": 24,
+        "heading_sha": "153e1364495ab40e36904faa0b7a44401e7ecb81492f055ce5e11408db8087b0"
+      }
+    ]
   },
   "decision_history": [
     {
@@ -211,6 +232,144 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "candidate": "891bc0b2c9a78b321f0bcaa77b3f4640a07989c7bb1b2957f849b351e3ff6f8c"
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "90f729ed-e508-4a02-88db-2442ff37c891",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T13:46:31.695Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Committed code (ed92aff, FEAT-170 files only via scratch range a32b458..dfe3e6e). Property 4 broken: swap() mkdirs parents, unland/recover leave created empty dirs (brandnew/deep). Props 1-3 survived probes. OpenAI attempt hit quota mid-run (no verdict)."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "f6e13200-07e2-4822-8ca7-0330116569e4",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T14:20:30.684Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "503db360554cc937f424556e059173ad5332bb2c2b1b19ba2cbcd3db118e0478",
+      "note": "P4 two-break: crash mid-unland unrecoverable (no journal, aside debris); shared created dir left after unland A then B. Both re-reproduced (scratch/f170-repro). Contract INVALID only for 2 FIXER-TEST lines; valid rerun 34c122ac HOLDS missed both. P1-3 held."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "8e6313bf-a6c0-44bd-bf88-c91840b14426",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T14:42:07.970Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "8b1ad3a8727c0c476ce6677f9e40be35813d93fbfe167b3ae85eb0ac5f036d82",
+      "note": "P4 broken, one mechanism: reconcileDirs takes a dir baseline from the earliest journal observation forever, so a dir recreated later is deleted by a later unland and by recover (run 8c200722c7ea). Held: 3-ticket nested dirs all 6 orders; crash at 12 land seams. P1-3: fixer suite only."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "dd5a59d6-b681-455d-b2ff-6f0a723e1984",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T15:17:40.101Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "99aded899daafe69c45c5e0b079cf3a43cf56d421c3c81a2de509b3755014f2b",
+      "note": "Final verify, cand 99aded899daa (own 5 files). P3, one mechanism: violatesLanded pure-deletion window has no slack above the gap; a deleted line re-added 1 line above lands unrefused (below is refused). Adjudicate: adjacent vs far-resurrection residual. P1/P2/P4 held; suite 60/60."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "5b5f4f4c-2bee-45b4-aaa7-7750cfe95e32",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T18:52:08.633Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "fd34b0f2a68d90ee86aa8e67bb8a673d957fcff2bd7e454428b402212cf95eb2",
+      "note": "Cand fd34b0f2a68d. P3, one mechanism: violatesLanded (shadow-vcs.mjs:677) window for a replacement hunk is 1 line narrower each side, so a deleted line re-added adjacent above (-L1 +L1x +D) or below (-L4 +D +L4x) lands. P4 held (41 crash steps, modes/symlinks). Suite 72/72."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a12c54-95e2-73b1-bbdc-ccdc3e37b64c",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T19:03:14.344Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "9dc24dc609f916a9bb8b39c3ff15041326037cd1243bd7bfa6c4a3449ba74e2f",
+      "note": "Cand 9dc24dc609f9, VALID. P4 two-break STOP: (a) crash mid-recover after rename: file absent, 2nd recover exits 0 LEFT AS IS (b37b426602f3); (b) recover temp cleanup (shadow-vcs:877) deletes a tracked file named .<f>.orchard-new-* (f42ac1ea7fc8). P1-3 held; suite 73/73."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a12c64-c0f8-74e0-85f0-fa2f8dde4eb2",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T19:22:34.671Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "79494041df57ba7ab40cd16ecbd1bbc46dbc4dc75c1f995283f5d04ff3acdd7e",
+      "note": "Cand 79494041df57. P4 two-break STOP: (a) foreign chmod in crash window, recover exits 0, sameEntry ignores journaled perm; (b) readAbs treats EACCES as absent, recover exits 0 leaving landed file. Confirmed shadow-vcs.mjs:171,183. P1-3 held; suite 79/79."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "9bc195fb-0533-47ed-afa3-5ee688b021f4",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T20:24:37.934Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Cand 21d3325bacad (=live bytes) frozen in a scratch repo copy; FEAT-175 owns the files live. VALID. P3/P4, one mechanism: a created path written by another writer with post bytes is deleted by refused land (exit 4) and recover (exit 0). Unrepro: shadow-vcs:616 verify set. P1/P2 held; 82/82."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "418b9dd5-5ea4-4daf-9663-c2c2378abee7",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T21:03:08.378Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Dispatch wiring only, range 6032be5c..0f858810 (scratch, =live). VALID. P3/P1 two-break: (a) laneUsable takes valid meta + broken .git as continuation: charter commit/land fail, nothing-hot call gets charter; (b) subdir projectTop realpath vs git toplevel key leaks a permanent lane."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "run_id": "c9de9bbd-88a9-43e0-81e7-92317377a94a",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T21:21:56.557Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Dispatch wiring, final post-redesign; trees ee1cdd12..5b754e2e, frozen=live. VALID. P3 two-break: (a) nothing-hot dispatch runs shadow.mjs status first: creates shadow dirs + metrics line; (b) killed lane-new + pre-existing meta-less lane: drop --force rm -rf (shadow-dispatch:217). Suite 20/20."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a133e8-f00d-7821-9002-ac92ac8ebd25",
+      "verdict": "broken",
+      "verdict_on": "2026-10-13",
+      "recorded_at": "2026-10-13T06:43:01.730Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Same-line fix, cand 2b5efd4755d5 (scratch copy). VALID. Claim B two-break: size-3 conflict markers land; an unresolved copy under another name lands. Held: boundaries, newline/repeat lines, abort+re-sync, isolation, re-land, 3 tickets, metrics. Suite 98/98."
     }
   ],
   "verification_class": "plan+review",
@@ -677,6 +836,102 @@ Source: `scratch/process-research-2026-10-07/agent-vcs.md` §11 and its OpenAI r
 | 14 | Strawman baselines | **Accepted.**<br>- P2's actual baseline is today's shim refusing a lane commit (capability missing). The attacks are acceptance tests, and the naive cwd-keyed allow is a labelled negative control proving each attack is real.<br>- P4's actual baseline is today's candidate freeze from live after a post-land edit.<br>- Also added: interrupted land, then recover; and full inventories (type, mode, link target, sha256). |
 | 15 | Rollback deletes the undo history | **Accepted.** `shadow retire` refuses while any landing is unpromoted (it lists the `unland` commands). Otherwise it archives the project's records, never deletes them. |
 
+## Shadow pilot — wiring into lane dispatch (plan, 2026-10-11)
+**Goal:** a lane for a ticket whose files another lane is editing concurrently automatically works in its shadow lane, lands with `shadow.mjs land`, and reports through a candidate. Every other dispatch is unchanged. Any failure falls back to today's flow.
+
+### The decision: one module, `scripts/lib/shadow-dispatch.mjs`
+`pilotForDispatch({ prompt | ticket, projectTop, lockDir, selfOwner, phase, provider, sandbox, env })` returns `{ pilot, reason, hot[], laneDir?, prompt? }`. It never throws; any error means `{ pilot: false, reason: 'error: …' }`.
+
+1. **Ticket.**
+   - In-process lanes: from the `Dispatch:` line in the prompt (`parseDispatchDeclaration`, the shared grammar).
+   - External lanes: from `--ticket`.
+   - Exactly one ticket is required. Otherwise it is not a pilot.
+2. **Eligibility.** Every item must hold; otherwise it is not a pilot, with the reason recorded:
+   - the phase is `fixing` (or absent for in-process lanes; verify and finding lanes never write);
+   - the project is a git repo with HEAD;
+   - its registry entry is not `isolation: container`;
+   - not inside a container, and not on native Windows;
+   - the external provider is `anthropic` with `--sandbox workspace-write`. Codex's sandbox keeps `.git` read-only, so lanes there could not commit; they fall back.
+3. **Hot.** The ticket's expected files are the `code_refs` of its board record (`resolveBoardDir`; no record or no `code_refs` → not a pilot, `unknown files`). The ticket is a pilot when:
+   - **(a)** it already has a shadow lane (a continuation or fix round); or
+   - **(b)** for any expected path, there is a **live** FEAT-129 lock held by an owner other than the dispatching session itself. Live means `reclaimReason(lock) === null`. The lock dir is `dataDir()/file-locks/<projectKey>`, which the runtime already computes. Or
+   - **(c)** another ticket owns the path through an open candidate, a claim, or a standing un-promoted landing.
+4. **Action.**
+   - Run `laneNew` if the lane is absent (host side, real git, under the shadow root).
+   - Append the **pilot charter** to the prompt. The `Dispatch:` line stays first, so the cost collector is untouched.
+   - Record a `dispatch` metric event `{ticket, pilot, reason, hot}`. This also measures pilot coverage.
+
+### Pilot charter (appended)
+- Work ONLY in `<laneDir>`.
+- Commit there: `node <orchard>/scripts/shadow.mjs run <T> --repo <P> -- commit -am "…"`.
+- Never edit `<P>` for this ticket.
+- When done: `shadow.mjs land <T> --repo <P>`. On OVERLAP / REVERTS-FOREIGN: `shadow.mjs sync <T>`, resolve in the lane, commit, land again.
+- Then: `shadow.mjs freeze <T> --repo <P> [--check "<cmd>"]` (on `owned`, follow its `--depends-on` instruction). Report the candidate hash and the landed files.
+
+### Wiring
+- **In-process `Agent` lanes** (`claude-runtime.ts`, PreToolUse, `Agent` branch):
+  - The rewrite composes with the FEAT-124 Fable reroute. It is applied to `ft.updatedInput ?? tool_input`.
+  - The hook returns `allow` with `updatedInput` only when something changed.
+  - The pilot needs the session's `fileLockDir`, `gitRepoPath` and `sessionLabel` (owner).
+  - A thrown error is caught, logged and falls through unchanged.
+- **External lanes** (`scripts/dispatch.mjs`): after the `Dispatch:` line, for anthropic + workspace-write the same decision runs. On pilot, the charter is appended, `--cwd` becomes the lane dir, and `--add-dir <P>` makes the shared tree readable for reference.
+- Nothing else changes. The broker, the ledger and the cost collector see the same `Dispatch:` line.
+
+### Fail-closed table
+| Situation | Result |
+|---|---|
+| No `Dispatch:` line, several tickets, a verify/finding phase | Unchanged |
+| Container project, non-git project, no HEAD, native Windows, Codex | Unchanged (reason in the metric) |
+| No board record or no `code_refs` | Unchanged (`unknown files`) |
+| `laneNew` or the hot check throws | Unchanged; one console warning |
+| Existing lane for the ticket | Pilot (continuation), even if nothing is hot now |
+
+### Proofs (scratch server + fake CLI that sends an `Agent` PreToolUse; must-FAIL on the pre-wiring runtime / pass after)
+- **W1** pilot ticket (its `code_refs` file locked by another live owner): the rewritten prompt carries the charter, the lane dir exists and the seed matches the shared tree. Before: unchanged (must-FAIL).
+- **W2** non-pilot ticket (nothing hot): unchanged; a `dispatch` metric with `pilot:false`.
+- **W3** failure fallback: a container-registered project and a forced `laneNew` failure (an unwritable shadow root) leave the prompt unchanged, and the call is allowed.
+- **W4** Fable reroute and pilot together: `model: opus` and the charter both present.
+- **W5** external: `dispatch.mjs --provider anthropic --sandbox workspace-write --ticket T` with a stub `claude` on PATH. The stub sees `cwd = laneDir` and the charter for a pilot ticket, and the original cwd/prompt for a non-pilot one.
+- Then `npm run gate`.
+
+## Shadow pilot — OPT-IN usage (wiring rescoped, 2026-10-12)
+**Ruling.** After verify c9de9bbd (the second two-break on the wiring), the independent adjudicator RESCOPED: the automatic dispatch wiring is deleted. The FEAT-129 file lock already prevents two lanes editing one file, so the hook added little, and its risk spanned every dispatch.
+
+**Removed:**
+- `scripts/lib/shadow-dispatch.mjs` (+ `.d.mts`);
+- the pilot block in `src/server/runtime/claude-runtime.ts` (the `Agent` branch is back to `Agent`-only, Fable gate as before);
+- `scripts/verify-feat-170-dispatch.mjs` and its fake CLI;
+- the dispatch-only changes in `shadow-vcs.mjs` (`shadowPathsFor`, no-lane exit 6, the half-lane `drop --force`).
+
+The "wiring into lane dispatch" plan above is superseded.
+
+**Opt-in usage** (also in `docs/CONVENTIONS.md`, "Shadow-repo pilot — OPT-IN"): the orchestrator, or a charter, calls the tools explicitly for a ticket it chooses.
+1. `shadow.mjs lane-new <T> --repo <P>`.
+2. The lane works in `<laneDir>` and commits with `shadow.mjs run <T> --repo <P> -- commit -am "…"`.
+3. `shadow.mjs land <T> --repo <P>`.
+4. `shadow.mjs freeze <T> --repo <P> [--check …]`.
+5. `independent-verify --candidate <T>`.
+6. The user promotes: `candidate.mjs commit <T> --repo <P>`. Undo a landing: `shadow.mjs unland <T> --repo <P>`.
+
+The core tools keep their recorded verdicts and accepted residuals (see the Activity log, 2026-10-11 summary entry). Pilot metrics come from `shadow.mjs metrics`.
+
+## Shadow-repo pilot — REMOVED (user decision, 2026-10-13)
+**Decision (user).** Remove the shadow-repo part and keep the candidate tools (`candidate.mjs`, `candidate-store.mjs`, `candidate commit`). Every "Shadow-repo pilot" / "Shadow pilot" section above is superseded.
+
+**Evidence** (`<state>/scratch/process-research-2026-10-07/shadow-default.md`): in 45 days, no loss would have been prevented by shadow repos alone; lock waits cost 0.6% of lane time; the pilot added surface, including a git-write exception in the shim.
+
+**Removed:**
+- `scripts/shadow.mjs`, `scripts/lib/shadow-vcs.mjs`, `scripts/lib/shadow-guard.mjs`, `scripts/verify-feat-170-shadow.mjs`, `scripts/verify-feat-170-optin.mjs`. No npm script referenced them.
+- **The shim exception** (`scripts/lib/git-shim.mjs`): the local allow for a write whose resolved repo sat under the baked shadow root (`shadowDecision`, `{shadow, exec}`, the pinned-exec spawn), the baked `shadowRoot` in the shim source, and the `shadowRoot` options of `decideGitShim`, `resolveGitShim`, `runGitShim` and `installGitShim` (+ `git-shim.d.mts`).
+- **The host exception** (`scripts/lib/agent-git-policy.mjs` `defaultFixtureRoots`): the shadow root no longer counts as a fixture root. The roots are now the scratch root, the system tmp and `/work`.
+
+**Kept (FEAT-164 intact):** `parseGlobals`, `gitBuiltins`, `splitGitCmdline`, `expandGitAliases` and `resolveWriteTarget` moved by mechanical extraction from the pre-deletion `shadow-guard.mjs` to `scripts/lib/git-target.mjs`. Only one comment phrase changed. `agent-git-policy.mjs` and `git-shim.mjs` import them from there. The FEAT-164 suite's pinned historical fixtures still import `./shadow-guard.mjs`; its loader maps that one name to the pinned `fixtures/feat-164/shadow-guard-r3.mjs`, so the must-FAIL baselines stay byte-identical.
+
+**Candidates:** behaviour unchanged. `candidate-store.mjs`: one comment reworded at `freezeCandidate`'s optional `expect` option. The option stays; its only caller was `shadow.mjs`. `candidate.mjs`: untouched.
+
+**Leftover state on disk — NOT deleted, for the user to remove** (`~/.local/state/claude-station/shadow/`, 15G, 24 entries):
+`bug250p3-2817e37e73e7d`, `bug250p3-54366ff98d8078`, `bug250p4-0412f108c85238`, `bug250p4-8a2689353650a`, `bug250p4b-21c03bd07d9328`, `bug250p4b-d2d67a0191a6c`, `bug250r3-b9476afec9d39`, `bug250r4-2c048142baa56`, `bug250r4b-5567dde446e128`, `bug250r5-57b4b5adf7658`, `bug250r5b-38ef85ebda97a`, `iv-B-168`, `iv-B-168b`, `iv-B-168.json`, `iv-B-168.log`, `iv-B-177`, `iv-B-177.json`, `iv-B-177.log`, `iv-B-188`, `iv-B-188.log`, `orchard-74a11dd3efbd` (the pilot's lanes/landings/objects/metrics for this repo), `req-168.txt`, `req-177.txt`, `req-188.txt`. Once removed, an agent git write there is refused (see the proof).
+
 ## Activity log (APPEND-ONLY — never edit or delete a prior entry)
 
 ### 2026-10-07 — agent
@@ -828,3 +1083,90 @@ Source: `scratch/process-research-2026-10-07/agent-vcs.md` §11 and its OpenAI r
 
 ### 2026-10-08 — worker (fixing, shadow pilot)
 - **shadow pilot — FIXED, not VERIFIED: two-break adjudicated (verify faa119a9):** Final verify faa119a9-6fdc-441b-98c4-b0c0f0c5b9ff BROKEN with two findings: (1) an exec-bit strip on a file another ticket created; (2) far resurrection, a line another ticket deleted re-inserted at a different offset. Two-break, adjudicated by the orchestrator as non-author reviewer. RESCOPED PROPERTY: a landing never changes another in-flight ticket's landed hunk in place — its bytes, its deletions at their own position, and the file mode it set. Why: re-inserting the same text elsewhere in a file is indistinguishable from a legitimate new edit (braces, imports, repeated lines), so refusing it would cause false refusals, and under the careless-agent threat model it is not a revert. ACCEPTED RESIDUAL: far resurrection (a deleted line re-added away from its original hunk) is not refused. The pilot's foreign-edit-incident metric (shadow.mjs metrics; plus shadow.mjs incident --kind silent-loss/foreign-edit when a verifier or the user finds one) is what would reveal it causing real harm; at 1 or more reported harm the check is reopened. FIX (inside the property): the mode the other ticket set is part of the exact comparison, including for a file it created (shadow-vcs.mjs violatesLanded). Proof: V4 (exec bit stripped from another ticket's created, landed file) FAILS on the pre-fix code (scratch/feat170-shadow/r3-before.log, 54/1) and PASSES now; suite 55/55 confined (r3-after.log); npm run gate PASS. Status: FIXED, not VERIFIED. No further verify rounds; the pilot's metrics are the next check. Files: scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — you (answer · via ticket view · decision 102eac2d-bfd1-4624-9fff-df3e4329d40c)
+- **Question:** Must a frozen candidate guarantee it holds ONLY its own ticket lines, or only that the exact frozen, verified bytes are what gets committed?
+- **Chose:** A — Rescope to frozen-byte integrity
+- **Note:** Orchestrator decided A (rescope to frozen-byte integrity) on 2026-10-07; recorded via decision-answer API per dispatch.
+- **State:** answered — awaiting agent action (not dispatched)
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run 90f729ed-e508-4a02-88db-2442ff37c891 — VERDICT: BROKEN — Committed code (ed92aff, FEAT-170 files only via scratch range a32b458..dfe3e6e). Property 4 broken: swap() mkdirs parents, unland/recover leave created empty dirs (brandnew/deep). Props 1-3 survived probes. OpenAI attempt hit quota mid-run (no verdict).. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **shadow pilot — unland/recover remove the dirs a landing created (verify 90f729ed):** Verify 90f729ed BROKEN on property 4 (unland restores exactly): swap() creates parent dirs and neither unland nor recover removed them. Fix: land records the dirs it will create (createdDirs, in the pending journal, before writing); unland, recover and a failed land remove exactly those, deepest first, only while each is still an empty real directory, so a pre-existing dir or one that gained other content is never removed. Proofs: two DIRS checks (unland with a new nested dir, a pre-existing dir and a created dir that gained a foreign file; recover after a crash mid-landing) FAIL on the pre-fix code (scratch/feat170-shadow/r4-before.log, 55/2) and PASS now; shadow suite 57/57 (r4-after.log), candidates suite 93/93 (r4-cand.log), both confined. npm run gate: check-nul, prompt-privacy and typecheck PASS; leak-gate FAILS on 1 hit in scripts/verify-feat-164-release.mjs (another lane's file, not touched here). Status unchanged: FIXED, not VERIFIED. Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run f6e13200-07e2-4822-8ca7-0330116569e4 — VERDICT: BROKEN — P4 two-break: crash mid-unland unrecoverable (no journal, aside debris); shared created dir left after unland A then B. Both re-reproduced (scratch/f170-repro). Contract INVALID only for 2 FIXER-TEST lines; valid rerun 34c122ac HOLDS missed both. P1-3 held.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **DESIGN REVIEW OUTCOME — unland redesigned as land-the-inverse (two-break on property 4):** Two-break on property 4 (unland restores exactly): (a) a crash mid-unland left debris and a half-restored tree, recover found nothing, and a second unland refused; (b) A created a dir, B landed into it, unland A then B left an empty dir. Orchestrator adjudication as non-author reviewer: REDESIGN, chosen over rescope (a is a real integrity failure on the user's working tree, the recoverability goal) and over keep-patching (unland had its own non-journaled restore path, a second mechanism that kept breaking separately from land). BUILT: unland is now 'land the inverse change' through the ONE journaled, crash-recoverable path (commitJournaled in scripts/lib/shadow-vcs.mjs): pending record (typed pre/post, observed dirs, lane meta before/after), then swaps, then dir reconcile, then meta, then done. A pending land OR unland blocks further changes, and recover restores every path from the path or its aside, removes temp files, reconciles dirs and restores the meta. Per-landing createdDirs tracking is deleted; directories are reconciled from the desired tree: a dir is removed only if it is empty AND absent from the tree with all remaining landings applied (its earliest journal observation says it did not exist, and no standing landing puts a file under it). PROOFS: UNLAND-CRASH (a crash at each of 13 steps of an unland: journal, every staged/aside/installed point of 3 path kinds, applied, dirs, meta, plus after 1 and 2 swaps) and SHARED-DIR (b) both FAIL on the pre-redesign code (scratch/feat170-shadow/r5-before.log; a real crash after 1 swap: second unland exit 3, recover 'nothing to recover') and PASS now. Shadow suite 59/59 (r5-after.log), candidates suite 93/93 (r5-cand.log), both confined. npm run gate PASS in full (leak-gate, check-nul, prompt-privacy, typecheck). Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run 8e6313bf-a6c0-44bd-bf88-c91840b14426 — VERDICT: BROKEN — P4 broken, one mechanism: reconcileDirs takes a dir baseline from the earliest journal observation forever, so a dir recreated later is deleted by a later unland and by recover (run 8c200722c7ea). Held: 3-ticket nested dirs all 6 orders; crash at 12 land seams. P1-3: fixer suite only.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **RESCOPE directories (verify 8e6313bf):** Verify 8e6313bf BROKEN on one point: reconcileDirs takes the first journal observation of a directory as its permanent baseline, so a directory recreated later is deleted by a later unland or recover. Unland orders, every crash seam and shared dirs held. Orchestrator adjudication (non-author): RESCOPE directories. RESCOPED PROPERTY: unland/recover restore every file's bytes and mode exactly and NEVER remove a directory that contains anything. WHY: git does not track empty directories and promotion commits files only, so an EMPTY directory removed or left behind has no effect on the repo or on anyone's work. ACCEPTED RESIDUAL: empty-directory presence. CONFIRMED in code: the only removal is fs.rmdirSync (shadow-vcs.mjs reconcileDirs), which the kernel refuses on a non-empty directory (ENOTEMPTY) atomically at removal time whatever the journal says; the readdir check is only a fast path; a symlink fails ENOTDIR. No other code path removes a directory. Test RESCOPE (must-pass): a dir first observed absent, removed, then recreated by hand with content (incl. a dotfile) survives an unland and a crash + recover of later landings into it. Shadow suite 60/60 (scratch/feat170-shadow/r6.log), candidates 93/93 (r6-cand.log), both confined; npm run gate PASS. Files (unstaged): scripts/lib/shadow-vcs.mjs (comment only), scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run dd5a59d6-b681-455d-b2ff-6f0a723e1984 — VERDICT: BROKEN — Final verify, cand 99aded899daa (own 5 files). P3, one mechanism: violatesLanded pure-deletion window has no slack above the gap; a deleted line re-added 1 line above lands unrefused (below is refused). Adjudicate: adjacent vs far-resurrection residual. P1/P2/P4 held; suite 60/60.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **symmetric in-place adjacency (verify dd5a59d6):** Verify dd5a59d6: properties 1, 2, 4 held; property 3 broke at a boundary: re-adding a line another ticket deleted ONE line above its gap landed, one line below was refused. Adjudication (non-author): an off-by-one asymmetry inside the in-place rule, not far resurrection; re-adding the exact deleted text immediately next to its gap, on either side, is an in-place revert. Fix (shadow-vcs.mjs violatesLanded): O's change spans [start,end] in O-post coordinates (a gap point for a pure deletion); an insertion point within one line on either side, or a replaced range touching [start-0.5, end+0.5], counts as adjacent. Farther away stays the accepted far-resurrection residual. Proofs (ADJ): 9 placements (mid above/gap/below; start gap/below; end above/gap; 1-line file gap/below). Four of them (mid above, start below, end above, 1-line below) FAIL on the pre-fix code (scratch/feat170-shadow/r7-before.log, 67/5); all PASS now, nothing written by the refused landings, and a two-lines-away placement still lands (residual). Shadow suite 72/72 (r7-after.log), candidates 93/93 (r7-cand.log), both confined; npm run gate PASS. Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run 5b5f4f4c-2bee-45b4-aaa7-7750cfe95e32 — VERDICT: BROKEN — Cand fd34b0f2a68d. P3, one mechanism: violatesLanded (shadow-vcs.mjs:677) window for a replacement hunk is 1 line narrower each side, so a deleted line re-added adjacent above (-L1 +L1x +D) or below (-L4 +D +L4x) lands. P4 held (41 crash steps, modes/symlinks). Suite 72/72.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **RESCOPE property 3 (verify 5b5f4f4c, independent adjudication WA §N):** Verify 5b5f4f4c broke property 3 a third way: an edit that also rewrites the neighbouring line shrank the adjacency window (shadow-vcs.mjs R2). An INDEPENDENT adjudicator (WA §N) ruled RESCOPE. PROPERTY 3 IS NOW: land never changes or removes a line another in-flight ticket inserted, never changes the mode it set, and never recreates a file it deleted or deletes one it created. Re-adding text another ticket deleted, at any position, is an ACCEPTED RESIDUAL; the promotion diff shows it, and the foreign-edit metric reopens it at 1 or more harm. REASONING: a content rule would refuse closing braces, imports and blank lines that legitimately recur; a position rule ('adjacent to the gap') is ill-defined when diff placement is ambiguous, and it broke three times (asymmetry dd5a59d6, neighbour rewrite 5b5f4f4c, far placement faa119a9). CHANGE: rule R2 (adjacency: start/end/near/back) and its doc text deleted from violatesLanded; R1, the typed checks (file created/deleted, symlink/non-file) and the mode check kept. Tests: the ADJ refusals became residual must-land checks (11 placements incl. neighbour-rewritten and two-lines-away, one file per case, each lands exactly the lane's bytes); V3 (stale restore of a deleted line) is now a residual must-land; a new check keeps R1 next to it (rewriting a line another ticket inserted, with its neighbour rewritten, is refused). Shadow suite 73/73 (scratch/feat170-shadow/r8.log), candidates 93/93 (r8-cand.log), both confined; npm run gate PASS. Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a12c54-95e2-73b1-bbdc-ccdc3e37b64c — VERDICT: BROKEN — Cand 9dc24dc609f9, VALID. P4 two-break STOP: (a) crash mid-recover after rename: file absent, 2nd recover exits 0 LEFT AS IS (b37b426602f3); (b) recover temp cleanup (shadow-vcs:877) deletes a tracked file named .<f>.orchard-new-* (f42ac1ea7fc8). P1-3 held; suite 73/73.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **DESIGN REVIEW OUTCOME — recover rebuilds from the journal; staging outside the tree (OpenAI verify 01a12c54):** Property 4 broke twice inside its redesign (OpenAI run 01a12c54-95e2-73b1-bbdc-ccdc3e37b64c): (a) a crash during recover after its rename left the file missing and a second recover exited 0; (b) the glob temp cleanup deleted a TRACKED file named .<file>.orchard-new-*. Independent adjudicator: REDESIGN. Root cause: recover inferred state from pattern-named leftovers in the working tree and ignored the journal's own objects/ copy of the original bytes. BUILT (scripts/lib/shadow-vcs.mjs): (1) STAGING: every temp/aside file lives in <git-common-dir>/orchard-staging/<tag>/{new,aside,rnew,raside}-<i>; the exact names are journaled before any is created; a change is refused when the staging dir and a target are on different filesystems (crossFsCheck; not provable in the single-FS container). (2) RECOVER (restoreFromJournal, also used by a land that fails mid-way): rebuilds each path to its journaled pre entry from objects/; a live entry we moved into staging is put back first; bytes that are neither the journaled pre nor post are never deleted or overwritten; staging files are deleted only when identified; every path is re-read and must equal pre exactly (kind, mode, bytes) before the record is marked recovered, otherwise exit 5, record stays pending, the message names the file and the original's object path. (3) DELETED: in-tree .orchard-new/.orchard-aside/.orchard-conflict names, the glob cleanup, recover's asides branch, the old swap/applyAll. PROOFS, each run on the reconstructed pre-redesign code (scratch/feat170-shadow/r9-before.log, 69/10) and now (r9-after.log, 79/79): RECOVER-CRASH (crash at each of 7 recover steps, twice in a row) FAIL→PASS; RECOVER-FROM-OBJECTS (only the journal holds the original) FAIL→PASS; NAMES (user files named .f.txt.orchard-new-123 and .f.txt.orchard-aside-<tag>; the old code deleted the first) FAIL→PASS; FOREIGN-WRITE (write during the crash window: untouched, exit 5, stays pending, then completes once resolved) FAIL→PASS; MODE-LINK (exec bit + symlink target) PASS→PASS, a regression guard (the old code already held it). The other before-failures are the known P4 artefact of the --no-git copy. Candidates suite 93/93 (r9-cand.log); npm run gate PASS. CLI: exit 5 documented. Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/shadow.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a12c64-c0f8-74e0-85f0-fa2f8dde4eb2 — VERDICT: BROKEN — Cand 79494041df57. P4 two-break STOP: (a) foreign chmod in crash window, recover exits 0, sameEntry ignores journaled perm; (b) readAbs treats EACCES as absent, recover exits 0 leaving landed file. Confirmed shadow-vcs.mjs:171,183. P1-3 held; suite 79/79.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **property 4: (a) RESCOPE git mode, (b) FIX unreadable ≠ absent (OpenAI verify 01a12c64):** OpenAI verify 01a12c64-c0f8-74e0-85f0-fa2f8dde4eb2 found a two-break on property 4; independent adjudicator ruled each. (a) A foreign chmod 0640→0600 is not caught: RESCOPE. 'Mode' in property 4 (and everywhere in shadow-vcs.mjs) means GIT mode: regular / executable / symlink / type. Every check compares git mode and promotion carries only git mode. Full POSIX permission bits are carried on write (permFor) but NOT verified, an accepted residual, now stated in the module's property text. (b) EACCES treated as 'absent' (fail-open error branch): FIXED. readAbs, lexists, the snapshot loop, observeDirs and ancestorProblem treat only ENOENT/ENOTDIR as absent and rethrow every other error. Recover's re-read counts any error as a mismatch (exit 5), and an unreadable staging file is kept; the record stays pending and the message says the path could not be read. Before the fix, a created file inside a chmod-000 directory read as 'absent' = its pre state, so recover cleared the record with the landed file still there. PROOFS (non-root, uid 1000 in the confined runner), on the pre-fix code (scratch/feat170-shadow/r10-before.log) and now (r10-after.log): EACCES (crashed land + chmod 000 on its dir: recover non-zero, record pending, file stays; after access is restored, recover completes and the tree is exact) FAIL→PASS. MODE 0644→0755 (git mode change): exit 5, file left as is. MODE RESIDUAL 0640→0600: exit 0, file untouched. Both PASS before and after: regression guards for the rescope, the old code already held them. Shadow suite 82/82, candidates 93/93 (r10-cand.log), both confined; npm run gate PASS. Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run 9bc195fb-0533-47ed-afa3-5ee688b021f4 — VERDICT: BROKEN — Cand 21d3325bacad (=live bytes) frozen in a scratch repo copy; FEAT-175 owns the files live. VALID. P3/P4, one mechanism: a created path written by another writer with post bytes is deleted by refused land (exit 4) and recover (exit 0). Unrepro: shadow-vcs:616 verify set. P1/P2 held; 82/82.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **verify 9bc195fb: last residual accepted; residual summary and final property text:** Verify 9bc195fb-0533-47ed-afa3-5ee688b021f4 held P1 and P2. The one remaining break: another writer puts the lane's EXACT bytes at a path the landing creates, and then a refused land or a recover deletes that file. Orchestrator ruling (with the user's delegation): ACCEPTED RESIDUAL, minor. Reasoning: it needs identical bytes at the identical new path inside the same window (very unlikely); if it happens no content is lost (the bytes are in the journal objects and in the shadow repo); the foreign-edit metric reopens it at 1 or more real harm. The unreproduced line-616 note is not a finding. FINAL PROPERTIES: (P1) an agent's git write is allowed only in a repo that git resolves inside the shadow root, and never changes the real repo; (P2) a landing applies only the lane's own diff and refuses overlaps with nothing written; (P3) a landing never changes or removes a line another in-flight ticket inserted, never changes the git mode it set, and never recreates a file it deleted or deletes one it created; (P4) unland and recover restore every path's bytes and GIT mode exactly from the journal, never delete or overwrite bytes they cannot identify, clear a record only after re-reading every path, and never remove a directory that contains anything; (P5) promotion commits exactly the landed bytes as git stores them. ACCEPTED RESIDUALS: re-adding text another ticket deleted, at any position (5b5f4f4c); full POSIX permission bits beyond git mode (01a12c64); empty-directory presence (8e6313bf); identical bytes written by another writer at a path a landing creates, removed by a refused land or recover (9bc195fb); plus the stated same-uid class (absolute-path git, scrubbed PATH, direct .git tampering, directory-swap races), containers (pilot refused, no protection claimed) and native Windows (refused). All reopen through shadow.mjs metrics / incident at 1 or more harm.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **pilot wired into lane dispatch — plan reviewed, built, proved:** Plan: 'Shadow pilot — wiring into lane dispatch' in this body. Plan review: OpenAI quota spent (resets 2026-10-12 02:58), so a separate Claude Opus process (dispatch.mjs anthropic, session d321f147-7f6d-4a70-9799-c3ceb957ca53): APPROVE-WITH-CHANGES, 9 findings. Dispositions: F1 external dispatch.mjs lanes OUT of scope (claude -p there has neither the git shim nor the file lock; --add-dir would re-open the real tree), they keep today's flow. F2/F3 lane-new runs as an awaited child process (event loop never blocked), bounded by min(90 s, hook timeout - 5 s); on timeout or failure the dispatch falls back unchanged and a meta-less half lane is removed. F4 a local try/catch around the pilot in the Agent branch, so a throw never reaches the orchestrator-profile boundary that denies. F5 dead-heat dispatches (before either lane holds a lock or claim) are both non-pilots: a stated limit, measured by the dispatch metric. F6 a dead foreign lock reads live until its TTL: stated, and own-session lanes are checked against liveLaneIds. F7 a lane is continued only with readable meta, matching project, seed and .git. F8 the charter has no Dispatch-shaped line and no fence, and the prompt must read back as the one ticket. F9 both Agent and Task tool names. A session shim with no shadow root baked (started before the pilot) is also not a pilot, since its lane commits would be refused. BUILT: scripts/lib/shadow-dispatch.mjs (+ .d.mts): pilotForAgentCall. Hot means an existing lane, or a live FEAT-129 lock on a code_refs file held by another lane, or another ticket's claim, candidate or standing landing. Eligibility: one declared ticket, fixing phase, git repo with HEAD, not a container project, not inside a container, not native Windows, code_refs known. src/server/runtime/claude-runtime.ts: the Agent/Task PreToolUse branch composes the Fable reroute and the pilot. scripts/lib/shadow-vcs.mjs: shadowPathsFor (paths without creating). scripts/lib/git-shim.d.mts: shadowRoot on the install handle. PROOFS: scripts/verify-feat-170-dispatch.mjs, scratch server (real src/server/index.ts and ClaudeRuntime, fake CLI scripts/fixtures/feat-170/fake-cli.mjs sending Agent PreToolUse), confined: 16/16 (scratch/feat170-shadow/d3.log). W1 pilot ticket gets the charter (lane, land, freeze) and a lane seeded from the live shared tree; W4 Fable reroute plus pilot. Both FAIL on the pre-wiring runtime (d-before.log) and PASS now. W2 a non-pilot ticket is unchanged, before and after. W3 lane creation failure falls back unchanged and allowed, with no lane left. W5 a thrown pilot error never denies. Direct checks cover a container project, verify phase, no code_refs, timeout, a meta-less half lane, the declaration round-trip and a self-held lock. Regressions: shadow suite 82/82, candidates 93/93, FEAT-124 Fable 51/51 (the reroute decision object is kept, so its source pins hold), FEAT-129 file lock 84/84. npm run gate PASS. Files (unstaged): scripts/lib/shadow-dispatch.mjs, scripts/lib/shadow-dispatch.d.mts, scripts/verify-feat-170-dispatch.mjs, scripts/fixtures/feat-170/fake-cli.mjs, src/server/runtime/claude-runtime.ts, scripts/lib/shadow-vcs.mjs, scripts/lib/git-shim.d.mts, this ticket.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run 418b9dd5-5ea4-4daf-9663-c2c2378abee7 — VERDICT: BROKEN — Dispatch wiring only, range 6032be5c..0f858810 (scratch, =live). VALID. P3/P1 two-break: (a) laneUsable takes valid meta + broken .git as continuation: charter commit/land fail, nothing-hot call gets charter; (b) subdir projectTop realpath vs git toplevel key leaks a permanent lane.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **dispatch wiring: lane location and health deferred to shadow.mjs (verify 418b9dd5):** Verify 418b9dd5-5ea4-4daf-9663-c2c2378abee7 found a two-break in the dispatch wiring: (a) laneUsable accepted a lane whose .git is broken; (b) a project registered at a subdirectory leaked a lane. Independent adjudicator: REDESIGN with a narrow rescope. Single cause: the dispatch code derived its own lane location and health instead of deferring to shadow.mjs. BUILT (scripts/lib/shadow-dispatch.mjs): before anything is created, refuse unless realpath(projectTop) equals the repo toplevel (a subdirectory-registered project gets today's flow). Lane location and health come only from shadow.mjs: a lane is continued only if 'shadow.mjs status T --repo top' exits 0 (its laneDir from that JSON). Exit 6 (new, shadow-vcs NO_LANE_EXIT) means no lane. Any other failure is a broken lane: it goes through the normal hot check and never gets a charter, and the lane is left untouched (no replace, no repair). A NEW lane is checked with shadow.mjs status after lane-new; if it fails, or our lane-new was killed, it is removed with 'shadow.mjs drop --force' (drop now also removes a half-made lane dir with no meta). A lane-new that refused (something already at the lane path) made nothing and nothing is dropped. No probe land/unland (it would write the real tree). laneUsable and dropHalfLane are deleted. PROOFS, each on the pre-redesign code (scratch/feat170-shadow/d-health-before.log, 15/5) and now (d4.log, 20/20, confined; W1-W5 scratch-server checks still pass): HEALTH-1 valid meta but a broken .git, nothing hot: no charter, lane untouched, FAIL then PASS. HEALTH-2 the same with its file hot: falls back, no new lane, FAIL then PASS. HEALTH-3 a subdirectory-registered project: shadow root unchanged, FAIL then PASS. HEALTH-4 a new lane failing status is dropped (status then exits 6), FAIL then PASS. The meta-less half lane not made by this dispatch is left untouched, FAIL then PASS. Shadow suite 82/82, candidates 93/93; npm run gate PASS. Files (unstaged): scripts/lib/shadow-dispatch.mjs, scripts/lib/shadow-vcs.mjs, scripts/verify-feat-170-dispatch.mjs.
+
+### 2026-10-11 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-opus-5 run c9de9bbd-88a9-43e0-81e7-92317377a94a — VERDICT: BROKEN — Dispatch wiring, final post-redesign; trees ee1cdd12..5b754e2e, frozen=live. VALID. P3 two-break: (a) nothing-hot dispatch runs shadow.mjs status first: creates shadow dirs + metrics line; (b) killed lane-new + pre-existing meta-less lane: drop --force rm -rf (shadow-dispatch:217). Suite 20/20.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — worker (fixing, shadow pilot)
+- **wiring RESCOPED to opt-in (verify c9de9bbd, second two-break):** Verify c9de9bbd-88a9-43e0-81e7-92317377a94a BROKEN on the dispatch wiring: a status spawn and side effects on non-hot dispatches; drop --force deleting an old lane's work; and a confirmed regression where Task turned an orchestrator-profile DENY into ALLOW, because the hook returned allow before decide() ran. Independent adjudicator (second two-break): RESCOPE — remove automatic wiring entirely and make the pilot opt-in. Reasoning: the FEAT-129 file lock already prevents two lanes editing one file, so the hook's value is small while its risk spans every dispatch. DONE: deleted scripts/lib/shadow-dispatch.mjs (+ .d.mts), scripts/verify-feat-170-dispatch.mjs and its fake CLI; restored src/server/runtime/claude-runtime.ts byte-for-byte to its pre-wiring state (import gone, the Agent branch matches Agent only, Fable gate unchanged); reverted the dispatch-only shadow-vcs.mjs changes (shadowPathsFor, no-lane exit 6, the half-lane drop --force). Kept shadow.mjs and the candidate tools; the opt-in usage is documented in this body ('Shadow pilot — OPT-IN usage') and in docs/CONVENTIONS.md ('Shadow-repo pilot — OPT-IN, for a chosen hot-file ticket'). PROOFS: scripts/verify-feat-170-optin.mjs (scratch server, real ClaudeRuntime, confined) 6/6 (scratch/feat170-shadow/optin.log): O1 a Task call in an orchestrator-profile session is DENIED; O2 an Agent dispatch for a ticket whose file another live lane holds is not rewritten and creates no shadow lane or project dir and no metrics line (shadow root empty). rg for pilotForAgentCall and shadow-dispatch outside docs: no matches. Shadow suite 82/82, candidates 93/93; npm run gate PASS. State: in_verification (built, not verified: no standing HOLDS; the core tools carry their recorded verdicts and accepted residuals). Files (unstaged): src/server/runtime/claude-runtime.ts (restored), scripts/lib/shadow-vcs.mjs, scripts/lib/git-shim.d.mts, scripts/verify-feat-170-optin.mjs, docs/CONVENTIONS.md, this ticket; deleted scripts/lib/shadow-dispatch.mjs, scripts/lib/shadow-dispatch.d.mts, scripts/verify-feat-170-dispatch.mjs, scripts/fixtures/feat-170/fake-cli.mjs.
+
+### 2026-10-13 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a133e8-f00d-7821-9002-ac92ac8ebd25 — VERDICT: BROKEN — Same-line fix, cand 2b5efd4755d5 (scratch copy). VALID. Claim B two-break: size-3 conflict markers land; an unresolved copy under another name lands. Held: boundaries, newline/repeat lines, abort+re-sync, isolation, re-land, 3 tickets, metrics. Suite 98/98.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-13 — worker (fixing, shadow pilot)
+- **same-line conflicts: detected once, resolved in the lane, land without --allow-revert (research 2026-10-07 4c; OpenAI verify 01a133e8):** Defect (research shadow-default.md 4c, confirmed in code): a same-line conflict between two tickets could not land. sync merged the shared tree, but land's REVERTS-FOREIGN rule (R1) refused every resolution that touched the other ticket's line and always said 'sync again'. A second sync re-raised the same conflict, because the snapshot was always parented on meta.base. Only --allow-revert, which waives property 3 for the whole file, got through, and metrics counted that as resolved with 1 sync or fewer. FIX (scripts/lib/shadow-vcs.mjs, scripts/shadow.mjs): (1) sync locates each conflicted file (histogram, then myers, git's touching-hunk rule), names the file, the lane marker lines and the in-flight tickets whose landed lines sit in the conflict, and records {path, snapshot, shared-tree ranges, with, exact marker lines}. The first refused land (OVERLAP) names the ticket and line too. (2) sync chains on the previous snapshot once the lane holds it, so a resolved conflict is never raised again. (3) Property 3 now reads: land never changes another in-flight ticket's inserted lines UNLESS they are that ticket's lines inside a conflict sync recorded against THAT ticket, on that path, after the lane committed the resolution (the snapshot is in the tip's history). The exemption is per ticket, path and range; the ticket's other lines and all other tickets' lines stay protected. Each resolution used is written to the landing journal (resolved[]) and the metrics. unland restores the records with the base. (4) Leftover markers never land: the exact marker lines sync saw (at the lane's conflict-marker-size) are refused in every landed path, and any 7+ marker on the conflict path. (5) No loop: land advises sync only when it can change the outcome (an overlap, or foreign lines the lane has not seen). Otherwise it says sync will NOT change this. (6) metrics: oneSync excludes waived lands; waived and viaRecordedConflict are added. PROOFS: 19 new checks in scripts/verify-feat-170-shadow.mjs (SL-*), confined. Pre-fix code: scratch/feat170-shadow/r11-before.log, 77/98, every must-FAIL check fails; the P4 failures are the known no-.git copy artefact. Now 101/101 (r12-after.log). VERIFY: OpenAI 01a133e8 on candidate 2b5efd4755d5, frozen in a scratch repo copy. Contract VALID, verdict BROKEN, two mechanisms on claim B: conflict-marker-size=3 markers landed, and an unresolved copy committed under another name landed. Boundaries, history, re-land, three tickets and metrics held. The first OpenAI attempt 01a133df was INVALID (content flagged by the provider). ONE FIX ROUND: exact marker lines recorded at sync and checked on every landed path. Two new checks fail on the 2b5efd candidate (r12-before.log) and pass now. Not re-verified (one round allowed). Shadow 101/101, candidates 93/93 (r12-cand.log), npm run gate PASS. Status: FIXED, not VERIFIED. Files (unstaged): scripts/lib/shadow-vcs.mjs, scripts/shadow.mjs, scripts/verify-feat-170-shadow.mjs.
+
+### 2026-10-13 — worker (fixing, shadow removal)
+- **Note:** **shadow-repo pilot REMOVED; candidate tools kept (user decision 2026-10-13).** EVIDENCE (scratch/process-research-2026-10-07/shadow-default.md): in 45 days no loss would have been prevented by shadow repos alone; lock waits cost 0.6% of time; the pilot added surface incl. a git-write exception in the shim. REMOVED: scripts/shadow.mjs, scripts/lib/shadow-vcs.mjs, scripts/lib/shadow-guard.mjs, scripts/verify-feat-170-shadow.mjs, scripts/verify-feat-170-optin.mjs (no npm scripts referenced them); the shim local allow under the baked shadow root (git-shim.mjs shadowDecision/exec/baked shadowRoot + .d.mts); the shadow root as a FEAT-164 fixture root (agent-git-policy defaultFixtureRoots = scratch, tmp, /work). FEAT-164 helpers (parseGlobals, alias expansion, resolveWriteTarget) moved by mechanical extraction to scripts/lib/git-target.mjs; FEAT-164 suite loader maps pinned fixtures ./shadow-guard.mjs to the pinned r3 fixture; U0b now asserts the exact root set. candidate-store.mjs: one comment reworded (freeze `expect` option kept; logged for the mixed-tree lane); candidate.mjs untouched. PROOFS (confined; BEFORE = reconstructed pre-removal shim+guard, 440 lines matching the pre-deletion count, and the pinned r3 policy): scratch/feat170-shadow-removal/proof.mjs 11/11. An agent commit in a repo under the former shadow root was locally ALLOWED by the shim and treated by the host as a fixture (must-FAIL baseline); now the shim defers to the host, which REFUSES it as an unregistered repo outside the scratch/fixture roots, the same refusal as any such repo (case: refused, not a fixture root). The real shim executable refuses and HEAD does not move; a /tmp fixture is still allowed. rg: no live reference (left: the pinned FEAT-164 historical fixtures + their loader, the CONVENTIONS removal note, an unrelated generic comment in verify-bug-250). SUITES: candidates 93/93; FEAT-164 release 127/127, permanent 41/41, single-authority 31/31, store-authority 28/28, settings-ui 18/18; self-grant 20 pass/2 fail/11 open, IDENTICAL check outcomes on the pre-removal baseline (UA6, H1a pre-existing); npm run gate PASS. REVIEW: OpenAI codex 01a1364f-8821-7501-825a-d75cf6413485: no dangling exception, guard not weakened; 1 low (U0b membership not equality, fixed) + 1 info (verbatim unprovable from HEAD; answered: extraction was sed of the pre-deletion file). Leftover dirs listed in the body section, not deleted. Docs: CONVENTIONS opt-in section replaced by a candidates section.
+
+### 2026-10-13 — worker (fixing, mixed-state verify)
+- **mixed-state verify mode built:** Independent verify no longer fails to START on a shared tree (BUG-255 shape: freeze refused owned; FEAT-164/170/175 dependency cycles; 800 KB working-tree blend). NEW DEFAULT `independent-verify --ticket T [--files a,b] [--mixed]`: uses T's clean candidate when every file is CURRENT (prompt byte-identical to --candidate), else freezes a MIXED-STATE candidate (candidate-store freezeMixed): T's files as they sit in the tree from ONE whole-tree snapshot (the room, so co-owners' untracked companions boot), snapshot bytes checked equal to live, NO claim and NO ticket-state write (never refused for ownership, blocks no one), foreign hunks DISCLOSED (ticket ids + line ranges only; attributed by matching other open candidates' frozen bytes, plus lines present at T's claim), diff limited to T's files, verdict bound to a v3 identity hash (files + room tree + disclosure). candidateStatus flips CHANGED on any later edit; readiness/commit refuse a mixed candidate (binding, not a commit unit); foreignReport ignores mixed candidates. board-tool verified records verify_mode clean-candidate|mixed-state READ FROM THE CANDIDATE, not a flag; echo names it. Also `candidate.mjs mixed`. Files: scripts/independent-verify.mjs, scripts/lib/candidate-store.mjs, scripts/candidate.mjs, scripts/board-tool.mjs, scripts/verify-mixed-state-verify.mjs (new), package.json, scripts/test-manifest.json. PROOFS (npm run verify:mixed-state-verify, confined runner): 32/32 PASS; against the pre-edit copies of the 4 files M1/M2 AFTER checks FAIL and M3 crashes (no hash) = must-FAIL anchors. verify:feat-170 93/93 before and after (clean path unchanged). npm run gate PASS. Unrelated pre-existing: verify:independent-verification 1 fail (node_modules/.bin/ms absent on host), verify:feat-097 commit-path fail on board drift (orphan FEAT-162 row). Residual: attribution is content matching, not line provenance (unlisted hunks may be foreign; 84 of 93 app.js hunks unattributed for BUG-255 because their tickets froze nothing); a repo with clean/smudge filters would read as unstable.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Note:** Owner cell moved off 👤: this decision was answered and an agent has acted since, so the rail already treats it as resolved; the 👤 in INDEX was stale drift (BUG-259 triage). Nothing about the answer or its record changed.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Note:** Correction: the Owner cell is back on 👤. board:check requires 👤 while the record still says human_action decide, and settling that record is outside BUG-259. The earlier note's 'stale drift' stands as an observation only; nothing else changed.

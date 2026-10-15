@@ -238,10 +238,16 @@ console.log('\n=== STEP 3 — launch snapshot: placement + survives truncation =
   const idxNeeds = full.indexOf('Needs you (');
   check('snapshot has the answered section, placed BEFORE the needs-you list',
     idxAnswered !== -1 && idxNeeds !== -1 && idxAnswered < idxNeeds, { idxAnswered, idxNeeds });
-  check('snapshot states the decided-but-not-dispatched instruction',
-    /DECIDED but NOT dispatched/.test(full) && /ask before you begin/.test(full), 'instruction present');
+  // BUG-257: the answer IS the go for a picked option (was "ask before you begin",
+  // which turned every answered card into a second question); a question, a
+  // rejection or an explicit wait in the answer is still not a go.
+  check('snapshot states the answered-not-started instruction: a picked option is the go, a question/rejection/wait is not',
+    // BUG-257 r2: the rule now also says a NOTE governs over the pick (do NOT start on a wait/condition/rejection/question).
+    /no agent has started/.test(full) && /picked option with no note is the user's go/.test(full) && /note governs over the pick/.test(full)
+      && /do NOT start/.test(full) && !/ask before you begin/.test(full), 'instruction present');
   check('snapshot lists an answered ticket with its chosen answer + date',
-    full.includes('BUG-600') && /chose: chose option B/.test(full) && full.includes(`answered ${TODAY}`),
+    // BUG-257 r2: the answer is quoted whole (`> chose option B`), not `chose: <60-char cut>`.
+    full.includes('BUG-600') && /> chose option B/.test(full) && full.includes(`answered ${TODAY}`),
     full.slice(idxAnswered, idxAnswered + 160));
 
   // Deliberately OVERFULL: tiny maxChars that would slice the tail hard. The
@@ -249,7 +255,7 @@ console.log('\n=== STEP 3 — launch snapshot: placement + survives truncation =
   // needs/inflight tail is what truncates.
   const tight = boardStateSection(proj, { maxChars: 300 });
   check('OVERFULL board (maxChars 300): answered section STILL fully present',
-    tight.includes('Answered — awaiting action (3)') && /ask before you begin/.test(tight) &&
+    tight.includes('Answered — awaiting action (3)') && /note governs over the pick/.test(tight) &&
       tight.includes('BUG-600') && tight.includes('BUG-620'),
     { len: tight.length });
   check('OVERFULL board: the TAIL is what truncates (ends with the …ellipsis)',

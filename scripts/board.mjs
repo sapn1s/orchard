@@ -57,6 +57,7 @@ import {
 // migrated project. An explicit --dir still wins. board.mjs is COPIED into
 // targets, so board-path.mjs (also copied) is a plain-ESM sibling import.
 import { resolveBoardDir } from './lib/board-path.mjs';
+import * as DS from './lib/delegation-source.mjs'; // FEAT-184
 // The ONE definition of the ticket format (plan §3 / §8 step 2). board.mjs used
 // to carry its own `isDoneStatus`, its own TICKET_FILE_RE, its own H1 regex and
 // its own row splitter; src/server/tickets.ts and scripts/arch-watch.mjs
@@ -533,6 +534,33 @@ function checkBoard(dir) {
   }
   const answerLedger = loadAnswerLedger(dir);
   if (answerLedger.error) fails.push(`ANSWER LEDGER UNREADABLE: ${ANSWER_LEDGER_FILE} — ${answerLedger.error}`);
+  // FEAT-184 — the sealed store behind adoptions and (once it exists) user answers.
+  {
+    const dd = DS.defaultDataDir();
+    const present = DS.storePresent(dd, dir);
+    const store = present ? DS.loadStore(dd, dir) : null;
+    if (present && !store.ok) {
+      fails.push(`DELEGATION STORE DAMAGED: the sealed delegation/answer store for this board (${DS.storeFiles(dd, dir).file}) does not verify — ${store.damaged}. ` +
+        'No delegation is live and no adoption or post-migration user answer counts until it is restored. Move the file and its .head aside only if you accept losing them.');
+    }
+    for (const f of fs.readdirSync(dir).filter((n) => /^[A-Z]+-\d+.*\.md$/.test(n))) {
+      let rec = null;
+      try { const pt = parseTicket(fs.readFileSync(path.join(dir, f), 'utf8'), { file: f, mode: 'auto' }); rec = pt.format === 'block' ? pt.record : null; } catch { continue; }
+      const id = /^([A-Z]+-\d+)/.exec(f)[1];
+      const answers = Array.isArray(rec?.decision?.answers) ? rec.decision.answers : [];
+      for (const a of answers) {
+        if (!a || typeof a !== 'object') continue;
+        if (a.by === 'agent-under-delegation') {
+          if (!present) warns.push(`UNVERIFIABLE ADOPTION (advisory): ${id} (${f}) carries an adoption under delegation ${a.delegation_id}, but this machine has no delegation store for the board, so it counts for nothing here.`);
+          else if (store.ok && !DS.adoptionReceipt(store, id, a)) {
+            fails.push(`UNVERIFIED ADOPTION: ${id} (${f}) carries an agent-under-delegation entry (answer ${a.answer_id}, delegation ${a.delegation_id}) with no sealed receipt in the delegation store — it was not written by the server's adopt route, so it counts for nothing. Remove it; adopt with \`node scripts/board-tool.mjs adopt\` under a delegation the user recorded.`);
+          }
+        } else if (a.by === 'user' && present && store.ok && DS.storeMigrated(store) && !DS.answerReceipt(store, id, a)) {
+          fails.push(`UNAUTHENTICATED USER ANSWER: ${id} (${f}) carries a by:user answer (${a.answer_id}) with no sealed receipt — it was not written by the server's answer route, so it counts for nothing. Only the user answers, on the Decide card.`);
+        }
+      }
+    }
+  }
   const ledger = loadLedger(dir);
   if (ledger.error) fails.push(`VERIFICATION LEDGER UNREADABLE: ${LEDGER_FILE} — ${ledger.error}`);
   ledger.entries.forEach((e, i) => {
@@ -607,7 +635,7 @@ function checkBoard(dir) {
         : '';
       warns.push(
         `NO INDEPENDENT VERIFICATION (advisory): ${t.id} is ${t.statusRaw} but carries no standing HOLDS ` +
-        `verification${got} — it was verified by whoever fixed it. Run \`node scripts/independent-verify.mjs\` ` +
+        `verification${got} — it was verified by whoever fixed it. Run \`node scripts/independent-verify.mjs --ticket ${t.id}\` ` +
         'and record its verdict with `node scripts/board-tool.mjs verified`, or mark the ticket ' +
         '`Verification-class: trivial` (or `docs-only`) if the threshold genuinely does not apply.'
       );

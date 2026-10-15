@@ -30,6 +30,20 @@ import { listProjects } from './registry.ts';
 
 const ORCHARD_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
+/**
+ * FEAT-190 r10 — every git the host gate runs is pinned to the repo by `cwd` and must NOT be
+ * redirected elsewhere by an inherited `GIT_*` env (the one resolver, gitCommonDirOf, already
+ * scrubs these). The host process is normally env-clean, so this is defence-in-depth, not the live
+ * bypass — but it keeps the gate's `git` acting on the SAME repo every other consumer resolved. An
+ * EMPTY value still counts as set, so delete the keys outright.
+ */
+const GIT_SCRUBBED_ENV: NodeJS.ProcessEnv = (() => {
+  const e = { ...process.env };
+  for (const k of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT']) delete e[k];
+  for (const k of Object.keys(e)) if (/^GIT_CONFIG_(KEY|VALUE)_\d+$/.test(k)) delete e[k];
+  return e;
+})();
+
 /** Absolute path of the gate the host runs — always Orchard's, never the target's copy. */
 export function hostLeakGatePath(): string {
   return path.join(ORCHARD_ROOT, 'scripts', 'leak-gate.mjs');
@@ -47,7 +61,7 @@ export function ownProjectNamesFor(repoPath: string | null | undefined): string[
   if (!repoPath) return [];
   try {
     const top = execFileSync('git', ['rev-parse', '--show-toplevel'], {
-      cwd: repoPath, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'],
+      cwd: repoPath, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'pipe', 'ignore'], env: GIT_SCRUBBED_ENV,
     }).trim();
     const realTop = top ? realOrNull(top) : null;
     if (!realTop) return [];
@@ -75,7 +89,7 @@ export function ownProjectArgs(repoPath: string | null | undefined): string[] {
 function gitAsync(repoPath: string, args: string[], input?: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const cp = execFile('git', args, {
-      cwd: repoPath, encoding: 'utf8', timeout: 10_000, maxBuffer: 256 * 1024 * 1024,
+      cwd: repoPath, encoding: 'utf8', timeout: 10_000, maxBuffer: 256 * 1024 * 1024, env: GIT_SCRUBBED_ENV,
     }, (err, stdout) => { if (err) reject(err); else resolve(stdout as string); });
     // End stdin either way: feed `hash-object --stdin-paths`, and keep a git that ignores
     // stdin from ever waiting on an open pipe.
@@ -176,7 +190,7 @@ export function gateVerdictKey(repoPath: string | null | undefined): string | nu
 export function repoContentFingerprint(repoPath: string | null | undefined): { head: string; entries: string[]; gateKey: string | null } | null {
   if (!repoPath) return null;
   const git = (args: string[], input?: string): string => execFileSync('git', args, {
-    cwd: repoPath, encoding: 'utf8', timeout: 10_000, maxBuffer: 256 * 1024 * 1024,
+    cwd: repoPath, encoding: 'utf8', timeout: 10_000, maxBuffer: 256 * 1024 * 1024, env: GIT_SCRUBBED_ENV,
     stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'ignore'], ...(input === undefined ? {} : { input }),
   });
   try {

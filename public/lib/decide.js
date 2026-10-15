@@ -119,6 +119,94 @@ function renderAnswered(decision, a, onSubmit) {
 }
 
 /**
+ * FEAT-184 — the read-only reading of an ADOPTION: an agent chose the decision's
+ * own recommendation under a delegation YOU recorded. Deliberately NOT the "You
+ * answered" reading — no tick, the agent named as the actor, your delegation quoted
+ * — because an adoption is not your answer. The override form follows it.
+ */
+function renderAdopted(decision, a) {
+  const box = el('div', { class: 'dc-answered dc-adopted' });
+  const d = a.delegation ?? {};
+  // FEAT-184 (fixing r2) — WHO decided is FIXED from the entry kind, never built from
+  // agent-supplied text: an adoption is always "an agent", so a lookalike author
+  // ("you", a Cyrillic/zero-width spoof) can never render as the deciding actor. The
+  // agent's self-named label is shown separately, QUOTED and attributed to the agent.
+  box.append(el('div', { class: 'dc-answered-h' },
+    el('span', { class: 'dc-adopt-k', text: 'Adopted by an agent' }),
+    el('span', { text: `under your delegation on ${a.on} — ${a.awaiting ? 'awaiting an agent' : 'an agent has since acted'}` })));
+  if (a.chose) {
+    const opt = (decision?.options ?? []).find((o) => o.key === a.chose.key);
+    box.append(el('div', { class: 'dc-pick' },
+      el('span', { class: 'dc-k', text: a.chose.key }),
+      inlineInto(el('span', { class: 'dc-pl' }), a.chose.label || opt?.label || '')));
+  }
+  if (d.adopted_by) {
+    box.append(el('div', { class: 'dc-adopt-agent' },
+      el('span', { class: 'dc-adopt-agent-k', text: 'Agent: ' }),
+      el('q', { text: String(d.adopted_by) })));
+  }
+  if (d.statement) {
+    box.append(el('div', { class: 'dc-deleg-quote' },
+      el('span', { class: 'dc-deleg-k', text: 'Your delegation: ' }),
+      el('q', { text: d.statement })));
+  }
+  if (d.revoked) {
+    box.append(el('div', { class: 'dc-deleg-revoked' },
+      el('span', { text: 'You have since revoked this delegation — the adoption stands as recorded, but no new adoption will be accepted under it.' })));
+  }
+  if (a.note) box.append(inlineInto(el('div', { class: 'dc-note-ro' }), a.note));
+  return box;
+}
+
+/**
+ * FEAT-184 — the user's own delegation controls on a pending card: the live
+ * delegations that already cover this ticket (with Revoke), and a fold to record a
+ * new one. Recording goes to a USER-ONLY route; the server refuses an agent caller.
+ */
+function renderDelegate({ ticketId, delegations, onDelegate, onRevoke }) {
+  const wrap = el('div', { class: 'dc-delegate' });
+  const live = (delegations ?? []).filter((x) => x && x.state === 'live');
+  for (const dl of live) {
+    const row = el('div', { class: 'dc-deleg-live' },
+      el('span', { class: 'dc-deleg-k', text: `Delegated to agents until ${String(dl.expires_at).slice(0, 10)}: ` }),
+      el('q', { text: dl.statement }));
+    if (onRevoke) {
+      const rb = el('button', { class: 'dc-deleg-revoke', type: 'button', text: 'Revoke' });
+      rb.addEventListener('click', () => { rb.disabled = true; onRevoke(dl.delegation_id, { failed: () => { rb.disabled = false; } }); });
+      row.append(rb);
+    }
+    wrap.append(row);
+  }
+  if (!onDelegate) return wrap.childNodes.length ? wrap : null;
+  const fold = el('details', { class: 'dc-deleg-fold' });
+  fold.append(el('summary', { text: live.length ? 'Delegate more…' : 'Delegate to agents…' }));
+  // Own class names (never .dc-note / .dc-send / .dc-err): the answer form's
+  // selectors — and the suites that drive it — must keep finding the ANSWER controls.
+  const words = el('textarea', { class: 'dc-deleg-words', rows: '2', placeholder: 'Your words, e.g. “do whatever you recommend”', 'aria-label': 'Your delegation, in your words' });
+  const ids = el('input', { class: 'dc-deleg-ids', type: 'text', value: ticketId || '', 'aria-label': 'Tickets it covers (comma-separated ids)' });
+  const days = el('select', { class: 'dc-deleg-days', 'aria-label': 'Expires after' });
+  for (const n of [7, 30, 90]) days.append(el('option', { value: String(n), text: `${n} days`, ...(n === 30 ? { selected: true } : {}) }));
+  const err = el('div', { class: 'dc-deleg-err', hidden: true });
+  const btn = el('button', { class: 'dc-deleg-send solid', type: 'button', text: 'Record delegation' });
+  const foot = el('div', { class: 'dc-deleg-foot', text: 'Lets an agent adopt only each listed ticket’s RECOMMENDED option, until it expires or you revoke it. An adoption shows as the agent’s, never as your answer, and you can override it.' });
+  const refresh = () => { btn.disabled = !words.value.trim() || !ids.value.trim(); };
+  words.addEventListener('input', refresh); ids.addEventListener('input', refresh); refresh();
+  btn.addEventListener('click', () => {
+    btn.disabled = true; err.hidden = true;
+    onDelegate({
+      statement: words.value.trim(),
+      tickets: ids.value.split(/[\s,]+/).map((x) => x.trim()).filter(Boolean),
+      days: Number(days.value),
+    }, { failed(why) { err.hidden = false; err.textContent = why || 'not recorded'; refresh(); } });
+  });
+  fold.append(el('label', { class: 'dc-deleg-lbl', text: 'Your words' }), words,
+    el('label', { class: 'dc-deleg-lbl', text: 'Tickets it covers' }), ids,
+    el('label', { class: 'dc-deleg-lbl', text: 'Expires after' }), days, err, btn, foot);
+  wrap.append(fold);
+  return wrap;
+}
+
+/**
  * "Add a follow-up" — a small composer under the answered state. It reuses the
  * reply pipeline with a `followup` flag: the server appends a NEW dated entry and
  * keeps the ticket answered-awaiting (owner 👤). The caller re-reads and re-renders
@@ -168,7 +256,7 @@ function renderFollowupForm(decision, onSubmit) {
  * @param {object?}  o.answered  server TicketAnswerState, or null when unanswered
  * @param {Function} o.onSubmit  (reply, ui) => void; reply = { kind, question, chose, note }
  */
-export function createDecideCard({ decision, rich = null, answered, onSubmit }) {
+export function createDecideCard({ decision, rich = null, answered, onSubmit, ticketId = null, delegations = null, onDelegate = null, onRevoke = null }) {
   // The rich record is authoritative about the options when it exists: it carries
   // the same option keys plus the comparison fields the prose parse cannot see.
   const richOpts = rich && Array.isArray(rich.options) && rich.options.length ? rich.options : null;
@@ -177,7 +265,10 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   const stageNow = richOpts ? activeStage(rich) : null;
   const answerable = (opt) => !(mode === 'staged' && Number.isInteger(opt.stage) && Number.isInteger(stageNow) && opt.stage > stageNow);
   const recKeys = recommendedKeys(rich ?? decision);
-  const card = el('div', { class: `tv-decide${richOpts ? ' dc-rich' : ''}`, 'data-state': answered ? 'answered' : 'pending', 'data-mode': mode });
+  // FEAT-184 — an ADOPTION is not your answer: it reads as the agent's, and the
+  // answer form stays available under "Override" (a later answer of yours wins).
+  const adopted = !!answered && answered.by === 'agent-under-delegation';
+  const card = el('div', { class: `tv-decide${richOpts ? ' dc-rich' : ''}`, 'data-state': adopted ? 'adopted' : answered ? 'answered' : 'pending', 'data-mode': mode });
 
   card.append(el('div', { class: 'dc-eyebrow' },
     el('span', { class: 'dc-dot' }),
@@ -191,6 +282,13 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   // A prerequisite is a fact that must be established before this decision is
   // SAFE to make. It is not a caveat on an option, so it sits above the options
   // where it is read before one is picked.
+  // BUG-259 — the card says WHY it is yours: the hard stop it was filed under.
+  // A card filed before the gate has none and shows nothing here.
+  if (rich?.stop) {
+    card.append(el('div', { class: 'dc-stop' },
+      el('span', { class: 'dc-stop-k', text: 'Why this is yours: ' }),
+      el('span', { text: `${rich.stop}${rich.stopConsequence ? ` — ${rich.stopConsequence}` : ''}` })));
+  }
   if (rich?.prerequisite) {
     card.append(inlineInto(
       el('div', { class: 'dc-prereq' }, el('span', { class: 'dc-prereq-k', text: 'First establish: ' })),
@@ -202,14 +300,26 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   // follow-up rides the SAME onSubmit pipeline as the form.
   // (No recommendation echo here: the question now is "what did I answer", and a
   // "Recommends B" beside "You answered C" reads as an argument, not a record.)
-  if (answered) { card.append(renderAnswered(decision, answered, onSubmit)); return { node: card }; }
+  if (answered && !adopted) { card.append(renderAnswered(decision, answered, onSubmit)); return { node: card }; }
+
+  // The form below goes into `host`: the card itself, or — under an adoption — the
+  // Override fold, so the user can answer over the agent's adoption.
+  let host = card;
+  if (adopted) {
+    card.append(renderAdopted(decision, answered));
+    if (!onSubmit) return { node: card };
+    const ov = el('details', { class: 'dc-override' });
+    ov.append(el('summary', { text: 'Override — answer it yourself' }));
+    card.append(ov);
+    host = ov;
+  }
 
   if (rich) {
     // A migrated decision states its recommendation AND the reason, or states
     // honestly that there is none — `recommendation: null` is a correct record
     // (a prerequisite is unproven), not a missing field, so it is said out loud
     // rather than left as an absence the reader has to notice.
-    card.append(recKeys.length
+    host.append(recKeys.length
       ? el('div', { class: 'dc-rec' },
         el('span', { class: 'dc-rec-k', text: `Recommends ${recKeys.join(' + ')}` }),
         rich.recommendation_reason
@@ -219,7 +329,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
         el('span', { class: 'dc-rec-why', text: 'This ticket does not recommend an option.' })));
   } else {
     const rec = recLine(decision, options);
-    if (rec) card.append(rec);
+    if (rec) host.append(rec);
   }
 
   /* ---- the reply form -------------------------------------------------- */
@@ -232,7 +342,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
     seg.append(b);
     segBtns.set(k, b);
   }
-  card.append(seg);
+  host.append(seg);
 
   // `single`/`staged` pick ONE key; `multi` accumulates a set, because BUG-104's
   // real answer was "1 + 2 + 4" and a radio group cannot say that.
@@ -286,7 +396,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
     row.append(mid);
     list.append(row);
   }
-  if (options.length) card.append(optsHead, list);
+  if (options.length) host.append(optsHead, list);
   // The staged plan, stated: what stage 1 answers, and what it unlocks. Without
   // it "you may only answer the first question" is a restriction with no reason.
   if (rich?.mode === 'staged' && rich.stages?.length) {
@@ -299,7 +409,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
         el('span', { class: 'dc-stage-q', text: st.question || '' }),
         st.unlocked_by ? el('span', { class: 'dc-stage-u', text: `unlocked by ${st.unlocked_by}` }) : null));
     }
-    if (plan.childNodes.length) card.append(plan);
+    if (plan.childNodes.length) host.append(plan);
   }
 
   const note = el('textarea', {
@@ -311,7 +421,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   note.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && !btn.disabled) { e.preventDefault(); btn.click(); }
   });
-  card.append(note);
+  host.append(note);
 
   const err = el('div', { class: 'dc-err', hidden: true });
   const btn = el('button', { class: 'dc-send solid', type: 'button', text: 'Record answer' });
@@ -320,7 +430,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   // bottom of its own scroll region — a tall multi-option decision scrolls behind
   // it and the primary action is never stranded below the fold (BUG-107).
   const actions = el('div', { class: 'dc-actions' }, err, btn, foot);
-  card.append(actions);
+  host.append(actions);
 
   function setKind(k) {
     kind = k;
@@ -338,7 +448,7 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   const chosenKeys = () => (mode === 'multi' ? [...pickedSet] : (picked ? [picked] : []));
   const complete = () => (kind === 'decision' ? (!!chosenKeys().length || !!note.value.trim()) : !!note.value.trim());
   function refresh() {
-    if (card.dataset.state !== 'pending') return;
+    if (card.dataset.state !== 'pending' && card.dataset.state !== 'adopted') return;
     btn.disabled = !complete();
   }
 
@@ -363,5 +473,11 @@ export function createDecideCard({ decision, rich = null, answered, onSubmit }) 
   });
 
   setKind('decision');
+  // FEAT-184 — your delegation controls sit BELOW the answer form: answering is the
+  // primary act; delegating is the occasional one.
+  if (!adopted) {
+    const dg = renderDelegate({ ticketId, delegations, onDelegate, onRevoke });
+    if (dg) card.append(dg);
+  }
   return { node: card };
 }

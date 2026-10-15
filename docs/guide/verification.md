@@ -53,8 +53,9 @@ from whoever wrote the fix. This is not a prompt convention; it is enforced by
   instructions, board snapshot and framing — contaminated by construction.
   Verification goes out through `~/scripts/dispatch.mjs` as a **separate process,
   a fresh CLI, its own context**.
-- **A clean room, not just a fresh prompt.** The tree is exported at the reviewed
-  revision into a temp dir and the ambient-instruction surface (`CLAUDE.md`,
+- **A clean room, not just a fresh prompt.** The verified tree — by default the
+  ticket's files as they are (`independent-verify --ticket <ID>`: its current
+  candidate, else a mixed-tree freeze), or a committed revision — is exported into a temp dir and the ambient-instruction surface (`CLAUDE.md`,
   `AGENTS.md`, `.claude/`, `docs/prompts/`, `docs/bugs/`) is **stripped** before
   the verifier starts — so it can't re-import the framing we're decorrelating
   from.

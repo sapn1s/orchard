@@ -376,5 +376,148 @@ ok(fileLockEnabled({}) === true, 'lock ON by default');
 ok(fileLockEnabled({ ORCHARD_ALLOW_FILE_CLOBBER: '1' }) === false, 'hatch disables the lock');
 ok(evaluateFileLock({ toolName: 'Write', toolInput: { file_path: '/x' }, lockDir: '/tmp/nope', owner: 'a', env: { ORCHARD_ALLOW_FILE_CLOBBER: '1' } }).allow, 'hatch open → every mutation allowed');
 
+/* ─────────── 9. ROUND 4 — the 10-11 independent verify's five clobbers (run 34d17925) */
+section('9. round 4 — heredoc / sed --in-place= / subshell / git -C: must-FAIL (synthesized pre-fix key) → PASS');
+{
+  /*
+   * Each case: lane A holds an uncommitted edit on the target. The PRE-FIX
+   * classification is SYNTHESIZED as a fixed literal (CONVENTIONS: never anchor a
+   * must-FAIL to HEAD) — exactly what the round-3 scanner produced, read off the
+   * verify's findings: no mutation at all, or a key that is not the real file.
+   * CONTROL: claiming under that pre-fix shape does NOT protect A, and running
+   * the REAL command in a real shell clobbers A's bytes on disk. POST: the
+   * shipped decision DENIES it (busy, names A), the command is not run, A survives.
+   */
+  const repo = makeRepo('repo-r4');
+  fs.mkdirSync(path.join(repo, 'sub'), { recursive: true });
+  const lockDir = path.join(SCRATCH, 'locks-r4');
+  const A = 'session-A', B = 'session-B';
+  const cases = [
+    { name: "heredoc then redirect: cat <<'EOF' > f", file: 'f.txt', cmd: "cat <<'EOF' > f.txt\nB-OVERWRITE\nEOF", pre: null },
+    { name: 'heredoc piped to tee: cat <<EOF | tee f', file: 'g.txt', cmd: 'cat <<EOF | tee g.txt >/dev/null\nB-OVERWRITE\nEOF', pre: null },
+    { name: 'sed --in-place=.bak (long form with suffix)', file: 'h.txt', cmd: 'sed --in-place=.bak s/A-work/B-OVERWRITE/ h.txt', pre: null },
+    { name: 'subshell (cd sub && sed -i …)', file: 'sub/s.txt', cmd: '(cd sub && sed -i s/A-work/B-OVERWRITE/ s.txt)', pre: 's.txt)' },
+    { name: 'git -C sub checkout -- f', file: 'sub/c.txt', cmd: 'git -C sub checkout -- c.txt', pre: 'c.txt', committed: true },
+  ];
+  for (const c of cases) {
+    const abs = path.join(repo, c.file);
+    write(abs, c.committed ? 'committed\n' : 'A-work\n');
+    if (c.committed) { git(repo, 'add', '.'); git(repo, 'commit', '-qm', `base ${c.file}`); }
+    const arm = () => { write(abs, 'A-work\n'); return evaluateFileLock({ toolName: 'Write', toolInput: { file_path: abs }, lockDir, repoRoot: repo, owner: A }); };
+    ok(arm().allow, `[${c.name}] lane A claims ${c.file}`);
+    // CONTROL (synthesized pre-fix): no mutation → nothing claimed; else the wrong literal key is claimed.
+    const preAllow = c.pre == null ? true
+      : evaluateFileLock({ toolName: 'Write', toolInput: { file_path: c.pre }, lockDir, repoRoot: repo, owner: B }).allow;
+    ok(preAllow, `[${c.name}] CONTROL: the pre-fix classification (${c.pre == null ? 'no mutation' : `key \`${c.pre}\``}) does NOT protect A`);
+    execFileSync('bash', ['-c', c.cmd], { cwd: repo });
+    ok(!read(abs).includes('A-work'), `[${c.name}] CONTROL: the real command CLOBBERS A's uncommitted bytes (bug reproduced on disk)`);
+    try { fs.rmSync(`${abs}.bak`, { force: true }); } catch {}
+    // POST: the shipped decision.
+    arm();
+    const post = evaluateFileLock({ toolName: 'Bash', toolInput: { command: c.cmd }, lockDir, repoRoot: repo, owner: B });
+    ok(!post.allow && post.busy && post.holder?.owner === A, `[${c.name}] POST: DENIED, busy, names lane A`);
+    if (post.allow) execFileSync('bash', ['-c', c.cmd], { cwd: repo });
+    ok(read(abs) === 'A-work\n', `[${c.name}] POST: A's uncommitted work SURVIVES`);
+  }
+  // Non-regression: the shapes the fixes touch must not invent mutations.
+  ok(!scanBashMutation("git commit -m \"$(cat <<'EOF'\nfix: it's done > not-a-file\nEOF\n)\"").mutates,
+    'heredoc body is still DATA: the commit-message idiom (body contains `>`) is not a mutation');
+  ok(!scanBashMutation('cat <<EOF\nhello > x\nEOF').mutates, 'a heredoc with no redirect on its opening line is not a mutation');
+  ok(scanBashMutation('bash <<EOF\nsed -i s/a/b/ sub/z\nEOF').paths?.includes('sub/z'), 'a heredoc FED TO A SHELL is code: its sed -i is seen');
+  ok(JSON.stringify(scanBashMutation('(cd sub; echo > a) > b').paths) === JSON.stringify(['sub/a', 'b']),
+    'subshell cwd is scoped: `cd` inside ( ) does not leak past `)`');
+  ok(!scanBashMutation('sed -n s/a/b/p f').mutates && !scanBashMutation('sed s/a/b/ f > /dev/null').mutates, 'sed without in-place is still not a mutation');
+  ok(JSON.stringify(scanBashMutation('sed -i -e s/a/b/ -e s/c/d/ f').paths) === JSON.stringify(['f']), 'sed -e scripts are not mistaken for files');
+  ok(scanBashMutation('git -C a -C b restore x').paths?.[0] === 'a/b/x', 'successive git -C dirs compose (a/b/x)');
+}
+
+/* ──────── 9b. ROUND 4 — paths built from shell variables: resolve, else a conservative scope */
+section('9b. round 4 — variable-path targets: never a literal key, never a silent skip');
+{
+  const repo = makeRepo('repo-r4-var');
+  fs.mkdirSync(path.join(repo, 'src/seed/content/en'), { recursive: true });
+  fs.mkdirSync(path.join(repo, 'src/other'), { recursive: true });
+  const lockDir = path.join(SCRATCH, 'locks-r4-var');
+  const A = 'session-A', B = 'session-B';
+  const held = path.join(repo, 'src/seed/content/en/home.ts');
+  write(held, 'A-work\n');
+  ok(evaluateFileLock({ toolName: 'Write', toolInput: { file_path: held }, lockDir, repoRoot: repo, owner: A }).allow, 'lane A holds src/seed/content/en/home.ts');
+
+  const loop = 'for f in home about; do echo B > src/seed/content/en/$f.ts; done';
+  // CONTROL (synthesized pre-fix): the target was locked under its LITERAL text.
+  ok(evaluateFileLock({ toolName: 'Write', toolInput: { file_path: path.join(repo, 'src/seed/content/en/$f.ts') }, lockDir, repoRoot: repo, owner: 'pre-fix-literal' }).allow,
+    'CONTROL: the pre-fix literal key `src/seed/content/en/$f.ts` collides with nothing (the illusion of protection)');
+  // Drop the control's literal-key lock so it cannot leak into the POST checks below.
+  for (const lf of fs.readdirSync(lockDir)) { try { if (JSON.parse(read(path.join(lockDir, lf))).owner === 'pre-fix-literal') fs.unlinkSync(path.join(lockDir, lf)); } catch {} }
+  execFileSync('bash', ['-c', loop], { cwd: repo });
+  ok(read(held) === 'B\n', 'CONTROL: the real loop CLOBBERS A\'s file on disk');
+  write(held, 'A-work\n');
+  // POST 1 — resolvable: the for-list pins $f, so the EXACT files are claimed.
+  ok(JSON.stringify(scanBashMutation(loop).paths) === JSON.stringify(['src/seed/content/en/home.ts', 'src/seed/content/en/about.ts']),
+    'a `for f in …` list resolves $f → the exact target paths');
+  const pLoop = evaluateFileLock({ toolName: 'Bash', toolInput: { command: loop }, lockDir, repoRoot: repo, owner: B });
+  ok(!pLoop.allow && pLoop.holder?.owner === A, 'POST: the resolved loop is DENIED on the real key (names A)');
+  ok(read(held) === 'A-work\n', 'POST: A\'s work survives');
+  ok(evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'D=src/seed/content/en; echo B > $D/home.ts' }, lockDir, repoRoot: repo, owner: B }).allow === false,
+    'an in-command assignment (D=…; > $D/home.ts) resolves to the real key → DENIED');
+  ok(evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'echo B > src/seed/content/en/{home,x}.ts' }, lockDir, repoRoot: repo, owner: B }).allow === false,
+    'a brace list resolves to the real key → DENIED');
+
+  // POST 2 — unresolvable: a conservative check on the static directory prefix.
+  const unres = 'echo B > src/seed/content/en/$NAME.ts';
+  const cls = scanBashMutation(unres);
+  ok(cls.mutates && !cls.paths.length && cls.scopes?.[0]?.dir === 'src/seed/content/en', 'an unassigned $NAME is NOT given a literal key: it becomes a scope on its static dir');
+  const pScope = evaluateFileLock({ toolName: 'Bash', toolInput: { command: unres }, lockDir, repoRoot: repo, owner: B });
+  ok(!pScope.allow && pScope.holder?.owner === A && pScope.scope === 'src/seed/content/en', 'POST: unresolvable target with a foreign lock in its dir → DENIED (scope named)');
+  ok(/cannot be resolved/.test(pScope.reason || '') && /Spell the target/.test(pScope.reason || ''), 'the refusal says why and how to unblock (spell the path out)');
+  ok(evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'echo B > src/other/$NAME.ts' }, lockDir, repoRoot: repo, owner: B }).allow,
+    'no false busy: an unresolvable target in a DIFFERENT dir (no foreign lock there) is allowed');
+  const lead = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'echo B > "$1"' }, lockDir, repoRoot: repo, owner: B });
+  ok(!lead.allow && lead.scope === '', 'a LEADING unresolved var could point anywhere → checked against the whole tree → DENIED while A holds a file');
+  // Temp targets are outside the project: no lock, no false busy.
+  ok(!scanBashMutation('S=$(mktemp -d); echo x > $S/out.txt').mutates, '$(mktemp -d) targets are outside the project → not a project mutation');
+  ok(!scanBashMutation('echo x > "$TMPDIR/x"').mutates, '$TMPDIR targets are outside the project');
+  ok(scanBashMutation('T=$(mktemp -p src/seed); echo x > $T').scopes?.[0]?.dir === 'src/seed', 'mktemp -p DIR lands under DIR → scoped there, not treated as outside');
+  // Globs resolve against the disk.
+  const gl = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'sed -i s/A/B/ src/seed/content/en/*.ts' }, lockDir, repoRoot: repo, owner: B });
+  ok(!gl.allow && gl.holder?.owner === A, 'a glob target expands against the disk → the held match DENIES');
+  // A solo lane is unaffected by its own scope.
+  ok(evaluateFileLock({ toolName: 'Bash', toolInput: { command: unres }, lockDir, repoRoot: repo, owner: A }).allow, 'the holder itself is never blocked by its own lock in the scope');
+}
+
+/* ──────── 9c. ROUND 4 — container and host sessions of one project share one key namespace */
+section('9c. round 4 — container (/workspace/<id>) vs host session on the same project');
+{
+  const repo = makeRepo('repo-r4-mode');
+  fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+  const lockDir = path.join(SCRATCH, 'locks-r4-mode'); // ONE dir per project id — same for both modes
+  const WS = '/workspace/proj-123';
+  const HOST = 'host-session', CTR = 'container-session';
+  const f = path.join(repo, 'src/a.ts');
+  write(f, 'host-work\n');
+  ok(evaluateFileLock({ toolName: 'Write', toolInput: { file_path: f }, lockDir, repoRoot: repo, owner: HOST }).allow, 'host session holds src/a.ts');
+  // CONTROL (synthesized pre-fix wiring: no alias) — the container path keys absolute, collides with nothing.
+  ok(lockKeyFor(`${WS}/src/a.ts`, repo) !== lockKeyFor(f, repo), 'CONTROL: without the alias, /workspace/<id>/src/a.ts and the host path are TWO keys');
+  ok(evaluateFileLock({ toolName: 'Write', toolInput: { file_path: `${WS}/src/a.ts` }, lockDir, repoRoot: repo, owner: CTR }).allow,
+    'CONTROL: so the container session\'s Write is ALLOWED over the host session\'s held file (the cross-mode gap)');
+  // POST — the shipped wiring declares the CLI-side repo path as an alias.
+  ok(lockKeyFor(`${WS}/src/a.ts`, repo, [WS]) === 'src/a.ts', 'POST: with the alias the container path keys `src/a.ts`, the host key');
+  const w = evaluateFileLock({ toolName: 'Write', toolInput: { file_path: `${WS}/src/a.ts` }, lockDir, repoRoot: repo, pathAliases: [WS], owner: CTR + '2' });
+  ok(!w.allow && w.holder?.owner === HOST, 'POST: container Write to the host-held file is DENIED (names the host session)');
+  const b = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `cd ${WS} && sed -i s/a/b/ src/a.ts` }, lockDir, repoRoot: repo, pathAliases: [WS], owner: CTR + '3' });
+  ok(!b.allow && b.holder?.owner === HOST, 'POST: container Bash `cd /workspace/<id> && sed -i` is DENIED too');
+  // Reverse direction: container claims, host is refused.
+  const g = path.join(repo, 'src/b.ts');
+  ok(evaluateFileLock({ toolName: 'Write', toolInput: { file_path: `${WS}/src/b.ts` }, lockDir, repoRoot: repo, pathAliases: [WS], owner: CTR }).allow, 'container session holds src/b.ts (via /workspace path)');
+  const h = evaluateFileLock({ toolName: 'Write', toolInput: { file_path: g }, lockDir, repoRoot: repo, owner: HOST });
+  ok(!h.allow && h.holder?.owner === CTR, 'POST: host Write to the container-held file is DENIED (names the container session)');
+  // Wiring pins: the bridge declares the alias and the runtime passes it.
+  const rt = read(path.join(REPO_ROOT, 'src/server/runtime/claude-runtime.ts'));
+  const br = read(path.join(REPO_ROOT, 'src/server/agent-bridge.ts'));
+  ok(/pathAliases: config\.fileLockPathAliases \?\? \[\]/.test(rt), 'the shipped hook passes config.fileLockPathAliases to evaluateFileLock');
+  ok(/fileLockPathAliases: this\.cwd && this\.cwd !== opts\.project\.hostPath \? \[this\.cwd\] : undefined/.test(br), 'the bridge declares the container cwd as the alias');
+  ok(/path\.join\(dataDir\(\), 'file-locks', fileLockProjectKey/.test(rt) && /gitGrantKey: opts\.project\.id/.test(br), 'the lock DIR is keyed by project id for both modes (one namespace)');
+}
+
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

@@ -44,15 +44,23 @@ against an honest one that could only test what it already thought of.
   the round, do not commission it.
 
 ## How to run it
-1. **Dispatch it out of process.** `node scripts/independent-verify.mjs
-   --repo <dir> --range <A..B> --requirement @<file> --run "<test command>"
-   --test-file <fixer's test>`. It wraps `scripts/dispatch.mjs`, so the
-   verifier is a fresh CLI with its own context.
+1. **Dispatch it out of process, on the ticket's files as they are.** The
+   default is `node scripts/independent-verify.mjs --ticket <ID>
+   --requirement @<file> --run "<test command>" --test-file <fixer's test>`.
+   It uses the ticket's frozen candidate while it is current, and otherwise
+   falls back by itself to a mixed-tree freeze of the ticket's files in the
+   shared tree (other tickets' hunks are shown to the verifier, attributed).
+   Add `--files a,b` when the ticket has no candidate or claim; `--mixed`
+   skips the candidate attempt. **Do not hand-build a candidate** (an exported
+   HEAD plus re-applied hunks, untangle scripts, a scratch two-commit repo):
+   one verify lane spent 34 min doing that (measured 2026-10-14). Use
+   `--range <A..B>` only for already-committed work. It wraps
+   `scripts/dispatch.mjs`, so the verifier is a fresh CLI with its own context.
    **Not a Task subagent** — those are in-process and inherit this session's
    instructions, board snapshot and framing. Contaminated by construction; the
    convenience is exactly what makes them useless here.
-2. **Clean room, not just a clean prompt.** The script exports the tree at the
-   reviewed revision into a temp dir and removes the ambient-instruction
+2. **Clean room, not just a clean prompt.** The script exports the verified tree (the
+   ticket's candidate or mixed freeze, or a committed revision) into a temp dir and removes the ambient-instruction
    surface agent CLIs auto-discover (`CLAUDE.md`, `AGENTS.md`, `.claude/`) plus
    `docs/prompts/` and `docs/bugs/`. The verifier should not know our board,
    our methodology, or who wrote the code. That is cheaper as well as less

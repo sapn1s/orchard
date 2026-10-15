@@ -319,6 +319,15 @@ function tokenizeSegments(str) {
     if (ch === '\n' || ch === ';') { pushSeg(); i++; continue; }
     if (ch === '&') { pushSeg(); i += str[i + 1] === '&' ? 2 : 1; continue; }
     if (ch === '|') { pushSeg(); i += str[i + 1] === '|' ? 2 : 1; continue; }
+    /*
+     * Round 4 (10-11 verify): a SUBSHELL `( … )` is its own scope. Unhandled,
+     * `(cd sub && sed -i s/a/b/ f)` tokenised as head `(cd` (so the cd was never
+     * applied) and target `f)` — the clobber walked straight past. `(` / `)` now
+     * close the current segment and emit scope markers; the scanner pushes and
+     * pops its cwd/vars on them, exactly as bash scopes a subshell.
+     */
+    if (ch === '(') { pushSeg(); segments.push([SUB_OPEN]); i++; continue; }
+    if (ch === ')') { pushSeg(); segments.push([SUB_CLOSE]); i++; continue; }
     // Redirections: `>` and `>|` truncate (clobber); `>>` appends (not a clobber).
     // Also `N>` (fd-prefixed). Emit a marker so the next token is read as target.
     if (ch === '>') {
@@ -333,6 +342,9 @@ function tokenizeSegments(str) {
   pushSeg();
   return segments;
 }
+
+const SUB_OPEN = '__SUB_OPEN__';
+const SUB_CLOSE = '__SUB_CLOSE__';
 
 const NOOP_HEADS = new Set(['command', 'nohup', 'time', 'builtin', '!', '{', '}',
   'then', 'else', 'elif', 'do', 'done', 'fi', 'in', 'if', 'for', 'while', 'until', 'case', 'esac', 'sudo']);
@@ -356,15 +368,22 @@ const GIT_TREE_MUTATORS = new Set([
 const GIT_GLOBAL_VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree',
   '--namespace', '--exec-path', '--config-env', '--super-prefix', '--attr-source']);
 
-/** Skip git's global options to reach the subcommand + its args. */
+/**
+ * Skip git's global options to reach the subcommand + its args. Also returns the
+ * `-C <dir>` chain (round 4, 10-11 verify): git resolves pathspecs against the
+ * `-C` dir, so `git -C sub checkout -- f` rewrites `sub/f` — keying it `f` let a
+ * lock on `sub/f` be bypassed. Successive `-C`s compose, as git documents.
+ */
 function gitSubcommand(tokens) {
   let i = 0; // tokens here EXCLUDE the leading 'git'
+  const cdirs = [];
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === '--version' || t === '--help' || t === '-h') return null;
+    if (t === '-C') { if (tokens[i + 1] != null) cdirs.push(tokens[i + 1]); i += 2; continue; }
     if (GIT_GLOBAL_VALUE_OPTS.has(t)) { i += 2; continue; }
     if (t.startsWith('-')) { i++; continue; }
-    return { sub: t, args: tokens.slice(i + 1) };
+    return { sub: t, args: tokens.slice(i + 1), cdirs };
   }
   return null;
 }
@@ -442,55 +461,285 @@ function redirTargets(tokens) {
 /** Trailing bare (non-flag) positionals of an arg list. */
 function positionals(args) { return args.filter((a) => !a.startsWith('-')); }
 
+/* ── Heredocs (round 4, 10-11 verify) ───────────────────────────────────────────
+ * A heredoc BODY is data, but everything else on its opening line is code. The
+ * old scanner cut the whole command at the first `<<`, so `cat <<'EOF' > f` and
+ * `cat <<EOF | tee f` — the commonest agent file-writing idiom — dropped the
+ * `> f` / `| tee f` that FOLLOWS the operator and classified as no mutation.
+ * Now: per line, each `<<[-]DELIM` operator is removed IN PLACE (the rest of the
+ * line is kept), and the body lines up to the delimiter are lifted out. A body
+ * fed to a shell (`bash <<EOF`, `sudo sh -s <<EOF`) IS code and is scanned too.
+ * Quote-unaware on purpose, like the old cut: `"$(cat <<'EOF' … EOF)"` (the
+ * commit-message idiom) puts the operator inside double quotes, and bash still
+ * parses it as a heredoc there.
+ */
+const HEREDOC_OP = /(^|[^<])<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_.-]*)\3/g;
+function splitHeredocs(command) {
+  const lines = command.split('\n');
+  const out = []; const bodies = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const ops = [];
+    out.push(line.replace(HEREDOC_OP, (_m, pre, dash, _q, delim, offset) => {
+      ops.push({ dash: !!dash, delim, before: line.slice(0, offset + pre.length) });
+      return `${pre} `;
+    }));
+    for (const op of ops) {
+      const body = [];
+      while (i + 1 < lines.length) {
+        const l = lines[++i];
+        const cmp = op.dash ? l.replace(/^\t+/, '') : l;
+        if (cmp === op.delim || cmp.trim() === op.delim) break;
+        body.push(l);
+      }
+      bodies.push({ body: body.join('\n'), before: op.before });
+    }
+  }
+  return { src: out.join('\n'), bodies };
+}
+/** Does the text before a heredoc operator end in a shell that will EXECUTE the body? */
+function heredocFeedsShell(before) {
+  const segs = tokenizeSegments(before).filter((s) => s[0] !== SUB_OPEN && s[0] !== SUB_CLOSE);
+  const last = segs[segs.length - 1];
+  if (!last) return false;
+  const h = headOf(stripRedirs(last));
+  return !!h && EXEC_C.has(h.head) && !h.args.includes('-c');
+}
+
+/* ── Unexpanded shell syntax in a write target (round 4) ────────────────────────
+ * A target like `src/seed/content/en/$f.ts` used to be locked under its LITERAL
+ * text, a key no real write ever produces — so it collided with nothing and the
+ * write was waved through with an illusion of protection. Measured on this
+ * machine's transcripts (170k Bash calls): a THIRD of all path-mutating commands
+ * carry such a target, half with a LEADING variable (`$S/x`, `~/x`, `$D/x` —
+ * mostly scratch dirs assigned earlier in the same command).
+ *
+ * So the policy is RESOLVE FIRST, then be conservative about the remainder:
+ *  1. Resolve what the command itself pins: `X=lit` / `export X=…` assignments
+ *     (in order, subshell-scoped), `for f in a b c` lists, brace lists `{a,b}`,
+ *     `~` / `$HOME`, `$PWD`. Those become EXACT keys and are held like any path.
+ *  2. A temp target (`$(mktemp …)` without an explicit dir, `$TMPDIR`) is outside
+ *     the project and cannot clobber its tree → no lock.
+ *  3. What is still unresolved (`$1`, `$(cmd)`, an unassigned var, `read f`)
+ *     becomes a SCOPE: the static directory prefix before the first unresolved
+ *     piece. The decision then refuses if ANY live foreign lock sits under that
+ *     directory — or under the whole tree when even the root is unknown (a
+ *     leading unresolved var could point anywhere). Check-only, no hold: holding
+ *     a directory for a lane's whole life would wedge every other session out of
+ *     it. Never a literal key, never a silent skip.
+ * Markers are private code points the tokenizer passes through untouched.
+ */
+const UNK = '\u0001'; // unresolvable expansion
+const OUT = '\u0002'; // rooted in a temp dir — outside any project tree
+const MAX_EXPANSIONS = 64;
+const VAR_REF = /\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*)|\{[^}]*\}|[0-9@*#?$!-])/;
+
+/** `$(mktemp …)` → where its output lives: OUT (temp dir), DIR/UNK (explicit dir), or UNK. */
+function mktempValue(body) {
+  const segs = tokenizeSegments(body);
+  if (segs.length !== 1) return UNK;
+  const h = headOf(stripRedirs(segs[0]));
+  if (!h || h.head !== 'mktemp') return UNK;
+  let dir = null, tflag = false; const pos = [];
+  for (let k = 0; k < h.args.length; k++) {
+    const a = h.args[k];
+    if (a === '-p') { dir = h.args[++k] ?? ''; continue; }
+    if (a === '--tmpdir') { tflag = true; continue; }
+    if (a.startsWith('--tmpdir=')) { dir = a.slice('--tmpdir='.length); continue; }
+    if (a.startsWith('--')) continue;
+    if (a.startsWith('-p') && a.length > 2) { dir = a.slice(2); continue; }
+    if (a.startsWith('-')) { if (a.slice(1).includes('t')) tflag = true; continue; }
+    pos.push(a);
+  }
+  if (dir != null && dir !== '') return `${dir.replace(/\/+$/, '')}/${UNK}`;
+  if (tflag || dir === '' || !pos.length) return OUT;
+  return pos[0].includes('/') ? `${path.posix.dirname(pos[0])}/${UNK}` : UNK; // a bare template lands in cwd
+}
+
+/** One level of brace-list expansion (`a/{b,c}.ts`), recursive; null when it explodes. */
+function braceExpand(s) {
+  const m = /(^|[^$])\{([^{}]*,[^{}]*)\}/.exec(s);
+  if (!m) return [s];
+  const start = m.index + m[1].length; const end = start + m[2].length + 2;
+  const out = [];
+  for (const alt of m[2].split(',')) {
+    const sub = braceExpand(s.slice(0, start) + alt + s.slice(end));
+    if (!sub) return null;
+    out.push(...sub);
+    if (out.length > MAX_EXPANSIONS) return null;
+  }
+  return out;
+}
+
+/** Expand one shell word against the statically-known vars → candidate strings (may hold UNK/OUT). */
+function expandWord(word, vars, home) {
+  let words = braceExpand(word) ?? [UNK];
+  words = words.map((w) => (w === '~' ? home : w.startsWith('~/') ? home + w.slice(1) : /^~[^/]/.test(w) ? UNK + w.slice(w.indexOf('/') >>> 0) : w));
+  for (let guard = 0; guard < 16; guard++) {
+    let changed = false; const next = [];
+    for (const w of words) {
+      const m = VAR_REF.exec(w);
+      if (!m) { next.push(w); continue; }
+      changed = true;
+      const name = m[1] || m[2];
+      let vals;
+      if (!name) vals = [UNK];
+      else if (vars.has(name)) vals = vars.get(name);
+      else if (name === 'HOME') vals = [home];
+      else if (name === 'PWD') vals = ['.'];
+      else if (name === 'TMPDIR' || name === 'TMP' || name === 'TEMP') vals = [OUT];
+      else vals = [UNK];
+      for (const v of vals) next.push(w.slice(0, m.index) + v + w.slice(m.index + m[0].length));
+    }
+    words = next.length > MAX_EXPANSIONS ? [UNK] : next;
+    if (!changed) break;
+  }
+  return words;
+}
+
+/**
+ * Place an expanded word relative to the effective cwd →
+ *   { kind:'path', path } | { kind:'scope', dir: string|null } | { kind:'outside' }.
+ * `dir: null` = the root itself is unknown (a leading unresolved piece);
+ * `dir: ''` = the command's start dir (the repo root).
+ */
+function placeExpanded(p, cwd) {
+  if (p.startsWith(OUT)) return { kind: 'outside' };
+  p = p.split(OUT).join(UNK);
+  if (p.startsWith(UNK)) return { kind: 'scope', dir: null };
+  let full;
+  if (path.posix.isAbsolute(p)) full = p;
+  else if (cwd.startsWith(OUT)) return { kind: 'outside' };
+  else if (cwd.startsWith(UNK)) return { kind: 'scope', dir: null };
+  else full = cwd ? `${cwd}/${p}` : p;
+  const u = full.indexOf(UNK);
+  if (u < 0) return { kind: 'path', path: path.posix.normalize(full) };
+  const prefix = full.slice(0, u);
+  const slash = prefix.lastIndexOf('/');
+  const dir = slash >= 0 ? prefix.slice(0, slash) : '';
+  if (path.posix.isAbsolute(full) && !dir) return { kind: 'scope', dir: null };
+  return { kind: 'scope', dir: dir ? path.posix.normalize(dir) : '' };
+}
+
+const DECLARE_HEADS = new Set(['export', 'local', 'declare', 'readonly', 'typeset']);
+
 /**
  * Scan a Bash command for whole-file / git-tree mutations and their targets.
- * Recurses into `sh -c '…'` / `eval` / command substitutions and `env` preambles
- * (the same evasions git-write-policy covers). Read-only commands, appends, and
- * anything unrecognised are NOT mutations — the lock never fires on `ls`/`npm
- * test`/a git read, so two lanes on DIFFERENT files never contend (requirement 5).
+ * Recurses into `sh -c '…'` / `eval` / command substitutions / shell-fed heredocs
+ * and `env` preambles (the same evasions git-write-policy covers). Read-only
+ * commands, appends, and anything unrecognised are NOT mutations — the lock never
+ * fires on `ls`/`npm test`/a git read, so two lanes on DIFFERENT files never
+ * contend (requirement 5).
+ *
+ * Returns `{ mutates:false }`, `{ mutates:true, tree:true, kind }`, or
+ * `{ mutates:true, paths:[…], scopes:[{dir, raw}], kind }` — `scopes` are the
+ * unresolvable targets (see the round-4 block above); `dir:null` means "anywhere".
  */
-export function scanBashMutation(command, depth = 0) {
+export function scanBashMutation(command, depth = 0, ctx = null) {
   if (typeof command !== 'string' || depth > 6) return { mutates: false };
+  const home = (ctx && ctx.home) || os.homedir();
+  let vars = new Map(ctx && ctx.vars ? ctx.vars : []);
 
-  // Heredoc bodies are DATA — decide the opening line, but KEEP a redirect target
-  // on that line (`cat > f <<EOF` clobbers f). Drop only the body.
-  const heredoc = command.search(/<<-?\s*['"]?[A-Za-z_]/);
-  const src = heredoc >= 0 ? command.slice(0, heredoc) : command;
+  const { src, bodies } = splitHeredocs(command);
 
+  // Command substitutions become a marker IN the word they sit in (`"$(pwd)/f"`
+  // stays one unresolved word rather than collapsing to `/f`); `$(mktemp)` is
+  // placed (temp dir vs explicit dir). Their bodies are scanned for mutations too.
   const subs = [];
   const flattened = src
-    .replace(/\$\(([^()]*)\)/g, (_m, b) => { subs.push(b); return ' '; })
-    .replace(/`([^`]*)`/g, (_m, b) => { subs.push(b); return ' '; });
-  for (const body of subs) { const r = scanBashMutation(body, depth + 1); if (r.mutates) return r; }
+    .replace(/\$\(([^()]*)\)/g, (_m, b) => { subs.push(b); return mktempValue(b); })
+    .replace(/`([^`]*)`/g, (_m, b) => { subs.push(b); return mktempValue(b); });
 
   const allPaths = [];
+  const scopes = [];
   let kind = null;
   /*
    * The command's EFFECTIVE cwd, tracked across `&&`/`;`-joined segments so a
-   * `cd sub && sed -i f` keys `f` as `sub/f`, not `f` (round-1 gap #b — a lane
-   * holding `sub/f` and this one would otherwise get divergent keys and both
-   * "own" the file). Relative to the command's start dir (the repo root the tool
-   * runs in); `push()` prefixes it onto relative targets so the caller's
-   * `lockKeyFor` resolves them correctly. An absolute `cd` switches the base.
+   * `cd sub && sed -i f` keys `f` as `sub/f`, not `f` (round-1 gap #b), and
+   * scoped by subshells (round 4). Relative to the command's start dir (the repo
+   * root the tool runs in). May itself carry UNK/OUT when `cd` went somewhere
+   * unresolvable or temporary.
    */
   let cwd = '';
-  const push = (p) => { if (p) allPaths.push(path.isAbsolute(p) ? p : (cwd ? path.join(cwd, p) : p)); };
+  const stack = [];
+  const place = (e, raw) => {
+    const r = placeExpanded(e, cwd);
+    if (r.kind === 'path') allPaths.push(r.path);
+    else if (r.kind === 'scope') scopes.push({ dir: r.dir, raw });
+  };
+  const push = (p) => { if (p) for (const e of expandWord(p, vars, home)) place(e, p); };
+  /** Fold a recursive scan's result in, re-rooted at the current cwd. */
+  const merge = (r) => {
+    if (!r || !r.mutates) return null;
+    if (r.tree) return r;
+    for (const p of r.paths || []) place(p, p);
+    for (const s of r.scopes || []) {
+      if (s.dir == null) scopes.push(s);
+      else place(`${s.dir ? `${s.dir}/` : ''}${UNK}`, s.raw);
+    }
+    kind ??= r.kind;
+    return null;
+  };
+  const sub = (cmd) => merge(scanBashMutation(cmd, depth + 1, { vars, home }));
+
+  for (const body of subs) { const t = sub(body); if (t) return t; }
+  for (const b of bodies) if (heredocFeedsShell(b.before)) { const t = sub(b.body); if (t) return t; }
+
   for (const rawTokens of tokenizeSegments(flattened)) {
+    if (rawTokens[0] === SUB_OPEN) { stack.push({ cwd, vars: new Map(vars) }); continue; }
+    if (rawTokens[0] === SUB_CLOSE) { const f = stack.pop(); if (f) { cwd = f.cwd; vars = f.vars; } continue; }
+
     // Any truncating redirect in this segment clobbers its target file, whatever
     // the command is (`git show HEAD:f > f`, `node gen.mjs > f`, `cat a b > f`).
     for (const t of redirTargets(rawTokens)) if (t && !isDiscardRedirTarget(t)) { push(t); kind ??= 'redirect'; }
 
     const tokens = stripRedirs(rawTokens);
+
+    // Static variable bindings (round 4). A segment of ONLY assignments, or an
+    // export/local/declare, binds for later segments; `for v in …` binds v to the
+    // list; `read v` binds v to "unknown". A prefix assignment on a command
+    // (`X=1 cmd`) scopes to that command only and is not recorded.
+    if (tokens.length && tokens.every((t) => ASSIGNMENT.test(t))) {
+      for (const t of tokens) { const eq = t.indexOf('='); vars.set(t.slice(0, eq), expandWord(t.slice(eq + 1), vars, home)); }
+      continue;
+    }
+    if (tokens[0] === 'for' && tokens[1]) {
+      vars.set(tokens[1], tokens[2] === 'in' ? tokens.slice(3).flatMap((w) => expandWord(w, vars, home)) : [UNK]);
+      continue;
+    }
+
     const h = headOf(tokens);
     if (!h) continue;
     const { head, args } = h;
 
-    // `cd DIR` shifts the effective cwd for every LATER segment. `cd -` / `cd`
-    // (to $OLDPWD / $HOME) is not statically resolvable → leave cwd unchanged
-    // (conservative: the following mutation keys against the last known dir).
+    if (DECLARE_HEADS.has(head)) {
+      for (const a of args) { if (ASSIGNMENT.test(a)) { const eq = a.indexOf('='); vars.set(a.slice(0, eq), expandWord(a.slice(eq + 1), vars, home)); } }
+      continue;
+    }
+    if (head === 'read') { for (const a of positionals(args)) vars.set(a, [UNK]); continue; }
+
+    // `cd DIR` shifts the effective cwd for every LATER segment (until the
+    // enclosing subshell closes). `cd -` / bare `cd` is not statically resolvable
+    // → leave cwd unchanged (conservative: keys against the last known dir).
     if (head === 'cd') {
       const dir = args.find((a) => !a.startsWith('-'));
-      if (dir) cwd = path.isAbsolute(dir) ? dir : (cwd ? path.join(cwd, dir) : dir);
+      if (dir) {
+        const ex = expandWord(dir, vars, home);
+        let r;
+        if (ex.length === 1) r = placeExpanded(ex[0], cwd);
+        else {
+          // Several candidates (a `for d in a b` var): scope to their common dir.
+          const placed = ex.map((e) => placeExpanded(e, cwd));
+          if (placed.every((x) => x.kind === 'path')) {
+            const parts = placed.map((x) => x.path.split('/'));
+            const common = [];
+            for (let k = 0; parts.every((p) => k < p.length - 1 && p[k] === parts[0][k]); k++) common.push(parts[0][k]);
+            const j = common.join('/');
+            r = { kind: 'scope', dir: j ? j : (path.posix.isAbsolute(placed[0].path) ? null : '') };
+          } else r = { kind: 'scope', dir: null };
+        }
+        cwd = r.kind === 'path' ? r.path : r.kind === 'outside' ? OUT : r.dir ? `${r.dir}/${UNK}` : UNK;
+      }
       continue;
     }
 
@@ -499,7 +748,10 @@ export function scanBashMutation(command, depth = 0) {
       if (parsed && GIT_TREE_MUTATORS.has(parsed.sub)) {
         const tgt = gitMutationTarget(parsed.sub, parsed.args);
         if (tgt.tree) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
-        for (const p of tgt.paths) push(p);
+        // `git -C a -C b …` resolves pathspecs under a/b (absolute -C resets the base).
+        let pre = '';
+        for (const d of parsed.cdirs) pre = path.posix.isAbsolute(d) ? d : (pre ? `${pre}/${d}` : d);
+        for (const p of tgt.paths) push(pre && !path.posix.isAbsolute(p) ? `${pre}/${p}` : p);
         kind = `git ${parsed.sub}`;
       }
       continue;
@@ -514,16 +766,15 @@ export function scanBashMutation(command, depth = 0) {
         if (a.startsWith('-')) { j++; continue; }
         break;
       }
-      const r = scanBashMutation(args.slice(j).join(' '), depth + 1);
-      if (r.mutates) { if (r.tree) return r; for (const p of r.paths) push(p); }
+      const t = sub(args.slice(j).join(' ')); if (t) return t;
       continue;
     }
     if (EXEC_C.has(head)) {
       const ci = args.indexOf('-c');
-      if (ci >= 0 && args[ci + 1] != null) { const r = scanBashMutation(args[ci + 1], depth + 1); if (r.mutates) { if (r.tree) return r; for (const p of r.paths) push(p); } }
+      if (ci >= 0 && args[ci + 1] != null) { const t = sub(args[ci + 1]); if (t) return t; }
       continue;
     }
-    if (head === 'eval') { const r = scanBashMutation(args.join(' '), depth + 1); if (r.mutates) { if (r.tree) return r; for (const p of r.paths) push(p); } continue; }
+    if (head === 'eval') { const t = sub(args.join(' ')); if (t) return t; continue; }
 
     // Whole-file overwriters. `cp/mv/install` clobber their DESTINATION (last
     // positional); `tee`/`dd`/`truncate`/`sed -i` clobber named files.
@@ -538,9 +789,39 @@ export function scanBashMutation(command, depth = 0) {
     }
     if (head === 'dd') { const of = args.find((a) => a.startsWith('of=')); if (of) { push(of.slice(3)); kind = 'dd'; } continue; }
     if (head === 'truncate') { for (const p of positionals(args)) { push(p); kind = 'truncate'; } continue; }
+    /*
+     * sed. Round 4 (10-11 verify): the long form `--in-place=SUFFIX` was missed
+     * (only an exact `--in-place` matched). Parse sed's options properly: `-i`
+     * (with an optional attached suffix — GNU's `-ie` means suffix "e") or
+     * `--in-place[=SUFFIX]` → in place; `-e`/`-f`/`--expression`/`--file` supply
+     * the script, in which case EVERY positional is a file; otherwise the first
+     * positional is the script.
+     */
     if (head === 'sed') {
-      const inPlace = args.some((a) => a === '-i' || a === '--in-place' || (a.startsWith('-i') && a.length > 2) || (a.startsWith('-') && !a.startsWith('--') && a.includes('i')));
-      if (inPlace) for (const p of positionals(args).slice(1)) { push(p); kind = 'sed -i'; } // skip the script positional
+      let inPlace = false, scriptGiven = false; const pos = [];
+      for (let k = 0; k < args.length; k++) {
+        const a = args[k];
+        if (a === '--') { pos.push(...args.slice(k + 1)); break; }
+        if (a.startsWith('--')) {
+          if (a === '--in-place' || a.startsWith('--in-place=')) inPlace = true;
+          else if (a === '--expression' || a === '--file') { scriptGiven = true; k++; }
+          else if (a.startsWith('--expression=') || a.startsWith('--file=')) scriptGiven = true;
+          else if (a === '--line-length') k++;
+          continue;
+        }
+        if (a.startsWith('-') && a.length > 1) {
+          const cl = a.slice(1);
+          for (let c = 0; c < cl.length; c++) {
+            const ch = cl[c];
+            if (ch === 'i') { inPlace = true; break; }                                  // rest = suffix
+            if (ch === 'e' || ch === 'f') { scriptGiven = true; if (c === cl.length - 1) k++; break; }
+            if (ch === 'l') { if (c === cl.length - 1) k++; break; }
+          }
+          continue;
+        }
+        if (a !== '') pos.push(a);
+      }
+      if (inPlace) for (const p of (scriptGiven ? pos : pos.slice(1))) { push(p); kind = 'sed -i'; }
       continue;
     }
     /*
@@ -604,7 +885,8 @@ export function scanBashMutation(command, depth = 0) {
       continue;
     }
   }
-  return allPaths.length ? { mutates: true, paths: allPaths, kind: kind ?? 'write' } : { mutates: false };
+  if (!allPaths.length && !scopes.length) return { mutates: false };
+  return { mutates: true, paths: allPaths, scopes, kind: kind ?? 'write' };
 }
 
 /* ─────────────────────────────────────────────────────── the top-level decision */
@@ -623,25 +905,90 @@ function realpathBestEffort(p) {
 }
 
 /**
+ * Round 4 — the CONTAINER/HOST namespace. Every session of a project already
+ * shares ONE lock dir (keyed by project id under the data dir — the hook runs in
+ * the server for both modes). What diverged was the KEY: a container session's
+ * CLI sees the repo at `/workspace/<id>` (its cwd), which is not under the host
+ * repo root, so its targets keyed as absolute `/workspace/<id>/src/a.ts` while a
+ * host session keyed `src/a.ts` — two keys for one file, no coordination. The
+ * bridge (owner of isolation) declares the CLI-side repo path(s) as `pathAliases`;
+ * a target under an alias is rewritten onto the real repo root BEFORE keying, so
+ * both modes produce the same repo-relative key.
+ */
+function unalias(p, repoRoot, aliases) {
+  if (!repoRoot || !aliases || !aliases.length || !path.isAbsolute(p)) return p;
+  for (const a of aliases) {
+    if (typeof a !== 'string' || !a || !path.isAbsolute(a)) continue;
+    const base = a.replace(/\/+$/, '') || '/';
+    if (p === base) return path.resolve(repoRoot);
+    if (p.startsWith(`${base}/`)) return path.join(path.resolve(repoRoot), p.slice(base.length + 1));
+  }
+  return p;
+}
+
+/** Repo-relative path of an absolute one ('' = the root itself), or null when outside the repo. */
+function repoRelative(abs, repoRoot) {
+  if (!repoRoot) return null;
+  const root = realpathBestEffort(path.resolve(repoRoot));
+  const rel = path.relative(root, realpathBestEffort(abs));
+  if (rel === '') return '';
+  return rel && !rel.startsWith('..') && !path.isAbsolute(rel) ? rel : null;
+}
+
+/**
  * Normalise a raw target to the lock KEY. A path UNDER the repo root keys by its
- * repo-RELATIVE path, so two sessions on the same project (whatever their absolute
- * cwd — a container's `/workspace/<id>` vs a direct session's hostPath) coordinate
- * on the same key. A path outside the repo keys by its absolute path.
+ * repo-RELATIVE path, so two sessions on the same project coordinate on the same
+ * key whatever their absolute cwd — including a container's `/workspace/<id>`,
+ * mapped back onto the repo through `aliases` (round 4). A path outside the repo
+ * keys by its absolute path.
  *
  * Both the target AND the repo root are realpath-resolved before the relative is
  * taken, so a symlinked target (or a symlinked repo root, e.g. a /tmp that is a
  * link to /private/tmp) can never split one file into two keys and let two lanes
  * both "own" it — the round-1 symlink clobber (gap #a).
  */
-export function lockKeyFor(rawPath, repoRoot) {
-  const absRaw = path.isAbsolute(rawPath) ? rawPath : path.resolve(repoRoot || process.cwd(), rawPath);
+export function lockKeyFor(rawPath, repoRoot, aliases = []) {
+  const p = unalias(rawPath, repoRoot, aliases);
+  const absRaw = path.isAbsolute(p) ? p : path.resolve(repoRoot || process.cwd(), p);
   const abs = realpathBestEffort(absRaw);
-  if (repoRoot) {
-    const root = realpathBestEffort(path.resolve(repoRoot));
-    const rel = path.relative(root, abs);
-    if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return rel;
+  const rel = repoRelative(abs, repoRoot);
+  return rel ? rel : abs;
+}
+
+/**
+ * A resolved target may still carry a GLOB (`sed -i … src/*.ts`, or a `for f in
+ * *.ts` list). Bash expands it against the disk, so do the same: a literal file of
+ * that exact name wins (Next.js `[id]` dirs are real names), else the matches,
+ * else the literal (bash passes an unmatched glob through verbatim).
+ */
+function expandGlob(p, repoRoot, aliases) {
+  if (!/[*?[]/.test(p)) return [p];
+  const abs = (() => { const q = unalias(p, repoRoot, aliases); return path.isAbsolute(q) ? q : path.resolve(repoRoot || process.cwd(), q); })();
+  try { if (fs.existsSync(abs)) return [abs]; } catch { /* fall through */ }
+  try {
+    const hits = typeof fs.globSync === 'function' ? fs.globSync(abs) : [];
+    if (hits.length) return hits.slice(0, 512).map((h) => (path.isAbsolute(h) ? h : path.resolve(h)));
+  } catch { /* fall through */ }
+  return [abs];
+}
+
+/**
+ * Round 4 — an UNRESOLVABLE target's conservative check. Refuse if any live
+ * foreign lock sits at or under `relDir` (repo-relative). Read-only like
+ * checkTree: it holds nothing, so it cannot wedge the directory for other lanes.
+ */
+function checkScope(lockDir, owner, relDir, now, ttlMs) {
+  let files = [];
+  try { files = fs.readdirSync(lockDir).filter((f) => f.endsWith('.lock')); } catch { return { ok: true }; }
+  for (const f of files) {
+    const file = path.join(lockDir, f);
+    const lock = readLock(file);
+    if (!lock || lock.owner === owner || typeof lock.key !== 'string') continue;
+    if (lock.key !== relDir && !lock.key.startsWith(`${relDir}/`)) continue;
+    if (reclaimReason(lock, now, ttlMs)) { tryReclaim(file); continue; }
+    return { ok: false, holder: lock };
   }
-  return abs;
+  return { ok: true };
 }
 
 /**
@@ -657,6 +1004,7 @@ export function evaluateFileLock({
   toolInput,
   lockDir,
   repoRoot = null,
+  pathAliases = [],
   owner,
   ownerPid = process.pid,
   now = Date.now(),
@@ -680,7 +1028,25 @@ export function evaluateFileLock({
       if (r.ok) return { allow: true, kind: cls.kind, tree: true };
       return { allow: false, busy: true, holder: r.holder, kind: cls.kind, tree: true, reason: busyRefusal(cls.kind, r.holder, { tree: true }) };
     }
-    const keys = [...new Set((cls.paths || []).map((p) => lockKeyFor(p, repoRoot)))];
+    // Unresolvable targets first (check-only): their directory, or the whole
+    // tree when the root itself is unknown. An out-of-repo directory cannot hold
+    // this project's files, so it has nothing to check against here.
+    for (const s of cls.scopes || []) {
+      let rel = null; let whole = s.dir == null || !repoRoot;
+      if (!whole) {
+        const d = unalias(s.dir, repoRoot, pathAliases);
+        rel = repoRelative(path.isAbsolute(d) ? d : path.resolve(repoRoot, d), repoRoot);
+        if (rel == null) continue;      // outside the project tree
+        if (rel === '') whole = true;   // the repo root → every file
+      }
+      const r = whole ? checkTree(lockDir, owner, now, ttlMs) : checkScope(lockDir, owner, rel, now, ttlMs);
+      if (!r.ok) {
+        return { allow: false, busy: true, holder: r.holder, kind: cls.kind, scope: whole ? '' : rel, unresolved: s.raw,
+          reason: busyRefusal(cls.kind, r.holder, { scope: whole ? '' : rel, unresolved: s.raw }) };
+      }
+    }
+    const resolved = (cls.paths || []).flatMap((p) => expandGlob(p, repoRoot, pathAliases));
+    const keys = [...new Set(resolved.map((p) => lockKeyFor(p, repoRoot, pathAliases)))];
     if (!keys.length) return { allow: true, kind: cls.kind };
     const r = claimPaths(lockDir, keys, meta, now, ttlMs);
     if (r.ok) return { allow: true, kind: cls.kind };
@@ -798,13 +1164,16 @@ export function refreshOwnedLocks({ lockDir, ownerPid = process.pid, host = os.h
 }
 
 /** The fail-loud "file busy" message — the CLI behaviour the user cited, told to the agent. */
-export function busyRefusal(kind, holder, { tree = false, exhausted = false, error = null } = {}) {
+export function busyRefusal(kind, holder, { tree = false, exhausted = false, error = null, scope = null, unresolved = null } = {}) {
   const who = holder && holder.owner ? `\`${holder.owner}\`` : 'another live lane';
   const age = holder && Number.isFinite(Number(holder.refreshedAt))
     ? ` (held ${Math.round((Date.now() - Number(holder.refreshedAt)) / 1000)}s ago)` : '';
-  const head = tree
-    ? `File-busy lock: this ${kind || 'whole-tree'} operation would overwrite the working tree, but ${who} holds an uncommitted lock on a file in it${age}.`
-    : `File-busy lock: the target is locked by ${who}${age} — a \`${kind || 'write'}\` here would silently drop that lane's uncommitted work.`;
+  const held = holder && holder.key ? ` (\`${holder.key}\`)` : '';
+  const head = scope != null
+    ? `File-busy lock: this \`${kind || 'write'}\` targets \`${unresolved}\`, a path built from shell syntax that cannot be resolved before it runs, so it was checked conservatively against ${scope ? `everything under \`${scope}/\`` : 'the whole working tree'} — and ${who} holds an uncommitted lock there${held}${age}. Spell the target path(s) out literally (or assign the variable in this same command) so only the real file is checked.`
+    : tree
+      ? `File-busy lock: this ${kind || 'whole-tree'} operation would overwrite the working tree, but ${who} holds an uncommitted lock on a file in it${age}.`
+      : `File-busy lock: the target is locked by ${who}${age} — a \`${kind || 'write'}\` here would silently drop that lane's uncommitted work.`;
   const tail = exhausted
     ? 'The lock store is under contention right now; this is a fail-safe deny (serialize, never clobber). Retry shortly — the lock auto-releases on a bound.'
     : error

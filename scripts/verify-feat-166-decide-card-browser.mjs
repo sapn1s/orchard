@@ -104,7 +104,7 @@ async function main() {
   const answered = all.find((x) => rec(x) && x.id !== fresh?.id && ticketAnswerState(x.text, path.join(BUGS, x.f))?.kind === 'decision');
   if (!fresh || !answered) { console.log('STOP — real board has no qualifying tickets'); process.exit(1); }
   console.log(`  (busy board copy: ${all.length} tickets, ${open.size} open rows; fresh=${fresh.id} answered-before=${answered.id})`);
-  const decide = (id) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'board-tool.mjs'), 'decide', '--id', id, '--question', QUESTION,
+  const decide = (id) => spawnSync(process.execPath, [path.join(ROOT, 'scripts', 'board-tool.mjs'), 'decide', '--id', id, '--question', QUESTION, '--decider', 'taste', '--consequence', 'you will read this card every single day',
     ...OPTS.flatMap((o) => ['--option', o]), '--recommend', 'B', '--why', 'B removes the half-hourly prompt while staying revocable.', '--author', 'worker (fixing r1)'],
   { cwd: ROOT, encoding: 'utf8', env: { ...process.env, ORCHARD_BOARD_TOOL_ROOT: WORK } });
 

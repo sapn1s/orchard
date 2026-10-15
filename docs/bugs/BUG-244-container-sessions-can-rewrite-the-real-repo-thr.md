@@ -360,3 +360,6 @@ Timed/once grants (host memory, <= 6 h) do **not** switch the bind: a bind canno
 
 ### 2026-10-11 — landed in batch commit (orchestrator triage)
 - Work landed in the 2026-10-11 whole-tree batch commit. Verified state unchanged; this entry records only the git landing. Full batch manifest is in the commit message.
+
+### 2026-10-11 — worker (FEAT-164 fixing)
+- **Note:** Coordination from FEAT-164 (fixing, 2026-10-11), for the lane building container rebuild on grant change: settings.gitWrite becomes { commit, push, scope, release } (legacy { permanent:true } is still read). The ONE rule is scripts/lib/agent-git-policy.mjs normalizeGitWrite(raw).mode, one of none, scoped or release. FEAT-164 is changing gitGuardOn to: guard ON unless mode === 'scoped' (one line in container-manager.ts). Release mode keeps the .git overlay ro, which is the structural half of soft releases. So a rebuild trigger should compare that mode, not .permanent. Detail in FEAT-164's plan.

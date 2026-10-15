@@ -168,6 +168,51 @@ export interface TranscriptBlock {
   truncated?: boolean;
   /** Original length of a `truncated` text/thinking/tool_result block (BUG-234). */
   fullLength?: number;
+  /**
+   * FEAT-177 — a user-message attachment (`type:'attachment'`). Either a
+   * `dataUrl` (a CLI-written base64 image/document, rendered inline) or an
+   * `uploadId`+`projectId` the client fetches from `GET /api/uploads/...`.
+   */
+  attachment?: {
+    kind: 'image' | 'document' | 'text';
+    mediaType?: string;
+    name?: string;
+    bytes?: number;
+    uploadId?: string;
+    projectId?: string;
+    dataUrl?: string;
+  };
+}
+
+/**
+ * FEAT-177 — map a raw user-message content block (either the CLI's native
+ * base64 `image`/`document` block or Orchard's lean `attachment` reference
+ * block) to a renderable attachment TranscriptBlock. Returns null for any
+ * block that is not an attachment. Shared by both block builders so the tail,
+ * forward, live and main-transcript routes render attachments identically.
+ */
+export function attachmentBlockOf(b: Record<string, any>): TranscriptBlock | null {
+  const MAX_INLINE_B64 = 8 * 1024 * 1024; // ~6 MB image after the 5 MB cap; larger falls back to a no-preview chip
+  if (b?.type === 'image' || b?.type === 'document') {
+    const src = b.source;
+    const kind: 'image' | 'document' = b.type === 'document' ? 'document' : 'image';
+    if (src && src.type === 'base64' && typeof src.data === 'string') {
+      const mediaType = typeof src.media_type === 'string' ? src.media_type : (kind === 'document' ? 'application/pdf' : 'image/png');
+      const att: NonNullable<TranscriptBlock['attachment']> = { kind, mediaType, name: typeof b.title === 'string' ? b.title : undefined };
+      if (src.data.length <= MAX_INLINE_B64) att.dataUrl = `data:${mediaType};base64,${src.data}`;
+      return { type: 'attachment', attachment: att };
+    }
+    // An Orchard-style reference carried on a native-typed block.
+    if (src && src.type === 'orchard-upload' && typeof src.uploadId === 'string') {
+      return { type: 'attachment', attachment: { kind, uploadId: src.uploadId, projectId: src.projectId, mediaType: src.media_type, name: typeof b.title === 'string' ? b.title : undefined } };
+    }
+    return { type: 'attachment', attachment: { kind } };
+  }
+  if (b?.type === 'attachment' && typeof b.uploadId === 'string') {
+    const kind: 'image' | 'document' | 'text' = b.kind === 'document' ? 'document' : b.kind === 'text' ? 'text' : 'image';
+    return { type: 'attachment', attachment: { kind, uploadId: b.uploadId, projectId: typeof b.projectId === 'string' ? b.projectId : undefined, mediaType: typeof b.mediaType === 'string' ? b.mediaType : undefined, name: typeof b.name === 'string' ? b.name : undefined, bytes: typeof b.bytes === 'number' ? b.bytes : undefined } };
+  }
+  return null;
 }
 
 export interface TranscriptMessage {
@@ -1073,6 +1118,8 @@ function toBlocks(content: unknown, cap: number | undefined, includeToolResults:
       content?: unknown;
     };
     const type = typeof b.type === 'string' ? b.type : 'unknown';
+    const att = attachmentBlockOf(b as Record<string, any>); // FEAT-177
+    if (att) { out.push(att); continue; }
     if (type === 'text' || type === 'thinking') {
       const src = type === 'thinking' ? (b.thinking ?? '') : (b.text ?? '');
       out.push({ type, ...deliverText(src, cap) });

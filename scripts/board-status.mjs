@@ -46,6 +46,7 @@ import { execFileSync } from 'node:child_process';
 import { readTickets, readIndex } from './board.mjs';
 import { resolveBoardDir } from './lib/board-path.mjs';
 import { classifyLegacyStatus, TICKET_ID_RE } from './lib/ticket-schema.mjs';
+import { readRoundHistory, ESCALATION_ACTIONS } from './round-ceiling.mjs';
 
 const DEFAULT_ENTRIES = 5;
 const STATUS_CELL_MAX = 200; // one-line status header, truncated for pasteability
@@ -119,6 +120,29 @@ function worktreeState(dir, file) {
   return { code: code.trim(), label, dirty: true };
 }
 
+/**
+ * FEAT-181 — the automatic surface for the round ceiling. Over-ceiling tickets
+ * are read through the ONE canonical round reader (round-ceiling.mjs over the
+ * durable cost ledger — never a second count here), then filtered to tickets
+ * still LIVE on this board. A closed ticket absorbed its rounds in the past;
+ * re-raising it on every status call is the "notification theatre" the
+ * cross-provider refutation warned against, so it is dropped. Every raised item
+ * keeps its named owner + actionable choices from the reader. Degrades to a
+ * NAMED gap (available:false + reason), never an empty success and never a throw
+ * that could break board:status — a missing ledger is "unknown", not "none".
+ */
+function overCeiling(tickets, { ticketId = null } = {}) {
+  // FEAT-181 r2: usability (and its reason) is owned by the ONE reader
+  // (readRoundHistory) — board-status renders that fact instead of re-deriving it.
+  // This also closes the r1 gap where a ledger with zero declared rounds read as a
+  // vacuous "none" (code 'no-declared-round' now flows through as a NAMED gap).
+  const hist = readRoundHistory({});
+  if (!hist.usable) return { available: false, reason: hist.reason, code: hist.code, raised: [] };
+  let raised = hist.result.raised.filter((r) => { const t = tickets.get(r.ticket); return t && !t.done; });
+  if (ticketId) raised = raised.filter((r) => r.ticket === ticketId);
+  return { available: true, minRound: hist.result.minRound, raised };
+}
+
 function buildTicketReport(dir, id, entries) {
   const { tickets } = readTickets(dir);
   // Match zero-pad- and case-insensitively (ARCH-17 ≡ ARCH-017) against the real
@@ -142,10 +166,15 @@ function buildTicketReport(dir, id, entries) {
   const text = fs.readFileSync(path.join(dir, t.file), 'utf8');
   const heads = activityHeaders(text);
   const wt = worktreeState(dir, t.file);
+  const oc = overCeiling(tickets, { ticketId: id });
+  const ocMe = oc.raised.find((r) => r.ticket === id) ?? null;
 
   return {
     ok: true,
     id,
+    over_ceiling: ocMe
+      ? { max_round: ocMe.maxRound, severity: ocMe.severity, owner: ocMe.owner, actions: ocMe.actions, by_phase: ocMe.byPhase }
+      : (oc.available ? null : { unavailable: oc.reason }),
     title: t.title,
     file: t.file,
     work_state: t.workState ?? null,
@@ -198,6 +227,14 @@ function printTicketReport(r) {
   for (const v of r.verified_by) L.push(`    ${v}`);
   L.push(`  activity log:     ${r.total_entries} entr${r.total_entries === 1 ? 'y' : 'ies'}; newest ${r.last_entries.length}:`);
   for (const h of r.last_entries) L.push(`    ${h}`);
+  if (r.over_ceiling && r.over_ceiling.max_round != null) {
+    const oc = r.over_ceiling;
+    const phases = Object.entries(oc.by_phase || {}).map(([p, n]) => `${p}:${n}`).join(' ');
+    L.push(`  ⚠ ROUND CEILING: [${String(oc.severity).toUpperCase()}] max declared round ${oc.max_round} (by phase ${phases}) — OWNER: ${oc.owner}. DECIDE one of:`);
+    for (const a of ESCALATION_ACTIONS) L.push(`      - ${a.label}`);
+  } else if (r.over_ceiling && r.over_ceiling.unavailable) {
+    L.push(`  round ceiling:   not checked (${r.over_ceiling.unavailable})`);
+  }
   process.stdout.write(L.join('\n') + '\n');
 }
 
@@ -222,6 +259,12 @@ function buildBoardSummary(dir) {
     dirty = out.split('\n').filter((l) => /-\d+-.*\.md$/.test(l)).length;
   } catch { dirty = null; }
 
+  const oc = overCeiling(tickets);
+  const SEV_RANK = { critical: 3, high: 2, elevated: 1 };
+  const overCeilingList = oc.raised
+    .map((r) => ({ ticket: r.ticket, max_round: r.maxRound, severity: r.severity, owner: r.owner, actions: r.actions }))
+    .sort((a, b) => b.max_round - a.max_round || (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0) || (a.ticket < b.ticket ? -1 : 1));
+
   return {
     ok: true,
     dir,
@@ -233,6 +276,16 @@ function buildBoardSummary(dir) {
     ambiguous_status: ambiguous,
     unmappable_status: unmappable,
     dirty_ticket_files: dirty,
+    // FEAT-181 — live tickets at or over the round ceiling, owned by the
+    // orchestrator with an actionable choice. `available:false` is a NAMED gap.
+    over_ceiling: {
+      available: oc.available,
+      reason: oc.available ? null : oc.reason,
+      code: oc.available ? null : (oc.code ?? null),
+      min_round: oc.minRound ?? null,
+      count: overCeilingList.length,
+      tickets: overCeilingList,
+    },
   };
 }
 
@@ -242,6 +295,16 @@ function printBoardSummary(s) {
   L.push(`  open: ${s.open}    done: ${s.done}    needs-you (👤): ${s.needs_you}`);
   if (s.needs_you_ids.length) L.push(`  awaiting you: ${s.needs_you_ids.join(', ')}`);
   L.push(`  ambiguous-DONE status: ${s.ambiguous_status}    unmappable status: ${s.unmappable_status}    dirty ticket files: ${s.dirty_ticket_files ?? 'unknown'}`);
+  const oc = s.over_ceiling;
+  if (oc && !oc.available) {
+    L.push(`  round ceiling (≥ default): not checked (${oc.reason})`);
+  } else if (oc && oc.count === 0) {
+    L.push(`  round ceiling (≥ ${oc.min_round}): no LIVE ticket over the ceiling`);
+  } else if (oc) {
+    L.push(`  ⚠ round ceiling (≥ ${oc.min_round}): ${oc.count} LIVE ticket(s) absorbing too many verify rounds — orchestrator to decide rescope / redesign / stop:`);
+    for (const r of oc.tickets) L.push(`      [${String(r.severity).toUpperCase()}] ${r.ticket} — max declared round ${r.max_round}`);
+    L.push(`      (run \`npm run board:status -- <ID>\` for the §N question + choices, or \`npm run arch:rounds -- --ledger\`)`);
+  }
   L.push(`  (run \`npm run board:status -- <ID>\` for one ticket's full record)`);
   process.stdout.write(L.join('\n') + '\n');
 }

@@ -5,41 +5,71 @@
   "title": "Tool adoption stayed deliberate instead of accumulating unused tools",
   "summary": "A shortlist of developer tools was researched and worked through one at a time, keeping only what proved its worth. Two were adopted and are in real use: a structural code-search tool and a browser-testing tool. A test-quality checker was parked because it needs deterministic fixtures the project does not have.",
   "impact_if_we_wait": "The ticket stays open as a low-priority note and nothing breaks. Bounded: both adopted tools are already in use, and the parked candidate blocks no work. The only cost is a stale entry on the board.",
-  "current_need": "Decide whether to close this now that the shortlist is worked through, or keep it open as a parking spot for future tool candidates.",
+  "current_need": "Close the ticket with its two adoptions and one parked candidate recorded as the outcome.",
   "severity": "low",
   "area": "Development tooling",
   "reported": "2026-08-04",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-04",
-  "decision": {
-    "mode": "single",
-    "question": "Should this close now, or stay open as a parking spot for future tool candidates?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Close the ticket",
-        "what_changes": "The ticket moves to done with the two adoptions and one parked candidate recorded as its outcome.",
-        "benefit": "The board stops carrying an entry that asks nothing of anyone.",
-        "cost": "A future tool candidate needs a fresh ticket rather than a line appended here.",
-        "why_not_obvious": "The research and the rejection reasons become harder to find, so a rejected candidate can be re-proposed later."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "e0e57d56-8c63-4e30-906d-af7604a0d91d",
+      "asked_on": "2026-08-04",
+      "question": "Should this close now, or stay open as a parking spot for future tool candidates?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Open or closed is board bookkeeping; the three candidates it existed for are settled.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Open or closed is board bookkeeping; the three candidates it existed for are settled.",
+        "on": "2026-10-14",
+        "next": "Close the ticket with its two adoptions and one parked candidate recorded as the outcome.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether to close this now that the shortlist is worked through, or keep it open as a parking spot for future tool candidates."
+        }
       },
-      {
-        "key": "B",
-        "label": "Keep as a parking spot",
-        "what_changes": "The ticket stays open and collects new tool candidates as they come up.",
-        "benefit": "The shortlist and the reasons for rejecting candidates stay in one obvious place.",
-        "cost": "An open ticket that needs no action sits on the board indefinitely.",
-        "why_not_obvious": "An entry nobody has to act on trains readers to skim past open tickets generally."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should this close now, or stay open as a parking spot for future tool candidates?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Close the ticket",
+            "what_changes": "The ticket moves to done with the two adoptions and one parked candidate recorded as its outcome.",
+            "benefit": "The board stops carrying an entry that asks nothing of anyone.",
+            "cost": "A future tool candidate needs a fresh ticket rather than a line appended here.",
+            "why_not_obvious": "The research and the rejection reasons become harder to find, so a rejected candidate can be re-proposed later."
+          },
+          {
+            "key": "B",
+            "label": "Keep as a parking spot",
+            "what_changes": "The ticket stays open and collects new tool candidates as they come up.",
+            "benefit": "The shortlist and the reasons for rejecting candidates stay in one obvious place.",
+            "cost": "An open ticket that needs no action sits on the board indefinitely.",
+            "why_not_obvious": "An entry nobody has to act on trains readers to skim past open tickets generally."
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "The three candidates it existed to evaluate are all settled, and reopening or refiling later costs one ticket.",
+        "prerequisite": null
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "The three candidates it existed to evaluate are all settled, and reopening or refiling later costs one ticket.",
-    "prerequisite": null
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "Each shortlisted tool is either adopted after proving value or explicitly dropped",
     "No tool is left installed but unused"
@@ -296,3 +326,9 @@ product regression (session-lifecycle + regression-prone). (2) `verify:orchestra
 genuinely broken (STALE) committed test — crashes on import; worth fixing the test to the allow-list
 API. (3) scratch-server tier is intrinsically FLAKY here; pure tier is stable. No product code
 touched; only the three runner/manifest files + this ticket.
+
+### 2026-10-11 — agent
+- **correction — two 2026-10-10 entries belong to FEAT-174:** The two 2026-10-10 entries above ("built the missing test runner + manifest + CI; ran the suites for real" and "round 2: de-contaminated health run + manifest tier/timeout fixes") describe building npm test — scripts/test-runner.mjs, scripts/gen-test-manifest.mjs, scripts/test-manifest.json, .github/workflows/test.yml — and the suite-health run (report: ~/.local/state/claude-station/scratch/feat-033-health/report.md). That work is NOT tool adoption; it was mis-filed here. It now lives on FEAT-174 ("Verify suites have a runner and CI"), which carries the substance and the still-open items (independent verify, ~10 real-candidate failures to confirm, the crashing verify:orchestrator-enforcement test, browser-tier triage, unpushed CI). Per the append-only rule the two entries are left in place; this entry is the correction. The runner work committed in ed92aff.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Open or closed is board bookkeeping; the three candidates it existed for are settled. Next: Close the ticket with its two adoptions and one parked candidate recorded as the outcome. You can reopen this decision from the ticket view.

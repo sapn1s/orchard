@@ -28,6 +28,8 @@
  * FAKE_TRANSCRIPT_DIR (BUG-217 round 5, opt-in): append each user message and
  * the turn's reply to `<dir>/<FAKE_SDK_ID>.jsonl`, as the real CLI records what
  * it took — the receiver's own record the outbox confirms a delivery from.
+ * FAKE_EXIT_BEFORE_INIT=1 (BUG-253, opt-in): exit on the first user frame, before `system:init`.
+ * FAKE_INIT_DELAY_MS=<ms> (BUG-253, opt-in): the first turn's `system:init` comes that much later.
  */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -329,7 +331,12 @@ rl.on('line', (line) => {
   }
   if (m.type === 'user') {
     log({ ev: 'user-frame', text: JSON.stringify(m.message).slice(0, 200) });
+    // BUG-253 (opt-in): a CLI that dies after taking its first prompt but before `system:init` — nothing recorded.
+    if (process.env.FAKE_EXIT_BEFORE_INIT === '1') { log({ ev: 'exit', reason: 'exit-before-init' }); process.exit(3); }
     const text = Array.isArray(m.message?.content) ? m.message.content.map((b) => b?.text ?? '').join('') : String(m.message?.content ?? '');
+    // BUG-253 (opt-in): hold the FIRST turn's `system:init` this long — a window between "took the prompt" and init.
+    const initDelay = turn === 0 ? Number(process.env.FAKE_INIT_DELAY_MS ?? 0) || 0 : 0;
+    if (initDelay > 0) { log({ ev: 'init-delay', ms: initDelay }); void sleep(initDelay).then(() => runTurn(text)); return; }
     void runTurn(text);
   }
 });

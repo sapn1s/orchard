@@ -26,13 +26,16 @@
  * the only `git` run is `git add` through the shim in a NON-repo dir (allowed →
  * git itself fails "not a git repository"; refused → the shim's refusal).
  *
- * STATUS: H1/H2/H3 and the in-cgroup case are marked OPEN (exit 2), not FAIL. They
- * are real self-grant paths today and are reproduced on every run. Closing them
- * awaits the FEAT-164 fork decision, because a same-uid host agent can work around
- * anything Orchard alone holds. The checks are behavioural ("refused, grants
- * nothing"), so whichever design closes them, this suite verifies it. Every other
- * check is an invariant that must hold now: the user's grants, the request flow,
- * the answer-once rule, restart, and a torn registry. A failure there is FAIL (exit 1).
+ * STATUS (option A built, user decision 2026-10-12): H1/H2/H3 and the in-cgroup case
+ * are now hard invariants (FAIL, exit 1). They were reported as OPEN (exit 2) until the
+ * fork was decided; on the pre-option-A tree all 11 reproduce (must-FAIL baseline).
+ * Closed by: the caller check (src/server/caller-provenance.ts requireUserCaller) on the
+ * grant POST, the policy PUT and a git-write request answer; and the sealed standing
+ * grant (scripts/lib/git-write-seal.mjs) verified on every registry load.
+ * Residuals by design (decision card): a same-uid agent that deliberately escapes its
+ * scope, reads the seal key, or replays an old sealed value. Every other check is an
+ * invariant too: the user's grants, the request flow, the answer-once rule, restart,
+ * and a torn registry.
  *
  *   node scripts/verify-feat-164-self-grant.mjs
  */
@@ -47,16 +50,12 @@ import { isolatedServerEnv } from './lib/station-boot.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-let pass = 0, fail = 0, holesOpen = 0;
-/** `hole` marks a self-grant path whose closure awaits the FEAT-164 fork decision
- * (see the ticket's 2026-10-05 fixing-r2 entry). It is reported loudly as OPEN and
- * makes the run exit 2; every other check is an invariant that must hold today. */
-function check(name, ok, detail, { hole = false } = {}) {
+let pass = 0, fail = 0;
+function check(name, ok, detail) {
   if (ok) { pass++; console.log(`  PASS ${name}`); return; }
-  if (hole) holesOpen++; else fail++;
-  console.log(`  ${hole ? 'OPEN' : 'FAIL'} ${name}${detail === undefined ? '' : ` — ${typeof detail === 'string' ? detail : JSON.stringify(detail)?.slice(0, 400)}`}`);
+  fail++;
+  console.log(`  FAIL ${name}${detail === undefined ? '' : ` — ${typeof detail === 'string' ? detail : JSON.stringify(detail)?.slice(0, 400)}`}`);
 }
-const HOLE = { hole: true };
 
 if (spawnSync('systemd-run', ['--version']).status !== 0) {
   console.log('FAIL systemd-run is required (agent sessions are cgroup-scoped by it; the suite cannot model them without it)');
@@ -97,9 +96,14 @@ async function step(s) {
     p.settings = p.settings || {};
     if (s.copyFrom) p.settings.gitWrite = reg.projects.find((x) => x.id === s.copyFrom).settings.gitWrite;
     else if (s.merge) p.settings.gitWrite = { ...(p.settings.gitWrite || {}), ...s.merge };
+    else if (s.rowSet) Object.assign(p, s.rowSet);
     else p.settings.gitWrite = s.value;
     fs.writeFileSync(s.file, JSON.stringify(reg, null, 2) + '\\n');
     return { ok: true };
+  }
+  if (s.kind === 'exec') {
+    const r = spawnSync(process.execPath, s.args, { encoding: 'utf8', env: { ...process.env, ...(s.env || {}) }, timeout: 30000 });
+    return { status: r.status, out: ((r.stdout || '') + (r.stderr || '')).slice(0, 600) };
   }
   if (s.kind === 'git') {
     const r = spawnSync('git', s.args, { cwd: s.cwd, encoding: 'utf8', env: process.env });
@@ -184,12 +188,6 @@ let d = null; try { d = await r.json(); } catch {}
 console.log(JSON.stringify({ status: r.status, d }));`);
 const userCgroup = () => asUser(`import * as fs from 'node:fs'; console.log(JSON.stringify({ cgroup: fs.readFileSync('/proc/self/cgroup','utf8').trim() }));`);
 
-/** An agent-shaped caller that is NOT a session: the CLI run from an agent's Bash
- * lands in that agent's claude-station-host-*.scope. Model it with such a scope. */
-function cliInAgentScope(args) {
-  const r = spawnSync('systemd-run', ['--user', '--scope', '--quiet', '--collect', `--unit=claude-station-host-t-f164cli-${tag}-${randomBytes(3).toString('hex')}`, process.execPath, path.join(ROOT, 'scripts', 'git-grant.mjs'), ...args], { encoding: 'utf8', env: { ...process.env, PORT: String(PORT) }, timeout: 30_000 });
-  return { status: r.status, out: `${r.stdout}${r.stderr}`.slice(0, 400) };
-}
 
 /* ── a live session = the agent ─────────────────────────────────────────────── */
 async function startAgent(projectId) {
@@ -240,6 +238,14 @@ const grantOf = async (pid) => (await j('GET', `/api/projects/${encodeURICompone
 const regRow = (pid) => JSON.parse(fs.readFileSync(REGISTRY, 'utf8')).projects.find((p) => p.id === pid);
 const isRefusal = (r) => /orchard|refus|blocked|not permitted|git write/i.test(r.stderr) && !/not a git repository/i.test(r.stderr);
 const isAllowedThrough = (r) => /not a git repository/i.test(r.stderr);
+// FEAT-190 r3 — the git-write-policy PUT is optimistic-concurrency gated: it must carry the
+// `revision` it was rendered from, or the route refuses it (400 revision-required). The GET of
+// the grant route returns the current revision (verify-feat-190-ui covers the 400/409 contract
+// directly). A USER save threads that revision; this helper GETs it first, then PUTs as the user.
+const userPutPolicy = async (pid, body) => {
+  const revision = (await j('GET', `/api/projects/${encodeURIComponent(pid)}/git-write-grant`)).d?.revision ?? null;
+  return userHttp('PUT', `/api/projects/${encodeURIComponent(pid)}/git-write-policy`, { ...body, revision });
+};
 
 try {
   await boot();
@@ -259,14 +265,20 @@ try {
   for (const body of [{ scope: 'once' }, { scope: 'duration', minutes: 30 }, { scope: 'permanent' }]) {
     const [r] = await agent.run([{ kind: 'http', method: 'POST', url: grantUrl(A), body }]);
     const g = await grantOf(A);
-    check(`H2 agent POST scope=${body.scope} is refused (4xx) and grants nothing`, r.status >= 400 && r.status < 500 && g === null, { status: r.status, grant: g?.scope ?? null }, HOLE);
-    if (body.scope === 'permanent') check('H2b no permanent grant reached the registry from an agent POST', !regRow(A)?.settings?.gitWrite?.permanent, regRow(A)?.settings?.gitWrite, HOLE);
+    check(`H2 agent POST scope=${body.scope} is refused (4xx) and grants nothing`, r.status >= 400 && r.status < 500 && g === null, { status: r.status, grant: g?.scope ?? null });
+    if (body.scope === 'permanent') check('H2b no permanent grant reached the registry from an agent POST', !regRow(A)?.settings?.gitWrite?.permanent, regRow(A)?.settings?.gitWrite);
     if (g) userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
   }
-  const cli = cliInAgentScope([A, '--permanent']);
+  // The grant CLI run from the agent's own Bash: a child of the real session process, in
+  // its claude-station-host-t-*.scope (a stand-alone look-alike scope would be a caller
+  // the server never launched, which is the deliberate-escape residual, not this path).
+  const [cli] = await agent.run([{ kind: 'exec', args: [path.join(ROOT, 'scripts', 'git-grant.mjs'), A, '--permanent'], env: { PORT: String(PORT) } }]);
   const gCli = await grantOf(A);
-  check('H2c the grant CLI run from an agent cgroup is refused and grants nothing', cli.status !== 0 && gCli === null, { status: cli.status, grant: gCli?.scope ?? null, out: cli.out }, HOLE);
+  check('H2c the grant CLI run from an agent cgroup is refused and grants nothing', cli.status !== 0 && gCli === null, { status: cli.status, grant: gCli?.scope ?? null, out: cli.out });
   if (gCli) userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
+  const [pol] = await agent.run([{ kind: 'http', method: 'PUT', url: `${BASE}/api/projects/${encodeURIComponent(A)}/git-write-policy`, body: { commit: true, push: true, scope: 'agent self-set scope' } }]);
+  const polAfter = (await j('GET', `/api/projects/${encodeURIComponent(A)}/git-write-grant`)).d?.policy;
+  check('H2d an agent PUT of the agent git policy is refused (4xx) and changes nothing', pol.status >= 400 && pol.status < 500 && polAfter?.mode === 'none' && !regRow(A)?.settings?.gitWrite?.commit, { status: pol.status, mode: polAfter?.mode });
 
   /* ═══ H3 — the agent raises a request and approves it itself ═══════════════ */
   console.log('\n[H3] agent raises a git-write request and answers it "Allow"');
@@ -274,9 +286,9 @@ try {
   check('H3a the agent may RAISE a request (201, inert)', rq.status === 201 && rq.d?.granted === false, rq);
   const [ans] = await agent.run([{ kind: 'http', method: 'POST', url: `${BASE}/api/projects/${encodeURIComponent(A)}/board/answer`, body: { id: rq.d?.id, answer: 'Allow' } }]);
   const gAns = await grantOf(A);
-  check('H3b the agent\'s own "Allow" is refused (4xx) and mints no grant', ans.status >= 400 && ans.status < 500 && gAns === null, { status: ans.status, grant: gAns?.scope ?? null }, HOLE);
+  check('H3b the agent\'s own "Allow" is refused (4xx) and mints no grant', ans.status >= 400 && ans.status < 500 && gAns === null, { status: ans.status, grant: gAns?.scope ?? null });
   const feed = await j('GET', `/api/projects/${encodeURIComponent(A)}/board`);
-  check('H3c the request is still pending on the rail for the user', (feed.d?.needsYou ?? []).some((x) => x.id === rq.d?.id), (feed.d?.needsYou ?? []).map((x) => x.id), HOLE);
+  check('H3c the request is still pending on the rail for the user', (feed.d?.needsYou ?? []).some((x) => x.id === rq.d?.id), (feed.d?.needsYou ?? []).map((x) => x.id));
   if (gAns) userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
 
   /* ═══ USER — the user's grants still work, and take effect live ════════════ */
@@ -300,23 +312,86 @@ try {
   check('UA4 an agent MAY revoke (giving up access is never a self-grant)', agentRevoke.status === 200 && (await grantOf(A)) === null, agentRevoke);
   const uPerm = userHttp('POST', `/api/projects/${A}/git-write-grant`, { scope: 'permanent' });
   check('UA5 the user\'s permanent grant is issued', uPerm.status === 200 && uPerm.d?.grant?.scope === 'permanent', uPerm);
+  // UA5b REWRITTEN to the FEAT-190 r13 rule (superseding the FEAT-164 r2/r3 behaviour it asserted).
+  // Under FEAT-164 a scope-less permanent grant was RELEASE mode and a direct write to the project's
+  // OWN repo — including its scratch fixture repo — was refused, naming "release mode". FEAT-190 r13
+  // made scratch/fixture repos STORE-GOVERNED: a repo under the scratch root is no longer judged by
+  // the real-repo policy (release mode is a REAL-repo guard only; decideByTarget sets `scratch` from
+  // defaultFixtureRoots() and effectiveGitPermission then allows with reason 'scratch'), so the shim
+  // lets the write THROUGH and the FEAT-108 store decides. PA is a scratch dir, so a release-mode
+  // write there is allowed through exactly like the scoped case below (UA6). The REAL-repo release
+  // refusal that UA5b used to prove is covered on resolvable repos by verify-feat-190-matrix (the
+  // "an EXPLICITLY release-mode sharer/co-owner still vetoes" cases) and verify-feat-164-release (X7).
+  const [gitRelease] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PA }]);
+  check('UA5b release mode on a SCRATCH repo is store-governed — the write passes the shim (FEAT-190 r13; real-repo release refusal covered by verify-feat-190-matrix)', isAllowedThrough(gitRelease), gitRelease);
+  const uScoped = await userPutPolicy(A, { commit: true, push: false, scope: 'FEAT-164 self-grant probe: scratch dir only' });
+  check('UA5c the user sets SCOPED mode (commit + a scope note)', uScoped.status === 200 && uScoped.d?.policy?.mode === 'scoped', uScoped);
   const [gitAllowed] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PA }]);
   check('UA6 the running agent session\'s git write now passes the shim (git itself then fails: not a repo)', isAllowedThrough(gitAllowed), gitAllowed);
 
+  /* ═══ B — grant binding: a grant is FOR the repo identity it was given for ═══ */
+  console.log('\n[B] grant binding (coordinator ruling after verify f8f4bf80)');
+  const PC = path.join(RUN, 'proj-c'); fs.mkdirSync(PC, { recursive: true });
+  userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
+  const uT = userHttp('POST', `/api/projects/${A}/git-write-grant`, { scope: 'duration', minutes: 30 });
+  check('B0 setup: the user\'s 30-minute grant on A records the repo it is for', uT.status === 200 && !!uT.d?.grant?.repo?.toplevel, uT.d?.grant);
+  const [wT] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PA }]);
+  check('B0 normal granted work is unaffected: under the timed grant the agent\'s write in A passes the shim', isAllowedThrough(wT), wT);
+  const [pp] = await agent.run([{ kind: 'http', method: 'PATCH', url: `${BASE}/api/projects/${encodeURIComponent(A)}`, body: { hostPath: PC } }]);
+  check('B1 an agent PATCH of the project path is refused (403) and the path is unchanged', pp.status === 403 && pp.d?.code === 'agent-self-grant' && regRow(A)?.hostPath === PA, { status: pp.status, hostPath: regRow(A)?.hostPath });
+  await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: A, rowSet: { hostPath: PC } }]);
+  const [w2] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PC }]);
+  const g2b = await grantOf(A);
+  check('B2 a registry-file path edit leaves the live grant inert for the new path (write refused, grant voided)', w2.status !== 0 && isRefusal(w2) && g2b === null, { w2, grant: g2b?.scope ?? null });
+  await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: A, rowSet: { hostPath: PA } }]);
+  check('B2b moving the path back does not revive it (the voided grant stays gone)', (await grantOf(A)) === null, await grantOf(A));
+  userHttp('POST', `/api/projects/${A}/git-write-grant`, { scope: 'duration', minutes: 30 });
+  await userPutPolicy(A, { commit: true, push: false, scope: 'FEAT-164 binding probe: scratch dir only' });
+  const uMove = userHttp('PATCH', `/api/projects/${encodeURIComponent(A)}`, { hostPath: PC });
+  const polMoved = (await j('GET', `/api/projects/${encodeURIComponent(A)}/git-write-grant`)).d;
+  check('B3 a USER path change is allowed and voids both the timed and the standing grant', uMove.status === 200 && polMoved?.grant === null && polMoved?.policy?.mode === 'none', { status: uMove.status, grant: polMoved?.grant?.scope ?? null, mode: polMoved?.policy?.mode });
+  const [w3] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PC }]);
+  check('B3b after the move, the agent\'s write in the new repo is refused until the user re-grants', w3.status !== 0 && isRefusal(w3), w3);
+  const reG = userHttp('POST', `/api/projects/${A}/git-write-grant`, { scope: 'duration', minutes: 30 });
+  const [w4] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PC }]);
+  check('B3c a re-grant binds the new repo and the agent\'s write there passes', reG.status === 200 && isAllowedThrough(w4), { reG: reG.status, w4 });
+  // restore A for the H1 checks: back at PA with the user's scoped grant
+  userHttp('PATCH', `/api/projects/${encodeURIComponent(A)}`, { hostPath: PA });
+  userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
+  await userPutPolicy(A, { commit: true, push: false, scope: 'FEAT-164 self-grant probe: scratch dir only' });
+
+  /* ═══ G — the user's git panel routes run git in the server, outside the shim ═══ */
+  console.log('\n[G] agent calls the git panel (server-side git, no shim, no grant)');
+  for (const action of ['stage', 'commit', 'push']) {
+    const [g] = await agent.run([{ kind: 'http', method: 'POST', url: `${BASE}/api/projects/${encodeURIComponent(A)}/git/${action}`, body: { paths: ['x'], message: 'agent probe' } }]);
+    check(`G1 an agent POST git/${action} is refused as user-only (403)`, g.status === 403 && g.d?.code === 'agent-self-grant', g);
+  }
+  const uStage = userHttp('POST', `/api/projects/${encodeURIComponent(A)}/git/stage`, { paths: ['x'] });
+  check('G2 the USER\'s git panel action is not refused by the caller check (git itself may fail: not a repo)', uStage.status !== 403 && uStage.d?.code !== 'agent-self-grant' && uStage.d?.code !== 'caller-unknown', uStage);
+  const [gd] = await agent.run([{ kind: 'http', method: 'POST', url: `${BASE}/api/projects/${encodeURIComponent(A)}/git/diff`, body: { path: 'x' } }]);
+  check('G3 git/diff (a read) is not gated', gd.status !== 403, gd);
+
   /* ═══ H1 — the agent edits the registry file ════════════════════════════════ */
   console.log('\n[H1] agent edits the registry file');
+  const pAPath = regRow(A)?.hostPath;
+  check('H1e setup: A holds the user\'s scoped grant', (await grantOf(A))?.scope === 'permanent', await grantOf(A));
+  await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: A, rowSet: { hostPath: PB } }]);
+  check('H1e repointing a granted project\'s hostPath at another dir voids the grant (seal binds id + hostPath)', (await grantOf(A)) === null, await grantOf(A));
+  await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: A, rowSet: { hostPath: pAPath } }]);
   const [cp] = await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: B, copyFrom: A }]);
-  check('H1a setup: agent copied A\'s stored grant onto B', cp.ok === true && regRow(B)?.settings?.gitWrite?.permanent === true);
-  check('H1a a user grant copied onto ANOTHER project grants nothing there', (await grantOf(B)) === null, await grantOf(B), HOLE);
+  // The stored shape is { commit, push, scope, grantedAt, grantedVia, seal } since the rescope
+  // (permanent:true is the r1 legacy shape, never written any more).
+  check('H1a setup: agent copied A\'s stored grant onto B', cp.ok === true && regRow(B)?.settings?.gitWrite?.commit === true, regRow(B)?.settings?.gitWrite);
+  check('H1a a user grant copied onto ANOTHER project grants nothing there', (await grantOf(B)) === null, await grantOf(B));
   await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: A, merge: { grantedAt: new Date(Date.now() - 1000).toISOString() } }]);
-  check('H1b an agent-altered user grant stops granting (tamper reads as none)', (await grantOf(A)) === null, await grantOf(A), HOLE);
+  check('H1b an agent-altered user grant stops granting (tamper reads as none)', (await grantOf(A)) === null, await grantOf(A));
   userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
   await agent.run([{ kind: 'editRegistry', file: REGISTRY, projectId: A, value: { permanent: true, grantedAt: new Date().toISOString(), grantedVia: 'dashboard' } }]);
   check('H1c setup: agent wrote settings.gitWrite = {permanent:true} into the registry', regRow(A)?.settings?.gitWrite?.permanent === true);
   const gForged = await grantOf(A);
-  check('H1c the forged registry setting grants nothing (route view)', gForged === null, gForged, HOLE);
+  check('H1c the forged registry setting grants nothing (route view)', gForged === null, gForged);
   const [gitForged] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PA }]);
-  check('H1d the forged setting does not let the agent\'s git write through the shim', gitForged.status !== 0 && isRefusal(gitForged), gitForged, HOLE);
+  check('H1d the forged setting does not let the agent\'s git write through the shim', gitForged.status !== 0 && isRefusal(gitForged), gitForged);
   userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
   userHttp('DELETE', `/api/projects/${B}/git-write-grant`);
 
@@ -350,7 +425,7 @@ try {
   check('C0 setup: this agent is NOT in a session scope (it shares the server cgroup)', !/claude-station-host-/.test(srvCg.cgroup), srvCg.cgroup);
   const [r2] = await agent2.run([{ kind: 'http', method: 'POST', url: grantUrl(B), body: { scope: 'permanent' } }]);
   const g2 = await grantOf(B);
-  check('C1 an in-cgroup agent POSTing the grant route is refused and grants nothing', r2.status >= 400 && r2.status < 500 && g2 === null, { status: r2.status, grant: g2?.scope ?? null }, HOLE);
+  check('C1 an in-cgroup agent POSTing the grant route is refused and grants nothing', r2.status >= 400 && r2.status < 500 && g2 === null, { status: r2.status, grant: g2?.scope ?? null });
 } catch (e) {
   check(`suite threw: ${e.stack?.split('\n').slice(0, 3).join(' | ')}`, false, server?.logText?.().slice(-1500));
 } finally {
@@ -393,6 +468,47 @@ async function reapOwnHosts() {
   check('CLEANUP every session-host scope this run started is gone (none left running)', hosts.length > 0 && left.length === 0, { started: hosts.map((h) => h.unit), left });
 }
 
-console.log(`\nFEAT-164 self-grant: ${pass} passed, ${fail} failed, ${holesOpen} self-grant holes OPEN`);
-if (holesOpen) console.log('  OPEN = an agent can still grant itself this way; closure awaits the FEAT-164 fork decision.');
-process.exit(fail ? 1 : holesOpen ? 2 : 0);
+/* ═══ SEAL — the one writer's seal, the migration, and the release CLI's reader (pure) ═══ */
+console.log('\n[M] seal: migration at key creation, project binding, the out-of-server reader');
+{
+  const seal = await import('./lib/git-write-seal.mjs');
+  const { resolveTarget } = await import('./lib/release.mjs');
+  const D = mkdtempScratch('f164seal-');
+  try {
+    const legacy = { permanent: true, grantedAt: '2026-10-01T00:00:00.000Z', grantedVia: 'dashboard' };
+    const scoped = { commit: true, push: true, scope: 'pre-upgrade scoped grant', grantedAt: '2026-10-11T00:00:00.000Z', grantedVia: 'dashboard' };
+    const projects = [{ id: 'm-legacy', hostPath: D, settings: { gitWrite: { ...legacy } } }, { id: 'm-scoped', hostPath: path.join(D, 'nope'), settings: { gitWrite: { ...scoped } } }, { id: 'm-none', settings: {} }];
+    const migrated = seal.sealLegacyOnKeyCreation(D, projects);
+    const [pL, pS] = projects;
+    check('M1 first key creation seals the grants that existed before the upgrade (they keep working)', migrated.join() === 'm-legacy,m-scoped' && !!seal.verifiedGitWrite(D, pL, pL.settings.gitWrite) && !!seal.verifiedGitWrite(D, pS, pS.settings.gitWrite), migrated);
+    check('M1b the key file is private (0600)', (fs.statSync(seal.sealKeyPath(D)).mode & 0o777) === 0o600);
+    const later = [{ id: 'm-forged', settings: { gitWrite: { ...scoped } } }];
+    check('M2 once the key exists, migration never runs again (a value planted later stays unsealed)', seal.sealLegacyOnKeyCreation(D, later).length === 0 && seal.verifiedGitWrite(D, later[0], later[0].settings.gitWrite) === null);
+    check('M3 a sealed value copied onto another project does not verify there', seal.verifiedGitWrite(D, { id: 'm-other', hostPath: pS.hostPath }, pS.settings.gitWrite) === null);
+    check('M3b the same project with its hostPath repointed does not verify (the seal binds the repo)', seal.verifiedGitWrite(D, { id: 'm-scoped', hostPath: D }, pS.settings.gitWrite) === null);
+    check('M4 a sealed value with one field changed does not verify', seal.verifiedGitWrite(D, pS, { ...pS.settings.gitWrite, push: false }) === null && seal.verifiedGitWrite(D, pS, { ...pS.settings.gitWrite, scope: 'x' }) === null);
+    check('M5 a junk / wrong-length seal does not verify', seal.verifiedGitWrite(D, pS, { ...scoped, seal: 'zz' }) === null && seal.verifiedGitWrite(D, pS, { ...scoped, seal: '0'.repeat(64) }) === null);
+    // The release CLI reads registry.json itself (a separate process): it must apply the same check.
+    fs.writeFileSync(path.join(D, 'registry.json'), JSON.stringify({ projects: [{ id: 'm-legacy', name: 'm-legacy', hostPath: D, settings: { gitWrite: projects[0].settings.gitWrite } }] }));
+    const ok = resolveTarget('m-legacy', { env: { CLAUDE_STATION_DATA: D } });
+    fs.writeFileSync(path.join(D, 'registry.json'), JSON.stringify({ projects: [{ id: 'm-legacy', name: 'm-legacy', hostPath: D, settings: { gitWrite: legacy } }] }));
+    const forged = resolveTarget('m-legacy', { env: { CLAUDE_STATION_DATA: D } });
+    check('M6 release.mjs honours a sealed grant and treats an unsealed one as none', ok.policy.mode !== 'none' && forged.policy.mode === 'none', { sealed: ok.policy.mode, unsealed: forged.policy.mode });
+    // Symlink swap: the path STRING is unchanged, but it now resolves to another repo.
+    const { repoIdentityOf, bindingHolds, grantBindingOf } = await import('./lib/repo-identity.mjs');
+    const X1 = path.join(D, 'x1'), X2 = path.join(D, 'x2'), LNK = path.join(D, 'lnk');
+    fs.mkdirSync(X1); fs.mkdirSync(X2); fs.symlinkSync(X1, LNK);
+    const boundL = repoIdentityOf(LNK);
+    const heldBefore = bindingHolds(boundL, LNK);
+    fs.rmSync(LNK); fs.symlinkSync(X2, LNK);
+    check('M8 a symlink swap under an unchanged path voids the binding (identity is the resolved repo)', heldBefore && !bindingHolds(boundL, LNK) && !bindingHolds(null, X1) && repoIdentityOf(path.join(D, 'missing')) === null, { boundL });
+    check('M9 migration binds each pre-existing grant to its current repo', JSON.stringify(pL.settings.gitWrite.repo) === JSON.stringify(grantBindingOf(D)), pL.settings.gitWrite.repo);
+    fs.rmSync(seal.sealKeyPath(D));
+    check('M7 no key = no grant (fail closed), the reader never creates one', seal.verifiedGitWrite(D, pL, pL.settings.gitWrite) === null && !fs.existsSync(seal.sealKeyPath(D)));
+  } catch (e) {
+    check(`[M] threw: ${e.stack?.split('\n').slice(0, 3).join(' | ')}`, false);
+  } finally { fs.rmSync(D, { recursive: true, force: true }); }
+}
+
+console.log(`\nFEAT-164 self-grant: ${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);

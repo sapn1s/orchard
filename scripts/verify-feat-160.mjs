@@ -113,6 +113,8 @@ async function main() {
   const validate = await import(path.join(ROOT, 'src', 'server', 'validate.ts'));
   const sessionAccounts = await import(path.join(ROOT, 'src', 'server', 'session-accounts.ts'));
   const globals = await import(path.join(ROOT, 'src', 'server', 'global-settings.ts'));
+  // BUG-255 r4 — the one launch-account authority (the constructor calls it; so does the declared fact).
+  const launchAccount = await import(path.join(ROOT, 'src', 'server', 'launch-account.ts'));
 
   /* Mint a ready, credentialled account the way step 3's login does. */
   const accountsFile = path.join(DATA, 'claude-accounts.json');
@@ -131,7 +133,9 @@ async function main() {
   /* ─────────────────────────────────────────────────────────── §1 wiring ── */
   section('1. wiring — the command, the one handler, the client routing');
   const eventsSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'events.ts'), 'utf8');
-  ok(/\{ type: 'switch-account'; requestId\?: string; account: string \| null; inherit\?: boolean \}/.test(eventsSrc),
+  // BUG-255 extended this member with optional offline-target fields (sessionId/
+  // encodedDir/projectId), so match the stable PREFIX rather than the exact `}`.
+  ok(/type: 'switch-account'; requestId\?: string; account: string \| null; inherit\?: boolean/.test(eventsSrc),
     "'switch-account' is a real ClientCommand member carrying the round-4 inherit flag (events.ts)", /switch-account.*inherit/.test(eventsSrc));
   const indexSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'index.ts'), 'utf8');
   const handlerCount = (indexSrc.match(/case 'switch-account':/g) ?? []).length;
@@ -139,7 +143,9 @@ async function main() {
   const appSrc = fs.readFileSync(path.join(ROOT, 'public', 'app.js'), 'utf8');
   ok(/if \(dockLive\(\)\) \{[\s\S]*?return switchAccountLive\(next\);/.test(appSrc),
     'pickAccount routes a LIVE pick to switchAccountLive (app.js)', /switchAccountLive/.test(appSrc));
-  ok(/function switchAccountLive\(next\)/.test(appSrc) && /type: 'switch-account', requestId, account/.test(appSrc),
+  // BUG-255 added an optional `target` param to switchAccountLive for an offline
+  // rebind, so match the name without pinning the full signature.
+  ok(/function switchAccountLive\(next/.test(appSrc) && /type: 'switch-account', requestId, account/.test(appSrc),
     'switchAccountLive sends the switch-account frame', true);
 
   /* ─────────────────────── §2 validate-before-reap ORDER (+ must-FAIL twin) ── */
@@ -313,7 +319,7 @@ async function main() {
   const SID = '11111111-2222-3333-4444-555555555555';
   // undefined (never switched) is DISTINCT from a real binding to the default (null).
   ok(sessionAccounts.getSessionAccount(SID) === undefined,
-    'an unbound session returns undefined (→ caller uses the per-launch override, pre-FEAT-160 behaviour)',
+    'an unbound session returns undefined (→ it launches on its project account, BUG-255 r4)',
     sessionAccounts.getSessionAccount(SID));
   sessionAccounts.setSessionAccount(SID, B.id);
   ok(sessionAccounts.getSessionAccount(SID)?.account === B.id, 'setSessionAccount binds the session to an account id', sessionAccounts.getSessionAccount(SID));
@@ -356,9 +362,11 @@ async function main() {
   // outbox pump, "Send anyway", boot re-pump, fork) honours it. Guard against grading
   // a private model of the constructor by asserting the real file does exactly this.
   const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'server', 'agent-bridge.ts'), 'utf8');
-  ok(/getSessionAccount\(opts\.resumeSessionId\)/.test(bridgeSrc) && /effective\.claudeAccount = bound\.account/.test(bridgeSrc),
-    'the AgentSession constructor reads getSessionAccount(opts.resumeSessionId) and assigns effective.claudeAccount (the one reader)',
-    'getSessionAccount(opts.resumeSessionId) → effective.claudeAccount = bound.account');
+  // BUG-255 r4 (refactor-tracking): the reader is now launch-account.ts effectiveLaunchAccount,
+  // called by the constructor with the resume's session id — same contract, one authority.
+  ok(/sessionId: opts\.resumeSessionId/.test(bridgeSrc) && /effective\.claudeAccount = effectiveLaunchAccount\(/.test(bridgeSrc),
+    'the AgentSession constructor assigns effective.claudeAccount from effectiveLaunchAccount({sessionId: resumeSessionId}) (the one reader)',
+    'effective.claudeAccount = effectiveLaunchAccount(accountSubject, …)');
   // BEHAVIOURAL (/proc): mirror the constructor's merge-then-bind using the REAL
   // session-accounts + env formula, spawn a child with that env, read /proc/<pid>/environ.
   const readEnviron = (pid) => {
@@ -376,15 +384,13 @@ async function main() {
     setTimeout(() => resolve(child.pid), 150);
   });
   const envForAcct = (accountId) => { const dir = accts.resolveLaunchAccountDir(accountId); return dir ? { CLAUDE_CONFIG_DIR: dir } : {}; };
-  // The constructor: start from the override-effective account, THEN let a binding win.
+  // The constructor (BUG-255 r4): the client's account pick is taken off a resume unread
+  // (takeAccountPick) and the REAL effectiveLaunchAccount decides — binding, else project account.
+  const DIRECT_PROJ = { isolation: 'direct', settings: { claudeAccount: null } };
   const effectiveWithBinding = (overrideAccount, resumeSid) => {
-    const base = globals.applyGlobalDefaults({ model: null, effort: null, claudeAccount: null });
-    let eff = base.claudeAccount;
-    const ov = validate.validateSessionOverrides({ claudeAccount: overrideAccount }, { isolation: 'direct' });
-    if ('claudeAccount' in ov) eff = ov.claudeAccount;        // the stale client override (account A)
-    const bound = sessionAccounts.getSessionAccount(resumeSid); // the server-owned binding (account B)
-    if (bound !== undefined) eff = bound.account;              // ← the reader: the binding WINS
-    return eff;
+    const { rest } = launchAccount.takeAccountPick({ claudeAccount: overrideAccount }, { newSession: false });
+    if (rest && 'claudeAccount' in rest) throw new Error('a resume kept the client pick');
+    return launchAccount.effectiveLaunchAccount({ sessionId: resumeSid }, DIRECT_PROJ);
   };
   // Bind the session to B, then resume carrying the STALE override A.
   sessionAccounts.setSessionAccount(SID, B.id);
@@ -396,22 +402,25 @@ async function main() {
     { CLAUDE_CONFIG_DIR: boundEnv.CLAUDE_CONFIG_DIR, bDir: accts.resolveAccountDir(B.id) });
   ok(boundEnv.CLAUDE_CONFIG_DIR !== accts.resolveAccountDir(A.id),
     '...and NOT on the stale-override account A (the pre-fix mis-bill)', { aDir: accts.resolveAccountDir(A.id) });
-  // must-FAIL / non-vacuity: with NO binding (the pre-FEAT-160 state), the SAME resume
-  // runs on the override account A — proving the binding is what flips A→B and the
-  // observation is not vacuous.
+  // Non-vacuity (BUG-255 r4 — this control used to assert the UNBOUND resume ran on the
+  // client's override A; that was verify-r3's break 1): with NO binding the SAME resume runs
+  // on the PROJECT account (here the default, var absent) — never the client's A — and the
+  // binding is what flips it to B.
   const UNBOUND = '99999999-8888-7777-6666-555555555555';
   const unboundPid = await spawnWithEnv(envForAcct(effectiveWithBinding(A.id, UNBOUND)));
   const unboundEnv = readEnviron(unboundPid);
-  ok(unboundEnv.CLAUDE_CONFIG_DIR === accts.resolveAccountDir(A.id),
-    'must-FAIL control: with NO binding the resume runs on the override account A (pre-fix behaviour — the binding is causal)',
-    { CLAUDE_CONFIG_DIR: unboundEnv.CLAUDE_CONFIG_DIR, aDir: accts.resolveAccountDir(A.id) });
+  ok(!('CLAUDE_CONFIG_DIR' in unboundEnv),
+    'control: with NO binding the resume runs on the PROJECT account (default, var absent), NOT the client override A (BUG-255 r4)',
+    { CLAUDE_CONFIG_DIR: unboundEnv.CLAUDE_CONFIG_DIR ?? '<absent>' });
   for (const pid of spawnedPids) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
   // THE ROUND-2 OUTBOX CASE rides the SAME single reader: the outbox pump's `resume`
   // route hands a queued row to `startSession` (→ the AgentSession constructor → the
   // binding reader above), so a row queued under the old account (A) resumes under the
   // new bound account (B), not its frozen override. Assert the resume route is that one
   // spawn path (not a separate account resolution the binding would miss).
-  const handOverResume = indexSrc.slice(indexSrc.indexOf('async handOver('), indexSrc.indexOf('async handOver(') + 4000);
+  // Window widened (4000 -> 9000): handOver grew (BUG-253 new-session branch,
+  // attachments) and the resume branch's startSession now sits past the old window.
+  const handOverResume = indexSrc.slice(indexSrc.indexOf('async handOver('), indexSrc.indexOf('async handOver(') + 9000);
   ok(/route === 'resume'|Resume from the transcript/.test(handOverResume) && /await startSession\(/.test(handOverResume),
     "the outbox pump's resume route spawns via startSession (so a queued row reads the ONE binding reader — the round-2 case rides the same chokepoint)",
     { callsStartSession: /await startSession\(/.test(handOverResume) });
@@ -434,12 +443,17 @@ async function main() {
   ok(freshResolves === M.id,
     'a fresh session with no project account inherits the MACHINE default M (applyGlobalDefaults)', { freshResolves, M: M.id });
   // SOURCE: the handler resolves inherit via applyGlobalDefaults over proj.settings.claudeAccount.
-  ok(/cmd\.inherit === true\s*\n?\s*\?\s*applyGlobalDefaults\(\{[^}]*claudeAccount: proj\.settings\.claudeAccount/.test(caseBody),
-    'the switch-account handler resolves an inherit pick via applyGlobalDefaults(proj.settings.claudeAccount) (the machine-default chain)',
-    { usesApplyGlobalDefaults: /applyGlobalDefaults\(/.test(caseBody) });
+  // BUG-255 r4 (refactor-tracking): resolved by launch-account.ts projectLaunchAccount — the
+  // same applyGlobalDefaults chain, owned by the one launch-account authority.
+  ok(/cmd\.inherit === true\s*\n?\s*\?\s*projectLaunchAccount\(proj\)/.test(caseBody)
+     && launchAccount.projectLaunchAccount({ settings: { claudeAccount: null } }) === M.id,
+    'the switch-account handler resolves an inherit pick via projectLaunchAccount(proj) (the machine-default chain → M)',
+    { usesProjectLaunchAccount: /projectLaunchAccount\(/.test(caseBody) });
   // SOURCE: the client no longer resolves inherit itself — it sends inherit:true and
   // does NOT compute `project.settings.claudeAccount ?? null` in switchAccountLive.
-  const swBody = appSrc.slice(appSrc.indexOf('function switchAccountLive'), appSrc.indexOf('function switchAccountLive') + 1400);
+  // Window widened (1400 -> 2800): BUG-255 added an explanatory comment before the
+  // frame, pushing `account, inherit }` past the old window.
+  const swBody = appSrc.slice(appSrc.indexOf('function switchAccountLive'), appSrc.indexOf('function switchAccountLive') + 2800);
   ok(/inherit = next === undefined/.test(swBody) && /account, inherit \}/.test(swBody)
      && !/settings\?\.claudeAccount \?\? null/.test(swBody),
     'switchAccountLive sends inherit:true and NO LONGER client-resolves project.settings.claudeAccount ?? null (the omission that mis-billed)',
@@ -484,9 +498,10 @@ async function main() {
   const BOUND_SID = '55555555-4444-3333-2222-111111111111';
   sessionAccounts.setSessionAccount(BOUND_SID, B.id);
   sessionAccounts._resetSessionAccountsCache();
-  // round-4: for a BOUND session, the drop removes claudeAccount → validation passes.
+  // BUG-255 r4: dropBoundAccountOverride is deleted; takeAccountPick removes the pick from
+  // EVERY existing session's resume/enqueue (bound or not) → validation passes, never stranded.
   const staleOverrides = { claudeAccount: DELETED, model: 'claude-opus-4-8' };
-  const stripped4 = sessionAccounts.dropBoundAccountOverride(BOUND_SID, { ...staleOverrides });
+  const stripped4 = launchAccount.takeAccountPick({ ...staleOverrides }, { newSession: false }).rest;
   let boundValidateThrew = false;
   try { if (stripped4) validate.validateSessionOverrides(stripped4, { isolation: 'direct' }); } catch { boundValidateThrew = true; }
   ok(!boundValidateThrew && stripped4 && !('claudeAccount' in stripped4) && stripped4.model === 'claude-opus-4-8',
@@ -499,14 +514,16 @@ async function main() {
   ok(rawValidateThrew != null && /existing account/i.test(rawValidateThrew.message),
     'must-FAIL twin: the round-3 path (validate the raw override, no drop) FATALLY throws on the deleted account (the strand)',
     rawValidateThrew?.message ?? '<no throw>');
-  // Non-vacuity: an UNBOUND session is UNTOUCHED — the legitimate FEAT-145 refusal of a
-  // bad launch account is preserved (the drop is bound-only, never a blanket bypass).
-  const unboundStripped = sessionAccounts.dropBoundAccountOverride('44444444-3333-2222-1111-000000000000', { ...staleOverrides });
-  let unboundStillThrows = false;
-  try { validate.validateSessionOverrides(unboundStripped, { isolation: 'direct' }); } catch { unboundStillThrows = true; }
-  ok(unboundStripped && 'claudeAccount' in unboundStripped && unboundStillThrows,
-    'non-vacuity: an UNBOUND session keeps its claudeAccount and still fails validation of a bad launch account (FEAT-145 refusal preserved)',
-    { unboundKeepsAccount: 'claudeAccount' in (unboundStripped ?? {}) });
+  // Non-vacuity (BUG-255 r4): an UNBOUND resume ALSO drops the pick (it was verify-r3's break 1
+  // that it did not), while a NEW session's pick is kept for validation — the FEAT-145 refusal
+  // of a bad launch account is preserved where a pick still means something.
+  const unboundStripped = launchAccount.takeAccountPick({ ...staleOverrides }, { newSession: false });
+  const newPick = launchAccount.takeAccountPick({ ...staleOverrides }, { newSession: true });
+  let newStillThrows = false;
+  try { validate.validateSessionOverrides({ claudeAccount: newPick.pick?.value }, { isolation: 'direct' }); } catch { newStillThrows = true; }
+  ok(!('claudeAccount' in (unboundStripped.rest ?? {})) && unboundStripped.pick === undefined && newPick.pick?.value === DELETED && newStillThrows,
+    'an UNBOUND resume drops the pick too; a NEW session keeps it and still fails validation of a bad account (FEAT-145 refusal preserved)',
+    { unboundKeepsAccount: 'claudeAccount' in (unboundStripped.rest ?? {}), newPick: newPick.pick, newStillThrows });
 
   /* ── §10 the inventory — every client-carried account read on a bound resume is guarded ── */
   section('10. inventory — every resume/enqueue validate of a client claudeAccount is guarded for a bound session');
@@ -515,25 +532,22 @@ async function main() {
   // could reach a bound session — the ws `start` resume, the outbox pump's handOver
   // resume, and the POST /api/outbox enqueue — and each must drop it first via
   // dropBoundAccountOverride. (The switch handler itself is the WRITER, exempt.)
-  const dropCalls = (indexSrc.match(/dropBoundAccountOverride\(/g) ?? []).length;
-  ok(dropCalls >= 3,
-    'index.ts guards all three resume/enqueue paths with dropBoundAccountOverride (start resume, outbox handOver, POST /api/outbox)',
-    { dropCalls });
-  // The ws start resume: the drop precedes the validateSessionOverrides it feeds.
+  // BUG-255 r4 (refactor-tracking): the guard is takeAccountPick, and it now strips EVERY
+  // existing session's pick (not only a bound one's); dropBoundAccountOverride is gone.
+  const takeCalls = (indexSrc.match(/takeAccountPick\(/g) ?? []).length;
+  ok(takeCalls >= 3 && !/dropBoundAccountOverride\(/.test(indexSrc),
+    'index.ts strips the client account pick with takeAccountPick on every resume/enqueue path (dropBoundAccountOverride deleted)',
+    { takeCalls });
   const startCase = indexSrc.slice(indexSrc.indexOf("case 'start':"), indexSrc.indexOf("case 'send':"));
-  ok(startCase.indexOf('dropBoundAccountOverride(') > -1
-     && startCase.indexOf('dropBoundAccountOverride(') < startCase.indexOf('validateSessionOverrides(rawOverrides'),
-    'the ws start resume drops the bound account BEFORE validateSessionOverrides(rawOverrides)', true);
-  // The outbox handOver resume: drop precedes its validate.
-  ok(/dropBoundAccountOverride\(sid,[^)]*resume\.overrides/.test(indexSrc),
-    'the outbox pump handOver resume drops the bound account from the frozen row before validating it', true);
-  // The POST enqueue: drop precedes its validate.
-  ok(/dropBoundAccountOverride\(sid, rest2\)/.test(indexSrc),
-    'the POST /api/outbox enqueue drops the bound account before validating the row', true);
-  // And the single READER is still the one authority (unchanged from §7) — the drops
-  // only stop a stale client value from FATALING; the constructor still decides.
-  ok(/effective\.claudeAccount = bound\.account/.test(bridgeSrc),
-    'the AgentSession constructor remains the ONE place that decides a bound session\'s account (ARCH-010)', true);
+  ok(startCase.indexOf('takeAccountPick(') > -1
+     && startCase.indexOf('takeAccountPick(') < startCase.indexOf('validateSessionOverrides(rawOverrides'),
+    'the ws start takes the account pick off BEFORE validateSessionOverrides(rawOverrides)', true);
+  ok(/takeAccountPick\(resume\.overrides, \{ newSession: false \}\)/.test(indexSrc),
+    'the outbox pump handOver resume takes the pick off the frozen row before validating it', true);
+  ok(/takeAccountPick\(rest2, \{ newSession: false \}\)/.test(indexSrc),
+    'the POST /api/outbox enqueue takes the pick off before validating the row', true);
+  ok(/effective\.claudeAccount = effectiveLaunchAccount\(/.test(bridgeSrc),
+    'the AgentSession constructor remains the ONE place that decides a session\'s account (effectiveLaunchAccount, ARCH-010)', true);
 
   /* ── summary ─────────────────────────────────────────────────────────── */
   section('summary');

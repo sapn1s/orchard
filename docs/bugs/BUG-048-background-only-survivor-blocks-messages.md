@@ -5,73 +5,105 @@
   "title": "Restart survivors delay new messages",
   "summary": "After a restart, a message waits while a background helper finishes, although background work does not block messages during normal operation. Messages auto-deliver safely but silently after the drain. The proposed first stage explains the delay; a later stage would shorten it without introducing competing transcript writers.",
   "impact_if_we_wait": "Messages remain silently delayed for about a minute after some restarts. Bounded: this is temporary delivery latency, not message loss or conversation corruption, and normal operation is unaffected.",
-  "current_need": "Approve showing an honest held status with automatic-delivery timing before attempting live delivery into surviving helpers.",
+  "current_need": "Build A: queued messages say background work is holding them and that they deliver automatically. Stage 2 (deliver into the survivor) is re-declared only after its single-writer design is demonstrated.",
   "severity": "low",
   "area": "Restart message delivery",
   "reported": "2026-08-11",
   "reported_by": "user",
-  "owner": "agent",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "staged_decision",
-  "updated": "2026-08-11",
-  "decision": {
-    "mode": "staged",
-    "question": "Should we first explain the safe delay before attempting faster delivery?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Show held status",
-        "what_changes": "Queued messages display that background work is holding them and that they will deliver automatically.",
-        "benefit": "The existing safe wait becomes understandable instead of appearing broken.",
-        "cost": "The message still waits until the surviving helper reaches its boundary.",
-        "why_not_obvious": "Improved status may reduce pressure to remove a delay that still contradicts normal behavior.",
-        "stage": 1
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "a030c903-beb2-4ef3-b4b0-a668bf79b283",
+      "asked_on": "2026-08-11",
+      "question": "Should we first explain the safe delay before attempting faster delivery?",
+      "mode": "staged",
+      "options_keys": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Stage 1 is a reversible honesty fix with a recommendation; it does not preclude faster delivery later. Stage 2 is gated on a technical demonstration, not on you.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Stage 1 is a reversible honesty fix with a recommendation; it does not preclude faster delivery later. Stage 2 is gated on a technical demonstration, not on you.",
+        "on": "2026-10-14",
+        "next": "Build A: queued messages say background work is holding them and that they deliver automatically. Stage 2 (deliver into the survivor) is re-declared only after its single-writer design is demonstrated.",
+        "handoff": null,
+        "prior": {
+          "human_action": "staged_decision",
+          "work_state": "open",
+          "current_need": "Approve showing an honest held status with automatic-delivery timing before attempting live delivery into surviving helpers."
+        }
       },
-      {
-        "key": "B",
-        "label": "Keep silent waiting",
-        "what_changes": "The current automatic queue and delivery behavior remains unchanged.",
-        "benefit": "No interface work is required before pursuing the deeper delivery change.",
-        "cost": "People continue seeing an unexplained delay after affected restarts.",
-        "why_not_obvious": "Skipping temporary interface work avoids churn if faster delivery follows immediately.",
-        "stage": 1
-      },
-      {
-        "key": "C",
-        "label": "Deliver into survivor",
-        "what_changes": "Queued messages enter the surviving helper at its next safe boundary.",
-        "benefit": "The wait shortens without starting a competing conversation writer.",
-        "cost": "The broker needs new message routing and lifecycle handling across both runtimes.",
-        "why_not_obvious": "Incorrect boundary handling could corrupt the conversation record or interrupt background completion.",
-        "stage": 2
-      },
-      {
-        "key": "D",
-        "label": "Retain bounded drain",
-        "what_changes": "Messages continue waiting for complete drain while the interface reports progress and timing.",
-        "benefit": "The established single-writer guarantee remains simple.",
-        "cost": "Restart-only latency remains part of normal product behavior.",
-        "why_not_obvious": "The safer implementation preserves a user-visible inconsistency that can last about a minute.",
-        "stage": 2
+      "snapshot": {
+        "mode": "staged",
+        "question": "Should we first explain the safe delay before attempting faster delivery?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Show held status",
+            "what_changes": "Queued messages display that background work is holding them and that they will deliver automatically.",
+            "benefit": "The existing safe wait becomes understandable instead of appearing broken.",
+            "cost": "The message still waits until the surviving helper reaches its boundary.",
+            "why_not_obvious": "Improved status may reduce pressure to remove a delay that still contradicts normal behavior.",
+            "stage": 1
+          },
+          {
+            "key": "B",
+            "label": "Keep silent waiting",
+            "what_changes": "The current automatic queue and delivery behavior remains unchanged.",
+            "benefit": "No interface work is required before pursuing the deeper delivery change.",
+            "cost": "People continue seeing an unexplained delay after affected restarts.",
+            "why_not_obvious": "Skipping temporary interface work avoids churn if faster delivery follows immediately.",
+            "stage": 1
+          },
+          {
+            "key": "C",
+            "label": "Deliver into survivor",
+            "what_changes": "Queued messages enter the surviving helper at its next safe boundary.",
+            "benefit": "The wait shortens without starting a competing conversation writer.",
+            "cost": "The broker needs new message routing and lifecycle handling across both runtimes.",
+            "why_not_obvious": "Incorrect boundary handling could corrupt the conversation record or interrupt background completion.",
+            "stage": 2
+          },
+          {
+            "key": "D",
+            "label": "Retain bounded drain",
+            "what_changes": "Messages continue waiting for complete drain while the interface reports progress and timing.",
+            "benefit": "The established single-writer guarantee remains simple.",
+            "cost": "Restart-only latency remains part of normal product behavior.",
+            "why_not_obvious": "The safer implementation preserves a user-visible inconsistency that can last about a minute.",
+            "stage": 2
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "It makes the current safe behavior honest while preserving a reversible path toward shorter waits.",
+        "prerequisite": "Before stage two, establish how survivor and resumed work avoid concurrent transcript writes.",
+        "stages": [
+          {
+            "stage": 1,
+            "question": "Should affected messages show that they are held and will auto-deliver?",
+            "unlocked_by": "Approval to expose drain state and automatic-delivery timing."
+          },
+          {
+            "stage": 2,
+            "question": "Should messages enter the survivor at its next safe boundary?",
+            "unlocked_by": "A demonstrated single-writer design for broker delivery across both runtimes."
+          }
+        ]
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "It makes the current safe behavior honest while preserving a reversible path toward shorter waits.",
-    "prerequisite": "Before stage two, establish how survivor and resumed work avoid concurrent transcript writes.",
-    "stages": [
-      {
-        "stage": 1,
-        "question": "Should affected messages show that they are held and will auto-deliver?",
-        "unlocked_by": "Approval to expose drain state and automatic-delivery timing."
-      },
-      {
-        "stage": 2,
-        "question": "Should messages enter the survivor at its next safe boundary?",
-        "unlocked_by": "A demonstrated single-writer design for broker delivery across both runtimes."
-      }
-    ]
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "Held messages display why they are waiting and when automatic delivery is expected",
     "A post-restart message reaches the model without waiting for background work to finish",
@@ -398,3 +430,6 @@ YES, including while background work is live.**
    `verify:restart-reconnect-race` stays a gate.
 (b) is rejected on direct evidence now, not inference: the survivor writes full autonomous turns
 at unpredictable times (probe 1) and the current CLI offers no same-file guard (probe 2).
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Stage 1 is a reversible honesty fix with a recommendation; it does not preclude faster delivery later. Stage 2 is gated on a technical demonstration, not on you. Next: Build A: queued messages say background work is holding them and that they deliver automatically. Stage 2 (deliver into the survivor) is re-declared only after its single-writer design is demonstrated. You can reopen this decision from the ticket view.

@@ -7,7 +7,7 @@
  * twice and drifting — the UI renders all three with one renderer.
  */
 import type { TranscriptBlock, TranscriptMessage } from '../lib/session-history.ts';
-import { deliverText } from '../lib/session-history.ts';
+import { deliverText, attachmentBlockOf } from '../lib/session-history.ts';
 
 export interface BuildOptions {
   maxTextChars?: number;
@@ -69,6 +69,8 @@ export function blocksOf(e: Record<string, any>, opts: BuildOptions = {}): Trans
   }
   if (!Array.isArray(content)) return blocks;
   for (const b of content as Record<string, any>[]) {
+    const att = attachmentBlockOf(b); // FEAT-177 — image/document/file attachment
+    if (att) { blocks.push(att); continue; }
     if (b?.type === 'text') blocks.push({ type: 'text', ...clip(String(b.text ?? '')) });
     else if (b?.type === 'thinking' || b?.type === 'redacted_thinking') blocks.push({ type: 'thinking', ...clip(String(b.thinking ?? '')) });
     else if (b?.type === 'tool_use') {

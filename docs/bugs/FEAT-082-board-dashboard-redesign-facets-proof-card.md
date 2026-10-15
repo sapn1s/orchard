@@ -5,57 +5,89 @@
   "title": "Finished and unfinished tickets look the same on the board",
   "summary": "The ticket board is one large table where every kind of item is mixed together, so telling finished work from unfinished means reading a ticket's whole history. Colour-coded type labels, a proof card at the top of each ticket, and a counts strip are the recommended answer. A drag-the-cards board was considered and rejected.",
   "impact_if_we_wait": "Confirming that a requested feature is actually done stays a manual read of a long history log. Bounded: this is a presentation and navigation gap, nothing is lost or wrong in the tickets themselves, and the board keeps working as it does today.",
-  "current_need": "Approve the type labels and proof card, and choose how the card's evidence is gathered.",
+  "current_need": "Build C: declared evidence fields with a prose fallback, then the type labels and proof card.",
   "severity": "medium",
   "area": "Ticket board",
   "reported": "2026-08-14",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-19",
-  "decision": {
-    "mode": "single",
-    "question": "Should the proof card read evidence from existing ticket text, from new declared fields, or both?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Scrape existing ticket text",
-        "what_changes": "The card reads pass counts, failure proof and commit out of prose already written on each ticket.",
-        "benefit": "Works on all 174 existing tickets immediately, with no change to how tickets are written.",
-        "cost": "The card shows \"not recorded\" wherever the prose never said it, which is often.",
-        "why_not_obvious": "Reading loose prose is guesswork, so the card can show a confident number that came from the wrong sentence."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "a7c34729-3f54-4abf-997f-b48bed1fe30a",
+      "asked_on": "2026-08-19",
+      "question": "Should the proof card read evidence from existing ticket text, from new declared fields, or both?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "chosen": "C",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Engineering choice of evidence source with a recommendation; the visual design still gets its screenshot review before done.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Engineering choice of evidence source with a recommendation; the visual design still gets its screenshot review before done.",
+        "on": "2026-10-14",
+        "next": "Build C: declared evidence fields with a prose fallback, then the type labels and proof card.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Approve the type labels and proof card, and choose how the card's evidence is gathered."
+        }
       },
-      {
-        "key": "B",
-        "label": "Declare the evidence when closing",
-        "what_changes": "Tickets gain named fields for counts and commit, and the card reads only what was declared.",
-        "benefit": "What the card shows is exactly what someone wrote down, so it can be trusted.",
-        "cost": "Every existing ticket stays blank, and closing a ticket gains an extra step.",
-        "why_not_obvious": "A step at close time is the one people skip when busy, and a skipped field looks the same as no work done."
-      },
-      {
-        "key": "C",
-        "label": "Declared fields with a text fallback",
-        "what_changes": "The card prefers declared fields and falls back to reading prose when they are absent.",
-        "benefit": "Old tickets show something and new ones are reliable.",
-        "cost": "The most work, and the prose-reading path has to keep working indefinitely.",
-        "why_not_obvious": "Two sources for one number means a disagreement between them is possible and nobody sees which one won."
-      },
-      {
-        "key": "D",
-        "label": "Rework the design first",
-        "what_changes": "The type labels and proof card are set aside and the board layout is designed again.",
-        "benefit": "Avoids building on a shape that was chosen in a single read-only pass.",
-        "cost": "Nothing improves meanwhile, and the evidence question cannot be answered until the design settles.",
-        "why_not_obvious": "The two alternatives already considered were rejected for reasons a second pass would likely reach again."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should the proof card read evidence from existing ticket text, from new declared fields, or both?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Scrape existing ticket text",
+            "what_changes": "The card reads pass counts, failure proof and commit out of prose already written on each ticket.",
+            "benefit": "Works on all 174 existing tickets immediately, with no change to how tickets are written.",
+            "cost": "The card shows \"not recorded\" wherever the prose never said it, which is often.",
+            "why_not_obvious": "Reading loose prose is guesswork, so the card can show a confident number that came from the wrong sentence."
+          },
+          {
+            "key": "B",
+            "label": "Declare the evidence when closing",
+            "what_changes": "Tickets gain named fields for counts and commit, and the card reads only what was declared.",
+            "benefit": "What the card shows is exactly what someone wrote down, so it can be trusted.",
+            "cost": "Every existing ticket stays blank, and closing a ticket gains an extra step.",
+            "why_not_obvious": "A step at close time is the one people skip when busy, and a skipped field looks the same as no work done."
+          },
+          {
+            "key": "C",
+            "label": "Declared fields with a text fallback",
+            "what_changes": "The card prefers declared fields and falls back to reading prose when they are absent.",
+            "benefit": "Old tickets show something and new ones are reliable.",
+            "cost": "The most work, and the prose-reading path has to keep working indefinitely.",
+            "why_not_obvious": "Two sources for one number means a disagreement between them is possible and nobody sees which one won."
+          },
+          {
+            "key": "D",
+            "label": "Rework the design first",
+            "what_changes": "The type labels and proof card are set aside and the board layout is designed again.",
+            "benefit": "Avoids building on a shape that was chosen in a single read-only pass.",
+            "cost": "Nothing improves meanwhile, and the evidence question cannot be answered until the design settles.",
+            "why_not_obvious": "The two alternatives already considered were rejected for reasons a second pass would likely reach again."
+          }
+        ],
+        "recommendation": "C",
+        "recommendation_reason": "It gives new tickets a number worth trusting while still showing something useful on the ones already written.",
+        "prerequisite": "Establish how much of the existing prose can actually be read reliably. If very little, the fallback path is not worth keeping and B becomes correct."
       }
-    ],
-    "recommendation": "C",
-    "recommendation_reason": "It gives new tickets a number worth trusting while still showing something useful on the ones already written.",
-    "prerequisite": "Establish how much of the existing prose can actually be read reliably. If very little, the fallback path is not worth keeping and B becomes correct."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "Filtering by type shows only that type, and each ticket carries its type label",
     "A ticket with an independent verdict shows that verdict and its run identifier on the card",
@@ -398,3 +430,6 @@ dark, luma 25), `board-digest-narrow.png` (480px, luma 244), plus the scratch/em
 ### 2026-08-19 — clean-room independent verification of the three-band ticket view (198013f)
 
 - **Verified-by:** dispatch openai run 01a01b6c-0f4a-73d2-8a6b-8c5b97af8e6b (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: C. Why: Engineering choice of evidence source with a recommendation; the visual design still gets its screenshot review before done. Next: Build C: declared evidence fields with a prose fallback, then the type labels and proof card. You can reopen this decision from the ticket view.

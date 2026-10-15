@@ -26,4 +26,12 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
+# FEAT-176 — warn (never refuse) when a file no longer holds what a finished lane
+# wrote. The whole tree, not only the staged paths: a lane's file reverted to HEAD
+# is never staged, which is exactly how such a loss stays silent. Bounded, and any
+# failure is ignored: this line can never block a commit.
+if [ -f "$ROOT/scripts/lane-snapshot.mjs" ]; then
+  timeout 15 node "$ROOT/scripts/lane-snapshot.mjs" check --repo "$ROOT" --warn || true
+fi
+
 node "$GATE" --summary --staged --identity

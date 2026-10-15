@@ -56,7 +56,7 @@ const frozenCard = all.find((x) => x.p.format === 'block' && x.p.record?.decisio
 const [T1, T2] = pool.map((x) => x.id);
 console.log(`  (busy copy: ${all.length} tickets, ${open.size} open; card=${T1} rail=${T2} frozen-card=${frozenCard?.id})`);
 
-const decide = (id, q, extra = []) => spawnSync(process.execPath, [path.join(ROOT, 'scripts/board-tool.mjs'), 'decide', '--id', id, '--question', q,
+const decide = (id, q, extra = []) => spawnSync(process.execPath, [path.join(ROOT, 'scripts/board-tool.mjs'), 'decide', '--id', id, '--question', q, '--decider', 'taste', '--consequence', 'you will read this card every single day',
   '--option', 'A=Keep it as is | Nothing changes | No new surface | Friction stays | It is the status quo',
   '--option', 'B=Change it | The new behaviour ships | Less friction | A new surface | It costs a migration',
   '--recommend', 'B', '--why', 'It removes the friction.', '--author', 'worker (fixing r3 test)', ...extra],

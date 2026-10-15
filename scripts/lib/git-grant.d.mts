@@ -65,6 +65,10 @@ export interface EvaluateGitWriteOpts {
   window?: GitWriteToolCallWindow | null;
   /** BUG-231 — the repo content the gate scanned ({head, path:blob entries}); lets the shim skip an unchanged re-gate. */
   repoFingerprint?: RepoFingerprintReader;
+  /** FEAT-190 r9 — the ONE resolved target repo recorded on the audit entry (the repo the write reached). */
+  targetRepo?: { toplevel?: string | null; commonDir?: string | null; label?: string | null } | null;
+  /** FEAT-190 r9 — the session's project key, recorded alongside targetRepo on the audit entry. */
+  sourceProjectKey?: string | null;
 }
 
 export declare function evaluateGitWrite(opts: EvaluateGitWriteOpts): GitWriteEvaluation;
@@ -80,6 +84,10 @@ export interface RedeemGitWriteOpts {
   runLeakGate?: GateRunner | null;
   sessionLabel?: string | null;
   repoFingerprint?: RepoFingerprintReader;
+  /** FEAT-190 r9 — the ONE resolved target repo recorded on the audit entry (the repo the write reached). */
+  targetRepo?: { toplevel?: string | null; commonDir?: string | null; label?: string | null } | null;
+  /** FEAT-190 r9 — the session's project key, recorded alongside targetRepo on the audit entry. */
+  sourceProjectKey?: string | null;
 }
 
 /** BUG-231 — the shim's decision for one invocation: redeem the session's live window, else decide independently. */

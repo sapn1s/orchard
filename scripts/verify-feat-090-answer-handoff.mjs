@@ -28,7 +28,7 @@ import * as path from 'node:path';
 import WebSocket from 'ws';
 import {
   readBoard, boardStateSection, composeAnswerEntry, legacyProseAnswerState,
-  boardAnswerBriefing, answeredAwaitingKeys,
+  boardAnswerBriefing, boardStateSnapshot, markAnswersDelivered,
 } from '../src/server/board.ts';
 import { answerTicket, readTicket, TicketError } from '../src/server/tickets.ts';
 
@@ -182,14 +182,19 @@ function partA() {
   /* the briefing: once per (id,date), silent when empty, seeded from the snapshot. */
   const seen = new Set();
   const b1 = boardAnswerBriefing(host, seen);
-  check('boardAnswerBriefing: announces the answered decision once, as a not-dispatched fact',
-    !!b1 && b1.includes(NEEDS_ID) && /do not start work on it silently/i.test(b1), (b1 ?? '').split('\n')[0]);
+  // BUG-257: the briefing tells the agent a picked option is the user's go (not "ask before you begin").
+  check('boardAnswerBriefing: announces the answered decision once, as a not-started fact whose picked option is the go',
+    !!b1 && b1.includes(NEEDS_ID) && /picked option with no note is the user's go/i.test(b1) && /note governs over the pick/.test(b1)
+      && !/ask before you begin/i.test(b1), (b1 ?? '').split('\n')[0]);
   check('boardAnswerBriefing: the SAME answer is never announced twice (second call → null)',
     boardAnswerBriefing(host, seen) === null, 'second call null');
-  const seedSeen = new Set(answeredAwaitingKeys(host));
-  check('answeredAwaitingKeys seeds the seen-set so a fresh session (snapshot already carried it) does NOT re-announce',
-    boardAnswerBriefing(host, seedSeen) === null && answeredAwaitingKeys(host).some((k) => k.startsWith(`${NEEDS_ID}@`)),
-    answeredAwaitingKeys(host));
+  // BUG-257 r3: a session's seen-set is written only once the launch snapshot carrying
+  // these keys is DELIVERED (markAnswersDelivered); nothing pre-seeds it.
+  const snapKeys = boardStateSnapshot(host)?.answeredKeys ?? [];
+  const seedSeen = new Set(); markAnswersDelivered(seedSeen, snapKeys);
+  check('a delivered launch snapshot marks its answers seen, so the live briefing does NOT re-announce them',
+    boardAnswerBriefing(host, seedSeen) === null && snapKeys.some((k) => k.startsWith(`${NEEDS_ID}@`)),
+    snapKeys);
   // empty lane → null
   const TMP2 = fs.mkdtempSync(path.join(os.tmpdir(), 'f90b-'));
   seedBoard(path.join(TMP2, 'docs', 'bugs'));

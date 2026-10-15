@@ -177,6 +177,19 @@ export function getObject(store, h) {
 
 /** The identity that is hashed: key order fixed, files sorted by path. */
 function identityOf(m) {
+  // MIXED-STATE (see freezeMixed): a different identity version, so no clean (v2)
+  // candidate's hash changes. It pins the whole verified room tree and exactly what
+  // was disclosed to the verifier, besides the ticket's own frozen files.
+  if (m.mode === 'mixed') {
+    return {
+      v: 3, mode: 'mixed', ticket: m.ticket, base: m.base, roomTree: m.roomTree,
+      files: [...m.files].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)).map((f) => ({
+        path: f.path, owner: f.owner, deleted: !!f.deleted, mode: f.deleted ? null : f.mode,
+        sha256: f.deleted ? null : f.sha256, baseBlob: f.baseBlob, baseMode: f.baseMode,
+      })),
+      disclosure: m.disclosure ?? null,
+    };
+  }
   return {
     v: 2,
     ticket: m.ticket,
@@ -430,8 +443,8 @@ export function freezeCandidate({ repo, id, files, dependsOn = [], acceptForeign
       const b = blobAt(info.top, info.head, p);
       entries.push({ path: p, owner: f.owner, deleted: f.deleted, mode: f.mode, sha256: f.sha256, baseBlob: b ? b.blob : null, baseMode: b ? b.mode : null });
     }
-    // Shadow-repo pilot (plan review 1 #9): a caller that knows which bytes the candidate
-    // MUST hold (the landed bytes) passes them; the captured bytes are checked against
+    // Optional `expect` (FEAT-170 plan review 1 #9): a caller that knows which bytes the candidate
+    // MUST hold passes them; the captured bytes are checked against
     // them here, after the stable read and before anything is published, so an edit
     // between the caller's check and this capture can never become the candidate.
     if (expect) {
@@ -507,10 +520,36 @@ function buildTree(top, store, m, onto) {
   } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ } }
 }
 
+/** FEAT-164 release — the tree `onto` + candidate `m`'s frozen bytes (the same builder the commit uses). */
+export function buildCandidateTree(top, store, m, onto) { return buildTree(top, store, m, onto); }
+
+/**
+ * FEAT-164 release — after ONE release commit published several candidates, mark each
+ * candidate's members committed (the same transition `commitCandidate` makes, under the
+ * store lock). `hashes` = the published candidates' hashes.
+ */
+export function markCandidatesCommitted(repo, hashes, commit, event = 'release') {
+  const info = repoInfo(repo);
+  return withStoreLock(info.store, () => {
+    for (const hash of hashes) {
+      const m = loadCandidate(info.store, hash);
+      for (const T of membersOf(m)) {
+        const ts = readTicketState(info.store, T);
+        ts.history.push({ event, hash, commit, at: new Date().toISOString() });
+        // Same transition as commitCandidate: the owner always; a dependency only while
+        // its open candidate is still the one this group pinned.
+        if (T === m.ticket || ts.open === m.deps.find((d) => d.ticket === T)?.hash) { ts.open = null; ts.claim = null; ts.state = 'committed'; }
+        writeTicketState(info.store, ts);
+      }
+    }
+  });
+}
+
 /** Materialise for a verifier: integrity-checked, and the recomputed tree must equal the recorded one. */
 export function materializeCandidate(repo, ref) {
   const info = repoInfo(repo);
   const m = loadCandidate(info.store, resolveRefIn(info, ref));
+  if (m.mode === 'mixed') return materializeMixed(info, m);
   let tree;
   try { tree = buildTree(info.top, info.store, m, m.base); }
   catch (e) { fail('base-missing', `candidate ${m.hash.slice(0, 12)}'s base ${m.base.slice(0, 12)} cannot be read (${e.message}) — history was rewritten or pruned; re-freeze`); }
@@ -527,6 +566,226 @@ function resolveRefIn(info, ref) {
   return loadCandidate(info.store, ref).hash;
 }
 export function resolveRef(repo, ref) { return resolveRefIn(repoInfo(repo), ref); }
+
+/* ─────────────────────────────────────────── MIXED-STATE freeze (no ownership) */
+
+/*
+ * WHY. A clean candidate needs the ticket's files to carry only its own uncommitted
+ * lines (or a declared dependency group). On a shared tree that is often false: BUG-255's
+ * verify could not start because five other open tickets had hunks in the same files
+ * (freeze refused `owned`; a group hit dependency cycles; --working-tree was an 800 KB
+ * blend). Lanes worked around it by hand: copy the tree to scratch, check the hashes
+ * against the live files, verify there, record the verdict.
+ *
+ * A MIXED-STATE candidate is that workaround as the tool's own path:
+ *   - the ticket's files are frozen AS THEY ARE in the working tree, foreign hunks
+ *     included, from ONE snapshot of the whole tree (the verifier's room), and their
+ *     snapshot bytes are checked equal to the live bytes before anything is published;
+ *   - it takes NO claim and writes NO ticket state, so it never refuses because another
+ *     ticket owns a file, and never makes anyone else's freeze refuse;
+ *   - each hunk of those files that is attributable to another ticket (matched against
+ *     that ticket's own frozen bytes) or predates this ticket's claim is DISCLOSED, with
+ *     the owning ticket where known — ticket ids and line ranges only, never prose;
+ *   - the hash pins the files, the room tree and the disclosure; a later edit to any
+ *     frozen file makes candidateStatus report CHANGED, so the bound verdict lapses.
+ * It is a verification binding, not a commit unit (readiness refuses it).
+ */
+
+/** The ticket's own file list when the caller names none: its open candidate's own files, else its claim. */
+export function ticketFilesOf(repo, id) {
+  const info = repoInfo(repo);
+  const st = readTicketState(info.store, id);
+  if (st.open) {
+    try { return loadCandidate(info.store, st.open).files.filter((f) => f.owner === id).map((f) => f.path); } catch { /* fall through */ }
+  }
+  return (st.claim?.files || []).map((f) => f.path);
+}
+
+/**
+ * Is the ticket's open CLEAN candidate usable as-is (every file CURRENT, no stale base,
+ * pinned dependencies still open at their pinned hash, and it covers `files` if named)?
+ * Returns { usable, hash, reasons[] } — the reasons say why a clean diff is not possible.
+ */
+export function cleanCandidateUsable(repo, id, files = null) {
+  const info = repoInfo(repo);
+  const st = readTicketState(info.store, id);
+  if (!st.open) return { usable: false, hash: null, reasons: [`${id} has no open clean candidate`] };
+  let s;
+  try { s = candidateStatus(repo, st.open); } catch (e) { return { usable: false, hash: st.open, reasons: [`its candidate cannot be loaded: ${e.message}`] }; }
+  const reasons = [];
+  for (const f of s.files) {
+    if (f.state !== 'CURRENT') reasons.push(`${f.path}: ${f.state}`);
+    if (f.staleBase) reasons.push(`${f.path}: STALE-BASE`);
+  }
+  for (const d of s.manifest.deps) if (readTicketState(info.store, d.ticket).open !== d.hash) reasons.push(`dependency ${d.ticket} re-frozen, released or committed`);
+  if (files?.length) {
+    const own = new Set(s.manifest.files.filter((f) => f.owner === id).map((f) => f.path));
+    const miss = [...new Set(files.map((f) => repoRel(info.top, f)))].filter((p) => !own.has(p));
+    if (miss.length) reasons.push(`the candidate does not cover ${miss.join(', ')}`);
+  }
+  return { usable: reasons.length === 0, hash: s.manifest.hash, reasons };
+}
+
+/** `git diff --no-index -U0` hunks WITH their line content. */
+function contentHunks(a, b) {
+  if (Buffer.compare(a, b) === 0) return [];
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orchard-cand-hunks-'));
+  try {
+    const pa = path.join(dir, 'a'); const pb = path.join(dir, 'b');
+    fs.writeFileSync(pa, a); fs.writeFileSync(pb, b);
+    const r = spawnSync('git', ['diff', '--no-index', '--no-ext-diff', '--no-textconv', '-U0', '--text', '--', pa, pb], { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024 });
+    if (r.status !== 0 && r.status !== 1) fail('git-failed', `git diff --no-index failed: ${(r.stderr || '').trim()}`);
+    const out = []; let cur = null;
+    for (const line of (r.stdout || '').split('\n')) {
+      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+      if (m) { cur = { oldStart: +m[1], oldLen: m[2] === undefined ? 1 : +m[2], newStart: +m[3], newLen: m[4] === undefined ? 1 : +m[4], del: [], add: [] }; out.push(cur); continue; }
+      if (!cur) continue;
+      if (line.startsWith('-')) cur.del.push(line.slice(1));
+      else if (line.startsWith('+')) cur.add.push(line.slice(1));
+    }
+    return out;
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+const hunkKey = (h) => JSON.stringify([h.del, h.add]);
+/** A line worth matching on: short / punctuation-only lines (`}`, `);`) match everywhere. */
+const significant = (t) => /[A-Za-z0-9_]{3,}/.test(t);
+
+/**
+ * Attribute each hunk of HEAD→frozen for one file. Sources, all from the store:
+ *   other tickets' OPEN candidates owning the file (their frozen bytes) → that ticket;
+ *   this ticket's own CLAIM-time bytes → lines that predate this ticket's lane;
+ *   this ticket's own (stale) open candidate → its own lines;
+ *   other tickets' CLAIMS → named as claimants (a claim records pre-lane bytes, so it
+ *   cannot say which lines are theirs).
+ */
+function discloseFile(info, id, rel, headBytes, frozenBytes, owners, ownState) {
+  const live = contentHunks(headBytes, frozenBytes);
+  const src = [];
+  const claimants = [];
+  for (const o of owners.get(rel) || []) {
+    if (o.ticket === id) continue;
+    if (o.via === 'claim') { claimants.push(o.ticket); continue; }
+    let m; try { m = loadCandidate(info.store, o.hash); } catch { continue; }
+    const f = m.files.find((x) => x.path === rel && x.owner === o.ticket);
+    if (!f) continue;
+    src.push({ kind: 'other', ticket: o.ticket, hunks: contentHunks(headBytes, f.deleted ? Buffer.alloc(0) : getObject(info.store, f.sha256)) });
+  }
+  const claimSha = ownState.claim?.files?.find((f) => f.path === rel)?.sha256;
+  const pre = claimSha ? contentHunks(headBytes, getObject(info.store, claimSha)) : [];
+  let own = [];
+  if (ownState.open) {
+    try {
+      const f = loadCandidate(info.store, ownState.open).files.find((x) => x.path === rel && x.owner === id);
+      if (f) own = contentHunks(headBytes, f.deleted ? Buffer.alloc(0) : getObject(info.store, f.sha256));
+    } catch { /* none */ }
+  }
+  const keys = (hs) => new Set(hs.map(hunkKey));
+  const sig = (hs) => new Set(hs.flatMap((h) => [...h.del.map((t) => `-${t}`), ...h.add.map((t) => `+${t}`)]).filter((t) => significant(t.slice(1))));
+  const srcK = src.map((s) => ({ ...s, keys: keys(s.hunks), sig: sig(s.hunks) }));
+  const preK = keys(pre); const preSig = sig(pre); const ownK = keys(own);
+  const hunks = []; let unattributed = 0; let ownN = 0;
+  for (const h of live) {
+    const k = hunkKey(h);
+    const hs = [...h.del.map((t) => `-${t}`), ...h.add.map((t) => `+${t}`)].filter((t) => significant(t.slice(1)));
+    const exact = [...new Set(srcK.filter((s) => s.keys.has(k)).map((s) => s.ticket))];
+    const partial = [...new Set(srcK.filter((s) => hs.some((t) => s.sig.has(t))).map((s) => s.ticket))];
+    const at = { path: rel, newStart: h.newStart, newLen: h.newLen, oldStart: h.oldStart, oldLen: h.oldLen };
+    if (exact.length) hunks.push({ ...at, class: 'foreign', owners: exact, basis: 'identical to the owner\'s frozen change' });
+    else if (preK.has(k) || (hs.length && hs.every((t) => preSig.has(t)))) hunks.push({ ...at, class: 'foreign', owners: partial, basis: `already present when ${id} claimed the file` });
+    else if (ownK.has(k)) ownN++;
+    else if (partial.length) hunks.push({ ...at, class: 'mixed', owners: partial, basis: 'shares changed lines with the owner\'s frozen change; may also hold this ticket\'s lines' });
+    else unattributed++;
+  }
+  return { file: { path: rel, hunks: live.length, own: ownN, unattributed, claimants: [...new Set(claimants)].sort() }, hunks };
+}
+
+/**
+ * Freeze a MIXED-STATE candidate. Never claims, never refuses for ownership, writes no
+ * ticket state. Refusals: 'missing-arg' (no files known), 'unstable' (files changed
+ * while snapshotting), 'ignored' (a listed file exists but git ignores it), 'no-such-file',
+ * 'no-change' (every listed file equals HEAD — nothing to verify).
+ */
+export function freezeMixed({ repo, id, files = null, why = null }) {
+  if (!TICKET_RE.test(id)) fail('bad-id', `${id} is not a ticket id`);
+  let info = repoInfo(repo);
+  const rels = files?.length ? [...new Set(files.map((f) => repoRel(info.top, f)))] : ticketFilesOf(repo, id);
+  if (!rels.length) fail('missing-arg', `mixed freeze ${id}: name the ticket's files (--files a b c); ${id} has no candidate or claim to take them from`);
+  let room = null; let entries = null;
+  for (let attempt = 0; attempt < 4 && !entries; attempt++) {
+    info = repoInfo(repo);
+    room = snapshotTree(info.top);
+    if (room.head !== info.head) continue; // HEAD moved mid-snapshot
+    const got = [];
+    let ok = true;
+    for (const p of rels) {
+      const b = blobAt(info.top, room.tree, p);
+      const h = blobAt(info.top, room.head, p);
+      const bytes = b ? catBlob(info.top, b.blob) : null;
+      const live = readLive(info.top, p);
+      // The room's bytes must be the live bytes ("check the hashes against the live files").
+      if (!!b !== live.exists || (b && (Buffer.compare(bytes, live.bytes) !== 0 || b.mode !== live.mode))) {
+        if (live.exists && !b && spawnSync('git', ['-C', info.top, 'check-ignore', '-q', '--no-index', '--', p]).status === 0) {
+          fail('ignored', `mixed freeze ${id}: ${p} exists but git ignores it, so the snapshot (the verifier's room) cannot carry it`);
+        }
+        ok = false; break;
+      }
+      if (!b && !h) fail('no-such-file', `${p} exists neither in the working tree nor at HEAD — nothing to freeze`);
+      got.push({ path: p, owner: id, deleted: !b, mode: b ? b.mode : null, bytes, blob: b ? b.blob : null, baseBlob: h ? h.blob : null, baseMode: h ? h.mode : null });
+    }
+    if (ok) entries = got;
+  }
+  if (!entries) fail('unstable', `mixed freeze ${id}: the files kept changing while being snapshotted — another lane is writing them; run again when it has finished`);
+  const changed = entries.filter((e) => e.blob !== e.baseBlob || (!e.deleted && e.mode !== e.baseMode));
+  if (!changed.length) fail('no-change', `mixed freeze ${id}: none of the files differs from HEAD — there is nothing to verify`);
+
+  ensureStore(info.store);
+  const owners = ownersByPath(info.store);
+  const ownState = readTicketState(info.store, id);
+  const disclosure = { files: [], hunks: [] };
+  for (const e of entries) {
+    const head = e.baseBlob ? catBlob(info.top, e.baseBlob) : Buffer.alloc(0);
+    const d = discloseFile(info, id, e.path, head, e.bytes ?? Buffer.alloc(0), owners, ownState);
+    disclosure.files.push(d.file); disclosure.hunks.push(...d.hunks);
+  }
+  const manifest = {
+    ticket: id, mode: 'mixed', base: room.head, roomTree: room.tree, tree: room.tree, deps: [], checks: [],
+    files: entries.map(({ bytes, blob, ...e }) => ({ ...e, sha256: e.deleted ? null : putObject(info.store, bytes) })),
+    disclosure,
+  };
+  manifest.hash = candidateHash(manifest);
+  manifest.meta = {
+    frozenAt: new Date().toISOString(),
+    why: why ? [].concat(why) : [],
+    ownership: 'none: a mixed-state freeze takes no claim, writes no ticket state and is never refused for ownership',
+    unchangedFiles: entries.filter((e) => !changed.includes(e)).map((e) => e.path),
+  };
+  publishOnce(path.join(info.store, 'cand', `${manifest.hash}.json`), JSON.stringify(manifest, null, 2));
+  return manifest;
+}
+
+/** Snapshot the whole working tree (tracked + untracked-not-ignored) in a throwaway index. */
+function snapshotTree(top) {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orchard-mixed-'));
+  const env = { GIT_INDEX_FILE: path.join(tmp, 'index') };
+  try {
+    const head = gitOut(top, ['rev-parse', 'HEAD']);
+    git(top, ['read-tree', head], { env });
+    git(top, ['add', '-A'], { env });
+    return { head, tree: gitOut(top, ['write-tree'], { env }) };
+  } finally { try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ } }
+}
+
+/** Materialise a mixed candidate: its room tree must still exist and hold exactly the frozen bytes. */
+function materializeMixed(info, m) {
+  const t = git(info.top, ['cat-file', '-t', m.roomTree], { allowFail: true });
+  if ((t.status ?? 1) !== 0 || String(t.stdout).trim() !== 'tree') fail('base-missing', `mixed candidate ${m.hash.slice(0, 12)}'s room tree ${m.roomTree.slice(0, 12)} is gone (pruned) — freeze it again`);
+  for (const f of m.files) {
+    const b = blobAt(info.top, m.roomTree, f.path);
+    const okF = f.deleted ? !b : !!b && b.mode === f.mode && sha256(catBlob(info.top, b.blob)) === f.sha256;
+    if (!okF) fail('tree-mismatch', `mixed candidate ${m.hash.slice(0, 12)}: ${f.path} in the room tree is not the frozen bytes — refusing to verify something other than what was frozen`);
+  }
+  return { manifest: m, base: m.base, tree: m.roomTree, info };
+}
 
 /* ─────────────────────────────────────────── later changes: byte equality */
 
@@ -626,11 +885,11 @@ export async function ticketSatisfied(top, C, T) {
   const sorted = [...entries].sort((a, b) => String(a.recorded_at ?? '').localeCompare(String(b.recorded_at ?? '')));
   const bound = sorted.filter((e) => e.candidate === C.hash);
   const last = bound.at(-1);
-  if (!last) return { ok: false, reason: `${T} has no verdict bound to candidate ${C.hash.slice(0, 12)} (independent-verify --candidate ${C.hash.slice(0, 12)} for ${T}'s requirement, then board-tool verified --id ${T} … --candidate ${C.hash})` };
+  if (!last) return { ok: false, reason: `${T} has no verdict bound to candidate ${C.hash.slice(0, 12)} (independent-verify --ticket ${T} for ${T}'s requirement — it verifies candidate ${C.hash.slice(0, 12)} while current — then board-tool verified --id ${T} … --candidate ${C.hash})` };
   if (last.verdict !== 'holds') return { ok: false, reason: `${T}'s verdict on candidate ${C.hash.slice(0, 12)} is ${String(last.verdict).toUpperCase()} (run ${last.run_id})` };
   const laterBroken = sorted.filter((e) => e.verdict === 'broken' && String(e.recorded_at ?? '') > String(last.recorded_at ?? ''));
   if (laterBroken.length) return { ok: false, reason: `${T} has a BROKEN recorded after its HOLDS (run ${laterBroken.at(-1).run_id})` };
-  return { ok: true, run: last.run_id };
+  return { ok: true, run: last.run_id, at: last.recorded_at ?? null };
 }
 
 /* ─────────────────────────────────────────────────── integration after a base move */
@@ -709,6 +968,12 @@ export async function readiness(repo, ref) {
   const st = candidateStatus(repo, ref);
   const C = st.manifest;
   const blocking = []; const notes = [];
+  if (C.mode === 'mixed') {
+    // A mixed-state candidate binds a verdict to the ticket's files as they sit in the
+    // shared tree, other tickets' hunks included. Its verified room was the whole
+    // working tree, so no `candidate commit` of it would publish what was verified.
+    return { hash: C.hash, ticket: C.ticket, members: membersOf(C), ready: false, blocking: [`${C.hash.slice(0, 12)} is a MIXED-STATE candidate (verified in the shared tree with other tickets' uncommitted hunks): it binds a verdict, it is not a commit unit — its files are committed together with their co-owners; \`candidate status --candidate ${C.hash.slice(0, 12)}\` shows whether the verdict still covers them`], notes, files: st.files, verdicts: {}, base: C.base, head: info.head, mode: 'mixed' };
+  }
   const done = committedAs(info.top, C.hash);
   if (done) return { hash: C.hash, ticket: C.ticket, members: membersOf(C), ready: false, committed: done, blocking: [`already committed as ${done.slice(0, 12)}`], notes, files: st.files, verdicts: {}, base: C.base, head: info.head };
   for (const f of st.files) {
@@ -814,10 +1079,41 @@ export async function commitCandidate({ repo, ref, message = null }) {
   // ride-along: it staged the board file's LIVE bytes after the tree check, so the
   // published tree was not the verified one. The board is committed separately.
   const allPaths = C.files.map((f) => f.path);
+  const verified = Object.entries(r.verdicts).map(([t, v]) => `${t} run ${v.run}`).join('; ');
+  const res = publishFrozenTree({
+    repo, head, paths: allPaths, hashes: [C.hash], event: 'commit', reflog: `candidate commit ${C.ticket}`,
+    buildTree: () => {
+      const codeTree = buildTree(info.top, info.store, C, head);
+      if (codeTree !== r.resultTree) fail('tree-mismatch', `the tree this commit makes (${codeTree.slice(0, 12)}) is not the checked one (${String(r.resultTree).slice(0, 12)}) — nothing committed`);
+      return codeTree;
+    },
+    message: `${message || `${r.members.join(', ')}: commit frozen candidate ${C.hash.slice(0, 12)}`}\n\nVerified: ${verified}.\n\n${TRAILER}: ${C.hash}\n`,
+    trailers: [`${TRAILER}: ${C.hash}`],
+  });
+  return { commit: res.commit, parent: head, tree: res.tree, paths: allPaths, members: r.members, notes: r.notes, stillDirty: res.stillDirty };
+}
 
-  // 2. Staged state on these paths would be discarded by the index sync: refuse.
+/**
+ * THE PUBLISHER of frozen bytes into a real repo — one for `candidate commit` (one
+ * candidate) and FEAT-164's release cut (a batch + a version tag), so there is ONE
+ * publication path (FEAT-164 plan review #3):
+ *   1. HEAD must still be `head`; refuse if the real index has STAGED changes on `paths`;
+ *   2. throwaway index = `buildTree()` (HEAD + frozen bytes, nothing else); its tree is
+ *      re-read and must equal what was built;
+ *   3. the repo's pre-commit hook (the leak gate scans the STAGED bytes = exactly what is
+ *      committed) and commit-msg; refuse if a hook changed the index;
+ *   4. commit-tree (and, for a release, mktag); then ONE `update-ref --stdin`
+ *      transaction: HEAD <new> <expected old> [+ create refs/tags/<tag>] — both or
+ *      neither; if HEAD moved, nothing is published;
+ *   5. sync the real index for `paths` only; post-commit; mark the candidates committed.
+ * WHO MAY RUN IT is the project's git-write authority's decision (see commitCandidate).
+ */
+export function publishFrozenTree({ repo, head, paths, buildTree: build, message, trailers = [], tag = null, hashes = [], event = 'commit', reflog = 'orchard publish' }) {
+  const info = repoInfo(repo);
+  if (info.head !== head) fail('head-moved', `HEAD moved (expected ${head.slice(0, 12)}, now ${info.head.slice(0, 12)}) — nothing was published; run the command again`);
+  // 1. Staged state on these paths would be discarded by the index sync: refuse.
   const staged = [];
-  for (const p of allPaths) {
+  for (const p of paths) {
     const idx = String(git(info.top, ['ls-files', '-s', '-z', '--', `:(literal)${p}`]).stdout).split('\0').find(Boolean);
     const idxBlob = idx ? /^\d+ ([0-9a-f]+) /.exec(idx)?.[1] ?? null : null;
     const hd = blobAt(info.top, head, p);
@@ -832,50 +1128,47 @@ export async function commitCandidate({ repo, ref, message = null }) {
   const idxFile = path.join(tmpDir, 'index');
   const ienv = { GIT_INDEX_FILE: idxFile };
   try {
-    const codeTree = buildTree(info.top, info.store, C, head);
-    if (codeTree !== r.resultTree) fail('tree-mismatch', `the tree this commit makes (${codeTree.slice(0, 12)}) is not the checked one (${String(r.resultTree).slice(0, 12)}) — nothing committed`);
-    git(info.top, ['read-tree', codeTree], { env: ienv });
+    const built = build();
+    git(info.top, ['read-tree', built], { env: ienv });
     const tree = gitOut(info.top, ['write-tree'], { env: ienv });
-    if (tree !== r.resultTree) fail('tree-mismatch', `the staged tree (${tree.slice(0, 12)}) is not the checked one (${String(r.resultTree).slice(0, 12)}) — nothing committed`);
+    if (tree !== built) fail('tree-mismatch', `the staged tree (${tree.slice(0, 12)}) is not the checked one (${String(built).slice(0, 12)}) — nothing committed`);
     if (tree === gitOut(info.top, ['rev-parse', `${head}^{tree}`])) fail('nothing-to-commit', 'the candidate is identical to HEAD — already committed?');
 
     const msgFile = path.join(tmpDir, 'COMMIT_EDITMSG');
-    const verified = Object.entries(r.verdicts).map(([t, v]) => `${t} run ${v.run}`).join('; ');
-    fs.writeFileSync(msgFile, `${message || `${r.members.join(', ')}: commit frozen candidate ${C.hash.slice(0, 12)}`}\n\nVerified: ${verified}.\n\n${TRAILER}: ${C.hash}\n`);
+    fs.writeFileSync(msgFile, message);
     const hookEnv = { ...process.env, ...ienv, GIT_EDITOR: ':' };
     for (const [name, args] of [['pre-commit', []], ['commit-msg', [msgFile]]]) {
       const h = hookPath(info.top, name);
       if (!h) continue;
-      const hr = spawnSync(h, args, { cwd: info.top, env: hookEnv, stdio: ['ignore', 'inherit', 'inherit'] });
+      const hr = spawnSync(h, args, { cwd: info.top, env: hookEnv, stdio: ['ignore', 2, 'inherit'] });
       if ((hr.status ?? 1) !== 0) fail('hook-refused', `the repository's ${name} hook refused this commit (exit ${hr.status}) — nothing was committed`);
     }
     if (gitOut(info.top, ['write-tree'], { env: ienv }) !== tree) fail('hook-changed-index', 'a hook changed the staged content — refusing to commit bytes other than the verified ones; nothing was committed');
     let msg = fs.readFileSync(msgFile, 'utf8');
-    if (!msg.includes(`${TRAILER}: ${C.hash}`)) msg += `\n${TRAILER}: ${C.hash}\n`;
+    for (const t of trailers) if (!msg.includes(t)) msg += `${msg.endsWith('\n') ? '' : '\n'}${t}\n`;
     const newCommit = gitOut(info.top, ['commit-tree', tree, '-p', head, '-F', '-'], { input: msg });
-    const upd = git(info.top, ['update-ref', '-m', `candidate commit ${C.ticket}`, 'HEAD', newCommit, head], { allowFail: true });
+    let tagObj = null;
+    if (tag) {
+      const ident = gitOut(info.top, ['var', 'GIT_COMMITTER_IDENT']);
+      tagObj = gitOut(info.top, ['mktag'], { input: `object ${newCommit}\ntype commit\ntag ${tag.name}\ntagger ${ident}\n\n${tag.message ?? msg}` });
+    }
+    const tx = `update HEAD ${newCommit} ${head}\n${tag ? `create refs/tags/${tag.name} ${tagObj}\n` : ''}`;
+    const upd = git(info.top, ['update-ref', '-m', reflog, '--stdin'], { input: tx, allowFail: true });
     if ((upd.status ?? 1) !== 0) {
       const now = String(git(info.top, ['rev-parse', '--verify', 'HEAD'], { allowFail: true }).stdout || '').trim();
       if (now === head) fail('publish-refused', `update-ref was refused, so nothing was published (the git-write authority, or git itself): ${String(upd.stderr || '').trim().split('\n')[0] || `exit ${upd.status}`}`);
       fail('head-moved', `HEAD moved while committing (expected ${head.slice(0, 12)}) — nothing was published; run the command again`);
     }
     // Published. Sync only these paths in the real index; then the store.
-    git(info.top, ['reset', '-q', newCommit, '--', ...allPaths.map((p) => `:(literal)${p}`)], { allowFail: true });
+    git(info.top, ['reset', '-q', newCommit, '--', ...paths.map((p) => `:(literal)${p}`)], { allowFail: true });
     const post = hookPath(info.top, 'post-commit');
-    if (post) spawnSync(post, [], { cwd: info.top, stdio: 'inherit' });
-    withStoreLock(info.store, () => {
-      for (const T of r.members) {
-        const ts = readTicketState(info.store, T);
-        ts.history.push({ event: 'commit', hash: C.hash, commit: newCommit, at: new Date().toISOString() });
-        ts.open = null; ts.claim = null; ts.state = 'committed';
-        writeTicketState(info.store, ts);
-      }
-    });
-    const stillDirty = allPaths.filter((p) => {
+    if (post) spawnSync(post, [], { cwd: info.top, stdio: ['ignore', 2, 'inherit'] });
+    if (hashes.length) markCandidatesCommitted(repo, hashes, newCommit, event);
+    const stillDirty = paths.filter((p) => {
       const l = readLive(info.top, p); const b = blobAt(info.top, newCommit, p);
       return l.exists ? !b || gitBlobOf(info.top, l.bytes) !== b.blob : !!b;
     });
-    return { commit: newCommit, parent: head, tree, paths: allPaths, members: r.members, notes: r.notes, stillDirty };
+    return { commit: newCommit, parent: head, tree, tag: tagObj, paths, stillDirty };
   } finally { fs.rmSync(tmpDir, { recursive: true, force: true }); }
 }
 
@@ -958,7 +1251,9 @@ function allCandidates(store) {
 export async function foreignReport({ repo, days = 30, now = Date.now() }) {
   const info = repoInfo(repo);
   const since = new Date(now - days * 86_400_000).toISOString();
-  const cands = allCandidates(info.store);
+  // A mixed-state candidate's frozen bytes hold OTHER tickets' lines by design, so it is
+  // never a source of line ownership (it would attribute B's lines to the verifier's ticket).
+  const cands = allCandidates(info.store).filter((m) => m.mode !== 'mixed');
   const found = readForeignFound(info.store);
 
   // ── informational: what --accept-foreign took in (latest freeze per ticket in the window)

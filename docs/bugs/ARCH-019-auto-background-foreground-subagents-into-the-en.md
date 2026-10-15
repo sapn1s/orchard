@@ -5,49 +5,80 @@
   "title": "Auto-background foreground subagents into the engine level, or keep the bridge backstop?",
   "summary": "A subagent dispatched WITHOUT run_in_background never enters the engine's background_tasks_changed level — the level is background-only by design. So a long-running foreground subagent (the BUG-157 shape) is carried only by the bridge's row-based backstop. CLI 2.1.284 ships CLAUDE_AUTO_BACKGROUND_TASKS, which auto-backgrounds such a task into the level after a timeout, but changes turn semantics — a user call.",
   "impact_if_we_wait": "Nothing breaks: BUG-157 round-4 already carries the foreground shape via container /proc ground truth plus the row-based backstop, so this is an improvement decision, not an outage. Left unasked, the choice stays implicit (auto-background OFF) without anyone having decided it.",
-  "current_need": "A user decision: should Orchard set CLAUDE_AUTO_BACKGROUND_TASKS on launched sessions (accepting that a blocking tool call returns early once a foreground task crosses the timeout), or keep foreground work out of the level and rely on the bridge's row-based backstop?",
+  "current_need": "Nothing to build; the bridge backstop stays.",
   "severity": "low",
   "area": "background-work protection (agent-bridge.ts, claude-runtime.ts)",
   "reported": "2026-09-28",
   "reported_by": "agent",
   "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-09-28",
-  "decision": {
-    "mode": "single",
-    "question": "Set CLAUDE_AUTO_BACKGROUND_TASKS so foreground subagents auto-background into the level, or keep foreground work on the bridge's row-based backstop?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Keep the bridge backstop; do not set it",
-        "what_changes": "Nothing changes: foreground subagents keep running inline to completion, exactly as today.",
-        "benefit": "Costs nothing and changes no turn semantics; the row-based #hasUnsettledWork() plus container /proc ground truth already carry the BUG-157 shape.",
-        "cost": "A foreground long-runner stays invisible to the level, so the level-derived guards never see it and the backstop stays load-bearing.",
-        "why_not_obvious": "The bridge backstop is unproven under load, so leaning on it forever may be fragile — but the engine option changes turn semantics for every session."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "2a3048ad-2f17-4108-96d6-10995cad00a1",
+      "asked_on": "2026-09-28",
+      "question": "Set CLAUDE_AUTO_BACKGROUND_TASKS so foreground subagents auto-background into the level, or keep foreground work on the bridge's row-based backstop?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Engineering choice; the recommendation is no change, and no open gap justifies changing turn semantics.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Engineering choice; the recommendation is no change, and no open gap justifies changing turn semantics.",
+        "on": "2026-10-14",
+        "next": "Nothing to build; the bridge backstop stays.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "A user decision: should Orchard set CLAUDE_AUTO_BACKGROUND_TASKS on launched sessions (accepting that a blocking tool call returns early once a foreground task crosses the timeout), or keep foreground work out of the level and rely on the bridge's row-based backstop?"
+        }
       },
-      {
-        "key": "B",
-        "label": "Set CLAUDE_AUTO_BACKGROUND_TASKS on launched sessions",
-        "what_changes": "A long-running foreground task auto-backgrounds into the level after the default timeout, entering the level-derived protection lineage.",
-        "benefit": "The level-derived lineage (BUG-043/074/105) protects foreground work natively and the bridge's row-based backstop becomes belt-and-suspenders.",
-        "cost": "Turn semantics change for every launched session: a blocking call past the timeout returns early with a placeholder and the model proceeds without the result.",
-        "why_not_obvious": "Auto-background looks like a clean engine-native fix, but the early-return semantics can surprise a session that assumed its subagent finished inline."
-      },
-      {
-        "key": "C",
-        "label": "Set the knob and pin the timeout",
-        "what_changes": "Same as B, but pin CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS so only genuinely long foreground work backgrounds; short calls still complete inline.",
-        "benefit": "Most of B's level coverage with a smaller semantic blast radius, since short foreground calls keep completing inline.",
-        "cost": "A tuning parameter we now own and must justify, and the early-return semantics still apply above the threshold.",
-        "why_not_obvious": "It softens B's blast radius, but we must own and defend a timeout value, and the early return still applies above it."
+      "snapshot": {
+        "mode": "single",
+        "question": "Set CLAUDE_AUTO_BACKGROUND_TASKS so foreground subagents auto-background into the level, or keep foreground work on the bridge's row-based backstop?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Keep the bridge backstop; do not set it",
+            "what_changes": "Nothing changes: foreground subagents keep running inline to completion, exactly as today.",
+            "benefit": "Costs nothing and changes no turn semantics; the row-based #hasUnsettledWork() plus container /proc ground truth already carry the BUG-157 shape.",
+            "cost": "A foreground long-runner stays invisible to the level, so the level-derived guards never see it and the backstop stays load-bearing.",
+            "why_not_obvious": "The bridge backstop is unproven under load, so leaning on it forever may be fragile — but the engine option changes turn semantics for every session."
+          },
+          {
+            "key": "B",
+            "label": "Set CLAUDE_AUTO_BACKGROUND_TASKS on launched sessions",
+            "what_changes": "A long-running foreground task auto-backgrounds into the level after the default timeout, entering the level-derived protection lineage.",
+            "benefit": "The level-derived lineage (BUG-043/074/105) protects foreground work natively and the bridge's row-based backstop becomes belt-and-suspenders.",
+            "cost": "Turn semantics change for every launched session: a blocking call past the timeout returns early with a placeholder and the model proceeds without the result.",
+            "why_not_obvious": "Auto-background looks like a clean engine-native fix, but the early-return semantics can surprise a session that assumed its subagent finished inline."
+          },
+          {
+            "key": "C",
+            "label": "Set the knob and pin the timeout",
+            "what_changes": "Same as B, but pin CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS so only genuinely long foreground work backgrounds; short calls still complete inline.",
+            "benefit": "Most of B's level coverage with a smaller semantic blast radius, since short foreground calls keep completing inline.",
+            "cost": "A tuning parameter we now own and must justify, and the early-return semantics still apply above the threshold.",
+            "why_not_obvious": "It softens B's blast radius, but we must own and defend a timeout value, and the early return still applies above it."
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "The foreground shape is already carried by BUG-157 round-4's ground-truth close decision, so B and C change turn semantics for a gap that is not currently open.",
+        "prerequisite": null
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "The foreground shape is already carried by BUG-157 round-4's ground-truth close decision, so B and C change turn semantics for a gap that is not currently open.",
-    "prerequisite": null
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A user picks A, B, or C on the Needs-You rail",
     "If B/C: an isolated real-CLI probe with the knob set shows a foreground subagent outliving the timeout enters the level (0 today)",
@@ -130,3 +161,6 @@ ARCH-015 established that the level itself is LIVE on the current CLI and the br
 
 ### 2026-09-28 — agent
 - **Filed:** through the board tool; the record was validated before it was written.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Engineering choice; the recommendation is no change, and no open gap justifies changing turn semantics. Next: Nothing to build; the bridge backstop stays. You can reopen this decision from the ticket view.

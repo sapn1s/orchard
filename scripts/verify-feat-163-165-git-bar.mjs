@@ -31,7 +31,8 @@
  *
  * MUST-FAIL on the pre-change tree: the chip is hidden for a non-repo, the face
  * shows a bare count with no +/− spans, #gitPop does not exist and the chip
- * carries a native title; the grant control has no permanent option.
+ * carries a native title; the agent-git pill has no "Settings…" button and its
+ * standing grant still reads "permanent" rather than "soft releases" / "scoped".
  *
  * Screenshots (both themes): docs/bugs/assets/FEAT-16{3,4,5}-*.png
  */
@@ -335,54 +336,61 @@ try {
   /* ── FEAT-164: the permanent grant, end to end through the real UI ────────── */
   });
   await section('164-grant', async () => {
-  console.log('\n[164] permanent agent-git grant through the Git panel');
-  const gw = `/api/projects/${encodeURIComponent(modId)}/git-write-grant`;
-  await page.goto(`${BASE}/#/git?project=${encodeURIComponent(modId)}`);
-  await page.waitForFunction(() => document.querySelector('.git-view.open .gt-gitwrite') && !document.querySelector('.gt-gw-allow').hidden, null, { timeout: 30_000 });
-  // The panel slides in; measure only once it has settled on screen.
-  await page.waitForFunction(() => document.documentElement.classList.contains('git-open'), null, { timeout: 10_000 }).catch(() => {});
-  await sleep(300);
-  const pill = () => page.evaluate(() => { const w = document.querySelector('.gt-gitwrite'); return { on: w.dataset.on, scope: w.dataset.scope, armed: w.dataset.armed, state: w.querySelector('.gt-gw-state').textContent, allow: !w.querySelector('.gt-gw-allow').hidden, perm: w.querySelector('.gt-gw-perm').hidden ? null : w.querySelector('.gt-gw-perm').textContent, revoke: !w.querySelector('.gt-gw-revoke').hidden }; });
+  // FEAT-164 (post soft-releases): the standing grant moved OUT of the pill into
+  // project Settings. The pill now offers "Allow 30 min", "Settings…" and Revoke —
+  // never the old "Allow permanently…" arm/confirm. Driven on the SCRATCH non-git
+  // project (ngId), so no real checkout is registered for this flow.
+  console.log('\n[164] agent-git pill: Settings… + the 30-minute grant + standing-policy display');
+  const gw = `/api/projects/${encodeURIComponent(ngId)}/git-write-grant`;
+  const pol = `/api/projects/${encodeURIComponent(ngId)}/git-write-policy`;
+  const openPanel = async () => {
+    await page.goto(`${BASE}/#/git?project=${encodeURIComponent(ngId)}`);
+    await page.waitForFunction(() => document.querySelector('.git-view.open .gt-gitwrite'), null, { timeout: 30_000 });
+    await page.waitForFunction(() => document.documentElement.classList.contains('git-open'), null, { timeout: 10_000 }).catch(() => {});
+    await sleep(300);
+  };
+  await openPanel();
+  const pill = () => page.evaluate(() => { const w = document.querySelector('.gt-gitwrite'); return { on: w.dataset.on, scope: w.dataset.scope, mode: w.dataset.mode, state: w.querySelector('.gt-gw-state').textContent, allow: !w.querySelector('.gt-gw-allow').hidden, settings: !!document.querySelector('.gt-gw-settings'), perm: !!document.querySelector('.gt-gw-perm'), revoke: !w.querySelector('.gt-gw-revoke').hidden }; });
   const headClip = async () => { const r = await page.evaluate(() => { const b = document.querySelector('.gt-gitwrite').getBoundingClientRect(); return { x: b.x, y: b.y, w: b.width, h: b.height }; }); return { x: Math.max(0, r.x - 30), y: Math.max(0, r.y - 12), width: Math.min(1440 - Math.max(0, r.x - 30), r.w + 60), height: r.h + 24 }; };
-  let p0 = await pill();
-  check('initial: blocked, both "Allow 30 min" and "Allow permanently…" offered', p0.on === 'false' && p0.allow && p0.perm === 'Allow permanently…' && !p0.revoke, p0);
+  const p0 = await pill();
+  check('initial: blocked; "Allow 30 min" + "Settings…" offered; the old "Allow permanently…" is GONE', p0.on === 'false' && p0.allow && p0.settings && !p0.perm && !p0.revoke, p0);
   if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, 'FEAT-164-blocked-light.png'), clip: await headClip() });
-  await page.click('.gt-gw-perm');
-  let p1 = await pill();
-  check('one click only ARMS it: explicit confirm label + what it means; NO grant yet', p1.armed === 'true' && p1.perm === 'Confirm: allow permanently' && /until you revoke/.test(p1.state) && (await j('GET', gw)).d.grant === null, p1);
-  if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, 'FEAT-164-armed-light.png'), clip: await headClip() });
-  await sleep(6500);
-  p1 = await pill();
-  check('an armed confirm lapses after 6 s with no grant', p1.armed === 'false' && p1.perm === 'Allow permanently…' && (await j('GET', gw)).d.grant === null, p1);
-  await page.click('.gt-gw-perm'); await page.click('.gt-gw-perm');
-  await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.scope === 'permanent', null, { timeout: 10_000 }).catch(() => {});
-  const p2 = await pill();
-  const g2 = (await j('GET', gw)).d.grant;
-  const row2 = JSON.parse(fs.readFileSync(path.join(DATA, 'registry.json'), 'utf8')).projects.find((p) => p.id === modId);
-  check('confirm grants PERMANENT: labelled "permanent", Revoke shown, server scope=permanent, registry setting written', p2.scope === 'permanent' && /permanent/.test(p2.state) && p2.revoke && p2.perm === null && !p2.allow && g2?.scope === 'permanent' && row2?.settings?.gitWrite?.permanent === true, { p2, g2, setting: row2?.settings?.gitWrite });
-  for (const theme of ['light', 'dark']) { await setTheme(theme); await sleep(120); if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, `FEAT-164-permanent-${theme}.png`), clip: await headClip() }); }
-  await setTheme('light');
-  // A reload re-reads it from the server (it is a project setting, not page state).
-  await page.reload();
-  await page.waitForFunction(() => document.querySelector('.gt-gitwrite')?.dataset.scope === 'permanent', null, { timeout: 30_000 }).catch(() => {});
-  check('after a page reload the panel still shows the permanent grant', (await pill()).scope === 'permanent');
-  await page.click('.gt-gw-revoke');
-  await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.on === 'false', null, { timeout: 10_000 }).catch(() => {});
-  const p3 = await pill();
-  const row3 = JSON.parse(fs.readFileSync(path.join(DATA, 'registry.json'), 'utf8')).projects.find((p) => p.id === modId);
-  check('Revoke (same control) clears it: UI blocked, server grant null, registry setting cleared', p3.on === 'false' && p3.allow && (await j('GET', gw)).d.grant === null && !row3?.settings?.gitWrite?.permanent, { p3, setting: row3?.settings?.gitWrite });
-  // The 30-minute grant keeps working, and can be upgraded.
+  // "Settings…" closes the panel and opens the drawer AT the Agent git section.
+  await page.click('.gt-gw-settings');
+  await page.waitForFunction(() => !document.querySelector('#smodal').hidden && !!document.querySelector('[data-focus="agentGit"]'), null, { timeout: 15_000 });
+  await sleep(350);
+  const opened = await page.evaluate(() => { const g = document.querySelector('[data-focus="agentGit"]'); const r = g.getBoundingClientRect(); return { modal: !document.querySelector('#smodal').hidden, inView: r.top >= 0 && r.top < innerHeight - 40 }; });
+  check('"Settings…" opens the Settings drawer scrolled to the Agent git section', opened.modal && opened.inView, opened);
+  // Close the drawer before reopening the git panel, or its modal overlay
+  // intercepts the pill clicks below.
+  await page.keyboard.press('Escape');
+  await page.waitForFunction(() => document.querySelector('#smodal').hidden, null, { timeout: 10_000 }).catch(() => {});
+  // The 30-minute grant still works through the pill.
+  await openPanel();
   await page.click('.gt-gw-allow');
   await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.scope === 'duration', null, { timeout: 10_000 }).catch(() => {});
   const p4 = await pill(); const g4 = (await j('GET', gw)).d.grant;
-  check('"Allow 30 min" still grants a 30-minute window; "Make permanent…" offered', p4.scope === 'duration' && /left/.test(p4.state) && p4.perm === 'Make permanent…' && g4?.scope === 'duration' && g4.expiresInMs > 29 * 60_000, { p4, g4 });
+  check('"Allow 30 min" grants a 30-minute window; pill shows time left + Revoke', p4.scope === 'duration' && /left/.test(p4.state) && p4.revoke && !p4.allow && g4?.scope === 'duration' && g4.expiresInMs > 29 * 60_000, { p4, g4 });
   if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, 'FEAT-164-timed-light.png'), clip: await headClip() });
-  await page.click('.gt-gw-perm'); await page.click('.gt-gw-perm');
-  await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.scope === 'permanent', null, { timeout: 10_000 }).catch(() => {});
-  check('a timed grant can be upgraded to permanent', (await pill()).scope === 'permanent' && (await j('GET', gw)).d.grant?.scope === 'permanent');
   await page.click('.gt-gw-revoke');
   await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.on === 'false', null, { timeout: 10_000 }).catch(() => {});
-  check('one Revoke clears permanent AND the timed grant beneath it', (await j('GET', gw)).d.grant === null && (await pill()).on === 'false');
+  check('Revoke clears the timed grant', (await j('GET', gw)).d.grant === null && (await pill()).on === 'false');
+  // A STANDING policy, set through the ONE writer route, is reflected in the pill.
+  await j('PUT', pol, { commit: true, push: false, scope: null });
+  await openPanel();
+  await page.waitForFunction(() => document.querySelector('.gt-gitwrite')?.dataset.mode === 'release', null, { timeout: 30_000 }).catch(() => {});
+  const p5 = await pill();
+  check('a standing release policy reads "Agent git · soft releases" (Revoke shown, Allow hidden)', p5.mode === 'release' && p5.state === 'Agent git · soft releases' && p5.revoke && !p5.allow, p5);
+  for (const theme of ['light', 'dark']) { await setTheme(theme); await sleep(120); if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, `FEAT-164-standing-${theme}.png`), clip: await headClip() }); }
+  await setTheme('light');
+  await j('PUT', pol, { commit: true, push: true, scope: 'commit to main' });
+  await openPanel();
+  await page.waitForFunction(() => document.querySelector('.gt-gitwrite')?.dataset.mode === 'scoped', null, { timeout: 30_000 }).catch(() => {});
+  check('a standing scoped policy reads "Agent git · scoped"', (await pill()).state === 'Agent git · scoped');
+  // Revoke on the pill clears the standing commit grant via DELETE git-write-grant.
+  await page.click('.gt-gw-revoke');
+  await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.on === 'false', null, { timeout: 10_000 }).catch(() => {});
+  check('Revoke on the pill clears the standing grant (DELETE git-write-grant clears commit server-side)', (await pill()).on === 'false' && (await j('GET', pol)).d.policy.mode === 'none', (await j('GET', pol)).d.policy.mode);
 
   });
   check('no page errors during the run', consoleErrors.length === 0, consoleErrors.slice(0, 3));

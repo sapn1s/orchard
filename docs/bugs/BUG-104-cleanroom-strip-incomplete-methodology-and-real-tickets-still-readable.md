@@ -5,77 +5,109 @@
   "title": "Verifier can still read the methodology the clean room removes",
   "summary": "A verification pass is meant to see only the requirement, the change, the test code and how to run it. The isolated copy it receives removes the methodology documents and the ticket board, yet the same methodology sentences sit inside verify scripts, and two full copies of a real ticket sit in a test fixture folder.",
   "impact_if_we_wait": "A safety property a great deal of trust rests on is weaker than stated. Bounded: the exposure is passive and nothing reaches the prompt. No verifier is known to have read those files, and no past verdict is shown to be wrong.",
-  "current_need": "Choose which of the four approaches to take to close the exposure without hiding the test code a verifier must re-run.",
+  "current_need": "Build 2 and 1, with 4 as the standing check on the clean-room export.",
   "severity": "medium",
   "area": "Verification integrity",
   "reported": "2026-08-18",
   "reported_by": "agent",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-18",
-  "decision": {
-    "mode": "multi",
-    "question": "How should the leaked methodology and ticket text be closed without hiding the test code?",
-    "options": [
-      {
-        "key": "1",
-        "label": "Move ticket snapshots out of the export",
-        "what_changes": "The two real-ticket calibration copies are read from a place the isolated copy never receives.",
-        "benefit": "Closes the ticket-text exposure completely and costs the least of the four.",
-        "cost": "Leaves the methodology sentences inside the verify scripts exactly as they are.",
-        "why_not_obvious": "It names one path, so the next real-ticket fixture added somewhere else reopens the same hole unnoticed.",
-        "combines_with": [
-          "2",
-          "3",
-          "4"
-        ]
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "3fc047d0-eb87-40a9-ab66-947ba1205f7e",
+      "asked_on": "2026-08-18",
+      "question": "How should the leaked methodology and ticket text be closed without hiding the test code?",
+      "mode": "multi",
+      "options_keys": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "chosen": "2",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — judgement: Four engineering approaches and nothing user-held at stake. Stand-ins (2) close the quoted methodology, plus moving the ticket snapshots (1), with the standing guard (4) checking the export.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "judgement",
+        "ref": null,
+        "why": "Four engineering approaches and nothing user-held at stake. Stand-ins (2) close the quoted methodology, plus moving the ticket snapshots (1), with the standing guard (4) checking the export.",
+        "on": "2026-10-14",
+        "next": "Build 2 and 1, with 4 as the standing check on the clean-room export.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Choose which of the four approaches to take to close the exposure without hiding the test code a verifier must re-run."
+        }
       },
-      {
-        "key": "2",
-        "label": "Replace quoted methodology with stand-ins",
-        "what_changes": "Verify scripts assert against invented sentences, or load the real text from a file that is removed.",
-        "benefit": "Removes the methodology text while keeping every script the verifier must re-run.",
-        "cost": "Several verify scripts have to change, and each one is a live check.",
-        "why_not_obvious": "A later script can quote the methodology again, so the fix does not stay closed on its own.",
-        "combines_with": [
-          "1",
-          "3",
-          "4"
-        ]
-      },
-      {
-        "key": "3",
-        "label": "Redact the copy instead of deleting paths",
-        "what_changes": "The isolated copy is scanned for known methodology and ticket markers and those passages are blanked.",
-        "benefit": "Catches text wherever it sits rather than only where somebody listed it.",
-        "cost": "A scanner over the whole copy can blank something a test depends on and break a run.",
-        "why_not_obvious": "Marker matching misses any phrasing nobody thought to list, so it reads as complete while staying partial.",
-        "combines_with": [
-          "1",
-          "2",
-          "4"
-        ]
-      },
-      {
-        "key": "4",
-        "label": "Add a standing guard",
-        "what_changes": "A check refuses methodology or ticket text in the copy handed over, and it runs on every pass.",
-        "benefit": "Whatever is closed stays closed instead of drifting back over time.",
-        "cost": "On its own it closes nothing; it only reports what the other options fix.",
-        "why_not_obvious": "A guard that fires on ordinary work gets switched off, and then it protects nothing.",
-        "combines_with": [
-          "1",
-          "2",
-          "3"
-        ]
+      "snapshot": {
+        "mode": "multi",
+        "question": "How should the leaked methodology and ticket text be closed without hiding the test code?",
+        "options": [
+          {
+            "key": "1",
+            "label": "Move ticket snapshots out of the export",
+            "what_changes": "The two real-ticket calibration copies are read from a place the isolated copy never receives.",
+            "benefit": "Closes the ticket-text exposure completely and costs the least of the four.",
+            "cost": "Leaves the methodology sentences inside the verify scripts exactly as they are.",
+            "why_not_obvious": "It names one path, so the next real-ticket fixture added somewhere else reopens the same hole unnoticed.",
+            "combines_with": [
+              "2",
+              "3",
+              "4"
+            ]
+          },
+          {
+            "key": "2",
+            "label": "Replace quoted methodology with stand-ins",
+            "what_changes": "Verify scripts assert against invented sentences, or load the real text from a file that is removed.",
+            "benefit": "Removes the methodology text while keeping every script the verifier must re-run.",
+            "cost": "Several verify scripts have to change, and each one is a live check.",
+            "why_not_obvious": "A later script can quote the methodology again, so the fix does not stay closed on its own.",
+            "combines_with": [
+              "1",
+              "3",
+              "4"
+            ]
+          },
+          {
+            "key": "3",
+            "label": "Redact the copy instead of deleting paths",
+            "what_changes": "The isolated copy is scanned for known methodology and ticket markers and those passages are blanked.",
+            "benefit": "Catches text wherever it sits rather than only where somebody listed it.",
+            "cost": "A scanner over the whole copy can blank something a test depends on and break a run.",
+            "why_not_obvious": "Marker matching misses any phrasing nobody thought to list, so it reads as complete while staying partial.",
+            "combines_with": [
+              "1",
+              "2",
+              "4"
+            ]
+          },
+          {
+            "key": "4",
+            "label": "Add a standing guard",
+            "what_changes": "A check refuses methodology or ticket text in the copy handed over, and it runs on every pass.",
+            "benefit": "Whatever is closed stays closed instead of drifting back over time.",
+            "cost": "On its own it closes nothing; it only reports what the other options fix.",
+            "why_not_obvious": "A guard that fires on ordinary work gets switched off, and then it protects nothing.",
+            "combines_with": [
+              "1",
+              "2",
+              "3"
+            ]
+          }
+        ],
+        "recommendation": null,
+        "recommendation_reason": null,
+        "prerequisite": "Establish which verify scripts genuinely need the real methodology sentence to assert anything. If none do, the stand-in option stops being a trade-off."
       }
-    ],
-    "recommendation": null,
-    "recommendation_reason": null,
-    "prerequisite": "Establish which verify scripts genuinely need the real methodology sentence to assert anything. If none do, the stand-in option stops being a trade-off."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "The isolated copy handed to a verifier contains no methodology sentences from the working agreement",
     "The isolated copy contains no full copy of a real ticket",
@@ -295,3 +327,6 @@ Export a clean room and grep it for the known methodology phrase and for the ARC
 - **Verified:** `ticketDecision()` now yields 4 options; `board:check` no longer reports UNPARSEABLE DECISION
   for BUG-104; `npm run verify:decision-shape` 25/25 PASS.
 - **Still open / handoff:** unchanged — a human picks 1, 2, 3 and/or 4 (4 combines with any of 1-3).
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: judgement. Chose: 2. Why: Four engineering approaches and nothing user-held at stake. Stand-ins (2) close the quoted methodology, plus moving the ticket snapshots (1), with the standing guard (4) checking the export. Next: Build 2 and 1, with 4 as the standing check on the clean-room export. You can reopen this decision from the ticket view.

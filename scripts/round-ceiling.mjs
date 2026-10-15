@@ -68,6 +68,21 @@ export const DEFAULTS = {
   maxReport: 25,
 };
 
+/**
+ * FEAT-181 — the escalation is a DECISION, not a notification. Cross-provider
+ * refutation rated a bare round ceiling "a notification policy masquerading as a
+ * latency intervention UNLESS the escalation has a named owner, a response
+ * commitment, and an actionable decision." So every raised item carries the
+ * owner (the orchestrator, who routes it) and the three concrete choices WA §N
+ * leaves open — never just "here is a count."
+ */
+export const ESCALATION_OWNER = 'orchestrator';
+export const ESCALATION_ACTIONS = Object.freeze([
+  { key: 'rescope', label: 'rescope — narrow the ticket or split off the part that is converging, so the loop can close' },
+  { key: 'redesign', label: 'redesign — the recurring failure is a design fault; open an ARCH-### (docs/bugs/TEMPLATE-ARCH.md: invariant, options, migration, proof bar)' },
+  { key: 'stop', label: 'stop — halt further rounds; two consecutive rounds returning only wording/cosmetics mean STOP (WA §N)' },
+]);
+
 /** Escalating severity from the observed round, relative to the ceiling. */
 export function severityFor(round, minRound) {
   const delta = round - minRound;
@@ -126,6 +141,11 @@ export function roundCeiling(lanes, opts = {}) {
       severity,
       lanesDeclaringRound: g.lanesDeclaringRound,
       byPhase: g.byPhase,
+      // FEAT-181 — the raised item IS the actionable decision: a named owner and
+      // the concrete choices, carried on the record every surface reads, so no
+      // surface has to re-invent "what do I do with this."
+      owner: ESCALATION_OWNER,
+      actions: ESCALATION_ACTIONS.map((a) => a.key),
       question:
         `WA §N: ${g.ticket} has reached round ${g.maxRound} (declared, ≥ ceiling ${minRound}). ` +
         'Two consecutive rounds returning only wording/cosmetics mean STOP, and a recurring ' +
@@ -140,6 +160,68 @@ export function roundCeiling(lanes, opts = {}) {
     (a, b) => b.maxRound - a.maxRound || SEV_RANK[b.severity] - SEV_RANK[a.severity] || (a.ticket < b.ticket ? -1 : 1),
   );
   return { minRound, ticketsWithDeclaredRound: byTicket.size, lanesRead, lanesWithDeclaredRound, raised };
+}
+
+/**
+ * FEAT-181 (r2 redesign) — the ONE owner of the fact "is the round history
+ * usable, and if not, WHY." Before this, board-status and the dispatch preflight
+ * each re-derived usability their own (incomplete) way — the ARCH-010 defect that
+ * produced three separate silent-empty-success routes (ticket r1). Now every
+ * surface renders this single typed fact, reason included.
+ *
+ * COVERAGE POLICY (plan review, OpenAI 01a13718, Q1/Q2). `usable` is a
+ * LEDGER-GLOBAL property — does the declared-round SIGNAL exist at all — NOT a
+ * per-ticket completeness claim. By the declared-only contract above (ARCH-010), a
+ * ticket with no declared-round lane is legitimately round-0 and is
+ * indistinguishable from a brand-new ticket; manufacturing a per-ticket gap for
+ * every not-yet-dispatched ticket would be noise. The gap we NAME is the
+ * whole-ledger one: zero declared rounds anywhere = the declaration mechanism is
+ * not feeding the ledger = nothing is checkable.
+ *
+ * Stable `code` (never throws) so callers/tests key on the kind, not the wording:
+ *   - 'unreadable'       — the ledger read itself threw (e.g. EISDIR).
+ *   - 'no-ledger'        — absent / empty / torn-only ledger (readLedger() -> []).
+ *   - 'reader-failed'    — roundCeiling() threw over the lanes.
+ *   - 'no-declared-round'— lanes exist but ZERO declared a round (pre-FEAT-100).
+ *   - null               — usable.
+ * KNOWN LIMIT: readLedger() (cost-collect.mjs) silently drops torn JSON lines; a
+ * dropped line that held a ticket's highest round cannot be detected here. That is
+ * a pre-existing property of the shared reader, not introduced by this owner.
+ *
+ * @param {object} o
+ * @param {Array|null} [o.lanes] pass lanes (incl. []) to classify without reading
+ *        the durable ledger; null/omitted reads the durable ledger.
+ * @param {number} [o.minRound]
+ * @returns {{usable:boolean, code:string|null, reason:string|null, lanes:Array, result:object|null}}
+ */
+export function readRoundHistory({ lanes = null, minRound } = {}) {
+  let obtained = lanes;
+  if (obtained == null) {
+    try {
+      obtained = readLedger();
+    } catch (e) {
+      return { usable: false, code: 'unreadable', reason: `cost ledger unreadable: ${e?.message ?? e}`, lanes: [], result: null };
+    }
+  }
+  if (!Array.isArray(obtained) || obtained.length === 0) {
+    return { usable: false, code: 'no-ledger', reason: 'no durable cost ledger (round history unavailable on this host)', lanes: [], result: null };
+  }
+  let result;
+  try {
+    result = roundCeiling(obtained, minRound != null ? { minRound } : {});
+  } catch (e) {
+    return { usable: false, code: 'reader-failed', reason: `round reader failed: ${e?.message ?? e}`, lanes: obtained, result: null };
+  }
+  if (result.lanesWithDeclaredRound === 0) {
+    return {
+      usable: false,
+      code: 'no-declared-round',
+      reason: `round history carries no declared round (${result.lanesRead} lane(s) read, 0 declared a round — nothing to check against the ceiling)`,
+      lanes: obtained,
+      result,
+    };
+  }
+  return { usable: true, code: null, reason: null, lanes: obtained, result };
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +289,8 @@ async function main() {
         const phases = Object.entries(r.byPhase).map(([p, n]) => `${p}:${n}`).join(' ');
         console.log(`  [${r.severity.toUpperCase()}] ${r.ticket} — max declared round ${r.maxRound} (${r.lanesDeclaringRound} lane(s) declared a round; by phase ${phases})`);
         console.log(`      ${r.question}`);
+        console.log(`      OWNER: ${r.owner}. DECIDE one of:`);
+        for (const a of ESCALATION_ACTIONS) console.log(`        - ${a.label}`);
       }
       if (res.raised.length > DEFAULTS.maxReport) console.log(`  … and ${res.raised.length - DEFAULTS.maxReport} more (see --json).`);
       console.log(

@@ -18,6 +18,10 @@ export interface GitShimDecision {
   sanctioned?: boolean;
   consultHost?: boolean;
   granted?: boolean;
+  /** BUG-261 — the host's TYPED refusal class the shim renders by, on a deny. */
+  refusalKind?: string | null;
+  /** BUG-261 — the classified `git <sub>` offender, for the generic-refusal fallback. */
+  offender?: string;
 }
 
 /**
@@ -28,7 +32,7 @@ export interface GitShimDecision {
 export declare function decideGitShim(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { ignoreEnvHatch?: boolean; realGit?: string | null; shadowRoot?: string | null },
+  opts?: { ignoreEnvHatch?: boolean },
 ): GitShimDecision;
 
 /** Bounded timeout (ms) on the host grant consult — the shim must never hang. */
@@ -41,7 +45,7 @@ export declare const HOST_GRANT_TIMEOUT_MS: number;
 export declare function askHostGrant(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string; target?: unknown },
 ): Promise<GitShimDecision>;
 
 /**
@@ -51,7 +55,7 @@ export declare function askHostGrant(
 export declare function resolveGitShim(
   argv: string[],
   env?: Record<string, string | undefined>,
-  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string; ignoreEnvHatch?: boolean; realGit?: string | null; shadowRoot?: string | null },
+  opts?: { fetchImpl?: typeof fetch; timeoutMs?: number; hostUrl?: string; grantKey?: string; shimAuth?: string; windowKey?: string; shimBootId?: string; ignoreEnvHatch?: boolean; realGit?: string | null },
 ): Promise<GitShimDecision>;
 
 /** The loud refusal a shimmed subprocess prints before exiting non-zero. */
@@ -74,7 +78,7 @@ export declare function runGitShim(argv: string[], opts?: { realGit?: string; ho
  */
 export declare function installGitShim(
   env?: Record<string, string | undefined>,
-  opts?: { baseDir?: string; grantKey?: string; hostUrl?: string; sessionLabel?: string; shimAuth?: string | (() => string); windowKey?: string; shimBootId?: string | (() => string); reuseDir?: string; shadowRoot?: string | null },
+  opts?: { baseDir?: string; grantKey?: string; hostUrl?: string; sessionLabel?: string; shimAuth?: string | (() => string); windowKey?: string; shimBootId?: string | (() => string); reuseDir?: string },
 ): { env: Record<string, string>; shimDir: string; realGit: string; ensure: () => GitShimEnsure };
 
 /**

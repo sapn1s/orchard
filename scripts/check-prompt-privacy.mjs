@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * check-prompt-privacy.mjs — FEAT-172 publication-privacy guard (round 4).
+ * check-prompt-privacy.mjs — FEAT-172 publication-privacy guard (round 7).
  *
  * The owner's per-operator facts (which provider subscription is abundant vs
  * scarce, the concrete plan/billing, that the machine dual-boots) were scrubbed
@@ -20,9 +20,11 @@
  * is out of scope by design (WA §N two-break design review, round 2 → RESCOPE).
  *
  * So the guard catches, over the publication-bound scan set, exactly:
- *   (1) any normalized sentence / marker-anchored n-gram DERIVED from the local
- *       overlay (docs/prompts/OPERATOR.local.md) — its facts, verbatim, including
- *       when they wrap a line break (normalization folds newlines);
+ *   (1) any marker-anchored n-gram DERIVED from the local overlay
+ *       (docs/prompts/OPERATOR.local.md) — its facts, verbatim, including when
+ *       they wrap a line break (the ONE tokenize() chokepoint folds newlines on
+ *       BOTH the derivation and the scan side, so there is no line structure to
+ *       be asymmetric about);
  *   (2) the specific KNOWN pre-scrub texts (the budget/capacity/dual-boot prose),
  *       line-wrapped forms included; and
  *   (3) a small GENERIC fallback of personal-ASSERTION patterns, so a machine with
@@ -36,34 +38,53 @@
  * of a cleverly-reworded leak by bolting on more rephrasing patterns — that was the
  * round-1/round-2 failure mode; attack the contract stated here, not an imagined one.
  *
- * ── RESIDUAL (round 4 — accepted, bounded) ───────────────────────────────────
+ * ── RESIDUAL (round 5 — accepted, bounded) ───────────────────────────────────
  * Two residuals remain, and BOTH fail LOUD (a non-zero exit a human sees), never
  * silently:
  *   • Rephrasing (as above) can still slip a reworded personal fact past the guard.
  *   • A VERY GENERIC overlay — one whose only marker-bearing lines are framing +
- *     shared ROUTING/WA vocabulary + a bare date (e.g. a heading that is nothing but
- *     "as of <date>") — now yields NO derived signature for those lines. That closes
- *     the round-3 over-match (such a line used to false-FAIL a clean published doc),
- *     but it also means a future overlay that encodes a fact using ONLY shared
- *     vocabulary would not be promoted to a derived signature. A false positive of
- *     the opposite kind (an overlay phrase that happens to collide with published
- *     text) likewise surfaces as a loud FAIL, not a silent pass — a human adjudicates
- *     it, never the gate quietly letting a leak through.
+ *     a bare date (e.g. a heading that is nothing but "as of <date>") — yields NO
+ *     derived signature for those lines (no distinctive token survives the
+ *     marker/date/stopword filter). That closes the round-3 over-match (such a line
+ *     used to false-FAIL a clean published doc), but it also means a future overlay
+ *     that encodes a fact using ONLY framing + dates would not be promoted to a
+ *     signature; such a fact is not operator-identifying on its face.
  *
- * ── Why this is NOT a hand list of files + a hand list of regexes (round 1 was,
- *    and an independent verify broke it two ways — run 911b54e2) ───────────────
+ * ── CRITICAL INVARIANT (round-5 design decision — run 01a129ca) ───────────────
+ * The non-leak vocabulary is NEVER derived from scanned content. Round 4 excluded any
+ * overlay token that also appeared in the published ROUTING / Working Agreement docs
+ * ("shared vocabulary"), loaded live from those files. But those are the very files
+ * this guard scans for leaks: pasting an overlay sentence INTO ROUTING.md (or a WA
+ * file) promoted that sentence's own tokens to "public", so every n-gram derived over
+ * it lost its distinctive token and was dropped — the leak passed SILENTLY (exit 0)
+ * while the identical sentence in README.md was caught. Those re-syncable mirror files
+ * are exactly the ones most likely to take a leak back. FIX: distinctiveness rests
+ * ONLY on the fixed marker/date/STOPWORDS predicates; no file this guard reads may
+ * define what counts as non-leaking. regressed-from: FEAT-172 round-4.
  *
- * Round 1 scanned 6 named files with line-by-line regexes. Two structural holes:
- *   (1) Line-by-line could not see prose that WRAPS a line break, and the known
- *       pre-scrub paragraph ("Capacity here is Claude-abundant, GPT-scarce … a $20
- *       ChatGPT / Plus plan on rolling 5-hour windows") wraps exactly there, so
- *       restoring it passed.  → FIX: normalize (markdown + whitespace, INCLUDING
- *       newlines) and match over sliding 1–3 line windows, not single lines.
- *   (2) A 6-file allow-list left README, the worker template, the .example overlay
- *       and the rest of docs/guide/* unscanned, so personal assertions added there
- *       passed.  → FIX: ENUMERATE the scan set from the repo (tracked + untracked-
- *       but-not-ignored) and DENY-list the few surfaces that cannot be scanned,
- *       each justified below, so a NEW prose file is covered by default.
+ * ── THE LINE-STRUCTURE BREAK CLASS (rounds 1, 5 and 6) and its fix ────────────
+ *
+ * Three independent breaks all had the SAME shape: some stage of the pipeline
+ * reasoned about LINES, and a fact that wraps a line break slipped through the
+ * seam. Round 1 matched line-by-line on the SCAN side (a wrapped pre-scrub
+ * paragraph passed). Round 5 folded newlines on the scan side but still
+ * `split('\n')`-ed the overlay BEFORE normalizing on the DERIVATION side, so a
+ * wrapped overlay marker produced NO signature and a verbatim copy passed
+ * SILENTLY (run 01a129d7). Patching one seam at a time just moved the seam.
+ *   → FIX (round 6 — REDESIGN, single chokepoint): ONE function, tokenize(),
+ *     folds a WHOLE document (markdown + ALL whitespace incl. newlines +
+ *     punctuation, case-folded) into a flat token stream. BOTH the overlay
+ *     derivation AND the scan of every candidate file — AND the known pre-scrub
+ *     texts — go through it. Signatures and matching are n-grams over those token
+ *     streams. There is NO line splitting and NO line window anywhere in the
+ *     matching path, so there is no line seam left to be asymmetric across.
+ *     regressed-from: FEAT-172 round-5 (and the same class as round-1 break 1).
+ *
+ * The OTHER round-1 hole was scope: a 6-file allow-list left README, the worker
+ * template, the .example overlay and the rest of docs/guide/* unscanned.
+ *   → FIX: ENUMERATE the scan set from the repo (tracked + untracked-but-not-
+ *     ignored) and DENY-list the few surfaces that cannot be scanned, each
+ *     justified below, so a NEW prose file is covered by default.
  *
  * ── Scan scope (a): deny-list, not allow-list ────────────────────────────────
  * Scanned = every git-tracked OR untracked-not-ignored TEXT file, MINUS:
@@ -90,8 +111,25 @@
  *     windows" there are PUBLIC ChatGPT-Plus product facts, not a personal claim.
  *   • docs/assets/ and any binary file (NUL-byte / non-text extension).
  *   • this guard + its .orchard/ mirror necessarily contain the forbidden literals.
- * The real overlay (docs/prompts/*.local.md) is gitignored, so it is never in the
- * untracked-not-ignored set; a committed one is caught by assertion (1) below.
+ * The scan set is EXACTLY what git would publish or could publish: `git ls-files`
+ * plus `--others --exclude-standard`, read `-z` and NUL-split with NO trimming (a
+ * leading/trailing space is part of a real path; trimming made readFileSync ENOENT
+ * and silently skip the file — round-6 secondary, run 01a129e8).
+ *
+ * The overlay is handled by GIT'S OWN ignore rules, NOT by a hand-coded deny.
+ * `.gitignore` ignores `/docs/prompts/*.local.md`, so the real overlay is in
+ * neither `git ls-files` nor the untracked-not-ignored set — git already excludes
+ * it. We therefore DO NOT hand-deny `*.local.md`: the old blanket deny skipped
+ * EVERY `*.local.md` anywhere, but only `/docs/prompts/*.local.md` is the ignored
+ * overlay, so any OTHER `*.local.md` (docs/guide/notes.local.md, a root
+ * README.local.md, …) is an un-ignored publication-bound prose file that was being
+ * skipped silently — known personal prose in one published unseen (round-6 primary,
+ * run 01a129e8). Such files are now scanned like any prose file.
+ * Conversely, if a `/docs/prompts/*.local.md` path EVER appears in the candidate
+ * set, git is no longer ignoring it (tracked, ignore rule removed, or `git add -f`)
+ * and it would be PUBLISHED with the operator's real holdings → assertion (1) FAILS
+ * LOUDLY. (This subsumes round-2/3's "tracked overlay" assertion and also catches
+ * an un-ignored but untracked overlay.)
  *
  * ── Pattern source (b): derived from the overlay + a generic fallback ─────────
  * When docs/prompts/OPERATOR.local.md exists, it IS the list of personal facts, so
@@ -117,6 +155,12 @@ const ROOT = (() => {
 })();
 
 const OVERLAY_REL = 'docs/prompts/OPERATOR.local.md';
+// The gitignored operator overlay(s): `.gitignore` ignores exactly
+// `/docs/prompts/*.local.md`. If a path matching this glob EVER shows up in the
+// publication-bound candidate set, git is no longer ignoring it (tracked, or the
+// ignore rule was removed / `git add -f`), so it WOULD be published with the
+// operator's real holdings inside — a loud FAIL (round-6 design).
+const OVERLAY_GLOB = /^docs\/prompts\/[^/]*\.local\.md$/;
 
 // ── Deny-list: prefixes/paths that are NOT publication-bound prose (justified in
 //    the header). Everything else tracked/untracked-not-ignored & text is scanned.
@@ -151,13 +195,22 @@ function denied(rel) {
   if (BINARY_EXT.test(rel)) return true;
   // the guard itself (either copy) contains the forbidden literals by necessity
   if (/(^|\/)check-prompt-privacy\.mjs$/.test(rel)) return true;
-  // the gitignored real overlay is never published; a committed one → assertion (1)
-  if (/(^|\/)[^/]*\.local\.md$/.test(rel)) return true;
+  // NB: we do NOT hand-deny `*.local.md`. Git's own ignore rules already keep the
+  // real operator overlay out of the scan set (it is gitignored, so it appears in
+  // neither `git ls-files` nor `--others --exclude-standard`). A blanket
+  // `*.local.md` deny was WRONG: only `/docs/prompts/*.local.md` is the ignored
+  // overlay, so any OTHER `*.local.md` (e.g. docs/guide/notes.local.md, a root
+  // README.local.md) is a publication-bound, un-ignored prose file that MUST be
+  // scanned — hand-denying it let known personal prose publish silently (round-6
+  // reviewer, run 01a129e8). An overlay path that DOES show up as a candidate
+  // (git is no longer ignoring it → it would be published) is caught loudly by the
+  // OVERLAY_GLOB check in listCandidates, not here.
   return false;
 }
 
 function listCandidates() {
   const out = new Set();
+  const overlay = new Set();
   const tracked = spawnSync('git', ['ls-files', '-z'], { cwd: ROOT, encoding: 'utf8' });
   const others = spawnSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], { cwd: ROOT, encoding: 'utf8' });
   // FAIL CLOSED (round-2 break A — vacuity): if enumeration cannot run (not a git
@@ -167,32 +220,57 @@ function listCandidates() {
   for (const r of [tracked, others]) {
     if (r.status !== 0) {
       const msg = ((r.stderr || '').trim() || (r.error && r.error.message) || `exit ${r.status}`).slice(0, 200);
-      return { ok: false, reason: `git file enumeration failed — cannot determine the publication-bound scan set (${msg})`, files: [] };
+      return { ok: false, reason: `git file enumeration failed — cannot determine the publication-bound scan set (${msg})`, files: [], overlayPublished: [] };
     }
-    for (const rel of r.stdout.split('\0').map((s) => s.trim()).filter(Boolean)) {
+    // NUL-split `git ls-files -z` (the trailing NUL yields an empty final field,
+    // dropped by filter(Boolean)). NO `.trim()`: a filename with leading/trailing
+    // whitespace is a real, publishable path; trimming it made readFileSync ENOENT
+    // and silently skip the file (round-6 secondary finding, run 01a129e8).
+    for (const rel of r.stdout.split('\0').filter(Boolean)) {
+      if (OVERLAY_GLOB.test(rel)) { overlay.add(rel); continue; }
       if (!denied(rel)) out.add(rel);
     }
   }
+  const overlayPublished = [...overlay].sort();
   const files = [...out].sort();
   // Also fail closed on an EMPTY scan set: a real Orchard checkout always has
   // publication-bound prose (README, docs/prompts/*), so 0 candidates means the
   // enumeration ran against the wrong/empty tree — passing would be vacuous.
   if (files.length === 0) {
-    return { ok: false, reason: 'enumeration yielded 0 candidate files — refusing to pass vacuously', files };
+    return { ok: false, reason: 'enumeration yielded 0 candidate files — refusing to pass vacuously', files, overlayPublished };
   }
-  return { ok: true, reason: '', files };
+  return { ok: true, reason: '', files, overlayPublished };
 }
 
-// ── Normalization: strip markdown emphasis, fold dashes/punctuation to spaces,
-//    collapse ALL whitespace (incl. newlines) so wrapped prose is one string.
-function norm(s) {
-  return s
+// ── THE CHOKEPOINT: tokenize(text) -> token[] ────────────────────────────────
+// Folds a WHOLE document into a flat, case-folded token stream: strip markdown
+// emphasis, fold en/em dashes + sentence punctuation to spaces, then split on
+// ALL whitespace INCLUDING newlines. A fact that wraps a line break therefore
+// becomes a contiguous token run, identically on the derivation side and the
+// scan side — no line structure survives for the two sides to disagree about
+// (the rounds-1/5/6 break class). `$`, digits, `/`, `+` and the plain hyphen are
+// PRESERVED so markers stay intact ("$20", "5-hour", "claude-abundant").
+function tokenize(text) {
+  return text
     .replace(/[`*_~]+/g, ' ')
     .replace(/[–—]/g, ' ')          // en/em dash
     .replace(/[(),.:;!?"'‘’“”]/g, ' ')
-    .replace(/\s+/g, ' ')
     .toLowerCase()
-    .trim();
+    .split(/\s+/)
+    .filter(Boolean);
+}
+// The same stream as a single normalized string, for the GENERIC regexes and for
+// substring containment of a derived n-gram. Space-joined, so a regex `\b` or a
+// space-padded signature match respects token boundaries.
+function stream(text) {
+  return tokenize(text).join(' ');
+}
+// Best-effort SOURCE LINE for a human-readable report ONLY — never a matching
+// decision (matching is always over the whole-document token stream above).
+function bestLine(lines, anchorTok) {
+  if (!anchorTok) return 0;
+  const i = lines.findIndex((l) => tokenize(l).includes(anchorTok));
+  return i < 0 ? 0 : i;
 }
 
 // ── Generic fallback — PERSONAL ASSERTIONS only (never bare "abundant"/"scarce"/
@@ -215,23 +293,28 @@ const GENERIC = [
 ];
 
 // ── Derived signatures from the overlay: marker-anchored n-grams that carry a
-//    DISTINCTIVE token (round-4 fix — addresses the over-match break, run ff31f61a).
+//    DISTINCTIVE token (round-5 design — run 01a129ca).
 //
 // Round-3's derived set promoted ANY 2–3-token window straddling a marker, and the
 // "dated stamp" marker (/^20\d\d(-\d\d){0,2}$/) let a BARE DATE anchor a signature:
 // an overlay heading "as of 2026-08-05" produced the gram "as of 2026-08-05", which
 // then matched the REAL docs/prompts/ROUTING.md staleness banners ("researched
 // 2026-08-05", "as of 2026-08-05") — a genuinely-clean published doc flagged as a
-// leak. Dates and framing words ("as", "of", "dated", "researched") are SHARED
-// vocabulary between the overlay and the published docs, so they must never anchor a
-// signature on their own.
+// leak. Dates and framing words ("as", "of", "dated", "researched") are framing
+// scaffolding, so they must never anchor a signature on their own.
 //
 // RULE: an overlay-derived n-gram counts only if it contains ≥1 DISTINCTIVE token —
-// one that is NOT a marker, NOT a date, NOT a stopword, and NOT a word that already
-// appears in the public ROUTING/WA text. A window of only markers + dates + framing +
-// shared vocabulary carries nothing that identifies the operator, so it is dropped.
+// one that is NOT a marker, NOT a date and NOT a stopword. A window of only markers +
+// dates + framing carries nothing that identifies the operator, so it is dropped.
 // This can only SHRINK the derived set, so it cannot introduce a false positive; the
 // known pre-scrub facts stay covered by the GENERIC fallback above regardless.
+//
+// Distinctiveness is derived ONLY from the fixed STOPWORDS/marker/date predicates —
+// NEVER from the content this guard scans. Round 4 excluded any token also present in
+// the published ROUTING/WA docs; because those are the files scanned for leaks,
+// pasting overlay prose into one of them promoted that prose's tokens to "public" and
+// silently suppressed its own signatures (round-4 self-suppression break, run
+// 01a129ca). No scanned file may ever define the non-leak vocabulary.
 function isMarker(tok) {
   return /\$\d/.test(tok)            // currency amount
     || /\d-hour/.test(tok)           // metering window
@@ -253,48 +336,40 @@ const STOPWORDS = new Set([
   'dated', 'researched', 'mo', 'vs', 'etc', 'do', 'does', 'did', 'can', 'will', 'may',
   'treat', 'same', 'all', 'any', 'each', 'one', 'two', 'now', 'new',
 ]);
-// Words that appear in the PUBLIC, de-personalised ROUTING / Working Agreement mirrors
-// are shared product vocabulary ("provider", "scarce", "window", "chatgpt", "claude",
-// "anthropic", "rolling", …), NOT operator-identifying tokens. Loaded from the tracked
-// published docs so the exclusion tracks the real text, not a frozen hand list.
-function loadPublicWords() {
-  const words = new Set();
-  const names = ['ROUTING.md'];
-  try {
-    for (const f of fs.readdirSync(path.join(ROOT, 'docs/prompts'))) {
-      if (/^WORKING_AGREEMENT\.v\d+\.md$/i.test(f)) names.push(f);
-    }
-  } catch { /* no docs/prompts on this tree — generic fallback still runs */ }
-  for (const n of names) {
-    let text;
-    try { text = fs.readFileSync(path.join(ROOT, 'docs/prompts', n), 'utf8'); } catch { continue; }
-    for (const tok of norm(text).split(' ')) if (tok) words.add(tok);
-  }
-  return words;
-}
-function distinctive(tok, publicWords) {
+// A token is DISTINCTIVE (operator-identifying) if it is not a marker, not a date,
+// not a stopword, and long enough to mean something. NOTHING is derived from the
+// scanned content: a prior round excluded tokens that appeared in the published
+// ROUTING / Working Agreement docs ("shared vocabulary"), but those are the very
+// files this guard scans for leaks — pasting overlay prose INTO one of them promoted
+// that prose's own tokens to "public" and suppressed its own signatures, a SILENT
+// pass of a real leak (round-4 break, run 01a129ca). The design rule now: no
+// vocabulary may be derived from scanned content. Distinctiveness rests only on
+// markers, dates and stopwords, which also keeps the round-3 "as of <date>"
+// over-match fixed (a window of only framing + a bare date has no distinctive token).
+function distinctive(tok) {
   if (tok.length < 3) return false;        // too short to identify anyone
   if (isMarker(tok) || isDate(tok)) return false; // a marker/date is not itself distinctive
   if (STOPWORDS.has(tok)) return false;    // framing / function word
-  if (publicWords.has(tok)) return false;  // shared with the published docs
   return true;
 }
-function derivedSignatures(overlayText, publicWords) {
+function derivedSignatures(overlayText) {
   const sigs = new Set();
-  for (const raw of overlayText.split('\n')) {
-    const toks = norm(raw).split(' ').filter(Boolean);
-    for (let i = 0; i < toks.length; i++) {
-      if (!isMarker(toks[i])) continue;
-      for (const [s, e] of [[i - 2, i], [i - 1, i + 1], [i, i + 2]]) {
-        const a = Math.max(0, s);
-        const b = Math.min(toks.length - 1, e);
-        if (b - a < 1) continue;
-        const gram = toks.slice(a, b + 1);
-        // Drop grams that carry no operator-identifying token (bare dates + framing +
-        // shared vocabulary). This is the round-4 over-match fix.
-        if (!gram.some((t) => distinctive(t, publicWords))) continue;
-        sigs.add(gram.join(' '));
-      }
+  // tokenize the WHOLE overlay (round-6): the token stream spans former line
+  // breaks, so a marker that wrapped onto its own line now anchors n-grams the
+  // same way a one-line marker does. No `split('\n')` — that was the round-5 seam.
+  const toks = tokenize(overlayText);
+  for (let i = 0; i < toks.length; i++) {
+    if (!isMarker(toks[i])) continue;
+    for (const [s, e] of [[i - 2, i], [i - 1, i + 1], [i, i + 2]]) {
+      const a = Math.max(0, s);
+      const b = Math.min(toks.length - 1, e);
+      if (b - a < 1) continue;
+      const gram = toks.slice(a, b + 1);
+      // Drop grams that carry no operator-identifying token (bare dates +
+      // framing). Distinctiveness is the fixed marker/date/stopword predicate
+      // only — nothing is derived from scanned content (round-4/5 invariant).
+      if (!gram.some((t) => distinctive(t))) continue;
+      sigs.add(gram.join(' '));
     }
   }
   return [...sigs];
@@ -302,21 +377,10 @@ function derivedSignatures(overlayText, publicWords) {
 
 const failures = [];
 
-// (1) no tracked operator-local overlay — it must stay gitignored.
-{
-  const r = spawnSync('git', ['ls-files', 'docs/prompts/*.local.md'], { cwd: ROOT, encoding: 'utf8' });
-  if (r.status === 0) {
-    for (const f of r.stdout.split('\n').map((s) => s.trim()).filter(Boolean)) {
-      failures.push(`${f}: an operator-local overlay is TRACKED — it must stay gitignored (never committed).`);
-    }
-  }
-}
-
 // Build the overlay-derived signature set (empty when no overlay present).
-const publicWords = loadPublicWords();
 let derived = [];
 try {
-  derived = derivedSignatures(fs.readFileSync(path.join(ROOT, OVERLAY_REL), 'utf8'), publicWords);
+  derived = derivedSignatures(fs.readFileSync(path.join(ROOT, OVERLAY_REL), 'utf8'));
 } catch { /* no overlay on this machine — generic fallback still runs */ }
 
 // (2) scan every publication-bound file for personal assertions / overlay prose.
@@ -326,41 +390,39 @@ if (!scan.ok) {
   console.error('  The guard cannot verify an unknowable scan set; treating as a leak risk.');
   process.exit(1);
 }
+// (1) The operator overlay must stay gitignored. If a `docs/prompts/*.local.md`
+// path shows up in the publication-bound set at all, git is no longer ignoring it
+// (tracked, or the ignore rule was removed / force-added), so it WOULD be published
+// with the operator's real holdings — FAIL LOUDLY. This subsumes the old
+// "tracked overlay" assertion and also catches an un-ignored untracked overlay.
+for (const f of scan.overlayPublished) {
+  failures.push(`${f}: the operator-local overlay is NOT gitignored (it appears in the publishable set) — it would be published with the operator's real holdings. Keep it matched by \`/docs/prompts/*.local.md\` in .gitignore and never \`git add -f\` it.`);
+}
 const scanned = scan.files;
 for (const rel of scanned) {
   let text;
   try { text = fs.readFileSync(path.join(ROOT, rel), 'utf8'); } catch { continue; }
+  // Matching is over the WHOLE-document token stream (one chokepoint). `lines` is
+  // used ONLY to report a best-effort human-readable source line, never to match.
   const lines = text.split('\n');
+  const fileStream = stream(text);
 
-  // Generic patterns over sliding 1–3 line windows (catches wrapped prose).
-  const seen = new Set();
-  for (let i = 0; i < lines.length; i++) {
-    for (let w = 0; w < 3 && i + w < lines.length; w++) {
-      const windowNorm = norm(lines.slice(i, i + w + 1).join(' '));
-      if (!windowNorm) continue;
-      for (const g of GENERIC) {
-        const key = `${g.re.source}@${i}`;
-        if (seen.has(key)) continue;
-        if (g.re.test(windowNorm)) {
-          seen.add(key);
-          failures.push(`${rel}:${i + 1}: personal assertion — ${g.why}: ${lines[i].trim().slice(0, 120)}`);
-        }
-      }
-    }
+  // (a) Generic personal-assertion patterns over the whole normalized stream.
+  for (const g of GENERIC) {
+    const m = g.re.exec(fileStream);
+    if (!m) continue;
+    const anchor = tokenize(m[0])[0];
+    const ln = bestLine(lines, anchor);
+    failures.push(`${rel}:${ln + 1}: personal assertion — ${g.why}: ${lines[ln].trim().slice(0, 120)}`);
   }
 
-  // Derived overlay signatures over the whole normalized file.
+  // (b) Derived overlay signatures: space-padded containment over the same stream
+  //     so an n-gram only matches on token boundaries.
   if (derived.length) {
-    const fileNorm = norm(text);
+    const padded = ` ${fileStream} `;
     for (const sig of derived) {
-      if (!fileNorm.includes(sig)) continue;
-      // best-effort line: first line whose normalized form contains the sig's head token
-      const head = sig.split(' ')[0];
-      let ln = lines.findIndex((l) => norm(l).includes(head));
-      if (ln < 0) ln = 0;
-      const key = `derived:${sig}@${ln}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      if (!padded.includes(` ${sig} `)) continue;
+      const ln = bestLine(lines, sig.split(' ')[0]);
       failures.push(`${rel}:${ln + 1}: operator-overlay prose leaked into a published file ("${sig}")`);
     }
   }
@@ -369,7 +431,7 @@ for (const rel of scanned) {
 if (failures.length === 0) {
   console.log(`PROMPT-PRIVACY: PASS — scanned ${scanned.length} publication-bound file(s); ` +
     `${derived.length} overlay-derived signature(s)${derived.length ? '' : ' (no overlay on this machine)'}; ` +
-    `no tracked overlay; no personal assertions.`);
+    `overlay gitignored (not in the publishable set); no personal assertions.`);
   process.exit(0);
 }
 console.error(`PROMPT-PRIVACY: FAIL — ${failures.length} leak(s) of an operator-specific fact into published material:`);

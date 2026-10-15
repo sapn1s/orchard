@@ -276,3 +276,6 @@ one-line change someone else applies:
 - **Decision for the user:** the codex gap flagged in the round-2 decision is now
   CLOSED and proven active (Decision A applied to codex too). This lane leaves
   only the independent-verify gate before VERIFIED.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: verify-owed. Why: The decision is resolved (A on both runtimes); the status names an independent clean-room verify as the only remaining gate. Next: Dispatch the independent clean-room verify of the subprocess git shim. You can reopen this decision from the ticket view.

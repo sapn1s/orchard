@@ -5,41 +5,71 @@
   "title": "An overnight machine suspend recorded a passing suite as failed",
   "summary": "A machine slept for over eight hours while verification work was running. On waking, the harness's timer treated the frozen hours as elapsed work and killed a suite that had already been passing, recording it as a failure. A second agent's own timer paused with the machine and finished normally.",
   "impact_if_we_wait": "A suite that was green can be posted as red, and a person or a gate may act on a result that never happened. Bounded: it needs an actual suspend during a run, no data is lost, and the leaked-process side already has its own ticket.",
-  "current_need": "Decide whether to build the suspend-window detection that marks such a result inconclusive, or leave the pattern to be spotted by hand.",
+  "current_need": "Build A: a timeout kill whose span brackets a recorded sleep is recorded as inconclusive, with a test that keeps genuine failures failing.",
   "severity": "high",
   "area": "Verification result trust",
   "reported": "2026-08-19",
   "reported_by": "agent",
   "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-19",
-  "decision": {
-    "mode": "single",
-    "question": "Should a kill that brackets a machine suspend be marked inconclusive automatically, or spotted by hand?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Detect the suspend window",
-        "what_changes": "A result carrying the timeout-kill fingerprint whose span brackets a recorded sleep is recorded as inconclusive rather than failed.",
-        "benefit": "A killed-across-sleep run stops being indistinguishable from a real failure.",
-        "cost": "Needs a way to read the machine's sleep record, plus a test that simulates a sleep bracketing a killed command.",
-        "why_not_obvious": "A wrong window match would relabel a genuine failure as inconclusive, which hides the exact class of result the project most wants to trust."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "d3b5e46e-b2a0-4cc0-8c0c-e4184ee85c91",
+      "asked_on": "2026-08-19",
+      "question": "Should a kill that brackets a machine suspend be marked inconclusive automatically, or spotted by hand?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Engineering fix with a recommendation; it touches no product path and removes a false verdict.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Engineering fix with a recommendation; it touches no product path and removes a false verdict.",
+        "on": "2026-10-14",
+        "next": "Build A: a timeout kill whose span brackets a recorded sleep is recorded as inconclusive, with a test that keeps genuine failures failing.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether to build the suspend-window detection that marks such a result inconclusive, or leave the pattern to be spotted by hand."
+        }
       },
-      {
-        "key": "B",
-        "label": "Leave it to the reader",
-        "what_changes": "Nothing is built; whoever reads the result notices the pass-count-then-kill shape as happened here.",
-        "benefit": "No work, and the one observed case was caught and re-run without any tooling.",
-        "cost": "It was caught by luck, and an unattended sleep can post the red result while nobody is watching.",
-        "why_not_obvious": "The failure only appears when nobody is checking, so the absence of further reports is not evidence it is rare."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should a kill that brackets a machine suspend be marked inconclusive automatically, or spotted by hand?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Detect the suspend window",
+            "what_changes": "A result carrying the timeout-kill fingerprint whose span brackets a recorded sleep is recorded as inconclusive rather than failed.",
+            "benefit": "A killed-across-sleep run stops being indistinguishable from a real failure.",
+            "cost": "Needs a way to read the machine's sleep record, plus a test that simulates a sleep bracketing a killed command.",
+            "why_not_obvious": "A wrong window match would relabel a genuine failure as inconclusive, which hides the exact class of result the project most wants to trust."
+          },
+          {
+            "key": "B",
+            "label": "Leave it to the reader",
+            "what_changes": "Nothing is built; whoever reads the result notices the pass-count-then-kill shape as happened here.",
+            "benefit": "No work, and the one observed case was caught and re-run without any tooling.",
+            "cost": "It was caught by luck, and an unattended sleep can post the red result while nobody is watching.",
+            "why_not_obvious": "The failure only appears when nobody is checking, so the absence of further reports is not evidence it is rare."
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "It removes a false verdict from the one class of result this project most needs to trust, and it can be added without touching any product path.",
+        "prerequisite": "Establish that this machine's sleep record is reliably readable after the fact. If it is not, automatic detection has nothing to match against."
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "It removes a false verdict from the one class of result this project most needs to trust, and it can be added without touching any product path.",
-    "prerequisite": "Establish that this machine's sleep record is reliably readable after the fact. If it is not, automatic detection has nothing to match against."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A timed-out result whose span brackets a recorded sleep is marked inconclusive, not failed",
     "A genuine suite failure is still recorded as a failure",
@@ -140,3 +170,6 @@ Suspend windows are read from a local system record; if that record is missing o
 - **Verified:** observation only, from the system journal — `PM: suspend entry` 02:50:57, `suspend exit` 11:10:06 (8h19m09s). Agent A's tool call returned ~14 s after resume with the full gap inside it and committed ~9 min later; Agent B's loop returned `143`/"timed out" on thaw after 37/37. Read-only; nothing killed, no scope touched.
 - **Still open / handoff:** everything. The next agent should start from **detection and attribution** — recognise the cross-suspend `143` fingerprint and refuse to count it as a genuine verification FAIL — not from trying to prevent the harness's wall-clock kill, which this repo does not own. For verify harnesses we DO own, prefer a monotonic/process-paused timer over a wall-clock deadline. Read BUG-114 before touching the host-leak consequence; it owns that mechanism.
 - **Symptom of a deeper design flaw?** not answered — the ticket is open. The suspicion to test when closing it: whether a "verification FAIL" recorded by this system needs to carry provenance strong enough to tell "the suite failed" apart from "the process was killed by something unrelated to the code under test" (a wall-clock timeout, an OOM, a suspend) — i.e. whether a raw non-zero exit should ever be allowed to mean "verified failing" without that provenance.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Engineering fix with a recommendation; it touches no product path and removes a false verdict. Next: Build A: a timeout kill whose span brackets a recorded sleep is recorded as inconclusive, with a test that keeps genuine failures failing. You can reopen this decision from the ticket view.

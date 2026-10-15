@@ -38,6 +38,7 @@ const ROOT = path.resolve(HERE, '..');
 // rev-parse` with cwd: ROOT, which resolves at any nesting.
 const LEAK_GATE = path.join(HERE, 'leak-gate.mjs');
 const CHECK_NUL = path.join(HERE, 'check-nul.mjs');
+const CHECK_UNICODE_SEPS = path.join(HERE, 'check-unicode-separators.mjs');
 // FEAT-172 — optional sibling: a repo that ships it (Orchard) gets the
 // operator-privacy regression guard; one that does not (an onboarded target
 // without it) simply skips it. Run only when the sibling file is present.
@@ -73,6 +74,19 @@ const results = [];
   const ok = r.status === 0;
   const out = ((r.stdout || '') + (ok ? '' : (r.stderr || ''))).trim();
   results.push({ name: 'check-nul', ok, detail: out });
+}
+
+/* 2a. check-unicode-separators (BUG-260) — a raw U+2028/U+2029 pasted into a
+ *    regex literal is a syntax error that crashes every static importer
+ *    unconditionally, invisibly, before any try/catch can run. Its exit
+ *    STATUS is truth. */
+{
+  const r = spawnSync(process.execPath, [CHECK_UNICODE_SEPS], {
+    cwd: REPO, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  });
+  const ok = r.status === 0;
+  const out = ((r.stdout || '') + (ok ? '' : (r.stderr || ''))).trim();
+  results.push({ name: 'check-unicode-separators', ok, detail: out });
 }
 
 /* 2b. prompt-privacy (FEAT-172) — OPTIONAL. Guards against an operator-specific

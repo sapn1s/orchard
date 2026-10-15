@@ -5,7 +5,7 @@
   "title": "No way to see which parts of the workflow cost the most",
   "summary": "There is no breakdown of where the effort in this workflow goes. Nobody can tell whether independent verification, investigation, or redoing broken work consumes the largest share. A read-only chart and table over records already kept would answer that, and nothing has been built yet.",
   "impact_if_we_wait": "If usage is ever limited, a decision about what to cut would be made blind. Bounded: nothing breaks and no data is lost while this stays queued, since it only reads records that are already retained.",
-  "current_need": "The capture layer is built and recording; what remains is deciding whether the breakdown also needs a rendered view, or whether the command-line report is enough.",
+  "current_need": "Build the rendered view its success criteria already require (estimates labelled, legible in light and dark).",
   "severity": "low",
   "area": "Process cost attribution",
   "reported": "2026-08-14",
@@ -13,14 +13,17 @@
   "owner": "unassigned",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-08-20",
+  "updated": "2026-10-14",
   "decision": null,
   "decision_history": [
     {
       "asked_on": "2026-08-14",
       "question": "Should we build the read-only cost breakdown now, or leave it queued?",
       "mode": "single",
-      "options_keys": ["A", "B"],
+      "options_keys": [
+        "A",
+        "B"
+      ],
       "chosen": "A",
       "chosen_on": "2026-08-20",
       "chosen_by": "user",
@@ -255,3 +258,6 @@ an estimate at list rates, not money paid.
   the message-id folding rule against a lane that was interrupted mid-stream; whether `conversing`
   and `investigating` are being used as catch-alls; and whether the ledger's last-record-wins read
   is right when a lane is collected twice while still running.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: criteria (sc:3, sc:4). Why: this was a bare Needs-You row asking whether the cost breakdown also needs a rendered view; the ticket's own success criteria already require one (the view states figures are estimates; the chart renders legibly in both themes). Next: build the rendered view. There was no decision record to move, so this is a log entry plus the Owner cell; you can put it back on your rail with Mark 👤 on the ticket view.

@@ -5,41 +5,71 @@
   "title": "Tickets read as agent notes and people skip the headings",
   "summary": "Ticket headings carry instructions written for the author rather than questions a reader can answer, and the wording is inherited from an agent-facing document. Readers skip past them. The in-app ticket view now leads with a plain-language layer and keeps the detailed material below it. The templates, the standard charter wording and the parsers still use the old dialect.",
   "impact_if_we_wait": "New tickets keep being written in vocabulary a reader never agreed to, so the durable record stays hard to read. Bounded: this is presentation and wording, not content. Every existing ticket keeps its full detail and the board tooling keeps working.",
-  "current_need": "Decide whether to rename the headings across templates and parsers now, or leave the view layer to carry readability alone.",
+  "current_need": "Build A: rename the headings to plain questions and migrate every heading reader.",
   "severity": "medium",
   "area": "Ticket readability",
   "reported": "2026-08-15",
   "reported_by": "user",
-  "owner": "agent",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-20",
-  "decision": {
-    "mode": "single",
-    "question": "Should the ticket headings be renamed to plain questions, or left as they are?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Rename headings and migrate parsers",
-        "what_changes": "Templates and charter wording use plain questions, and the tooling that reads headings is updated to match.",
-        "benefit": "A reader meets ordinary language at the top of every new ticket instead of author instructions.",
-        "cost": "Some headings are load-bearing for tooling, so every reader of them has to be found and moved first.",
-        "why_not_obvious": "A missed heading reader fails on tickets it used to parse, and that surfaces as a blank section rather than an error."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "c135bc58-a073-4e4b-b9e1-364a0531a62c",
+      "asked_on": "2026-08-20",
+      "question": "Should the ticket headings be renamed to plain questions, or left as they are?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — criteria: The ticket's own success criteria already require every parser to read tickets after the rename.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "criteria",
+        "ref": "sc:1",
+        "why": "The ticket's own success criteria already require every parser to read tickets after the rename.",
+        "on": "2026-10-14",
+        "next": "Build A: rename the headings to plain questions and migrate every heading reader.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether to rename the headings across templates and parsers now, or leave the view layer to carry readability alone."
+        }
       },
-      {
-        "key": "B",
-        "label": "Leave templates as they are",
-        "what_changes": "Nothing moves. The in-app view keeps doing the readability work on top of the existing wording.",
-        "benefit": "No parser risk, and the shipped view already puts plain language first for anyone reading in the app.",
-        "cost": "Anyone reading the files directly still meets the old dialect, and every new ticket adds another one.",
-        "why_not_obvious": "The stored text is the durable record, so the readability problem keeps growing in the copy that outlives the app."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should the ticket headings be renamed to plain questions, or left as they are?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Rename headings and migrate parsers",
+            "what_changes": "Templates and charter wording use plain questions, and the tooling that reads headings is updated to match.",
+            "benefit": "A reader meets ordinary language at the top of every new ticket instead of author instructions.",
+            "cost": "Some headings are load-bearing for tooling, so every reader of them has to be found and moved first.",
+            "why_not_obvious": "A missed heading reader fails on tickets it used to parse, and that surfaces as a blank section rather than an error."
+          },
+          {
+            "key": "B",
+            "label": "Leave templates as they are",
+            "what_changes": "Nothing moves. The in-app view keeps doing the readability work on top of the existing wording.",
+            "benefit": "No parser risk, and the shipped view already puts plain language first for anyone reading in the app.",
+            "cost": "Anyone reading the files directly still meets the old dialect, and every new ticket adds another one.",
+            "why_not_obvious": "The stored text is the durable record, so the readability problem keeps growing in the copy that outlives the app."
+          }
+        ],
+        "recommendation": null,
+        "recommendation_reason": null,
+        "prerequisite": "Establish which headings the board generator, the board checker and the in-app view actually parse. If few are load-bearing, the rename stops being risky."
       }
-    ],
-    "recommendation": null,
-    "recommendation_reason": null,
-    "prerequisite": "Establish which headings the board generator, the board checker and the in-app view actually parse. If few are load-bearing, the rename stops being risky."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A reader unfamiliar with the project states what is wrong and what happens next from the top section alone",
     "Board generation, board checking and the in-app view parse every ticket after the rename",
@@ -421,3 +451,6 @@ properties that need separate tests.
 **Proposed INDEX row** (this lane does not edit `INDEX.md`):
 
 `| FEAT-087 | tickets are written in agent dialect; make the reader-facing parts human-readable | — | OPEN — the in-app view half (item 4) has shipped over five commits and is awaiting a fifth independent round; four clean-room rounds have returned BROKEN, each on a false CLAIM rather than a broken mechanism; the template/charter/parser half is untouched. | med |`
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: criteria (sc:1). Chose: A. Why: The ticket's own success criteria already require every parser to read tickets after the rename. Next: Build A: rename the headings to plain questions and migrate every heading reader. You can reopen this decision from the ticket view.

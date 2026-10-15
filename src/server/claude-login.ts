@@ -41,6 +41,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   AccountError,
@@ -86,9 +87,27 @@ export type LoginEmit = (e: LoginEvent) => void;
 interface LoginSession {
   accountId: string;
   label: string;
+  /** The account's real overlay dir — the one every session/container binds. */
   dir: string;
+  /**
+   * BUG-254 r4 — where the CLI actually writes `.credentials.json`. For a REAUTH it is a private
+   * TEMP dir, so a successful sign-in never atomic-replaces (and so orphans a running container's
+   * single-file bind — BUG-136) the account's real credential; the fresh credential is then written
+   * IN PLACE into the real file (same inode), so a running container sees the new token with no
+   * recreate. For a first login `writeDir === dir` (no temp, nothing to copy). Removed on finish.
+   */
+  writeDir: string;
   child: ChildProcess;
   emit: LoginEmit;
+  /**
+   * RE-authentication of an already-`ready` account (BUG-254), as opposed to
+   * the first login of a freshly-added `pending` one. A reauth NEVER deletes the
+   * account on failure/cancel/timeout — the established row and its existing
+   * credential are kept untouched, and only a successful CLI write replaces the
+   * credential in place, so the account id (and every project pinned to it) is
+   * preserved. The pending first-login path still cleans its half-made row away.
+   */
+  reauth: boolean;
   /** Codes the user pasted — held ONLY to redact them out of relayed output. */
   secrets: string[];
   urlEmitted: boolean;
@@ -119,6 +138,50 @@ function redact(s: string, secrets: readonly string[]): string {
 function clearTimers(s: LoginSession): void {
   for (const t of s.timers) clearTimeout(t);
   s.timers = [];
+}
+
+/**
+ * BUG-254 r7 — copy the freshly-minted credential from the reauth's temp config dir into the
+ * account's real `.credentials.json` via a WHOLESALE ATOMIC REPLACE: write the new bytes to a
+ * sibling temp file in the account dir, fsync, then `rename()` it over the target. The rename is
+ * atomic within the directory, so a concurrent reader ever sees EITHER the complete old document OR
+ * the complete new one — never a torn or partial read. The credential bytes are never logged.
+ *
+ * Why not the r4 same-inode in-place rewrite: there is no atomic same-inode replace on Linux, and a
+ * single `write(2)` of a ~1 KB credential is NOT atomic against a concurrent reader. The r7 docker-
+ * sandbox gate measured ~0.012% torn reads (49 per 400 000) even for a padded fixed-length single
+ * write, observed by a real container reader over the single-file bind. Because CLI 2.1.296 reloads
+ * the credential ONLY on an mtime CHANGE, a torn read cached against the final write's mtime has no
+ * recovery trigger (no further write/touch/login) — it would strand the running CLI on a bad read
+ * forever. So the in-place path is removed: the re-login replaces the file wholesale (new inode),
+ * the running container keeps its old bound inode (BUG-136) until the verified idle-only reconciler
+ * (grant-rebuild.ts) recreates it the moment the project is idle. Its sessions are failing on auth,
+ * so they ARE idle; the priced residual is a few seconds until the heal runs rather than instant.
+ */
+export function applyCredentialReplace(fromDir: string, toDir: string): void {
+  const src = path.join(fromDir, '.credentials.json');
+  const dst = path.join(toDir, '.credentials.json');
+  const content = fs.readFileSync(src); // Buffer; never stringified or logged
+  const tmp = path.join(toDir, `.credentials.json.reauth-${process.pid}-${Date.now()}`);
+  const fd = fs.openSync(tmp, 'w', 0o600); // fresh sibling file in the SAME dir (so rename is atomic)
+  try {
+    fs.writeSync(fd, content, 0, content.length, 0);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    fs.renameSync(tmp, dst); // atomic replace — a reader sees the whole old OR the whole new file
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
+}
+
+/** Remove a reauth's temp config dir (it briefly held a real credential). Best effort. */
+function cleanupWriteDir(s: LoginSession): void {
+  if (s.writeDir === s.dir) return; // first login wrote straight to the account dir — nothing temp
+  try { fs.rmSync(s.writeDir, { recursive: true, force: true }); } catch { /* gone, or left for the OS tmp reaper */ }
 }
 
 /**
@@ -166,6 +229,7 @@ function finish(
   if (s.finished) return;
   s.finished = true;
   clearTimers(s);
+  cleanupWriteDir(s); // BUG-254 r4 — remove the reauth temp dir (held a credential briefly)
   if (active === s) active = null;
   s.emit({ t: 'claude-login-done', accountId: s.accountId, ...verdict });
 }
@@ -217,16 +281,30 @@ function onOutput(s: LoginSession, stream: 'stdout' | 'stderr', chunk: string): 
 }
 
 /**
- * Start the login for a PENDING account. Refuses, with a distinct status, when:
- * another attempt is live (409), the id is the default (400), the account does
- * not exist (404), or it is already `ready` (409 — logging in over a live
- * credential would silently replace a working account).
+ * Start a login for an account. Two shapes, chosen from the row's state:
+ *
+ *  - a `pending` account → its FIRST login (a failed attempt deletes the
+ *    half-made row, as before);
+ *  - a `ready` account → a RE-login in place (BUG-254). It reuses this exact
+ *    relay against the SAME account dir, so a successful sign-in replaces
+ *    `.credentials.json` and KEEPS the account id — every project pinned to it
+ *    keeps working. A failed reauth leaves the account and its old credential
+ *    untouched. This replaces the old "delete it and add it again" refusal,
+ *    which minted a new id and broke every project pointing at the old one.
+ *
+ * Still refused, each with a distinct status: another attempt is live (409),
+ * the id is the default (400 — that is plain `claude` CLI territory), or the
+ * account does not exist (404).
+ *
+ * `onReady(accountId)` fires AFTER a successful sign-in has been written down
+ * (`markAccountReady`), so the caller can propagate the replaced credential to
+ * running sessions (BUG-254) without this module importing the session layer.
  */
 export function startClaudeLogin(
   accountId: string,
   emit: LoginEmit,
-  opts: { timeoutMs?: number; urlGraceMs?: number } = {},
-): { accountId: string; label: string; dir: string; pid: number } {
+  opts: { timeoutMs?: number; urlGraceMs?: number; onReady?: (accountId: string) => void } = {},
+): { accountId: string; label: string; dir: string; pid: number; reauth: boolean } {
   if (active && !active.finished) {
     throw new AccountError(
       `a Claude login is already in progress for "${active.label}" — finish or cancel it first ` +
@@ -243,23 +321,27 @@ export function startClaudeLogin(
   }
   const row = readAccounts().find((r) => r.id === accountId);
   if (!row) throw new AccountError(`no account ${accountId}`, 404);
-  if (row.state !== 'pending') {
-    throw new AccountError(
-      `account "${row.label}" is already logged in (state: ${row.state}) — delete it and add it again to re-authenticate`,
-      409,
-    );
-  }
+  const reauth = row.state === 'ready';
 
   const { dir } = materialiseAccountDir(accountId); // idempotent; repairs the overlay
   const bin = process.env.CLAUDE_STATION_CLAUDE_BIN || 'claude';
 
   /*
-   * The child env. `CLAUDE_CONFIG_DIR` is the whole point — it is what makes
-   * the CLI write `.credentials.json` into THIS account's overlay instead of
-   * the user's real store. `BROWSER`/`DISPLAY` are the "do not open a browser
-   * on the server's own desktop" contract.
+   * BUG-254 r4 — a REAUTH writes to a private temp dir, not the account's real dir, so the CLI's
+   * atomic credential replace cannot orphan a running container's single-file bind (BUG-136). The
+   * fresh credential is copied IN PLACE into the real file on success (same inode). A first login
+   * has no running consumers of a credential that does not exist yet, so it writes straight to the
+   * account dir exactly as before.
    */
-  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: dir, BROWSER: '/usr/bin/true' };
+  const writeDir = reauth ? fs.mkdtempSync(path.join(os.tmpdir(), 'cs-reauth-')) : dir;
+
+  /*
+   * The child env. `CLAUDE_CONFIG_DIR` is the whole point — it is what makes
+   * the CLI write `.credentials.json` into THIS account's overlay (or, for a
+   * reauth, the temp dir) instead of the user's real store. `BROWSER`/`DISPLAY`
+   * are the "do not open a browser on the server's own desktop" contract.
+   */
+  const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: writeDir, BROWSER: '/usr/bin/true' };
   delete env.DISPLAY;
   delete env.WAYLAND_DISPLAY;
 
@@ -274,8 +356,10 @@ export function startClaudeLogin(
     accountId,
     label: row.label,
     dir,
+    writeDir,
     child,
     emit,
+    reauth,
     secrets: [],
     urlEmitted: false,
     finished: false,
@@ -291,13 +375,15 @@ export function startClaudeLogin(
   child.stderr?.on('data', (d: string) => onOutput(s, 'stderr', d));
 
   child.on('error', (err: Error) => {
-    dropPendingAccount(accountId);
+    // A reauth keeps the established account; only a first-login's half-made
+    // pending row is cleaned away.
+    const removed = s.reauth ? false : dropPendingAccount(accountId);
     finish(s, {
       ok: false,
       loggedIn: false,
       subscriptionType: null,
       reason: `could not run \`${bin} auth login --claudeai\`: ${err.message}`,
-      accountRemoved: true,
+      accountRemoved: removed,
     });
   });
 
@@ -311,10 +397,37 @@ export function startClaudeLogin(
      * here would be wrong in both directions; `readAccountHealth` parses
      * `loggedIn` and that single field decides.
      */
-    void readAccountHealth(accountId)
+    // BUG-254 r4 — a reauth wrote to the temp dir; read the confirmed `loggedIn` fact from THERE.
+    void readAccountHealth(accountId, s.writeDir === s.dir ? {} : { configDir: s.writeDir })
       .then((health) => {
         if (health.loggedIn) {
+          if (s.reauth) {
+            // BUG-254 r7 — replace the account credential WHOLESALE (atomic rename, new inode). If
+            // this fails the real credential is untouched (still the old one), so the account is NOT
+            // marked ready on a credential we could not install. A running container keeps its old
+            // bound inode until the idle reconciler recreates it (grantRebuild, nudged below).
+            try {
+              applyCredentialReplace(s.writeDir, s.dir);
+            } catch (err) {
+              finish(s, {
+                ok: false,
+                loggedIn: false,
+                subscriptionType: null,
+                reason:
+                  `signed in, but the new credential could not be written to the account in place (${(err as Error).message}). ` +
+                  'The account is unchanged — it still has its previous credential; try again.',
+              });
+              return;
+            }
+          }
           markAccountReady(accountId, health);
+          // Propagate the replaced credential to running sessions (BUG-254).
+          // Fires only on a confirmed sign-in, after the fact is written down.
+          try {
+            opts.onReady?.(accountId);
+          } catch {
+            /* propagation is best-effort; it must not fail the login verdict */
+          }
           finish(s, {
             ok: true,
             loggedIn: true,
@@ -331,7 +444,9 @@ export function startClaudeLogin(
           reason:
             `the sign-in did not complete — \`claude auth status\` still reports logged out (the CLI ${how})` +
             (health.error ? `: ${health.error}` : '') +
-            '. The account is kept so you can try again.',
+            (s.reauth
+              ? '. The account is unchanged — it still has its previous credential.'
+              : '. The account is kept so you can try again.'),
         });
       })
       .catch((err: Error) => {
@@ -351,12 +466,13 @@ export function startClaudeLogin(
     setTimeout(() => {
       if (s.finished) return;
       killGroup(child);
-      const removed = dropPendingAccount(accountId);
+      const removed = s.reauth ? false : dropPendingAccount(accountId);
       finish(s, {
         ok: false,
         loggedIn: false,
         subscriptionType: null,
-        reason: `the sign-in timed out after ${Math.round(timeoutMs / 1000)}s — the CLI was stopped and the half-made account removed`,
+        reason: `the sign-in timed out after ${Math.round(timeoutMs / 1000)}s — the CLI was stopped` +
+          (removed ? ' and the half-made account removed' : s.reauth ? ' (the account is unchanged)' : ''),
         timedOut: true,
         accountRemoved: removed,
       });
@@ -381,7 +497,7 @@ export function startClaudeLogin(
     }, graceMs),
   );
 
-  return { accountId, label: row.label, dir, pid: child.pid ?? -1 };
+  return { accountId, label: row.label, dir, pid: child.pid ?? -1, reauth };
 }
 
 /**
@@ -415,12 +531,13 @@ export function cancelClaudeLogin(accountId?: string, reason = 'cancelled'): boo
   if (!s || s.finished) return false;
   if (accountId && s.accountId !== accountId) return false;
   killGroup(s.child);
-  const removed = dropPendingAccount(s.accountId);
+  const removed = s.reauth ? false : dropPendingAccount(s.accountId);
   finish(s, {
     ok: false,
     loggedIn: false,
     subscriptionType: null,
-    reason: `${reason} — the CLI was stopped${removed ? ' and the half-made account removed' : ''}`,
+    reason: `${reason} — the CLI was stopped` +
+      (removed ? ' and the half-made account removed' : s.reauth ? ' (the account is unchanged)' : ''),
     cancelled: true,
     accountRemoved: removed,
   });

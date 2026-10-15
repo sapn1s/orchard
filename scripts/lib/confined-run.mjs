@@ -59,7 +59,7 @@ const DK_TIMEOUT_MS = 120_000;
  * is present and holds at runtime. Nothing a caller passes is merged in except
  * the numeric limits.
  */
-export function confinementFlags(limits = {}) {
+export function confinementFlags(limits = {}, { seccompProfile = null } = {}) {
   const l = { ...DEFAULT_LIMITS, ...limits };
   for (const k of ['memoryMb', 'pids', 'workMb', 'tmpMb', 'outMb']) {
     if (!Number.isInteger(l[k]) || l[k] <= 0) throw new Error(`confined-run: limit ${k} must be a positive integer`);
@@ -83,7 +83,43 @@ export function confinementFlags(limits = {}) {
     '--memory-swap', `${l.memoryMb}m`,
     '--log-driver', 'none',
     '--label', `${CONFINED_LABEL}=1`,
+    // --allow-userns only (ARCH-021 D1): the pinned default profile plus the userns rule.
+    ...(seccompProfile ? ['--security-opt', `seccomp=${seccompProfile}`, '--label', `${CONFINED_LABEL}.userns=1`] : []),
   ];
+}
+
+/*
+ * ARCH-021 D1 — the `--allow-userns` opt-in. Per invocation only; the default above is
+ * untouched. Docker's default seccomp profile allows unshare/setns/mount/umount2/
+ * pivot_root and namespace-flag clone ONLY to a container holding CAP_SYS_ADMIN, which
+ * this runner drops, so bwrap cannot run here by default. The opt-in profile is that
+ * default profile (vendored, sha256-pinned) plus ONE rule allowing exactly those
+ * syscalls. Every other flag stays (cap-drop ALL, no-new-privileges, network none,
+ * read-only rootfs, no host mount). The kernel stays the boundary: the container's
+ * own mount namespace is owned by the init user namespace, where the process holds no
+ * capability, so a mount or umount there is EPERM; only a NEW user namespace's private
+ * copy (whose inherited mounts are locked) can be changed.
+ */
+export const SECCOMP_DEFAULT_PATH = new URL('./seccomp/docker-default-29.8.1.json', import.meta.url);
+export const SECCOMP_DEFAULT_SHA256 = '536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74';
+export const USERNS_SYSCALLS = Object.freeze(['unshare', 'setns', 'mount', 'umount', 'umount2', 'pivot_root', 'clone']);
+
+/** The opt-in profile: the pinned default plus the one userns rule. Throws if the vendored file drifted. */
+export function usernsSeccompProfile() {
+  const raw = fs.readFileSync(SECCOMP_DEFAULT_PATH);
+  const sum = crypto.createHash('sha256').update(raw).digest('hex');
+  if (sum !== SECCOMP_DEFAULT_SHA256) throw new Error(`confined-run: vendored seccomp profile hash ${sum} != pinned ${SECCOMP_DEFAULT_SHA256}`);
+  const prof = JSON.parse(raw);
+  prof.syscalls = [...prof.syscalls, { names: [...USERNS_SYSCALLS], action: 'SCMP_ACT_ALLOW', comment: 'orchard confined-run --allow-userns (ARCH-021 D1)' }];
+  return prof;
+}
+
+/** Write the opt-in profile to a private temp file; returns { path, cleanup }. */
+function writeUsernsProfile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orchard-seccomp-'));
+  const p = path.join(dir, 'userns.json');
+  fs.writeFileSync(p, JSON.stringify(usernsSeccompProfile()), { mode: 0o600 });
+  return { path: p, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
 
 /** Docker CLI env pinned to the sandbox daemon. Host env that could redirect the CLI is dropped. */
@@ -605,8 +641,14 @@ export async function runConfined(argv, opts = {}) {
 
   const name = `orchard-confined-${process.pid}-${crypto.randomBytes(4).toString('hex')}`;
   const expires = Math.ceil(budget.until / 1000);
-  const create = dk(env, ['create', '--name', name, ...confinementFlags(limits), '--label', `${EXPIRES_LABEL}=${expires}`, ...inner,
-    '--entrypoint', 'sleep', image, String(Math.floor(remaining()))], { budget });
+  // The docker CLI reads the seccomp file at create time and sends it inline, so it is removed right after.
+  const prof = opts.allowUserns ? writeUsernsProfile() : null;
+  if (prof) log('--allow-userns: seccomp = pinned docker default + unshare/setns/mount/umount2/pivot_root/clone; every other confinement flag unchanged');
+  let create;
+  try {
+    create = dk(env, ['create', '--name', name, ...confinementFlags(limits, { seccompProfile: prof?.path ?? null }), '--label', `${EXPIRES_LABEL}=${expires}`, ...inner,
+      '--entrypoint', 'sleep', image, String(Math.floor(remaining()))], { budget });
+  } finally { prof?.cleanup(); }
   if (create.code !== 0) { reapAmbiguous(env, name, expires, log); throw new Error(`confined-run: create failed: ${create.err}`); }
   const id = create.out;
   // Image-independent expiry: survives this process being SIGKILLed.

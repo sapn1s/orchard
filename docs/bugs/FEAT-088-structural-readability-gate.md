@@ -5,49 +5,80 @@
   "title": "Ticket readability check misses repetition and ordering faults",
   "summary": "A reader stalled on a long decision ticket whose sentences all passed the readability check. The faults were structural: one fact repeated five times, the justification placed after the decision it supported. A mechanical repetition and ordering lint now ships, passing 26 of 26 checks. A model-judged review layer exists but has no agreed run cadence.",
   "impact_if_we_wait": "Decision tickets keep reaching people in a shape that is slow to read, and the judgement-level faults stay unflagged. Bounded: the mechanical lint already catches repetition and ordering, and no ticket content or existing check is affected.",
-  "current_need": "Decide whether the model-judged review runs on every decision-bearing reply, only on tickets, or always but advisory without blocking.",
+  "current_need": "Build C: the model-judged structure review runs everywhere as advisory.",
   "severity": "medium",
   "area": "Ticket readability checks",
   "reported": "2026-08-15",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-18",
-  "decision": {
-    "mode": "single",
-    "question": "Where should the model-judged structure review run: every decision reply, tickets only, or advisory everywhere?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Run on every decision reply",
-        "what_changes": "Any reply that carries a decision is reviewed for structure before it reaches the reader, and blocks on failure.",
-        "benefit": "Every piece of decision content a person reads has been checked for structure.",
-        "cost": "Roughly doubles the wait on exactly the turns where someone is waiting to decide.",
-        "why_not_obvious": "The delay lands hardest on the moments a person is least willing to wait, so the check invites being switched off."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "8885d507-85ac-4252-9b7e-0b36794bc782",
+      "asked_on": "2026-08-18",
+      "question": "Where should the model-judged structure review run: every decision reply, tickets only, or advisory everywhere?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C"
+      ],
+      "chosen": "C",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Advisory first is reversible and gathers the firing rate needed to choose blocking later.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Advisory first is reversible and gathers the firing rate needed to choose blocking later.",
+        "on": "2026-10-14",
+        "next": "Build C: the model-judged structure review runs everywhere as advisory.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether the model-judged review runs on every decision-bearing reply, only on tickets, or always but advisory without blocking."
+        }
       },
-      {
-        "key": "B",
-        "label": "Run on tickets only",
-        "what_changes": "Only tickets presented as ready to decide are reviewed; ordinary replies are untouched.",
-        "benefit": "Costs nothing on interactive turns and covers the longest documents.",
-        "cost": "Decision content delivered in conversation stays entirely unchecked.",
-        "why_not_obvious": "Most decisions are put to a person in a reply rather than a ticket, so the common path is the uncovered one."
-      },
-      {
-        "key": "C",
-        "label": "Advisory everywhere",
-        "what_changes": "The review runs on all decision content and reports findings without blocking anything.",
-        "benefit": "Shows how often the check would fire before anyone commits to enforcing it.",
-        "cost": "Findings nobody must act on are routinely ignored, so bad structure still ships.",
-        "why_not_obvious": "A check that never blocks produces no evidence that its findings were worth acting on."
+      "snapshot": {
+        "mode": "single",
+        "question": "Where should the model-judged structure review run: every decision reply, tickets only, or advisory everywhere?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Run on every decision reply",
+            "what_changes": "Any reply that carries a decision is reviewed for structure before it reaches the reader, and blocks on failure.",
+            "benefit": "Every piece of decision content a person reads has been checked for structure.",
+            "cost": "Roughly doubles the wait on exactly the turns where someone is waiting to decide.",
+            "why_not_obvious": "The delay lands hardest on the moments a person is least willing to wait, so the check invites being switched off."
+          },
+          {
+            "key": "B",
+            "label": "Run on tickets only",
+            "what_changes": "Only tickets presented as ready to decide are reviewed; ordinary replies are untouched.",
+            "benefit": "Costs nothing on interactive turns and covers the longest documents.",
+            "cost": "Decision content delivered in conversation stays entirely unchecked.",
+            "why_not_obvious": "Most decisions are put to a person in a reply rather than a ticket, so the common path is the uncovered one."
+          },
+          {
+            "key": "C",
+            "label": "Advisory everywhere",
+            "what_changes": "The review runs on all decision content and reports findings without blocking anything.",
+            "benefit": "Shows how often the check would fire before anyone commits to enforcing it.",
+            "cost": "Findings nobody must act on are routinely ignored, so bad structure still ships.",
+            "why_not_obvious": "A check that never blocks produces no evidence that its findings were worth acting on."
+          }
+        ],
+        "recommendation": "C",
+        "recommendation_reason": "It gathers the firing rate needed to choose between the other two, and it can be switched to blocking later without rework.",
+        "prerequisite": "Establish how often the review actually fires and how long it adds. If it is rare and fast, running it everywhere stops being expensive."
       }
-    ],
-    "recommendation": "C",
-    "recommendation_reason": "It gathers the firing rate needed to choose between the other two, and it can be switched to blocking later without rework.",
-    "prerequisite": "Establish how often the review actually fires and how long it adds. If it is rare and fast, running it everywhere stops being expensive."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "The repetition detector reports the five and three repeated claims in the source ticket",
     "The same ticket, with repetitions removed, reports clean",
@@ -208,3 +239,6 @@ is gated on it (§ Open decision, options a/b/c — recommend (c) advisory-first
 **Left for the user's open decision:** whether Layer 2 runs always / tickets-only / advisory, and
 whether Layer 1 becomes a `docs:fresh`-style board blessing on decision-bearing tickets. No hook wiring
 done. An independent clean-room verify of the FP characterisation is recommended before any enforcement.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: C. Why: Advisory first is reversible and gathers the firing rate needed to choose blocking later. Next: Build C: the model-judged structure review runs everywhere as advisory. You can reopen this decision from the ticket view.

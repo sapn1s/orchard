@@ -505,3 +505,6 @@ The suspect is a suite or an `onboard.mjs` that concurrent FEAT-106 lanes were e
 
 ### 2026-10-11 — landed in batch commit (orchestrator triage)
 - Work landed in the 2026-10-11 whole-tree batch commit. Verified state unchanged; this entry records only the git landing. Full batch manifest is in the commit message.
+
+### 2026-10-11 — agent
+- **committed + follow-up:** The r2->r5 guard/chokepoint work and the HOLDS verify were committed in ed92aff. Follow-up: the standing HOLDS verdict (fd7a7f71) was a same-provider Anthropic clean-room run because OpenAI quota was out — re-verify cross-provider (OpenAI) after the Oct 14 quota reset to restore decorrelation.

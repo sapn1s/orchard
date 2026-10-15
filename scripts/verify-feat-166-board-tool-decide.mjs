@@ -122,7 +122,7 @@ async function main() {
   const legacy = require_(all.find((x) => x.p.format === 'legacy') ?? null, 'legacy prose ticket');
   console.log(`  (discovered: fresh=${fresh.id} open-decision=${openDecision.id} answered-before=${answeredBefore.id} done=${doneOne.id} legacy=${legacy.id})`);
 
-  const decideArgs = (id, extra = [], opts = OPTS) => ['decide', '--id', id, '--question', QUESTION,
+  const decideArgs = (id, extra = [], opts = OPTS) => ['decide', '--id', id, '--question', QUESTION, '--decider', 'taste', '--consequence', 'you will read this card every single day',
     ...opts.flatMap((o) => ['--option', o]), '--recommend', 'B', '--why', WHY, '--author', 'worker (fixing r1)', ...extra];
 
   section('1. round-trip on a scratch copy of a real ticket, via the CLI form lanes type');
@@ -172,7 +172,7 @@ async function main() {
     ['decide', '--id', openDecision.id, '--question', QUESTION, ...OPTS.flatMap((o) => ['--option', o]), '--recommend', 'B', '--replace'], 'missing-arg');
   await refuses('option missing its fields', openDecision.id, d2(openDecision.id, ['--replace'], [OPTS[0], 'B=Just a label']), 'bad-options');
   await refuses('question without "?"', openDecision.id,
-    ['decide', '--id', openDecision.id, '--question', 'Pick one', ...OPTS.flatMap((o) => ['--option', o]), '--replace'], 'invalid-ticket');
+    ['decide', '--id', openDecision.id, '--question', 'Pick one', '--decider', 'taste', '--consequence', 'you will read this card every single day', ...OPTS.flatMap((o) => ['--option', o]), '--replace'], 'invalid-ticket');
   await refuses('open undecided decision, no --replace (real hand-written one)', openDecision.id, d2(openDecision.id), 'open-decision');
   await refuses('open undecided decision, no --replace (one this tool wrote)', fresh.id, d2(fresh.id), 'open-decision');
   await refuses('author that would forge a user answer', fresh.id, [...d2(fresh.id, ['--replace']).filter((a, i, arr) => !(a === '--author' || arr[i - 1] === '--author')), '--author', 'you (answer via ticket view)'], 'bad-author');

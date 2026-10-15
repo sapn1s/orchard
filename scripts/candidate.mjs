@@ -5,6 +5,8 @@
  *   claim   --id T --files a b …                 at lane start: own these files, record their pre-lane bytes
  *   freeze  --id T --files a b … [--check "<cmd>"]… [--depends-on U]… [--accept-foreign f]… [--round n] [--note s]
  *                                                 at fix-handoff: the immutable, hashed candidate
+ *   mixed   --id T [--files a b …]               MIXED-STATE freeze: the files as they sit in the shared tree, other
+ *                                                 tickets' hunks included and disclosed; NO claim, never refused for ownership
  *   integrate <T|H>… | --all                      after HEAD moved: run the recorded checks on the EXACT tree each commit would make
  *   status  [--id T | --candidate H]              CURRENT / CHANGED / REVERTED / STALE-BASE per file (only CURRENT keeps a verdict)
  *   ready                                         every open candidate: READY or why not, and the command
@@ -18,10 +20,12 @@
  */
 import * as path from 'node:path';
 import * as fs from 'node:fs';
+import { warnIfLaneWorkLost } from './lib/lane-snapshot.mjs';
 import {
   claimFiles, freezeCandidate, candidateStatus, readiness, commitCandidate, releaseTicket,
   loadCandidate, repoInfo, allTicketStates, resolveRef, CandidateError, TICKET_RE,
   integrateCandidate, reconcileCommitted, membersOf, foreignReport, recordForeignFound,
+  freezeMixed,
 } from './lib/candidate-store.mjs';
 
 const argv = process.argv.slice(2);
@@ -53,7 +57,7 @@ for (let i = 1; i < argv.length; i++) {
 const repo = path.resolve(flags.repo || process.cwd());
 
 function usage(msg) {
-  process.stderr.write(`candidate: ${msg}\n${fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(2, 16).map((l) => l.replace(/^ \* ?/, '')).join('\n')}\n`);
+  process.stderr.write(`candidate: ${msg}\n${fs.readFileSync(new URL(import.meta.url), 'utf8').split('\n').slice(2, 18).map((l) => l.replace(/^ \* ?/, '')).join('\n')}\n`);
   process.exit(2);
 }
 const short = (h) => (h ? h.slice(0, 12) : '—');
@@ -73,6 +77,8 @@ async function main() {
     }
     case 'freeze': {
       if (!flags.id) usage('freeze needs --id');
+      // FEAT-176: freezing a file that lost a finished lane's lines would freeze the loss.
+      try { warnIfLaneWorkLost({ top: repoInfo(repo).top, paths: flags.files?.length ? flags.files : null }); } catch { /* warning only */ }
       const m = freezeCandidate({ repo, id: flags.id, files: flags.files, dependsOn: flags.dependsOn, acceptForeign: flags.acceptForeign, checks: flags.checks, round: Number.isFinite(flags.round) ? flags.round : null, note: flags.note ?? null });
       if (flags.json) { console.log(JSON.stringify(m, null, 2)); return; }
       console.log(`FROZEN ${m.ticket} candidate ${m.hash}`);
@@ -82,7 +88,18 @@ async function main() {
       if (m.deps.length) console.log(`  GROUP: ${membersOf(m).join(' + ')} are verified and committed together; each needs a HOLDS bound to this hash`);
       if (!m.checks.length) console.log('  note: no --check recorded, so this candidate cannot be integration-checked if HEAD moves before it is committed');
       if (m.meta.unchangedFiles.length) console.log(`  note: identical to HEAD: ${m.meta.unchangedFiles.join(', ')}`);
-      console.log(`\nVerify exactly this: node scripts/independent-verify.mjs --candidate ${m.hash} --requirement … --run …`);
+      console.log(`\nVerify it: node scripts/independent-verify.mjs --ticket ${m.ticket} --requirement … --run …  (uses this candidate while its files are current)`);
+      return;
+    }
+    case 'mixed': {
+      if (!flags.id) usage('mixed needs --id');
+      const m = freezeMixed({ repo, id: flags.id, files: flags.files, why: flags.why ?? null });
+      if (flags.json) { console.log(JSON.stringify(m, null, 2)); return; }
+      console.log(`FROZEN ${m.ticket} MIXED-STATE candidate ${m.hash}`);
+      console.log(`  base ${short(m.base)}  room tree ${short(m.roomTree)}  ${m.files.length} file(s); no ownership taken`);
+      for (const f of m.disclosure.files) console.log(`  ${f.path}: ${f.hunks} hunk(s), ${f.unattributed} unattributed${f.claimants.length ? `, claimed by ${f.claimants.join(', ')}` : ''}`);
+      for (const h of m.disclosure.hunks) console.log(`    ${h.class.padEnd(7)} ${h.path} +${h.newStart},${h.newLen}  ${h.owners.join(', ') || 'owner unknown'} — ${h.basis}`);
+      console.log(`\nVerify it: node scripts/independent-verify.mjs --ticket ${m.ticket} --mixed --requirement … --run …  (or --candidate ${m.hash} for exactly these bytes)`);
       return;
     }
     case 'status': {
@@ -125,6 +142,7 @@ async function main() {
     case 'commit': {
       const ref = flags.positional[0] || flags.id || flags.candidate;
       if (!ref) usage('commit needs a ticket id or candidate hash');
+      try { warnIfLaneWorkLost({ top: repoInfo(repo).top }); } catch { /* FEAT-176: warning only */ }
       const r = await commitCandidate({ repo, ref, message: flags.message ?? null });
       console.log(`COMMITTED ${r.members.join(' + ')} as ${r.commit.slice(0, 12)} (${r.paths.length} file(s): ${r.paths.join(', ')})`);
       for (const n of r.notes) console.log(`  note: ${n}`);

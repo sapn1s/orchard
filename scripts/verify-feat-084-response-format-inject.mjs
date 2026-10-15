@@ -188,10 +188,14 @@ async function main() {
   // orchestrator cannot Read a lane's scratch file, so the handoff IS the only channel,
   // and a cleanup pass that overwrites it cost two extra resumes (measured) — paying
   // ~200 bytes here to stop that is the trade. Raised to 6200, and the maxChars cap to
-  // 6400 (templates.ts) so the core is still delivered whole. Growing past this is a
+  // 6400 (templates.ts) so the core is still delivered whole. The ask-subject gate
+  // added `about:` to the orchard-ask line (+~83, observed 6277; the core was at
+  // 6194/6200 before it): an ask about the agent's own round idled one session ~420 min
+  // (20ed61fc), and the subject codes must reach the session that writes the ask.
+  // Raised to 6300, still under the 6400 cap. Growing past this is a
   // decision, not an accident.
   check('responseFormatSection() (default path) reads it, stays condensed (marked core only)',
-    typeof realSec === 'string' && realSec.length > 300 && realSec.length <= 6200
+    typeof realSec === 'string' && realSec.length > 300 && realSec.length <= 6300
       && realSec.length < 6400
       && realSec.includes('orchard-digest') && !realSec.includes('How it degrades (the UI contract)'),
     `len=${realSec?.length}`);

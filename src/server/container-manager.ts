@@ -35,12 +35,12 @@ import type { Readable, Writable } from 'node:stream';
 import { projectRoot, ensureDir, dataDir } from '../lib/paths.ts';
 import type { Project, Mount, ContainerSettings } from './registry.ts';
 import { containerSettingsOf, browserSettingsOf, toolSettingsOf } from './registry.ts';
-// FEAT-145 step 6 — the account layer. `applyGlobalDefaults` is the shared
-// machine→project merge (agent-bridge's `pickOverridable` is the other caller);
-// `resolveAccountDir` is the sole id→dir authority (ARCH-010) and
+// FEAT-145 step 6 — the account layer. The account is decided by launch-account.ts
+// `effectiveLaunchAccount` (BUG-255 r4, the one authority; its container branch is the
+// machine→project merge); `resolveAccountDir` is the sole id→dir authority (ARCH-010) and
 // `resolveLaunchAccountDir` the sole "may a launch use this account" gate.
-import { applyGlobalDefaults } from './global-settings.ts';
 import { AccountError, DEFAULT_ACCOUNT_ID, resolveAccountDir, resolveLaunchAccountDir } from './claude-accounts.ts';
+import { effectiveLaunchAccount } from './launch-account.ts';
 import { provisionHash, recipeHash, serenaPin, type ProvisionState } from './provisioning.ts';
 // FEAT-157 — the release catalog, the pin and the ONE target policy (security floor included).
 import * as baseRel from './base-releases.ts';
@@ -61,6 +61,9 @@ import { ensureServices, connectSessionToServices, teardownServices, orphanServi
 import { LABEL_OWNER, ownerKey, ownerLabelArgs, ownershipOf, mayActOn, type Ownership } from './instance-owner.ts';
 import { available as browserAvailable, browserBinds, containerEnv as browserContainerEnv, socketPath as browserSocketPath, stateHome as browserStateHome, CONTAINER_MCP_DIR } from './browser.ts';
 import { dispatchBinds, dispatchSocketPath, dispatchStateHome, CONTAINER_DISPATCH_DIR, CONTAINER_DISPATCH_SOCKET_DIR } from './dispatch-broker.ts';
+import { normalizeGitWrite } from '../../scripts/lib/agent-git-policy.mjs';
+import { bindingHolds, grantCoversTarget, repoIdentityOf } from '../../scripts/lib/repo-identity.mjs';
+import { timedGrantView as storeTimedGrantView } from '../../scripts/lib/git-grant-store.mjs';
 
 /* --------------------------------------------------------------- constants */
 
@@ -1052,12 +1055,9 @@ function hostUidGid(): { uid: number; gid: number } {
  * `null` means the implicit default account (`~/.claude`).
  */
 export function containerAccountId(project: Project): string | null {
-  const s = (project.settings ?? {}) as Partial<Project['settings']>;
-  return applyGlobalDefaults({
-    model: s.model ?? null,
-    effort: s.effort ?? null,
-    claudeAccount: s.claudeAccount ?? null,
-  }).claudeAccount;
+  // BUG-255 r4 — decided by the one launch-account authority (its container branch), so the
+  // credential bind and every session's declared/launched account cannot diverge.
+  return effectiveLaunchAccount({ sessionId: null }, { settings: project.settings, isolation: 'container' });
 }
 
 /**
@@ -1155,21 +1155,24 @@ export interface BindSpec {
  * refuses the write (EROFS) however it was spawned. Docker orders mounts by destination,
  * so the nested overlay applies over its rw parent whatever the list order.
  *
- * THE SWITCH is the FEAT-164 PERMANENT grant only (`settings.gitWrite.permanent`): a
+ * THE SWITCH is the FEAT-164 PERMANENT grant (`settings.gitWrite.permanent`): a
  * project-scope fact declared in the registry, which no container can reach, so it is a
  * safe drift-oracle input (the same rule that keeps accounts and mounts project-scope).
- * A granted project's bind list is byte-identical to before. Timed/once grants live in
- * host memory and expire; a bind cannot follow that clock without recreating containers
- * under live sessions, so in a container project they still pass the host hook but the
- * in-container write fails "Read-only file system". The ORCHARD_ALLOW_GIT_WRITE hatch is
+ * A granted project's bind list is byte-identical to before. FEAT-175 adds a live
+ * DURATION grant (host memory, read through `setTimedGrantSource`; see `gitGuardOn`):
+ * grant-rebuild.ts follows its clock by recreating the container once no session is
+ * working. A ONCE grant still cannot reach a container (a mount cannot express "one
+ * write"): it passes the host hook, but the in-container write fails "Read-only file
+ * system". The ORCHARD_ALLOW_GIT_WRITE hatch is
  * deliberately NOT an input: it is a per-process env, and the drift oracle must not flip
  * with whichever process happens to evaluate it.
  *
- * DRIFT: a guard difference is its own `gitguard:` reason and is INFORMATIONAL ONLY:
+ * DRIFT: a guard difference is its own `gitguard:` reason and is INFORMATIONAL ONLY here:
  * `doEnsure` never recreates, defers or refuses for it, idle or not (BUG-214 class — the
  * change itself must never cost a live session its container, nor a container its writable
- * layer). The overlay applies whenever the container is next created anyway: none exists,
- * another drift reason recreates it, or the user presses Rebuild. Non-git projects and
+ * layer). The overlay applies whenever the container is next created: none exists, another
+ * drift reason recreates it, the user presses Rebuild, or (FEAT-175) the grant reconciler
+ * recreates it after a grant change once every session of the project is idle. Non-git projects and
  * granted repos produce no guard bind at all, so their bind lists are unchanged.
  *
  * Reach: repos at a rw bind root or one level below it, every alias through which a rw bind
@@ -1181,10 +1184,92 @@ export interface BindSpec {
 export const GIT_GUARD_WHY = 'real repo .git (read-only: no permanent git-write grant)';
 const GIT_GUARD_LABEL = 'claude-station.git-guard';
 
-/** BUG-244 — is the read-only .git guard on for this project? Off only under the permanent grant. */
-export function gitGuardOn(project: Pick<Project, 'settings'>): boolean {
-  const g = (project.settings as { gitWrite?: { permanent?: unknown } | null } | undefined)?.gitWrite;
-  return !(g && typeof g === 'object' && g.permanent === true);
+/*
+ * FEAT-175 — TIMED/ONCE GRANTS NOW SWITCH THE GUARD TOO. BUG-244 kept them out because a bind cannot
+ * follow an expiring clock without recreating containers under live sessions. FEAT-175's reconciler
+ * (grant-rebuild.ts) is what follows the clock: it recreates the container only once no session of the
+ * project has work in flight, and holds new turns meanwhile. The timed half is read through a source the
+ * SERVER registers (index.ts -> the git-grant store's `grantView`, read-only). With no source registered
+ * (the lifecycle harness, any other process) only the permanent grant counts: fail closed to read-only.
+ * The source is host memory the container cannot reach, so it is a safe drift-oracle input, like the
+ * permanent setting. A container whose binds were computed while any timed grant was live carries
+ * `claude-station.git-write-timed` (the ids), because every timed grant dies with the server process and
+ * the reconciler must re-check that container at boot.
+ */
+let timedGrantSource: ((projectId: string) => boolean) | null = null;
+/** FEAT-175 — register (or clear) the reader of live timed/once git-write grants. */
+export function setTimedGrantSource(fn: ((projectId: string) => boolean) | null): void {
+  timedGrantSource = typeof fn === 'function' ? fn : null;
+}
+/** Does a live timed/once grant unlock this project now? Never throws; no source = no. */
+export function timedGrantLive(projectId: string | undefined): boolean {
+  if (!timedGrantSource || !projectId) return false;
+  try { return timedGrantSource(projectId) === true; } catch { return false; }
+}
+export const GIT_WRITE_TIMED_LABEL = 'claude-station.git-write-timed';
+/** FEAT-164 single authority — the repo identity a live timed grant was given for (index.ts registers the
+ * store's view). No source = null = the timed grant covers no repo in a container (fail closed). */
+let timedGrantBindingSource: ((projectId: string) => unknown) | null = null;
+export function setTimedGrantBindingSource(fn: ((projectId: string) => unknown) | null): void {
+  timedGrantBindingSource = typeof fn === 'function' ? fn : null;
+}
+/** The identity the grant that opens this project's container was given for (standing first), or null. */
+function containerGrantBinding(project: Pick<Project, 'settings'> & { id?: string; hostPath?: string }): unknown {
+  if (standingGitWriteOpen(project)) return (project.settings as { gitWrite?: { repo?: unknown } | null } | undefined)?.gitWrite?.repo ?? null;
+  if (timedGrantLive(project.id) && project.id) {
+    // Default: the grant store's own record (the same module instance the server's grant routes write).
+    const src = timedGrantBindingSource ?? ((id: string) => storeTimedGrantView(id)?.repo ?? null);
+    try { return src(project.id) ?? null; } catch { return null; }
+  }
+  return null;
+}
+/** The `gitguard:` reason that LOOSENS the container (an overlay present but no longer wanted). */
+const GUARD_UNWANTED_PREFIX = 'gitguard: read-only .git overlay no longer wanted';
+
+/*
+ * FEAT-175 r2 (REDESIGN after IV 01a12c66) — THE ACTUAL .git MODE IS A DECLARED FACT, NOT AN INFERENCE.
+ * Every container create writes `claude-station.git-mode=ro|rw` (the gitGuardOn answer its binds were computed
+ * from) and reports it SYNCHRONOUSLY through `onContainerGitMode` once the container exists under its final name.
+ * The reconciler compares that with the DESIRED mode (gitGuardOn now) — level-based, no change detection.
+ */
+export type GitMode = 'ro' | 'rw';
+export const GIT_MODE_LABEL = 'claude-station.git-mode';
+let gitModeHook: ((projectId: string, mode: GitMode) => void) | null = null;
+/** FEAT-175 — register the synchronous receiver of "this project's container now exists with this .git mode". */
+export function onContainerGitMode(fn: ((projectId: string, mode: GitMode) => void) | null): void { gitModeHook = typeof fn === 'function' ? fn : null; }
+/** container name → the mode its create args declared (read back when it takes its final name). */
+const createdGitMode = new Map<string, GitMode>();
+function reportGitMode(projectId: string, createdName: string): void {
+  const m = createdGitMode.get(createdName);
+  createdGitMode.delete(createdName);
+  if (m && gitModeHook) { try { gitModeHook(projectId, m); } catch { /* the reconciler re-reads */ } }
+}
+/** The desired .git mode of a project's container now (throws if the project's settings cannot be read). */
+export function desiredGitMode(project: Pick<Project, 'settings'> & { id?: string }): GitMode {
+  return gitGuardOn(project) ? 'ro' : 'rw';
+}
+
+/** BUG-244 — is the read-only .git guard on for this project? Off under the permanent grant, or (FEAT-175)
+ * a live timed/once grant when the server registered the timed source. */
+export function gitGuardOn(project: Pick<Project, 'settings'> & { id?: string }): boolean {
+  if (standingGitWriteOpen(project)) return false;
+  return !timedGrantLive(project.id);
+}
+
+/**
+ * FEAT-164 (applied by FEAT-175 at FEAT-164's request, verify adb2b039 P4) — the STANDING grant opens a
+ * container's real .git only in mode `scoped` (commit granted with a user scope note; a migrated legacy grant
+ * reads through the same normaliser). Release mode — including the legacy `{permanent:true}` — keeps it
+ * read-only, because releases are cut on the host. The ONE rule: `normalizeGitWrite(...).mode === 'scoped'`.
+ * grant-rebuild's fingerprint calls this same function, so a rebuild fires exactly when this answer flips.
+ */
+export function standingGitWriteOpen(project: Pick<Project, 'settings'> & { hostPath?: string }): boolean {
+  const gw = (project.settings as { gitWrite?: { repo?: unknown } | null } | undefined)?.gitWrite ?? null;
+  if (normalizeGitWrite(gw).mode !== 'scoped') return false;
+  // FEAT-164 grant binding: a grant sealed by the writer carries `repo` (every stored one
+  // does); it opens the .git only while the project's path still resolves to that repo.
+  if (gw && gw.repo !== undefined && !bindingHolds(gw.repo, project.hostPath)) return false;
+  return true;
 }
 
 function parseGitGuardLabel(v: unknown): string[] {
@@ -1302,6 +1387,79 @@ function gitDirsUsedBy(folder: string): { direct: string[]; indirect: string[] }
   return { direct: [...direct], indirect: [...indirect] };
 }
 
+/*
+ * FEAT-164 (verify 1659cb7f) — the guard's OWN discovery is a capped walk, not depth 1: every repo work tree
+ * (a `.git` dir, symlink or gitfile) and every bare repo up to GIT_GUARD_MAX_DEPTH below a rw bind root, within
+ * GIT_GUARD_MAX_DIRS directories. The walk is PRUNED (verify 6efa2e34: an ordinary node_modules deeper than the
+ * cap truncated every JS project's discovery, so a granted container lost its writable .git): a directory named
+ * in GIT_GUARD_PRUNE_DIRS is itself still checked (a repo AT `dist/` or `vendor/` is found and overlaid) but its
+ * contents are not walked, and they count toward neither cap. That list is bounded and fixed: package-manager
+ * trees, vendored dependency trees, and build/cache output, where a nested repo is a dependency's checkout
+ * rather than the user's. RESIDUAL (recorded): a repo nested INSIDE one of them is not overlaid.
+ * When either cap is hit the walk is TRUNCATED: a nested repo it did not reach cannot be proven absent, so the
+ * project's grant is NOT applied in the container (fail closed: every reached .git, the granted one included,
+ * stays read-only) and the plan says so (`gitGuardDiscoveryOf`). Results are cached briefly per root: the walk
+ * is also the drift oracle's input.
+ */
+export const GIT_GUARD_MAX_DEPTH = 8;
+/** Directories whose CONTENTS the guard's walk does not descend (the directory itself is still checked). */
+export const GIT_GUARD_PRUNE_DIRS: ReadonlySet<string> = new Set([
+  // package-manager trees
+  'node_modules', 'bower_components', 'jspm_packages', '.pnpm-store', '.yarn',
+  // vendored dependency trees
+  'vendor', 'Pods', 'Carthage',
+  // virtualenvs and language caches
+  '.venv', 'venv', '__pycache__', '.tox', '.nox', '.mypy_cache', '.pytest_cache', '.ruff_cache', '.gradle', '.m2', '.cargo',
+  // build / bundler / framework output and caches
+  'target', 'dist', 'build', 'out', '.next', '.nuxt', '.svelte-kit', '.turbo', '.parcel-cache', '.cache', '.angular', 'coverage', '.terraform',
+]);
+export const GIT_GUARD_MAX_DIRS = 20_000;
+const DISCOVERY_CACHE_MS = 30_000;
+interface Discovery { repos: string[]; bares: string[]; truncated: string | null }
+const discoveryCache = new Map<string, { at: number; d: Discovery }>();
+let discoveryLimits: { maxDepth: number; maxDirs: number } = { maxDepth: GIT_GUARD_MAX_DEPTH, maxDirs: GIT_GUARD_MAX_DIRS };
+/** TEST-ONLY: clear the walk cache, optionally with smaller caps (to prove truncation fails closed). */
+export function _setGitGuardDiscoveryForTest(limits: { maxDepth?: number; maxDirs?: number } | null): void {
+  discoveryCache.clear();
+  discoveryLimits = { maxDepth: limits?.maxDepth ?? GIT_GUARD_MAX_DEPTH, maxDirs: limits?.maxDirs ?? GIT_GUARD_MAX_DIRS };
+}
+function discoverReposUnder(hostRoot: string): Discovery {
+  const { maxDepth, maxDirs } = discoveryLimits;
+  const ck = `${hostRoot}\0${maxDepth}\0${maxDirs}`;
+  const hit = discoveryCache.get(ck);
+  if (hit && Date.now() - hit.at < DISCOVERY_CACHE_MS) return hit.d;
+  const repos: string[] = [], bares: string[] = [];
+  let truncated: string | null = null, seen = 0;
+  const hasDotGit = (d: string) => { try { fs.lstatSync(path.join(d, '.git')); return true; } catch { return false; } };
+  const queue: Array<[string, number, boolean]> = [[hostRoot, 0, false]];
+  while (queue.length) {
+    const [d, depth, pruned] = queue.shift()!;
+    if (++seen > maxDirs) { truncated = `more than ${maxDirs} directories under ${hostRoot}`; break; }
+    if (hasDotGit(d)) repos.push(d);
+    else if (isGitDirItself(d)) { bares.push(d); continue; }
+    if (pruned) continue;                                       // a GIT_GUARD_PRUNE_DIRS entry: checked, not walked
+    let ents: fs.Dirent[] = [];
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+      // Symlinked dirs are not followed: a bind does not expose the target's own .git through them as a nested dir.
+      if (!e.isDirectory() || NESTED_REPO_SKIP.has(e.name)) continue;
+      const prune = GIT_GUARD_PRUNE_DIRS.has(e.name);
+      if (depth + 1 > maxDepth) { truncated = truncated ?? `directories deeper than ${maxDepth} levels under ${hostRoot}`; continue; }
+      queue.push([path.join(d, e.name), depth + 1, prune]);
+    }
+  }
+  const out: Discovery = { repos, bares, truncated };
+  discoveryCache.set(ck, { at: Date.now(), d: out });
+  return out;
+}
+/** The plan's account of the guard's discovery for a project (FEAT-164): did it reach every nested repo? */
+export interface GitGuardDiscovery { maxDepth: number; maxDirs: number; truncated: string[]; grantApplied: boolean }
+const discoveryReport = new Map<string, GitGuardDiscovery>();
+export function gitGuardDiscoveryOf(project: Project): GitGuardDiscovery | null {
+  desiredBinds(project);
+  return discoveryReport.get(project.id) ?? null;
+}
+
 /** Repo work trees a bind root exposes: the root itself and its direct child directories (depth 1). */
 function repoRootsUnder(hostRoot: string): string[] {
   const out: string[] = [];
@@ -1337,8 +1495,13 @@ function ownerRootOf(gitDir: string, referencedFrom: string): string {
  * enclosing monorepo, linked-worktree commondir, submodule gitdir, bare repo). P's grant is never Q's
  * grant. An unreadable registry reads as "not granted" (fail closed to read-only).
  */
-function repoWriteGranted(project: Project, gitDir: string, owners: string[], usedBy: () => UsedBy): boolean {
+function repoWriteGranted(project: Project, gitDir: string, owners: string[], usedBy: () => UsedBy, target: unknown, discoveryComplete: boolean): boolean {
   if (gitGuardOn(project)) return false;
+  // FEAT-164 (verify 1659cb7f): fail closed when discovery could not reach everything under the binds.
+  if (!discoveryComplete) return false;
+  // THE single authority: the grant covers only the repository it was given for. An unregistered repo nested
+  // anywhere under a granted bind root (a submodule, a vendored checkout) is another repository → read-only.
+  if (!grantCoversTarget(containerGrantBinding(project), target as never)) return false;
   let u: UsedBy;
   try { u = usedBy(); } catch { return false; }
   // DIRECT users (the repo's own work tree, a subfolder of it, a linked worktree of it) decide first: any
@@ -1417,16 +1580,21 @@ function gitGuardBinds(project: Project, binds: BindSpec[]): BindSpec[] {
     return (usedCache = { self: { folder: self, direct: self ? gitDirsUsedBy(self).direct : [] }, others });
   };
   const guarded = new Set<string>();
-  for (const r of rw) {
-    for (const repo of repoRootsUnder(r.host)) {
+  const found = rw.map((r) => ({ r, d: discoverReposUnder(r.host) }));
+  const truncated = found.map((f) => f.d.truncated).filter((x): x is string => !!x);
+  const complete = truncated.length === 0;
+  discoveryReport.set(project.id, { maxDepth: discoveryLimits.maxDepth, maxDirs: discoveryLimits.maxDirs, truncated, grantApplied: !gitGuardOn(project) && complete });
+  for (const { d } of found) {
+    for (const repo of d.repos) {
       let repoReal = repo;
       try { repoReal = fs.realpathSync(repo); } catch { /* keep as found */ }
+      const target = repoIdentityOf(repoReal);
       for (const gd of gitDirsOf(repo)) {
-        if (!repoWriteGranted(project, gd, [ownerRootOf(gd, repoReal), repoReal], usedBy)) guarded.add(gd);
+        if (!repoWriteGranted(project, gd, [ownerRootOf(gd, repoReal), repoReal], usedBy, target, complete)) guarded.add(gd);
       }
     }
-    for (const bare of bareReposUnder(r.host)) {
-      if (!repoWriteGranted(project, bare, [bare], usedBy)) guarded.add(bare);
+    for (const bare of d.bares) {
+      if (!repoWriteGranted(project, bare, [bare], usedBy, repoIdentityOf(bare), complete)) guarded.add(bare);
     }
   }
   /*
@@ -1827,6 +1995,12 @@ interface Inspected {
   cmd: string[];
   /** BUG-244 — container paths of the read-only .git overlays it was created with (label); [] when none/unlabelled. */
   gitGuard: string[];
+  /** FEAT-175: the container carries the git-guard label (created by post-BUG-244 code). */
+  hasGitGuardLabel: boolean;
+  /** FEAT-175: project ids whose timed grant was live when this container was created ([] = none). */
+  gitWriteTimed: string[];
+  /** FEAT-175 r2: the declared .git mode label ('' when the container predates it). */
+  gitMode: string;
 }
 
 function inspect(name: string): Inspected | null {
@@ -1865,6 +2039,9 @@ function inspect(name: string): Inspected | null {
     entrypoint: ((j.Config?.Entrypoint ?? []) as unknown[]).map(String),
     cmd: ((j.Config?.Cmd ?? []) as unknown[]).map(String),
     gitGuard: parseGitGuardLabel(j.Config?.Labels?.[GIT_GUARD_LABEL]),
+    hasGitGuardLabel: typeof j.Config?.Labels?.[GIT_GUARD_LABEL] === 'string',
+    gitWriteTimed: parseGitGuardLabel(j.Config?.Labels?.[GIT_WRITE_TIMED_LABEL]),
+    gitMode: String(j.Config?.Labels?.[GIT_MODE_LABEL] ?? ''),
   };
 }
 
@@ -2011,7 +2188,7 @@ function driftReasons(project: Project, live: Inspected, useImage?: string): str
     const missing = [...wantGuard.filter((b) => !gotGuard.includes(b)), ...guardMissing];
     const extra = [...gotGuard.filter((b) => !wantGuard.includes(b)), ...guardExtra];
     if (missing.length) out.push(`gitguard: the real repo .git is writable in this container (no permanent git-write grant); read-only overlay missing: ${missing.join(', ')}`);
-    if (extra.length) out.push(`gitguard: read-only .git overlay no longer wanted (permanent git-write grant, or the repo moved): ${extra.join(', ')}`);
+    if (extra.length) out.push(`${GUARD_UNWANTED_PREFIX} (git-write grant, or the repo moved): ${extra.join(', ')}`);
     /*
      * BUG-244 IV r3 (BUG-136 class): STARTING a stopped container whose overlay source is gone makes the
      * daemon recreate that source as a ROOT-OWNED directory in the user's tree. So for a stopped container
@@ -2154,11 +2331,22 @@ function lockdownCreateArgs(): string[] {
  *  - a host path that does not exist right now is NOT reported. The stealth
  *    browser's socket comes and goes with its daemon, and flagging its absence
  *    would recreate the container on a schedule set by something unrelated.
- *  - any docker/stat surprise degrades to "no drift found", never to a spurious
- *    recreate: this check may only ever add a reason it can prove.
+ *  - any docker/stat surprise degrades to UNKNOWN (never a spurious recreate):
+ *    `staleFileBinds` below returns ONLY the proven-stale reasons, so the
+ *    doEnsure recreate path can act only on a mismatch it proved; an unprovable
+ *    bind is reported separately as UNKNOWN (BUG-254 r4) so the FEAT-175 idle
+ *    reconciler can KEEP RETRYING it rather than treating a probe hiccup as
+ *    "clean" and leaving a real stale bind (and its expired-auth failures) in
+ *    place. A partial probe PRESERVES the mismatches it did prove.
  */
-function staleFileBinds(project: Project, live: Inspected): string[] {
-  if (!live.running) return [];
+interface FileBindProbe {
+  /** Proven host↔container inode mismatches — safe to recreate on. */
+  stale: string[];
+  /** Binds the probe could not read inside the container — unproven either way. */
+  unknown: string[];
+}
+function probeFileBinds(project: Project, live: Inspected): FileBindProbe {
+  if (!live.running) return { stale: [], unknown: [] };
   const files: { hostPath: string; containerPath: string; why: string; ino: string }[] = [];
   for (const b of desiredBinds(project)) {
     let st: fs.Stats;
@@ -2170,12 +2358,16 @@ function staleFileBinds(project: Project, live: Inspected): string[] {
     if (st.isDirectory()) continue;
     files.push({ hostPath: b.hostPath, containerPath: b.containerPath, why: b.why, ino: String(st.ino) });
   }
-  if (!files.length) return [];
+  if (!files.length) return { stale: [], unknown: [] };
+  const unknownReason = (f: { hostPath: string; why: string }) =>
+    `file bind ${f.hostPath} (${f.why}): could not be read inside the running container to check it is the current host file`;
   let r: RunResult;
   try {
     r = lifecycle.withProbe(() => dockerSync(['exec', containerName(project.id), 'stat', '-c', '%i %n', ...files.map((f) => f.containerPath)], 10_000));
   } catch {
-    return [];
+    // The whole probe could not run (docker/exec surprise): every bind is UNKNOWN,
+    // not "clean". The reconciler retries; it never recreates on an unknown.
+    return { stale: [], unknown: files.map(unknownReason) };
   }
   // `stat` reports what it can and exits non-zero for the rest, so the exit code
   // is not consulted — only the lines it actually produced.
@@ -2184,18 +2376,51 @@ function staleFileBinds(project: Project, live: Inspected): string[] {
     const m = /^(\d+) (.+)$/.exec(line.trim());
     if (m) inside.set(m[2]!, m[1]!);
   }
-  const out: string[] = [];
+  const stale: string[] = [];
+  const unknown: string[] = [];
   for (const f of files) {
     const got = inside.get(f.containerPath);
-    if (got === undefined) continue; // could not be read inside — unproven, so not a reason
+    if (got === undefined) { unknown.push(unknownReason(f)); continue; } // could not be read inside — UNKNOWN, retried
     if (got !== f.ino) {
-      out.push(
+      stale.push(
         `stale file bind ${f.hostPath} (${f.why}): the host file has been replaced since this container was created, ` +
           'so the container still holds the old one',
       );
     }
   }
-  return out;
+  return { stale, unknown };
+}
+
+/**
+ * The PROVEN-stale file binds only — what `driftReasons`/`doEnsure` may recreate
+ * on. Unknowns are deliberately excluded here (never a spurious recreate); they
+ * reach the idle reconciler through `credBindDriftOf`.
+ */
+function staleFileBinds(project: Project, live: Inspected): string[] {
+  return probeFileBinds(project, live).stale;
+}
+
+/**
+ * BUG-254 r4 — the project container's single-file (credential) bind drift, for the
+ * FEAT-175 idle reconciler: 'stale' (a proven host↔container inode mismatch — the
+ * account `.credentials.json` was replaced on the host and the running container
+ * still holds the old, frozen inode), 'unknown' (the running container could not
+ * be read to decide — the reconciler keeps RETRYING, never recreates), or 'clean'
+ * (no container to act on, stopped/foreign/none, or every bind current). 'stale'
+ * wins over 'unknown' so a proven drift is always acted on.
+ */
+export function credBindDriftOf(project: Project): 'clean' | 'stale' | 'unknown' {
+  if (project.isolation !== 'container') return 'clean';
+  let live: Inspected | null;
+  try { live = inspect(containerName(project.id)); } catch { return 'unknown'; }
+  if (!live) return 'clean';            // no container — a fresh start binds the current file
+  if (!mayActOn(live.owner)) return 'clean'; // another instance's container is never acted on from here
+  if (!live.running) return 'clean';    // stopped — the next start rebinds the current file
+  let p: FileBindProbe;
+  try { p = probeFileBinds(project, live); } catch { return 'unknown'; }
+  if (p.stale.length) return 'stale';
+  if (p.unknown.length) return 'unknown';
+  return 'clean';
 }
 
 interface CacheEntry {
@@ -2217,6 +2442,60 @@ export function isBuilding(projectId: string): boolean {
 }
 
 /** Live container state. Reads docker, never internal flags. */
+/**
+ * FEAT-175 — the container's read-only .git drift, fresh (never the status cache), for the grant reconciler.
+ * null = no container this server may act on (none, or another instance's). 'error' = docker could not be read
+ * right now: the caller keeps whatever it believed (a pending rebuild is never dropped on a daemon blip).
+ * `reasons` are only the `gitguard:` / `gitguard-lapsed:` ones.
+ */
+export interface GuardDrift {
+  containerId: string;
+  running: boolean;
+  reasons: string[];
+  /** Applying the drift makes the container MORE read-only (an overlay missing or lapsed): new turns are held. */
+  tightens: boolean;
+  hasGitGuardLabel: boolean;
+  gitWriteTimed: string[];
+}
+export function guardDriftOf(project: Project): GuardDrift | null | 'error' {
+  if (project.isolation !== 'container') return null;
+  let live: Inspected | null;
+  try { live = inspect(containerName(project.id)); } catch { return 'error'; }
+  if (!live) return null;
+  if (!mayActOn(live.owner)) return null; // BUG-216: another instance's container is never recreated from here
+  let reasons: string[];
+  try { reasons = driftReasons(project, live); } catch { return 'error'; }
+  const guard = reasons.filter((r) => r.startsWith('gitguard:') || r.startsWith('gitguard-lapsed:'));
+  return {
+    containerId: live.id,
+    running: live.running,
+    reasons: guard,
+    // Anything but "overlay no longer wanted" makes the container more read-only (fail safe: unknown = tightens).
+    tightens: guard.some((r) => !r.startsWith(GUARD_UNWANTED_PREFIX)),
+    hasGitGuardLabel: live.hasGitGuardLabel,
+    gitWriteTimed: live.gitWriteTimed,
+  };
+}
+
+/**
+ * FEAT-175 r2 — the ACTUAL .git mode of the project's container, read from docker: its declared label; for a
+ * container created before the label existed, derived from its guard drift (none → as desired; a missing
+ * overlay → rw; an unwanted one → ro). 'none' = no container this server may act on. 'unknown' = docker or
+ * the drift oracle could not be read — callers fail closed on it.
+ */
+export function actualGitModeOf(project: Project): GitMode | 'none' | 'unknown' {
+  let live: Inspected | null;
+  try { live = inspect(containerName(project.id)); } catch { return 'unknown'; }
+  if (!live) return 'none';
+  if (!mayActOn(live.owner)) return 'none';
+  if (live.gitMode === 'ro' || live.gitMode === 'rw') return live.gitMode;
+  try {
+    const guard = driftReasons(project, live).filter((r) => r.startsWith('gitguard:') || r.startsWith('gitguard-lapsed:'));
+    if (!guard.length) return desiredGitMode(project);
+    return guard.some((r) => !r.startsWith(GUARD_UNWANTED_PREFIX)) ? 'rw' : 'ro';
+  } catch { return 'unknown'; }
+}
+
 export function statusOf(project: Project): ContainerStatus {
   const name = containerName(project.id);
   const cached = statusCache.get(project.id);
@@ -3719,7 +3998,7 @@ export function ensureContainer(project: Project, opts: EnsureOptions & OpReques
  * happen in the project's slot, and the LEASE for `execTag` is granted before the slot is released,
  * so no other operation can run between "the container is ready" and "a session holds it".
  */
-export function admitContainer(project: Project, execTag: string, req: OpRequest = {}): Promise<ContainerStatus> {
+export function admitContainer(project: Project, execTag: string, req: OpRequest = {}): Promise<ContainerStatus & { admittedProject?: Project }> {
   return inOp(project, 'admit', req, async (op, p) => {
     if (p.isolation !== 'container') throw new ContainerError('not-container', `project ${p.id} has isolation "${p.isolation}", not "container"`);
     await ensureServices(p, req.onLog);
@@ -3727,7 +4006,9 @@ export function admitContainer(project: Project, execTag: string, req: OpRequest
     if (st.state !== 'running') throw new ContainerError('not-running', `container ${st.containerName} is "${st.state}" — refusing to start a session on the host instead`);
     connectSessionToServices(p.id, req.onLog);
     lifecycle.grantLease(op, execTag);
-    return st;
+    // BUG-255 r4 — the snapshot this admission bound the credentials from (re-read under the slot), so the
+    // session's launch account is decided against the same project its container runs as.
+    return { ...st, admittedProject: p };
   });
 }
 
@@ -3999,7 +4280,7 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
     for (let i = reasons.length - 1; i >= 0; i--) if (reasons[i]!.startsWith('gitguard:')) reasons.splice(i, 1);
     if (guardPending.length && !reasons.length && !opts.forceRecreate) {
       opts.onLog?.(`[container] ${name}: the read-only .git setting changed (git-write grant, or a repo appeared or moved); ` +
-        'it applies when this container is next created (Rebuild applies it now). Keeping the container as it is.\n');
+        'it applies when this container is next created — after a grant change Orchard recreates it once no session is working (Rebuild applies it now). Keeping the container as it is.\n');
     }
     if (reasons.length || opts.forceRecreate) {
       /*
@@ -4153,6 +4434,18 @@ export function createArgs(project: Project, name: string, image: string, opts: 
   const binds = desiredBinds(project);
   // BUG-244: which binds are the read-only .git overlays, so drift can tell them apart later.
   args.push('--label', `${GIT_GUARD_LABEL}=${JSON.stringify(binds.filter((b) => b.why === GIT_GUARD_WHY).map((b) => b.containerPath))}`);
+  // FEAT-175 r2: the declared .git mode of this container (see GIT_MODE_LABEL).
+  {
+    const gm = desiredGitMode(project);
+    createdGitMode.set(name, gm);
+    args.push('--label', `${GIT_MODE_LABEL}=${gm}`);
+  }
+  // FEAT-175: written ONLY while some timed grant is live, so every other create is byte-identical to before.
+  {
+    let timed: string[] = [];
+    try { timed = timedGrantSource ? listProjects().map((q) => q.id).filter((id) => timedGrantLive(id)) : []; } catch { timed = []; }
+    if (timed.length) args.push('--label', `${GIT_WRITE_TIMED_LABEL}=${JSON.stringify(timed)}`);
+  }
   for (const b of binds) args.push('-v', bindString(b));
   args.push(image);
   args.push(...LOCKDOWN_CMD);
@@ -4164,6 +4457,8 @@ function createAndStart(project: Project, name: string, image: string, opts: Ens
   if (created.code !== 0) {
     throw new ContainerError('create-failed', `could not create ${name}`, (created.stderr || created.stdout).trim().slice(0, 1200));
   }
+  // FEAT-175 r2: it exists now under this name — when that is the project's own name, its mode is a fact.
+  if (name === containerName(project.id)) reportGitMode(project.id, name);
   // BUG-216: start the container this call created (its ID), not whatever holds the name by now.
   const id = created.stdout.trim().split('\n').pop()?.trim() || name;
   const started = dockerSync(['start', id], 60_000);
@@ -4211,6 +4506,7 @@ async function swapContainer(project: Project, name: string, image: string, live
   await removeContainer(name);
   const rn = dockerSync(['rename', next, name], 30_000);
   if (rn.code !== 0) throw new ContainerError('rename-failed', `could not rename ${next} to ${name}`, (rn.stderr || rn.stdout).trim().slice(0, 600));
+  reportGitMode(project.id, next); // FEAT-175 r2: the swapped-in container is now the project's container
   invalidate(project.id);
   const st = assertRunning(project);
   assertCliResolves(project, name, image);
@@ -4325,6 +4621,22 @@ export function rebuildContainer(project: Project, req: OpRequest = {}): Promise
     }
     const st = await ensureInOp(op, now, { onLog: req.onLog, forceRecreate: true });
     try { connectSessionToServices(now.id, req.onLog); } catch (err) { (st as { serviceRejoin?: string }).serviceRejoin = (err as Error).message; }
+    return st;
+  });
+}
+
+/**
+ * FEAT-175 — recreate the container on its CURRENT image with its CURRENT desired binds (the git-write grant
+ * changed), as its own operation in the project's slot. Unlike Rebuild it builds no image. `forceOver` is the
+ * set of leases the caller captured AFTER closing exactly those (idle) sessions; any other lease refuses
+ * (`clearForDestroy`), so a session admitted meanwhile is never destroyed. Throws on refusal or failure.
+ */
+export function recreateContainer(project: Project, req: OpRequest = {}): Promise<ContainerStatus> {
+  return inOp(project, 'rebuild', req, async (op, p) => {
+    if (p.isolation !== 'container') throw new ContainerError('not-container', `project ${p.id} has isolation "${p.isolation}", not "container"`);
+    await clearForDestroy(op, req, 'recreate');
+    const st = await ensureInOp(op, p, { onLog: req.onLog, forceRecreate: true });
+    try { connectSessionToServices(p.id, req.onLog); } catch (err) { (st as { serviceRejoin?: string }).serviceRejoin = (err as Error).message; }
     return st;
   });
 }

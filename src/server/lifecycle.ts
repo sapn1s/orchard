@@ -555,16 +555,29 @@ function authorizeProbe(args: readonly string[]): void {
   const c = pos[0] ? inspectContainer(pos[0]) : null;
   if (!c || c === 'error' || roleOf(c) !== 'session') refuse('probe-scope', 'a probe may only read a session container');
   if (!actable(c)) refuse('foreign-owner', `a probe may only read this instance's session container, not ${c.name}`);
-  const cmd = pos.slice(1);
-  const statOk = cmd[0] === 'stat' && cmd[1] === '-c' && cmd[2] === '%i %n' && cmd.slice(3).every((p) => p.startsWith('/') && !p.includes('\n'));
-  const memOk = cmd.length === 3 && cmd[0] === 'sh' && cmd[1] === '-c' && cmd[2] === MEMORY_PROBE_SCRIPT;
-  // BUG-244: the read-only .git overlay check — access(W_OK) on absolute paths only; writes nothing.
-  // Matched on the RAW argv after the container token (`positionals` drops every `-…` word, including `-c`).
+  // BUG-254 r4 — ALL three fixed probes are matched on the RAW argv after the container token: `positionals`
+  // drops every `-…` word (including the `-c` that `stat -c '%i %n'` and `sh -c <script>` both carry), so
+  // matching the stripped list made statOk/memOk impossible — the inode-identity probe (BUG-136/BUG-254
+  // staleFileBinds) and the memory probe were SILENTLY refused as "not one of the fixed read-only probes" and
+  // their callers degraded to "no drift"/"no reading" (the r2 self-heal miss). guardOk already used `tail`;
+  // statOk and memOk now do too. This narrows, never widens: each still matches one exact command shape.
   const tail = pos[0] ? rest.slice(rest.indexOf(pos[0]) + 1) : [];
+  const statOk = tail.length >= 4 && tail[0] === 'stat' && tail[1] === '-c' && tail[2] === '%i %n'
+    && tail.slice(3).every((p) => p.startsWith('/') && !p.includes('\n'));
+  const memOk = tail.length === 3 && tail[0] === 'sh' && tail[1] === '-c' && tail[2] === MEMORY_PROBE_SCRIPT;
+  // BUG-244: the read-only .git overlay check — access(W_OK) on absolute paths only; writes nothing.
   const guardOk = tail.length >= 5 && tail[0] === 'sh' && tail[1] === '-c' && tail[2] === GIT_GUARD_PROBE_SCRIPT && tail[3] === 'sh'
     && tail.slice(4).every((p) => p.startsWith('/') && !p.includes('\n'));
   if (!statOk && !memOk && !guardOk) refuse('probe-scope', 'not one of the fixed read-only probes');
-  if (rest.some((a) => a === '-u' || a === '--user' || a.startsWith('--user=') || a === '--privileged')) refuse('probe-scope', 'a probe runs as the container default user, unprivileged');
+  // BUG-254 r4 (independent-verify BROKEN, run 90182607): the CONTAINER must be the FIRST token after
+  // `exec` — NO docker flags may precede it. The three fixed probes are always spawned as
+  // `exec <container> <cmd…>`, so this never refuses a real probe; it STRUCTURALLY blocks every spelling
+  // of a privilege flag (`-u root`, `-uroot`, `--user=root`, `--privileged`, `--privileged=true`), which
+  // the earlier allow-then-blocklist missed (a flag after the container breaks the probe shape above and
+  // is already refused; only a flag BEFORE it could slip a different uid/privilege past the gate). The
+  // enumerated blocklist is kept below as defence in depth.
+  if (rest[0] !== pos[0]) refuse('probe-scope', 'a probe must name its container first, with no docker flags (it runs as the container default user, unprivileged)');
+  if (rest.some((a) => a === '-u' || a === '--user' || a.startsWith('--user=') || a.startsWith('-u') || a === '--privileged' || a.startsWith('--privileged'))) refuse('probe-scope', 'a probe runs as the container default user, unprivileged');
 }
 
 /** Run `fn` with the authority of a lease (the session's own exec, probe and reap). */
@@ -812,6 +825,14 @@ function authorize(args: readonly string[]): MutationGrant {
   const ctx = als.getStore();
   if (!ctx) refuse('outside-authority', `refusing docker ${args.slice(verbAt(args), verbAt(args) + 2).join(' ')}: a docker mutation may only run inside a lifecycle operation (ARCH-022)`);
   if (!lanes.isWriter()) refuse('no-claim', 'refusing docker mutation: this server does not hold its data dir');
+  // BUG-254 r9 (independent design review) — NO docker GLOBAL option may precede the verb on ANY authority
+  // path (probe, lease, op). `verbIndex` skips leading global options WITHOUT inspecting them, so a
+  // `-H <other-daemon>` / `--context` / `--config` / `-l` before the verb would send the granted exec or
+  // mutation to a daemon this gate never identified (it inspects targets on the default daemon). Every
+  // Orchard docker argv begins with the verb or object word (audited: no caller emits a global option), so
+  // this refuses nothing legitimate. It ends STRUCTURALLY the class the probe gate was being patched for one
+  // spelling at a time (r4 privilege flags after exec, r8 global options before it) — one check, all paths.
+  if (verbAt(args) !== 0) refuse('global-option', 'a docker call under the authority may not carry a global option before the verb (it could redirect the daemon, context or config this gate checked)');
   if (ctx.kind === 'lease') {
     authorizeLease(ctx.leaseId, args);
     return { id: recordGrant({ ctx: 'lease', opId: null, projectId: leases.get(ctx.leaseId)?.projectId ?? null, verb: 'exec', target: ctx.leaseId }), settled: () => undefined };

@@ -99,13 +99,15 @@ async function main() {
   check("the user's verbatim case (high confidence, NO decider) is BLOCKED", runHook(highNoDecider).blocked, 'blocked');
   const medNoDecider = tx('mednd', `${DIGEST}\n\`\`\`\`orchard-ask\nBlue or green? I recommend blue.\nconfidence: med\n\`\`\`\``);
   check('a med-confidence ask with NO decider is BLOCKED (protocol engaged, unowned)', runHook(medNoDecider).blocked, 'blocked');
-  const owned = tx('owned', `${DIGEST}\n\`\`\`\`orchard-ask\nBlue or green? I recommend blue.\nconfidence: high\ndecider: taste — the brand palette is your call.\n\`\`\`\``);
+  const owned = tx('owned', `${DIGEST}\n\`\`\`\`orchard-ask\nBlue or green? I recommend blue.\nconfidence: high\nabout: preference\ndecider: taste\nconsequence: the brand palette is your call.\n\`\`\`\``);
   check('a fully-owned ask (confidence + decider) is ALLOWED', !runHook(owned).blocked, 'allowed');
 
   // WA §A "a recommendation is a claim — vet it like code": the OPTIONAL `evidence:`
   // field. An ask carrying it is still allowed; and — the property that keeps it
   // optional — an owned ask WITHOUT it is NOT newly blocked (old replies don't fail).
-  const withEvidence = tx('withev', `${DIGEST}\n\`\`\`\`orchard-ask\nAdopt the new retry policy? I recommend yes.\nconfidence: med\ndecider: risk — it changes failure behaviour in prod.\nevidence: 14 sessions / 9 tickets; refuted cross-provider, 2 counter-cases survived.\n\`\`\`\``);
+  // BUG-256: a generic `risk` decider is no longer a hard stop; this fixture names the
+  // hard stop it means (`outward` — production behaviour) so it still exercises evidence.
+  const withEvidence = tx('withev', `${DIGEST}\n\`\`\`\`orchard-ask\nAdopt the new retry policy? I recommend yes.\nconfidence: med\nabout: approval\ndecider: outward\nconsequence: it changes failure behaviour in prod.\nevidence: 14 sessions / 9 tickets; refuted cross-provider, 2 counter-cases survived.\n\`\`\`\``);
   check('an owned ask WITH an evidence: line is ALLOWED', !runHook(withEvidence).blocked, 'allowed');
   check('an owned ask WITHOUT evidence is STILL ALLOWED (evidence is optional)', !runHook(owned).blocked, 'allowed');
 

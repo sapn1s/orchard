@@ -5,57 +5,89 @@
   "title": "Agents waiting on work that already ended still look busy",
   "summary": "Five agents sat for over half an hour waiting on verification runs that had already been stopped. Each showed as running, so nothing told them apart from real work. The stall warning built for exactly this class never fired: a waiter's own sleeping process counts as proof that the work is alive.",
   "impact_if_we_wait": "One such wait is still sleeping now, more than forty minutes after the run it watched ended, and nothing will ever end it. Bounded: no result is falsified and no stored data is touched. The cost is a person's attention and the minutes spent proving the work is dead.",
-  "current_need": "Choose between preventing a wait that outlives its work and surfacing one as stalled, then have the chosen guard built.",
+  "current_need": "Build C with an enforced deadline and a visible final report of what the wait last saw.",
   "severity": "medium",
   "area": "Waiting on long verification runs",
   "reported": "2026-08-22",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-22",
-  "decision": {
-    "mode": "single",
-    "question": "Should a wait that outlives the work it watches be made impossible, or made visible?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Refuse a parked wait",
-        "what_changes": "A background command whose only job is to sleep until something appears is refused before it starts.",
-        "benefit": "The failure cannot be created at all, so nothing has to notice it afterwards.",
-        "cost": "The refusal has to recognise the shape reliably, and the tool guidance every agent reads still recommends that shape.",
-        "why_not_obvious": "A legitimate wait on something that outlives the session would be refused with no way through."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "bd7bfc42-521e-4265-a53a-d6fa9ba18906",
+      "asked_on": "2026-08-22",
+      "question": "Should a wait that outlives the work it watches be made impossible, or made visible?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "chosen": "C",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — judgement: Four engineering options, no recommendation, nothing user-held. C (bound every wait) is cheap and reversible; B needs a progress signal the engine lacks and A refuses legitimate waits.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "judgement",
+        "ref": null,
+        "why": "Four engineering options, no recommendation, nothing user-held. C (bound every wait) is cheap and reversible; B needs a progress signal the engine lacks and A refuses legitimate waits.",
+        "on": "2026-10-14",
+        "next": "Build C with an enforced deadline and a visible final report of what the wait last saw.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Choose between preventing a wait that outlives its work and surfacing one as stalled, then have the chosen guard built."
+        }
       },
-      {
-        "key": "B",
-        "label": "Judge the watched work",
-        "what_changes": "Whether a waiting row is progressing is judged from the work it watches rather than from the waiter's own process.",
-        "benefit": "A wait on dead work becomes a visible warning without anyone probing processes by hand.",
-        "cost": "Needs a per-row progress signal the engine does not supply today, plus a rule for what counts as movement.",
-        "why_not_obvious": "A slow but healthy wait would be warned about, which is the false alarm this warning was designed to avoid."
-      },
-      {
-        "key": "C",
-        "label": "Bound every wait",
-        "what_changes": "Every wait carries a deadline, exits at it, and reports what it last saw.",
-        "benefit": "No wait can outlive the work it watches by more than that deadline.",
-        "cost": "Nothing announces the failure, so an endless wait becomes only a late one.",
-        "why_not_obvious": "Nothing would enforce the deadline, so the discipline lapses exactly when whoever writes the wait is in a hurry."
-      },
-      {
-        "key": "D",
-        "label": "Spot it by hand",
-        "what_changes": "Nothing is built, and whoever notices a quiet agent checks the processes themselves.",
-        "benefit": "No work, and this occurrence was caught and stopped by a person within the hour.",
-        "cost": "The shape has recurred across ten separate days in this project, and each recurrence costs someone's attention.",
-        "why_not_obvious": "The wait is invisible while nobody is looking, so a quiet stretch is not evidence that it stopped happening."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should a wait that outlives the work it watches be made impossible, or made visible?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Refuse a parked wait",
+            "what_changes": "A background command whose only job is to sleep until something appears is refused before it starts.",
+            "benefit": "The failure cannot be created at all, so nothing has to notice it afterwards.",
+            "cost": "The refusal has to recognise the shape reliably, and the tool guidance every agent reads still recommends that shape.",
+            "why_not_obvious": "A legitimate wait on something that outlives the session would be refused with no way through."
+          },
+          {
+            "key": "B",
+            "label": "Judge the watched work",
+            "what_changes": "Whether a waiting row is progressing is judged from the work it watches rather than from the waiter's own process.",
+            "benefit": "A wait on dead work becomes a visible warning without anyone probing processes by hand.",
+            "cost": "Needs a per-row progress signal the engine does not supply today, plus a rule for what counts as movement.",
+            "why_not_obvious": "A slow but healthy wait would be warned about, which is the false alarm this warning was designed to avoid."
+          },
+          {
+            "key": "C",
+            "label": "Bound every wait",
+            "what_changes": "Every wait carries a deadline, exits at it, and reports what it last saw.",
+            "benefit": "No wait can outlive the work it watches by more than that deadline.",
+            "cost": "Nothing announces the failure, so an endless wait becomes only a late one.",
+            "why_not_obvious": "Nothing would enforce the deadline, so the discipline lapses exactly when whoever writes the wait is in a hurry."
+          },
+          {
+            "key": "D",
+            "label": "Spot it by hand",
+            "what_changes": "Nothing is built, and whoever notices a quiet agent checks the processes themselves.",
+            "benefit": "No work, and this occurrence was caught and stopped by a person within the hour.",
+            "cost": "The shape has recurred across ten separate days in this project, and each recurrence costs someone's attention.",
+            "why_not_obvious": "The wait is invisible while nobody is looking, so a quiet stretch is not evidence that it stopped happening."
+          }
+        ],
+        "recommendation": null,
+        "recommendation_reason": null,
+        "prerequisite": "Establish what the engine reports about a background task beyond the fact that it exists. Without a per-task progress signal, judging the watched work has nothing to read."
       }
-    ],
-    "recommendation": null,
-    "recommendation_reason": null,
-    "prerequisite": "Establish what the engine reports about a background task beyond the fact that it exists. Without a per-task progress signal, judging the watched work has nothing to read."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A wait whose watched run has ended either stops within a bounded time or is shown as stalled",
     "A wait that is genuinely still progressing is never flagged, however quiet it is",
@@ -399,3 +431,6 @@ transcripts on this machine; scan `/tmp/bug140-probe/scan.mjs`)**
 - **Nothing changed in code. No git writes.** The only processes I started were the probe's CLI
   and its 3 shells, and all ended through their stop files. `pgrep` confirmed none left. `:4317`
   was not touched.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: judgement. Chose: C. Why: Four engineering options, no recommendation, nothing user-held. C (bound every wait) is cheap and reversible; B needs a progress signal the engine lacks and A refuses legitimate waits. Next: Build C with an enforced deadline and a visible final report of what the wait last saw. You can reopen this decision from the ticket view.

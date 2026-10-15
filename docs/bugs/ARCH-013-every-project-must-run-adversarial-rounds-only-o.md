@@ -5,56 +5,88 @@
   "title": "Every project must run adversarial rounds; only one has the tool",
   "summary": "A trivial landing-page fix bought a verification round, and the verifier repeated the fixer's own check. The scoping half is fixed in the WA this lane. The duplication half is not text: independent-verify.mjs, the only adversarial verifier charter, exists in orchard alone, so a round dispatched elsewhere is an ad-hoc subagent that repeats the demonstration.",
   "impact_if_we_wait": "Every non-orchard project keeps paying clean-room prices for a round that cannot be a round. The expensive half is already closed by the shipped harm-class table, so what remains is duplication, not risk. No product behaviour is affected and no data is exposed.",
-  "current_need": "A human picks an option. No build starts until then.",
+  "current_need": "Build C: dispatch.mjs refuses a verify-phase dispatch with no harm class and no named attack.",
   "severity": "medium",
   "area": "Verification tooling reach across projects",
   "reported": "2026-08-25",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-25",
-  "decision": {
-    "mode": "single",
-    "question": "How does an adversarial verification round become available outside orchard?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Sweep the verifier into every onboarded project",
-        "what_changes": "independent-verify.mjs and its vrun harness join SYNCED_TOOLS in fleet-sync.mjs, beside board.mjs and verdict-contract.mjs.",
-        "benefit": "Uses machinery that exists and a path already proven for verdict-contract. Cheapest of the three builds.",
-        "cost": "The sweep skips the 7 projects with no docs/bugs, and a swept copy goes stale in its target — the failure BUG-118 recorded for verdict-contract.",
-        "why_not_obvious": "Copying a tool into 13 trees is how verdict-contract got the staleness bug this project already paid for once."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "d45aedfa-89de-41e6-9bf4-5e8d0545d9a2",
+      "asked_on": "2026-08-25",
+      "question": "How does an adversarial verification round become available outside orchard?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "chosen": "C",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Engineering choice with a recommendation; C is local to dispatch.mjs, reversible, and touches no other repo.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Engineering choice with a recommendation; C is local to dispatch.mjs, reversible, and touches no other repo.",
+        "on": "2026-10-14",
+        "next": "Build C: dispatch.mjs refuses a verify-phase dispatch with no harm class and no named attack.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "A human picks an option. No build starts until then."
+        }
       },
-      {
-        "key": "B",
-        "label": "Make the round a launcher capability",
-        "what_changes": "The station offers a verify dispatch verb; the clean-room export and adversarial charter are owned centrally, with no copy in any target tree.",
-        "benefit": "No staleness, no per-project onboarding, and it reaches projects with no board.",
-        "cost": "New machinery in the subsystem where this project's defects concentrate. ARCH-011 declined a service-shaped answer to an adjacent question for exactly this reason.",
-        "why_not_obvious": "It is the architecturally clean answer and the one this board has twice decided it cannot afford."
-      },
-      {
-        "key": "C",
-        "label": "Enforce at dispatch time, distribute nothing",
-        "what_changes": "dispatch.mjs refuses a verify-phase dispatch that lacks a harm class scoring above zero and a NAMED attack distinct from the fixer's recorded command.",
-        "benefit": "Turns 'if you cannot name the attack, do not commission it' into a refusal at the moment of spend, not after. No new copies anywhere.",
-        "cost": "dispatch.mjs is orchard-local, so it enforces where the problem is least present. The class is self-declared, which is ARCH-011's own flaw.",
-        "why_not_obvious": "The self-declaration flaw is inverted here: the cheap direction is to under-claim and skip a round, which the recorded class makes auditable afterwards."
-      },
-      {
-        "key": "D",
-        "label": "Accept the asymmetry and say so",
-        "what_changes": "The WA states that a clean-room round exists only where the project provides a clean-room verifier; elsewhere the fixer's recorded demonstration plus the harm-class table is the whole proof.",
-        "benefit": "Costs nothing and closes the duplication by deleting an instruction that cannot be honoured.",
-        "cost": "Loses what rounds uniquely buy: hidden-content defects, a verifier's own suite being vacuous, and claims of proof about unproven work.",
-        "why_not_obvious": "Deleting an unhonourable rule is usually right; here it is the one rule measured as catching what nothing else catches."
+      "snapshot": {
+        "mode": "single",
+        "question": "How does an adversarial verification round become available outside orchard?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Sweep the verifier into every onboarded project",
+            "what_changes": "independent-verify.mjs and its vrun harness join SYNCED_TOOLS in fleet-sync.mjs, beside board.mjs and verdict-contract.mjs.",
+            "benefit": "Uses machinery that exists and a path already proven for verdict-contract. Cheapest of the three builds.",
+            "cost": "The sweep skips the 7 projects with no docs/bugs, and a swept copy goes stale in its target — the failure BUG-118 recorded for verdict-contract.",
+            "why_not_obvious": "Copying a tool into 13 trees is how verdict-contract got the staleness bug this project already paid for once."
+          },
+          {
+            "key": "B",
+            "label": "Make the round a launcher capability",
+            "what_changes": "The station offers a verify dispatch verb; the clean-room export and adversarial charter are owned centrally, with no copy in any target tree.",
+            "benefit": "No staleness, no per-project onboarding, and it reaches projects with no board.",
+            "cost": "New machinery in the subsystem where this project's defects concentrate. ARCH-011 declined a service-shaped answer to an adjacent question for exactly this reason.",
+            "why_not_obvious": "It is the architecturally clean answer and the one this board has twice decided it cannot afford."
+          },
+          {
+            "key": "C",
+            "label": "Enforce at dispatch time, distribute nothing",
+            "what_changes": "dispatch.mjs refuses a verify-phase dispatch that lacks a harm class scoring above zero and a NAMED attack distinct from the fixer's recorded command.",
+            "benefit": "Turns 'if you cannot name the attack, do not commission it' into a refusal at the moment of spend, not after. No new copies anywhere.",
+            "cost": "dispatch.mjs is orchard-local, so it enforces where the problem is least present. The class is self-declared, which is ARCH-011's own flaw.",
+            "why_not_obvious": "The self-declaration flaw is inverted here: the cheap direction is to under-claim and skip a round, which the recorded class makes auditable afterwards."
+          },
+          {
+            "key": "D",
+            "label": "Accept the asymmetry and say so",
+            "what_changes": "The WA states that a clean-room round exists only where the project provides a clean-room verifier; elsewhere the fixer's recorded demonstration plus the harm-class table is the whole proof.",
+            "benefit": "Costs nothing and closes the duplication by deleting an instruction that cannot be honoured.",
+            "cost": "Loses what rounds uniquely buy: hidden-content defects, a verifier's own suite being vacuous, and claims of proof about unproven work.",
+            "why_not_obvious": "Deleting an unhonourable rule is usually right; here it is the one rule measured as catching what nothing else catches."
+          }
+        ],
+        "recommendation": "C",
+        "recommendation_reason": "The scoping fix already removes most rounds, so what remains is whether the survivors are real. C refuses an unnameable round where the spend happens, in a file that already records class and round."
       }
-    ],
-    "recommendation": "C",
-    "recommendation_reason": "The scoping fix already removes most rounds, so what remains is whether the survivors are real. C refuses an unnameable round where the spend happens, in a file that already records class and round."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "In any project, the command that runs an independent verification round can be named, and running it produces a run id the ticket can cite.",
     "A verification round's evidence contains at least one command that is not the fixer's recorded command.",
@@ -327,3 +359,6 @@ outside orchard. No build starts until an option is chosen.
   zero-round class and does not warrant an independent round — but the *reach* claim is
   fleet-wide and asserted from one machine's registry, so if that claim is doubted, re-run
   `scripts/verify-verification-scoping-reach.mjs` rather than re-reading this entry.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: C. Why: Engineering choice with a recommendation; C is local to dispatch.mjs, reversible, and touches no other repo. Next: Build C: dispatch.mjs refuses a verify-phase dispatch with no harm class and no named attack. You can reopen this decision from the ticket view.

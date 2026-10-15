@@ -495,6 +495,9 @@ function richDecision(d) {
     recommendation_reason: str(d.recommendation_reason),
     prerequisite: str(d.prerequisite),
     stages: list(d.stages),
+    // BUG-259 — why this decision is the user's (the hard stop the card declared).
+    stop: str(d.stop),
+    stopConsequence: str(d.stop_consequence),
   };
 }
 

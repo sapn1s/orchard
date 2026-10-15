@@ -82,7 +82,16 @@
  *                                       --option='A=label | what changes | gains | costs | why not obvious'
  *                                       --option='B=…' [--option=…] [--recommend=A --why='…']
  *                                       [--replace] [--work-state=blocked] [--author='worker (fixing r2)'] [--rev=<token>]
+ *                                       --decider=<hard stop> --consequence='…'   (BUG-259: required)
  *                                       (a fork that needs the user — FEAT-166; never Activity-log prose)
+ *   node scripts/board-tool.mjs own     --id=FEAT-087 --basis=recommendation|judgement|criteria|settled|verify-owed
+ *                                       [--chose=A] [--ref=sc:1|BUG-240] --why='…' --author='worker (…)'
+ *                                       [--next='the work it implies'] [--handoff='what stays the user's'] [--rev=<token>]
+ *                                       (BUG-259: an agent's OWN decision, recorded as the agent's; the user can reopen it)
+ *   node scripts/board-tool.mjs adopt   --id=FEAT-182 --delegation=<id the user recorded>
+ *                                       --author='worker (…)' [--option=A] [--note='…']
+ *                                       (FEAT-184: adopt the RECOMMENDATION under a user's recorded
+ *                                       delegation, through the server; never a user answer)
  *   node scripts/board-tool.mjs commit  --ids=BUG-133,FEAT-097 --message='…'
  *
  * The board directory is this repo's own `docs/bugs/`. `ORCHARD_BOARD_TOOL_ROOT`
@@ -105,10 +114,17 @@ import {
 } from './lib/ticket-schema.mjs';
 import { genBoard, checkBoard, decisionShapeFails, reachabilityFails } from './board.mjs';
 import * as VS from './lib/verification-source.mjs';
+import { warnIfLaneWorkLost } from './lib/lane-snapshot.mjs';
 // FEAT-106 — resolve the board dir (docs/bugs legacy / .orchard/bugs flat) for
 // whatever root the tool is pointed at; ORCHARD_BOARD_TOOL_ROOT semantics are
 // unchanged (it still names the host, the resolver just finds the board under it).
 import { resolveBoardDir } from './lib/board-path.mjs';
+// FEAT-184 — the shared per-ticket write lock (the server's answer/adopt writers take it too).
+import { withTicketLock, READS_AS_USER } from './lib/delegation-source.mjs';
+// BUG-259 — the ONE closed hard-stop list and verdict, shared with the turn-end ask check.
+import { deciderOf, hardStopDefect, HARD_STOPS } from './lib/format-metrics.mjs';
+import { ownRefusal, ownRecord, withdrawRefusal, withdrawRecord } from './lib/owned-decision.mjs';
+import { activityHeadings } from './lib/answer-source.mjs';
 
 const HERE = path.dirname(url.fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = path.resolve(HERE, '..');
@@ -604,6 +620,19 @@ async function verbUpdate(root, flags) {
     { label: '--current-need', text: flags.get('current-need') },
   ], `update ${id}`);
 
+  // BUG-259 — THE HIDING PATH, closed. Moving a ticket with an OPEN decision off
+  // the Needs-You rail (owner away from you, or a different human_action) without
+  // anyone deciding is how a card vanished with no record of who decided what.
+  // An agent's own call is recorded with `own`; the user's is answered by the user.
+  if ((flags.has('owner') && flags.get('owner') !== 'you') || flags.has('human-action')) {
+    if (await openDecisionOn(root, detail)) {
+      throw new Refusal('open-decision', `update: ${id} has an open decision nobody has answered — moving it off the Needs-You rail would hide it; nothing was written`, [
+        'If the decision is the agent\'s own call: node scripts/board-tool.mjs own --id=… --basis=… --chose=… --why=… --author=…',
+        'If it is the user\'s, it stays until they answer it (or adopt under a delegation they recorded, FEAT-184).',
+      ]);
+    }
+  }
+
   const wantsRecordChange = [...Object.keys(RECORD_SETTERS)].some((f) => flags.has(f) && f !== 'owner');
   const parsed = parseTicket(detail.markdown, { file: base, mode: 'auto' });
 
@@ -636,8 +665,7 @@ async function verbUpdate(root, flags) {
       // FEAT-166 r3 — the rev of the bytes this update READ, as late as physically
       // possible: a concurrent writer (e.g. the server recording a user answer into
       // the record) since that read makes this refuse instead of erasing it.
-      assertFresh(file, detail.rev);
-      fs.writeFileSync(file, next);
+      withTicketLock(file, () => { assertFresh(file, detail.rev); fs.writeFileSync(file, next); }); // FEAT-184 r2
       touched.push('record');
     }
     if (flags.has('status-line')) {
@@ -679,8 +707,7 @@ async function verbUpdate(root, flags) {
       }
       const next = before.replace(/^- \*\*Status:\*\*.*$/m, `- **Status:** ${line}`);
       const revNow = currentRev(file);
-      assertFresh(file, revNow);
-      fs.writeFileSync(file, next);
+      withTicketLock(file, () => { assertFresh(file, revNow); fs.writeFileSync(file, next); }); // FEAT-184 r2
       touched.push('status-line');
     }
     if (flags.has('severity') || flags.has('human-action') || flags.has('current-need')) {
@@ -780,11 +807,14 @@ async function verbVerified(root, flags) {
   // independent-verify --candidate printed). It must be a full hash that THIS repo's
   // candidate store can reproduce — a typo or a foreign hash binds to nothing.
   let candidate = null;
+  let verifyMode = null;
   if (flags.has('candidate')) {
     candidate = String(flags.get('candidate')).trim().toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(candidate)) throw new Refusal('bad-candidate', `verified: --candidate ${JSON.stringify(flags.get('candidate'))} is not a full 64-hex candidate hash`);
     const CS = await import('./lib/candidate-store.mjs');
-    try { CS.loadCandidate(CS.repoInfo(root).store, candidate); }
+    // The MODE is read from the stored candidate, never from a flag: a mixed-state
+    // verdict (other tickets' hunks were in the verified files) is recorded as such.
+    try { verifyMode = CS.loadCandidate(CS.repoInfo(root).store, candidate).mode === 'mixed' ? 'mixed-state' : 'clean-candidate'; }
     catch (e) { throw new Refusal('unknown-candidate', `verified: --candidate ${candidate.slice(0, 12)} cannot be reproduced from this repo's candidate store — ${e.message}`); }
   }
 
@@ -809,7 +839,7 @@ async function verbVerified(root, flags) {
     author: author ?? `dispatch ${provider}`,
     recorded_by: 'board-tool',
     harness: 'scripts/independent-verify.mjs',
-    ...(candidate ? { candidate } : {}),
+    ...(candidate ? { candidate, verify_mode: verifyMode } : {}),
     ...(note ? { note } : {}),
   };
   const probs = VS.entryProblems(entry);
@@ -860,8 +890,8 @@ async function verbVerified(root, flags) {
       throw new Refusal('invalid-ticket', `verified: ${id} would fail validateTicket (${v.violations.length} violation(s)) — nothing was written`, v.violations);
     }
     const { body: keepBody } = extractTicketBlock(detail.markdown);
-    assertFresh(file, detail.rev); // FEAT-166 r3: the rev READ, so a user answer since is never erased
-    fs.writeFileSync(file, formatTicket(record, keepBody));
+    // FEAT-166 r3: the rev READ, so a user answer since is never erased; FEAT-184 r2: under the ticket lock.
+    withTicketLock(file, () => { assertFresh(file, detail.rev); fs.writeFileSync(file, formatTicket(record, keepBody)); });
     where = 'the record\'s verification[]';
     touched.push('verification');
     if (wantState) { stateSet = wantState; touched.push('work-state'); }
@@ -876,6 +906,7 @@ async function verbVerified(root, flags) {
   // Human-readable echo. Its label is NOT `Verified-by`, so no reader of prose
   // (legacy or migration) mistakes it for a record; the typed entry is the proof.
   const echo = `dispatch ${provider}${model ? `/${model}` : ''} run ${runId} — VERDICT: ${verdict.toUpperCase()}` +
+    `${candidate ? ` — ${verifyMode} candidate ${candidate.slice(0, 12)}` : ''}` +
     `${note ? ` — ${note}` : ''}. Typed entry in ${where}; this line is an echo, not proof.`;
   const appended = appendNote(root, id, echo, currentRev(file), {
     author: entry.author,
@@ -896,7 +927,7 @@ async function verbVerified(root, flags) {
 
 /* ──────────────────────────────────────────────────────────── decide (record) */
 
-const DECIDE_FLAGS = ['id', 'question', 'option', 'recommend', 'why', 'replace', 'work-state', 'author', 'rev'];
+const DECIDE_FLAGS = ['id', 'question', 'option', 'recommend', 'why', 'replace', 'work-state', 'author', 'rev', 'decider', 'consequence'];
 /** The option-key shape the Decide parser accepts (OPTION_BULLET_RE in src/server/board.ts). */
 const OPTION_KEY_RE = /^[A-Za-z0-9]{1,6}$/;
 const OPTION_FIELDS = ['label', 'what_changes', 'benefit', 'cost', 'why_not_obvious'];
@@ -970,7 +1001,7 @@ async function verbDecide(root, flags) {
   const { ticketAnswerState } = await boardApi();
   const id = assertId(flags.get('id'), '--id');
 
-  for (const k of ['question', 'recommend', 'why', 'author', 'option']) {
+  for (const k of ['question', 'recommend', 'why', 'author', 'option', 'decider', 'consequence']) {
     if ((flags.all.get(k) ?? []).some((v) => /[\r\n\u2028\u2029]/.test(String(v)))) {
       throw new Refusal('multi-line', `decide: --${k} must be a single line`);
     }
@@ -1000,8 +1031,31 @@ async function verbDecide(root, flags) {
     throw new Refusal('bad-author', `decide: --author ${JSON.stringify(author)} reads as the user — this verb declares a question and never writes a user's answer`);
   }
 
+  // BUG-259 — THE GATE. A card on the Needs-You rail must say why the decision is
+  // the USER's, in the SAME grammar the turn-end ask check reads (format-metrics
+  // deciderOf/hardStopDefect, BUG-256): `--decider` is exactly one closed-list code
+  // and `--consequence` says what happens to the user. Without both, the decision
+  // is the agent's own: take it with `own`, or just do the work. This checks the
+  // DECLARATION, not its truth — the stop is shown on the card, in front of the
+  // person it claims to need.
+  const deciderRaw = String(flags.get('decider') ?? '').trim();
+  const consequenceRaw = String(flags.get('consequence') ?? '').trim();
+  const declared = deciderRaw ? deciderOf(`decider: ${deciderRaw}\nconsequence: ${consequenceRaw}`) : null;
+  const stopDefect = hardStopDefect(declared);
+  if (stopDefect) {
+    const msg = stopDefect === 'decider-no-consequence'
+      ? `decide: --decider=${declared.hardStop} needs --consequence="what happens to the user if the agent picks" (at least 3 words) — nothing was written`
+      : `decide: ${deciderRaw ? `--decider=${JSON.stringify(deciderRaw)} is not exactly one hard stop` : '--decider=<hard stop> is required'} — this is the agent's own decision, so nothing was written`;
+    throw new Refusal(stopDefect === 'decider-no-consequence' ? 'decider-no-consequence' : 'not-hard-stop', msg, [
+      `A decision card is the USER's only for exactly one of: ${HARD_STOPS.join(', ')}, plus the consequence, e.g. --decider=live --consequence="restarting the service ends your three running sessions".`,
+      'Implementation, sequencing, which-option-when-recommended, file-or-fix, another round, and bookkeeping are the agent\'s: decide and continue, or record it with `board-tool own`.',
+    ]);
+  }
+
   await assertNoLeak([
     { label: '--question', text: question },
+    { label: '--decider', text: deciderRaw },
+    { label: '--consequence', text: consequenceRaw },
     { label: '--why', text: why },
     { label: '--author', text: author },
     ...rawOptions.map((t, i) => ({ label: `--option #${i + 1}`, text: t })),
@@ -1037,6 +1091,12 @@ async function verbDecide(root, flags) {
     if (!answered && flags.get('replace') !== 'true') {
       throw new Refusal('open-decision', `decide: ${id} already has an open decision the user has not answered ("${old.decision.question}") — pass --replace to supersede it`);
     }
+    // BUG-259 — a replacement may not change the stop an open card already
+    // declared (an access card re-filed as taste is how a real stop would be
+    // laundered toward something easier to wave through).
+    if (!answered && old.decision.stop && old.decision.stop !== declared.hardStop) {
+      throw new Refusal('stop-change', `decide: ${id}'s open card declares the hard stop "${old.decision.stop}"; a replacement must keep it (got "${declared.hardStop}") — only the user's answer retires that stop`);
+    }
     superseded = answered ? 'answered' : 'unanswered';
     history.push({
       id: old.decision.id ?? null,
@@ -1046,9 +1106,13 @@ async function verbDecide(root, flags) {
       options_keys: Array.isArray(old.decision.options) ? old.decision.options.map((o) => o && o.key) : [],
       chosen: answered ? (ans.chose?.key ?? null) : null,
       chosen_on: answered ? ans.on : null,
-      chosen_by: answered ? 'you' : null,
+      // FEAT-184 — an adoption stays an adoption in history: never 'you'.
+      chosen_by: answered ? (ans.by === 'agent-under-delegation' ? 'agent-under-delegation' : 'you') : null,
+      ...(answered && ans.by === 'agent-under-delegation' ? { delegation_id: ans.delegation?.id ?? null } : {}),
       note: answered
-        ? `Answered by the user; superseded on ${TODAY()} by a new decision declared with board-tool decide.`
+        ? (ans.by === 'agent-under-delegation'
+          ? `Adopted by ${ans.delegation?.adopted_by ?? 'an agent'} under the user's delegation ${ans.delegation?.id ?? '?'} (not a user answer); superseded on ${TODAY()} by a new decision declared with board-tool decide.`
+          : `Answered by the user; superseded on ${TODAY()} by a new decision declared with board-tool decide.`)
         : `Superseded unanswered on ${TODAY()} with board-tool decide --replace.`,
       // FEAT-166 r3 — the typed answers move with their decision, as HISTORY: no
       // reader counts decision_history; board:check uses their heading shas to
@@ -1075,6 +1139,16 @@ async function verbDecide(root, flags) {
       recommendation: recommend,
       recommendation_reason: recommend ? why : null,
       prerequisite: null,
+      stop: declared.hardStop,
+      stop_consequence: declared.consequence,
+      // BUG-263 — a decision the USER reopened stays the user's across a
+      // replacement. Without this, `decide --replace` on a reopened open card
+      // minted a fresh decision with no `reopened_from`, and `board-tool own` /
+      // `withdraw` (which refuse a reopened card) then no longer saw the reopen —
+      // laundering the user's take-back (the clean-room verify finding; root of
+      // BUG-259 break #5). Carried only when superseding an UNANSWERED reopened
+      // card; an answered one is history.
+      ...(superseded === 'unanswered' && old.decision && old.decision.reopened_from ? { reopened_from: old.decision.reopened_from } : {}),
     },
     decision_history: history,
     human_action: 'decide',
@@ -1091,12 +1165,12 @@ async function verbDecide(root, flags) {
   const { body } = extractTicketBlock(detail.markdown);
   // FEAT-166 r3 — against the rev of the bytes we READ (not a fresh rev, which is
   // a tautology): a user answer recorded since that read is never overwritten.
-  assertFresh(file, detail.rev);
-  fs.writeFileSync(file, formatTicket(record, body));
+  withTicketLock(file, () => { assertFresh(file, detail.rev); fs.writeFileSync(file, formatTicket(record, body)); }); // FEAT-184 r2
 
   const summary = options.map((o) => `${o.key} — ${o.label}`).join('; ');
   const logText = `${question} Options: ${summary}.`
     + (recommend ? ` Recommended: ${recommend} — ${why}` : ' No recommendation.')
+    + ` Why it is the user's: ${declared.hardStop} — ${declared.consequence}.`
     + (superseded ? ` Supersedes the earlier ${superseded} decision (kept in decision_history).` : '')
     + ' Written to the record with board-tool decide; the Decide card reads the record, not this line.';
   const appended = appendNote(root, id, logText, currentRev(file), { author, label: 'Decision declared' }).appended;
@@ -1115,6 +1189,303 @@ async function verbDecide(root, flags) {
     decision: record.decision, superseded, work_state: workState, owner_cell: ownerCell, appended,
     index_row: indexRowOf(root, id), board: await boardReport(root, { warns: 'summary' }),
   };
+}
+
+/* ──────────────────────────────────────────────────────────── own (BUG-259) */
+
+/**
+ * Is there a decision on this ticket that nobody has answered (the user) or
+ * adopted (an agent under the user's delegation)? Record tickets read the record;
+ * a legacy prose ticket counts only while its INDEX row is 👤 and its prose
+ * `## Decision` parses — the shape the Needs-You rail itself shows.
+ */
+async function openDecisionOn(root, detail) {
+  const { ticketAnswerState, ticketDecision } = await boardApi();
+  const parsed = parseTicket(detail.markdown, { file: path.basename(detail.file), mode: 'auto' });
+  if (ticketAnswerState(detail.markdown, detail.file)) return false;
+  if (parsed.format === 'block' && parsed.record) return !!(parsed.record.decision && typeof parsed.record.decision === 'object');
+  const row = indexRowOf(root, detail.id ?? parsed.id ?? '') ?? '';
+  return row.includes(NEEDS_YOU) && !!ticketDecision(detail.markdown);
+}
+
+const OWN_FLAGS = ['id', 'basis', 'chose', 'ref', 'why', 'next', 'handoff', 'author', 'rev'];
+
+/**
+ * `own` — BUG-259. The agent records a decision that was never the user's as ITS
+ * OWN: who decided, on what typed basis, why, and what happens next. The card
+ * leaves the Needs-You rail; the user can reopen it from the ticket view (a
+ * user-only server route). It writes NO answer — that is what separates it from a
+ * user answer (by: user) and from FEAT-184's adoption (by: agent-under-delegation,
+ * a USER-owned decision taken under the user's recorded delegation).
+ *
+ * Refused: a card that declares a hard stop (the agent filed it as the user's), a
+ * decision the user reopened, an answered or adopted one, an author that reads as
+ * the user, an option that is not on the card. The record and its log entry land
+ * in ONE locked, rev-checked write; INDEX is regenerated after.
+ */
+async function verbOwn(root, flags) {
+  assertKnownFlags(flags, OWN_FLAGS, 'own');
+  const repeated = [...new Set(flags.repeated)];
+  if (repeated.length) throw new Refusal('repeated-flag', `own: --${repeated.join(', --')} given more than once`);
+  for (const k of OWN_FLAGS) {
+    if ((flags.all.get(k) ?? []).some((v) => /[\r\n\u2028\u2029]/.test(String(v)))) throw new Refusal('multi-line', `own: --${k} must be a single line`);
+  }
+  const api = await ticketsApi();
+  const { readTicket, setBoardOwner, assertFresh, currentRev, composeLogEntry, TicketError } = api;
+  const { ticketAnswerState, ticketDecision } = await boardApi();
+  const id = assertId(flags.get('id'), '--id');
+  const opts = {
+    basis: String(flags.get('basis') ?? '').trim(),
+    chose: flags.has('chose') ? String(flags.get('chose')).trim() : null,
+    ref: flags.has('ref') ? String(flags.get('ref')).trim() : null,
+    why: String(flags.get('why') ?? '').trim(),
+    next: flags.has('next') ? String(flags.get('next')).trim() : null,
+    handoff: flags.has('handoff') ? String(flags.get('handoff')).trim() : null,
+    author: String(flags.get('author') ?? '').trim(),
+  };
+  if (READS_AS_USER.test(opts.author)) throw new Refusal('bad-author', `own: --author ${JSON.stringify(opts.author)} reads as the user — an owned decision is the agent's and is recorded as one`);
+  await assertNoLeak(['why', 'next', 'handoff', 'author', 'ref', 'chose'].map((k) => ({ label: `--${k}`, text: opts[k] })), `own ${id}`);
+
+  const detail = readTicket(root, id);
+  const file = detail.file;
+  const base = path.basename(file);
+  if (flags.has('rev')) assertFresh(file, flags.get('rev'));
+  if (ticketAnswerState(detail.markdown, file)) {
+    throw new Refusal('answered', `own: ${id}'s decision is already answered (or adopted) — there is nothing left for an agent to own`);
+  }
+  const parsed = parseTicket(detail.markdown, { file: base, mode: 'auto' });
+  const refExists = (ref) => {
+    if (TICKET_ID_RE.test(ref)) { try { readTicket(root, ref); return true; } catch { return false; } }
+    return detail.markdown.includes(ref); // an answer id recorded on this ticket
+  };
+
+  let next;
+  let logText;
+  let legacy = false;
+  if (parsed.format === 'block' && parsed.record) {
+    const refusal = ownRefusal(parsed.record, opts, { refExists });
+    if (refusal) throw new Refusal(refusal.code, `own: ${id} — ${refusal.message}; nothing was written`);
+    const { record } = ownRecord(parsed.record, { ...opts, today: TODAY(), askedOn: lastDeclaredOn(detail.markdown) });
+    record.owner = 'unassigned';
+    const v = validateTicket(record, { file: base });
+    if (!v.ok) throw new Refusal('invalid-ticket', `own: ${id} would fail validateTicket (${v.violations.length} violation(s)) — nothing was written`, v.violations);
+    const { body } = extractTicketBlock(detail.markdown);
+    next = (entry) => formatTicket(record, body.replace(/\s*$/, '\n') + entry);
+  } else {
+    // A legacy prose card: there is no record to move, so the decision stays in
+    // its prose section and the typed log entry plus the Owner cell carry the act.
+    legacy = true;
+    if (/\*\*Decision reopened:\*\*/.test(detail.markdown)) {
+      throw new Refusal('reopened-by-user', `own: the user reopened an agent decision on ${id} — it is theirs now; nothing was written`);
+    }
+    if (!(await openDecisionOn(root, detail))) throw new Refusal('no-open-decision', `own: ${id} has no open decision on the Needs-You rail`);
+    if (!ticketDecision(detail.markdown)) throw new Refusal('no-open-decision', `own: ${id} has no parseable decision`);
+    const stub = { decision: { mode: 'single', options: [] }, success_criteria: [] };
+    const r = ownRefusal(stub, { ...opts, chose: null }, { refExists });
+    if (r && !['missing-arg', 'bad-choice', 'not-recommendation'].includes(r.code)) throw new Refusal(r.code, `own: ${id} — ${r.message}; nothing was written`);
+    if (!opts.why || !opts.author || !['settled', 'verify-owed', 'judgement', 'recommendation'].includes(opts.basis)) {
+      throw new Refusal('bad-basis', 'own: a legacy prose card takes --basis=settled|verify-owed|judgement|recommendation with --why and --author (and --ref for settled)');
+    }
+    if (opts.basis === 'settled' && !(opts.ref && refExists(opts.ref))) throw new Refusal('bad-ref', 'own: --basis=settled needs --ref naming what settled it');
+    next = (entry) => detail.markdown.replace(/\s*$/, '\n') + entry;
+  }
+  const sentence = (t) => (/[.!?]$/.test(t) ? t : `${t}.`);
+  logText = `Decided by the agent, not by you. Basis: ${opts.basis}${opts.ref ? ` (${opts.ref})` : ''}.`
+    + (opts.chose ? ` Chose: ${opts.chose}.` : '')
+    + ` Why: ${sentence(opts.why)}`
+    + (opts.next ? ` Next: ${sentence(opts.next)}` : '')
+    + (opts.handoff ? ` Still yours: ${sentence(opts.handoff)}` : '')
+    + ' You can reopen this decision from the ticket view.';
+  const entry = composeLogEntry(logText, { author: opts.author, label: 'Decided by agent (own)' });
+  withTicketLock(file, () => { assertFresh(file, detail.rev); fs.writeFileSync(file, next(entry)); });
+
+  let ownerCell = null;
+  try {
+    ownerCell = setBoardOwner(root, id, 'unassigned').owner;
+  } catch (err) {
+    if (err instanceof TicketError) throw new Refusal('no-open-row', `own: the decision was recorded but ${err.message}`);
+    throw err;
+  }
+  genBoard(boardDirOf(root));
+  return {
+    verb: 'own', id, legacy, file: rel(root, file), rev: currentRev(file), basis: opts.basis, chose: opts.chose,
+    next: opts.next, handoff: opts.handoff, owner_cell: ownerCell, appended: entry,
+    index_row: indexRowOf(root, id), board: await boardReport(root, { warns: 'summary' }),
+  };
+}
+
+/* ──────────────────────────────────────────────────────── withdraw (BUG-263) */
+
+const WITHDRAW_FLAGS = ['id', 'reason', 'decided', 'author', 'rev'];
+
+/**
+ * `withdraw` — BUG-263. An agent filed a Decide card as the USER's (a hard-stop
+ * card, so `own` refuses it and only the user can clear it) but the decision was
+ * actually the agent's own call, already made and built, and neither card option
+ * matches what shipped. `decide --replace` only swaps the question; `update` hides
+ * the card; the answer routes refuse an agent (BUG-258). This is the honest take-
+ * back: it records the agent's decision as its OWN (a typed owned-decision entry,
+ * never a user answer) with the reason and what was decided, closes the card from
+ * the Decide rail, and leaves the user a one-click Reopen — the user's authority is
+ * preserved, the stop is not laundered into an easier class.
+ *
+ * Refused: a decision the user already answered or adopted (that is the user's, and
+ * only the user reopens it), one the user reopened, a missing reason/decided, an
+ * author that reads as the user, and a legacy prose or unreadable ticket. The
+ * record and its log entry land in ONE locked, rev-checked write; INDEX after.
+ */
+async function verbWithdraw(root, flags) {
+  assertKnownFlags(flags, WITHDRAW_FLAGS, 'withdraw');
+  const repeated = [...new Set(flags.repeated)];
+  if (repeated.length) throw new Refusal('repeated-flag', `withdraw: --${repeated.join(', --')} given more than once`);
+  for (const k of WITHDRAW_FLAGS) {
+    if ((flags.all.get(k) ?? []).some((v) => /[\r\n\u2028\u2029]/.test(String(v)))) throw new Refusal('multi-line', `withdraw: --${k} must be a single line`);
+  }
+  const api = await ticketsApi();
+  const { readTicket, setBoardOwner, assertFresh, currentRev, composeLogEntry, TicketError } = api;
+  const { ticketAnswerState } = await boardApi();
+  const id = assertId(flags.get('id'), '--id');
+  const opts = {
+    reason: String(flags.get('reason') ?? '').trim(),
+    decided: String(flags.get('decided') ?? '').trim(),
+    author: String(flags.get('author') ?? '').trim(),
+  };
+  if (READS_AS_USER.test(opts.author)) throw new Refusal('bad-author', `withdraw: --author ${JSON.stringify(opts.author)} reads as the user — a withdrawal is the agent's own act and is recorded as one`);
+  await assertNoLeak(['reason', 'decided', 'author'].map((k) => ({ label: `--${k}`, text: opts[k] })), `withdraw ${id}`);
+
+  const detail = readTicket(root, id);
+  const file = detail.file;
+  const base = path.basename(file);
+  if (flags.has('rev')) assertFresh(file, flags.get('rev'));
+
+  // THE INVARIANT: a withdrawal may NEVER touch a decision the user answered or
+  // adopted. ticketAnswerState is the ONE reader of answered-state (FEAT-166 r3);
+  // an agent can never create or erase an answer, so a user-answered card is
+  // refused here before anything is written.
+  if (ticketAnswerState(detail.markdown, file)) {
+    throw new Refusal('answered', `withdraw: ${id}'s decision is already answered (or adopted) by you — an agent cannot withdraw your answer; reopening it is yours`);
+  }
+  const parsed = parseTicket(detail.markdown, { file: base, mode: 'auto' });
+  if (parsed.format !== 'block' || !parsed.record) {
+    throw new Refusal('legacy-ticket', `withdraw: ${id} has no record decision to withdraw (legacy prose ticket, or an unreadable record) — nothing was written`);
+  }
+  // FAIL CLOSED on a user answer whose verification source is tampered. ticketAnswerState
+  // (above) and withdrawRefusal's decision.answers scan (below) both fall back to
+  // PENDING when a seal store is damaged/key-unreadable or the frozen snapshot is
+  // unpinned — so a withdrawal that trusted only them would CLOSE a card carrying a
+  // genuine user answer and ERASE it (clean-room verify r2/r4). The user-answer DISPLAY
+  // heading, by contrast, lives in the ticket markdown itself (the server writes one on
+  // every answer, FEAT-166 r3) and no store tamper can remove it. Refuse if any
+  // user-answer-shaped heading is BOUND to the CURRENT decision — by its
+  // `· decision <id>` envelope, or null===null for a legacy id-less decision. Fenced
+  // headings are included: a false refusal is safe (the user still decides); erasing an
+  // answer is not. Bound-only, so a heading from a SUPERSEDED decision never false-refuses.
+  const curDecisionId = (parsed.record.decision && parsed.record.decision.id) ?? null;
+  const ANSWER_AUTHOR_RE = /^you\s+\((?:answer|follow-?up|question|counter|via Needs-You rail)/i;
+  const HEADING_DECISION_RE = /·\s*decision\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*\)\s*$/i;
+  // Match an answer heading bound to the CURRENT decision (id, or both-null legacy),
+  // OR any id-LESS (pre-FEAT-166-r2 / legacy) answer heading. The latter matters
+  // because withdraw sets decision:null, which turns the ticket's decision key back
+  // to `none` — and a pre-r3 frozen/ledger answer keyed `none` then RE-BINDS,
+  // resurrecting a stale user answer the withdrawal would otherwise mask (clean-room
+  // verify r5: ARCH-010/011/007/004). A heading proven to belong to a SUPERSEDED
+  // id-bearing decision does not re-bind (its answer moved to decision_history under
+  // its own id), so it is correctly allowed.
+  const answeredHeading = activityHeadings(detail.markdown, { includeFenced: true })
+    .some((h) => {
+      if (!ANSWER_AUTHOR_RE.test(h.author)) return false;
+      const hid = HEADING_DECISION_RE.exec(h.author)?.[1] ?? null;
+      return hid === curDecisionId || hid === null;
+    });
+  if (answeredHeading) {
+    throw new Refusal('answered', `withdraw: ${id} carries a user reply on a decision (an Activity-log answer heading) — only the user reopens it; an agent never withdraws a decision the user answered, even when the seal store or frozen snapshot cannot be verified`);
+  }
+  const refusal = withdrawRefusal(parsed.record, opts);
+  if (refusal) throw new Refusal(refusal.code, `withdraw: ${id} — ${refusal.message}; nothing was written`);
+  const { record } = withdrawRecord(parsed.record, { ...opts, today: TODAY(), askedOn: lastDeclaredOn(detail.markdown) });
+  record.owner = 'unassigned';
+  const v = validateTicket(record, { file: base });
+  if (!v.ok) throw new Refusal('invalid-ticket', `withdraw: ${id} would fail validateTicket (${v.violations.length} violation(s)) — nothing was written`, v.violations);
+  const { body } = extractTicketBlock(detail.markdown);
+  const sentence = (t) => (/[.!?]$/.test(t) ? t : `${t}.`);
+  const logText = 'Withdrawn by the agent, not answered by you. This card was filed as yours, but the decision was the agent\'s own call — already made and built — and neither card option matched what shipped.'
+    + ` Decided: ${sentence(opts.decided)}`
+    + ` Reason: ${sentence(opts.reason)}`
+    + ' You can reopen this decision from the ticket view.';
+  // Label matches `own`'s (`Decided by agent (own)`) so the reopen route's legacy
+  // guard and the test-support rewind read a withdrawal identically; on a record
+  // ticket (the only kind withdraw writes) the reopen reads the typed entry anyway.
+  const entry = composeLogEntry(logText, { author: opts.author, label: 'Decided by agent (own)' });
+  withTicketLock(file, () => { assertFresh(file, detail.rev); fs.writeFileSync(file, formatTicket(record, body.replace(/\s*$/, '\n') + entry)); });
+
+  let ownerCell = null;
+  try {
+    ownerCell = setBoardOwner(root, id, 'unassigned').owner;
+  } catch (err) {
+    if (err instanceof TicketError) throw new Refusal('no-open-row', `withdraw: the decision was recorded but ${err.message}`);
+    throw err;
+  }
+  genBoard(boardDirOf(root));
+  return {
+    verb: 'withdraw', id, file: rel(root, file), rev: currentRev(file),
+    decided: opts.decided, reason: opts.reason, owner_cell: ownerCell, appended: entry,
+    index_row: indexRowOf(root, id), board: await boardReport(root, { warns: 'summary' }),
+  };
+}
+
+/* ─────────────────────────────────────────────────────────── adopt (FEAT-184) */
+
+const ADOPT_FLAGS = ['id', 'delegation', 'option', 'note', 'author'];
+
+/**
+ * `adopt` — record that an AGENT chose a decision's own recommendation under a
+ * delegation the USER recorded on the dashboard (FEAT-184). It is a thin client of
+ * the server's adopt route (POST /api/projects/:id/tickets/:tid/adopt), which is the
+ * one writer: it checks the delegation is live and covers this ticket, that the
+ * option is the recommendation, and writes a typed `agent-under-delegation` entry
+ * naming the delegation — never a user answer. This tool signs and writes nothing
+ * itself. With no delegation for the ticket, there is nothing to adopt: leave the
+ * Decide card to the user (`GET /api/projects/:id/delegations` lists them).
+ *
+ * The server is found at ORCHARD_URL, else http://127.0.0.1:$PORT (default 4317);
+ * the project by the board root's real path.
+ */
+async function verbAdopt(root, flags) {
+  assertKnownFlags(flags, ADOPT_FLAGS, 'adopt');
+  const id = assertId(flags.get('id'), '--id');
+  const delegation = String(flags.get('delegation') ?? '').trim();
+  if (!delegation) {
+    throw new Refusal('missing-arg', 'adopt: --delegation=<id> is required — an adoption always names the delegation the USER recorded', [
+      'With no recorded delegation covering this ticket, do not adopt: the decision is the user\'s (leave the Decide card).',
+      'The user records one on the dashboard (Decide card → "Delegate to agents"); list them: GET /api/projects/<project>/delegations.',
+    ]);
+  }
+  const author = String(flags.get('author') ?? '').trim();
+  if (!author) throw new Refusal('missing-arg', 'adopt: --author=<the agent adopting, e.g. "worker (FEAT-182 fixing r1)"> is required');
+  if (READS_AS_USER.test(author) || /[\r\n\u2028\u2029]/.test(author)) {
+    throw new Refusal('bad-author', `adopt: --author ${JSON.stringify(author)} reads as the user (or spans lines) — an adoption is an agent's act and is recorded as one`);
+  }
+  const base = String(process.env.ORCHARD_URL || `http://127.0.0.1:${process.env.PORT || 4317}`).replace(/\/+$/, '');
+  let projects;
+  try {
+    const r = await fetch(`${base}/api/projects`);
+    projects = (await r.json())?.projects ?? [];
+  } catch (err) {
+    throw new Refusal('no-server', `adopt: cannot reach the Orchard server at ${base} (${err.message}) — the server is the one writer of an adoption`);
+  }
+  const realRoot = (() => { try { return fs.realpathSync(root); } catch { return path.resolve(root); } })();
+  const proj = projects.find((pp) => { try { return fs.realpathSync(pp.hostPath) === realRoot; } catch { return false; } });
+  if (!proj) throw new Refusal('no-project', `adopt: no Orchard project at ${realRoot} on ${base}`);
+  const body = { delegation_id: delegation, author };
+  if (flags.has('option')) body.option = String(flags.get('option')).trim();
+  if (flags.has('note')) body.note = String(flags.get('note'));
+  const r = await fetch(`${base}/api/projects/${encodeURIComponent(proj.id)}/tickets/${encodeURIComponent(id)}/adopt`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  let d = null;
+  try { d = await r.json(); } catch { /* not json */ }
+  if (!r.ok || !d?.ok) throw new Refusal(d?.code || `http-${r.status}`, `adopt: ${d?.error || `the server answered ${r.status}`}`);
+  return { verb: 'adopt', id, project: proj.id, adopted: d.adopted, appended: d.appended, board_error: d.board_error ?? null };
 }
 
 /* ─────────────────────────────────────────────────────────────── committing */
@@ -1205,6 +1576,10 @@ async function verbCommit(root, flags) {
     ]);
   }
 
+  // FEAT-176: a commit is a moment the user looks — warn (stderr, never refuse)
+  // when a finished lane's work is gone from the live tree.
+  warnIfLaneWorkLost({ top: root });
+
   // 3. The gate. Exit status, read directly.
   const gate = runGate(root);
   if (!gate.ok) {
@@ -1244,6 +1619,9 @@ const VERBS = {
   update: verbUpdate,
   verified: verbVerified,
   decide: verbDecide,
+  own: verbOwn,
+  withdraw: verbWithdraw,
+  adopt: verbAdopt,
   commit: verbCommit,
 };
 

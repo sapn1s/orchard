@@ -20,6 +20,7 @@ import { createDecideCard } from './lib/decide.js';
 import { ticketView, NOT_RECORDED, WORK_STATE_LABEL, HUMAN_ACTION_LABEL, outstandingBroken, INVISIBLE_CLAIM } from './lib/ticket-record.js';
 import { renderAssistantText } from './lib/digest.js';
 import { renderRequestsInto } from './lib/requests-view.js';
+import { titleMatchRank, compareSessionHits } from './lib/search-ranking.js';
 import { parseHash, formatHash, sameRoute, parseTicketsHash, formatTicketsHash, parseGuideHash, formatGuideHash, parseGitHash, formatGitHash } from './lib/route.js';
 
 /*
@@ -231,6 +232,7 @@ const state = {
   queue: [], // BUG-217 round 5: the dock's rows — the server outbox's unfinished rows, then this tab's unacknowledged requests
   queueUnfiled: [], // BUG-217 round 5: rows typed while no session binding existed (queueKey null) — on screen only, never stored
   outbox: null, // BUG-217 round 5: the server's last answer for the current session's outbox ({ sessionId, rows, recent, hold, damaged })
+  startOutbox: null, // BUG-253: on a project's new-session view — its first messages that did not start a session ({ projectId, rows, recent, damaged })
   outboxFollowing: false, // BUG-217 round 5: a reopen to follow a server-started turn is in flight
   queueUndo: null, // BUG-217 r2: the last Discard, undoable for a few seconds ({ key, text, until, timer })
   sendAttempts: new Map(), // BUG-191: sendId -> { texts, el, at, resume } — per-attempt ownership of an in-flight `send`
@@ -488,9 +490,16 @@ let gitInitArmed = null;
  * this is correct both before and after the account setting exists.
  */
 function claudeAccountView() {
-  const o = state.overrides ?? {};
-  const v = ('claudeAccount' in o ? o.claudeAccount : null) ?? currentProject()?.settings?.claudeAccount ?? null;
-  return typeof v === 'string' && v ? v : 'default';
+  // BUG-255 r3 — when the dock holds a real session, the account is the SERVER'S
+  // declared fact and nothing else (launch, else binding, else the account its resume
+  // launches under). `undefined` when the server has not said — the indicator then
+  // reads "account unknown — checking" and re-reads; there is NO client fallback for a
+  // session (r2's empty-fact fallback to the override chain was the container break).
+  // Only a dock with no session at all (a next launch, not yet a session) reads the
+  // launch intention.
+  const sid = dockSessionId();
+  if (sid) return sessionAccountOf(sid);
+  return nextLaunchAccountView();
 }
 /** A snapshot's display name: 'OpenAI', 'Claude', or 'Claude (<account label>)'. */
 function usageSnapName(s) {
@@ -740,6 +749,9 @@ const node = {
   box: $('#box'),
   prompt: $('#prompt'),
   go: $('#go'),
+  chips: $('#chips'),           // FEAT-177 — staged attachment chips row
+  attachBtn: $('#attachBtn'),   // FEAT-177 — attach button
+  fileInput: $('#fileInput'),   // FEAT-177 — hidden file picker
   skipBtn: $('#skipBtn'),
   planBtn: $('#planBtn'),
   modelBtn: $('#modelBtn'),
@@ -802,6 +814,9 @@ const node = {
 node.budgetLockedText = el('span');
 node.budgetLocked = el('div', { class: 'frozen', id: 'budgetLocked', hidden: true }, node.budgetLockedText);
 node.dropped.insertAdjacentElement('afterend', node.budgetLocked);
+
+// FEAT-177 — wire composer attachment paste / drag-drop / attach button.
+attInit();
 
 /*
  * BUG-149: the server refuses a send when another tab is already driving the
@@ -1014,6 +1029,153 @@ function declareLockedProvider(sessionId, provider) {
 }
 
 /*
+ * BUG-255 r2 — the ONE session-keyed store for "which Claude account is this
+ * session on". It holds ONLY the server's declared, VERSIONED account fact
+ * (index.ts accountFactOf): { sessionId, boot, rev, launch?, bound?, switching,
+ * last }. The server pushes it (`session-account`) to EVERY tab's sockets on
+ * every change; this tab also re-reads it (GET) when it opens a session, when its
+ * watch socket (re)connects, and whenever its own switch request's outcome is
+ * unknown. `acceptAccountFact` is the store's ONLY writer, and a request's
+ * response (an ack, or its absence) NEVER writes it — that rule is what keeps a
+ * second tab, a lost ack and a late read from misrepresenting the account.
+ *   launch  present = a running launch holds the session; the account its CLI is on.
+ *   bound   present = the committed next-resume binding (FEAT-160).
+ * `null` for either = the implicit default (~/.claude) account; an ABSENT key =
+ * no such fact. Ordering: a fact applies iff its boot differs (server restarted)
+ * or its rev is >= the stored one, so a late GET never overwrites a newer push.
+ */
+const sessionAccounts = new Map(); // sessionId → declared account fact
+/*
+ * BUG-255 r3 — the version of a fact is (boot, rev), a TOTAL order across server
+ * restarts: `boot` is a number that strictly increases with every server start,
+ * `rev` bumps on every publish within a boot. The highest boot this tab has heard
+ * from is the only boot whose facts are CURRENT: a fact from a newer boot replaces
+ * the held one whatever its rev, and a fact from an older boot never wins (r2
+ * accepted any "different" boot, so a late read answered by the old server, landing
+ * after the restart, overwrote the newer fact and stuck).
+ */
+let accountFactMaxBoot = 0;
+
+function acceptAccountFact(f) {
+  if (!f || typeof f.sessionId !== 'string' || typeof f.rev !== 'number' || typeof f.boot !== 'number') return false;
+  if (f.boot < accountFactMaxBoot) return false; // from a server boot older than one already heard from
+  const prev = sessionAccounts.get(f.sessionId);
+  if (prev && prev.boot === f.boot && f.rev < prev.rev) return false; // older than what we hold
+  accountFactMaxBoot = f.boot;
+  sessionAccounts.set(f.sessionId, f);
+  return true;
+}
+
+/** BUG-255 r3 — the fact for `sid` iff it is CURRENT (from the newest boot heard from), else
+ *  undefined. A fact held from an older boot is not shown: the restarted server may say otherwise. */
+function currentAccountFact(sessionId) {
+  const d = sessionId ? sessionAccounts.get(sessionId) : undefined;
+  return d && d.boot === accountFactMaxBoot ? d : undefined;
+}
+
+/** A declared account value → the picker token ('default' | id). */
+const acctTok = (v) => (v === null ? 'default' : v);
+
+/**
+ * The account to DISPLAY as the CURRENT account for a session — the server's fact
+ * and nothing else: the running launch account if there is one (the CLI is on it
+ * now), else the committed binding, else the account the server says a resume
+ * launches under (`next`). `undefined` = the server has not said (no current fact,
+ * or a fact that places nothing) — rendered "account unknown — checking", never
+ * filled from a client override, the project setting, or a previous value.
+ */
+function sessionAccountOf(sessionId) {
+  const d = currentAccountFact(sessionId);
+  if (!d) return undefined;
+  if ('launch' in d) return acctTok(d.launch);
+  // BUG-255 r4 — `next` is the server's ONE launch-account decision (effectiveLaunchAccount):
+  // the binding for a direct project, the PROJECT account for a container one. The raw
+  // binding is never rendered as current: in a container project it does not launch.
+  if ('next' in d) return acctTok(d.next);
+  return undefined;
+}
+
+/** 'unknown' = no current fact, or a fact that names no account (render "account unknown —
+ *  checking" and re-read); 'known' = the server named the account. There is no third
+ *  state and no fallback: BUG-255 r3 deleted the client's own account chain for a session. */
+function accountFactState(sessionId) {
+  return sessionAccountOf(sessionId) === undefined ? 'unknown' : 'known';
+}
+
+/** The account a declared-but-not-current change is heading to, or undefined: a live
+ *  switch in progress (`switching.target`), or a binding that differs from the
+ *  running launch (the next message resumes on it). Shown as PENDING, never current. */
+function sessionAccountPending(sessionId) {
+  const d = currentAccountFact(sessionId);
+  if (!d) return undefined;
+  if (d.switching) return acctTok(d.switching.target ?? null);
+  // BUG-255 r4 — the running launch differs from what the next launch uses (`next`, the server's
+  // one decision): pending, the next message resumes on it.
+  if ('launch' in d && 'next' in d && acctTok(d.launch) !== acctTok(d.next)) return acctTok(d.next);
+  return undefined;
+}
+
+/** BUG-255 r3 — the account is unknown for the dock session: re-read it from the server
+ *  (backing off), until a current fact names it or the dock moves to another session. */
+let acctUnknownTimer = null;
+let acctUnknownTries = 0;
+function chaseUnknownAccount() {
+  const sid = dockSessionId();
+  if (!sid || accountFactState(sid) === 'known') { acctUnknownTries = 0; return; }
+  if (acctUnknownTimer) return;
+  const wait = [400, 800, 1500, 3000, 5000][Math.min(acctUnknownTries++, 4)];
+  acctUnknownTimer = setTimeout(async () => {
+    acctUnknownTimer = null;
+    if (dockSessionId() !== sid) return;
+    await refreshAccountFact(sid);
+    if (dockSessionId() === sid) { paintAccountSel(); chaseUnknownAccount(); }
+  }, wait);
+}
+
+/** Re-read the declared fact for `sid` (GET). Returns the fact, or null if the
+ *  read failed (the caller decides whether to retry). Never invents a fact. */
+async function refreshAccountFact(sid) {
+  if (!sid) return null;
+  try {
+    // BUG-255 r3 — tell the server where this tab opened the session, so it can place a
+    // session whose store dir is not its project's own and declare the account it resumes on.
+    const here = state.current?.sessionId === sid ? state.current : null;
+    const f = await api.getSessionAccountFact(sid, { projectId: here?.projectId ?? state.openProjectId ?? null, dir: here?.encodedDir ?? null });
+    if (acceptAccountFact(f)) onAccountFact(f);
+    return f;
+  } catch { return null; }
+}
+
+/** The sdk session id the dock is SHOWING (live or re-opened resumable), or null
+ *  when the dock is foreign (BUG-106) or holds no session (a fresh/next launch). */
+function dockSessionId() {
+  if (dockIsForeign()) return null;
+  return state.sdkSessionId || state.current?.sessionId || state.resumeOnNextSend || null;
+}
+
+/**
+ * FEAT-145 chain for a session that has NOT started yet — what the NEXT launch
+ * would bill to: an armed per-launch override (explicit `null` = the implicit
+ * default, NOT the project account — BUG-255 fixed the old `??` that collapsed
+ * it), else the project setting, else the default. The machine-wide default layer
+ * lives only on the server, so an inherited/unset value shows as the project
+ * default; the server resolves the real machine default when the launch happens.
+ */
+function nextLaunchAccountView() {
+  // A container project's account is project-scope only (FEAT-145): no per-launch
+  // override exists there, so none is read.
+  const o = accountLockedReason() ? {} : (state.overrides ?? {});
+  if ('claudeAccount' in o) return o.claudeAccount === null ? 'default' : (o.claudeAccount || 'default');
+  // BUG-255 r4 — the server declares the project's launch account (machine default under the
+  // project setting, effectiveLaunchAccount); the project setting alone is only a fallback for an
+  // older payload.
+  const cp = currentProject();
+  if (cp && 'launchAccount' in cp) return cp.launchAccount === null ? 'default' : (cp.launchAccount || 'default');
+  const proj = cp?.settings?.claudeAccount ?? null;
+  return typeof proj === 'string' && proj ? proj : 'default';
+}
+
+/*
  * BUG-198 — WHOSE overrides the in-memory bag holds, declared when the bag is
  * (re)loaded, never re-derived from the view. `state.overrides` is ONE bag shared
  * by reference (the drawer holds it), and it belongs to exactly one session: the
@@ -1115,7 +1277,11 @@ function restoreOverrides(encodedDir, sessionId) {
   // BUG-196 round 5 — stripped BEFORE the assign, so this is not even a transient
   // provider writer: pickProvider is the only one.
   if (saved && typeof saved === 'object') {
-    const { provider: _stale, ...rest } = saved;
+    // BUG-255 r3 — nor an ACCOUNT: an existing session's account is the server's fact
+    // (binding, else the project account), and a pick on it goes through the server.
+    // A stored per-session account is a leftover from before that rule; re-arming it
+    // was the second source the container break rendered (and a resume would honour).
+    const { provider: _stale, claudeAccount: _staleAcct, ...rest } = saved;
     Object.assign(state.overrides, rest);
     // BUG-196 round 6 — and heal STORAGE here too, not only when a pin lands: the
     // matrix found a stale provider left on disk whenever the pin never arrived
@@ -1123,7 +1289,7 @@ function restoreOverrides(encodedDir, sessionId) {
     // re-armed), but storage must not hold what no id may carry.
     // Written under THIS key directly: restore runs before openSession reassigns
     // state.current, so persistOverrides() would write under the OUTGOING session.
-    if ('provider' in saved) {
+    if ('provider' in saved || 'claudeAccount' in saved) {
       const all = ovrStore();
       const k = `${encodedDir ?? ''} ${sessionId}`;
       if (Object.keys(rest).length) all[k] = rest;
@@ -1232,7 +1398,7 @@ const drawer = createDrawer({
   pickSessionProvider: (next) => pickProvider(next),
   pickSessionAccount: (next) => pickAccount(next),
   notify: say,
-  openGit: () => void gitView?.open(),
+  openGit: (pid) => void gitView?.open(pid ? { projectId: pid } : {}),
   async refreshProject() {
     const p = await api.getProject(state.current.projectId);
     const i = state.projects.findIndex((x) => x.id === p.id);
@@ -1259,6 +1425,15 @@ gitView = createGitView({
   getProjects: () => state.projects,
   navigate: (id, options) => navGit(id, options),
   notify: say,
+  // FEAT-164 — the git pill's "Settings…" button closes the git overlay and opens
+  // the project Settings drawer scrolled/focused to the Agent git section. The panel
+  // may be showing a project other than the globally-selected one, so select it first.
+  openSettings: (focus, projectId) => {
+    if (projectId) selectProject(projectId);
+    window.history.pushState(null, '', gitReturnHash);
+    hideGit();
+    void drawer.open('settings', { focus });
+  },
   onStatusChanged(status, projectId) {
     const p = state.projects.find((candidate) => candidate.id === projectId) ?? null;
     if (!p || !status) return;
@@ -2360,6 +2535,15 @@ function renderSearch(raw) {
   const text = pq.text;
   if (scopeIds && !state.sessions.get(pq.project.id)?.loaded) void loadSessions(pq.project.id);
 
+  // FEAT-189 — the dispatched/agent lanes (and external programmatic sessions)
+  // an orchestrator fills a project with carry ticket ids as titles and bury the
+  // human's own sessions. "Lane" is the server's declared `foldByDefault` fact
+  // (foldsFromList — the SAME signal the nav list folds on, ARCH-010), which
+  // covers agent lanes AND provenance-less sdk-cli sessions; ranking on the
+  // narrower startedBy would mis-rank the latter as the user's own. The toggle
+  // drops lanes entirely; by default they are KEPT but ranked below (undefined = shown).
+  const includeLanes = state.searchIncludeLanes !== false;
+  let laneMatches = 0; // folded-by-default titles that matched, before any filter
   const hits = [];
   for (const p of state.projects) {
     if (scopeIds && !scopeIds.has(p.id)) continue;
@@ -2367,10 +2551,23 @@ function renderSearch(raw) {
     if (!s?.loaded) continue;
     for (const sess of s.list) {
       // An empty scoped query ("#proj ") lists the whole project.
-      if (!text || rowTitle(sess).toLowerCase().includes(text)) hits.push({ p, sess });
-      if (hits.length >= 300) break;
+      if (text && !rowTitle(sess).toLowerCase().includes(text)) continue;
+      const lane = foldsFromList(sess) ? 1 : 0;
+      if (lane) laneMatches++;
+      if (lane && !includeLanes) continue;
+      hits.push({
+        p, sess, lane,
+        // An empty query lists the project in recency order (rank is constant).
+        rank: text ? titleMatchRank(rowTitle(sess), text) : 0,
+        rk: recencyKey(sess),
+      });
     }
   }
+  // Relevance first, then user-started above lanes, then recency — the ordering
+  // the old code lacked (it rendered s.list recency order, origin-blind). Only
+  // meaningful for a text query; an empty scoped list stays pure recency.
+  if (text) hits.sort(compareSessionHits);
+  if (hits.length > 300) hits.length = 300;
   // FEAT-147 — plain-text search also surfaces PROJECTS, above the session
   // hits. The reported need: reach a project (e.g. to start a new session in
   // it) by typing part of its name, without knowing the "#" scope grammar or
@@ -2394,6 +2591,20 @@ function renderSearch(raw) {
   node.tree.append(el('div', { class: 'search-section', text: 'Sessions' }));
   node.tree.append(el('div', { class: 'found-l', text:
     `${hits.length} ${scopeIds ? `in #${pq.project.name}` : `of ${total} sessions`}` }));
+  // FEAT-189 — the dispatched-lane toggle. Shown whenever a text query matched
+  // at least one agent lane, so the control only appears when it does something.
+  // Default keeps lanes (ranked below); clicking hides them. One control governs
+  // both this list and the Messages group below (searchIncludeLanes).
+  if (text && laneMatches > 0) {
+    const includeLanes = state.searchIncludeLanes !== false;
+    const ctl = el('div', { class: 'cs-ctl' });
+    const pill = el('button', { class: `cs-pill${includeLanes ? '' : ' off'}`, text:
+      includeLanes ? `dispatched lanes shown (${laneMatches})` : `dispatched lanes hidden (${laneMatches})` });
+    pill.title = 'Dispatched/agent worker lanes rank below your own sessions. Click to hide them entirely.';
+    pill.addEventListener('click', () => { state.searchIncludeLanes = !includeLanes; renderTree(); });
+    ctl.append(pill);
+    node.tree.append(ctl);
+  }
   if (!state.searchLoaded && !scopeIds) node.tree.append(el('div', { class: 'hint-row', text: 'indexing the rest…' }));
   for (const { p, sess } of hits) {
     const row = sessionRow(p, sess); // already carries its own .when
@@ -2561,13 +2772,34 @@ function renderContentSearch(q) {
   for (const h of shown) {
     const key = `${h.projectId}\0${h.encodedDir}\0${h.sessionId}`;
     let g = bySession.get(key);
-    if (!g) { g = { key, hits: [] }; bySession.set(key, g); groups.push(g); }
+    if (!g) { g = { key, hits: [], lane: searchHitIsLane(h) ? 1 : 0 }; bySession.set(key, g); groups.push(g); }
     g.hits.push(h);
   }
-  for (const g of groups.slice(0, cs.visibleGroups)) node.tree.append(searchHitGroup(g, cs));
-  if (groups.length > cs.visibleGroups) {
-    const more = el('button', { class: 'cs-more', text: `Show ${groups.length - cs.visibleGroups} more session${groups.length - cs.visibleGroups === 1 ? '' : 's'}` });
-    more.addEventListener('click', () => { cs.visibleGroups = groups.length; renderTree(); });
+  // FEAT-189 — same origin rule as the Sessions list: a lane's message hits rank
+  // below the user's own sessions (and drop out entirely when the shared toggle
+  // hides lanes). The server already ordered hits by relevance within a session;
+  // this is a STABLE partition on the declared `foldByDefault` fact, so relevance
+  // order is preserved inside each band.
+  const includeLanes = state.searchIncludeLanes !== false;
+  let laneGroups = 0;
+  for (const g of groups) if (g.lane) laneGroups++;
+  const visibleGroups = (includeLanes ? groups : groups.filter((g) => !g.lane))
+    .map((g, i) => ({ g, i }))
+    .sort((a, b) => (a.g.lane - b.g.lane) || (a.i - b.i))
+    .map((x) => x.g);
+  if (laneGroups > 0) {
+    const ctl = el('div', { class: 'cs-ctl' });
+    const pill = el('button', { class: `cs-pill${includeLanes ? '' : ' off'}`, text:
+      includeLanes ? `dispatched lanes shown (${laneGroups})` : `dispatched lanes hidden (${laneGroups})` });
+    pill.title = 'Dispatched/agent worker lanes rank below your own sessions. Click to hide them entirely.';
+    pill.addEventListener('click', () => { state.searchIncludeLanes = !includeLanes; renderTree(); });
+    ctl.append(pill);
+    node.tree.append(ctl);
+  }
+  for (const g of visibleGroups.slice(0, cs.visibleGroups)) node.tree.append(searchHitGroup(g, cs));
+  if (visibleGroups.length > cs.visibleGroups) {
+    const more = el('button', { class: 'cs-more', text: `Show ${visibleGroups.length - cs.visibleGroups} more session${visibleGroups.length - cs.visibleGroups === 1 ? '' : 's'}` });
+    more.addEventListener('click', () => { cs.visibleGroups = visibleGroups.length; renderTree(); });
     node.tree.append(more);
   }
   if (r.truncated) node.tree.append(el('div', { class: 'hint-row cs-truncated', text: 'More message matches exist than the search returned — refine the query to see them.' }));
@@ -2578,6 +2810,17 @@ function searchHitTitle(h) {
   const s = state.sessions.get(h.projectId);
   const row = s?.list?.find((x) => x.sessionId === h.sessionId && x.encodedDir === h.encodedDir);
   return row ? rowTitle(row) : h.sessionId.slice(0, 8);
+}
+
+/* FEAT-189 — whether a content-search hit's session is a LANE (folded by default:
+   a dispatched/agent lane or an external programmatic session), read from the
+   loaded row's server-surfaced `foldByDefault` fact via foldsFromList (never
+   re-derived — ARCH-010). An unloaded row is treated as NOT a lane (the safe,
+   server-matching default that keeps the user's own sessions visible). */
+function searchHitIsLane(h) {
+  const s = state.sessions.get(h.projectId);
+  const row = s?.list?.find((x) => x.sessionId === h.sessionId && x.encodedDir === h.encodedDir);
+  return row ? foldsFromList(row) : false;
 }
 
 function searchHitGroup(g, cs) {
@@ -3852,66 +4095,199 @@ function setModelLive(value) {
  * the resume. `next` is the picker choice: `undefined` = inherit the project's
  * account, `null` = the default (~/.claude) account, a string = that account id.
  */
-function switchAccountLive(next) {
+function switchAccountLive(next, target = null) {
   if (acctPending) return say('still waiting on the last account switch', true);
   /*
    * FEAT-160 round 4 — send the RAW picker choice; the SERVER resolves it. An
    * "inherit / Project default" pick (`next === undefined`) must NOT be resolved
    * here: the full chain is the project setting UNDER the machine-wide default,
    * and the machine-default layer lives only on the server (global-settings).
-   * The old client resolution `project.settings.claudeAccount ?? null` omitted
-   * it, so picking "Project default" on a session billing the machine default
-   * bound ~/.claude instead — an un-correctable mis-bill. So: `inherit:true` for
-   * the inherit pick (the server resolves it exactly as a fresh session would),
-   * else the concrete choice (`null` = default, or an account id).
+   * So: `inherit:true` for the inherit pick, else the concrete choice (`null` =
+   * default, or an account id).
+   *
+   * BUG-255 — `target` names the session for an OFFLINE rebind over the socket
+   * (the server classifies it by its own lifetime authorities). When `target` is
+   * null this is the classic live switch on this socket's own session.
+   *
+   * BUG-255 r2 — nothing here (nor the ack, nor its absence) changes what the
+   * indicator shows: it renders only the server's pushed account fact, which
+   * marks this switch "switching…" while the server works on it.
    */
   const inherit = next === undefined;
   const account = inherit ? null : next; // concrete pick; ignored by the server when inherit
   const requestId = `acc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  if (!send({ type: 'switch-account', requestId, account, inherit })) {
+  const frame = { type: 'switch-account', requestId, account, inherit };
+  if (target) { frame.sessionId = target.sessionId; frame.encodedDir = target.encodedDir; frame.projectId = target.projectId; }
+  if (!send(frame)) {
     return say('account unchanged — no live connection, nothing was sent', true);
   }
-  acctPending = { requestId, next, account };
-  acctPending.timer = setTimeout(() => finishAccountSwitch(requestId, false,
-    'the server never confirmed — this session is still running on the old account'), 8000);
-  // The resolved account comes back on the ack (the server owns the chain); for an
-  // inherit pick we cannot name it yet, so say the generic target.
+  const sid = target?.sessionId ?? dockSessionId();
+  acctPending = { requestId, sid, next, account, offline: !!target, unknown: false };
+  // BUG-255 r2 — no ack in time is OUTCOME UNKNOWN: ask the server, never assume.
+  acctPending.timer = setTimeout(() => accountOutcomeUnknown(requestId), 8000);
+  const verb = target ? 'switching this session to' : 'switching the running session to';
   say(inherit
-    ? 'switching the running session to the project default account…'
-    : `switching the running session to ${acctShortName(account ?? 'default')}…`);
+    ? `${verb} the project default account…`
+    : `${verb} ${acctShortName(account ?? 'default')}…`);
   closePops();
   paintAccountSel();
 }
 
 /**
- * Settle a live account switch. `ok` is the server's word. On success the old CLI
- * was already reaped server-side, so we arm the new account override and re-arm
- * the resume — the transcript is intact and the NEXT message resumes the same
- * session id under the new account (we never invent a turn, same rule as
- * reconnectDropped). On failure the old session is still running, untouched.
+ * BUG-255 — switch the account of a session the server owns an account for that
+ * is NOT live on this socket (a re-opened resumable session, or one another tab
+ * drives). It has no ws to send over, so this goes over the HTTP route; the server
+ * rebinds a proven-stopped session durably and refuses visibly for anything still
+ * running.
+ *
+ * BUG-255 r2 — the response NEVER changes the indicator (the server pushes the
+ * new fact to every tab, this one included). A server refusal (a JSON
+ * `{ok:false,error}` body) is reported as a refusal; anything else — a network
+ * error, a reset connection, a non-JSON reply, no reply in time — is OUTCOME
+ * UNKNOWN, which re-reads the server's fact and is never shown as a refusal.
  */
-function finishAccountSwitch(requestId, ok, why, account = null, sessionId = null) {
+async function rebindAccountOffline(sid, next) {
+  if (acctPending) return say('still waiting on the last account switch', true);
+  const inherit = next === undefined;
+  const requestId = `rebind-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const body = {
+    account: inherit ? null : (next ?? null),
+    inherit,
+    encodedDir: state.current?.encodedDir ?? null,
+    projectId: currentProject()?.id ?? state.openProjectId ?? null,
+    requestId,
+  };
+  acctPending = { requestId, sid, next, account: body.account, offline: true, unknown: false };
+  acctPending.timer = setTimeout(() => accountOutcomeUnknown(requestId), 10_000);
+  closePops();
+  paintAccountSel();
+  say(inherit ? 'switching this session to the project default account…' : `switching this session to ${acctShortName(body.account ?? 'default')}…`);
+  try {
+    const r = await api.rebindSessionAccount(sid, body);
+    if (r && typeof r.ok === 'boolean') finishAccountSwitch(requestId, r.ok, r.error || 'the server declined the account switch', r.account ?? null, sid, true);
+    else accountOutcomeUnknown(requestId);
+  } catch (err) {
+    const b = err && err.body;
+    if (b && b.ok === false && typeof b.error === 'string') {
+      // The server's own word: a refusal (bad/unready account, container, running elsewhere).
+      finishAccountSwitch(requestId, false, b.error, null, sid, true);
+    } else {
+      accountOutcomeUnknown(requestId);
+    }
+  }
+}
+
+/**
+ * BUG-255 r2 — this tab's switch request got no answer it can trust (a lost or
+ * late ack). Say so — "switch status unknown — checking" — and resolve it ONLY
+ * from the server's declared fact, which records each switch outcome under the
+ * requestId. Never reported as a refusal; the indicator keeps rendering the fact.
+ */
+function accountOutcomeUnknown(requestId) {
+  if (!acctPending || acctPending.requestId !== requestId || acctPending.unknown) return;
+  clearTimeout(acctPending.timer);
+  acctPending.unknown = true;
+  acctPending.checkUntil = Date.now() + 30_000;
+  acctPending.checks = 0;
+  say('switch status unknown — checking with the server…', true);
+  paintAccountSel();
+  void checkAccountOutcome(requestId);
+}
+
+const ACCT_CHECK_BACKOFF_MS = [300, 700, 1500, 2500, 4000];
+async function checkAccountOutcome(requestId) {
+  const p = acctPending;
+  if (!p || p.requestId !== requestId) return; // resolved (by a push or an earlier read)
+  await refreshAccountFact(p.sid); // onAccountFact settles it if the server recorded this request
+  if (acctPending !== p) return;
+  if (Date.now() > p.checkUntil) {
+    acctPending = null;
+    say('the server has no record of that account switch reaching it — the indicator shows the account the server says this session is on', true);
+    paintAccountSel();
+    return;
+  }
+  const wait = ACCT_CHECK_BACKOFF_MS[Math.min(p.checks++, ACCT_CHECK_BACKOFF_MS.length - 1)];
+  p.timer = setTimeout(() => void checkAccountOutcome(requestId), wait);
+}
+
+/**
+ * BUG-255 r2 — a declared account fact was accepted into the store (push, re-read
+ * or transcript). Repaint the indicator if it is the dock's session, and settle
+ * this tab's own in-flight switch from the server's RECORD of it (`last`), which
+ * is how a late or lost ack still resolves to the true outcome.
+ */
+function onAccountFact(f) {
+  // BUG-255 r3 — the outcome of THIS tab's request is read from `recent` (the last few
+  // outcomes), so a concurrent pick's outcome landing in `last` cannot hide ours.
+  const mine = acctPending && acctPending.sid === f.sessionId
+    ? [f.last, ...(Array.isArray(f.recent) ? f.recent : [])].find((o) => o && o.requestId === acctPending.requestId)
+    : null;
+  if (mine) {
+    const ok = mine.outcome === 'switched';
+    // 'failed' (r3: the stop failed — the switch did NOT happen, the binding was put back)
+    // and 'refused' are both "not switched"; the reason says which and why.
+    const why = mine.reason || (mine.outcome === 'failed' ? 'the account switch failed — the session stays on its current account' : 'the server declined the account switch');
+    finishAccountSwitch(acctPending.requestId, ok, why, mine.account ?? null, f.sessionId, acctPending.offline, mine.stopped === true);
+    return; // finishAccountSwitch repaints
+  }
+  // A fact from a NEWER boot makes every older-boot fact non-current, the dock's included.
+  const dock = dockSessionId();
+  if (dock && dock !== f.sessionId && !currentAccountFact(dock)) { paintAccountSel(); return; }
+  if (f.sessionId === dockSessionId()) {
+    paintAccountSel();
+    if (acctPop?.classList.contains('open')) paintAcctPop();
+    paintUsageChip();
+  }
+}
+
+/**
+ * Settle this tab's account switch. `ok` is the server's word (its ack, or its
+ * recorded outcome in the declared fact). BUG-255 r2 — this NEVER writes the
+ * account store: the indicator renders only the server's pushed fact. It reports
+ * the outcome and, for a confirmed LIVE switch, runs the flow side effects (the
+ * old CLI was reaped; the same session resumes on the next message).
+ */
+function finishAccountSwitch(requestId, ok, why, account = null, sessionId = null, rebound = false, stopped = false) {
   if (!acctPending || acctPending.requestId !== requestId) return;
   clearTimeout(acctPending.timer);
-  const chosen = acctPending.next; // undefined | null | id
-  const acctLabel = acctPending.account; // the resolved account this switch targeted
+  const acctLabel = acctPending.account; // the account this switch targeted
+  const wasOffline = acctPending.offline;
+  const sid = sessionId || acctPending.sid || state.sdkSessionId || state.current?.sessionId || null;
   acctPending = null;
-  if (!ok) { paintAccountSel(); return say(why || 'account switch declined — the session is still on the old account', true); }
-  // Arm the override exactly as pickAccount would, so the resume carries it.
-  if (chosen === undefined) delete state.overrides.claudeAccount;
-  else state.overrides.claudeAccount = chosen;
-  persistOverrides();
-  // The old CLI is gone: re-arm the resume like reconnectDropped (no invented turn).
-  const resume = sessionId || state.sdkSessionId;
-  state.live = false;
-  if (resume) {
-    state.resumeOnNextSend = resume;
-    const th = mainThread();
-    th.paneEl.append(el('div', { class: 'ran-lbl', text: `account switched · resuming session ${resume.slice(0, 8)} on your next message` }));
-    paintComposerFor(viewedThread());
+  // Re-read the fact either way: the push normally beats this, but the re-read
+  // guarantees the indicator converges even if that push was missed.
+  if (sid) void refreshAccountFact(sid);
+  if (!ok) {
+    // BUG-255 r3 — a failed live switch whose stop had already torn the bridge down: the
+    // server reaped the old process, so this tab is no longer live; the same session
+    // resumes (on its CURRENT account — the binding was put back) on the next message.
+    if (stopped && !wasOffline && sid) {
+      state.live = false;
+      state.resumeOnNextSend = sid;
+      paintComposerFor(viewedThread());
+    }
+    paintAccountSel();
+    return say(why || 'account switch declined — the session stays on its current account', true);
   }
+  // A stale client override for this session would only be dropped on resume;
+  // clear it so nothing lingers that disagrees with the server's binding.
+  delete state.overrides.claudeAccount;
+  persistOverrides();
   const name = acctShortName((account ?? acctLabel) ?? 'default');
-  say(`Claude account switched to ${name} — your next message resumes this session on it`);
+  if (rebound || wasOffline) {
+    say(`Claude account switched to ${name} — this session resumes on it on your next message`);
+  } else {
+    // LIVE switch: the old CLI was reaped; the SAME session resumes under the new
+    // account on the next message (we never invent a turn — the reconnectDropped rule).
+    state.live = false;
+    if (sid) {
+      state.resumeOnNextSend = sid;
+      const th = mainThread();
+      th.paneEl.append(el('div', { class: 'ran-lbl', text: `account switched · resuming session ${sid.slice(0, 8)} on your next message` }));
+      paintComposerFor(viewedThread());
+    }
+    say(`Claude account switched to ${name} — your next message resumes this session on it`);
+  }
   paintSessStatus();
   paintAccountSel();
   paintAcctPop();
@@ -4217,13 +4593,174 @@ function resetTranscript() {
   return adoptQueueRows();
 }
 
-function youBubble(th, text) {
+function youBubble(th, text, attachments) {
   th.paneEl.querySelector(':scope > .waiting')?.remove();
-  const w = el('div', { class: 'you' }, el('p', { text }));
+  const kids = [];
+  if (text || !attachments || !attachments.length) kids.push(el('p', { text: text ?? '' }));
+  const w = el('div', { class: 'you' }, ...kids);
+  // FEAT-177: render staged/sent attachment thumbnails inside the user bubble.
+  if (attachments && attachments.length) {
+    const row = el('div', { class: 'att' });
+    for (const a of attachments) row.append(attachmentEl(a));
+    w.append(row);
+  }
   th.paneEl.append(w);
   th.claudeBody = null;
   th.stream = null;
   return w;
+}
+
+/**
+ * FEAT-177 — one renderable element for an attachment, used by both the live
+ * user bubble and the reloaded transcript. `a` may be a staged ref (localUrl),
+ * a sent ref ({uploadId, projectId}), or a transcript block attachment
+ * ({dataUrl} | {uploadId, projectId}).
+ */
+function attachmentEl(a) {
+  const kind = a.kind || (a.mediaType && a.mediaType.startsWith('image/') ? 'image' : 'document');
+  const src = a.dataUrl || a.localUrl
+    || (a.uploadId && a.projectId ? `/api/uploads/${encodeURIComponent(a.projectId)}/${encodeURIComponent(a.uploadId)}` : null);
+  if (kind === 'image' && src) {
+    return el('img', { class: 'att-img', src, alt: a.name || 'attached image', loading: 'lazy' });
+  }
+  const ext = (a.mediaType === 'application/pdf') ? 'PDF' : (kind === 'text' ? 'TXT' : 'FILE');
+  const children = [el('span', { class: 'ficon', text: ext }), el('span', { class: 'nm', text: a.name || 'attachment' })];
+  if (typeof a.bytes === 'number') children.push(el('span', { class: 'sz', text: humanBytes(a.bytes) }));
+  if (src) return el('a', { class: 'att-file', href: src, target: '_blank', rel: 'noopener' }, ...children);
+  return el('span', { class: 'att-file' }, ...children);
+}
+
+function humanBytes(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1048576).toFixed(1)} MB`;
+}
+
+/* ======================================================================
+ * FEAT-177 — composer attachments (paste / drag-drop / attach button)
+ *
+ * Staged attachments live in `state.attachments`, each an uploaded REFERENCE
+ * ({uploadId, projectId, mediaType, kind, name, bytes}) plus a transient
+ * `localUrl` for the thumbnail. Bytes are uploaded to the server's blob store
+ * BEFORE the chip settles, so a send carries only references. Caps mirror the
+ * server (which re-checks): a refusal is shown loudly, never a silent drop.
+ * ==================================================================== */
+const ATT_MAX_BYTES = 5 * 1024 * 1024;
+const ATT_MAX_COUNT = 20;
+
+function attState() { return (state.attachments ??= []); }
+
+function attInit() {
+  // Attach button → hidden file input.
+  node.attachBtn?.addEventListener('click', () => node.fileInput?.click());
+  node.fileInput?.addEventListener('change', () => {
+    if (node.fileInput.files?.length) void attAddFiles(node.fileInput.files);
+    node.fileInput.value = '';
+  });
+  // Paste: harvest image/file items. NEVER preventDefault — ordinary text paste
+  // must still work, including a mixed text+image clipboard (review #10).
+  node.prompt?.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) { if (it.kind === 'file') { const f = it.getAsFile(); if (f) files.push(f); } }
+    if (files.length) void attAddFiles(files);
+  });
+  // Drag-drop onto the composer box only (scoped — review #10).
+  const box = node.box;
+  if (box) {
+    box.addEventListener('dragover', (e) => { if (e.dataTransfer?.types?.includes('Files')) { e.preventDefault(); box.classList.add('dragover'); } });
+    box.addEventListener('dragleave', (e) => { if (e.target === box) box.classList.remove('dragover'); });
+    box.addEventListener('drop', (e) => {
+      if (!e.dataTransfer?.files?.length) return;
+      e.preventDefault();
+      box.classList.remove('dragover');
+      void attAddFiles(e.dataTransfer.files);
+    });
+  }
+}
+
+async function attAddFiles(fileList) {
+  const p = currentProject();
+  if (!p) { say('pick a project before attaching a file', true); return; }
+  const files = [...fileList];
+  for (const file of files) {
+    if (attState().length >= ATT_MAX_COUNT) { say(`you can attach at most ${ATT_MAX_COUNT} files per message`, true); break; }
+    if (file.size > ATT_MAX_BYTES) { say(`"${file.name}" is ${(file.size / 1048576).toFixed(1)} MB — the limit is ${ATT_MAX_BYTES / 1048576} MB per file`, true); continue; }
+    if (file.size === 0) { say(`"${file.name}" is empty`, true); continue; }
+    // A pending placeholder chip, replaced when the upload settles.
+    const pending = { pendingId: `p-${Math.random().toString(36).slice(2)}`, name: file.name, bytes: file.size, kind: file.type?.startsWith('image/') ? 'image' : 'document', localUrl: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null, pending: true };
+    attState().push(pending);
+    attRenderChips();
+    try {
+      const ref = await attUpload(p.id, file);
+      const i = attState().findIndex((a) => a.pendingId === pending.pendingId);
+      if (i >= 0) attState()[i] = { ...ref, localUrl: pending.localUrl };
+      attRenderChips();
+    } catch (err) {
+      const i = attState().findIndex((a) => a.pendingId === pending.pendingId);
+      if (i >= 0) { attState()[i].pending = false; attState()[i].failed = true; }
+      attRenderChips();
+      say(`could not attach "${file.name}": ${err.message}`, true);
+      // Drop the failed chip after a moment so a stale failure never rides a send.
+      setTimeout(() => { attRemove(pending.pendingId); }, 3000);
+    }
+  }
+}
+
+async function attUpload(projectId, file) {
+  const buf = await file.arrayBuffer();
+  const res = await fetch(`/api/uploads?projectId=${encodeURIComponent(projectId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/octet-stream', 'X-Upload-Name': encodeURIComponent(file.name || 'attachment') },
+    body: buf,
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `upload failed (${res.status})`);
+  return body; // AttachmentRef
+}
+
+function attRenderChips() {
+  const host = node.chips;
+  if (!host) return;
+  host.textContent = '';
+  const list = attState();
+  host.hidden = list.length === 0;
+  for (const a of list) {
+    const key = a.pendingId || a.uploadId;
+    const thumb = (a.kind === 'image' && (a.localUrl || a.uploadId))
+      ? el('img', { class: 'thumb', src: a.localUrl || `/api/uploads/${encodeURIComponent(a.projectId)}/${encodeURIComponent(a.uploadId)}`, alt: '' })
+      : el('span', { class: 'ficon', text: a.mediaType === 'application/pdf' ? 'PDF' : a.kind === 'text' ? 'TXT' : 'FILE' });
+    const chip = el('div', { class: `chip${a.pending ? ' pending' : ''}${a.failed ? ' failed' : ''}` },
+      thumb,
+      el('div', { class: 'meta' }, el('span', { class: 'nm', text: a.name || 'attachment' }), el('span', { class: 'sz', text: a.failed ? 'failed' : a.pending ? 'uploading…' : humanBytes(a.bytes) })),
+      el('span', { class: 'rm', text: '×', title: 'Remove', role: 'button' }),
+    );
+    chip.querySelector('.rm').addEventListener('click', () => attRemove(key));
+    host.append(chip);
+  }
+}
+
+function attRemove(key) {
+  const list = attState();
+  const i = list.findIndex((a) => (a.pendingId || a.uploadId) === key);
+  if (i >= 0) { if (list[i].localUrl) { try { URL.revokeObjectURL(list[i].localUrl); } catch { /* ignore */ } } list.splice(i, 1); }
+  attRenderChips();
+}
+
+/** The reference array to put on a send/start frame (settled, non-failed only). */
+function attRefsForSend() {
+  return attState().filter((a) => !a.pending && !a.failed && a.uploadId).map((a) => ({ uploadId: a.uploadId, projectId: a.projectId, mediaType: a.mediaType, kind: a.kind, name: a.name, bytes: a.bytes }));
+}
+
+/** Are any attachments still uploading? A send must wait for them (review #10). */
+function attPending() { return attState().some((a) => a.pending); }
+
+function attClear() {
+  for (const a of attState()) { if (a.localUrl) { try { URL.revokeObjectURL(a.localUrl); } catch { /* ignore */ } } }
+  state.attachments = [];
+  attRenderChips();
 }
 
 /*
@@ -5639,8 +6176,9 @@ function usageTier(pct) {
 function usageFaceSnap(list) {
   const provider = providerView();
   return provider === 'anthropic'
-    ? (list.find((s) => s.provider === 'anthropic' && (s.accountId ?? 'default') === claudeAccountView())
-      ?? list.find((s) => s.provider === 'anthropic'))
+    // BUG-255 r4 — the snapshot of the account the server declares, and no other: an unknown
+    // account shows no reading (never a different account's window).
+    ? (() => { const acct = claudeAccountView(); return acct === undefined ? undefined : list.find((s) => s.provider === 'anthropic' && (s.accountId ?? 'default') === acct); })()
     : list.find((s) => s.provider === provider);
 }
 
@@ -6325,6 +6863,7 @@ function renderMessages(th, messages) {
     const useful = (m.blocks ?? []).filter(
       (b) => (b.type === 'text' && b.text?.trim())
         || b.type === 'tool_use'
+        || b.type === 'attachment' // FEAT-177 — a user-message image/file attachment
         || (b.type === 'thinking' && b.text?.trim()),
     );
     if (!useful.length) continue;
@@ -6355,6 +6894,13 @@ function renderMessages(th, messages) {
  */
 function renderBlockEntry(th, m, b, mark) {
   if (m.role === 'user') {
+    // FEAT-177 — a reloaded attachment block renders as a thumbnail/chip bubble.
+    if (b.type === 'attachment' && b.attachment) {
+      const w = el('div', { class: 'you' }, el('div', { class: 'att' }, attachmentEl(b.attachment)));
+      th.paneEl.append(w);
+      th.claudeBody = null; th.stream = null;
+      return stampTime(mark(w), m.timestamp);
+    }
     if (b.type !== 'text') return null;
     // BUG-028: a shutdown-cut interrupt marker is NOT the user's message —
     // caption it with its real cause instead of putting words (a stop) in
@@ -6505,6 +7051,10 @@ async function loadRecordedAgents(th, sessionId) {
 /* ---------------------------------------------------------- open a session */
 
 async function openSession(p, sess, opts = {}) {
+  // BUG-252 — opening a session is a navigation: a link still resolving must not
+  // take the view back afterwards (the route chokepoint, applyRoute). The route's
+  // OWN open passes its generation and is not a new navigation.
+  if (opts.routeGen == null || opts.routeGen !== nav.routeGen) nav.routeGen++;
   // FEAT-171 — opening a session (from the drawer, the finder, a route…) puts
   // the phone drawer away so the conversation is what the user sees.
   if (node.win.classList.contains('nav-open')) setNavOpen(false);
@@ -6524,6 +7074,11 @@ async function openSession(p, sess, opts = {}) {
     os: sess.os,
     closed: api.closedOf(sess), // FEAT-168 — drives the crown Close/Reopen control
   };
+  // BUG-255 r2 — the account indicator for THIS session renders only the server's
+  // declared fact; until it arrives (the transcript tail carries it; this re-read
+  // races it, newest rev wins) the indicator says "checking…", never a guess from
+  // the sidebar row, the previous session, or a restored override.
+  void refreshAccountFact(sess.sessionId);
   // BUG-106 — record the project that OWNS this now-open session, distinct from
   // the sidebar selection. A later bare selectProject moves current.projectId but
   // not this, which is how the dock's surfaces know they are foreign to the view.
@@ -6585,6 +7140,10 @@ async function openSession(p, sess, opts = {}) {
     // server declared it (resumeProviderOf). Keyed by the id, so it is true
     // whatever is on screen when it lands — recorded BEFORE the scope guard.
     declareLockedProvider(sess.sessionId, t.lockedProvider);
+    // BUG-255 r2 — the server's declared, versioned account fact for this session
+    // (launch / binding / switch state). Accepted by rev, keyed by the id, BEFORE
+    // the scope guard, so it is true whatever is on screen when the fetch lands.
+    if (t.accountFact && acceptAccountFact(t.accountFact)) onAccountFact(t.accountFact);
     // BUG-087 — switched away while this fetch was in flight: the pane now belongs
     // to a different session (resetTranscript already cleared it and bumped the
     // scope). Drop this answer rather than paint the prior session's transcript
@@ -8046,7 +8605,7 @@ function ticketCard(x) {
     title: `${it.id} — ${it.title}${isNeeds ? (answerable ? ' · click to answer' : ' · needs you (read-only)') : ' · open ticket'}`,
   });
   // FEAT-157: Orchard's base notice has no ticket id worth reading; it is named for what it is.
-  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.baseUpdate ? (it.baseUpdate.security ? 'Orchard base · security' : 'Orchard base') : it.id }));
+  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.baseUpdate ? (it.baseUpdate.security ? 'Orchard base · security' : 'Orchard base') : it.grantRebuild ? 'Container · git grant' : it.id }));
   const mark = ncSevMark(it.sev);
   if (mark) top.append(mark);
   card.append(top);
@@ -8322,7 +8881,7 @@ function renderRailSummary() {
     focusRow.append(el('span', { class: 'rs-glyph', text: isNeeds ? '👤' : '🤖' }));
     const body = [
       // FEAT-157: Orchard's base notice is named for what it is, not by its internal id.
-      el('span', { class: 'rs-id', text: fit?.baseUpdate ? 'Orchard base' : focus.id }),
+      el('span', { class: 'rs-id', text: fit?.baseUpdate ? 'Orchard base' : fit?.grantRebuild ? 'Container · git grant' : focus.id }),
       el('span', { class: 'rs-ft', text: focus.title }),
     ];
     if (isTicket) {
@@ -8574,6 +9133,7 @@ function railMoreRow(n, label) {
 /** Category of a rail item, as a short hue-independent tag. */
 function ncKindOf(it) {
   if (it.baseUpdate) return { kt: 'base', tag: 'BASE', word: 'Orchard base update' };
+  if (it.grantRebuild) return { kt: 'git', tag: 'GIT', word: 'container rebuild for a git-write grant' }; // FEAT-175
   if (it.gitWrite) return { kt: 'git', tag: 'GIT', word: 'git-write request' };
   if (it.services) return { kt: 'svc', tag: 'SVC', word: 'services request' };
   if (it.kind === 'decision') return { kt: 'dec', tag: 'DEC', word: 'runtime decision' };
@@ -8943,9 +9503,48 @@ function needsBaseCard(it) {
   return makeCollapsible(card, it);
 }
 
+/**
+ * FEAT-175 — a git-grant container rebuild notice: it failed, it is blocked by work it would stop, or
+ * git writes have run past a grant's end for 10+ minutes. Derived by the server on every read; answered
+ * only through the grant-rebuild route (Retry now / Rebuild now, which stops the blocking work).
+ */
+function needsGrantRebuildCard(it) {
+  const g = it.grantRebuild;
+  const err = el('span', { class: 'nc-err' });
+  const card = el('div', { class: `needs-card decision grant-rebuild${it.sev === 'high' ? ' security' : ''}`, 'data-id': it.id, 'data-kind': 'grant-rebuild' },
+    el('div', { class: 'nc-head' },
+      el('span', { class: 'nc-id', text: 'Container · git grant' }),
+      el('span', { class: 'nc-sev', text: it.sev || '' })),
+    el('div', { class: 'nc-title', text: it.title }),
+    el('div', { class: 'nc-question', text: it.question || '' }));
+  const row = el('div', { class: 'nc-opts' });
+  for (const a of (g.actions || [])) {
+    const b = el('button', { class: `nc-opt gr-${a.id}`, type: 'button', text: a.label, 'data-action': a.id,
+      title: a.id === 'force' ? 'Close the sessions that block it (they resume on their next message) and stop what they run, then recreate the container.' : 'Try the rebuild again now (still only when no session is working).' });
+    b.addEventListener('click', async () => {
+      for (const x of row.querySelectorAll('button')) x.disabled = true;
+      err.textContent = '';
+      try {
+        const r = await api.grantRebuild(g.projectId, a.id === 'force');
+        // FEAT-175: the server's own word for what this press did (it is never kept for later).
+        say(r?.outcome || (a.id === 'force' ? 'rebuild requested' : 'retrying the container rebuild'), r?.ok === false);
+      } catch (e) {
+        err.textContent = e.message;
+        for (const x of row.querySelectorAll('button')) x.disabled = false;
+      }
+      void refreshRail(true);
+    });
+    row.append(b);
+  }
+  card.append(row, el('div', { class: 'nc-form' }, el('div', { class: 'nc-acts' }, err)));
+  return makeCollapsible(card, it);
+}
+
 function needsCard(it) {
   // FEAT-157: Orchard's base-update notice has its own card and answer route.
   if (it.baseUpdate) return needsBaseCard(it);
+  // FEAT-175: a git-grant container rebuild notice has its own card and route.
+  if (it.grantRebuild) return needsGrantRebuildCard(it);
   // BUG-046: a stalled-work advisory is read-only and actionless — its own row.
   if (it.kind === 'stall') return needsStallRow(it);
   // FEAT-047: a consolidation finding is read-only + dismissible — its own row.
@@ -9188,6 +9787,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('focus', () => { void refreshRail(true); });
 
 function startNew(projectId) {
+  nav.routeGen++; // BUG-252 — a navigation: supersede any pending route resolution
   // FEAT-171 — a new session, like an opened one, puts the phone drawer away.
   if (node.win.classList.contains('nav-open')) setNavOpen(false);
   saveDraft(state.current); // BUG-083 — keep the outgoing session's draft before we leave it
@@ -10008,8 +10608,10 @@ function renderAsk(e) {
 
     // The ack echoes requestId, so concurrent approvals match exactly.
     const pending = {
-      settle: (matched) => {
+      settle: (matched, ack) => {
         clearTimeout(pending.timer);
+        // 2026-10-13 — the deadline refused this card before the click; the server recorded the late answer.
+        if (matched === false && ack?.refusedForNoAnswer) return expireAsk(e.requestId, 'Orchard had already refused this for no answer at its deadline — your late answer was recorded (for tuning that deadline), not applied');
         /*
          * BUG-187 P3 — after the server has published a COMPLETE pending list,
          * "no such pending request" is authoritative: the request is gone (a
@@ -10127,8 +10729,9 @@ function sendDecision({ requestId, payload, ui, onMatched, word = 'answer' }) {
   if (!send(payload)) return ui.failed('no live connection, nothing was sent');
 
   const pending = {
-    settle: (matched) => {
+    settle: (matched, ack) => {
       clearTimeout(pending.timer);
+      if (matched === false && ack?.refusedForNoAnswer) return ui.failed('Orchard had already refused this for no answer at its deadline — your late answer was recorded (for tuning that deadline), not applied');
       if (matched === false) return ui.failed('the server had no such pending request');
       onMatched();
     },
@@ -10385,12 +10988,18 @@ function watch() {
     // A reconnect must re-ask: follows live on the socket that requested them.
     // Except while parked in history — the gap machinery owns the tail then.
     followCurrent(!mainThread().gap);
+    // BUG-255 r2 — pushes sent while this socket was down (or by a restarted server)
+    // were missed: re-read the dock session's declared account fact.
+    void refreshAccountFact(dockSessionId());
   });
   ws.addEventListener('message', (ev) => {
     let e;
     try { e = JSON.parse(ev.data); } catch { return; }
     if (e?.t === 'session-appended') return applyAppend(e);
     if (e?.t === 'follow-status') return onFollowStatus(e);
+    // BUG-255 r2 — the page-lifetime watch socket is how a tab that is only VIEWING
+    // a session hears another tab (or the server) change its account.
+    if (e?.t === 'session-account') { if (acceptAccountFact(e)) onAccountFact(e); return; }
   });
   const retry = () => {
     if (state.watchWs !== ws) return;
@@ -11100,7 +11709,7 @@ function adoptQueuedLine(drain) {
 }
 
 /** A typed prompt goes straight to the session over this tab's socket (queued rows never ride a frame — the server's outbox delivers them). */
-function sendTurn(prompt, { texts, el }) {
+function sendTurn(prompt, { texts, el, attachments }) {
   const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
   state.sendAttempts.set(sendId, {
     texts: (texts ?? []).filter((t) => t && t.trim()),
@@ -11108,7 +11717,8 @@ function sendTurn(prompt, { texts, el }) {
     at: Date.now(),
     resume: state.sdkSessionId ?? state.current?.sessionId ?? null,
   });
-  const ok = send({ type: 'send', prompt, sendId });
+  // FEAT-177: attachment references ride the existing send frame (bytes already uploaded).
+  const ok = send({ type: 'send', prompt, sendId, ...(attachments && attachments.length ? { attachments } : {}) });
   if (!ok) state.sendAttempts.delete(sendId);
   return ok;
 }
@@ -11631,11 +12241,18 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       return;
     }
 
+    case 'session-account':
+      // BUG-255 r2 — the server's declared account fact, pushed to every socket.
+      if (acceptAccountFact(e)) onAccountFact(e);
+      return;
+
     case 'effective-config':
       // Authoritative: what the SDK was actually spawned with. The drawer
       // reconciles its `overridden` tags against this rather than against
       // what the UI believes it sent.
       state.effective = e;
+      // BUG-255 r2 — the account indicator does NOT read this: it renders only the
+      // server's pushed `session-account` fact (one writer, versioned).
       drawer.repaintLive();
       paintPerm(); // reflect what the server ACTUALLY applied, not our guess
       paintIntegrations(); // FEAT-051 — provider/capabilities honesty (codex: MCP off)
@@ -11671,14 +12288,14 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       }
       if (e.of === 'switch-account') {
         // FEAT-160 — the server reaped the old CLI on ok; arm the new account + resume.
-        finishAccountSwitch(e.requestId, e.ok === true, e.error || 'the server declined the account switch', e.account ?? null, e.sessionId ?? null);
+        finishAccountSwitch(e.requestId, e.ok === true, e.error || 'the server declined the account switch', e.account ?? null, e.sessionId ?? null, e.rebound === true, e.stopped === true);
         return;
       }
       if (e.of === 'question-response' || e.of === 'plan-response') {
         const pending = state.pendingAnswers.get(e.requestId);
         if (pending) {
           state.pendingAnswers.delete(e.requestId);
-          pending.settle(e.matched);
+          pending.settle(e.matched, e);
         }
         return;
       }
@@ -11686,7 +12303,7 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
         const pending = state.pendingAnswers.get(e.requestId);
         if (pending) {
           state.pendingAnswers.delete(e.requestId);
-          pending.settle(e.matched);
+          pending.settle(e.matched, e);
         }
         return;
       }
@@ -11861,7 +12478,11 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       }
       return;
 
-    case 'session-init':
+    case 'session-init': {
+      // BUG-252 — did this frame give the view a NEW identity (a new session's
+      // first id, or a fork's new id replacing its source's)? Captured before the
+      // assignment below; a reattach/resume names the id already on screen.
+      const identityChanged = state.current.sessionId !== e.sessionId;
       state.sdkSessionId = e.sessionId;
       state.current.sessionId = e.sessionId;
       // BUG-196 — a session made real by its first turn (or reattached) never goes
@@ -11875,6 +12496,10 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       // BUG-196 round 3 — recorded against the session ID the frame names (the
       // one declared source, lockedProviderOf), never on view state.
       declareLockedProvider(e.sessionId, e.lockedProvider);
+      // BUG-255 r2 — session-init.account is NOT written into the account store:
+      // the server pushes the versioned `session-account` fact for this launch to
+      // every socket (this one included); re-read too in case that push raced us.
+      if (e.sessionId) void refreshAccountFact(e.sessionId);
       state.pendingNew = null; // a running session is no longer a switchable pending-new view
       paintProvSurfaces();
       // FEAT-051: the CLI's own tool report is the ground truth for which MCP
@@ -11884,6 +12509,15 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       // The "new session" now has a real id — the URL picks it up (replace,
       // not push: this is the same place, not a navigation), so a reload
       // lands back IN this session instead of another blank one.
+      // BUG-252 — the dir is the one the session's OWNER (the bridge) declares
+      // its transcript lands in. The project list's `encodedDir` is the encoded
+      // HOST path, which a container session never writes to (its store is
+      // `-workspace-<id>`, FEAT-155) — so a reload of that URL found nothing. A
+      // new identity (new session, or a fork whose source dir was kept to stage
+      // the copy) adopts the declared dir; a reattach of the id on screen keeps
+      // the dir it was opened from. The project dir is only the fallback for an
+      // older server that does not declare one.
+      if (e.encodedDir && (identityChanged || !state.current.encodedDir)) state.current.encodedDir = e.encodedDir;
       if (!state.current.encodedDir) state.current.encodedDir = state.sessions.get(state.current.projectId)?.encodedDir ?? null;
       adoptPendingOverrides(state.current.encodedDir, e.sessionId, fromWs); // BUG-198 round 2 — only ITS OWN pending bag, over ITS socket
       persistOverrides(); // a pre-start armed toggle now has a session id to belong to
@@ -11933,6 +12567,7 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       void refreshCurrentProjectSessions();
       say(`${shortPath(e.cwd)} · ${e.model} · ${e.tools.length} tools · ${e.sessionId.slice(0, 8)}`);
       return;
+    }
 
     case 'text-delta': {
       // stream_event.parent_tool_use_id is always null — deltas are main-thread.
@@ -12184,6 +12819,8 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       // running rail (#strip) is the home for what's in flight; here we keep the
       // stable label and, when agents are running, append only a COMPACT bounded
       // indicator. The raw text rides the title so it stays reachable on hover.
+      // FEAT-175: a START still waiting (no turn yet — e.g. for a git-grant container rebuild) shows why.
+      if (state.busy && state.pendingStart != null && /^waiting: /.test(String(e.status ?? ''))) { say(String(e.status).slice(0, 240)); return; }
       if (state.busy) return; // a live main turn owns the footer; nothing to add
       const raw = String(e.status ?? '');
       const agents = runningAgentCount();
@@ -12454,7 +13091,11 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
          * or plain-resumes a genuine Codex thread — the very action its error names).
          */
         state.sessError = e.message;
+        // BUG-253: the server kept this new session's first message — it is in the dock (Send again / Discard),
+        // so the composer is not refilled with a second live copy that could be sent as well.
+        if (e.kept) state.pendingStartKeepComposer = true;
         rollBackPendingStart();
+        if (e.kept) { void refreshStarts(); setTimeout(() => { void refreshStarts(); }, 800); say('your message is kept in the dock below — Send again when ready, or Discard', true); }
         return;
       }
       if (e.fatal) {
@@ -12502,7 +13143,21 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
     case 'session-closed':
       // FEAT-160 — an account switch reaps the old CLI on purpose; finishAccountSwitch
       // reports it as "switched", so don't also say the generic "session closed".
-      if (!acctPending) say(`session closed (${e.reason})`);
+      if (!acctPending && !e.resumable) say(`session closed (${e.reason})`);
+      // FEAT-175 — Orchard closed this IDLE session to recreate its container for a git-write grant change.
+      // The same session resumes from its transcript on the next message (held in the outbox until the
+      // container is ready), exactly like FEAT-160's account switch re-arms it.
+      if (e.resumable) {
+        const resume = state.sdkSessionId;
+        state.live = false;
+        if (resume) {
+          state.resumeOnNextSend = resume;
+          mainThread().paneEl.append(el('div', { class: 'ran-lbl', text: `container recreated for a git-write grant change · resuming session ${resume.slice(0, 8)} on your next message` }));
+          paintComposerFor(viewedThread());
+        }
+        say('the container is being recreated for a git-write grant change — your next message resumes this session');
+        paintSessStatus();
+      }
       // BUG-153: the run is over, so nothing is "running in the background"
       // either — this is the third place `sessDetached` was cleared, and the
       // follow flag now carries that meaning on its own.
@@ -12633,12 +13288,14 @@ function dropRequest(nonce) {
  * `uncertain` (it may already have arrived) or `failed` (with the reason) —
  * such a row is never sent until the user says so.
  */
-function enqueueOutbox(text, { origin = 'queued', initial, reason, quiet = false } = {}) {
+function enqueueOutbox(text, { origin = 'queued', initial, reason, quiet = false, attachments } = {}) {
   const t = typeof text === 'string' ? text : '';
-  if (!t.trim()) return null; // BUG-150 D: nothing durable for a blank row
+  const atts = Array.isArray(attachments) ? attachments : [];
+  if (!t.trim() && !atts.length) return null; // BUG-150 D: nothing durable for a blank row (FEAT-177: unless it carries attachments)
   const target = outboxTarget();
   const req = {
     nonce: newNonce(), text: t, origin,
+    ...(atts.length ? { attachments: atts } : {}),
     ...(initial ? { initial } : {}),
     ...(reason ? { reason } : {}),
     // The session settings a server-side resume would use (the tab owns them today).
@@ -12667,8 +13324,8 @@ function enqueueOutbox(text, { origin = 'queued', initial, reason, quiet = false
   return req;
 }
 
-function queueMessage(text) {
-  if (!enqueueOutbox(text)) return;
+function queueMessage(text, attachments) {
+  if (!enqueueOutbox(text, { attachments })) return;
   const n = state.queue.filter((q) => q.state === 'queued' || q.state === 'pending' || q.state === 'sending').length;
   say(`message queued — ${n} waiting; it sends at the next pause (Edit or Discard it in the dock)`);
 }
@@ -12713,6 +13370,7 @@ async function flushPending() {
 let outboxBusy = false;
 async function refreshOutbox() {
   const sid = state.current?.sessionId;
+  if (!sid && queueKey) { void refreshStarts(); return; }
   if (!sid || !queueKey) return;
   if (outboxBusy) return;
   outboxBusy = true;
@@ -12721,6 +13379,38 @@ async function refreshOutbox() {
     if (state.current?.sessionId === sid && queueKey) applyOutboxView(v);
   } catch { /* unreachable: the next tick asks again — the rows are the server's, nothing is lost meanwhile */ }
   finally { outboxBusy = false; }
+}
+
+/*
+ * BUG-253 — a NEW session's first message is kept by the server from the moment the start is accepted
+ * (its own start box). One that did not start a session is shown here, on that project's new-session
+ * view, with the dock's usual Send again / Send anyway / Edit / Discard — each acting on the row's `box`.
+ */
+let startsBusy = false;
+async function refreshStarts() {
+  const pid = state.current?.projectId;
+  if (!pid || state.current?.sessionId || !queueKey || startsBusy) return;
+  startsBusy = true;
+  try {
+    const v = await api.outboxStarts(pid);
+    if (state.current?.projectId === pid && !state.current?.sessionId) applyStartsView(v);
+  } catch { /* the next tick asks again — the rows are the server's, nothing is lost meanwhile */ }
+  finally { startsBusy = false; }
+}
+function applyStartsView(v) {
+  if (!v || v.projectId !== state.current?.projectId || state.current?.sessionId) return;
+  const first = state.startOutbox?.projectId !== v.projectId;
+  state.startOutbox = v;
+  let started = 0;
+  for (const r of v.recent ?? []) {
+    if (outboxSeenDone.has(r.id)) continue;
+    outboxSeenDone.add(r.id);
+    // Only a Send again this dock offered is announced (an ordinary start is the starting tab's own news).
+    if (!first && r.retried && r.state === 'delivered') started++;
+  }
+  rebuildQueue();
+  paintQueue();
+  if (started) say(started === 1 ? 'your message started a new session — it is in the session list' : `${started} messages each started a new session — they are in the session list`);
 }
 
 /** Rows this tab has seen finish (id → true), so "sent" is said once and a delivery it did not start is followed once. */
@@ -12763,6 +13453,9 @@ function rebuildQueue() {
     rows.push({ ...r, local: false });
   }
   for (const r of v?.recent ?? []) known.add(r.nonce);
+  // BUG-253: first messages of this project that did not start a session (new-session view only).
+  const sv = !sid && state.startOutbox && state.startOutbox.projectId === state.current?.projectId ? state.startOutbox : null;
+  for (const r of sv?.rows ?? []) rows.push({ ...r, local: false });
   const store = pendingStore();
   const mine = Object.values(store)
     .filter((e) => e?.req && e.key === queueKey && !known.has(e.req.nonce))
@@ -12860,6 +13553,7 @@ function retargetQueue() {
 setInterval(() => {
   if (document.hidden) return;
   if (state.current?.sessionId && queueKey) void refreshOutbox();
+  else if (state.current?.projectId && queueKey) void refreshStarts(); // BUG-253
   if (Object.keys(pendingStore()).length) void flushPending();
 }, OUTBOX_POLL_MS);
 // Another tab filed or cleared a request: this tab's dock follows (the server rows follow on the poll).
@@ -12873,11 +13567,12 @@ window.addEventListener('storage', (e) => {
 
 /** Run one outbox action; the answer (or the refusal's row state) repaints the dock. Returns true on success. */
 async function outboxAct(item, fn, { onConflict } = {}) {
-  const sid = state.current?.sessionId;
+  // BUG-253: a first message that did not start a session lives in its own start box, not the current session's.
+  const sid = item?.box ?? state.current?.sessionId;
   if (!sid || !item?.id) return false;
   try {
     const v = await fn(sid, item.id);
-    applyOutboxView(v, { quiet: true });
+    if (item.box) void refreshStarts(); else applyOutboxView(v, { quiet: true });
     return true;
   } catch (err) {
     if (err?.status === 409) onConflict?.(err.body?.row ?? null, err);
@@ -13005,8 +13700,18 @@ function paintQueue() {
   const box = $('#queueBox');
   const undo = state.queueUndo && state.queueUndo.key === queueKey && state.queueUndo.until > Date.now() ? state.queueUndo : null;
   const damaged = state.outbox?.sessionId === state.current?.sessionId ? state.outbox?.damaged ?? null : null;
-  if (!state.queue.length && !undo && !damaged) { box.hidden = true; clear(box); return; }
+  // BUG-253: a damaged start box (new-session view) — its message may be the one that is missing.
+  const startDamage = !state.current?.sessionId && state.startOutbox?.projectId === state.current?.projectId ? (state.startOutbox?.damaged ?? []) : [];
+  if (!state.queue.length && !undo && !damaged && !startDamage.length) { box.hidden = true; clear(box); return; }
   clear(box);
+  for (const d of startDamage) {
+    const bar = el('div', { class: 'q-undo q-damaged', role: 'alert' });
+    bar.append(el('span', { class: 'q-undo-t', text: 'Orchard’s saved copy of a first message for a new session was damaged, so that message may be missing below — check the session list before sending it again.' }));
+    const b = el('button', { class: 'mini q-undo-b', text: 'Dismiss' });
+    b.addEventListener('click', () => { void api.outboxDismissDamage(d.box).then(() => refreshStarts(), () => {}); });
+    bar.append(b);
+    box.append(bar);
+  }
   if (damaged) {
     const bar = el('div', { class: 'q-undo q-damaged', role: 'alert' });
     bar.append(el('span', { class: 'q-undo-t', text: 'Orchard’s saved queue for this session was damaged. Anything it could not confirm is marked below — some queued messages may be missing, so check the conversation.' }));
@@ -13057,7 +13762,10 @@ function paintQueue() {
               ? `waiting for the session to finish re-attaching after a server restart — it goes in once it is ready (${hold.text})`
               : hold?.kind === 'external'
                 ? 'another program is writing this session — it sends once that stops, or press Send now'
-                : hold?.text || 'sending now';
+                : hold?.kind === 'rebuild'
+                  // FEAT-175 — the container is (about to be) recreated for a git-write grant change.
+                  ? `held for the container rebuild (git-write grant) — sends by itself once it is ready${hold.text ? ` · ${hold.text}` : ''}`
+                  : hold?.text || 'sending now';
   const prefix = waiting.length ? `${n} queued message${s} · `
     : unresolved.every((q) => q.state === 'uncertain') ? `${unresolved.length} message${unresolved.length === 1 ? '' : 's'} not confirmed as sent · `
       : `${unresolved.length} message${unresolved.length === 1 ? '' : 's'} not sent · `;
@@ -13081,7 +13789,7 @@ function paintQueue() {
   const rowStatus = (item) => (
     item.state === 'uncertain' ? `Not confirmed — ${item.reason ?? 'it may already have been sent'}`
       : item.state === 'failed' ? `Not sent — ${item.reason ?? 'it was not sent'}`
-        : item.state === 'sending' ? 'Sending…'
+        : item.state === 'sending' ? (item.box ? 'Starting a new session with it…' : 'Sending…')
           : item.state === 'pending' ? (item.reason ? `Not saved yet — ${item.reason}` : 'Saving…')
             : item.forced ? 'Sending after the interrupt…'
               : 'Waiting to send');
@@ -13114,7 +13822,7 @@ function paintQueue() {
       primary('Send anyway', 'It may already have been sent — send it again anyway', () => sendRowNow(item));
     } else if (item.state === 'failed') {
       primary('Send again', 'Send this message now', () => sendRowNow(item));
-    } else if (item.state === 'queued') {
+    } else if (item.state === 'queued' && !item.box) { // BUG-253: a first message waiting to start has no turn to interrupt
       if (hold?.kind === 'busy' && !item.forced) {
         const force = el('button', { class: 'mini force-send', text: 'Interrupt & send' });
         force.title = fg
@@ -13191,7 +13899,10 @@ async function submit() {
   const p = currentProject();
   if (!p) return say('pick a project first — or add one from the sidebar foot', true);
   const text = node.prompt.value.trim();
-  if (!text) return;
+  // FEAT-177: a message is sendable with text OR at least one attachment.
+  if (attPending()) return say('an attachment is still uploading — it sends as soon as that finishes', true);
+  const attachments = attRefsForSend();
+  if (!text && !attachments.length) return;
 
   // Bare /model: the CLI's interactive picker is terminal chrome the SDK
   // cannot ship, and burning a turn to print usage text helps no one — the
@@ -13240,9 +13951,10 @@ async function submit() {
    * `outbox-pending` — this only spares the bubble that refusal would unwind.)
    */
   if (state.current?.sessionId && state.queue.some((q) => q.state === 'queued' || q.state === 'sending' || q.state === 'pending')) {
-    queueMessage(text);
+    queueMessage(text, attachments);
     node.prompt.value = '';
     autosize();
+    attClear();
     return;
   }
 
@@ -13273,12 +13985,13 @@ async function submit() {
     // as if Claude were working. Same principle BUG-159 set: HELD, never refused.
     const awaitingDecision = state.busy && awaitingUserDecision();
     if (state.busy && !behindBackground && !awaitingDecision) {
-      queueMessage(text);
+      queueMessage(text, attachments);
       node.prompt.value = '';
       autosize();
+      attClear();
       return;
     }
-    const bubbleEl = youBubble(mainThread(), text);
+    const bubbleEl = youBubble(mainThread(), text, attachments);
     // Tracked so a rejection (budget stop raced the click — see isBudgetStop
     // in onEvent) can roll this exact bubble back instead of leaving it
     // looking delivered for a turn Claude never received.
@@ -13289,7 +14002,8 @@ async function submit() {
     state.turnStartedAt = Date.now();
     state.turnStartUnknown = false; // BUG-033: this tab started this turn — the clock is real
     setBusy(true);
-    sendTurn(text, { texts: [text.trim()], el: bubbleEl });
+    sendTurn(text, { texts: [text.trim()], el: bubbleEl, attachments });
+    attClear();
     if (behindBackground) say('queued behind background work — the idle session delivers it at the next pause');
     else if (awaitingDecision) say('sent — it runs as your next turn once the question above is settled');
     return;
@@ -13302,19 +14016,19 @@ async function submit() {
     const dir = state.forkEncodedDir; // BUG-090: server-supplied SOURCE dir for a needs-fork branch
     state.forkFrom = null;
     state.forkEncodedDir = null;
-    return startTurn(text, { resumeSessionId: from, fork: true, resumeEncodedDir: dir ?? undefined });
+    return startTurn(text, { resumeSessionId: from, fork: true, resumeEncodedDir: dir ?? undefined, attachments });
   }
 
   // A re-armed session wins: resume the exact SDK session that dropped.
   if (state.resumeOnNextSend) {
     const resume = state.resumeOnNextSend;
     state.resumeOnNextSend = null;
-    return startTurn(text, { resumeSessionId: resume });
+    return startTurn(text, { resumeSessionId: resume, attachments });
   }
   const resume = state.current.sessionId && state.current.os !== 'windows' && !state.sdkSessionId
     ? state.current.sessionId
     : undefined;
-  await startTurn(text, { resumeSessionId: resume });
+  await startTurn(text, { resumeSessionId: resume, attachments });
 }
 
 /*
@@ -13374,9 +14088,12 @@ async function reattachDriving(sess) {
  * entered message"). The flag rides on state so the refusal path (which runs
  * later, from the socket) can honour it without re-deriving who started the turn.
  */
-async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepComposer } = {}) {
+async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepComposer, attachments } = {}) {
   const p = currentProject();
   if (!p) return;
+  // BUG-252 — starting a session is a navigation too: a link still resolving must
+  // never take the view back from the session the user just began (IV c01b61e7).
+  nav.routeGen++;
   // BUG-149: a fresh attempt is under way — the previous "another tab has it"
   // banner is about to be re-answered by the server either way, so it must not
   // linger and describe a refusal that may no longer be true.
@@ -13404,8 +14121,8 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
    * delivered message was the one removed. Both are the transcript lying, which
    * is the failure this whole area exists to prevent.
    */
-  const startedBubble = youBubble(mainThread(), text);
-  if (!keepComposer) { node.prompt.value = ''; autosize(); }
+  const startedBubble = youBubble(mainThread(), text, attachments);
+  if (!keepComposer) { node.prompt.value = ''; autosize(); attClear(); }
   node.box.hidden = false;
   node.frozen.hidden = true;
   node.agentDone.hidden = true;
@@ -13450,7 +14167,8 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
     resumeEncodedDir: resumeSessionId ? (resumeEncodedDir ?? state.current.encodedDir ?? undefined) : undefined,
     fork,
     templateIds,
-    overrides: sessionOverrides({ resuming: !!resumeSessionId }), // BUG-196 round 4 — a resume never carries a provider
+    ...(attachments && attachments.length ? { attachments } : {}), // FEAT-177
+    overrides: sessionOverrides({ resuming: !!resumeSessionId, forking: !!fork }), // BUG-196 round 4 — a resume never carries a provider
   });
   renderTree();
 }
@@ -13465,7 +14183,7 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
  * (effective-config.ignoredOverrides); the client forgets a pick only on that
  * declaration (see the effective-config handler).
  */
-function sessionOverrides({ resuming = false } = {}) {
+function sessionOverrides({ resuming = false, forking = false } = {}) {
   const out = {};
   // The provider this start will run under (a session provider override wins,
   // then the project's own setting) — the engine a model override must match.
@@ -13485,6 +14203,10 @@ function sessionOverrides({ resuming = false } = {}) {
   for (const field of SESSION_OVERRIDABLE) {
     if (!(field in state.overrides)) continue;
     if (field === 'provider' && (locked || resuming)) continue;
+    // BUG-255 r4 — only a BRAND-NEW session carries an account pick (it becomes its initial
+    // binding). A resume or a fork never does: the server's effectiveLaunchAccount decides
+    // (a fork runs on its parent's account), and that is what the indicator shows.
+    if (field === 'claudeAccount' && resuming) continue;
     out[field] = state.overrides[field];
   }
   return Object.keys(out).length ? out : undefined;
@@ -14065,7 +14787,7 @@ let accountsInflight = null;
 function refreshAccounts(opts = {}) {
   if (accountsInflight) return accountsInflight;
   if (ACCOUNTS !== undefined && !opts.force) return Promise.resolve();
-  accountsInflight = api.getClaudeAccounts().then((list) => {
+  accountsInflight = api.getClaudeAccounts({ force: !!opts.force }).then((list) => {
     accountsInflight = null;
     ACCOUNTS = Array.isArray(list) ? list : null;
     paintAccountSel();
@@ -14114,7 +14836,7 @@ function acctUsageDesc(id) {
   return `${b.usedPercent}% of ${b.label}${reset ? ` · resets ${reset}` : ''}`;
 }
 
-let acctSel = null; let acctSelN = null; let acctPop = null; let acctOpts = null;
+let acctSel = null; let acctSelN = null; let acctPop = null; let acctOpts = null; let acctSelS = null; // BUG-255 r2: acctSelS = status suffix
 function ensureAccountEls() {
   if (acctSel) return;
   acctSelN = el('span', { id: 'acctSelN', text: 'Default' });
@@ -14169,42 +14891,97 @@ function paintAccountSel() {
   if (!show) { if (acctSel) acctSel.hidden = true; return; }
   ensureAccountEls();
   acctSel.hidden = false;
-  const cur = claudeAccountView(); // the ONE resolver — override → project → default
-  const armed = 'claudeAccount' in state.overrides;
+  const cur = claudeAccountView(); // BUG-255 r3 — the server fact for a dock session (undefined = not said), else the launch intention
+  const sid = dockSessionId();
+  const fact = sid ? currentAccountFact(sid) : undefined;
+  const armed = !sid && 'claudeAccount' in state.overrides; // an override is only ever a NEXT-launch intention
   const locked = accountLockedReason();
   const live = dockLive();
   // A live switch is blocked only while a turn is in flight (it applies to the
   // next turn, which cannot start until this one ends).
   const busyLocked = live && !locked && state.busy;
-  acctSelN.textContent = acctShortName(cur);
-  acctSel.dataset.set = String(armed);
+  // BUG-255 r2/r3 — the label renders ONLY the server's declared fact for the dock
+  // session: "account unknown — checking" until a current fact names the account
+  // (and it is re-read meanwhile), the current account, a pending change marked as
+  // pending ("→ X", never shown as current), and "?" while this tab's own switch
+  // outcome is unknown and being re-read from the server.
+  const checking = !!sid && cur === undefined;
+  if (checking) chaseUnknownAccount();
+  const pending = sid ? sessionAccountPending(sid) : undefined;
+  const unknown = !!(acctPending && acctPending.unknown && acctPending.sid === sid);
+  // This tab's own request is in flight: mark it (the account shown stays the declared one).
+  const requesting = !!(acctPending && !acctPending.unknown && acctPending.sid === sid);
+  acctSelN.textContent = checking ? 'account unknown — checking' : acctShortName(cur);
+  ensureAcctStatusEl();
+  acctSelS.textContent = checking ? '' : unknown ? ' · status unknown, checking' : pending !== undefined ? ` → ${acctShortName(pending)}` : requesting ? ' · switching…' : '';
+  acctSel.dataset.state = checking ? 'checking' : unknown ? 'unknown' : pending !== undefined ? 'pending' : requesting ? 'requesting' : '';
+  // The "set" badge marks a session-specific account: a session the server bound, or
+  // a next launch with an armed override.
+  acctSel.dataset.set = String(armed || (!!fact && 'bound' in fact && !locked)); // a dormant binding in a container project governs nothing
   acctSel.dataset.locked = String(!!locked || busyLocked);
+  if (checking) {
+    acctSel.title = 'Claude account: unknown — checking with the server which account this session is on…';
+    return;
+  }
   const usage = acctUsageDesc(cur);
-  const scope = armed ? ' (this session only)' : ' (project default)';
-  acctSel.title = locked
-    ? `Claude account: ${acctShortName(cur)} — fixed for this project. ${locked}`
+  const pendingNote = pending !== undefined
+    ? ` Pending: ${acctShortName(pending)} — ${fact?.switching ? 'the switch is in progress' : 'the next message resumes on it'}; it is not the current account yet.`
+    : '';
+  const unknownNote = unknown ? ' The last switch request got no reliable answer; checking with the server — this shows the account the server last declared.' : '';
+  // What the server says about this session's process, for the tooltip (r3: a running
+  // launch that is not this tab's is "running elsewhere", never "not running now").
+  const runningHere = live;
+  const runningElsewhere = !!fact && 'launch' in fact && !runningHere;
+  const name = acctShortName(cur);
+  const usageBit = usage ? ` (${usage})` : '';
+  acctSel.title = (locked
+    ? `Claude account: ${name} — fixed for this project. ${locked}`
     : busyLocked
-      ? `Claude account: ${acctShortName(cur)} — finish or interrupt the current turn to switch; the account applies to the next turn.`
-      : live
-        ? `Claude account: ${acctShortName(cur)}${usage ? ` — ${usage}` : ''}. Click to switch this running session to another subscription — the same conversation resumes on it on your next message.`
-        : `Claude account: ${acctShortName(cur)}${scope} — which subscription the next session bills to`
-          + `${usage ? `; ${usage}` : ''}. Applies when the next session starts; click to change.`;
+      ? `Claude account: ${name} — finish or interrupt the current turn to switch; the account applies to the next turn.`
+      : runningHere
+        ? `Claude account: ${name}${usage ? ` — ${usage}` : ''}. Click to switch this running session to another subscription — the same conversation resumes on it on your next message.`
+        : runningElsewhere
+          ? `Claude account: ${name} — the account this session is running on in another window or in the background${usageBit}. Switch it where it runs, or stop it first.`
+          : sid
+            ? `Claude account: ${name} — the account this session ${fact && 'bound' in fact ? 'is bound to' : 'resumes on (the project account)'}${usageBit}. It is not running now; click to switch it, and its next message resumes on the chosen subscription.`
+            : `Claude account: ${name}${armed ? ' (this session only)' : ' (project default)'} — which subscription the next session bills to`
+              + `${usage ? `; ${usage}` : ''}. Applies when the next session starts; click to change.`) + pendingNote + unknownNote;
+}
+
+/** BUG-255 r2 — the indicator's status suffix (pending / unknown), next to the name. */
+function ensureAcctStatusEl() {
+  if (acctSelS && acctSelS.isConnected) return;
+  acctSelS = el('span', { class: 'acct-st', id: 'acctSelS' });
+  acctSelN.insertAdjacentElement('afterend', acctSelS);
 }
 
 function paintAcctPop() {
   ensureAccountEls();
   clear(acctOpts);
   const locked = accountLockedReason();
-  const armed = 'claudeAccount' in state.overrides;
+  // BUG-255 r3 — for a dock SESSION the current row is the server's fact only (no row is
+  // marked while it is unknown); an override is only a NEXT-launch intention.
+  const sid = dockSessionId();
+  const armed = !sid && 'claudeAccount' in state.overrides;
   const armedVal = armed ? (state.overrides.claudeAccount ?? 'default') : null;
+  const serverCur = sid ? sessionAccountOf(sid) : undefined; // 'default' | id, or undefined (unknown)
+  const haveServer = !!sid;
   const dflt = accountRows().find((a) => a.id === 'default');
   const rows = [
-    { v: undefined, n: 'Project default', d: `Inherit — currently ${acctShortName(claudeAccountView())}` },
+    // "Project default" means "inherit the project/machine default for the NEXT
+    // launch" — never the CURRENT session's account, so it reads from the launch
+    // intention chain, not claudeAccountView() (which is now the session account).
+    { v: undefined, n: 'Project default', d: `Inherit — currently ${acctShortName(nextLaunchAccountView())}` },
     { v: null, n: dflt?.label ?? 'Default (~/.claude)', d: acctPlanDesc(dflt), id: 'default' },
     ...extraAccountRows().map((a) => ({ v: a.id, n: a.label, d: acctPlanDesc(a), id: a.id })),
   ];
   for (const o of rows) {
-    const isCur = o.v === undefined ? !armed : (armedVal === (o.v ?? 'default'));
+    // For a session the server owns an account for, the current row is the
+    // concrete account it is on ("Project default" is never current then). For a
+    // not-yet-started launch, the armed override (or inherit) is current.
+    const isCur = haveServer
+      ? (o.v !== undefined && (o.v ?? 'default') === serverCur)
+      : (o.v === undefined ? !armed : (armedVal === (o.v ?? 'default')));
     const b = el('button', { class: 'opt', role: 'menuitem', 'aria-pressed': String(isCur), 'aria-disabled': String(!!locked) });
     b.append(el('span', { class: 'g', text: isCur ? '●' : '○' }));
     const mid = el('span');
@@ -14214,7 +14991,7 @@ function paintAcctPop() {
     const usage = o.id ? acctUsageDesc(o.id) : '';
     const d = [o.d, usage].filter(Boolean).join(' · ');
     if (d) mid.append(el('span', { class: 'd', text: d }));
-    if (isCur && !armed && o.v === undefined) mid.append(el('span', { class: 'tag', text: 'inherited' }));
+    if (isCur && !haveServer && !armed && o.v === undefined) mid.append(el('span', { class: 'tag', text: 'inherited' }));
     b.append(mid);
     b.addEventListener('click', () => pickAccount(o.v));
     acctOpts.append(b);
@@ -14228,6 +15005,13 @@ function paintAcctPop() {
     acctOpts.append(el('div', { class: 'grp-note', text: state.busy
       ? 'A turn is in flight — finish or interrupt it first. The account applies to the next turn, which cannot start until this one ends.'
       : 'Switches THIS running session: the current CLI stops and the same conversation resumes under the chosen subscription on your next message. Each account is a thin overlay over ~/.claude, so the transcript history is shared; only the subscription differs.' }));
+  } else if (sid) {
+    // BUG-255 r3 — any re-opened session: the pick rebinds THIS session through the
+    // server (no running CLI to reap here). Never a next-session intention.
+    const runningElsewhere = 'launch' in (currentAccountFact(sid) ?? {});
+    acctOpts.append(el('div', { class: 'grp-note', text: runningElsewhere
+      ? 'This session is running in another window or in the background — the server will refuse a switch from here while it runs. Switch it where it is running, or stop it first.'
+      : 'Switches THIS session: it is not running now, so its next message resumes under the chosen subscription. Each account is a thin overlay over ~/.claude, so the transcript history is shared; only the subscription differs.' }));
   } else {
     acctOpts.append(el('div', { class: 'grp-note', text: 'Applies to the NEXT session only — the project and machine defaults are untouched. Each account is a thin overlay over ~/.claude, so the transcript history is shared; only the subscription differs.' }));
   }
@@ -14254,11 +15038,32 @@ function pickAccount(next) {
     if (state.busy) return say('finish or interrupt the current turn before switching accounts — the account applies to the next turn', true);
     return switchAccountLive(next);
   }
+  // BUG-255 — the dock holds a re-opened session that the server has BOUND to an
+  // account (FEAT-160). A client override for it is NOT the mechanism: it would be
+  // silently dropped on resume (dropBoundAccountOverride), which is the reported
+  // bug. Route the pick through the ONE server switch operation with the target
+  // session's identity; the server classifies it by its own lifetime authorities
+  // and either rebinds a proven-stopped session durably or refuses visibly. We
+  // never decide "safe offline rebind" from a client view predicate.
+  const sid = dockSessionId();
+  if (sid) {
+    // BUG-255 r3 — EVERY pick on a session (bound or not) goes through the server's
+    // switch operation; the client never arms an account override for a session (a
+    // resume no longer carries one). Until the account is known, refuse: we cannot
+    // tell the user what they are switching from.
+    if (accountFactState(sid) !== 'known') {
+      void refreshAccountFact(sid);
+      return say('still checking which account this session is on — try again in a moment', true);
+    }
+    return rebindAccountOffline(sid, next);
+  }
+  // No session in the dock — a genuine NEXT-session launch intention (FEAT-145).
+  // An armed override here is honoured when that session starts. Label it as such.
   if (next === undefined) delete state.overrides.claudeAccount;
   else state.overrides.claudeAccount = next;
   persistOverrides();
-  const name = next === undefined ? `${acctShortName(claudeAccountView())} (inherited)` : acctShortName(next ?? 'default');
-  const usage = acctUsageDesc(next === undefined ? claudeAccountView() : (next ?? 'default'));
+  const name = next === undefined ? `${acctShortName(nextLaunchAccountView())} (inherited)` : acctShortName(next ?? 'default');
+  const usage = acctUsageDesc(next === undefined ? nextLaunchAccountView() : (next ?? 'default'));
   say(`Claude account: ${name} — applies when the next session starts${usage ? ` · ${usage}` : ''}`);
   paintAccountSel();
   paintAcctPop();
@@ -16056,6 +16861,22 @@ function renderDigest(boardRes, listRes) {
       awaiting.append(g);
     }
   }
+  // BUG-259 — decisions agents took THEMSELVES lately. They left the rail, so the
+  // digest names them, collapsed; each opens its ticket, where you can reopen it.
+  const agentDecided = (board?.agentDecided ?? []).filter((d) => !d.reopened);
+  if (agentDecided.length) {
+    const det = el('details', { class: 'dg-agent-decided' });
+    det.append(el('summary', { class: 'dg-subh' },
+      el('span', { text: 'Agents decided these themselves (last 14 days)' }), el('span', { class: 'dg-subn', text: String(agentDecided.length) })));
+    const g = el('div', { class: 'dg-group' });
+    for (const d of agentDecided) {
+      g.append(el('a', { class: 'dg-item dg-agent-decided-item', 'data-id': d.id, href: ticketsHref(tv.projectId, d.id) },
+        el('div', {}, el('span', { class: 'dg-id', text: d.id }), document.createTextNode(` ${d.title ?? ''}`)),
+        el('span', { class: 'dg-blurb', text: `${d.chosen ? `chose ${d.chosen} · ` : ''}${d.basis} — ${d.why}` })));
+    }
+    det.append(g);
+    awaiting.append(det);
+  }
   wrap.append(awaiting);
 
   /* ── Answered — awaiting action (hidden when empty) ── */
@@ -16075,7 +16896,10 @@ function renderDigest(boardRes, listRes) {
         el('span', { class: 'dg-id', text: it.id }),
         el('span', { class: 'dg-title', text: it.title, title: it.title })));
       a.append(el('div', { class: 'dg-item-body' },
-        el('span', { class: 'dg-answer', text: `you chose “${clampText(it.answer, 80)}”${it.answeredOn ? ` on ${it.answeredOn}` : ''}` }),
+        // FEAT-184 — an adoption under your delegation is the agent's act, never "you chose".
+        el('span', { class: `dg-answer${it.adopted ? ' dg-adopted' : ''}`, text: it.adopted
+          ? `adopted under your delegation: “${clampText(String(it.answer ?? '').replace(/^adopted under delegation \S+ \(not a user answer\):\s*/, ''), 80)}”${it.answeredOn ? ` on ${it.answeredOn}` : ''}`
+          : `you chose “${clampText(it.answer, 80)}”${it.answeredOn ? ` on ${it.answeredOn}` : ''}` }),
         el('span', { class: 'dg-nodispatch', text: 'nothing dispatched yet' })));
       g.append(a);
     }
@@ -16846,7 +17670,13 @@ function ticketDetailNode(t, opts = {}) {
   }
   // Historical decisions must not read as active: they are a collapsed, visibly
   // inactive record at the foot of the deep band, never beside the live one.
-  if (v.decisionHistory.length) wrap.querySelector('.tv-md')?.append(decisionHistoryCard(v));
+  if (v.decisionHistory.length) wrap.querySelector('.tv-md')?.append(decisionHistoryCard(v, t, wrap, opts));
+  // BUG-259 — a LEGACY prose ticket an agent took with `own` has no record history:
+  // offer the same reopen from its log entry while it is off the rail.
+  else if (!opts.compact && !t.needsYou && /\*\*Decided by agent \(own\):\*\*/.test(t.markdown ?? '')
+    && !/\*\*Decision reopened:\*\*/.test(t.markdown ?? '')) {
+    wrap.querySelector('.tv-md')?.append(agentDecisionReopen(t, wrap, 'legacy', 'An agent decided this itself (see its “Decided by agent” log entry).'));
+  }
   return wrap;
 }
 
@@ -17098,7 +17928,21 @@ function mountDecide(wrap, t, v = null) {
 
   // The card lives in the right column on wide screens (grid-area decide).
   const wideWrap = el('div', { class: 'tv-decide-wrap' });
-  wideWrap.append(createDecideCard({ decision, rich, answered, onSubmit: submit }).node);
+  // FEAT-184 — your standing delegations for this ticket: record (user-only route) / revoke.
+  const reloadDetail = async () => {
+    const fresh = await api.ticket(pid, t.id);
+    tv.current = fresh;
+    clear(tv.detail).append(ticketDetailNode(fresh));
+  };
+  const onDelegate = async (body, ui) => {
+    try { await api.recordDelegation(pid, body); await reloadDetail(); say(`delegation recorded for ${body.tickets.join(', ')} — agents may adopt the recommended option`); }
+    catch (err) { ui.failed(err.message); say(`could not record the delegation: ${err.message}`, true); }
+  };
+  const onRevoke = async (did, ui) => {
+    try { await api.revokeDelegation(pid, did); await reloadDetail(); say('delegation revoked'); }
+    catch (err) { ui.failed(); say(`could not revoke: ${err.message}`, true); }
+  };
+  wideWrap.append(createDecideCard({ decision, rich, answered, onSubmit: submit, ticketId: t.id, delegations: t.delegations?.delegations ?? null, onDelegate, onRevoke }).node);
   // READING ORDER, not just grid position. The wide layout puts this card in the
   // right column either way, but the DOM order is what a narrow screen, a screen
   // reader and Tab all follow — and it is the thing the redesign is measured on:
@@ -17320,8 +18164,12 @@ function deepRecordCards(v) {
  * to a log full of implementation: a ticket has at most one live decision, and
  * everything else is history, drawn like history.
  */
-function decisionHistoryCard(v) {
+function decisionHistoryCard(v, t = null, wrap = null, opts = {}) {
   const box = el('details', { class: 'tv-slot tv-slot-hist' });
+  // BUG-259 — an agent's OWN decision that you have not reopened is shown open,
+  // as the agent's, with a Reopen control (never as your answer).
+  const live = v.decisionHistory.some((h) => h?.owned && !h?.reopened);
+  if (live) box.open = true;
   box.append(el('summary', { class: 'tv-slot-h' },
     el('h4', { class: 'tv-slot-t ph', text: 'Decisions already made' }),
     el('span', { class: 'tv-slot-n', text: `${v.decisionHistory.length} · settled` })));
@@ -17333,10 +18181,54 @@ function decisionHistoryCard(v) {
       el('span', { class: 'tvh-chosen', text: h?.chosen ? `chose ${h.chosen}` : 'no option recorded' }),
       el('span', { class: 'tvh-when', text: h?.chosen_on ? `on ${h.chosen_on}` : (h?.asked_on ? `asked ${h.asked_on}` : NOT_RECORDED) }),
       h?.chosen_by ? el('span', { class: 'tvh-by', text: `by ${h.chosen_by}` }) : null));
-    if (h?.note) item.append(el('div', { class: 'tvh-note', text: String(h.note) }));
+    if (h?.note && !h?.owned) item.append(el('div', { class: 'tvh-note', text: String(h.note) }));
+    if (h?.owned) {
+      const o = h.owned;
+      item.classList.add('tvh-owned');
+      item.append(el('div', { class: 'tvh-owned-by' },
+        el('b', { text: o.basis === 'withdrawn' ? 'Withdrawn by an agent, not answered by you' : 'Decided by an agent, not by you' }),
+        document.createTextNode(` — ${o.by ?? 'agent'} · ${o.basis ?? ''}${o.ref ? ` (${o.ref})` : ''}`)));
+      // BUG-263 — a withdrawn hard-stop card records what actually shipped, since
+      // its options did not match; show it so the user can judge the reopen.
+      if (o.decided) item.append(el('div', { class: 'tvh-note', text: `Decided: ${o.decided}` }));
+      if (o.why) item.append(el('div', { class: 'tvh-note', text: `Why: ${o.why}` }));
+      if (o.next) item.append(el('div', { class: 'tvh-note', text: `Next: ${o.next}` }));
+      if (o.handoff) item.append(el('div', { class: 'tvh-note', text: `Still yours: ${o.handoff}` }));
+      if (h.reopened) item.append(el('div', { class: 'tvh-when', text: `You reopened it on ${h.reopened.on ?? '?'}` }));
+      else if (t && wrap && !opts.compact && h.id) item.append(agentDecisionReopen(t, wrap, h.id, null));
+    }
     body.append(item);
   }
   box.append(body);
+  return box;
+}
+
+/**
+ * BUG-259 — "Reopen" for a decision an agent took itself: it goes back on your
+ * Needs-You rail as an open decision (a user-only server route; the rev you are
+ * looking at guards against a concurrent change).
+ */
+function agentDecisionReopen(t, wrap, decisionId, lead) {
+  const box = el('div', { class: 'tvh-reopen' });
+  if (lead) box.append(el('div', { class: 'tvh-note', text: lead }));
+  const btn = el('button', { class: 'tv-btn', type: 'button', text: 'Reopen — I want to decide this',
+    title: 'Put this decision back on your Needs-You rail as an open question' });
+  const msg = el('span', { class: 'tvh-reopen-msg' });
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    msg.textContent = 'reopening…';
+    try {
+      await api.ticketReopenDecision(tv.projectId, t.id, decisionId, wrap.dataset.rev);
+      await loadTicketRows();
+      const fresh = await api.ticket(tv.projectId, t.id);
+      tv.current = fresh;
+      clear(tv.detail).append(ticketDetailNode(fresh));
+    } catch (err) {
+      msg.textContent = err.status === 409 ? 'The ticket changed since you opened it — reload and retry.' : `Not reopened: ${err.message}`;
+      btn.disabled = false;
+    }
+  });
+  box.append(btn, msg);
   return box;
 }
 
@@ -17586,7 +18478,9 @@ window.addEventListener('hashchange', () => { setNavOpen(false); setDetailsOpen(
  * spam history). See lib/route.js for why hash and what the fields mean.
  */
 
-const nav = { applying: false, scrollTimer: null };
+// BUG-252: routeGen — the navigation generation; applyingGen — the route whose URL
+// intent is pending (its URL-sync hold lasts only while it is the newest navigation). See applyRoute.
+const nav = { applying: false, scrollTimer: null, routeGen: 0, applyingGen: null };
 
 function currentRoute() {
   const { projectId, sessionId, encodedDir } = state.current;
@@ -17611,6 +18505,7 @@ function currentRoute() {
 
 function syncUrl(mode = 'replace') {
   if (nav.applying) return; // navigation is being driven BY the URL right now
+  if (nav.applyingGen != null && nav.applyingGen === nav.routeGen) return; // BUG-252 — a link is resolving: the URL is its intent
   const r = currentRoute();
   if (!r) return;
   const prev = parseHash(location.hash);
@@ -17644,12 +18539,32 @@ function syncUrlSoon() {
  * — including a session that is not there — leaves a deliberate, honest view
  * behind and returns true. A missing session must NOT silently become a new
  * session: that silence was the original bug.
+ *
+ * BUG-252 — "does the session this link names exist, and where?" is answered
+ * in ONE place, `resolveRouteSession`, from its owners: the history list for a
+ * transcript on disk, the live bridge registry for a session whose transcript
+ * is not listed yet. A stale `dir=` on an id that exists opens the session and
+ * corrects the URL; "not here" is said only when neither owner knows the id —
+ * and even then the page keeps asking (`armRouteRetry`), so a session that
+ * appears later opens instead of leaving a dead link.
  */
 async function applyRoute(route) {
   if (!route) return false;
   const p = state.projects.find((x) => x.id === route.projectId);
   if (!p) return false;
-  nav.applying = true;
+  // BUG-252 — the ONE route-intent chokepoint. This link is the pending intent
+  // until it is drawn; every await below re-asks `routeIntentHolds` before it
+  // touches the view, and nothing re-resolves a link after it was drawn
+  // (the deferred re-resolve broke twice — IV c01b61e7, d215bd11 — and was
+  // removed at independent design review). Two ways the intent ends:
+  //  - an in-app navigation (open a session, a new session, a send, another
+  //    route) bumps `nav.routeGen` — and in doing so lifts this route's URL-sync
+  //    hold, so that navigation's own URL is written;
+  //  - the URL stops naming this session (a hash typed, Back, an overlay).
+  //    While the hold stands, nothing of ours rewrites the URL (`syncUrl`), so
+  //    a changed hash IS the user's.
+  const gen = ++nav.routeGen;
+  nav.applyingGen = gen;
   try {
     state.expanded.add(p.id);
     saveExpanded();
@@ -17657,34 +18572,165 @@ async function applyRoute(route) {
       startNew(p.id);
       return true;
     }
-    const s = await loadSessions(p.id);
-    const matches = (s.list ?? []).filter((x) => x.sessionId === route.sessionId);
-    const sess = route.dir
-      ? matches.find((x) => x.encodedDir === route.dir)
-      : (matches.length === 1 ? matches[0] : null);
-    if (!sess) {
-      selectProject(p.id, { quiet: true });
-      resetOverrides(OVR_NONE); // BUG-198 round 2 — no session here: owns nothing, never adopted (selectProject no longer clears)
-      state.current = { projectId: p.id, encodedDir: null, sessionId: null, title: null, os: null };
-      followCurrent(false);
-      clearPendingDelivery(); // BUG-079: a link that resolves to no session is still a boundary
-      closeSocket();
-      resetTranscript();
-      renderTree();
-      const why = matches.length > 1
-        ? ` The id ${route.sessionId.slice(0, 8)}… exists in ${matches.length} history folders and the link does not say which (no dir=) — open it from the sidebar instead.`
-        : ` No session ${route.sessionId.slice(0, 8)}… under “${p.name}”. It may have been deleted, or the link may be wrong.`;
-      mainThread().paneEl.append(el('div', { class: 'hint-row' },
-        el('b', { text: 'This link points to a session that is not here.' }),
-        document.createTextNode(why)));
-      say('session in the URL not found', true);
-      window.history.replaceState(null, '', formatHash({ projectId: p.id }));
+    const holds = () => routeIntentHolds(gen, route);
+    const res = await resolveRouteSession(p, route, holds);
+    if (!holds()) return true; // superseded while resolving — leave the newer view alone
+    if (res.kind === 'open') {
+      const sess = res.sess;
+      await openSession(p, sess, { at: route.i, agent: route.agent, routeGen: gen });
+      // The URL names where the session really is (a stale dir corrected) —
+      // only while this open still owns the view.
+      if (nav.routeGen === gen && state.current.sessionId === sess.sessionId && state.current.encodedDir === sess.encodedDir) {
+        const want = formatHash({ ...route, dir: sess.encodedDir });
+        const here = parseHash(location.hash);
+        if (location.hash !== want && here?.projectId === p.id && here.sessionId === sess.sessionId) {
+          window.history.replaceState(null, '', want);
+          paintTitle();
+        }
+      }
       return true;
     }
-    await openSession(p, sess, { at: route.i, agent: route.agent });
+    renderUnresolvedRoute(p, route, res);
     return true;
   } finally {
-    nav.applying = false;
+    if (nav.applyingGen === gen) nav.applyingGen = null;
+  }
+}
+
+/** BUG-252 — is the link `applyRoute` was given (generation `gen`) still what the user wants on screen? */
+function routeIntentHolds(gen, route) {
+  if (nav.routeGen !== gen) return false;
+  const here = parseHash(location.hash);
+  return !!here && here.projectId === route.projectId && here.sessionId === route.sessionId;
+}
+
+/*
+ * BUG-252 — a live session's transcript can trail its session-init by a moment
+ * (the CLI flushes its first lines a little after it reports the id), and a
+ * reload can land in that moment. The resolver waits for it, BEFORE anything
+ * is drawn, for at most ROUTE_STARTING_WAIT_MS, while the intent holds.
+ */
+const ROUTE_STARTING_WAIT_MS = 10_000;
+const ROUTE_STARTING_POLL_MS = 400;
+
+/**
+ * BUG-252 — the ONE answer to "which session does this link name". Outcomes:
+ *  - open      — a session to open (`sess`), from the history list or, for a
+ *                live session the list does not show yet, from its bridge;
+ *  - starting  — a live bridge owns the id but no transcript became readable
+ *                within the wait;
+ *  - ambiguous — the id is in several history folders and the link's dir
+ *                names none of them;
+ *  - unknown   — the history list could not be read: absence is NOT proven;
+ *  - missing   — neither the history list nor a live bridge knows the id.
+ * `holds()` — the caller's intent check; a superseded resolve stops early (its
+ * answer is discarded by the caller either way).
+ */
+async function resolveRouteSession(p, route, holds = () => true) {
+  const id = route.sessionId;
+  const st = sessionState(p.id);
+  const cached = st.loaded && !st.loading;
+  let s = await loadSessions(p.id);
+  const find = () => (s.list ?? []).filter((x) => x.sessionId === id);
+  let matches = find();
+  // A list served from cache predates anything created since: ask once more
+  // before concluding the id is absent.
+  if (!matches.length && cached && holds()) { s = await loadSessions(p.id, { force: true }); matches = find(); }
+  if (route.dir) {
+    const exact = matches.find((x) => x.encodedDir === route.dir);
+    if (exact) return { kind: 'open', sess: exact };
+  }
+  if (matches.length === 1) {
+    const row = matches[0];
+    // The server lists ONE copy per id. When the link names a different dir,
+    // that dir may still hold the copy the link meant (a duplicate the list
+    // folded away) — honour the link if its file is really there.
+    if (route.dir && route.dir !== row.encodedDir && await transcriptReadable(route.dir, id)) {
+      return { kind: 'open', sess: { ...row, encodedDir: route.dir } };
+    }
+    return { kind: 'open', sess: row };
+  }
+  if (matches.length > 1) return { kind: 'ambiguous', n: matches.length };
+  if (!holds()) return { kind: 'missing' };
+  // Not on disk as far as the list knows — ask the live registry (the bridge
+  // owns where its transcript lands, FEAT-155; never re-derived from a cwd).
+  let bridges = null;
+  try { bridges = await api.liveBridges(); } catch { bridges = null; }
+  const b = (bridges ?? []).find((x) => x.sdkSessionId === id && x.projectId === p.id);
+  if (b) {
+    const dir = b.storeEncodedDir;
+    if (dir) {
+      const until = Date.now() + ROUTE_STARTING_WAIT_MS;
+      for (;;) {
+        if (await transcriptReadable(dir, id)) {
+          return { kind: 'open', sess: { sessionId: id, encodedDir: dir, os: 'linux', displayTitle: id.slice(0, 8) } };
+        }
+        if (!holds() || Date.now() >= until) break;
+        await new Promise((r) => setTimeout(r, ROUTE_STARTING_POLL_MS));
+      }
+    }
+    return { kind: 'starting', dir };
+  }
+  if (s.error) return { kind: 'unknown', error: s.error };
+  return { kind: 'missing' };
+}
+
+/** BUG-252 — is `dir/id`'s transcript readable right now? One small request. */
+async function transcriptReadable(dir, id) {
+  try { await api.transcriptTail(dir, id, { limit: 1 }); return true; } catch { return false; }
+}
+
+/**
+ * BUG-252 — the view for a link that did not resolve to an openable session.
+ * The session view is left owning nothing (as before). Nothing here re-resolves
+ * on its own: "starting" and "unknown" keep the link in the URL (a reload asks
+ * again) and offer an explicit "Check again", which is a user navigation.
+ */
+function renderUnresolvedRoute(p, route, res) {
+  selectProject(p.id, { quiet: true });
+  resetOverrides(OVR_NONE); // BUG-198 round 2 — no session here: owns nothing, never adopted (selectProject no longer clears)
+  state.current = { projectId: p.id, encodedDir: null, sessionId: null, title: null, os: null };
+  followCurrent(false);
+  clearPendingDelivery(); // BUG-079: a link that resolves to no session is still a boundary
+  closeSocket();
+  resetTranscript();
+  renderTree();
+  const short = `${route.sessionId.slice(0, 8)}…`;
+  let head, why, again = null;
+  if (res.kind === 'starting') {
+    head = 'This session is starting.';
+    why = ` Session ${short} is running under “${p.name}” but has not written its transcript yet.`;
+    again = 'Check again';
+  } else if (res.kind === 'unknown') {
+    head = 'Could not check this link yet.';
+    why = ` The session list for “${p.name}” did not load (${res.error}).`;
+    again = 'Try again';
+  } else if (res.kind === 'ambiguous') {
+    head = 'This link points to a session that is not here.';
+    why = ` The id ${short} exists in ${res.n} history folders and the link does not say which — open it from the sidebar instead.`;
+  } else {
+    head = 'This link points to a session that is not here.';
+    why = ` No session ${short} under “${p.name}”. It may have been deleted, or the link may be wrong.`;
+  }
+  const row = el('div', { class: 'hint-row route-unresolved', 'data-route-outcome': res.kind },
+    el('b', { text: head }),
+    document.createTextNode(why));
+  if (again) {
+    row.append(document.createTextNode(' '), el('button', {
+      type: 'button', class: 'route-again', text: again,
+      onclick: () => {
+        const hash = formatHash(route);
+        if (location.hash !== hash) window.history.pushState(null, '', hash);
+        void applyRoute(route);
+      },
+    }));
+  }
+  mainThread().paneEl.append(row);
+  if (res.kind === 'missing' || res.kind === 'ambiguous') {
+    say('session in the URL not found', true);
+    window.history.replaceState(null, '', formatHash({ projectId: p.id }));
+  } else {
+    say(res.kind === 'starting' ? 'the session in the URL has not written its transcript yet' : `session list unavailable: ${res.error}`, res.kind === 'unknown');
   }
 }
 
@@ -17822,6 +18868,8 @@ async function boot() {
   if (location.hash.startsWith('#/tickets') || location.hash.startsWith('#/guide') || location.hash.startsWith('#/git')) onHashRoute();
   window.__station = {
     state, drawer, api, loadSessions, renderTree, onEvent, startTurn, viewAgent, showThread,
+    selectProject, startNew, submit, // FEAT-177 — expose for the end-to-end attachment demo
+
     // BUG-100: footer (#fine) internals, so a verify script can drive the real
     // status/turn-end paths and assert the isolation label is never displaced by
     // raw command text and that every item stays within the hard length cap.

@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-08-05",
+  "updated": "2026-10-13",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -62,7 +62,19 @@
     }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-fable-5",
+      "run_id": "41c8e0f3-d495-4fb6-9709-9894de025a1c",
+      "verdict": "broken",
+      "verdict_on": "2026-10-13",
+      "recorded_at": "2026-10-13T11:43:35.039Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    }
+  ],
   "verification_class": "fix",
   "body_slots": {
     "Diagnosis": true,
@@ -204,3 +216,6 @@ settled at source now.
 `src/server/agent-bridge.ts`, `public/app.js`, `scripts/verify-stale-agent-cards.mjs`,
 `package.json`) and commits. Shares `agent-bridge.ts`/`app.js` with BUG-020/BUG-028 lineage —
 serialize with any in-flight ticket touching those files.
+
+### 2026-10-13 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic/claude-fable-5 run 41c8e0f3-d495-4fb6-9709-9894de025a1c — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.

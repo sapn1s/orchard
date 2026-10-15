@@ -168,3 +168,10 @@ export function parseTicket(
 
 export function validateTicket(record: unknown, opts?: { file?: string | null }): { ok: boolean; violations: string[] };
 export function formatTicket(record: Record<string, unknown>, body?: string): string;
+
+// BUG-259 — an agent-owned decision's typed basis, and its history-entry shape check.
+export const OWN_BASES: readonly string[];
+export const OWN_BASES_NEEDING_REF: readonly string[];
+export const WITHDRAW_BASIS: string;
+export const OWNED_BASES: readonly string[];
+export function validateOwnedEntry(h: Record<string, unknown>, i: number, bad: (msg: string) => void): void;

@@ -5,57 +5,89 @@
   "title": "Agent git-write enforcement is a text parser over shell",
   "summary": "The mandatory leak gate runs only when FEAT-108 classifies an agent's Bash string as a git write. Shell is a full language, so the classifier is an open-ended parser and every gap is fail-open: an unrecognised write runs with the gate skipped. Six rounds and five clean rooms each landed an ungated commit through a new shell form.",
   "impact_if_we_wait": "Each clean-room round found a fresh bypass the previous parser missed (wrappers, expanded heads, pipe-into-shell, heredoc-as-stdin, git -c config execution). The enumeration is open: any new wrapper, builtin, config key or interpreter is a latent ungated commit until noticed. A leaked commit costs a full rewrite of main.",
-  "current_need": "Decide whether agent git-write enforcement stays a text classifier or gains a structural layer that runs the gate at git itself and the OS boundary.",
+  "current_need": "Record the text-classifier residual as priced under that threat model; nothing structural to build.",
   "severity": "high",
   "area": "agent git-write enforcement / leak-gate trigger",
   "reported": "2026-09-30",
   "reported_by": "agent",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-09-30",
-  "decision": {
-    "mode": "single",
-    "question": "Should agent git-write enforcement stay a shell-text parser, or enforce the leak gate at git and the OS boundary?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Price the text-only residual",
-        "what_changes": "Freeze the round-6 classifier as the only layer.",
-        "benefit": "Nothing new to build.",
-        "cost": "The invariant is not actually held; every new shell form is a latent ungated commit.",
-        "why_not_obvious": "It is the current de-facto state, so choosing it makes the fail-open an explicit recorded choice."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "8d03ba0a-3ca0-4af0-991e-e1dfbbb8c122",
+      "asked_on": "2026-09-30",
+      "question": "Should agent git-write enforcement stay a shell-text parser, or enforce the leak gate at git and the OS boundary?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C",
+        "D"
+      ],
+      "chosen": null,
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — settled: Your BUG-240 answer already set the threat model: the guard stops accidental agent commits, the shim covers that, and it is not a boundary against a malicious agent. No new enforcement layer is owed.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "settled",
+        "ref": "BUG-240",
+        "why": "Your BUG-240 answer already set the threat model: the guard stops accidental agent commits, the shim covers that, and it is not a boundary against a malicious agent. No new enforcement layer is owed.",
+        "on": "2026-10-14",
+        "next": "Record the text-classifier residual as priced under that threat model; nothing structural to build.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether agent git-write enforcement stays a text classifier or gains a structural layer that runs the gate at git itself and the OS boundary."
+        }
       },
-      {
-        "key": "B",
-        "label": "Enforce at git via hooks plus the shim",
-        "what_changes": "Add server-installed pre-commit/pre-push hooks that run the gate, alongside the FEAT-135 PATH shim.",
-        "benefit": "git invokes the hook however the string was formed.",
-        "cost": "Bypassable by absolute /usr/bin/git, --no-verify, and core.hooksPath.",
-        "why_not_obvious": "It raises the floor a lot but is not airtight alone."
-      },
-      {
-        "key": "C",
-        "label": "Mount .git read-only in containers",
-        "what_changes": "Container sessions get the repo .git read-only; writes go through an Orchard-mediated gated path.",
-        "benefit": "The kernel refuses the write; no parsing needed.",
-        "cost": "Applies only to container sessions; needs a mediated write channel.",
-        "why_not_obvious": "Direct host sessions are unaffected, so it is not a whole answer."
-      },
-      {
-        "key": "D",
-        "label": "Combine B for host and C for containers",
-        "what_changes": "Keep the text policy as early feedback; add hooks for host sessions and the read-only mount for containers.",
-        "benefit": "The invariant holds for every session class; the parser is demoted to a hint.",
-        "cost": "The most work of the four.",
-        "why_not_obvious": "Its residual is a small enumerable set, not any unparsed shell form."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should agent git-write enforcement stay a shell-text parser, or enforce the leak gate at git and the OS boundary?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Price the text-only residual",
+            "what_changes": "Freeze the round-6 classifier as the only layer.",
+            "benefit": "Nothing new to build.",
+            "cost": "The invariant is not actually held; every new shell form is a latent ungated commit.",
+            "why_not_obvious": "It is the current de-facto state, so choosing it makes the fail-open an explicit recorded choice."
+          },
+          {
+            "key": "B",
+            "label": "Enforce at git via hooks plus the shim",
+            "what_changes": "Add server-installed pre-commit/pre-push hooks that run the gate, alongside the FEAT-135 PATH shim.",
+            "benefit": "git invokes the hook however the string was formed.",
+            "cost": "Bypassable by absolute /usr/bin/git, --no-verify, and core.hooksPath.",
+            "why_not_obvious": "It raises the floor a lot but is not airtight alone."
+          },
+          {
+            "key": "C",
+            "label": "Mount .git read-only in containers",
+            "what_changes": "Container sessions get the repo .git read-only; writes go through an Orchard-mediated gated path.",
+            "benefit": "The kernel refuses the write; no parsing needed.",
+            "cost": "Applies only to container sessions; needs a mediated write channel.",
+            "why_not_obvious": "Direct host sessions are unaffected, so it is not a whole answer."
+          },
+          {
+            "key": "D",
+            "label": "Combine B for host and C for containers",
+            "what_changes": "Keep the text policy as early feedback; add hooks for host sessions and the read-only mount for containers.",
+            "benefit": "The invariant holds for every session class; the parser is demoted to a hint.",
+            "cost": "The most work of the four.",
+            "why_not_obvious": "Its residual is a small enumerable set, not any unparsed shell form."
+          }
+        ],
+        "recommendation": "D",
+        "recommendation_reason": "Only D actually holds the invariant for every session class while keeping the fast text feedback.",
+        "prerequisite": null
       }
-    ],
-    "recommendation": "D",
-    "recommendation_reason": "Only D actually holds the invariant for every session class while keeping the fast text feedback.",
-    "prerequisite": null
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "No agent-session git write reaches the repo ungated, proven by a probe that invokes git through a form the text classifier does not recognise.",
     "Freezing or removing the FEAT-108 text rules does not reintroduce an ungated commit.",
@@ -63,14 +95,28 @@
     "If the text-only option wins, the open-enumeration fail-open is recorded as an explicit priced choice."
   ],
   "code_refs": [
-    { "path": "scripts/lib/git-write-policy.mjs" },
-    { "path": "scripts/lib/git-grant.mjs" },
-    { "path": "scripts/lib/git-shim.mjs" },
-    { "path": "src/server/runtime/claude-runtime.ts" }
+    {
+      "path": "scripts/lib/git-write-policy.mjs"
+    },
+    {
+      "path": "scripts/lib/git-grant.mjs"
+    },
+    {
+      "path": "scripts/lib/git-shim.mjs"
+    },
+    {
+      "path": "src/server/runtime/claude-runtime.ts"
+    }
   ],
   "related": [
-    { "id": "FEAT-108", "relation": "recurrence_of" },
-    { "id": "FEAT-135", "relation": "see_also" }
+    {
+      "id": "FEAT-108",
+      "relation": "recurrence_of"
+    },
+    {
+      "id": "FEAT-135",
+      "relation": "see_also"
+    }
   ],
   "recurrence_evidence": [
     "FEAT-108",
@@ -216,3 +262,9 @@ is the better call.
 
 ### 2026-10-08 — BUG-240 decision lane
 - **threat model clarified (user intent):** Threat-model clarification from the user (append-only, recorded while answering BUG-240's venue card A). The agent git-write enforcement exists to stop agents AUTONOMOUSLY committing or pushing to a project's real repo — the failure it prevents is noise commits, a broken main branch and unintended changes (accidental or habitual writes). Quoting the user: "It is NOT a security boundary against a deliberately malicious agent." So this ticket's invariant and options should be read against that intent: the text/hook/shim layers (A/B) are about catching accidental or habitual real-repo writes, not about defeating a same-uid adversary who deliberately routes around them. That reframing does not change the options; it sets the bar they are judged against.
+
+### 2026-10-14 — worker (FEAT-164 evidence)
+- **Note:** Evidence from FEAT-164 (verify 6efa2e34-e237-4893-ab4b-72cc753c7999): in CONTAINER projects the FEAT-135 git shim is not on the agent's PATH, so FEAT-164's single push authority (decidePush: source grant + destination recorded at grant time + destination veto) never runs there. A plain `git push` from inside the container works under a commits-only grant or in release mode; the container gets no host git credentials, but nothing structural stops a push to a remote it can reach. Recorded as FEAT-164 residual 13: "Container sessions bypass decidePush; push enforcement in containers requires OS-level isolation (ARCH-021 option D)." It is one more concrete case where enforcement layered on a shim or text parser cannot hold and OS-level isolation would hold by construction.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: settled (BUG-240). Why: Your BUG-240 answer already set the threat model: the guard stops accidental agent commits, the shim covers that, and it is not a boundary against a malicious agent. No new enforcement layer is owed. Next: Record the text-classifier residual as priced under that threat model; nothing structural to build. You can reopen this decision from the ticket view.

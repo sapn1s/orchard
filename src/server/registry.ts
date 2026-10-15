@@ -3,6 +3,7 @@
  * are atomic so a crash cannot leave a half-written registry.
  */
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -10,6 +11,9 @@ import { dataDir, registryFile, slugify, writeAtomic, ensureDir, scratchDir, pro
 // BUG-223 round 4 — the registration-time classification of `settings.laneDocker`.
 // lane-docker.mjs imports only paths.ts and docker-sandbox.mjs, so there is no cycle.
 import { classifyLaneDocker, type LaneDockerSetting } from '../../scripts/lib/lane-docker.mjs';
+import { normalizeGitWrite, type AgentGitPolicy, type GitWriteSettingInput } from '../../scripts/lib/agent-git-policy.mjs';
+import { ensureSealKey, sealGitWrite, sealLegacyOnKeyCreation, verifiedGitWrite } from '../../scripts/lib/git-write-seal.mjs';
+import { grantBindingOf, bindingHolds, type RepoIdentity } from '../../scripts/lib/repo-identity.mjs';
 import type { Isolation } from './events.ts';
 // BUG-144 — the single Working-Agreement mutation source (wiring.ts imports only
 // TYPES + toolSettingsOf back from here, and both sides use their imports lazily
@@ -458,30 +462,132 @@ export interface ProjectSettings {
    */
   laneDocker?: LaneDockerSetting;
   /**
-   * FEAT-164 — the PERMANENT agent git-write grant for this project. DECLARED here,
-   * once (ARCH-010): written only by `setGitWritePermanent` (called by the
-   * user-facing grant route, never by the generic settings PATCH, which rejects the
-   * key), and read only by `gitWritePermanentOf`, the source the git-grant store
-   * consults at call time for every agent git write. Absent/null/anything but
-   * `{ permanent: true }` = no permanent grant. It never lifts the leak gate.
+   * FEAT-164 — the AGENT GIT POLICY for this project: may agents' work reach the real
+   * repo (`commit`), its remote (`push`), and under what scope (`scope`, the user's
+   * note; blank = undetermined = soft releases), with the release cadence overrides.
+   * DECLARED here, once (ARCH-010): written only by `setGitWritePolicy` (the settings
+   * route and the legacy grant route), never by the generic settings PATCH (which
+   * rejects the key); read only through `gitWritePolicyOf`, which applies the ONE rule
+   * (scripts/lib/agent-git-policy.mjs normalizeGitWrite). Absent = no agent commits
+   * (the default). Legacy `{ permanent: true }` (r1) still reads, as release mode.
    */
-  gitWrite?: { permanent: boolean; grantedAt?: string; grantedVia?: string } | null;
+  gitWrite?: GitWriteSetting | null;
 }
 
-/** FEAT-164 — the declared permanent git-write grant of a project, or null. The
- * ONE reader; the git-grant store calls it per decision, so a revoke bites on a
- * running session's next git write. Throws only if the registry is unreadable,
- * which the store treats as "no grant" (fail closed). */
+/** FEAT-164 — the stored shape of `settings.gitWrite` (see ProjectSettings.gitWrite). */
+export interface GitWriteSetting {
+  commit?: boolean;
+  push?: boolean;
+  scope?: string | null;
+  release?: GitWriteSettingInput['release'];
+  /** FEAT-190 — per-repo cross-repo opt-out map (keyed by the target repo's git common dir). */
+  repoOverrides?: GitWriteSettingInput['repoOverrides'];
+  /** r1 legacy shape only; never written any more. */
+  permanent?: boolean;
+  /** FEAT-164 option A — HMAC by the one writer (scripts/lib/git-write-seal.mjs); unsealed = none. */
+  seal?: string;
+  /** FEAT-164 grant binding — the repo identity granted (scripts/lib/repo-identity.mjs); a mismatch voids it. */
+  repo?: RepoIdentity | null;
+  grantedAt?: string;
+  grantedVia?: string;
+}
+
+/** FEAT-164 — THE reader of a project's agent git policy (normalised; mode none on any
+ * unreadable/absent value). Throws only if the registry itself is unreadable. */
+export function gitWritePolicyOf(projectId: string): AgentGitPolicy {
+  const p = getProject(projectId);
+  const gw = p?.settings?.gitWrite ?? null;
+  const policy = normalizeGitWrite(gw);
+  // FEAT-164 grant binding: a standing grant counts only while the project's path resolves
+  // to the repo identity it was given for (sealed in `repo`). A changed path, symlink
+  // target or .git voids it; no binding = void (fail closed). Mode none needs no check.
+  if (policy.mode !== 'none' && !bindingHolds((gw as GitWriteSetting | null)?.repo ?? null, p?.hostPath)) {
+    return normalizeGitWrite(null);
+  }
+  return policy;
+}
+
+/** FEAT-164 — the repo identity the project's standing grant is bound to (display/tests). */
+export function gitWriteBindingOf(projectId: string): RepoIdentity | null {
+  return (getProject(projectId)?.settings?.gitWrite as GitWriteSetting | null | undefined)?.repo ?? null;
+}
+
+/**
+ * FEAT-190 r3 — the OPTIMISTIC-CONCURRENCY revision of a project's stored agent-git policy
+ * (coordinator decision, two-break rule). Every setGitWritePolicy write refreshes `grantedAt` and
+ * so re-seals the value, so a hash of the stored seal is a per-write revision token that changes on
+ * every change (grant, revoke, path-change revoke) and is tamper-evident (the seal is the one
+ * writer's HMAC). No grant yet → the seal is absent → a fixed "empty" revision, which the first PUT
+ * carries and matches. The git-write-policy PUT route refuses a save whose carried revision differs
+ * from this (409), making "a save stores something other than what the user saw" impossible by
+ * construction, independent of any client race. It is a concurrency token, NOT a security boundary
+ * (the seal still guards the policy content); a tampered seal at worst yields a spurious 409.
+ */
+export function gitWriteRevisionOf(projectId: string): string {
+  const gw = getProject(projectId)?.settings?.gitWrite as GitWriteSetting | null | undefined;
+  const seal = gw && typeof gw.seal === 'string' ? gw.seal : '';
+  return createHash('sha256').update(`orchard-feat190-gitwrite-rev-v1\0${seal}`).digest('hex').slice(0, 16);
+}
+
+/** FEAT-164 — the git-grant store's projection: a STANDING grant exists iff agent commits
+ * are granted (mode ≠ none). It lets agents write scratch/fixture repos; which REAL repo
+ * writes are allowed is the shim-decide guard's job (agent-git-policy decideByTarget).
+ * `grantedAt` is the incarnation the store binds claims to: every save stamps a new one,
+ * so a claim minted under one policy never survives a change. Throws only if the registry
+ * is unreadable, which the store treats as "no grant" (fail closed). */
 export function gitWritePermanentOf(projectId: string): { permanent: boolean; grantedAt?: string; grantedVia?: string } | null {
-  return getProject(projectId)?.settings?.gitWrite ?? null;
+  const p = gitWritePolicyOf(projectId);
+  if (p.mode === 'none') return null;
+  return { permanent: true, grantedAt: p.grantedAt ?? 'legacy', grantedVia: p.grantedVia ?? 'user' };
 }
 
-/** FEAT-164 — the ONE writer of the permanent grant. `on:false` clears it. */
+/** FEAT-164 — THE ONE WRITER of the agent git policy. `value: null` revokes commit and
+ * push but keeps the scope note and cadence for a later re-grant. */
+export function setGitWritePolicy(projectId: string, value: GitWriteSettingInput | null, opts: { via?: string } = {}): Project {
+  const cur = getProject(projectId)?.settings?.gitWrite ?? null;
+  const prev = normalizeGitWrite(cur);
+  const keepRelease = cur && typeof cur === 'object' && cur.release && typeof cur.release === 'object' ? cur.release : undefined;
+  // FEAT-190 — preserve the per-repo cross-repo opt-out map across a save unless the caller
+  // sends a new one, and keep it across a revoke (it is inert while mode is none).
+  const keepOverrides = cur && typeof cur === 'object' && cur.repoOverrides && typeof cur.repoOverrides === 'object' ? cur.repoOverrides : undefined;
+  const overrides = value && value.repoOverrides !== undefined ? value.repoOverrides : keepOverrides;
+  // FEAT-190 — ALWAYS store a release object carrying an explicit `opt_in`, so the reader can tell a
+  // NEW record from a legacy one (normalizeGitWrite). CRITICAL (IV run 93ad10c2 BROKEN): when the
+  // caller does NOT specify release intent, `opt_in` PRESERVES the record's CURRENT effective mode
+  // (`prev.mode === 'release'`) rather than defaulting false — otherwise a compat/CLI re-grant
+  // (setGitWritePermanent, which sends no release) would stamp opt_in:false on a LEGACY blank-scope
+  // release grant and silently flip it to scoped + direct push. A plain NEW grant (no prior record,
+  // prev.mode 'none') still gets opt_in:false → scoped, which is the intended default.
+  const relOptIn = value && value.release && typeof value.release.opt_in === 'boolean'
+    ? value.release.opt_in
+    : prev.mode === 'release';
+  const next: GitWriteSetting = value
+    ? { commit: value.commit, push: value.commit && value.push, scope: value.scope, release: { ...(keepRelease || {}), ...(value.release || {}), opt_in: relOptIn }, ...(overrides ? { repoOverrides: overrides } : {}) }
+    : { commit: false, push: false, scope: prev.scope, ...(keepRelease ? { release: keepRelease } : {}), ...(overrides ? { repoOverrides: overrides } : {}) };
+  next.grantedAt = new Date().toISOString();
+  next.grantedVia = String(opts.via || 'user');
+  // FEAT-164 option A (S1): the one writer seals; every load verifies (sealGateOnLoad).
+  const row = getProject(projectId);
+  if (!row) throw new Error(`setGitWritePolicy: no project ${JSON.stringify(projectId)}`);
+  // The grant binding: the repo identity this policy is given for, inside the seal.
+  next.repo = grantBindingOf(row.hostPath); // identity + local remotes recorded NOW (the user's act)
+  const sealed = sealGitWrite(ensureSealKey(dataDir()).key, row, next as Record<string, unknown>);
+  return updateProject(projectId, { settings: { gitWrite: sealed } as unknown as ProjectSettings });
+}
+
+/** FEAT-164 r1 route compatibility (`POST git-write-grant {scope:'permanent'}`, the CLI's
+ * --permanent): grant/revoke COMMIT keeping the note, push and cadence as they were.
+ * Goes through the one writer. */
 export function setGitWritePermanent(projectId: string, on: boolean, opts: { via?: string } = {}): Project {
-  const value = on
-    ? { permanent: true, grantedAt: new Date().toISOString(), grantedVia: String(opts.via || 'user') }
-    : null;
-  return updateProject(projectId, { settings: { gitWrite: value } as unknown as ProjectSettings });
+  const cur = normalizeGitWrite(getProject(projectId)?.settings?.gitWrite ?? null);
+  // FEAT-190 r3 (IV run fd9c30b8) — a FRESH standing grant made through this route (the
+  // dashboard "Allow permanently" and `git-grant.mjs --permanent`) must default push ON, exactly
+  // like the panel's PUT (success criterion: "a grant with defaults allows commit AND push").
+  // Before this it inherited cur.push (false on a fresh project), so the CLI/legacy route stored a
+  // commit-only grant and the host refused pushes. An EXISTING grant's explicit push is preserved
+  // (mode !== 'none'), so a prior push:false opt-out is never silently re-enabled.
+  const push = on ? (cur.mode === 'none' ? true : cur.push) : false;
+  return setGitWritePolicy(projectId, on ? { commit: true, push, scope: cur.scope } : null, opts);
 }
 
 /**
@@ -660,7 +766,42 @@ function load(): RegistryFile {
   if (!obj || !Array.isArray(obj.projects)) {
     throw new Error(`registry: ${file} has no "projects" array.`);
   }
-  return { version: 1, projects: obj.projects as Project[] };
+  const projects = obj.projects as Project[];
+  sealGateOnLoad(projects);
+  return { version: 1, projects };
+}
+
+/**
+ * FEAT-164 option A (S1) — every project row read from disk passes its `settings.gitWrite`
+ * through the seal check BEFORE anything in the server sees it, so all readers (the policy
+ * reader, the container guard, the prompt note, the shim decide route) only ever get a
+ * value the one writer sealed for THAT project. An unsealed, re-sealed-for-another-project
+ * or edited value reads as no grant (null) — and the next save drops it from disk.
+ * The first load after the upgrade creates the key and seals the grants that already
+ * existed (git-write-seal.mjs sealLegacyOnKeyCreation), then persists them.
+ */
+const warnedUnsealed = new Set<string>();
+function sealGateOnLoad(projects: Project[]): void {
+  const dir = dataDir();
+  let migrated: string[] = [];
+  try { migrated = sealLegacyOnKeyCreation(dir, projects); } catch (err) {
+    console.warn(`[orchard] git-write seal key unavailable (${(err as Error).message}) — every standing agent git-write permission reads as none (FEAT-164).`);
+  }
+  if (migrated.length) {
+    save({ version: 1, projects });
+    console.warn(`[orchard] git-write seal key created; sealed the existing agent git-write permissions of ${migrated.join(', ')} (FEAT-164 option A migration).`);
+  }
+  for (const p of projects) {
+    const gw = (p?.settings as { gitWrite?: unknown } | undefined)?.gitWrite;
+    if (gw === undefined || gw === null) continue;
+    if (verifiedGitWrite(dir, p, gw)) continue;
+    const tag = `${p.id}:${JSON.stringify(gw)}`;
+    if (!warnedUnsealed.has(tag)) {
+      warnedUnsealed.add(tag);
+      console.warn(`[orchard] project ${p.id}: settings.gitWrite is not sealed by Orchard's writer (edited or copied outside it) — it permits NOTHING and is dropped on the next save (FEAT-164 option A).`);
+    }
+    (p.settings as { gitWrite?: unknown }).gitWrite = null;
+  }
 }
 
 function save(reg: RegistryFile): void {

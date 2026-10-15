@@ -1186,6 +1186,32 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "seedBootStubs seeds 8 stubs even with templates.ts absent (violates req 5, confirmed by code read); a pre-existing directory at a declared doc path is silently treated as present then EISDIRs at read, not named loudly. Left open."
+    },
+    {
+      "id": "FEAT-129",
+      "provider": "anthropic",
+      "model": "opus",
+      "run_id": "8417015c-e1eb-4a38-9f07-a1135fdfedac",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T22:46:10.602Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "id": "BUG-261",
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "01ffc7ee-eab3-4dd4-8ec5-178a6db97ad9",
+      "verdict": "holds",
+      "verdict_on": "2026-10-14",
+      "recorded_at": "2026-10-14T18:57:57.613Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "735ecb3437ad6796037014d980b4e916109be966c2d6a89df83b80a3cad59b2b",
+      "verify_mode": "mixed-state"
     }
   ]
 }

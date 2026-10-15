@@ -117,7 +117,7 @@ export const DEFAULT_GRANT_MS = 30 * 60 * 1000; // 30m
  * `grantedVia` is recorded for the audit trail ('dashboard' | 'cli' | …).
  * Returns the stored grant (a copy).
  */
-export function grantGitWrite(projectKey, { scope = 'once', ttlMs, grantedVia = 'user', note = '', now = Date.now() } = {}) {
+export function grantGitWrite(projectKey, { scope = 'once', ttlMs, grantedVia = 'user', note = '', repo = null, now = Date.now() } = {}) {
   if (!projectKey || typeof projectKey !== 'string') throw new Error('grantGitWrite: projectKey required');
   const clampedTtl = Math.min(Math.max(1, Number(ttlMs) || (scope === 'once' ? MAX_GRANT_MS : DEFAULT_GRANT_MS)), MAX_GRANT_MS);
   const grant = {
@@ -128,6 +128,14 @@ export function grantGitWrite(projectKey, { scope = 'once', ttlMs, grantedVia = 
     expiresAt: now + clampedTtl,
     grantedVia: String(grantedVia || 'user'),
     note: String(note || ''),
+    // FEAT-164 grant binding: the repo identity this grant was given for. The shim-decide
+    // route honours it only while the project's path still resolves to it (else revokes).
+    // ...plus the local remotes recorded at grant time (repo-identity grantBindingOf): the only local push targets.
+    repo: repo && typeof repo === 'object' ? {
+      toplevel: String(repo.toplevel), commonDir: repo.commonDir ?? null,
+      remotes: Array.isArray(repo.remotes) ? repo.remotes.filter((r) => r && typeof r === 'object').map((r) => ({ toplevel: String(r.toplevel), commonDir: r.commonDir ?? null })) : [],
+      networkKeys: Array.isArray(repo.networkKeys) ? repo.networkKeys.filter((k) => typeof k === 'string' && k) : [],
+    } : null,
   };
   grants.set(projectKey, grant);
   return viewGrant(grant, now);
@@ -541,7 +549,7 @@ export function _authorisationCount() { return authorisations; }
  * it there via `confirmGitWrite`, because only the executor observes git's exit.
  * The record carries a stable `id` so that confirmation can find it later.
  */
-export function recordGitWrite({ projectKey, offender, command, sessionLabel = null, grantScope = null, gatePassed = null, outcome = 'permitted', decision = null, now = Date.now() }) {
+export function recordGitWrite({ projectKey, offender, command, sessionLabel = null, grantScope = null, gatePassed = null, outcome = 'permitted', decision = null, targetRepo = null, sourceProjectKey = null, now = Date.now() }) {
   const rec = {
     // BUG-184 round 3 — id is `w<seq>-<boot>`: the per-process boot nonce makes it
     // globally unique across restarts (A3). It is only a LOOKUP handle, NOT the
@@ -562,6 +570,14 @@ export function recordGitWrite({ projectKey, offender, command, sessionLabel = n
     // gatePassed records the gate result AT DECIDE TIME (true/false/n-a). It is NOT
     // proof the write landed — `outcome` owns that. Kept for continuity/detail.
     gatePassed: gatePassed === null ? null : !!gatePassed,
+    // FEAT-190 — the resolved TARGET repo this write reached (identity, never the session's own
+    // project row) and the SOURCE project whose grant covered it. Together they let the git page
+    // show "which repos this grant reached" and drive the per-repo opt-out. null for same-repo /
+    // legacy writes. targetRepo: { toplevel, commonDir, label? }.
+    targetRepo: targetRepo && typeof targetRepo === 'object'
+      ? { toplevel: typeof targetRepo.toplevel === 'string' ? targetRepo.toplevel : null, commonDir: typeof targetRepo.commonDir === 'string' ? targetRepo.commonDir : null, label: typeof targetRepo.label === 'string' ? targetRepo.label.slice(0, 200) : null }
+      : null,
+    sourceProjectKey: typeof sourceProjectKey === 'string' && sourceProjectKey ? sourceProjectKey : null,
     outcome: WRITE_OUTCOMES.has(outcome) ? outcome : 'permitted',
     exitStatus: null,
     executedAt: null,
@@ -627,6 +643,74 @@ export function confirmGitWrite(id, { token = null, projectKey = null, exitStatu
   return { ok: true, reason: null, record: rec };
 }
 
+/* ─────────── FEAT-190 — CROSS-REPO REACH LOG (display / opt-out source ONLY) ───────────
+ * A grant covers the OTHER repos a session works in. This log records WHICH repos a source
+ * project's grant has touched, so the git page can list them and let the user switch any of them
+ * off (the per-repo opt-out, which lives in the grant's `repoOverrides`, keyed by commonDir).
+ *
+ * FEAT-190 r8 (orchestrator RESCOPE): the reach log has NO allow/deny role. It used to FREEZE a
+ * repo's remotes at first contact and refuse a push to any other remote (`remote-not-recorded`);
+ * that frozen-remote veto — a destination safeguard the user never asked for, outside the guard's
+ * threat model, which broke three times through its keying (grantedAt incarnation, cwd-vs-commonDir)
+ * — was removed, not re-keyed. The reach entry is now keyed by (sourceProjectKey, targetCommonDir):
+ * the repo identity, no grant incarnation. The remotes recorded on an entry are DISPLAY-only. No
+ * decision reads this log; the only decision keyed by commonDir is the per-repo opt-out in
+ * governingGrant (which reads the grant's repoOverrides, not this log).
+ * DURABLE (index.ts wires a jsonl sink and replays it on boot).
+ *   entry: { sourceProjectKey, targetCommonDir, targetToplevel, networkKeys:[], localCommonDirs:[], at }
+ */
+const crossRepoReach = new Map(); // `${sourceProjectKey}\0${targetCommonDir}` → entry
+let crossRepoReachSink = null;
+function reachKey(sourceProjectKey, targetCommonDir) {
+  return sourceProjectKey && targetCommonDir ? `${sourceProjectKey}\0${targetCommonDir}` : null;
+}
+/** Register (or clear) the durable sink for reach records. */
+export function setCrossRepoReachSink(fn) { crossRepoReachSink = typeof fn === 'function' ? fn : null; }
+/** Replay a durable reach record on boot (index.ts reads the jsonl). First-writer wins, so a
+ * replay never overwrites an existing entry. Tolerates legacy entries carrying a `grantedAt`
+ * field (ignored — it is no longer part of the key). Never throws. */
+export function loadCrossRepoReach(rec) {
+  if (!rec || typeof rec !== 'object') return;
+  const k = reachKey(rec.sourceProjectKey, rec.targetCommonDir);
+  if (!k || crossRepoReach.has(k)) return;
+  crossRepoReach.set(k, {
+    sourceProjectKey: rec.sourceProjectKey, targetCommonDir: rec.targetCommonDir,
+    targetToplevel: typeof rec.targetToplevel === 'string' ? rec.targetToplevel : null,
+    networkKeys: Array.isArray(rec.networkKeys) ? rec.networkKeys.filter((x) => typeof x === 'string') : [],
+    localCommonDirs: Array.isArray(rec.localCommonDirs) ? rec.localCommonDirs.filter((x) => typeof x === 'string') : [],
+    at: typeof rec.at === 'string' ? rec.at : new Date(Date.now()).toISOString(),
+  });
+}
+/**
+ * Record (for the git-page display / opt-out list) that a source project's grant has reached a
+ * target repo. Keyed by (sourceProjectKey, targetCommonDir); first-writer wins. `resolved` is the
+ * repo's remotes AS GIT RESOLVES THEM NOW (resolvedRemotesOf): { network:[keys], local:[{commonDir}] },
+ * kept DISPLAY-only. Never throws.
+ */
+export function recordCrossRepoReach(sourceProjectKey, { targetCommonDir, targetToplevel = null, resolved = null } = {}, now = Date.now()) {
+  const k = reachKey(sourceProjectKey, targetCommonDir);
+  if (!k) return null;
+  const hit = crossRepoReach.get(k);
+  if (hit) return hit;
+  const entry = {
+    sourceProjectKey, targetCommonDir, targetToplevel: typeof targetToplevel === 'string' ? targetToplevel : null,
+    networkKeys: resolved && Array.isArray(resolved.network) ? [...new Set(resolved.network.filter((x) => typeof x === 'string'))] : [],
+    localCommonDirs: resolved && Array.isArray(resolved.local) ? [...new Set(resolved.local.map((l) => l && l.commonDir).filter((x) => typeof x === 'string'))] : [],
+    at: new Date(now).toISOString(),
+  };
+  crossRepoReach.set(k, entry);
+  if (crossRepoReachSink) { try { crossRepoReachSink(entry); } catch { /* durability must never break a decision */ } }
+  return entry;
+}
+/** The reach entry for (sourceProjectKey, targetCommonDir), or null. */
+export function crossRepoReachOf(sourceProjectKey, targetCommonDir) {
+  return crossRepoReach.get(reachKey(sourceProjectKey, targetCommonDir)) ?? null;
+}
+/** Every reach entry for a source project (git page: "repos this grant reached"). */
+export function crossRepoReachFor(sourceProjectKey) {
+  return [...crossRepoReach.values()].filter((e) => e.sourceProjectKey === sourceProjectKey);
+}
+
 /** Most-recent-first copy of the ledger, optionally filtered to one project. */
 export function listGitWrites(projectKey = null, limit = 100) {
   const rows = projectKey ? ledger.filter((r) => r.projectKey === projectKey) : ledger;
@@ -644,11 +728,19 @@ export function grantView(projectKey, now = Date.now()) {
   return g ? viewGrant(g, now) : null;
 }
 
+/** FEAT-164 — DISPLAY read of the live TIMED/once grant alone (the standing grant is
+ * ignored), or null. The real-repo guard uses it to honour the user's explicit window;
+ * it never authorises a write (claimGrant does). */
+export function timedGrantView(projectKey, now = Date.now()) {
+  const g = projectKey ? liveTimedGrant(projectKey, now) : null;
+  return g ? viewGrant(g, now) : null;
+}
+
 /** Register (or clear) the durable audit sink. index.ts wires the host log file. */
 export function setGitWriteAuditSink(fn) { auditSink = typeof fn === 'function' ? fn : null; }
 
 /** TEST-ONLY: forget every grant and clear the ledger. */
-export function _resetGitGrantsForTest() { grants.clear(); revocationGen.clear(); calls.clear(); lastGlobalSweep = 0; authorisations = 0; ledger.length = 0; ledgerSeq = 0; confirmCaps.clear(); auditSink = null; permanentSource = null; }
+export function _resetGitGrantsForTest() { grants.clear(); revocationGen.clear(); calls.clear(); lastGlobalSweep = 0; authorisations = 0; ledger.length = 0; ledgerSeq = 0; confirmCaps.clear(); auditSink = null; permanentSource = null; crossRepoReach.clear(); crossRepoReachSink = null; }
 
 function viewGrant(g, now) {
   const bounded = g.remainingUses !== Infinity;
@@ -662,5 +754,6 @@ function viewGrant(g, now) {
     note: g.note,
     expiresAt: new Date(g.expiresAt).toISOString(),
     expiresInMs: Math.max(0, g.expiresAt - now),
+    repo: g.repo ?? null,
   };
 }

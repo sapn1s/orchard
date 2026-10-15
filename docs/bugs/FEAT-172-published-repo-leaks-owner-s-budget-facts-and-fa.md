@@ -11,9 +11,9 @@
   "reported": "2026-10-09",
   "reported_by": "user",
   "owner": "unassigned",
-  "work_state": "in_progress",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-10-09",
+  "updated": "2026-10-11",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -83,6 +83,52 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "TWO-BREAK: design review, do NOT patch. New-path FALSE-POSITIVE: dated-stamp derived marker over-matches shared dates (overlay 'as of 2026-08-05' hits real ROUTING.md banner; verifier run b7b91e2c9765 exit1 vs 0). Props 0-4 HOLD on real artifacts; real tree PASSES. See Activity log 2026-10-09."
+    },
+    {
+      "provider": "openai",
+      "model": "default",
+      "run_id": "01a129ca-58ed-7130-a30e-bc34606fff08",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T07:10:48.860Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "openai",
+      "model": "default",
+      "run_id": "01a129d7-55b9-7623-8be1-552f72c552a8",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T07:27:35.416Z",
+      "author": "dispatch openai clean-room + live adjudication",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "NEW break (two-break: design review). Round-4 self-suppression FIXED. New contract-(1) gap: derivedSignatures() splits overlay by newline BEFORE norm, so a wrapped overlay marker yields NO signature and a verbatim copy passes SILENTLY. Confirmed on real tree. See Activity log 2026-10-11."
+    },
+    {
+      "provider": "openai",
+      "model": "default",
+      "run_id": "01a129e8-0610-7d02-841e-fa2135d9f6f6",
+      "verdict": "broken",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T07:43:41.368Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a129f2-fce9-70f2-b630-a2fdaa354f1f",
+      "verdict": "holds",
+      "verdict_on": "2026-10-11",
+      "recorded_at": "2026-10-11T07:56:27.214Z",
+      "author": "dispatch openai clean-room + live adjudication",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Adjudicated HOLDS. Verifier sole BROKEN finding (NUL-byte .dat scanned, exit 1) is an OVER-match not a silent miss; fails severity bar; residual (header NUL-byte wording vs ext-only code, safe direction). 5 live-tree attacks held."
     }
   ],
   "verification_class": "plan+review",
@@ -335,3 +381,372 @@
   byte-identical to their pre-test state). Scratch artifacts under ~/.local/state/.../scratch (kept
   clean room `cleanroom-verify-miziUv`, record `cleanroom-record-jerL5i`) and /tmp/pp-* are
   disposable.
+
+### 2026-10-11 — dispatch openai
+- **Verification recorded:** dispatch openai/default run 01a129ca-58ed-7130-a30e-bc34606fff08 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — verify (round 4, independent clean-room re-attack)
+- **VERDICT: BROKEN (new break path — two-break: design review):** - **Commissioned** scripts/independent-verify.mjs as a separate process, cross-provider
+    **OpenAI** (author-provider anthropic to openai), run `01a129ca-58ed-7130-a30e-bc34606fff08`.
+    A real tiny OpenAI call was confirmed FIRST (dispatch "PONG", exit 0) — not just `--check`.
+    `--range ed92aff` (committed HEAD; chosen over `--working-tree` because a concurrent lane was
+    mutating scripts/* in the live tree at 10:03, which --working-tree would have raced and pulled in).
+    Gate code (scripts/check-prompt-privacy.mjs) plus a synthetic self-contained contract driver passed
+    via `--test-file` (the round-4 fixer left no test file; the driver builds its own throwaway
+    version-controlled scratch tree, installs the gate, and asserts all 4 properties — authored by this
+    verify lane, declared synthetic). Requirement = the gate header CONTRACT only; no ticket prose or
+    fixer reports passed.
+  - **BREAK (NEW PATH) — CONFIRMED on the REAL tree with the REAL gate (my live-tree check, labeled
+    mine; the in-room run used a read-only enumeration stub since in-room repo initialization was
+    unavailable, so the real reproduction is MINE):** an overlay sentence copied VERBATIM into
+    docs/prompts/ROUTING.md (or any WORKING_AGREEMENT*.md) is SILENTLY MISSED (exit 0), while the SAME
+    sentence in README.md is caught (exit 1). Reproduced: overlay fact "Observatory tier Zephyr runs
+    $91 quokka weekly here." pasted into README.md gave EXIT 1 (derived sigs "zephyr runs $91",
+    "$91 quokka weekly"); the identical sentence in ROUTING.md gave "PASS … 5 overlay-derived
+    signature(s)" EXIT 0. All files restored byte-identical; clean tree re-checked EXIT 0.
+  - **Root cause (version-control-independent):** `loadPublicWords()` tokenizes the very files it scans
+    (docs/prompts/ROUTING.md plus WORKING_AGREEMENT*.md) into the "shared public vocabulary" set that
+    `distinctive()` excludes. Pasting overlay prose INTO one of those files promotes that prose's own
+    tokens to "public words", so every derived n-gram over it has no distinctive token and is dropped,
+    and the leak passes. This is a SILENT pass of a real leak (not a loud FAIL), which the round-4
+    header's own RESIDUAL section says must never happen; it breaks contract property (2) ("a real
+    overlay sentence copied into ANY in-scope published file … must be caught") for exactly the files
+    loadPublicWords reads. The GENERIC fallback still catches the specific known pre-scrub facts, so
+    this bites NEW overlay facts not covered by a hardcoded GENERIC pattern.
+  - **regressed-from: FEAT-172 round-4** — the round-4 `distinctive()`/loadPublicWords mechanism, added
+    to fix round-3's dated-stamp OVER-match, introduced this self-suppression UNDER-match.
+  - **Properties otherwise HOLD on real artifacts (my live-tree checks, before finding the break):**
+    (1) fail-closed EXIT 1 in a non-repo dir; (2-overmatch) a bare shared date "as of 2026-08-05" does
+    NOT false-fire on the clean ROUTING banners (round-3 fix holds); (2-catch) overlay prose caught in
+    docs/CONVENTIONS.md AND a fresh untracked .orchard/CONVENTIONS.md (proves .orchard/*.md scanned);
+    (3) known pre-scrub prose caught across a hard line-wrap; (4) clean real tree PASS scanned 29.
+  - **Two-break stop honored:** NEW break direction (self-referential publicWords poisoning) vs
+    round-3's over-match, so reporting "two-break: design review", NO fix applied this lane. Design
+    question for the next pass: loadPublicWords must derive shared vocabulary from a source that CANNOT
+    contain leaked overlay prose (a pinned/committed baseline of the public docs, or the overlay's own
+    tokens must not be self-excluded) — scanning a file for leaks while trusting that same file to
+    define "non-leak vocabulary" is the structural contradiction.
+  - **No files changed by this lane** (verification only; overlay/ROUTING/README/CONVENTIONS/
+    integrations plus the gate were injected-then-restored byte-identical; the gate's temporary
+    working-tree marker for the abandoned --working-tree plan was also restored to HEAD).
+  - work_state left in_progress (BROKEN keeps the ticket open for design review).
+
+### 2026-10-11 — agent (fixing round 5, Opus 4.8) — addresses BROKEN run 01a129ca
+- **Break confirmed on the real tree, then fixed structurally.** Round-4's `loadPublicWords()`
+  tokenized the published ROUTING.md + `WORKING_AGREEMENT*.md` into a "shared vocabulary" that
+  `distinctive()` excluded — but those are the exact files the guard scans for leaks (and the files
+  most likely to take a leak back on an old-canonical re-sync). Pasting an overlay sentence INTO one
+  of them promoted its own tokens to "public", so every n-gram derived over it lost its distinctive
+  token and was dropped: a SILENT pass (exit 0), while the identical sentence in README.md was
+  caught. MUST-FAIL proof before the fix: synthetic overlay fact `Observatory tier Zephyr runs $91
+  quokka weekly here.` added to the overlay, pasted into ROUTING.md → **exit 0 (the break)**; same
+  sentence in README.md → exit 1.
+- **Design decision: option (a) — no vocabulary may be derived from scanned content.** Removed
+  `loadPublicWords()` and the `publicWords.has(tok)` exclusion entirely; `distinctive()` now rests
+  ONLY on the fixed marker/date/STOPWORDS predicates. This also keeps round-3's `as of <date>`
+  over-match fixed (a window of only framing + a bare date still has no distinctive token). Chose
+  (a) over (b) (a pinned/hash-committed word list) because the REAL clean tree with the REAL overlay
+  PASSES exit 0 under (a) — no false positive to force (b). Derived-signature count rose 5 → 10
+  (shared-vocab tokens are no longer suppressed) with zero false fire on the real tree.
+- **Verified with real commands (edit → run → restore byte-identical; tree left as inherited):**
+  - (1) synthetic overlay fact pasted into docs/prompts/ROUTING.md → **exit 1** (was exit 0): hits
+    `zephyr runs $91`, `runs $91 quokka`, `$91 quokka weekly`.
+  - (2) same fact pasted into README.md → **exit 1** (same 3 derived sigs).
+  - (3) overlay section headed `## Provider capacity (as of 2026-08-05)` with no leak → real tree
+    **PASS exit 0** (round-3 over-match stays fixed; the bare date does not false-fire on the
+    ROUTING banners).
+  - (4) known pre-scrub paragraph line-wrapped mid-sentence into docs/guide/integrations.md →
+    **exit 1** (17 hits incl. `Capacity here is`, `Claude-abundant`, `GPT-scarce`, `$N ChatGPT`,
+    `rolling N-hour`, derived `rolling 5-hour windows` across the 162→163 line break).
+  - (5) clean real tree → **PASS exit 0** (scanned 29; 10 overlay-derived signatures).
+  - (6) gate copied into a non-git scratch dir → **FAIL (fail-closed) exit 1** (round-3 vacuity
+    fix holds; empty-set branch shares the same `if(!scan.ok) exit 1` path).
+  - (7) `npm run gate` → **PASS exit 0** (leak-gate, check-nul, prompt-privacy, typecheck).
+  - All injected-then-restored files (overlay, ROUTING.md, README.md, integrations.md) diffed
+    byte-identical to HEAD after each test; only scripts/check-prompt-privacy.mjs is modified.
+- **`.orchard/` mirror:** `.orchard/check-prompt-privacy.mjs` does NOT exist in this working tree
+  (the flat `.orchard/` layout is the onboarded-target deploy artifact, never committed here — only
+  scripts/check-prompt-privacy.mjs is tracked and is what `scripts/gate.mjs` runs). There is no
+  mirror copy to keep byte-identical this round; if the deploy mirror is regenerated it should be
+  copied from the scripts/ source.
+- **regressed-from: FEAT-172 round-4** — round-4's `distinctive()`/`loadPublicWords()` mechanism,
+  added to fix round-3's dated-stamp over-match, introduced this self-suppression under-match.
+- **High-stakes:** privacy + regression-prone (broke rounds 1-4) → an independent clean-room verify
+  pass against the stated contract is warranted before close; generation is not its own only
+  verifier. Note the structural limit prior rounds hit: a clean room strips docs/ and the gitignored
+  overlay, so the gate's own inputs are absent in-room — the load-bearing checks are the live-tree
+  real-artifact runs above.
+- **Changed (unstaged; user commits):** `scripts/check-prompt-privacy.mjs`. No other files.
+
+### 2026-10-11 — dispatch openai clean-room + live adjudication
+- **Verification recorded:** dispatch openai/default run 01a129d7-55b9-7623-8be1-552f72c552a8 — VERDICT: BROKEN — NEW break (two-break: design review). Round-4 self-suppression FIXED. New contract-(1) gap: derivedSignatures() splits overlay by newline BEFORE norm, so a wrapped overlay marker yields NO signature and a verbatim copy passes SILENTLY. Confirmed on real tree. See Activity log 2026-10-11.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — verify (round 5, independent clean-room re-attack) — VERDICT: BROKEN (new break; two-break: design review)
+- **Commissioned** scripts/independent-verify.mjs as a SEPARATE process, cross-provider **OpenAI**
+  (author-provider anthropic → openai), run `01a129d7-55b9-7623-8be1-552f72c552a8`. A real tiny
+  OpenAI call was confirmed FIRST (dispatch "PONG", exit 0). `--working-tree` (the round-5 fix is an
+  unstaged edit to tracked scripts/check-prompt-privacy.mjs). Requirement = the gate-header CONTRACT
+  only (extracted lines 2-117; no ticket prose, no fixer reports). `--test-file` = a SYNTHETIC
+  self-contained contract driver authored by this verify lane (declared synthetic; builds its own
+  throwaway git repos, copies the guard, asserts P0/P2/P3/P4/P5).
+- **Round-4 self-suppression break is FIXED (my live-tree checks, labeled mine; real git tree, real
+  files, edit→run→restore byte-identical):** the derived-ONLY signature `chatgpt plus $20/mo`
+  (no GENERIC pattern matches that token order) is caught IDENTICALLY — 1 hit each, exit 1 — when
+  pasted into REAL docs/prompts/ROUTING.md (line 150), REAL docs/prompts/WORKING_AGREEMENT.v4.md
+  (line 637), and REAL README.md (line 39). No scanned file suppresses its own signatures;
+  distinctiveness rests only on markers/dates/STOPWORDS (loadPublicWords is gone). Critical invariant
+  HOLDS.
+- **Other contract properties HOLD on real artifacts (my live-tree checks):**
+  - (0) fail-closed: guard copied into a non-git scratch dir (real pre-scrub prose present) →
+    `FAIL (fail-closed) … not a git repository` EXIT 1.
+  - (3) known pre-scrub paragraph LINE-WRAPPED mid-sentence into REAL docs/guide/integrations.md →
+    EXIT 1, 25 hits across lines 160-164 incl. "Capacity here is", "Claude-abundant", "GPT-scarce",
+    "$N ChatGPT", "rolling N-hour", derived "rolling 5-hour windows" (scan-side newline folding works).
+  - round-3 over-match stays fixed: overlay heading "## Provider capacity (as of 2026-08-05)" →
+    clean real tree PASS EXIT 0 (no false-fire on the ROUTING "as of 2026-08-05" banners).
+  - marker/date/stopword-only windows do NOT anchor: "## as of 2026-08-05 dated 2026-08-10" → [],
+    "researched as of 2026-08-05" → [] (a distinctive word like "updated" legitimately still anchors).
+  - clean real tree → PASS EXIT 0 (scanned 29; 10 overlay-derived signatures).
+- **BREAK — NEW PATH (contract (1) violated; CONFIRMED on the REAL tree, my executed live check):**
+  `derivedSignatures()` iterates `overlayText.split('\n')` and runs `norm()` on EACH LINE separately,
+  so newline-folding is applied on the SCAN side but NOT on the DERIVATION side. An overlay fact whose
+  marker wraps onto its own line therefore yields NO signature, and a verbatim copy of that fact into a
+  published file passes SILENTLY. Reproduced on the real tree (overlay + README, byte-exact restore):
+    - A: overlay `My Zephyr subscription costs\n$91.` + verbatim one-line README copy → **EXIT 0**
+      (no signature derived; leak MISSED).
+    - B: identical fact on ONE line in the overlay → signatures "subscription costs $91"/"costs $91"
+      derived → **EXIT 1** (caught). The ONLY difference is a single newline in the overlay.
+  This is a silent pass (exit 0) of a verbatim overlay fact — exactly the "line-by-line cannot see
+  wrapped prose" failure class the guard's OWN header (round-1 break 1) says it fixed by folding
+  newlines; the fix was applied to the scan side only, leaving the derivation side line-by-line. It is
+  NOT a declared residual (not rephrasing, not a generic-overlay false positive).
+- **Independently surfaced by the OpenAI verifier too** (FINDING: "derivedSignatures splits the overlay
+  before normalization: 'My Zephyr subscription costs\n$91.' produces zero signatures … removing only
+  that newline makes the guard reject it"). The verifier could NOT execute it in-room — the agent
+  git-write guard (FEAT-135) blocked the driver's scratch `git init` INSIDE the codex clean room — so
+  its finding was code-reasoning; the EXECUTED real-artifact reproduction above is MINE and load-bearing.
+- **Harness-composed verdict was INVALID** (the FIXER-TEST citation was a stand-in: no harness-supplied
+  fixer test exists, and the driver could not run in-room due to the git block). Typed verdict recorded
+  as **BROKEN** on my confirmed executed real-tree repro, keeping the ticket open. work_state in_progress.
+- **Two-break stop honored:** NEW break direction (derivation-side newline asymmetry) vs round-4's
+  self-suppression → reporting "two-break: design review", NO fix applied this lane. Design question for
+  the next pass: the derivation must fold newlines like the scan side (derive over sliding line-windows
+  of the normalized overlay, or norm the whole overlay before splitting into token n-grams), so a
+  wrapped overlay fact is promoted to a signature symmetrically with how the scan matches it.
+- **High-stakes** (privacy; regression-prone — broken rounds 1-5): an independent clean-room pass is
+  structurally limited here (the room strips docs/ + the gitignored overlay AND the git-write guard
+  blocks in-room scratch git init), so the live-tree real-artifact checks above are the load-bearing
+  evidence and are MINE, not an independent provider's executed runs. A second fresh-context review of
+  the derivation-side-newline design decision is warranted before any round-6 fix.
+- **No files changed by this lane** (verification only; overlay/ROUTING/WA/README/integrations plus the
+  guard were injected-then-restored byte-identical — every restore verified with `cmp`). Scratch driver
+  + requirement under /tmp/ppv5 (synthetic, disposable); clean room/record under
+  ~/.local/state/claude-station/scratch are disposable.
+
+### 2026-10-11 — agent (fixing round 6, Opus 4.8) — addresses BROKEN run 01a129d7
+- **Break confirmed on the real tree first (must-FAIL before the fix):** with the round-5 guard,
+  appending `My Zephyr subscription costs⏎$91.` (wrapped) to the real overlay and the verbatim
+  one-line copy `My Zephyr subscription costs $91.` to README → **PASS exit 0** (leak MISSED). Root
+  cause as reported: `derivedSignatures()` did `overlayText.split('\n')` and `norm()`-ed each line
+  separately, so the marker `$91` landed alone on its own line and anchored no n-gram — while the
+  scan side folded newlines. Third break of the line-structure class (round 1 scan-side, round 5
+  derivation-side).
+- **Fix: REDESIGN with ONE chokepoint (design-review decision).** New `tokenize(text) -> token[]`
+  folds a WHOLE document (markdown + ALL whitespace incl. newlines + sentence punctuation, case-
+  folded; `$`/digits/`/`/`+`/plain-hyphen preserved) into a flat token stream. BOTH the overlay
+  derivation AND every candidate-file scan AND the known pre-scrub prose now go through it.
+  Signatures and matching are n-grams over token streams; `stream()`/padded-containment match on
+  token boundaries. **Deleted** the old `norm()`, the `split('\n')` derivation, and the sliding 1–3
+  line-window scan — NO line splitting or line window remains in the matching path (`lines` is kept
+  ONLY for best-effort human-readable `file:line` reporting, never a match decision). Distinctiveness
+  unchanged: markers/dates/STOPWORDS only, nothing derived from scanned content (round-4/5 invariant
+  held).
+- **regressed-from: FEAT-172 round-5** (same class as round-1 break 1).
+- **Verified with real commands (edit → run → restore byte-identical, every restore `cmp`-checked;
+  only scripts/check-prompt-privacy.mjs modified):**
+  - (1) verifier repro — wrapped overlay marker + verbatim 1-line README → **exit 1** (was exit 0);
+    derives `subscription costs $91` / `costs $91`.
+  - (2) same fact wrapped on the SCAN side (overlay 1-line, README wrapped mid-fact) → **exit 1**.
+  - (3) wrapped overlay fact pasted into docs/prompts/ROUTING.md → **exit 1**.
+  - (4) known pre-scrub prose line-wrapped mid-sentence into docs/guide/integrations.md → **exit 1**
+    (GENERIC `capacity here is` / `claude-abundant` / `gpt-scarce` / `$N chatgpt` / `rolling N-hour`
+    all fire across the folded wraps).
+  - (5) overlay headed `## Provider capacity (as of 2026-08-05)` with no leak → clean real tree
+    **PASS exit 0** (round-3 over-match stays fixed; bare date never anchors).
+  - (6) clean real tree with the real overlay → **PASS exit 0** (scanned 29; derived sigs 10→11, the
+    extra one being a formerly-wrapped overlay marker now covered; zero false fire).
+  - (7) guard copied into a non-git scratch dir → **FAIL (fail-closed) exit 1** (round-2 vacuity fix
+    holds).
+  - `npm run gate` → **PASS exit 0** (leak-gate, check-nul, prompt-privacy, typecheck).
+- **High-stakes** (privacy; regression-prone — broke rounds 1,5,6 on the same line-structure class):
+  an independent clean-room verify pass against the gate-header contract is warranted before close.
+  Known structural limit (prior rounds): a clean room strips docs/ + the gitignored overlay AND the
+  FEAT-135 git-write guard blocks in-room scratch `git init`, so the load-bearing evidence is the
+  live-tree real-artifact runs above (mine). The redesign removes an entire seam rather than patching
+  one, so the next re-attack should probe the chokepoint itself (does tokenize() leave ANY stage
+  reasoning about lines?) rather than a new wrap position.
+- **Changed (unstaged; user commits):** `scripts/check-prompt-privacy.mjs`. No other files.
+
+### 2026-10-11 — dispatch openai
+- **Verification recorded:** dispatch openai/default run 01a129e8-0610-7d02-841e-fa2135d9f6f6 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — verify (round 6, independent clean-room re-attack) — VERDICT: BROKEN (new break; two-break: design review)
+- **Commissioned** `scripts/independent-verify.mjs` as a SEPARATE process, cross-provider **OpenAI**
+  (author-provider anthropic → openai), run `01a129e8-0610-7d02-841e-fa2135d9f6f6`, model codex
+  default. Real tiny OpenAI call confirmed FIRST (`dispatch --provider openai "…PONG"`, exit 0,
+  thread 01a129e3). `--working-tree` (round-6 fix is an unstaged edit to tracked
+  scripts/check-prompt-privacy.mjs). Requirement = the gate-header CONTRACT only (header lines
+  2–127, leading ` * ` stripped; no ticket prose, no fixer reports). `--test-file` = a SYNTHETIC
+  self-contained contract driver authored by THIS verify lane (declared synthetic; /tmp/ppv6-driver.mjs).
+  Verdict-contract VALID (manifest-backed), verdict BROKEN. Record already carries the typed entry.
+- **The round-6 line-structure REDESIGN HOLDS (my executed live-tree checks, labeled MINE; a scratch
+  rsync copy of the real repo incl. the gitignored overlay + .git, real tree NEVER modified; each
+  mutate→run→restore `cmp`-checked byte-identical):**
+  - (P5) clean real tree + real overlay → PASS exit 0 (scanned 29; 11 overlay-derived sigs).
+  - Round-5 repro (overlay marker WRAPPED onto its own line + verbatim 1-line scan copy) → **exit 1**
+    (was exit 0 in round 5). Reverse (overlay 1-line, scan copy wrapped mid-fact) → exit 1. The
+    tokenize() chokepoint is symmetric: same function on overlay-derivation AND every scanned file.
+  - Markdown (`**`/backtick/`[link]()`), unicode (NBSP, smart quotes, em-dash), CRLF around a real
+    overlay marker in the scan copy → all **exit 1** (folded identically on both sides).
+  - Known pre-scrub prose line-wrapped mid-sentence into docs/guide/integrations.md → exit 1 (GENERIC
+    fires across folded wraps). N-gram edge (file == exactly a 3-token sig, no trailing NL) → exit 1.
+  - Round-3 over-match stays fixed: bare-date overlay heading `## … (as of 2026-08-05)` → clean PASS
+    exit 0 (no false-fire on ROUTING banners). Fail-closed: guard in a non-git dir → exit 1.
+  - Residual confirmed, NOT a break: a full-width `＄`-anchored overlay fact derives NO signature
+    (isMarker is ASCII-`$` only) — symmetric, not in the real overlay; within the round-5 "fact not
+    anchored on a recognized marker" residual envelope.
+- **BREAK — NEW PATH (scan SCOPE, a different class than the round-1/5/6 line-structure breaks;
+  CONFIRMED on the live tree, my executed repro):** `denied()` skips EVERY `*.local.md` file anywhere
+  (regex `/(^|\/)[^/]*\.local\.md$/`), but `.gitignore` ignores ONLY `/docs/prompts/*.local.md` and
+  the tracked-overlay assertion (1) globs ONLY `docs/prompts/*.local.md`. So the deny-list's own
+  justification ("the gitignored real overlay is never published; a committed one → assertion (1)")
+  is FALSE for any `*.local.md` OUTSIDE docs/prompts/: such a file is neither scanned NOR flagged.
+  Reproduced on the real-copy tree (untracked, not-gitignored, so it IS in the
+  `git ls-files --others --exclude-standard` publication-bound set):
+    - `docs/guide/notes.local.md` with `Capacity here is Claude-abundant, GPT-scarce; $20 ChatGPT
+      plan, rolling 5-hour windows.` → **PASS exit 0** (silent MISS).
+    - Root `README.local.md`, same prose → **PASS exit 0** (silent MISS).
+    - CONTROL: the IDENTICAL prose in `docs/guide/notes.md` (no `.local`) → **FAIL exit 1, 6 hits**.
+      The only difference is `.local` in the filename.
+  Known personal prose verbatim in a published/untracked `*.local.md` outside docs/prompts/ passes
+  silently — squarely the "accidental reintroduction of known personal text" threat the guard owns,
+  NOT a declared residual (not rephrasing, not framing+date-only).
+- **Secondary finding (OpenAI verifier, code-reasoning; I did not reproduce on a real leading-space
+  filename but confirmed the code path):** `listCandidates` does `.map((s) => s.trim())` on the
+  NUL-split `git ls-files` output, mutating any filename with leading/trailing whitespace; the
+  subsequent `readFileSync(ROOT/trimmed)` ENOENT→catch→continue silently skips it. Contrived
+  filename, same silent-skip class as the primary break.
+- **The OpenAI clean room could NOT execute the git-dependent cases** (checkout lacks .git and the
+  FEAT-135 git-write backstop blocked the driver's in-room `git init`); it injected enumeration stubs
+  and surfaced both findings by code-reasoning. The LOAD-BEARING evidence is the live-tree
+  reproduction above (MINE), consistent with the structural limit prior rounds recorded.
+- **Two-break stop honored:** NEW break direction (scan-scope `.local.md` deny vs assertion/gitignore
+  scope) → reporting **two-break: design review, NO fix applied this lane.** Design question for the
+  next pass: either (a) the `.local.md` deny must be scoped to exactly the gitignored overlay path(s)
+  so a `*.local.md` elsewhere is scanned like any prose file, or (b) assertion (1) must flag ANY
+  tracked/published `*.local.md` the deny-list excludes; and `listCandidates` must not `.trim()`
+  git-reported filenames.
+- **No files changed by this lane** (verification only). Scratch repo copy + driver + requirement
+  under /tmp/ppv6-* are synthetic/disposable; clean room/record under
+  ~/.local/state/claude-station/scratch are disposable.
+
+### 2026-10-11 — agent (fixing round 7, Opus 4.8) — addresses BROKEN run 01a129e8
+- **Both findings confirmed on the real tree, then fixed structurally.** PRIMARY (scan scope):
+  `denied()` hand-denied EVERY `*.local.md` anywhere, but `.gitignore` ignores ONLY
+  `/docs/prompts/*.local.md`. So any OTHER `*.local.md` (docs/guide/notes.local.md, a root
+  README.local.md) — un-ignored, hence in `git ls-files --others --exclude-standard` — was skipped
+  silently, publishing known personal prose unseen. SECONDARY: `listCandidates` ran `.trim()` on
+  NUL-split `git ls-files` names, so a filename with leading/trailing whitespace became a wrong path,
+  `readFileSync` ENOENT → catch → silent skip.
+- **Design (structural, charter):** the scan set is EXACTLY what git would/could publish —
+  `git ls-files -z` + `--others --exclude-standard`, NUL-split with NO `.trim()`. The overlay is
+  left to GIT'S OWN ignore rules (it is gitignored, so absent from both lists); the blanket
+  `*.local.md` deny is DELETED, so every other `*.local.md` is scanned like any prose file. The
+  justified deny-list (src/public/scripts/.githooks/deploy, docs/bugs, docs/analysis, docs/PROVIDERS.md,
+  .orchard code/history, binaries, the guard itself) is unchanged and NOT widened. New loud assertion
+  (1): if a `/docs/prompts/*.local.md` path EVER shows up in the candidate set (git no longer ignoring
+  it → it would be published with real holdings), FAIL LOUDLY — subsumes rounds 2/3's tracked-overlay
+  check and also catches an un-ignored-but-untracked overlay.
+- **regressed-from: FEAT-172 round-2** (the `*.local.md` blanket deny and the `.trim()` both entered
+  with round-2's deny-list enumeration).
+- **Verified with real commands (edit → run → restore byte-identical, every restore `cmp`-checked;
+  only scripts/check-prompt-privacy.mjs modified):**
+  - verifier repro `docs/guide/notes.local.md` with the known prose → **exit 1** (6 hits; was exit 0).
+  - a filename with a LEADING SPACE containing the known prose → **exit 1** (6 hits; was silently
+    skipped by the `.trim()`).
+  - a scratch rsync copy of the REAL tree (incl. .git + the gitignored overlay) with the
+    `/docs/prompts/*.local.md` ignore line removed → overlay now in `--others`, guard **FAILS LOUDLY
+    exit 1** ("the operator-local overlay is NOT gitignored … would be published"); same scratch with
+    the ignore intact → PASS exit 0.
+  - clean real tree with the real overlay → **PASS exit 0** (scanned 29; 11 overlay-derived sigs).
+  - guard copied into a non-git scratch dir → **FAIL (fail-closed) exit 1**.
+  - round-6 proofs still hold: wrapped overlay marker + verbatim 1-line scan copy → exit 1;
+    known pre-scrub prose line-wrapped mid-sentence into docs/guide/integrations.md → exit 1 (6 hits);
+    round-3 over-match stays fixed — bare-date overlay heading → clean PASS exit 0.
+  - `npm run gate` → **PASS exit 0** (leak-gate, check-nul, prompt-privacy, typecheck).
+- **Header contract updated** to state: scan set = git ls-files + others, NUL-split, no trim; overlay
+  handled by git ignore not a hand-deny; `*.local.md` outside docs/prompts/ is scanned; an overlay path
+  appearing as a candidate is a loud FAIL.
+- **High-stakes** (privacy; regression-prone — broke rounds 1-6): an independent clean-room verify pass
+  against the gate-header contract is warranted before close. Known structural limit (prior rounds): a
+  clean room strips docs/ + the gitignored overlay AND the FEAT-135 git-write guard blocks in-room
+  scratch `git init`, so the load-bearing evidence is the live-tree real-artifact runs above (mine).
+- **Changed (unstaged; user commits):** `scripts/check-prompt-privacy.mjs`. No other files. (There is
+  no committed `.orchard/` mirror of this guard in the working tree; nothing to keep byte-identical.)
+
+### 2026-10-11 — dispatch openai clean-room + live adjudication
+- **Verification recorded:** dispatch openai run 01a129f2-fce9-70f2-b630-a2fdaa354f1f — VERDICT: HOLDS — Adjudicated HOLDS. Verifier sole BROKEN finding (NUL-byte .dat scanned, exit 1) is an OVER-match not a silent miss; fails severity bar; residual (header NUL-byte wording vs ext-only code, safe direction). 5 live-tree attacks held.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-11 — verify (round 7, independent clean-room + live adjudication) — VERDICT: HOLDS
+- **Commissioned** `scripts/independent-verify.mjs` as a SEPARATE process, cross-provider **OpenAI**
+  (author-provider anthropic → openai), run `01a129f2-fce9-70f2-b630-a2fdaa354f1f`, model codex
+  default. A real tiny OpenAI call was confirmed FIRST (`dispatch --provider openai "…PONG"`, exit 0,
+  thread 01a129f1). Verified the ROUND-7 guard (an unstaged edit to tracked
+  scripts/check-prompt-privacy.mjs) via `--repo <static rsync copy of the real repo> --working-tree`,
+  chosen over `--working-tree` on the live tree because a concurrent lane is mutating scripts/* there.
+  Requirement = the gate-header CONTRACT only (header lines 2–144; no ticket prose, no fixer reports).
+  `--test-file` = a SYNTHETIC self-contained contract driver authored by THIS verify lane (declared
+  synthetic; the round-7 fixer left no test file).
+- **The git- and overlay-dependent attacks were run BY ME on the live tree, read-only** (a scratch
+  rsync copy of the REAL repo incl. .git + the gitignored overlay; `git ls-files` is a read, so the
+  guard runs unmodified; each mutate→run→restore `cmp`-checked byte-identical). The clean room strips
+  docs/ + the overlay and the FEAT-135 git-write guard blocks in-room `git init`, so (as every prior
+  round) the load-bearing evidence is these live-tree runs, labeled MINE:
+  - (1) SCAN SCOPE — round-7 PRIMARY fix HOLDS: untracked-not-ignored `docs/guide/notes.local.md`
+    with the known pre-scrub prose → **exit 1** (6 hits; was exit 0 in round 6). Control `docs/guide/
+    notes.md` same prose → exit 1. SECONDARY fix HOLDS: a filename with a LEADING SPACE → **exit 1**
+    (was silently skipped by the old `.trim()`). Deny-list AUDIT: of 1417 candidates, 29 prose files
+    are scanned (README, CONTRIBUTING, docs/guide/*, docs/prompts/* incl. all WA versions + ROUTING,
+    docs/CONVENTIONS.md, .orchard/*.md, .claude/agents/worker.md); the 642 denied prose files are all
+    within header-justified buckets (docs/bugs 614 append-only history, docs/analysis 16 internal
+    dated, scripts 11, public 1) + docs/PROVIDERS.md — NO outsider-facing/setup prose is hidden.
+    Overlay candidates = 0 (correctly gitignored out of the candidate set).
+  - (2) OVERLAY UN-IGNORED → loud FAIL: removing `/docs/prompts/*.local.md` from .gitignore in the
+    copy put the overlay in `--others` → **exit 1** "the operator-local overlay is NOT gitignored …
+    would be published". .gitignore restored byte-identical → exit 0.
+  - (3) FAIL-CLOSED: guard in a non-repo scratch dir with a leak file → **exit 1** "FAIL (fail-closed)
+    — git file enumeration failed". The zero-files branch shares the same `if(!scan.ok) exit 1` path
+    (lines 239-240 → 388); not independently executed (in-room/agent `git init` is blocked).
+  - (4) TOKENIZE SYMMETRY spot-check: a synthetic distinctive overlay fact whose marker WRAPS onto its
+    own line + a verbatim one-line copy into README.md → **exit 1** (derives "subscription costs $73"
+    etc.); overlay + README restored byte-identical → exit 0. (Round-6 redesign holds; one spot-check
+    as scoped.)
+  - (5) CLEAN tree with the REAL overlay → **PASS exit 0** (scanned 29; 11 overlay-derived sigs).
+- **Verifier's sole finding adjudicated a RESIDUAL, not a break (verdict HOLDS):** the OpenAI
+  verifier composed BROKEN on one case — a `sample.dat` built by prefixing a NUL byte to verbatim
+  pre-scrub prose is SCANNED (exit 1), which it called a "binary-exclusion" violation. This FAILS the
+  severity bar: it is an OVER-match (the guard CAUGHT the prose; exit 1), the OPPOSITE of a silent
+  miss, on a contrived 2-file stubbed scan — not a realistic accidental reintroduction path. The
+  header's "NUL-byte" wording vs the extension-only `BINARY_EXT` code is a cosmetic/documentation
+  mismatch in the SAFE direction (the code scans MORE than the header says → it catches more, never
+  misses). Confirmed on the real tree there is NO silent-miss exposure: all 9 binary-extension
+  candidates (favicon.svg, scripts/fixtures/*.gz) are also denied by the src/public/scripts prefixes,
+  so no publication-bound binary-ext file could hide a leak and be skipped.
+- **Verdict: HOLDS.** Zero breaks (two-break stop not reached). The one verifier finding is a residual
+  (over-match on a contrived NUL `.dat`; safe-direction header/code wording mismatch). All five scoped
+  attacks held on real artifacts. Recommend the author optionally align the header's "NUL-byte" clause
+  with the extension-only implementation (cosmetic, no behavior change).
+- **No files changed by this lane** (verification only; every mutate→run→restore on the scratch copy
+  `cmp`-verified byte-identical; the real tree was never modified). Requirement + synthetic driver
+  under /tmp/ppv7; scratch repo copy under /tmp/ppv7-copy.*; clean room/record under
+  ~/.local/state/claude-station/scratch are disposable.

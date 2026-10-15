@@ -9,6 +9,10 @@
  *                        running or unread (the no-parking guard let it go).
  *   park-guard-error   — the guard could not judge (transcript unreadable, too
  *                        large, or over its time budget) and allowed the stop.
+ *   late-answer        — DATA, not an alarm (2026-10-13): the user answered a
+ *                        card AFTER its deadline had already refused it. Counted
+ *                        (`lateAnswerCounts`) so the 30-min default can be judged
+ *                        on evidence; never shown as a Needs-You card.
  *
  * STORAGE — ROTATED BY DAY, so a window read is bounded by STRUCTURE, not bytes
  * (round 2; independent verify d8d016bd found the round-1 byte-tail read let
@@ -28,7 +32,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { dataDir } from '../lib/paths.ts';
 
-export type LaneIncidentKind = 'permission-expired' | 'lane-parked' | 'park-guard-error';
+export type LaneIncidentKind = 'permission-expired' | 'lane-parked' | 'park-guard-error' | 'late-answer';
+
+/** Kinds that are evidence for a count, not something the user must act on. */
+export const DATA_ONLY_KINDS: ReadonlySet<LaneIncidentKind> = new Set<LaneIncidentKind>(['late-answer']);
 
 export interface LaneIncident {
   kind: LaneIncidentKind;
@@ -42,6 +49,13 @@ export interface LaneIncident {
   /** One line a person can act on. */
   summary: string;
   detail?: string;
+  /** late-answer only: what the user did, and how late. */
+  requestId?: string | null;
+  answer?: 'approved' | 'denied' | 'answered' | 'passed' | null;
+  /** late-answer only: ms from the refusal to the answer, and from the card being raised. */
+  lateByMs?: number | null;
+  waitedMs?: number | null;
+  deadlineMs?: number | null;
 }
 
 /** A day file larger than this is reported, not read (32 MB ≈ 100k records). */
@@ -128,4 +142,33 @@ export function recentIncidents(
   out.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
   // A too-large file concerns every project: never filtered out.
   return [...out, ...notices];
+}
+
+/**
+ * 2026-10-13 — THE count the 30-min lane deadline is judged on: over the window,
+ * how many lane cards were refused for no answer, and how many of those the user
+ * then answered anyway (and how: approved = the refusal blocked something they
+ * wanted). Read from the ledger, nowhere else.
+ */
+export function lateAnswerCounts(
+  opts: { projectId?: string | null; windowMs?: number; now?: number; dir?: string } = {},
+): { windowMs: number; refused: number; lateAnswers: number; lateApproved: number; lateDenied: number; lateAnswered: number; latePassed: number; medianLateByMs: number | null; lateShare: number | null } {
+  const windowMs = opts.windowMs ?? 30 * DAY_MS;
+  const rows = recentIncidents({ ...opts, windowMs });
+  const refused = rows.filter((r) => r.kind === 'permission-expired').length;
+  const late = rows.filter((r) => r.kind === 'late-answer');
+  const by = (a: string) => late.filter((r) => r.answer === a).length;
+  const lags = late.map((r) => r.lateByMs).filter((v): v is number => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
+  const median = lags.length ? (lags.length % 2 ? lags[(lags.length - 1) / 2] : Math.round((lags[lags.length / 2 - 1] + lags[lags.length / 2]) / 2)) : null;
+  return {
+    windowMs,
+    refused,
+    lateAnswers: late.length,
+    lateApproved: by('approved'),
+    lateDenied: by('denied'),
+    lateAnswered: by('answered'),
+    latePassed: by('passed'),
+    medianLateByMs: median,
+    lateShare: refused ? Number((late.length / refused).toFixed(3)) : null,
+  };
 }

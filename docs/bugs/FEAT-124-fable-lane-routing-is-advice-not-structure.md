@@ -175,3 +175,6 @@ dependency is the finding: **derivation is not the cheap win here.**
   `src/server/runtime/claude-runtime.ts` (hook wiring + announce), `package.json` (verify script).
 </content>
 </invoke>
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: verify-owed. Why: The decision is resolved: option A was built and option B shipped. What remains is an independent clean-room verify, which is agent work. Next: Dispatch the independent clean-room verify of the built Fable gate. Still yours: The git hand-off of the built option A, after the verify passes. You can reopen this decision from the ticket view.

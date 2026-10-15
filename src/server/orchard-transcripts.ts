@@ -47,6 +47,7 @@ import { asOrchardWrite } from './own-writes.ts';
 // decide when a held lock is dead/stale and may be reclaimed.
 import { reclaimReason, FILE_LOCK_TTL_MS } from '../../scripts/lib/file-lock.mjs';
 import { normalizeLineEndings } from './board.ts';
+import type { AttachmentRef } from './attachments.ts';
 
 /** Root of all Orchard-owned transcripts. */
 export function orchardTranscriptsRoot(): string {
@@ -563,10 +564,23 @@ export class TranscriptRecorder {
     for (const e of pending) this.#write(e);
   }
 
-  /** A prompt the user (or the autonomous nudge) sent INTO the engine. */
-  recordUserPrompt(text: string): void {
+  /**
+   * A prompt the user (or the autonomous nudge) sent INTO the engine. FEAT-177:
+   * attachments are persisted as lean REFERENCE blocks (`type:'attachment'`) —
+   * uploadId + metadata only, NEVER base64 — so the durable transcript never
+   * balloons and the public board surface is unaffected; the client renders the
+   * thumbnail from the blob store via `GET /api/uploads/:projectId/:uploadId`.
+   */
+  recordUserPrompt(text: string, attachments?: AttachmentRef[]): void {
     // ARCH-006 (option A) — canonicalize at the transcript ingest boundary.
-    this.#push('user', { role: 'user', content: [{ type: 'text', text: normalizeLineEndings(text) }] });
+    const content: Array<Record<string, unknown>> = [];
+    if (!attachments || attachments.length === 0 || (text && text.trim())) {
+      content.push({ type: 'text', text: normalizeLineEndings(text) });
+    }
+    for (const a of attachments ?? []) {
+      content.push({ type: 'attachment', kind: a.kind, uploadId: a.uploadId, projectId: a.projectId, mediaType: a.mediaType, name: a.name, bytes: a.bytes });
+    }
+    this.#push('user', { role: 'user', content });
   }
 
   /**

@@ -60,9 +60,14 @@ Standing rules that apply to every dispatch here:
 - **High-stakes fixes get an independent skeptic.** For SECURITY, session-lifecycle, data-loss, or
   regression-prone changes (touching files with a history of regressions), your self-verified suite
   is NOT the last word: flag in your return that an independent clean-room verify pass is warranted
-  (scripts/independent-verify.mjs / a second fresh-context agent) — generation must not be its own
-  only verifier. Routine low-risk UI tweaks don't need it; use judgement and say which bucket the
+  (scripts/independent-verify.mjs --ticket <ID> / a second fresh-context agent) — generation must not
+  be its own only verifier. Routine low-risk UI tweaks don't need it; use judgement and say which bucket the
   change is in.
+- **When you ARE the verify lane, verify the files as they are:** `node scripts/independent-verify.mjs
+  --ticket <ID> --requirement @<file> --run "<cmd>"`. It uses the ticket's current candidate, else
+  falls back by itself to a mixed-tree freeze (other tickets' hunks disclosed to the verifier); add
+  `--files a,b` if the ticket has no candidate or claim. Never hand-build a candidate (exported HEAD
+  plus re-applied hunks, untangle scripts, scratch two-commit repos): measured 34 min lost in one lane.
 - **Your FINAL message to your orchestrator is a compact handoff, not a report (ARCH-016).** State
   only: the verdict (done / refuted / needs-you + which decision); the decisions the orchestrator
   must take; and a durable pointer — the ticket id + its Activity-log entry, and your report id +

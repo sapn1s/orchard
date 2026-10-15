@@ -827,6 +827,10 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .pill.sel:hover, .pill.sel:focus-visible { border-color: var(--ink-4); color: var(--ink); outline: none; }
 .pill.sel .cx { opacity: .55; margin-left: 1px; }
 .pill.sel .g { color: var(--ink-3); }
+/* BUG-255 r2 — the account indicator's pending / unknown suffix: secondary, never the current account. */
+#acctSel .acct-st { color: var(--ink-3); margin-left: 2px; }
+#acctSel[data-state="unknown"] .acct-st { font-style: italic; }
+#acctSel[data-state="checking"] #acctSelN { color: var(--ink-3); font-style: italic; }
 #provSel[data-provider="openai"] .g { color: var(--live); }
 
 /* FEAT-139 — the LIVE READOUT zone (git · usage · procs). A number you can only
@@ -1620,6 +1624,33 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 }
 .box textarea:focus { outline: none; }
 .box textarea::placeholder { color: var(--ink-3); }
+/* FEAT-177 — composer attachment chips + drag-over affordance */
+.box.dragover { border-color: var(--solid); background: var(--window); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 220px; padding: 4px 6px 4px 4px;
+  background: var(--window); border: 1px solid var(--hair); border-radius: 10px;
+  font-family: var(--sans); font-size: 12px; color: var(--ink);
+}
+.chip .thumb { width: 30px; height: 30px; border-radius: 6px; object-fit: cover; background: var(--sunken); flex: none; }
+.chip .ficon { width: 30px; height: 30px; border-radius: 6px; display: grid; place-items: center; background: var(--sunken); color: var(--ink-2); flex: none; font-family: var(--mono); font-size: 9px; text-transform: uppercase; }
+.chip .meta { display: flex; flex-direction: column; min-width: 0; line-height: 1.25; }
+.chip .meta .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip .meta .sz { color: var(--ink-3); font-size: 10px; }
+.chip .rm { width: 18px; height: 18px; border-radius: 50%; display: grid; place-items: center; color: var(--ink-3); cursor: pointer; flex: none; }
+.chip .rm:hover { background: var(--hair); color: var(--ink); }
+.chip.pending { opacity: .6; }
+.chip.failed { border-color: var(--danger, #c0392b); color: var(--danger, #c0392b); }
+/* transcript / bubble attachment thumbnails */
+.you .att, .att-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.att-img { max-width: 260px; max-height: 260px; border-radius: 10px; border: 1px solid var(--hair); display: block; }
+.att-file {
+  display: inline-flex; align-items: center; gap: 8px; padding: 6px 10px;
+  background: var(--sunken); border: 1px solid var(--hair); border-radius: 10px;
+  font-family: var(--sans); font-size: 12px; color: var(--ink); text-decoration: none;
+}
+.att-file .ficon { font-family: var(--mono); font-size: 9px; text-transform: uppercase; color: var(--ink-2); }
 .tray { display: flex; align-items: center; gap: 1px; margin-top: 6px; }
 .tray .ic { width: 26px; height: 26px; }
 .tray .ic:hover { background: var(--hair); }
@@ -2207,6 +2238,11 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   margin-top: 3px; display: block; font-weight: 400; letter-spacing: 0;
 }
+/* BUG-254 — honest account sign-in status. `ok` = live-probed signed in;
+   `warn` = needs re-login / status unknown. Both vars are defined per theme
+   (light and dark), so the colour reads in either. */
+.set .f.ok { color: var(--live); }
+.set .f.warn { color: var(--warn); }
 .set .v {
   text-align: right;
   display: flex; align-items: baseline; justify-content: flex-end;
@@ -2958,6 +2994,69 @@ button.mode:hover { color: var(--ink); text-decoration-color: var(--ink-4); }
 .guidance-in::placeholder { color: var(--ink-4); }
 .guidance-in:disabled { color: var(--ink-4); cursor: not-allowed; }
 .guidance-count { text-align: right; font-family: var(--mono); font-size: 10px; margin-top: 5px; }
+
+/* ── FEAT-164 — Agent git (Settings → Workspace). Reuses the drawer's own idioms:
+   the .risk/.sw toggle (as Response format does), a .guidance-in textarea for the
+   scope note and the checks list, a collapsed .sect for the cadence, .mini buttons
+   in a .cacts row for Save / Revoke / Cut, and .set-why/.grp-note for prose. The
+   only new structure is the status line and the cadence rows. ── */
+.agit-status {
+  display: flex; align-items: center; gap: 8px;
+  margin: 2px 0 2px;
+}
+.agit-status .agit-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--ink-4);
+}
+.agit-status[data-mode="scoped"] .agit-dot,
+.agit-status[data-mode="release"] .agit-dot { background: var(--st-done); }
+.agit-summary { font-size: 13px; color: var(--ink); font-weight: 550; }
+.agit-toggle .sw:disabled { opacity: .4; cursor: default; }
+.agit-toggle:has(.sw:disabled) .l { color: var(--ink-4); }
+.agit-scope { margin-top: 12px; }
+.agit-scope-in { min-height: 64px; }
+/* FEAT-164 migration: an existing permanent grant, kept as-is until the user saves. */
+.agit-migrated {
+  margin: 6px 0 8px; padding: 8px 10px; border-left: 3px solid var(--warn);
+  border-radius: 4px; background: color-mix(in srgb, var(--warn) 10%, transparent);
+  font-size: 12.5px; line-height: 1.45; color: var(--ink);
+}
+.agit-migrated strong { color: var(--warn); font-weight: 650; }
+/* 2026-10-13: release mode on a board with no typed verdicts — releases can never happen. */
+.agit-never {
+  margin: 8px 0 10px; padding: 9px 11px; border-left: 3px solid var(--warn);
+  border-radius: 4px; background: color-mix(in srgb, var(--warn) 12%, transparent);
+  font-size: 12.5px; line-height: 1.45; color: var(--ink);
+}
+.agit-never strong { color: var(--warn); font-weight: 650; }
+.agit-never-acts { margin-top: 8px; flex-wrap: wrap; gap: 6px; }
+.agit-cad { display: flex; flex-direction: column; gap: 9px; padding: 2px 0; }
+.agit-cad-row { display: flex; align-items: center; gap: 10px; }
+.agit-cad-l { flex: 0 0 148px; font-size: 12px; color: var(--ink-2); }
+.agit-cad .gtext { flex: 0 0 96px; width: 96px; text-align: right; }
+.agit-cad-tagPrefix { text-align: left !important; }
+.agit-cad-h { font-size: 11px; color: var(--ink-4); font-family: var(--mono); }
+.agit-cad-checks { display: flex; flex-direction: column; gap: 6px; }
+.agit-cad-checks .agit-cad-l { flex: none; }
+.agit-checks-in { min-height: 56px; }
+.agit-rel {
+  margin: 12px 0 2px; padding: 10px 12px;
+  background: var(--window); border: 1px solid var(--hair-2); border-radius: 8px;
+}
+.agit-rel-row { font-size: 11.5px; line-height: 1.5; }
+.agit-rel-row + .agit-rel-row { margin-top: 3px; }
+.agit-rel-row.grp-note { margin-top: 3px; max-width: none; }
+.agit-rel .agit-due { font-size: 12px; font-weight: 600; color: var(--ink-3); }
+.agit-rel .agit-due.on { color: var(--st-done); }
+.agit-rel .agit-why { font-size: 11.5px; color: var(--ink-3); }
+.agit-rel .u { margin-left: 7px; font-family: var(--mono); font-size: 10px; color: var(--ink-4); }
+.agit-excl { margin-top: 7px; }
+.agit-excl > summary { cursor: pointer; font-size: 11.5px; color: var(--ink-3); }
+.agit-excl > summary:hover { color: var(--ink-2); }
+.agit-excl-row { margin-top: 4px; max-width: none; }
+.agit-excl-row b { font-family: var(--mono); color: var(--ink-2); }
+.agit-rel-msg { color: var(--ink-2); }
+.agit-err { color: var(--warn); }
 
 /* ── drawer: textual inputs for list-valued settings ── */
 .set input.vin {
@@ -5684,6 +5783,14 @@ a.tv-row.flaw-err:not(.kb) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--
   padding-left: 9px;
 }
 .dc-prereq-k { font-weight: 700; color: color-mix(in srgb, var(--st-needs) 45%, var(--ink)); }
+/* BUG-259 — why a decision card is yours, and an agent's own decision in history */
+.dc-stop { font: 11.5px/1.5 var(--sans); color: var(--ink-2); }
+.dc-stop-k { font-weight: 700; color: var(--ink); }
+.tvh-owned-by { font: 12px/1.5 var(--sans); color: var(--ink-2); margin-top: 3px; }
+.tvh-reopen { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+.tvh-reopen-msg { font: 11.5px/1.4 var(--sans); color: var(--ink-2); }
+.dg-agent-decided { margin-top: 10px; }
+.dg-agent-decided > summary { cursor: pointer; }
 
 .dc-note { width: 100%; box-sizing: border-box; resize: vertical; min-height: 38px; font: 12px/1.5 var(--sans); color: var(--ink); background: var(--window); border: 1px solid var(--hair); border-radius: 8px; padding: 7px 9px; }
 .dc-note:focus { outline: none; border-color: var(--live); }
@@ -5715,6 +5822,33 @@ a.tv-row.flaw-err:not(.kb) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--
    above sets it apart from the record; it never edits the original answer. */
 .dc-followup-form { display: grid; gap: 8px; margin-top: 3px; padding-top: 12px; border-top: 1px solid var(--hair); }
 .dc-followup-lbl { font: 600 10.5px var(--mono); letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3); }
+/* FEAT-184 — an ADOPTION reads as the agent's act, not your answer: an outlined
+   "Adopted" tag instead of the filled tick, your delegation quoted beneath. */
+.dc-adopt-k { font: 700 9.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--warn); border: 1px solid currentColor; border-radius: 3px; padding: 1px 5px; flex: none; }
+.dc-deleg-quote, .dc-deleg-live { font-size: 11.5px; line-height: 1.5; color: var(--ink-3); }
+.dc-deleg-k { font: 600 10.5px var(--mono); color: var(--ink-3); }
+/* FEAT-184 (fixing r2) — the agent's own label, shown as quoted agent content so it
+   can never read as you; and the "since revoked" note on an adoption that stands. */
+.dc-adopt-agent { font-size: 11.5px; line-height: 1.5; color: var(--ink-3); }
+.dc-adopt-agent-k { font: 600 10.5px var(--mono); color: var(--ink-3); }
+.dc-adopt-agent q { font-style: normal; }
+.dc-deleg-revoked { font-size: 11.5px; line-height: 1.5; color: var(--warn); margin-top: 4px; }
+.dc-deleg-live { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; }
+.dc-deleg-revoke { font-size: 11px; padding: 1px 8px; }
+.dc-delegate { display: grid; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hair); }
+.dc-deleg-words, .dc-deleg-ids, .dc-deleg-days { width: 100%; box-sizing: border-box; font: 12px/1.5 var(--sans); color: var(--ink); background: var(--window); border: 1px solid var(--hair); border-radius: 8px; padding: 7px 9px; }
+.dc-deleg-words { resize: vertical; min-height: 38px; }
+.dc-deleg-send { font: 600 12.5px var(--sans); padding: 8px 12px; border-radius: 8px; cursor: pointer; width: 100%; background: transparent; color: var(--ink); border: 1px solid var(--ink-3); }
+.dc-deleg-send:hover:not(:disabled) { background: var(--sunken); }
+.dc-deleg-err { font-size: 11px; color: var(--warn); }
+.dc-deleg-foot { font-size: 10.5px; line-height: 1.45; color: var(--ink-4); }
+.dc-deleg-send:disabled { background: var(--sunken); color: var(--ink-4); border-color: var(--hair); cursor: not-allowed; }
+.dc-deleg-fold > summary, .dc-override > summary { cursor: pointer; font: 600 11px var(--sans); color: var(--ink-3); }
+.dc-deleg-fold[open], .dc-override[open] { display: grid; gap: 6px; }
+.dc-deleg-fold[open] > summary, .dc-override[open] > summary { margin-bottom: 4px; }
+.dc-deleg-lbl { font: 600 10.5px var(--mono); letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3); }
+.dc-override { margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--hair); }
+.dg-answer.dg-adopted { color: var(--warn); }
 
 /* narrow pinned action bar — reachable at every scroll position */
 .tv-decide-bar {

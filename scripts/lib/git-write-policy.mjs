@@ -713,8 +713,19 @@ export function gitWritesReachShim(command) {
  * redirect — leave the work in the tree, report the files, let the user commit.
  */
 export function gitWriteRefusal(offender) {
+  // BUG-261 — the decisive fact (this write was REFUSED, no grant lifted it, leave the
+  // work unstaged) leads AND is repeated last, so an agent reading this through
+  // `| head -1` or `| tail -1` cannot mistake it for the "grant present but gate failed"
+  // refusal. It deliberately says "no grant lifted it" rather than "no grant is active":
+  // the decide route maps EVERY non-gate-failed denial here, including the rare cases
+  // where a grant exists but did not cover THIS write (a re-decided call id, an offender
+  // outside the window's slots, a claim lost between gate and use — git-grant.mjs), so an
+  // absolute "no grant is active" would be false in those cases.
+  const decisive =
+    `orchard: git write \`${offender}\` was REFUSED — no grant lifted it; leave your changes ` +
+    'UNSTAGED and report the file list for the user to commit (read-only git still works).';
   return [
-    `Git writes are disabled for agent sessions: \`${offender}\` (via Bash) was blocked.`,
+    decisive,
     '',
     'The user does ALL git operations by hand. An agent commit that carried a home',
     'path or a private name into a public history has cost a full rewrite of main',
@@ -731,7 +742,41 @@ export function gitWriteRefusal(offender) {
     'for this project at runtime (dashboard "Allow git writes", or',
     '`node scripts/git-grant.mjs <project> --once`) with no relaunch. An agent',
     'cannot lift this for itself; the grant comes from the user only.',
+    '',
+    decisive,
   ].join('\n');
+}
+
+/**
+ * BUG-261 — a SAFE one-line summary of what the leak gate flagged, for a refusal that
+ * may land in a transcript the user later publishes. The gate's own output echoes the
+ * matched VALUES (an excerpt of each hit line, up to 160 chars — scripts/leak-gate.mjs
+ * `emitHit`) and the repo-relative file paths; neither may be shown to a possibly-public
+ * transcript. The TOKEN LABELS it prints in [brackets] are generic classifiers ("home
+ * path", "username (bare word)", "private project A (bot)", "github token (gh*_)" —
+ * scripts/lib/leak-tokens.mjs TOKENS/credential `name`s), carrying no private value, so
+ * we surface the DISTINCT labels and the hit COUNT only; everything else (paths,
+ * excerpts) is dropped. The agent runs `npm run gate` to see the values in its own,
+ * un-published session. Returns '' when nothing parseable is present.
+ */
+export function redactGateDetail(gateDetail) {
+  const text = String(gateDetail || '');
+  if (!text.trim()) return '';
+  // ONLY the gate's own FAIL-summary COUNTS are safe to surface. That line is gate-authored
+  // boilerplate (scripts/leak-gate.mjs) whose variable content is integers plus a trailing
+  // `[mode]` tag, which we do NOT capture. Everything else in the detail — each per-hit line
+  // and the footer — interleaves UNTRUSTED file paths and matched-value excerpts with the
+  // token labels, in a text format that cannot be parsed unambiguously: a flagged file whose
+  // own name contains `:N: [ … ]` makes any hit-line regex capture path/value text as the
+  // "label" (clean-room adversarial, BUG-261 r3). Since not-leaking is the whole point, we
+  // never parse a hit line; we report the hit + file counts only. The agent runs
+  // `npm run gate` to see the kinds and the exact file:line in its own, un-published session.
+  const m = /LEAK GATE: FAIL — (\d+) hit\(s\)[^\n]*? in (\d+) file\(s\)/.exec(text);
+  if (!m) return '';
+  // Keep the gate's own `hit(s)`/`file(s)` phrasing verbatim — no singular/plural logic to
+  // drift from it. m[1]/m[2] are integers only.
+  return `${Number(m[1])} hit(s) in ${Number(m[2])} file(s) ` +
+    '(the kinds and exact file:line are NOT shown here — run `npm run gate` to see them)';
 }
 
 /**
@@ -740,20 +785,34 @@ export function gitWriteRefusal(offender) {
  * the gate. This is the message for that refusal: the commit/push carries a
  * private token, so it is blocked exactly as an ungranted one would be — the
  * safety property (never leak) is enforced by the mechanism, not by the grant.
+ *
+ * BUG-261 — the agent that hit this read it through `git push … 2>&1 | tail -2`,
+ * saw only a generic footer, and concluded the grant had never reached the
+ * session (telling the user to restart). So the DECISIVE line — grant active,
+ * gate failed, a restart will NOT help, `npm run gate` shows what it flagged —
+ * is the FIRST line AND is repeated as the LAST line, so `| head -1` and
+ * `| tail -1` each still carry it. The gate detail is REDACTED (redactGateDetail):
+ * the labels + count, never the private values.
  */
 export function gitWriteGateFailedRefusal(offender, gateDetail = '') {
-  const detail = String(gateDetail || '').trim();
+  const decisive =
+    'orchard: git IS granted for this project — but the leak gate FAILED, so this write is blocked; ' +
+    'a restart will NOT help. Run `npm run gate` to see what it flagged.';
+  const flagged = redactGateDetail(gateDetail);
   return [
-    `Git writes ARE granted for this project, but \`${offender}\` was blocked: the`,
-    'leak gate FAILED. A grant lifts the prohibition on git writes; it never lifts',
-    'the leak gate. This commit/push would carry a private token (a home path, a',
-    'username, or a private project name) into history — the exact leak FEAT-108',
-    'exists to prevent, and the trade the user set is explicit: a leaked commit is',
-    'never acceptable, granted or not.',
+    decisive,
     '',
-    'Fix the leak the gate reports, then retry — or leave the work UNSTAGED and',
-    'report the file list for the user to handle. Run `npm run gate` to see the',
-    'hits yourself.',
-    ...(detail ? ['', 'Leak gate said:', detail] : []),
+    `The grant is active and reached this session, so re-launching or restarting changes nothing: \`${offender}\``,
+    'was refused by the mandatory leak gate, not by a missing grant. A grant lifts the prohibition on git',
+    'writes; it never lifts the gate. This commit/push would carry a private token (a home path, a username,',
+    'or a private project name) into history — the exact leak FEAT-108 exists to prevent, and the trade the',
+    'user set is explicit: a leaked commit is never acceptable, granted or not.',
+    '',
+    ...(flagged ? [`The gate flagged: ${flagged}`, ''] : []),
+    'Fix the leak the gate reports (run `npm run gate` for the exact file:line — the matched values are',
+    'private and are NOT echoed here), then retry; or leave the work UNSTAGED and report the file list for',
+    'the user to handle.',
+    '',
+    decisive,
   ].join('\n');
 }

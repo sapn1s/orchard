@@ -5,41 +5,71 @@
   "title": "No way to pass matured findings between projects",
   "summary": "When one project produces a result another project needs, there is no supported way to move it across. The handover happens by hand, and the receiving project's next session has no idea anything arrived. A lightweight file-drop design exists on paper, recommended over live project-to-project messaging, but nothing has been built.",
   "impact_if_we_wait": "Occasional handovers stay manual, roughly a few times a year. Bounded: nothing breaks and no work is lost, since copying a note across by hand still works and no existing project behaviour depends on this.",
-  "current_need": "Confirm this stays parked at low priority, or raise it so the file-drop design can be built.",
+  "current_need": "Nothing to build; it stays parked at low priority.",
   "severity": "low",
   "area": "Cross-project handoff",
   "reported": "2026-08-04",
   "reported_by": "user",
   "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-04",
-  "decision": {
-    "mode": "single",
-    "question": "Should cross-project handoff stay parked at low priority, or be scheduled now?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Keep it parked",
-        "what_changes": "Nothing is built. Moving a finding between projects stays a manual copy when it comes up.",
-        "benefit": "No effort spent on something needed a handful of times a year.",
-        "cost": "Each handover stays manual, and the receiving project keeps missing that anything arrived.",
-        "why_not_obvious": "A design left unbuilt long enough stops matching the parts it was drawn against, so the parked work quietly gets more expensive."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "7c556ac6-dc67-4aa5-9d10-e4e7212cde8d",
+      "asked_on": "2026-08-04",
+      "question": "Should cross-project handoff stay parked at low priority, or be scheduled now?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Keeping it parked starts no new direction; only scheduling it would.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Keeping it parked starts no new direction; only scheduling it would.",
+        "on": "2026-10-14",
+        "next": "Nothing to build; it stays parked at low priority.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Confirm this stays parked at low priority, or raise it so the file-drop design can be built."
+        }
       },
-      {
-        "key": "B",
-        "label": "Schedule the file drop",
-        "what_changes": "A curated note is written into the target project's inbox, and that project's next session is told it is there.",
-        "benefit": "The handover becomes durable and the receiving side notices it without being told.",
-        "cost": "Real build work on the inbound-awareness surface for a rare need.",
-        "why_not_obvious": "It spends a scarce build slot on a path used a few times a year, ahead of work people hit daily."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should cross-project handoff stay parked at low priority, or be scheduled now?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Keep it parked",
+            "what_changes": "Nothing is built. Moving a finding between projects stays a manual copy when it comes up.",
+            "benefit": "No effort spent on something needed a handful of times a year.",
+            "cost": "Each handover stays manual, and the receiving project keeps missing that anything arrived.",
+            "why_not_obvious": "A design left unbuilt long enough stops matching the parts it was drawn against, so the parked work quietly gets more expensive."
+          },
+          {
+            "key": "B",
+            "label": "Schedule the file drop",
+            "what_changes": "A curated note is written into the target project's inbox, and that project's next session is told it is there.",
+            "benefit": "The handover becomes durable and the receiving side notices it without being told.",
+            "cost": "Real build work on the inbound-awareness surface for a rare need.",
+            "why_not_obvious": "It spends a scarce build slot on a path used a few times a year, ahead of work people hit daily."
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "The need is genuinely rare and the manual workaround costs almost nothing, so this can wait without accumulating harm.",
+        "prerequisite": null
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "The need is genuinely rare and the manual workaround costs almost nothing, so this can wait without accumulating harm.",
-    "prerequisite": null
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "Handing a document from one project to another writes an inbox file carrying its source project and date",
     "The receiving project's next session opens already showing an inbound count",
@@ -119,3 +149,6 @@ Hand a document from a source project to a target and confirm the target's inbox
   messaging. Low prio / parked unless the user prioritizes it.
 
 - 2026-08-06 — privacy scrub for public release (FEAT-049, sanctioned append-only exception): private names/paths neutralized (project aliases, home paths → ~).
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Keeping it parked starts no new direction; only scheduling it would. Next: Nothing to build; it stays parked at low priority. You can reopen this decision from the ticket view.

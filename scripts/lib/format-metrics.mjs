@@ -154,7 +154,7 @@ export function evaluateLength(parsed) {
 /* ── ask-ownership gate (FEAT-137) ────────────────────────────────────────────
  * The MECHANICAL form of WA §A's ownership test. Every `orchard-ask` must declare,
  * in its own body, a CONFIDENCE and a DECIDER — the user-held thing that makes the
- * call theirs (taste, priority, spend, risk appetite, project direction). The
+ * call theirs (since BUG-256: one of HARD_STOPS below, with its consequence). The
  * defect this catches is the one the user hit verbatim ("there is a breaking bug
  * which will corrupt data … not sure if u want to fix it tho, so i will leave it"):
  * a HIGH-confidence ask that names no user-held decider is not the user's decision
@@ -162,12 +162,149 @@ export function evaluateLength(parsed) {
  *
  * HONEST LIMITATION, stated where the code is: this is a PRESENCE/well-formedness
  * check, not a truth check. It verifies the ask carries a recognised `confidence:`
- * level and a non-empty `decider:` line; it CANNOT verify the named decider is
- * genuinely user-held (a model can type `decider: taste` over a pure sequencing
- * choice). It catches the missing or unnameable declaration — the shape the user
+ * level and a `decider:` line naming a hard stop plus a consequence (BUG-256); it
+ * CANNOT verify the named stop is true (a model can type `decider: taste — …` over a
+ * pure sequencing choice) — the stated consequence makes such a relabel auditable. It catches the missing or unnameable declaration — the shape the user
  * actually hit — and the report surfaces the rest for a human to read. */
 const CONFIDENCE_RE = /^[ \t>*+-]*confidence[ \t]*:[ \t]*(high|hi|med(?:ium)?|low|lo)\b/im;
 const DECIDER_RE = /^[ \t>*+-]*decider[ \t]*:[ \t]*(\S.*)$/im;
+
+/* ── BUG-256: the decider is a CLOSED list of hard stops, with its consequence ──
+ * FEAT-137 accepted any text after `decider:`. Measured over 282 real asks
+ * (docs/research/unnecessary-asks-2026-10-14.md), naming a decider did not
+ * separate the user's calls from the agent's own (71/160 vs 55/122 unnecessary):
+ * `priority (whether to spend on it now)`, `spend`, a generic `risk` and even
+ * `none` passed. An ask is now legitimate only for one of these stops — the WA §A
+ * list (r3: the WHOLE decider value, exactly) — and a `consequence:` line must say
+ * the concrete consequence (≥ 3 words),
+ * so a relabel is at least visible to an audit. `info` (a fact only the user has)
+ * and `blocked` (a technical block the agent cannot clear) keep the
+ * unresolved-information and technical-blocker paths open. Agent effort, ordering
+ * and "another round?" on work already asked for are deliberately NOT here. */
+export const HARD_STOPS = Object.freeze([
+  'irreversible', // cannot be undone (history rewrite, deleting user data)
+  'outward',      // publishes or sends outside this machine (push, public repo, external service)
+  'live',         // restarts or interrupts running work (service restart, killing a session)
+  'git',          // a git write the user holds under their standing rule
+  'access',       // a credential, sudo, or permission only the user can grant
+  'money',        // real spend of the user's money or account quota (a paid plan, a purchase, burning a weekly limit)
+  'taste',        // the user's own look-and-feel preference on something they will use
+  'direction',    // a new goal or product direction beyond what was asked
+  'info',         // a fact only the user has (what they saw, what they want kept)
+  'blocked',      // a technical block the agent cannot clear itself
+]);
+const MIN_CONSEQUENCE_WORDS = 3;
+
+/**
+ * Read an ask's `decider:` and `consequence:` lines. Pure. Returns null when there
+ * is no `decider:` line, else `{ raw, lead, hardStop, consequence, consequenceWords }`.
+ *
+ * BUG-256 r3 — EXACT GRAMMAR (orchestrator adjudication after the third break of the
+ * token parse: r1 joined tokens, r2 compounds `live-priority` / `live_ops` → lead=live).
+ * The decider VALUE is the whole text after `decider:` on that line, trimmed and
+ * case-folded, and it must EQUAL one HARD_STOPS code. Nothing else is accepted:
+ * no compounds, separators, wrappers, multiple codes or trailing words. There is no
+ * lead-token or split step to get wrong — it is an allowlist of whole values, not an
+ * enumeration of bad shapes. `hardStop` is that code, else null; `lead` is the
+ * case-folded whole value (telemetry: what was actually declared).
+ * The consequence lives on its OWN `consequence:` line; `consequenceWords` counts
+ * word-like segments with Intl.Segmenter so any script counts (r1 B3).
+ * The check is WELL-FORMEDNESS, not truth: a relabel under a list code with a
+ * stated consequence passes by design; scripts/ask-audit.mjs measures it.
+ */
+const CONSEQUENCE_RE = /^[ \t>*+-]*consequence[ \t]*:[ \t]*(\S.*)$/im;
+const WORDS = typeof Intl !== 'undefined' && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: 'word' }) : null;
+export function consequenceWordCount(text) {
+  const t = String(text ?? '');
+  if (WORDS) { let n = 0; for (const s of WORDS.segment(t)) if (s.isWordLike) n++; return n; }
+  return (t.match(/[\p{L}\p{N}$][\p{L}\p{N}\p{M}$'.%-]*/gu) ?? []).length;
+}
+/** The exact-grammar verdict on one decider VALUE: the HARD_STOPS code it equals, else null. */
+export function hardStopCode(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  return HARD_STOPS.includes(v) ? v : null;
+}
+export function deciderOf(content) {
+  const text = String(content ?? '');
+  const m = DECIDER_RE.exec(text);
+  if (!m) return null;
+  const raw = m[1].trim();
+  const c = CONSEQUENCE_RE.exec(text);
+  const consequence = c ? c[1].trim() : '';
+  return { raw, lead: raw.toLowerCase(), hardStop: hardStopCode(raw), consequence, consequenceWords: consequenceWordCount(consequence) };
+}
+/**
+ * BUG-259 — THE one ownership verdict over a parsed decider, shared by the
+ * turn-end ask check (askOwnershipDefects, below) and the board's decision-card
+ * writer (`board-tool decide --decider=…`), so a chat ask and a Needs-You card
+ * are held to the same closed list and the same consequence floor (ARCH-010).
+ * Pure. `null` when the declaration is well-formed, else the defect code.
+ */
+export function hardStopDefect(decider) {
+  if (!decider || !decider.hardStop) return 'decider-not-hard-stop';
+  if (decider.consequenceWords < MIN_CONSEQUENCE_WORDS) return 'decider-no-consequence';
+  return null;
+}
+
+/* ── ask subject: WHAT the ask is about, crossed with its decider ─────────────
+ * The decider says WHY a call is the user's; it never said WHAT is being decided,
+ * so an ask about the agent's own work passed under any well-formed code. Measured
+ * in session 20ed61fc (2026-10-13): "I recommend one more round" passed as
+ * `decider: spend` and idled the session ~420 min overnight; "Shall I file it and
+ * start the fix?" and "Shall I measure it before you decide?" were the same shape.
+ * Every `orchard-ask` now declares `about:` — EXACTLY one closed-list subject (the
+ * BUG-256 r3 exact grammar: the whole trimmed, case-folded value, nothing else).
+ *
+ * AGENT_OWNED_SUBJECTS are the agent's call (WA §A): the ask is refused unless its
+ * decider is one of OWNED_SUBJECT_EXEMPT_STOPS — the ACTION stops, where the
+ * recommendation itself is irreversible, outward-facing, spends the user's money or
+ * account quota, or is an act the agent may not take alone (a live restart, a git
+ * write, a credential or permission). Under taste/direction/info/blocked the pair
+ * is incoherent — a true direction fork is `about: goal`, taste is `preference`, a
+ * fact is `fact`, a block is `action` — so it is refused. Measured on 40 real asks
+ * (2026-10-14): the strict three-stop list refused real commit and other-repo asks.
+ * The classification is the declared subject × the decider, never the ask's prose:
+ * no phrase list. Honest limit, as for the decider: a mislabelled subject passes;
+ * the declaration is recorded (`askSubjects`) so ask-audit can measure it. */
+export const AGENT_OWNED_SUBJECTS = Object.freeze([
+  'sequencing',     // what order, or when, to do work already asked for
+  'implementation', // how to deliver what was asked when the user's outcome is the same either way: approach, design, which fix
+  'round',          // whether to run another fix / verify / review round
+  'next-step',      // whether to proceed with the next step of the requested work
+  'approval',       // a go-ahead on the agent's own recommendation
+]);
+export const USER_SUBJECTS = Object.freeze([
+  'goal',       // a fork in what to build or pursue, or a policy the user lives under (security posture, what agents may do, method)
+  'preference', // the user's own look-and-feel or working preference (taste)
+  'fact',       // something only the user knows (info)
+  'action',     // something only the user can do: a click, a restart, a git write, a credential
+  'spend',      // whether to spend the user's money or account quota
+]);
+export const ASK_SUBJECTS = Object.freeze([...AGENT_OWNED_SUBJECTS, ...USER_SUBJECTS]);
+export const OWNED_SUBJECT_EXEMPT_STOPS = Object.freeze(['irreversible', 'outward', 'money', 'live', 'git', 'access']);
+const ABOUT_RE = /^[ \t>*+-]*about[ \t]*:[ \t]*(\S.*)$/im;
+
+/** Read an ask's `about:` line. Pure. null when absent, else `{ raw, subject }` (subject null if off-list). */
+export function aboutOf(content) {
+  const m = ABOUT_RE.exec(String(content ?? ''));
+  if (!m) return null;
+  const raw = m[1].trim();
+  const v = raw.toLowerCase();
+  return { raw, subject: ASK_SUBJECTS.includes(v) ? v : null };
+}
+/**
+ * The subject verdict for one ask. Pure. `null` when it passes, else
+ *   'ask-agent-owned'   — an agent-owned subject whose decider is not an exempt stop;
+ *   'ask-about-unknown' — the `about:` value is not exactly one ASK_SUBJECTS code;
+ *   'ask-missing-about' — no `about:` line.
+ */
+export function subjectDefect(about, decider) {
+  if (!about) return 'ask-missing-about';
+  if (!about.subject) return 'ask-about-unknown';
+  if (AGENT_OWNED_SUBJECTS.includes(about.subject)
+      && !OWNED_SUBJECT_EXEMPT_STOPS.includes(decider?.hardStop ?? '')) return 'ask-agent-owned';
+  return null;
+}
 // WA §A "a recommendation is a claim — vet it like code": what the recommendation
 // rests on (N and source) and whether it was independently refuted. Recognised the
 // SAME way as decider, but OPTIONAL — its absence is never a defect, so older replies
@@ -191,7 +328,16 @@ function confidenceLevel(content) {
  *   'missing-confidence'          — no recognised `confidence:` line at all.
  *   'high-confidence-no-decider'  — the CORE defect: confident AND no user-held decider.
  *   'missing-decider'             — a `decider:` line is absent (med/low confidence).
- * A well-formed ask (a confidence AND a decider) contributes nothing.
+ *   'decider-not-hard-stop'       — BUG-256: the decider names no HARD_STOPS entry
+ *                                   (priority, spend, risk, none, …): the agent's call.
+ *   'decider-no-consequence'      — BUG-256: a hard stop with no stated consequence.
+ *   'ask-agent-owned'             — the `about:` subject is the agent's own call
+ *                                   (sequencing, implementation, round, next-step,
+ *                                   approval) and the decider is not an exempt stop.
+ *                                   Checked first, before any label defect.
+ *   'ask-missing-about' / 'ask-about-unknown' — no `about:` line, or an off-list one.
+ * A well-formed ask (a confidence, a hard-stop decider with its consequence, and a
+ * user-held subject or an exempt stop) contributes nothing.
  */
 export function askOwnershipDefects(parsed) {
   const blocks = Array.isArray(parsed?.blocks) ? parsed.blocks : [];
@@ -200,11 +346,24 @@ export function askOwnershipDefects(parsed) {
     if (!b || b.name !== 'orchard-ask') continue;
     const content = String(b.content ?? '');
     const confidence = confidenceLevel(content);
-    const hasDecider = DECIDER_RE.test(content);
+    const decider = deciderOf(content);
+    const hasDecider = decider !== null;
+    const about = aboutOf(content);
+    // An agent-owned subject is refused FIRST: telling the author to fix its
+    // decider label would invite a relabel of a call that was never the user's.
+    const subjectVerdict = subjectDefect(about, decider);
+    if (subjectVerdict === 'ask-agent-owned') {
+      out.push({ confidence, hasDecider, decider: decider?.raw, about: about.subject, defect: subjectVerdict });
+      continue;
+    }
     if (!confidence) { out.push({ confidence: '', hasDecider, defect: 'missing-confidence' }); continue; }
     if (!hasDecider) {
       out.push({ confidence, hasDecider, defect: confidence === 'high' ? 'high-confidence-no-decider' : 'missing-decider' });
+      continue;
     }
+    const defect = hardStopDefect(decider);
+    if (defect) { out.push({ confidence, hasDecider, decider: decider.raw, defect }); continue; }
+    if (subjectVerdict) out.push({ confidence, hasDecider, decider: decider.raw, about: about?.raw, defect: subjectVerdict });
   }
   return out;
 }
@@ -299,6 +458,21 @@ export function buildRecord(parsed, meta = {}) {
     asksMissingConfidence: ownership.filter((d) => d.defect === 'missing-confidence').length,
     asksHighNoDecider: ownership.filter((d) => d.defect === 'high-confidence-no-decider').length,
     asksMissingDecider: ownership.filter((d) => d.defect === 'missing-decider').length,
+    // BUG-256 telemetry: which decider each ask named (first token, lower-case;
+    // '' when none), and how many named no hard stop — so a later ask audit can
+    // re-measure the unnecessary-ask share without re-parsing transcripts.
+    deciderTokens: (Array.isArray(parsed?.blocks) ? parsed.blocks : [])
+      .filter((b) => b && b.name === 'orchard-ask')
+      .map((b) => { const d = deciderOf(b.content); return d ? d.lead : ''; }), // r2: the TRUE lead, never a later joined code
+    asksNotHardStop: ownership.filter((d) => d.defect === 'decider-not-hard-stop').length,
+    asksNoConsequence: ownership.filter((d) => d.defect === 'decider-no-consequence').length,
+    // Ask-subject telemetry: the declared `about:` per ask (case-folded; '' when
+    // none) and how many were refused as the agent's own call.
+    askSubjects: (Array.isArray(parsed?.blocks) ? parsed.blocks : [])
+      .filter((b) => b && b.name === 'orchard-ask')
+      .map((b) => { const a = aboutOf(b.content); return a ? a.raw.toLowerCase() : ''; }),
+    asksAgentOwned: ownership.filter((d) => d.defect === 'ask-agent-owned').length,
+    asksMissingAbout: ownership.filter((d) => d.defect === 'ask-missing-about' || d.defect === 'ask-about-unknown').length,
     // OPTIONAL field (WA §A): how many asks carry an `evidence:` line. Recorded for
     // uptake visibility only — its absence is never a defect and never blocks.
     asksWithEvidence: asksWithEvidence(parsed),

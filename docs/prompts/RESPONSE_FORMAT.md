@@ -116,12 +116,12 @@ sentence — lead with the line they decide on.
 
 - **the world** — `orchard-finding` what is TRUE · `orchard-outcome` what I
   CHANGED in the world: shipped/committed/filed/deployed (never text I wrote you).
-- **a decision** — `orchard-ask` it is YOURS: a choice, question, approval or an
-  action only you can take; lead with my recommendation, then `confidence:`
-  high/med/low, `decider:` (taste/priority/spend/risk/direction) and optional
-  `evidence:` (what it rests on — N + source, and whether refuted) ·
-  `orchard-judgment` it
-  was MINE: the call and why, including where I got it wrong.
+- **a decision** — `orchard-ask` it is YOURS: a choice, question or action only
+  you can take; lead with my recommendation, then `confidence:` high/med/low,
+  `about:` goal|preference|fact|action|spend (my sequencing, implementation, round,
+  next-step or approval I decide, unless the decider is an action stop), `decider:`
+  one WA §A hard-stop code, `consequence:`, optional `evidence:` (N + source,
+  refuted?) · `orchard-judgment` it was MINE: the call and why, incl. where I erred.
 - **the work** — `orchard-status` where it stands as this turn ENDS (running,
   next, blocked, or nothing needs you) · `orchard-narration` what I am doing
   INSIDE this turn.
@@ -419,10 +419,40 @@ survive, and it is the case it helps most: four options with the cost in the sam
 slot is the ARCH-005 prototype's own structure.
 
 **The `orchard-ask` header fields.** Below the recommendation, an ask declares
-up to three fields the parser recognises:
+the fields the parser recognises:
 - `confidence:` high/med/low — your confidence in the recommendation.
-- `decider:` the user-held thing (taste/priority/spend/risk/direction) that makes
-  the call theirs. Without a nameable decider it is not an ask (WA §A).
+- `about:` WHAT is being decided — the line holds EXACTLY one subject code. The
+  user's subjects: `goal` (a fork in what to build or pursue, or a policy they will
+  live under — security posture, what agents may do, method),
+  `preference` (their own look-and-feel or working preference), `fact` (something
+  only they know), `action` (something only they can do: a click, a restart, a git
+  write, a credential), `spend` (their money or account quota). The agent's own
+  subjects: `sequencing`, `implementation` (how to deliver what was asked when the
+  user's outcome is the same either way), `round` (another fix/verify/review
+  round), `next-step` (proceeding with requested work) and `approval` (a go-ahead
+  on your own recommendation). The turn-end check refuses an ask about one of the
+  agent's subjects unless its decider is an ACTION stop — `irreversible`, `outward`,
+  `money`, `live`, `git` or `access`: the recommendation itself cannot be undone,
+  leaves this machine, spends the user's money or account quota, or is an act you
+  may not take alone. Under `taste`, `direction`, `info` or `blocked` the pair is
+  incoherent (a true fork is `about: goal`) and is refused. Otherwise decide it, state the call in an
+  `orchard-judgment`, and continue. The check classifies the declared subject ×
+  decider, never the prose; a mislabelled subject is recorded (`askSubjects`) for
+  audit, not prevented. (Measured: session 20ed61fc idled ~420 min on "I
+  recommend one more round", declared `decider: spend`.)
+- `decider:` the hard stop that makes the call theirs — the line holds EXACTLY one
+  code and nothing else: `irreversible`, `outward`, `live`, `git`, `access`, `money`,
+  `taste`, `direction`, `info`, `blocked` (WA §A), e.g. `decider: live`.
+- `consequence:` on its own line, what happens to the user, e.g. `consequence:
+  restarting ends every running session, including this one`. Priority, agent effort,
+  a generic risk, "another round?" and fixing a problem inside the requested work are
+  yours: decide them and continue. The turn-end check blocks any other decider value
+  once (BUG-256), including compounds, two codes or trailing words (`live-ops`,
+  `live/git`, `live — …`). It reads the declaration, not its truth; a mislabelled
+  stop is measured by `ask-audit`.
+  A board decision card is held to the same list: `board-tool decide` needs
+  `--decider=<stop> --consequence="…"`, and an agent's own call is recorded with
+  `board-tool own` (BUG-259).
 - `evidence:` (OPTIONAL) — what the recommendation rests on (N and source), and
   whether it was independently refuted. This is WA §A's "a recommendation is a
   claim — vet it like code" made legible in the ask itself: a recommendation the

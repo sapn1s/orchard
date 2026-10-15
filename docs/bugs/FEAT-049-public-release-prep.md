@@ -5,41 +5,71 @@
   "title": "Publishing the project would expose private details permanently",
   "summary": "The working files are now clean of private project names, home paths and personal context, and a security posture write-up plus rename and public-mirror scripts are written and tested. The stored history still holds everything that was scrubbed, so the public copy must start from a fresh history. Nothing has been published.",
   "impact_if_we_wait": "Nothing leaks while the project stays private, because the release steps only run when a person runs them. Bounded: this is exposure-on-publish, not a live disclosure, and no data is lost by leaving it open.",
-  "current_need": "Decide whether to hold this open until you publish, or close it and treat the release steps as a separate task.",
+  "current_need": "Nothing to build; the ticket stays open carrying the release steps.",
   "severity": "medium",
   "area": "Public release readiness",
   "reported": "2026-08-06",
   "reported_by": "user",
-  "owner": "you",
+  "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-10",
-  "decision": {
-    "mode": "single",
-    "question": "Should this stay open until the publish is run, or close now that the preparation is done?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Hold open until published",
-        "what_changes": "The ticket stays open and carries the release steps until someone runs them for real.",
-        "benefit": "The untested-in-anger release path stays visible instead of being assumed done.",
-        "cost": "An open ticket sits on the board indefinitely with no owner acting on it.",
-        "why_not_obvious": "A ticket that stays open with nobody working it teaches readers that open means nothing in particular."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "c464d468-b721-4622-ada1-3f35929e599b",
+      "asked_on": "2026-08-10",
+      "question": "Should this stay open until the publish is run, or close now that the preparation is done?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Open or closed is bookkeeping; keeping the release steps attached to the one risky run costs nothing.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Open or closed is bookkeeping; keeping the release steps attached to the one risky run costs nothing.",
+        "on": "2026-10-14",
+        "next": "Nothing to build; the ticket stays open carrying the release steps.",
+        "handoff": "Running the publish itself: making the repository public is an outward step only you take.",
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide whether to hold this open until you publish, or close it and treat the release steps as a separate task."
+        }
       },
-      {
-        "key": "B",
-        "label": "Close the preparation work",
-        "what_changes": "This closes on the cleanup and scripts, and publishing becomes its own ticket when wanted.",
-        "benefit": "The board reflects what is actually finished, which is all of the preparation.",
-        "cost": "The publish steps lose their home unless a replacement ticket is filed at the same time.",
-        "why_not_obvious": "The scripts have only ever been run in rehearsal, so closing records confidence the real run has not earned."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should this stay open until the publish is run, or close now that the preparation is done?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Hold open until published",
+            "what_changes": "The ticket stays open and carries the release steps until someone runs them for real.",
+            "benefit": "The untested-in-anger release path stays visible instead of being assumed done.",
+            "cost": "An open ticket sits on the board indefinitely with no owner acting on it.",
+            "why_not_obvious": "A ticket that stays open with nobody working it teaches readers that open means nothing in particular."
+          },
+          {
+            "key": "B",
+            "label": "Close the preparation work",
+            "what_changes": "This closes on the cleanup and scripts, and publishing becomes its own ticket when wanted.",
+            "benefit": "The board reflects what is actually finished, which is all of the preparation.",
+            "cost": "The publish steps lose their home unless a replacement ticket is filed at the same time.",
+            "why_not_obvious": "The scripts have only ever been run in rehearsal, so closing records confidence the real run has not earned."
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "The risky part is the run itself, and keeping one ticket attached to it costs nothing and reverses in a line.",
+        "prerequisite": null
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "The risky part is the run itself, and keeping one ticket attached to it costs nothing and reverses in a line.",
-    "prerequisite": null
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A leak check over the tree finds no private project name, home path or email",
     "The board index check and the interface and type checks stay clean after the scrub",
@@ -287,3 +317,6 @@ runs, and/or make it part of the gatekeeper's mechanical pre-steps for any commi
   **Both destinations prepared. Nothing pushed, no public repo created, the mirror never run with --push.** Private: `npm run gate` PASS unpiped, exit 0 read directly, waiver surfaced. Public: `bash scripts/publish-public-mirror.sh --out <scratch>` built 860 files, gate PASS, one commit, no remote. The built tree was then INSPECTED rather than trusted: README byte-identical to the newly committed one; LICENSE present, 4725 bytes, notice naming the repository with zero email shapes; `docs/bugs/assets/` absent and every image in the tree under `public/` or `docs/assets/`; `.mcp.json`, `.station-hands-off`, `.env`, `.claude/settings.local.json` and `registry.json` all absent; independent greps (not the gate) found no home path, no encoded home path, no real email, no non-loopback IP and no NUL-bearing text file — the only home-path hits are `/home/claude` (the container's own user), `/home/someone` and `/home/you` (placeholders). Runnable by a stranger: two runtime deps, lockfile present, `npm start` -> `node src/server/index.ts` which exists, entry + UI assets present, and all five README links resolve inside the tree.
 
   **Risk bucket: SECURITY / irreversible-disclosure.** An independent clean-room pass is warranted before the push, on two things specifically: the gate waiver (generation must not be its own only verifier), and the split-string class itself — the gate's blind spot is authored deliberately, one split string at a time, and one of those authors has now shipped a real address through it.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Open or closed is bookkeeping; keeping the release steps attached to the one risky run costs nothing. Next: Nothing to build; the ticket stays open carrying the release steps. Still yours: Running the publish itself: making the repository public is an outward step only you take. You can reopen this decision from the ticket view.

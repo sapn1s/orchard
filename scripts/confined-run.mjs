@@ -24,6 +24,9 @@
  *                       caps (defaults 4096 / 2048 / 2048 / 2 / 512); --out larger
  *                       than --out-mb is refused and fails the run
  *   --no-git            do not ship the project's .git
+ *   --allow-userns      per-invocation opt-in (ARCH-021 D1): seccomp = the pinned Docker
+ *                       default plus unshare/setns/mount/umount2/pivot_root/clone, so
+ *                       bwrap and `unshare -U` work inside. Nothing else changes.
  *
  * See scripts/lib/confined-run.mjs for what "confined" means and why.
  */
@@ -44,12 +47,13 @@ for (let i = 0; i < head.length; i++) {
   else if (a === '--ship') (opts.ship ??= []).push(next());
   else if (a === '--timeout-sec') opts.timeoutSec = Number(next());
   else if (a === '--no-git') opts.withGit = false;
+  else if (a === '--allow-userns') opts.allowUserns = true;
   else if (a === '--memory-mb') (opts.limits ??= {}).memoryMb = Number(next());
   else if (a === '--work-mb') (opts.limits ??= {}).workMb = Number(next());
   else if (a === '--pids') (opts.limits ??= {}).pids = Number(next());
   else if (a === '--cpus') (opts.limits ??= {}).cpus = Number(next());
   else if (a === '--out-mb') (opts.limits ??= {}).outMb = Number(next());
-  else if (a === '-h' || a === '--help') { console.log('usage: confined-run.mjs [--cwd D] [--subdir R] [--image I] [--out P] [--env K=V]... [--timeout-sec N] [--no-git] -- <cmd> [args...]'); process.exit(0); }
+  else if (a === '-h' || a === '--help') { console.log('usage: confined-run.mjs [--cwd D] [--subdir R] [--image I] [--out P] [--env K=V]... [--timeout-sec N] [--no-git] [--allow-userns] -- <cmd> [args...]'); process.exit(0); }
   else die(`unknown option ${a} (put the command after --)`);
 }
 if (!cmd.length) die('no command: put it after --');

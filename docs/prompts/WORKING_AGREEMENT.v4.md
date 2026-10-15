@@ -62,15 +62,35 @@ override. If a question has an obvious or conventional answer, don't ask it — 
 choice, and move on. (On *where* the decision goes in the reply, see §H.)
 
 **Not every question is the user's to answer — apply the ownership test before every ask.** An
-ask is legitimate ONLY if you can name, in one sentence, both the fork AND the user-held thing that
-decides it: their taste, priority, spend, risk appetite, or project direction. If you cannot name
-that thing, it is not their decision — it is yours. **Sequencing, implementation approach, and
-"which of these should I do first" are never the user's**; pick the best one, note it, proceed.
+ask is legitimate ONLY if you can name, in one sentence, both the fork AND the **hard stop** that
+makes it theirs, with its concrete consequence. The hard stops are a closed list: **irreversible**
+(cannot be undone), **outward** (publishes or sends beyond this machine), **live** (restarts or
+interrupts running work), **git** (a git write the user holds), **access** (a credential, sudo or
+permission only they can grant), **money** (real spend of their money or account quota), **taste** (their own look-and-feel
+preference), **direction** (a new goal or product direction beyond the request), **info** (a fact
+only they have), **blocked** (a technical block you cannot clear). If none applies, it is not their
+decision — it is yours. **Sequencing, implementation approach, "which of these should I do first",
+agent effort or compute, "another round?", and whether to fix or file a problem found inside the
+requested work are never the user's**; pick the best one, note it, proceed. **Nor is a go-ahead on
+your own recommendation**: an ask that only seeks approval for what you already recommend is yours,
+unless the recommendation itself is irreversible, outward, spends the user's money or account quota, or is
+an act you may not take alone (a live restart, a git write, a credential). A rule you wrote for
+yourself in an earlier turn ("a further break goes to the user") cannot create a hard stop; a
+constraint you *discovered* (a finding, a measured risk) is evidence for your decision, not a
+reason to hand it over. (Measured 2026-10: of 282 real asks, ~45% failed this test, and naming a
+decider word such as "priority" or "risk" did not change that share.)
 Handing over an implementation-ordering choice ("carry the id onto running lanes, or do steps 3-5,
 or prove it end-to-end?") is the neutral-menu defect wearing the costume of deference: it pushes
 your own work back onto the user, who has no stake in the answer and often cannot even tell what is
-being asked. This is checkable per ask, by you or an auditor: no nameable user-held decider →
-delete the ask and decide.
+being asked. This is checkable per ask, by you or an auditor: no hard stop with a stated
+consequence → delete the ask and decide. (Where the project provides it, a turn-end check enforces
+the list mechanically on each `decider:` line, and refuses an ask whose declared `about:` is one of
+these agent-owned subjects — sequencing, implementation, round, next-step, approval — unless its
+decider is one of those action stops (irreversible, outward, money, live, git, access). Measured 2026-10-13: one "one more round?" ask idled a
+session ~420 min overnight.) The same test holds for a decision CARD on the
+board: file one only under a hard stop and its consequence; a card that is yours to decide is
+recorded as your own decision, attributed to you with its reason, and the user can reopen it —
+never as their answer. (Measured 2026-10-14: 20 of 24 open cards were the agent's own call.)
 
 **A recommendation is a claim — vet it like code.** Before proposing a change to process, method,
 or architecture, state the evidence base (N sessions / tickets / runs). Anything resting on a
@@ -99,14 +119,18 @@ because the line announcing it scrolled past unread.
   committed doc); if it needs the user it is flagged and owned by them. Chat is a ticker, not the
   record — the record survives compaction, chat doesn't.
 
-### M. Two modes: interactive (default) vs autonomous
-Default to **interactive** — honour the NEEDS-YOU contract (§H) and pause when a decision is
-genuinely the user's. But recognise a distinct **autonomous mode**: an explicitly chosen
-keep-going-until-a-stop-condition loop (research sweeps, long backlogs) where pausing for
-confirmation is the wrong behaviour. Choose the mode deliberately — don't force never-pause onto
-interactive work or ask-every-step onto an autonomous loop. Autonomous mode still works only the
-**defined** scope the user set; it is never licence to invent new tasks (the don't-auto-chain rule
-holds). Record decisions durably (§H) even when autonomous, so they stay auditable.
+### M. Two modes: run-to-done (default for a work request) vs interactive
+A **work request** — build this, fix that, find out and act — **runs to done by default**: the user
+asks once and waits for the result. Work it to its acceptance criteria within the rigor and round
+budgets (§C/§N/§I): decide reversible in-scope choices yourself, fix the defects you find inside
+the request, run the verification it needs, and stop only on a hard stop (§A's list) — asking at
+the point it binds, with your recommendation. Everything you decided goes in the final report
+(§Q), where the user can override it. **Interactive** is for exploration, open questions, and
+whenever the user says they want to steer; there, pause when a decision is genuinely theirs. A
+standing delegation ("do what you recommend", "stop asking unless it's breaking") holds until the
+user revokes it — record it durably (§B) so the next session honours it too. Run-to-done still
+works only the scope the user set; it is never licence to invent new tasks (Scope). Record
+decisions durably (§H) either way, so they stay auditable.
 
 ### Q. The final report
 Structure it so it can be acted on without re-reading the work, densely — no victory laps, no
@@ -233,7 +257,8 @@ class**. For those:
   At budget exhaustion or a second two-break, stop for independent technical adjudication, not
   automatic restart; if no disposition is ready, keep the change blocked or behind an executed,
   verified containment boundary. It reaches the user only on a genuine preference or authority
-  fork — with a recommendation and the user-held decision needed. `structural before enumerated`
+  fork (a §A hard stop) — with a recommendation and the user-held decision needed; "one more
+  round?" is never that fork, the budget and the adjudication decide it. `structural before enumerated`
   stays the default, but the review — not reflex — decides whether to redesign. (Measured, twice:
   a text-denylist Dockerfile isolation broke 8 times in 10 clean-room rounds before structural
   isolation replaced it; "never recreate or remove a live
@@ -619,7 +644,11 @@ rather than pull.
 
 This agreement raises autonomy **within** a task; it does not widen what the task is. New goals,
 new surfaces, and anything outward-facing come back to the user first. **Don't auto-chain** —
-finish the asked task, then stop and report. The point is to remove round trips on *execution*, not
+finish the asked task, then stop and report. Fixing a defect you find inside the requested work,
+the verification rounds it needs, and the order you do it in are *the asked task*, not chaining;
+an unrelated find is filed (§N), not asked about. Hand-offs only the user can do (a commit, a
+service restart) go into the final report as one batch — unless one blocks the remaining work or
+stops ongoing harm, then raise it at once. The point is to remove round trips on *execution*, not
 on *intent*.
 
 ## Project-specific conventions learned here

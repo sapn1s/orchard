@@ -25,6 +25,7 @@ import type { RuntimeCapabilities, WorkLifetime } from './runtime/runtime.ts';
 import { ClaudeRuntime } from './runtime/claude-runtime.ts';
 import * as runtimeUpdate from './runtime/runtime-update.ts';
 import { CodexRuntime, detectCodex } from './runtime/codex-runtime.ts';
+import { contentBlocksFor, type AttachmentRef } from './attachments.ts';
 import type {
   EffectiveConfig,
   LiveAgent,
@@ -36,7 +37,7 @@ import type {
 import type { Project } from './registry.ts';
 import { composeInstructions, appendToSystemPrompt, containerBuildSection, type ComposedPrompt } from './templates.ts';
 import { recordSessionConfig, type SessionConfigSource } from './session-config.ts';
-import { boardStateSection, boardAnswerBriefing, answeredAwaitingKeys } from './board.ts';
+import { boardStateSnapshot, answerBriefingFor, markAnswersDelivered, type BoardSnapshot } from './board.ts';
 import { OpenToolCalls } from './open-tool-calls.ts';
 import type { InstructionRef, ProjectSettings } from './registry.ts';
 import { browserSettingsOf, orchestratorProfileOf, responseDigestOf, toolSettingsOf, getProject } from './registry.ts';
@@ -68,7 +69,8 @@ import { ServiceError } from './service-manager.ts';
 import { newExecTag, attachLease, drainLease } from './lifecycle.ts';
 import { applyGlobalDefaults, resolveModelForProvider, modelProviderOf } from './global-settings.ts'; // BUG-196 round 6: modelProviderOf
 import { resolveLaunchAccountDir } from './claude-accounts.ts';
-import { getSessionAccount } from './session-accounts.ts'; // FEAT-160 — the server-owned session→account binding wins over a stale override on resume.
+import { getSessionAccount, setSessionAccount } from './session-accounts.ts'; // FEAT-160 — the server-owned session→account binding.
+import { effectiveLaunchAccount, type LaunchAccountSubject } from './launch-account.ts'; // BUG-255 r4 — the one launch-account authority.
 import { brokerLifetimeForClose, reapHost, spawnSurvivable, survivalEnabled, type AttachHandle, type HostStatus, type SpawnedProcessLike, type SurvivalHandle, type SurvivalProbe } from './survival.ts';
 /*
  * ARCH-001: the bridge no longer decides its own liveness. It supplies the
@@ -88,10 +90,12 @@ import * as outcomes from './outcomes.ts';
 import * as requests from './requests.ts';
 import { ensureUnifiedMemoryDir } from './memories.ts';
 import { TranscriptRecorder, resolveOrchardSessionFile, resumeProviderOf, mirrorClaudeStore, CLAUDE_MIRROR_PROVIDER } from './orchard-transcripts.ts';
-import { encodeCwd } from '../lib/session-history.ts';
+import { encodeCwd, defaultRoot as transcriptStoreRoot } from '../lib/session-history.ts';
+import { spawnLaneSnapshot } from '../../scripts/lib/lane-snapshot.mjs';
 import { recordSessionProvenance } from '../lib/session-provenance.mjs';
 import { parseDispatchDeclaration } from '../../scripts/lib/cost-model.mjs';
 import { laneDockerEnv, requireSandboxUp, adoptedDockerMismatch } from '../../scripts/lib/lane-docker.mjs';
+import { agentGitPolicyNote, normalizeGitWrite } from '../../scripts/lib/agent-git-policy.mjs';
 
 /* ---------------------------------------------------------- slash commands */
 /*
@@ -166,9 +170,41 @@ function rememberModels(provider: string, models: KnownModel[]): void {
   try { fs.writeFileSync(modelsFile(provider), JSON.stringify(models)); } catch { /* volatile is fine */ }
 }
 
+/*
+ * FEAT-175 — THE TURN HOLD. While a project's container is about to be (or is being) recreated for a
+ * git-write grant change, no NEW turn may start on it: every turn passes `send` / `sendGated` (WS send,
+ * outbox handover, decision answers, the autonomous nudge, reattach-with-prompt) and every session start
+ * passes `startSessionAdmitting`, so the hold lives at those chokepoints only. The reconciler
+ * (grant-rebuild.ts) registers the sources; with none registered nothing is held. A hold is always a
+ * RETRYABLE refusal (code 'rebuild-hold'), so the caller queues the text in the outbox instead of losing it.
+ */
+type TurnHoldSource = (projectId: string) => { message: string } | null;
+type AdmissionGate = (projectId: string, onStatus: (s: string) => void, abandoned: () => boolean) => Promise<void>;
+let turnHoldSource: TurnHoldSource | null = null;
+let admissionGateFn: AdmissionGate | null = null;
+export function setTurnHold(fn: TurnHoldSource | null, gate: AdmissionGate | null): void {
+  turnHoldSource = typeof fn === 'function' ? fn : null;
+  admissionGateFn = typeof gate === 'function' ? gate : null;
+}
+/** FEAT-175 r2: container projects only; a source that throws HOLDS (fail closed — the .git mode is unknown). */
+function turnHoldOf(project: { id: string; isolation: string }): { message: string } | null {
+  if (!turnHoldSource || project.isolation !== 'container') return null;
+  try { return turnHoldSource(project.id); }
+  catch (err) { return { message: `Orchard cannot confirm this container's git mode right now (${(err as Error).message}); your message waits and is sent once it can.` }; }
+}
+/** A retryable 'rebuild-hold' refusal (FEAT-175). */
+export function rebuildHoldError(message: string): Error & { retryable: true; code: 'rebuild-hold' } {
+  const err = new Error(message) as Error & { retryable: true; code: 'rebuild-hold' };
+  err.retryable = true;
+  err.code = 'rebuild-hold';
+  return err;
+}
+
 export interface StartOptions {
   project: Project;
   firstPrompt: string;
+  /** FEAT-177 — attachments delivered with the first turn (image/document/text references). */
+  firstAttachments?: AttachmentRef[];
   /**
    * ARCH-022 — internal: the container exec tag `startSession` allocated BEFORE admission, so the
    * lifecycle authority's lease for it exists before the exec does. Callers never set it.
@@ -195,9 +231,31 @@ export interface StartOptions {
    * this session only; nothing here is ever written back to the registry.
    */
   overrides?: Partial<SessionOverrides>;
+  /**
+   * BUG-255 r4 — a BRAND-NEW session's account pick (no session id exists yet). It is
+   * the session's initial BINDING, not a launch override: launch-account.ts
+   * `effectiveLaunchAccount` reads it (only when there is no resumeSessionId) and the
+   * session persists it as its binding at `system:init`. `overrides` must never carry
+   * `claudeAccount` — startSession refuses one.
+   */
+  initialBinding?: { account: string | null };
+  /** Filled in by startSession() (container admission's project snapshot); callers never set this. */
+  launchProject?: Project;
   /** Extra system-prompt text appended after the composed templates (used by tests). */
   extraAppend?: string;
   onEvent: (e: StationEvent) => void;
+  /**
+   * FEAT-175 — the caller's own liveness (a WS start: its socket closed). Consulted while the start WAITS
+   * for a container rebuild, before admission, so an abandoned start never runs its prompt unseen.
+   */
+  abandoned?: () => boolean;
+  /**
+   * BUG-253 — the caller's durable record of a NEW session's first message. `onInit` is called once, at the
+   * first `system:init` (the session it started now has an id); `onEndBeforeInit` once, from `close()`, when
+   * the session ends without ever reaching init. Generic callbacks: the bridge knows nothing of where the
+   * record lives. Called synchronously; a throw is swallowed.
+   */
+  firstPromptHooks?: { onInit(sdkSessionId: string): void; onEndBeforeInit(reason: string): void };
   /** Filled in by startSession(); callers never set this. */
   forkPlan?: ForkPlan;
   /** Filled in by startSession(); callers never set this. */
@@ -633,12 +691,14 @@ export class AgentSession {
   #pump: Promise<void> | null = null;
   /** Declared provenance for this session; recorded at init. Default 'user'. */
   #startedBy: 'user' | 'agent';
+  /** BUG-253: the first-message record's callbacks, consumed once (init, or a close before it). */
+  #firstPromptHooks: StartOptions['firstPromptHooks'] | null;
 
   /**
-   * FEAT-090 — answered-awaiting tickets already ANNOUNCED to this session, keyed
-   * `<ticketId>@<answerDate>`. Seeded at launch with whatever the launch snapshot
-   * already carried (so it is never re-stated), then grown as the open-session
-   * briefing names each NEW answer once, riding the user's next message.
+   * FEAT-090 — answered-awaiting tickets already DELIVERED to this session (key
+   * board.ts answerKey). BUG-257 r3: written ONLY through markAnswersDelivered, by
+   * #withBriefing's `delivered()` after the turn carrying the launch snapshot or the
+   * live briefing was handed to the runtime. Nothing pre-seeds it.
    */
   #answerBriefSeen = new Set<string>();
   /** FEAT-157 — base-update notices this session has been told (key id@rev). */
@@ -653,6 +713,13 @@ export class AgentSession {
    * `bridgeForSession`.
    */
   resumeOf: string | null = null;
+  /** BUG-255 r2 — false for an ADOPTED restart survivor: its CLI was spawned by a
+   *  previous server, so `effective.claudeAccount` is this server's re-derivation,
+   *  not a record of the account it actually runs under. Never declared as fact. */
+  launchAccountKnown = true;
+  /** BUG-255 r4 — the binding a NEW session id takes at `system:init` (a new session's
+   *  initial pick, or a fork parent's binding captured at construction); null = none. */
+  #launchBinding: { account: string | null } | null = null;
   cwd: string;
   /**
    * FEAT-155 — for a container session, the HOST store dir its history lands
@@ -1098,6 +1165,13 @@ export class AgentSession {
   /** BUG-239 — lanes that had a permission refused for no answer (the park guard reads this). */
   #expiredAgents = new Set<string>();
   /**
+   * 2026-10-13 — cards the deadline REFUSED, by requestId, so an answer that
+   * arrives afterwards is recorded as a `late-answer` incident (the evidence the
+   * 30-min default is judged on). Bounded; in memory only (a restart forgets it,
+   * and the client then gets "no such pending request" as before).
+   */
+  #refusedCards = new Map<string, { kind: PendingKind; agentId: string | null; toolName: string; what: string; lane: string; raisedAt: number; refusedAt: number; deadlineMs: number }>();
+  /**
    * True between interrupt() and the resulting `result` message. The SDK reports
    * an interrupted turn as `error_during_execution`, which is byte-identical to
    * a genuine failure — so we track our own call rather than guess.
@@ -1163,6 +1237,7 @@ export class AgentSession {
     this.cwd = opts.project.hostPath;
     this.#emit = opts.onEvent;
     this.#startedBy = opts.startedBy ?? 'user';
+    this.#firstPromptHooks = opts.firstPromptHooks ?? null;
 
     const refs = opts.instructions ?? opts.project.settings.instructions ?? [];
     // FEAT-039 gap #1: fold this project's docs/CONVENTIONS.md (if any) onto the
@@ -1195,6 +1270,11 @@ export class AgentSession {
       : `node ${dispatchBroker.dispatchClientPath()}`;
     const dispatchNote = dispatchAvailabilityNote(dispatchOn, dispatchRoute, opts.dispatchUnavailableReason);
     this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, dispatchNote) };
+    // FEAT-164 — what the user decided about agent git in THIS project (scoped: the scope
+    // note verbatim; release: soft releases, never commit yourself). No grant → null →
+    // the prompt is byte-identical to before.
+    const gitPolicyNote = agentGitPolicyNote(normalizeGitWrite(opts.project.settings?.gitWrite ?? null), { orchardDir: projectRoot(), projectId: opts.project.id });
+    if (gitPolicyNote) this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, gitPolicyNote) };
     /*
      * Gated on the SAME facts plannedMcpServers() gates the attach on
      * (tools.ts: `browserSettingsOf(project).enabled` AND the absence of a
@@ -1272,6 +1352,9 @@ export class AgentSession {
     const effective: Overridable = { ...base };
     const overridden: SessionOverridable[] = [];
     for (const field of SESSION_OVERRIDE_FIELDS) {
+      // BUG-255 r4 — the account is NOT a per-launch override: it is decided below by
+      // effectiveLaunchAccount alone (startSession refuses an overrides.claudeAccount).
+      if (field === 'claudeAccount') continue;
       if (!opts.overrides || !(field in opts.overrides)) continue;
       const v = opts.overrides[field];
       if (JSON.stringify(v) === JSON.stringify(base[field])) continue; // same as default: not an override
@@ -1316,26 +1399,40 @@ export class AgentSession {
     this.permissionModeSource = permissionModeSource;
 
     /*
-     * FEAT-160 — the server-owned session→account binding WINS over the client's
-     * per-launch override on a RESUME. This is the single reader of that fact
-     * (session-accounts.ts owns it, the account switch writes it): every resume
-     * spawn — the ws `start` resume, the outbox pump's `resume` route, a "Send
-     * anyway" on an uncertain row, a boot re-pump, a fork — flows through this
-     * one constructor, so a session that was switched can never be run on the old
-     * account by a stale override on another tab or a row frozen before the
-     * switch. A session that was never switched has no binding and keeps its
-     * override exactly as FEAT-145 defines. Keyed by `opts.resumeSessionId` (the
-     * parent sid for a fork, so a fork of a switched session continues on it).
+     * BUG-255 r4 — THE LAUNCH ACCOUNT, decided by the one authority (launch-account.ts
+     * `effectiveLaunchAccount`) and nowhere else: a container project → the project
+     * account (its credential bind); else the session's binding (a resume, or a fork's
+     * PARENT); else a brand-new session's initial pick; else the project account. The
+     * same function computes the indicator's declared `next`, so the account shown and
+     * the account launched cannot diverge. For a container launch the project is the
+     * snapshot ADMISSION bound the credentials from (`launchProject`), not the possibly
+     * older `opts.project`. Every spawn (ws start new/resume/fork, the outbox pump's
+     * new + resume routes, Send anyway, boot re-pump) flows through this constructor.
      */
-    if (opts.resumeSessionId) {
-      const bound = getSessionAccount(opts.resumeSessionId);
-      if (bound !== undefined && bound.account !== (effective.claudeAccount ?? null)) {
-        effective.claudeAccount = bound.account;
-        if (!overridden.includes('claudeAccount')) overridden.push('claudeAccount');
+    const accountSubject: LaunchAccountSubject = opts.adopt
+      ? { sessionId: opts.adopt.st.sdkSessionId ?? opts.adopt.st.resumeHint ?? null }
+      : opts.resumeSessionId
+        ? { sessionId: opts.resumeSessionId }
+        : { sessionId: null, ...(opts.initialBinding ? { initialBinding: opts.initialBinding } : {}) };
+    effective.claudeAccount = effectiveLaunchAccount(accountSubject, opts.launchProject ?? opts.project);
+    if (effective.claudeAccount !== (base.claudeAccount ?? null) && !overridden.includes('claudeAccount')) overridden.push('claudeAccount');
+    /*
+     * The binding a NEW session id inherits at `system:init`: a new session's initial
+     * pick, or a fork PARENT's binding (captured now, never re-read at init — a parent
+     * rebound meanwhile does not move a child that launched on the old one). A resume
+     * keeps its own id and binding; a container project records none (its account is
+     * the project's). See #persistLaunchBinding.
+     */
+    if (!opts.adopt && (opts.launchProject ?? opts.project).isolation !== 'container') {
+      if (!opts.resumeSessionId && opts.initialBinding) this.#launchBinding = { account: opts.initialBinding.account };
+      else if (opts.resumeSessionId && opts.fork) {
+        const parent = getSessionAccount(opts.resumeSessionId);
+        if (parent !== undefined) this.#launchBinding = { account: parent.account };
       }
     }
 
     this.effective = effective;
+    this.launchAccountKnown = !opts.adopt;
     this.overriddenFields = overridden;
     this.ignoredOverrides = [];
 
@@ -1688,14 +1785,14 @@ export class AgentSession {
     let sp = this.composed.systemPrompt;
     sp = appendToSystemPrompt(sp, opts.extraAppend);
     // BUG-187 B1: an adopted session injects no board preamble (it sends no first turn).
-    const boardSnapshot = opts.adopt ? null : boardStateSection(opts.project.hostPath);
-    this.#configBoardSnapshot = boardSnapshot; // FEAT-132 — for the config record
+    let boardSnapshot: BoardSnapshot | null = null;
+    if (!opts.adopt) { try { boardSnapshot = boardStateSnapshot(opts.project.hostPath); } catch { boardSnapshot = null; } }
+    this.#configBoardSnapshot = boardSnapshot?.text ?? null; // FEAT-132 — for the config record
 
-    // FEAT-090: the snapshot above ALREADY carries the answered-awaiting lane, so
-    // seed the seen-set with what it just stated — the open-session briefing
-    // (#withBriefing) then never repeats a decision the launch prompt announced,
-    // and only NEW answers recorded WHILE this session is open get briefed.
-    try { for (const k of answeredAwaitingKeys(opts.project.hostPath)) this.#answerBriefSeen.add(k); } catch { /* no board */ }
+    // BUG-257 r3: NO seen-set seeding here. r2 seeded the snapshot's keys at launch,
+    // which on an ADOPT launch (snapshot null) marked answers seen that no prompt
+    // ever carried. The snapshot's own answeredKeys are marked by the first turn's
+    // delivered() below, once that turn is actually handed to the runtime.
 
     /*
      * FEAT-057 — "while you were away". A session being RESUMED may have had
@@ -1717,7 +1814,11 @@ export class AgentSession {
     // that a transcript re-read could not tell apart.
     // BUG-187 B1: no briefing on adoption — takeBriefing MARKS records as told,
     // and an adoption tells the model nothing (it sends no turn at all).
-    const firstPrompt = opts.adopt ? '' : this.#withBriefing(opts.firstPrompt ?? '', opts.resumeSessionId ?? null, boardSnapshot);
+    const firstBrief = opts.adopt ? null : this.#withBriefing(opts.firstPrompt ?? '', opts.resumeSessionId ?? null, boardSnapshot);
+    const firstPrompt = firstBrief ? firstBrief.text : '';
+    // FEAT-177: build the first turn's attachment content blocks (throws loudly if this engine
+    // cannot take an image — the start fails rather than silently dropping the attachment).
+    const firstContent = opts.adopt ? null : this.#attachmentContent(firstPrompt, opts.firstAttachments);
 
     /*
      * FEAT-037 P2b — arm Orchard-owned transcript capture for engines with no
@@ -1738,7 +1839,7 @@ export class AgentSession {
       });
       if (s.model) this.#recorder.setModel(s.model);
       if (opts.resumeSessionId && !opts.fork) this.#recorder.adoptSessionId(opts.resumeSessionId);
-      this.#recorder.recordUserPrompt(firstPrompt);
+      this.#recorder.recordUserPrompt(firstPrompt, opts.firstAttachments);
     }
 
     // Reported BEFORE the runtime spawns, so the UI knows what applied even if
@@ -1853,6 +1954,7 @@ export class AgentSession {
         env: { ...dispatchEnv, ...accountEnv },
         dockerEnv: laneDocker?.env,
         firstPrompt,
+        ...(firstContent ? { firstContent } : {}), // FEAT-177
         permissionMode: s.permissionMode,
         onApproval: (req) => this.#onCanUseTool(req.toolName, req.input, req.meta),
         // BUG-239 — the no-parking guard reads expired permissions and records parks here.
@@ -1875,6 +1977,9 @@ export class AgentSession {
         // project id (stable across isolation, unlike cwd).
         gitGrantKey: opts.project.id,
         gitRepoPath: opts.project.hostPath,
+        // FEAT-129 round 4 — a container CLI addresses the repo as `this.cwd`
+        // (`/workspace/<id>`); declare it so its lock keys match a host session's.
+        fileLockPathAliases: this.cwd && this.cwd !== opts.project.hostPath ? [this.cwd] : undefined,
         // BUG-231 — only a direct session's CLI sees the host git shim on its PATH.
         gitShimReachesCli: opts.project.isolation === 'direct',
         // BUG-242 — on re-adopt, the surviving CLI's existing shim dir (baked with
@@ -1903,6 +2008,7 @@ export class AgentSession {
       this.#emit({ t: 'error', message: `session could not start: ${(err as Error).message}`, fatal: true });
       throw err;
     }
+    firstBrief?.delivered(); // BUG-257 r3 — the first turn (snapshot + briefing) is now with the runtime
     this.#pump = this.#run();
     if (opts.adopt) void this.#completeAdoption(opts.adopt);
     // Truth about available models, refreshed opportunistically per session —
@@ -1925,14 +2031,34 @@ export class AgentSession {
    * resumed match records written under its SDK id before this bridge existed
    * (the exact case where the orchestrator was not awake to see the death).
    */
-  #withBriefing(prompt: string, extraId: string | null = null, extraPrefix: string | null = null): string {
+  /**
+   * BUG-257 r3 — returns the composed text AND `delivered()`, which marks every
+   * answer this text carries (launch-snapshot keys + live-briefing keys) as seen via
+   * markAnswersDelivered. Callers invoke it ONLY after the text was handed to the
+   * runtime; a refused/failed send leaves the answers unseen for the next turn.
+   */
+  #withBriefing(prompt: string, extraId: string | null = null, snapshot: BoardSnapshot | null = null): { text: string; delivered: () => void } {
+    const extraPrefix = snapshot?.text ?? null;
     let brief: string | null = null;
     try { brief = outcomes.takeBriefing([this.id, this.sdkSessionId, extraId]); } catch { brief = null; }
     // FEAT-090 — a SIBLING briefing: board tickets answered while this session was
-    // open, stated once per (ticketId, answerDate) and riding THIS turn (it never
-    // starts one — send() is what invokes it, and only when the user is sending).
+    // open, stated once per answer and riding THIS turn (it never starts one —
+    // send() is what invokes it, and only when the user is sending). Answers the
+    // snapshot in this same turn already carries are excluded (no repeat).
+    const snapKeys = snapshot?.answeredKeys ?? [];
     let answer: string | null = null;
-    try { answer = boardAnswerBriefing(this.project.hostPath, this.#answerBriefSeen); } catch { answer = null; }
+    let answerKeys: string[] = [];
+    try {
+      const view = snapKeys.length ? new Set([...this.#answerBriefSeen, ...snapKeys]) : this.#answerBriefSeen;
+      const b = answerBriefingFor(this.project.hostPath, view);
+      if (b) { answer = b.text; answerKeys = b.keys; }
+    } catch { answer = null; answerKeys = []; }
+    const toMark = [...snapKeys, ...answerKeys];
+    const delivered = () => markAnswersDelivered(this.#answerBriefSeen, toMark);
+    const text = this.#composeBriefing(prompt, brief, answer, extraPrefix);
+    return { text, delivered };
+  }
+  #composeBriefing(prompt: string, brief: string | null, answer: string | null, extraPrefix: string | null): string {
     // FEAT-157 — Orchard's base-update notice for a container project: on the first
     // turn of every launch, and once more whenever it changes (seen-set keyed id@rev).
     // Rides a turn the user is sending; never starts one.
@@ -1974,9 +2100,12 @@ export class AgentSession {
    * runtime's own input channel to run at the next turn boundary rather than
    * opening a fresh turn now. See the `this.busy` branch below.
    */
-  send(prompt: string): { delivered: boolean; queued: boolean } {
+  send(prompt: string, attachments?: AttachmentRef[]): { delivered: boolean; queued: boolean } {
     if (this.closed) throw new Error('session is closed');
     if (this.budgetStopped) throw new Error('session stopped: budget exceeded');
+    // FEAT-175: a container rebuild for a git-write grant holds every new turn (an interject included: it
+    // would run as the next turn on the old mount). Retryable, so the caller queues it.
+    { const hold = turnHoldOf(this.project); if (hold) throw rebuildHoldError(hold.message); }
     /*
      * BUG-187 B2 — a RESPONDER-ONLY adoption does not own the CLI: its broker is
      * finishing a drain an earlier server decided. A user message is taken only
@@ -2044,16 +2173,25 @@ export class AgentSession {
        * turn owns them, and the interjected turn inherits `busy` (its own
        * `result` clears it) exactly as a queued follow-up always has.
        */
-      const held = this.#withBriefing(prompt);
-      this.#runtime.send(held);
-      this.#recorder?.recordUserPrompt(held);
+      const heldB = this.#withBriefing(prompt);
+      const held = heldB.text;
+      // FEAT-177: build the provider content blocks (throws loudly if the engine
+      // cannot take an image/PDF — the whole message is refused, never dropped).
+      const heldContent = this.#attachmentContent(held, attachments);
+      this.#runtime.send(held, heldContent ?? undefined);
+      heldB.delivered(); // BUG-257 r3 — only now is the answer briefing delivered
+      this.#recorder?.recordUserPrompt(held, attachments);
       // BUG-159 (round 2): the user is now awaiting a reply on the main thread —
       // even if the current `busy` was a stuck woken claim, this interject will
       // drive a real turn, so the honest-main-turn gate must stop downgrading it.
       this.#turnUserInitiated = true;
       return { delivered: true, queued: true };
     }
-    const text = this.#withBriefing(prompt);
+    const textB = this.#withBriefing(prompt);
+    const text = textB.text;
+    // FEAT-177: resolve attachments to content blocks BEFORE the turn opens, so
+    // an unsupported-attachment refusal throws without having mutated turn state.
+    const content = this.#attachmentContent(text, attachments);
     this.busy = true;
     this.turnStartedAt = Date.now(); // BUG-033
     this.#turnUserInitiated = true;  // BUG-159: an explicit send opens a user-awaited turn
@@ -2071,10 +2209,25 @@ export class AgentSession {
     // busy-guard, which the race defeats).
     this.#interruptRequested = false;
     this.pushRunningSnapshot(true);  // BUG-034: the turn started — say so now
-    this.#runtime.send(text);
+    this.#runtime.send(text, content ?? undefined);
+    textB.delivered(); // BUG-257 r3 — only now is the answer briefing delivered
     // Covers user turns AND the autonomous nudge (which routes through here).
-    this.#recorder?.recordUserPrompt(text);
+    this.#recorder?.recordUserPrompt(text, attachments);
     return { delivered: true, queued: false };
+  }
+
+  /**
+   * FEAT-177 — resolve a message's attachments to the provider content-block
+   * array, or `null` when there are none (so the turn keeps the byte-for-byte
+   * bare-string path). Throws `AttachmentUnsupportedError` if the engine cannot
+   * receive an image/PDF — the single refusal point, never a silent drop.
+   */
+  #attachmentContent(text: string, attachments?: AttachmentRef[]): Array<Record<string, unknown>> | null {
+    if (!attachments || attachments.length === 0) return null;
+    return contentBlocksFor(text, attachments, {
+      imageAttachments: this.#runtime.capabilities.imageAttachments,
+      providerLabel: this.#runtime.capabilities.imageAttachments ? 'this provider' : 'codex',
+    });
   }
 
   async interrupt(): Promise<void> {
@@ -2151,6 +2304,18 @@ export class AgentSession {
       try {
         this.send(AUTONOMOUS_NUDGE);
       } catch (err) {
+        // FEAT-175: a container rebuild hold is a pause, not an error — the nudge waits for it to clear.
+        if ((err as { code?: string }).code === 'rebuild-hold') {
+          this.#autoTurnsDone -= 1;
+          const retry = () => {
+            if (!this.autonomous || this.closed || this.budgetStopped) return;
+            if (this.busy || turnHoldOf(this.project)) { setTimeout(retry, 2000).unref?.(); return; }
+            try { this.#autoTurnsDone += 1; this.send(AUTONOMOUS_NUDGE); }
+            catch (e2) { this.stopAutonomous('error'); this.#emit({ t: 'error', message: `autonomous stopped: ${(e2 as Error).message}`, fatal: false }); }
+          };
+          setTimeout(retry, 2000).unref?.();
+          return;
+        }
         this.stopAutonomous('error');
         this.#emit({ t: 'error', message: `autonomous stopped: ${(err as Error).message}`, fatal: false });
       }
@@ -2269,6 +2434,7 @@ export class AgentSession {
    */
   answerQuestion(requestId: string, answers: QuestionAnswer[] | undefined): { matched: boolean; answered: boolean } {
     const p = this.#approvals.get(requestId);
+    if (!p) this.#noteLateAnswer(requestId, 'question', (answers ?? []).length ? 'answered' : 'passed');
     if (!p || p.kind !== 'question') return { matched: false, answered: false };
     this.#approvals.delete(requestId);
 
@@ -2298,6 +2464,7 @@ export class AgentSession {
   /** Approve or reject a pending `plan-request`. Matched by id, as above. */
   answerPlan(requestId: string, approved: boolean, message?: string): boolean {
     const p = this.#approvals.get(requestId);
+    if (!p) this.#noteLateAnswer(requestId, 'plan', approved ? 'approved' : 'denied');
     if (!p || p.kind !== 'plan') return false;
     this.#approvals.delete(requestId);
     p.resolve(
@@ -2317,6 +2484,7 @@ export class AgentSession {
 
   answerApproval(requestId: string, allow: boolean, message?: string): boolean {
     const p = this.#approvals.get(requestId);
+    if (!p) this.#noteLateAnswer(requestId, 'approval', allow ? 'approved' : 'denied');
     // A decision card must not be settleable through the generic approval
     // channel: "Allow" on a question sends no answer at all.
     if (!p || p.kind !== 'approval') return false;
@@ -2873,6 +3041,53 @@ export class AgentSession {
     this.#rebuildBackgroundLevel();
   }
 
+  /**
+   * FEAT-176 — a lane ended: snapshot the files it wrote, so a later foreign write
+   * cannot erase them silently. This is STREAM BOOKKEEPING, not a hook: nothing the
+   * CLI waits on (a stop, a permission decision) runs it. The spawn is deferred off
+   * this frame's tick, detached and never awaited; every failure is a warning only.
+   * Deduped per task for a few seconds (two terminal frames for one end), while a
+   * revived task that ends again later gets a fresh snapshot.
+   */
+  #laneSnapshotAt = new Map<string, number>();
+  #laneEnded(lanes: Array<{ taskId: string; status: string; a?: LiveAgent; optional?: boolean }>): void {
+    try {
+      const now = Date.now();
+      const picked = lanes.filter(({ taskId, a }) => {
+        if (!taskId || (a && a.kind === 'tool')) return false;
+        const last = this.#laneSnapshotAt.get(taskId);
+        if (last && now - last < 5000) return false;
+        this.#laneSnapshotAt.set(taskId, now);
+        return true;
+      });
+      if (!picked.length) return;
+      if (this.#laneSnapshotAt.size > 2000) for (const [k, t] of this.#laneSnapshotAt) if (now - t > 60_000) this.#laneSnapshotAt.delete(k);
+      const sid = this.sdkSessionId;
+      const top = this.project.hostPath;
+      const dir = sid && /^[A-Za-z0-9._-]+$/.test(sid) ? path.join(transcriptStoreRoot(), this.storeEncodedDir, sid, 'subagents') : null;
+      const spec = {
+        v: 1 as const,
+        top,
+        aliases: this.cwd && this.cwd !== top ? [{ from: this.cwd, to: top }] : [],
+        stationSession: this.id,
+        sdkSession: sid,
+        lanes: picked.map(({ taskId, status, a, optional }) => ({
+          laneId: taskId,
+          source: 'claude-subagent',
+          transcripts: dir && /^[A-Za-z0-9_-]+$/.test(taskId) ? [path.join(dir, `agent-${taskId}.jsonl`)] : [],
+          ticket: a?.ticket ?? [],
+          status,
+          startedAt: a?.startedAt ?? null,
+          endedAt: now,
+          ...(optional ? { optional: true } : {}),
+        })),
+      };
+      setImmediate(() => { spawnLaneSnapshot(spec); });
+    } catch (e) {
+      try { console.warn(`[orchard] lane snapshot skipped (FEAT-176, ignored): ${(e as Error).message}`); } catch { /* never throw from bookkeeping */ }
+    }
+  }
+
   #recordAgentEnd(a: LiveAgent, status: 'completed' | 'failed' | 'killed'): void {
     if (status === 'completed') return;
     // BUG-041: lastProviderError only ever holds TERMINAL causes now; an
@@ -2914,6 +3129,9 @@ export class AgentSession {
    * Never `completed`: nothing here proves anything finished.
    */
   #recordSessionEnd(reason: string): void {
+    // FEAT-176: snapshot every still-running lane BEFORE the record guards below
+    // (an adopted or suppressed session returns early there), in ONE child.
+    this.#laneEnded([...this.#agents.values()].filter((a) => a.status === 'running').map((a) => ({ taskId: a.agentId, status: 'session-end', a })));
     // BUG-187 B3: a failed adoption tears down only this server's transport; the
     // CLI and its lanes keep running behind the broker — nothing here died.
     if (this.#suppressEndRecord || this.#adoptState === 'pending' || this.#adoptState === 'failed') return;
@@ -3389,23 +3607,31 @@ export class AgentSession {
    *    caller must NOT invite an automatic resend (the client judges it against
    *    the transcript, BUG-129's reconciliation).
    */
-  async sendGated(prompt: string): Promise<
+  async sendGated(prompt: string, attachments?: AttachmentRef[]): Promise<
     | { outcome: 'delivered' }
     | { outcome: 'refused'; message: string; drain: AdoptDrainPayload | undefined }
     | { outcome: 'uncertain'; message: string }
   > {
     if (this.closed) return { outcome: 'refused', message: 'session is closed', drain: undefined };
+    { const hold = turnHoldOf(this.project); if (hold) return { outcome: 'refused', message: hold.message, drain: undefined }; } // FEAT-175
     const gate = this.sendGate();
     if (!gate.ok) return { outcome: 'refused', message: gate.message, drain: gate.drain };
     if (!this.adoptGated) {
       // Not gated (e.g. the adoption settled `adopted` since the caller checked): the ordinary path.
-      try { this.send(prompt); } catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
+      try { this.send(prompt, attachments); } catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
       return { outcome: 'delivered' };
     }
     const handle = this.#survivalHandle;
     if (!handle) return { outcome: 'refused', message: 'this session has no broker to deliver into', drain: undefined };
-    const text = this.#withBriefing(prompt);
-    const r = await handle.broker.deliver({ role: 'user', content: [{ type: 'text', text }] }, GATED_DELIVER_ACK_MS);
+    const textB = this.#withBriefing(prompt);
+    const text = textB.text;
+    // FEAT-177: build content blocks (image/document/inlined-file). Throws loudly
+    // for an engine that cannot take an image — caught below and returned as a refusal.
+    let content: Array<Record<string, unknown>>;
+    try {
+      content = this.#attachmentContent(text, attachments) ?? [{ type: 'text', text }];
+    } catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
+    const r = await handle.broker.deliver({ role: 'user', content }, GATED_DELIVER_ACK_MS);
     if (r && !r.accepted) {
       const g = this.sendGate();
       return {
@@ -3421,6 +3647,7 @@ export class AgentSession {
       };
     }
     // Accepted: the CLI has the frame. Open the turn exactly as send() does.
+    textB.delivered(); // BUG-257 r3 — accepted; an uncertain/refused delivery leaves answers unseen
     this.busy = true;
     this.turnStartedAt = Date.now();
     this.#turnUserInitiated = true;
@@ -3429,7 +3656,7 @@ export class AgentSession {
     this.#advisoryNotice = null;
     this.#interruptRequested = false;
     this.pushRunningSnapshot(true);
-    this.#recorder?.recordUserPrompt(text);
+    this.#recorder?.recordUserPrompt(text, attachments);
     return { outcome: 'delivered' };
   }
 
@@ -3474,7 +3701,21 @@ export class AgentSession {
     if (this.#memTimer) { clearInterval(this.#memTimer); this.#memTimer = null; }
   }
 
-  async close(reason = 'closed'): Promise<void> {
+  /**
+   * BUG-255 r3 — a close() that THREW after it had begun tearing down (`closed` is set) can leave
+   * the CLI running with no bridge to serve it. Finish the part that stops the process, idempotently
+   * and without awaiting the pump (a half-dead stream may never settle): end the runtime (stdin EOF)
+   * and reap the survival broker. Never used on an intact session — that one keeps serving.
+   */
+  reapAfterFailedClose(): void {
+    if (!this.closed) return;
+    sessions.delete(this.id);
+    try { this.#runtime.close(); } catch { /* already ended */ }
+    if (this.#survivalHandle) { try { this.#survivalHandle.reap(); } catch { /* broker already gone */ } }
+    notifyAccountLaunch(this.sdkSessionId ?? this.resumeOf ?? null);
+  }
+
+  async close(reason = 'closed', opts: { resumable?: boolean } = {}): Promise<void> {
     if (this.closed) return;
     /*
      * FEAT-057 — RECORD BEFORE TEARING DOWN. This is the choke point every
@@ -3486,11 +3727,20 @@ export class AgentSession {
      */
     this.#recordSessionEnd(`the session ended while work was in flight (${reason})`);
     this.closed = true;
+    // BUG-253: closed before `system:init` — the first message's record must not stay "sending" in silence.
+    if (this.#firstPromptHooks) {
+      const h = this.#firstPromptHooks;
+      this.#firstPromptHooks = null;
+      try { h.onEndBeforeInit(reason); } catch (err) { console.error(`[orchard] BUG-253: first-message record (close) failed: ${(err as Error).message}`); }
+    }
     this.busy = false;
     this.turnStartedAt = null; // BUG-033: a cleared busy clears its clock
     // Released here, not only at shutdown: the map used to retain every session
     // ever started for the life of the process.
     sessions.delete(this.id);
+    // BUG-255 r2 — the launch is gone: the declared account fact for this session
+    // changes (no running launch any more), so its owner re-publishes it.
+    notifyAccountLaunch(this.sdkSessionId ?? this.resumeOf ?? null);
     // ARCH-022: the session is gone from the map, but its exec may still be draining a tool call — the
     // lease keeps the container protected until the authority proves none of its processes remain.
     if (this.#execId) drainLease(this.#execId);
@@ -3560,7 +3810,7 @@ export class AgentSession {
       };
       setTimeout(() => attemptReap(0), 15_000).unref();
     }
-    this.#emit({ t: 'session-closed', reason });
+    this.#emit({ t: 'session-closed', reason, ...(opts.resumable ? { resumable: true } : {}) });
   }
 
   /**
@@ -4127,6 +4377,29 @@ export class AgentSession {
    * `m.tools`). Nothing is re-derived. Best-effort — recordSessionConfig swallows
    * every error, so a config-record failure can never break a session start.
    */
+  /**
+   * BUG-255 r4 — a NEW session id (a fresh session or a fork) takes the binding it
+   * launched under, once, so a stopped new session's declared `next` (and its next
+   * resume) is the account it ran on. Only when no binding exists for the id yet (a
+   * repeated init, or a binding already written by a switch, never overwrites). A
+   * failed write is said, loudly and non-fatally: the session keeps running on its
+   * launch account, and its next resume uses the project account — which is exactly
+   * what the server then declares as `next`, so the indicator stays truthful.
+   * HONEST LIMIT: a crash between the spawn and this init leaves the id unbound (no
+   * id existed to key the binding by); its resume then runs on — and the indicator
+   * shows — the project account.
+   */
+  #persistLaunchBinding(sid: string): void {
+    const lb = this.#launchBinding;
+    if (!lb) return;
+    this.#launchBinding = null; // once
+    if (sid === this.resumeOf || getSessionAccount(sid) !== undefined) return;
+    try { setSessionAccount(sid, lb.account); }
+    catch (err) {
+      this.#emit({ t: 'error', fatal: false, message: `Orchard could not record this session's Claude account (${(err as Error).message}); it runs on it now, but its next resume uses the project's account` });
+    }
+  }
+
   #recordConfig(init: Record<string, unknown>): void {
     if (!this.sdkSessionId) return;
     const sources: SessionConfigSource[] = this.composed.sources.map((s) => ({
@@ -4348,6 +4621,8 @@ export class AgentSession {
           this.#expiredAgents.add(agentId!);
           const lane = this.#laneLabel(agentId);
           const what = inputSummary(toolName, input);
+          if (this.#refusedCards.size >= 500) this.#refusedCards.delete(this.#refusedCards.keys().next().value!);
+          this.#refusedCards.set(requestId, { kind, agentId: agentId ?? null, toolName, what, lane, raisedAt, refusedAt: Date.now(), deadlineMs: dl.deadlineMs });
           recordIncident({
             kind: 'permission-expired',
             projectId: this.project?.id ?? null,
@@ -4373,6 +4648,41 @@ export class AgentSession {
 
       this.#emit(event);
     });
+  }
+
+  /**
+   * 2026-10-13 — the user answered a card the deadline had ALREADY refused.
+   * Nothing is applied (the tool call is long settled); the moment is recorded
+   * once as a `late-answer` incident so the deadline default is judged on data.
+   * Returns true when `requestId` was such a card.
+   */
+  #noteLateAnswer(requestId: string, kind: PendingKind, answer: 'approved' | 'denied' | 'answered' | 'passed'): boolean {
+    const c = this.#refusedCards.get(requestId);
+    if (!c || c.kind !== kind) return false;
+    this.#refusedCards.delete(requestId);
+    const now = Date.now();
+    const lateByMs = now - c.refusedAt;
+    recordIncident({
+      kind: 'late-answer',
+      projectId: this.project?.id ?? null,
+      sessionId: this.id,
+      agentId: c.agentId,
+      lane: c.lane,
+      tool: c.toolName,
+      requestId,
+      answer,
+      lateByMs,
+      waitedMs: now - c.raisedAt,
+      deadlineMs: c.deadlineMs,
+      summary: `${c.lane}: you ${answer === 'passed' ? 'passed on' : answer} ${c.what} ${fmtMinutes(lateByMs)} after Orchard had already refused it for no answer`,
+    });
+    return true;
+  }
+
+  /** True when `requestId` is a `kind` card the deadline already refused (and no answer has been recorded yet) —
+   *  the same match #noteLateAnswer records on, so the ack never claims a record that was not made. */
+  wasRefusedForNoAnswer(requestId: string, kind: PendingKind): boolean {
+    return this.#refusedCards.get(requestId)?.kind === kind;
   }
 
   /** BUG-239 — a human-readable lane name for a card / incident. */
@@ -5207,6 +5517,13 @@ export class AgentSession {
         // fuse cannot fire mid-turn.
         this.#markForegroundTurnLive();
         this.sdkSessionId = String(m.session_id);
+        this.#persistLaunchBinding(this.sdkSessionId); // BUG-255 r4 — before the start is settled
+        // BUG-253: the session the first message started has an id — the record settles as delivered, once.
+        if (this.#firstPromptHooks) {
+          const h = this.#firstPromptHooks;
+          this.#firstPromptHooks = null;
+          try { h.onInit(this.sdkSessionId); } catch (err) { console.error(`[orchard] BUG-253: first-message record (init) failed: ${(err as Error).message}`); }
+        }
         this.cwd = String(m.cwd ?? this.cwd);
         // Declare who started this session, write-once, now that the engine's
         // session id exists (session-provenance.mjs). Default 'user' keeps a row
@@ -5240,17 +5557,31 @@ export class AgentSession {
           t: 'session-init',
           sessionId: this.sdkSessionId,
           cwd: this.cwd,
+          // BUG-252 — the host store dir this session's transcript lands in, as
+          // its OWNER declares it (FEAT-155). A container session's store is
+          // `-workspace-<id>`, not the project's encoded host path; the tab writes
+          // this into its URL, so a reload must find the session where it lives.
+          encodedDir: this.storeEncodedDir,
           model: String(m.model ?? 'unknown'),
           tools: Array.isArray(m.tools) ? m.tools : [],
           permissionMode: m.permissionMode,
           // BUG-196 — the engine this session dispatches on, so a new session made
           // real by its first turn locks its provider surfaces immediately.
           lockedProvider: String(this.effective.provider ?? 'anthropic'),
+          // BUG-255 — the Claude account this launch ACTUALLY runs under (the
+          // server-owned launch fact, after the FEAT-160 binding override above
+          // was applied). The client renders the indicator from this, never from
+          // its own override chain, so it cannot show an account the CLI is not on
+          // (ARCH-010). `null` = the implicit default account; a string = a minted
+          // account id. Anthropic only — a non-Claude engine carries no account.
+          account: this.effective.provider === 'openai' ? undefined : (this.effective.claudeAccount ?? null),
           // What THIS session's CLI says it answers to — powers the composer's
           // "/" autocomplete. Typed as a prompt, the CLI executes them itself.
           slashCommands: Array.isArray(m.slash_commands) ? m.slash_commands.map(String) : [],
         });
         rememberSlashCommands(Array.isArray(m.slash_commands) ? m.slash_commands.map(String) : []);
+        // BUG-255 r2 — a launch now holds this session id: re-publish its account fact.
+        notifyAccountLaunch(this.sdkSessionId);
         return;
 
       case 'task_started': {
@@ -5426,6 +5757,8 @@ export class AgentSession {
          * exists.
          */
         const a = this.#agents.get(String(m.task_id));
+        // FEAT-176: every terminal frame, settling or not, row or no row (adopted session).
+        if (status === 'completed' || status === 'failed' || status === 'killed') this.#laneEnded([{ taskId: String(m.task_id), status, a, optional: !a }]);
         // BUG-105 (4th clean-room verdict): the row's state at THIS instant is what
         // the one settle-predicate is asked about — `'absent'` when there is no row.
         let settles = false;
@@ -5483,6 +5816,8 @@ export class AgentSession {
             : (s === 'failed' || s === 'error') ? 'failed' as const
               : (s === 'stopped' || s === 'killed') ? 'killed' as const
                 : null;
+        // FEAT-176: a terminal notification ends a lane too (row or no row).
+        if (terminal) this.#laneEnded([{ taskId: String(m.task_id), status: terminal, a, optional: !a }]);
         // BUG-105 — the engine's own word that this task is over, taken from the
         // FRAME (see `task_updated` above: a level-listed task with no row here is
         // precisely where a lingering entry has nothing else to correct it).
@@ -5681,6 +6016,19 @@ export function resumeDirCandidates(
 }
 
 export async function startSession(opts: StartOptions): Promise<AgentSession> {
+  /*
+   * BUG-255 r4 — STRUCTURAL TRIPWIRE. The account a launch uses is decided ONLY by
+   * launch-account.ts `effectiveLaunchAccount` (in the constructor). A caller that hands
+   * a spawn its own account via `overrides.claudeAccount` is a second decider — refused,
+   * loudly, before anything runs. Callers strip the client's pick with `takeAccountPick`
+   * and pass a NEW session's pick as `initialBinding`.
+   */
+  if (opts.overrides && 'claudeAccount' in opts.overrides) {
+    throw new Error('BUG-255: overrides.claudeAccount must not reach a spawn — the launch account is decided only by effectiveLaunchAccount (pass a new session\'s pick as initialBinding)');
+  }
+  if (opts.initialBinding && opts.resumeSessionId) {
+    throw new Error('BUG-255: initialBinding is only for a NEW session — an existing session\'s account is its binding or its project\'s');
+  }
   // ARCH-022: a container session's exec tag exists before its admission, so the lease it is granted
   // covers the exec from the moment it can be submitted. A start that fails after admission drains it:
   // protection ends only once the authority proves none of its processes run (the constructor may have
@@ -5871,6 +6219,30 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
 
   const dispatchUnavailableReason = await prepareDispatchForSession(opts);
 
+  if (iso === 'container' && (turnHoldSource || admissionGateFn)) {
+    /*
+     * FEAT-175 — the START chokepoint of the git-grant container rebuild. A RESUME (it carries the user's
+     * typed message) is refused retryably, so the client / outbox keeps it in the durable outbox journal and
+     * delivers it after the rebuild. A NEW session waits here, before admission (no lease, nothing run),
+     * showing why; it is dropped before admission if its caller went away, and refused if the rebuild failed
+     * with the container gone (the text goes back to the composer).
+     */
+    const hold = turnHoldOf(opts.project);
+    if (hold && opts.resumeSessionId && !opts.fork) {
+      opts.onEvent({ t: 'error', message: hold.message, fatal: false, retryable: true, code: 'rebuild-hold' });
+      throw rebuildHoldError(hold.message);
+    }
+    if (admissionGateFn) {
+      try {
+        await admissionGateFn(opts.project.id, (s) => opts.onEvent({ t: 'status', status: s.slice(0, 300) }), opts.abandoned ?? (() => false));
+      } catch (err) {
+        const msg = (err as Error).message;
+        opts.onEvent({ t: 'error', message: msg, fatal: true });
+        throw err;
+      }
+    }
+  }
+  let launchProjectSnapshot: Project | undefined;
   if (iso === 'container') {
     /*
      * ARCH-022 — ADMISSION. Services (FEAT-112: before the container, so the network exists to join), the
@@ -5882,11 +6254,14 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
      */
     try {
       const pid = opts.project.id;
-      await admitContainer(opts.project, opts.execTag!, {
+      const admitted = await admitContainer(opts.project, opts.execTag!, {
         onLog: (s) => opts.onEvent({ t: 'status', status: s.trim().slice(0, 300) }),
         // A registered project is re-read under the slot: deleted meanwhile = refused, never re-created (F6).
         current: getProject(pid) ? () => getProject(pid) : undefined,
       });
+      // BUG-255 r4 — the launch account is decided against the project snapshot admission bound the
+      // container's credentials from, so the declared launch account IS the container's account.
+      if (admitted.admittedProject) launchProjectSnapshot = admitted.admittedProject;
     } catch (err) {
       const e = err as Error;
       /*
@@ -6031,7 +6406,7 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
 
   let s: AgentSession;
   try {
-    s = new AgentSession(id, { ...opts, forkPlan, dispatchUnavailableReason, browserUnavailableReason });
+    s = new AgentSession(id, { ...opts, ...(launchProjectSnapshot ? { launchProject: launchProjectSnapshot } : {}), forkPlan, dispatchUnavailableReason, browserUnavailableReason });
   } catch (err) {
     discardStaged(forkPlan?.stagedFile ?? null);
     // BUG-217 round 5: the constructor spawns the CLI with the first prompt, so a
@@ -6045,6 +6420,7 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
   s.startSnapshotError = snap.status === 'failed' ? snap.reason : null;
   sessions.set(id, s);
   if (opts.execTag) attachLease(opts.execTag, id); // ARCH-022: the lease now belongs to a registered session
+  notifyAccountLaunch(s.resumeOf); // BUG-255 r2 — a resume holds its session id (and account) from construction
   return s;
 }
 
@@ -6066,7 +6442,21 @@ export function adoptSession(
   if (existing && !existing.closed) throw new Error(`a live session ${id} already exists in this server`);
   const s = new AgentSession(id, { project, firstPrompt: '', onEvent, adopt: { st, ...facade } });
   sessions.set(id, s);
+  notifyAccountLaunch(s.sdkSessionId ?? s.resumeOf); // BUG-255 r2
   return s;
+}
+
+/**
+ * BUG-255 r2 — the account fact's owner (index.ts) is told whenever a launch
+ * starts holding, or stops holding, an SDK session id, so it can push the
+ * session's account fact to every tab. A setter, not an import, because
+ * index.ts imports this module.
+ */
+let accountLaunchNotifier: ((sid: string) => void) | null = null;
+export function setAccountLaunchNotifier(fn: ((sid: string) => void) | null): void { accountLaunchNotifier = fn; }
+function notifyAccountLaunch(sid: string | null | undefined): void {
+  if (!sid || !accountLaunchNotifier) return;
+  try { accountLaunchNotifier(sid); } catch (err) { console.error(`[orchard] BUG-255: account launch notifier failed: ${(err as Error).message}`); }
 }
 
 export function getSession(id: string): AgentSession | undefined {

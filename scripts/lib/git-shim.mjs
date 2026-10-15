@@ -85,8 +85,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { offenderForGit, gitWriteBlockEnabled } from './git-write-policy.mjs';
-// FEAT-170 shadow-repo pilot — a lane's OWN shadow repo, decided from the repo git resolves.
-import { shadowDecision, defaultShadowRoot, prepareShadowRoot } from './shadow-guard.mjs';
+import { resolveWriteTarget } from './git-target.mjs';
 
 /**
  * Plumbing verbs the sanctioned temp-index snapshot uses. These are NOT in the
@@ -139,7 +138,7 @@ function isTempIndex(env) {
  *   - sanctioned plumbing under a temp index → allow.
  *   - anything else    → DENY (deny-by-default).
  */
-export function decideGitShim(argv, env = process.env, { ignoreEnvHatch = false, realGit = null, shadowRoot = null } = {}) {
+export function decideGitShim(argv, env = process.env, { ignoreEnvHatch = false } = {}) {
   // BUG-173 round 3 — the INSTALLED shim passes `ignoreEnvHatch: true`. The
   // launch-time hatch ORCHARD_ALLOW_GIT_WRITE is a HOST-side control: the runtime
   // installs the shim ONLY when the host block is ON (gitWriteBlockEnabled() over
@@ -154,15 +153,6 @@ export function decideGitShim(argv, env = process.env, { ignoreEnvHatch = false,
   const sub = offender.startsWith('git ') ? offender.slice(4) : offender;
   if (SANCTIONED_PLUMBING.has(sub) && isTempIndex(env)) {
     return { allow: true, sanctioned: true };
-  }
-  // FEAT-170 shadow-repo pilot — a write whose RESOLVED repo (asked of the real git,
-  // with this invocation's own options and env) is an agent lane repo under the baked
-  // shadow root is the agent's own space. `exec` pins the resolved locations so the
-  // write cannot be redirected after this check (shadow-guard.mjs). Anything else —
-  // including a resolution failure — falls through to the unchanged path below.
-  if (shadowRoot && realGit) {
-    const s = shadowDecision(argv, env, { realGit, shadowRoot });
-    if (s.allow) return { allow: true, sanctioned: true, shadow: true, exec: s.exec };
   }
   // Deny-by-default LOCALLY. `consultHost` says a runtime grant COULD lift this —
   // the async resolver asks the host authority (BUG-173). Callers that cannot do
@@ -191,7 +181,7 @@ export const HOST_GRANT_TIMEOUT_MS = 15000;
  * the SAME `evaluateGitWrite` the FEAT-108 hook runs, so there is ONE grant
  * authority (ARCH-010) and the two layers cannot disagree.
  */
-export async function askHostGrant(argv, env = process.env, { fetchImpl = globalThis.fetch, timeoutMs = HOST_GRANT_TIMEOUT_MS, hostUrl, grantKey, shimAuth, windowKey, shimBootId } = {}) {
+export async function askHostGrant(argv, env = process.env, { fetchImpl = globalThis.fetch, timeoutMs = HOST_GRANT_TIMEOUT_MS, hostUrl, grantKey, shimAuth, windowKey, shimBootId, target = null } = {}) {
   // BUG-173 round 3 — the host coordinates come from the shim's BAKED source
   // (passed in via opts), NOT from agent-writable env vars. An agent can no longer
   // redirect the shim to a look-alike host by exporting ORCHARD_GIT_SHIM_HOST. The
@@ -210,7 +200,10 @@ export async function askHostGrant(argv, env = process.env, { fetchImpl = global
       // baked by a previous server boot, before this session's adoption re-bake
       // fired) from a genuinely foreign caller, and name the cause. It is NOT part
       // of the auth decision (the secret is), only of the refusal message.
-      body: JSON.stringify({ grantKey, argv, sessionLabel: env.ORCHARD_SESSION ?? null, shimAuth, ...(windowKey ? { windowKey } : {}), ...(shimBootId ? { shimBootId } : {}) }),
+      // FEAT-164 — `target`: what this write is aimed at, resolved by the REAL git with the
+      // invocation's own globals/env (git-target resolveWriteTarget), for the host's
+      // real-repo guard (release mode; push judged by destination).
+      body: JSON.stringify({ grantKey, argv, sessionLabel: env.ORCHARD_SESSION ?? null, shimAuth, ...(windowKey ? { windowKey } : {}), ...(shimBootId ? { shimBootId } : {}), ...(target ? { target } : {}) }),
       signal: controller.signal,
     });
     if (!res || res.status !== 200) return { allow: false };
@@ -225,9 +218,21 @@ export async function askHostGrant(argv, env = process.env, { fetchImpl = global
         allow: true, granted: true,
         recordId: typeof body.recordId === 'string' ? body.recordId : null,
         confirmToken: typeof body.confirmToken === 'string' ? body.confirmToken : null,
+        // FEAT-164 r2 — the record's project (the write's TARGET), for the confirm binding.
+        projectKey: typeof body.projectKey === 'string' ? body.projectKey : null,
       };
     }
-    return { allow: false, reason: typeof body?.reason === 'string' ? body.reason : undefined };
+    // BUG-261 — the host classifies the refusal with a TYPED `refusalKind`
+    // ('gate-failed' | 'ungranted' | 'policy' | 'error'). The shim renders by that
+    // type instead of sniffing the reason's prefix, so a granted-but-gate-failed
+    // refusal is no longer mistaken for an ungranted one and swallowed by the
+    // generic `gitShimRefusal`. Absent (an old host, or a fail-closed deny with no
+    // body) → null, and the shim falls back to the generic refusal.
+    return {
+      allow: false,
+      reason: typeof body?.reason === 'string' ? body.reason : undefined,
+      refusalKind: typeof body?.refusalKind === 'string' ? body.refusalKind : null,
+    };
   } catch {
     return { allow: false }; // fail closed on abort/network/parse
   } finally {
@@ -272,11 +277,19 @@ export async function confirmHostExec(recordId, status, { fetchImpl = globalThis
 export async function resolveGitShim(argv, env = process.env, opts = {}) {
   // The installed shim ignores the child-forgeable env hatch (BUG-173 round 3);
   // callers may override with ignoreEnvHatch:false to test the pure classifier.
-  const local = decideGitShim(argv, env, { ignoreEnvHatch: opts.ignoreEnvHatch !== false, realGit: opts.realGit ?? null, shadowRoot: opts.shadowRoot ?? null });
+  const local = decideGitShim(argv, env, { ignoreEnvHatch: opts.ignoreEnvHatch !== false });
   if (local.allow || !local.consultHost) return local;
-  const host = await askHostGrant(argv, env, opts);
-  if (host.allow) return { allow: true, granted: true, recordId: host.recordId ?? null, confirmToken: host.confirmToken ?? null };
-  return { allow: false, reason: host.reason ?? local.reason };
+  // FEAT-164 — resolve what the write is aimed at (real binary, invocation's own globals/env)
+  // so the host can apply the real-repo guard. Best-effort: a failure sends a null target,
+  // which the host treats by its own fail-closed rule.
+  let target = null;
+  if (opts.realGit) { try { target = resolveWriteTarget(argv, env, { realGit: opts.realGit }); } catch { target = null; } }
+  const host = await askHostGrant(argv, env, { ...opts, target });
+  if (host.allow) return { allow: true, granted: true, recordId: host.recordId ?? null, confirmToken: host.confirmToken ?? null, projectKey: host.projectKey ?? null };
+  // BUG-261 — carry the host's TYPED refusalKind and the classified OFFENDER (local.reason
+  // is the short `git <sub>` token, not a message) so runGitShim can render the right text
+  // and pass the real offender — not the whole reason — to the generic fallback.
+  return { allow: false, reason: host.reason ?? local.reason, refusalKind: host.refusalKind ?? null, offender: local.reason };
 }
 
 /** The loud refusal a shimmed subprocess prints before exiting non-zero. */
@@ -318,7 +331,7 @@ function resolveRealGit(env) {
 /** Absolute path to THIS module, baked into the generated shim's import. */
 const SELF = fileURLToPath(import.meta.url);
 
-function shimSource(realGit, { hostUrl, grantKey, shimAuth, windowKey, shimBootId, shadowRoot } = {}) {
+function shimSource(realGit, { hostUrl, grantKey, shimAuth, windowKey, shimBootId } = {}) {
   // A tiny node executable named `git`. It defers all logic to runGitShim so the
   // decision stays in ONE place (this module). realGit is an ABSOLUTE path, so
   // the allowed path execs the true binary and never re-enters the shim.
@@ -340,7 +353,7 @@ function shimSource(realGit, { hostUrl, grantKey, shimAuth, windowKey, shimBootI
   return [
     '#!/usr/bin/env node',
     `import(${JSON.stringify(SELF)})`,
-    `  .then((m) => m.runGitShim(process.argv.slice(2), ${JSON.stringify({ realGit, hostUrl, grantKey, shimAuth: auth, ...(windowKey ? { windowKey } : {}), ...(bootId ? { shimBootId: bootId } : {}), ...(shadowRoot ? { shadowRoot } : {}) })}))`,
+    `  .then((m) => m.runGitShim(process.argv.slice(2), ${JSON.stringify({ realGit, hostUrl, grantKey, shimAuth: auth, ...(windowKey ? { windowKey } : {}), ...(bootId ? { shimBootId: bootId } : {}) })}))`,
     "  .catch((e) => { process.stderr.write('orchard git-shim: ' + (e && e.message) + '\\n'); process.exit(1); });",
     '',
   ].join('\n');
@@ -388,24 +401,39 @@ function unsafeShimDir(dir) {
  * inheriting stdio and exits with its status; on deny, prints the refusal and
  * exits non-zero WITHOUT touching git.
  */
-export async function runGitShim(argv, { realGit, hostUrl, grantKey, shimAuth, windowKey, shimBootId, shadowRoot } = {}) {
-  const d = await resolveGitShim(argv, process.env, { hostUrl, grantKey, shimAuth, windowKey, shimBootId, realGit, shadowRoot, ignoreEnvHatch: true });
+export async function runGitShim(argv, { realGit, hostUrl, grantKey, shimAuth, windowKey, shimBootId } = {}) {
+  const d = await resolveGitShim(argv, process.env, { hostUrl, grantKey, shimAuth, windowKey, shimBootId, realGit, ignoreEnvHatch: true });
   if (!d.allow) {
-    process.stderr.write(gitShimRefusal(d.reason) + '\n');
+    // BUG-261 — render by the host's TYPED refusalKind, not by sniffing the reason's
+    // prefix. Only the AGENT-FACING refusals ('gate-failed' / 'ungranted' / 'policy')
+    // carry a full `reason` whose decisive line leads AND ends — print those VERBATIM.
+    // Every OTHER deny — the host's own fail-closed 'error' (bad/stale secret, unreadable
+    // body, missing grantKey), an unknown kind, or an unclassified deny (host unreachable
+    // / timeout / malformed body → no refusalKind) — renders the generic FEAT-135 refusal
+    // naming the real offender, so it never silently loses the "this is a git write / leave
+    // it unstaged" guidance and always names `git <sub>`. The host's specific 'error'
+    // reason (e.g. the BUG-242 stale-secret retry hint) is appended as context so the
+    // diagnosis is not lost.
+    const AGENT_FACING = new Set(['gate-failed', 'ungranted', 'policy']);
+    let msg;
+    if (AGENT_FACING.has(d.refusalKind) && typeof d.reason === 'string' && d.reason) {
+      msg = d.reason;
+    } else {
+      msg = gitShimRefusal(d.offender ?? d.reason);
+      if (d.refusalKind === 'error' && typeof d.reason === 'string' && d.reason) msg += `\n\nHost said: ${d.reason}`;
+    }
+    process.stderr.write(msg + '\n');
     process.exit(1);
   }
   const bin = realGit || 'git';
-  // FEAT-170 — a shadow allow execs with the resolved repo PINNED (shadow-guard.mjs).
-  const r = d.exec
-    ? spawnSync(bin, d.exec.argv, { stdio: 'inherit', env: d.exec.env })
-    : spawnSync(bin, argv, { stdio: 'inherit', env: process.env });
+  const r = spawnSync(bin, argv, { stdio: 'inherit', env: process.env });
   // BUG-184 — report the REAL git outcome back to the host ledger. `d.recordId` is
   // present only when the host recorded a decide-time permit (a granted write); a
   // read / sanctioned-plumbing allow has none, so no confirmation is sent. An exec
   // failure is a non-success outcome too (status 127). Best-effort: the git exit
   // status the user sees is unchanged regardless of whether the confirm lands.
   const exit = r.error ? 127 : (r.status == null ? 1 : r.status);
-  if (d.recordId && d.confirmToken) await confirmHostExec(d.recordId, exit, { hostUrl, shimAuth, confirmToken: d.confirmToken, projectKey: grantKey });
+  if (d.recordId && d.confirmToken) await confirmHostExec(d.recordId, exit, { hostUrl, shimAuth, confirmToken: d.confirmToken, projectKey: d.projectKey ?? grantKey });
   if (r.error) { process.stderr.write(`orchard git-shim: exec failed: ${r.error.message}\n`); process.exit(127); }
   process.exit(exit);
 }
@@ -454,11 +482,8 @@ export async function runGitShim(argv, { realGit, hostUrl, grantKey, shimAuth, w
  *   file is not trusted as an input — review #2).
  * @returns {{ env: Record<string,string>, shimDir: string, realGit: string, ensure: () => GitShimEnsure }}
  */
-export function installGitShim(env = process.env, { baseDir, grantKey, hostUrl, sessionLabel, shimAuth, windowKey, shimBootId, reuseDir, shadowRoot: shadowRootOpt } = {}) {
+export function installGitShim(env = process.env, { baseDir, grantKey, hostUrl, sessionLabel, shimAuth, windowKey, shimBootId, reuseDir } = {}) {
   const realGit = resolveRealGit(env);
-  // FEAT-170 — the shadow root is computed HERE, on the host, from the host's env, then
-  // canonicalised and BAKED (never read from the agent's env). `null` turns it off.
-  const shadowRoot = shadowRootOpt === null ? null : prepareShadowRoot(shadowRootOpt ?? defaultShadowRoot(env));
   // BUG-230 — the prior dir is NOT ours: it is only dropped from this env's PATH
   // below, never deleted (see the ownership note above).
   const prior = env.ORCHARD_GIT_SHIM_DIR;
@@ -489,14 +514,14 @@ export function installGitShim(env = process.env, { baseDir, grantKey, hostUrl, 
   // BUG-242 — a thunk so ensure() recomputes the source (= re-reads the current
   // secret/bootId) every call; the baked file always carries this process's live
   // secret. All coords are recomputed here, never read from a reused file.
-  const bakeSource = () => shimSource(realGit, { hostUrl, grantKey, shimAuth, windowKey, shimBootId, shadowRoot });
+  const bakeSource = () => shimSource(realGit, { hostUrl, grantKey, shimAuth, windowKey, shimBootId });
   writeShimFileAtomic(shimPath, bakeSource());
   const existing = (env.PATH ?? '')
     .split(path.delimiter)
     .filter((p) => p && p !== prior && p !== dir);
   const newEnv = { ...env, PATH: [dir, ...existing].join(path.delimiter), ORCHARD_GIT_SHIM_DIR: dir };
   if (sessionLabel && !newEnv.ORCHARD_SESSION) newEnv.ORCHARD_SESSION = sessionLabel;
-  return { env: newEnv, shimDir: dir, realGit, shadowRoot, ensure: () => ensureGitShim(dir, bakeSource) };
+  return { env: newEnv, shimDir: dir, realGit, ensure: () => ensureGitShim(dir, bakeSource) };
 }
 
 /**

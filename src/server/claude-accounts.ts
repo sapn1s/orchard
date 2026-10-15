@@ -83,6 +83,41 @@ export interface AccountHealth {
   error?: string;
 }
 
+/**
+ * The HONEST, live display state of an account (BUG-254). The stored `state`
+ * (`pending`/`ready`) is set ONCE at login time and never re-read, so it shows
+ * "signed in" forever after a credential expires or is revoked. This is the
+ * fact the CLI owns and nobody else may reconstruct (ARCH-010): it comes from a
+ * LIVE `claude auth status --json` probe, and it FAILS AWAY FROM "signed in" —
+ * a probe that cannot report is `unknown`, never `signed-in`.
+ *
+ *  - `signed-in`      — the live probe reported `loggedIn:true`.
+ *  - `needs-relogin`  — the probe reported a CLEAN `loggedIn:false` (expired /
+ *                       revoked / credential gone). Re-login in place fixes it.
+ *  - `unknown`        — the probe could not report (timeout, missing binary,
+ *                       non-JSON). We do NOT claim signed-in on a failed read.
+ *  - `setup-pending`  — a freshly-added account whose first login never
+ *                       completed (`state:'pending'`); distinct from a lapsed
+ *                       credential so the UI can say "finish signing in".
+ */
+export type AccountHealthState = 'signed-in' | 'needs-relogin' | 'unknown' | 'setup-pending';
+
+export interface AccountHealthView {
+  state: AccountHealthState;
+  subscriptionType: string | null;
+  checkedAt: number;
+  /** Plain-words detail for `unknown` (never the credential contents). */
+  error?: string;
+}
+
+/** An account row plus its LIVE health — the shape the API/drawer reads (BUG-254).
+ *  `health` is ABSENT for the default account: `~/.claude` is the machine's own
+ *  working credential, re-authenticated with the plain `claude` CLI, and probing
+ *  it would shell `claude auth status` against the user's REAL store (which the
+ *  CLI mutates — it rewrites `.claude.json`). The drawer shows its static
+ *  descriptive text instead. Only named overlay accounts carry a live probe. */
+export type AccountRowWithHealth = AccountRow & { health?: AccountHealthView };
+
 /** An error carrying an HTTP status so the route can answer honestly. */
 export class AccountError extends Error {
   status: number;
@@ -533,6 +568,7 @@ export function deleteAccount(id: string): { deleted: true; trashed: string | nu
     if (fs.existsSync(derived)) trashed = removeAccountDir(derived);
     rows.splice(idx, 1);
     writeAccounts(rows);
+    invalidateAccountHealth(id);
     return { deleted: true as const, trashed };
   });
 }
@@ -573,6 +609,9 @@ export function markAccountReady(id: string, health: Pick<AccountHealth, 'logged
       },
     };
     writeAccounts(rows);
+    // The credential just changed — a cached "needs-relogin"/"unknown" is now
+    // wrong, so force the next read to re-probe (BUG-254).
+    invalidateAccountHealth(id);
     return rows[idx];
   });
 }
@@ -638,8 +677,12 @@ export function resolveLaunchAccountDir(id: string | null | undefined): string |
  * exit). Bounded by a hard timeout; a timeout, missing binary, or unparseable
  * output degrades to `{ loggedIn: false, error }` — never a throw.
  */
-export async function readAccountHealth(id: string, opts: { timeoutMs?: number } = {}): Promise<AccountHealth> {
-  const dir = resolveAccountDir(id);
+export async function readAccountHealth(id: string, opts: { timeoutMs?: number; configDir?: string } = {}): Promise<AccountHealth> {
+  // BUG-254 r4 — an in-place re-login runs the CLI against a TEMP config dir so it never
+  // atomic-replaces (and so orphans a running container's bind) the account's real credential
+  // file; `configDir` lets the caller probe THAT dir for the confirmed `loggedIn` fact before it
+  // copies the fresh credential in place. Absent = the account's own dir, as before.
+  const dir = opts.configDir ?? resolveAccountDir(id);
   const timeoutMs = opts.timeoutMs ?? AUTH_STATUS_TIMEOUT_MS;
   const bin = process.env.CLAUDE_STATION_CLAUDE_BIN || 'claude';
   const checkedAt = Date.now();
@@ -680,4 +723,80 @@ export async function readAccountHealth(id: string, opts: { timeoutMs?: number }
     configDirectory: typeof obj.configDirectory === 'string' ? obj.configDirectory : null,
     projectsDirectory: typeof obj.projectsDirectory === 'string' ? obj.projectsDirectory : null,
   };
+}
+
+/* ------------------------------------------------- live health for the drawer */
+
+/**
+ * Collapse a live probe (or a not-yet-logged-in row) into the honest display
+ * state (BUG-254). The ordering is the safety property: `error` is checked
+ * BEFORE `loggedIn`, so a probe that failed can never be rendered as signed-in.
+ */
+function healthViewOf(row: Pick<AccountRow, 'state' | 'lastStatus'>, probe: AccountHealth | null): AccountHealthView {
+  // A freshly-added account whose first login never completed. No credential
+  // exists yet, so there is nothing to probe — say "finish signing in", which
+  // is a different thing from a credential that lapsed.
+  if (row.state === 'pending') {
+    return { state: 'setup-pending', subscriptionType: null, checkedAt: Date.now() };
+  }
+  if (!probe) {
+    return { state: 'unknown', subscriptionType: row.lastStatus?.subscriptionType ?? null, checkedAt: Date.now(), error: 'not probed' };
+  }
+  if (probe.error) {
+    // The probe could not report. NEVER claim signed-in on a failed read.
+    return { state: 'unknown', subscriptionType: row.lastStatus?.subscriptionType ?? null, checkedAt: probe.checkedAt, error: probe.error };
+  }
+  if (probe.loggedIn) {
+    return { state: 'signed-in', subscriptionType: probe.subscriptionType ?? row.lastStatus?.subscriptionType ?? null, checkedAt: probe.checkedAt };
+  }
+  // A clean `loggedIn:false` — the credential is gone, expired or revoked.
+  return { state: 'needs-relogin', subscriptionType: row.lastStatus?.subscriptionType ?? null, checkedAt: probe.checkedAt };
+}
+
+/**
+ * A tiny TTL cache over the live probe. The drawer list is read on demand (open
+ * the Accounts pane, or after a login/delete), not on a fast poll, but a burst
+ * of list reads must not spawn a `claude auth status` child per account each
+ * time. The window is deliberately short so the status stays HONEST: a lapsed
+ * credential is noticed within `HEALTH_TTL_MS`, never indefinitely (which was
+ * BUG-254). Invalidated the instant a login changes an account's credential.
+ */
+const HEALTH_TTL_MS = Number(process.env.CLAUDE_STATION_ACCOUNT_HEALTH_TTL_MS ?? 5_000);
+const healthCache = new Map<string, { view: AccountHealthView; at: number }>();
+
+/** Drop the cached health for one account (or all), so the next read re-probes. */
+export function invalidateAccountHealth(id?: string): void {
+  if (id) healthCache.delete(id);
+  else healthCache.clear();
+}
+
+/**
+ * The API/drawer list (BUG-254): every row plus its LIVE health. Default first,
+ * then the stored rows — same order as `listAccounts`. Probes run in PARALLEL
+ * and are each bounded by `readAccountHealth`'s own timeout, so one wedged
+ * account cannot stall the others. A `pending` row is never probed (no
+ * credential yet). The probe never throws — it degrades to `unknown`.
+ */
+export async function listAccountsWithHealth(opts: { ttlMs?: number; force?: boolean } = {}): Promise<AccountRowWithHealth[]> {
+  const rows = listAccounts();
+  const ttl = opts.ttlMs ?? HEALTH_TTL_MS;
+  const now = Date.now();
+  const views = await Promise.all(rows.map(async (row): Promise<AccountHealthView | undefined> => {
+    // The default (~/.claude) is never probed — see AccountRowWithHealth.
+    if (row.id === DEFAULT_ACCOUNT_ID) return undefined;
+    // A freshly-added account has no credential to probe yet.
+    if (row.state === 'pending') return healthViewOf(row, null);
+    const cached = healthCache.get(row.id);
+    if (!opts.force && cached && now - cached.at < ttl) return cached.view;
+    let probe: AccountHealth;
+    try {
+      probe = await readAccountHealth(row.id);
+    } catch (err) {
+      probe = { loggedIn: false, subscriptionType: null, checkedAt: Date.now(), configDirectory: null, projectsDirectory: null, error: (err as Error).message };
+    }
+    const view = healthViewOf(row, probe);
+    healthCache.set(row.id, { view, at: Date.now() });
+    return view;
+  }));
+  return rows.map((row, i) => (views[i] ? { ...row, health: views[i] } : { ...row }));
 }

@@ -76,7 +76,9 @@ const ev = (key, gate = gateOK) => evaluateGitWrite({ command: COMMIT, projectKe
 check('A1 no grant → agent commit DENIED', ev(pA.id).allow === false);
 reg.setGitWritePermanent(pA.id, true, { via: 'dashboard' });
 const rowA = JSON.parse(fs.readFileSync(path.join(DATA_A, 'registry.json'), 'utf8')).projects.find((p) => p.id === pA.id);
-check('A2 permanent grant is stored ONCE, as the project setting', rowA?.settings?.gitWrite?.permanent === true, rowA?.settings?.gitWrite);
+// FEAT-164 (2026-10-11): the declared setting is now the agent git POLICY { commit, push,
+// scope, … }; the r1 route's "permanent" grants commit (keeping note/push), = release mode.
+check('A2 permanent grant is stored ONCE, as the project setting', rowA?.settings?.gitWrite?.commit === true && rowA.settings.gitWrite.permanent === undefined, rowA?.settings?.gitWrite);
 const r3 = ev(pA.id);
 check('A3 permanent grant → agent commit ALLOWED, scope=permanent', r3.allow === true && r3.granted === true && r3.grant?.scope === 'permanent', { allow: r3.allow, scope: r3.grant?.scope });
 check('A4 permanent grant does NOT lift the leak gate (gate FAIL → denied)', (() => { const r = ev(pA.id, gateFAIL); return r.allow === false && r.gateFailed === true; })());
@@ -134,7 +136,15 @@ check('A14 a non-boolean permanent ("yes") grants nothing', ev(pA.id).allow === 
 withSetting(null);
 check('A15 gitWrite:null grants nothing', ev(pA.id).allow === false);
 withSetting({ permanent: true, grantedAt: '2026-10-05T00:00:00.000Z' });
-check('A16 control: a well-formed setting grants', ev(pA.id).allow === true);
+// FEAT-164 option A: a well-formed value hand-written into the registry is exactly the
+// agent's registry-edit self-grant, so it must NOT grant; the control is the same value
+// sealed by the one writer's key (what setGitWritePolicy stores).
+check('A16b option A: a well-formed but UNSEALED (hand-written) setting grants nothing', ev(pA.id).allow === false);
+const sealMod = await import('./lib/git-write-seal.mjs');
+const hpA = JSON.parse(real).projects.find((p) => p.id === pA.id).hostPath;
+const { repoIdentityOf } = await import('./lib/repo-identity.mjs');
+withSetting(sealMod.sealGitWrite(sealMod.ensureSealKey(DATA_A).key, { id: pA.id, hostPath: hpA }, { permanent: true, grantedAt: '2026-10-05T00:00:00.000Z', repo: repoIdentityOf(hpA) }));
+check('A16 control: a well-formed setting sealed by the writer grants', ev(pA.id).allow === true);
 // The registry file is replaced atomically by its writer, but a hand edit or a
 // torn copy is possible; a read of a TRUNCATED file must fail CLOSED, not throw
 // out of the hook and not grant.
@@ -203,7 +213,7 @@ try {
   const perm = await j('POST', gw, { scope: 'permanent' });
   check('B3 permanent grant via the route (scope permanent, no expiry)', perm.status === 200 && perm.d?.grant?.scope === 'permanent' && perm.d.grant.expiresAt === null, perm.d);
   const onDisk = JSON.parse(fs.readFileSync(path.join(DATA_B, 'registry.json'), 'utf8')).projects.find((p) => p.id === pid);
-  check('B4 stored as the declared project setting', onDisk?.settings?.gitWrite?.permanent === true && onDisk.settings.gitWrite.grantedVia === 'dashboard', onDisk?.settings?.gitWrite);
+  check('B4 stored as the declared project setting', onDisk?.settings?.gitWrite?.commit === true && onDisk.settings.gitWrite.grantedVia === 'dashboard', onDisk?.settings?.gitWrite);
   const patch = await j('PATCH', `/api/projects/${encodeURIComponent(pid)}`, { gitWrite: { permanent: false } });
   check('B5 generic PATCH cannot touch it (400)', patch.status === 400, patch);
   await stop(); await boot();
@@ -212,7 +222,7 @@ try {
   const del = await j('DELETE', gw);
   check('B7 DELETE revokes it (and reports it was active)', del.d?.revoked === true && del.d?.grant === null, del.d);
   const onDisk2 = JSON.parse(fs.readFileSync(path.join(DATA_B, 'registry.json'), 'utf8')).projects.find((p) => p.id === pid);
-  check('B8 setting cleared in the registry', !onDisk2?.settings?.gitWrite?.permanent, onDisk2?.settings?.gitWrite);
+  check('B8 setting cleared in the registry', !onDisk2?.settings?.gitWrite?.permanent && onDisk2?.settings?.gitWrite?.commit !== true, onDisk2?.settings?.gitWrite);
   check('B9 GET: no grant after revoke', (await j('GET', gw)).d?.grant === null);
   const sessions = await j('GET', '/api/sessions');
   check('B10 server still serves sessions list (grantView in the list path does not throw)', sessions.status === 200, sessions.status);

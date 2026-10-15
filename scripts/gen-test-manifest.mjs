@@ -46,6 +46,11 @@ const OVERRIDES = {
   'verify:live': { tier: 'host-live', why: 'needs a real multi-hundred-MB session in ~/.claude' },
   'verify:feat-154-open': { tier: 'host-live', why: 'needs the real session it was built from' },
   'verify:mcp-ready': { tier: 'host-live', why: 'in-process runtime; store-isolation guard refuses any non-production server' },
+  // 2026-10-13 defaults lane: the full runs drive a real CLI; their :unit / :wire variants are pure.
+  'verify:codex-instructions': { tier: 'host-live', why: 'drives the real codex app-server with the user\'s sign-in' },
+  'verify:late-answers': { tier: 'host-live', why: 'drives the real claude CLI (haiku) through a scratch server' },
+  'verify:codex-instructions:wire': { tier: 'pure', why: 'in-process app-server stand-in; no server/network' },
+  'verify:late-answers:unit': { tier: 'pure', why: 'ledger arithmetic only' },
 };
 
 /**

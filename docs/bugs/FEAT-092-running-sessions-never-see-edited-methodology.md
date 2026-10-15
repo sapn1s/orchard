@@ -5,41 +5,71 @@
   "title": "Running sessions keep following outdated project instructions",
   "summary": "When a governing instruction document is edited, sessions already running keep behaving by the old version until their process is replaced. The edit reaches nobody currently working. The longest-lived session has had the most time to drift, so the session people rely on most is the most out of date.",
   "impact_if_we_wait": "The session you talk to all day can quietly follow superseded rules, and it cannot tell that it is doing so. Bounded: this affects instruction freshness, not user data, and cycling the session or handing it the changed document remains a cheap workaround.",
-  "current_need": "Decide Option A (record the workaround) or Option B (per-turn amendment channel). The prerequisite is no longer open: a resumed session is now OBSERVED to apply freshly composed instructions, so the cycle-the-session workaround is proven to work.",
+  "current_need": "Build B: a per-turn dated notice for exactly the changed section of a governing document.",
   "severity": "medium",
   "area": "Session instruction freshness",
   "reported": "2026-08-18",
   "reported_by": "user",
   "owner": "unassigned",
   "work_state": "open",
-  "human_action": "decide",
-  "updated": "2026-08-22",
-  "decision": {
-    "mode": "single",
-    "question": "Should we accept the cycle-the-session workaround, or build a per-turn amendment channel?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Write down the workaround",
-        "what_changes": "Nothing is built. Cycling a session, or handing it the changed document mid-conversation, becomes the recorded practice.",
-        "benefit": "No build cost, and the remedy already works today for anyone who remembers it.",
-        "cost": "The lag stays, and it stays worst on the session that runs all day.",
-        "why_not_obvious": "A remedy that depends on someone noticing staleness fails exactly when nobody notices, and a running session cannot notice for itself."
+  "human_action": "none",
+  "updated": "2026-10-14",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "8ab84f81-7a38-4868-af16-2eb729d28895",
+      "asked_on": "2026-08-22",
+      "question": "Should we accept the cycle-the-session workaround, or build a per-turn amendment channel?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B"
+      ],
+      "chosen": "B",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — criteria: The ticket's own success criteria describe the per-turn notice channel; the workaround cannot meet them.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "criteria",
+        "ref": "sc:0",
+        "why": "The ticket's own success criteria describe the per-turn notice channel; the workaround cannot meet them.",
+        "on": "2026-10-14",
+        "next": "Build B: a per-turn dated notice for exactly the changed section of a governing document.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "open",
+          "current_need": "Decide Option A (record the workaround) or Option B (per-turn amendment channel). The prerequisite is no longer open: a resumed session is now OBSERVED to apply freshly composed instructions, so the cycle-the-session workaround is proven to work."
+        }
       },
-      {
-        "key": "B",
-        "label": "Build a per-turn amendment channel",
-        "what_changes": "Each turn checks whether a governing document changed on disk and prepends a dated notice carrying only the changed part.",
-        "benefit": "An edit reaches sessions that are already running, without re-sending the whole instruction stack.",
-        "cost": "Costs nothing on an unchanged turn and roughly 750 tokens once per edit, plus new wording and rate-limiting work.",
-        "why_not_obvious": "A mid-conversation notice can contradict what the session was told at launch, and it can be dropped when the conversation is compacted."
+      "snapshot": {
+        "mode": "single",
+        "question": "Should we accept the cycle-the-session workaround, or build a per-turn amendment channel?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Write down the workaround",
+            "what_changes": "Nothing is built. Cycling a session, or handing it the changed document mid-conversation, becomes the recorded practice.",
+            "benefit": "No build cost, and the remedy already works today for anyone who remembers it.",
+            "cost": "The lag stays, and it stays worst on the session that runs all day.",
+            "why_not_obvious": "A remedy that depends on someone noticing staleness fails exactly when nobody notices, and a running session cannot notice for itself."
+          },
+          {
+            "key": "B",
+            "label": "Build a per-turn amendment channel",
+            "what_changes": "Each turn checks whether a governing document changed on disk and prepends a dated notice carrying only the changed part.",
+            "benefit": "An edit reaches sessions that are already running, without re-sending the whole instruction stack.",
+            "cost": "Costs nothing on an unchanged turn and roughly 750 tokens once per edit, plus new wording and rate-limiting work.",
+            "why_not_obvious": "A mid-conversation notice can contradict what the session was told at launch, and it can be dropped when the conversation is compacted."
+          }
+        ],
+        "recommendation": null,
+        "recommendation_reason": null,
+        "prerequisite": "Establish whether a resumed session actually applies freshly composed instructions. The whole cycle-the-session workaround rests on that, and it is currently inferred rather than proven."
       }
-    ],
-    "recommendation": null,
-    "recommendation_reason": null,
-    "prerequisite": "Establish whether a resumed session actually applies freshly composed instructions. The whole cycle-the-session workaround rests on that, and it is currently inferred rather than proven."
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "Editing a governing document between two turns makes the next turn carry a dated notice for exactly the changed section",
     "An unchanged turn adds no notice and no token cost",
@@ -266,3 +296,6 @@ Any new channel that injects document text must respect the same clean-room stri
     now has evidence behind it: the same root property produced a second, independent instance (a capability
     decided at launch, not an instruction document) within four days, in a completely different subsystem. That
     is the recurrence the prior entry said would justify the ARCH ticket if Option B is declined.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: criteria (sc:0). Chose: B. Why: The ticket's own success criteria describe the per-turn notice channel; the workaround cannot meet them. Next: Build B: a per-turn dated notice for exactly the changed section of a governing document. You can reopen this decision from the ticket view.

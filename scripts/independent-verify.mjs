@@ -45,12 +45,25 @@
  *     [--keep-cleanroom] [--print-prompt] [--verdict-out <file>]
  *   node scripts/independent-verify.mjs --check-only <verdict-file>
  *
- * By default only COMMITTED work is visible (range → rev-parse → git archive).
+ * A verify lane verifying a TICKET uses `--ticket <T>` (below) — the default for every
+ * verify lane; never hand-build a candidate. With NO mode flag the room is the last
+ * commit, HEAD^..HEAD: only COMMITTED work is visible (range → rev-parse → git archive).
  * `--candidate <TICKET|hash>` (FEAT-170) verifies a FROZEN candidate: the ticket's files
  * exactly as frozen at fix-handoff, overlaid on the freeze-time HEAD and nothing else
  * (scripts/lib/candidate-store.mjs). Edits made to the live tree after the freeze —
  * another lane's, a whole-file restore (BUG-224) — cannot reach the room or the diff,
  * and the verdict's record command carries the candidate hash it is bound to.
+ *
+ * `--ticket <T> [--files a,b] [--mixed]` is the DEFAULT way to verify one ticket on a
+ * shared tree. It uses T's clean candidate (exactly as --candidate) when every frozen
+ * file is still CURRENT. Otherwise — no candidate, a CHANGED file, or files that also
+ * carry other open tickets' uncommitted hunks (the BUG-255 shape: freeze refused
+ * `owned`, dependency cycles) — it freezes a MIXED-STATE candidate
+ * (candidate-store freezeMixed): T's files as they sit in the tree, the whole tree as
+ * the room, NO ownership taken, the foreign hunks DISCLOSED to the verifier by owning
+ * ticket where known, the verdict bound to the content hash. The record shows the mode
+ * (board-tool reads it from the candidate: verify_mode clean-candidate|mixed-state).
+ * The verifier's inputs are unchanged otherwise: never the fixer's report.
  *
  * `--working-tree` (FEAT-134, mutually exclusive with --range) snapshots the
  * CURRENT dirty tree — tracked edits + untracked-not-ignored files — into a
@@ -82,7 +95,8 @@ import { mkdtempScratch, scratchRootInfo, checkSameFilesystem, SCRATCH_ENV } fro
 // snapshot is a dangling commit built via a throwaway index — real repo untouched.
 import { snapshotWorkingTree } from './lib/tree-snapshot.mjs';
 // FEAT-170: verify an immutable, content-hashed candidate instead of the shared tree.
-import { materializeCandidate, CandidateError } from './lib/candidate-store.mjs';
+import { materializeCandidate, CandidateError, freezeMixed, cleanCandidateUsable } from './lib/candidate-store.mjs';
+import { warnIfLaneWorkLost } from './lib/lane-snapshot.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
@@ -131,7 +145,8 @@ if (IS_ENTRY) {
 }
 
 const USAGE = `usage: node scripts/independent-verify.mjs --requirement <text|@file>
-         [--repo <dir>] [--range <A..B|rev> | --working-tree | --candidate <TICKET|hash>]
+         [--repo <dir>] [--ticket <TICKET> [--files a,b,…] [--mixed]   (default for a ticket)
+                         | --candidate <TICKET|hash> | --range <A..B|rev> | --working-tree]
          [--run "<command>"]... [--test-file <path>]... [--allow-input <repo-rel-path>]...
          [--author-provider anthropic|openai]
          [--provider anthropic|openai] [--model <m>] [--timeout-min <n>]
@@ -167,6 +182,9 @@ const opts = {
   range: null,
   workingTree: false,
   candidate: null,
+  ticket: null,
+  mixed: false,
+  files: [],
   requirement: null,
   runs: [],
   testFiles: [],
@@ -192,6 +210,10 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--range') opts.range = take();
   else if (a === '--working-tree') opts.workingTree = true;
   else if (a === '--candidate') opts.candidate = take();
+  else if (a === '--ticket') opts.ticket = take();
+  else if (a === '--mixed') opts.mixed = true;
+  else if (a === '--files') opts.files.push(...take().split(',').map((x) => x.trim()).filter(Boolean));
+  else if (a === '--file') opts.files.push(take());
   else if (a === '--requirement') opts.requirement = take();
   else if (a === '--run') opts.runs.push(take());
   else if (a === '--test-file') opts.testFiles.push(take());
@@ -255,6 +277,8 @@ if (IS_ENTRY) {
   if (!opts.requirement) die(`--requirement is required\n${USAGE}`);
   if (opts.workingTree && opts.range) die('--working-tree and --range are mutually exclusive: one verifies the dirty tree, the other a committed range');
   if (opts.candidate && (opts.workingTree || opts.range)) die('--candidate is mutually exclusive with --range and --working-tree: it verifies one frozen candidate, nothing else');
+  if (opts.ticket && (opts.candidate || opts.workingTree || opts.range)) die('--ticket is mutually exclusive with --candidate, --range and --working-tree: it picks the clean candidate or the mixed-state freeze itself');
+  if ((opts.mixed || opts.files.length) && !opts.ticket) die('--mixed and --files go with --ticket <TICKET>');
   if (opts.authorProvider !== 'anthropic' && opts.authorProvider !== 'openai') die('--author-provider must be anthropic|openai');
   if (opts.provider && opts.provider !== 'anthropic' && opts.provider !== 'openai') die('--provider must be anthropic|openai');
   // Cross-provider by default: decorrelated blind spots (ROUTING.md).
@@ -1116,7 +1140,33 @@ function readRequirement(spec) {
   return fs.readFileSync(f, 'utf8');
 }
 
-function composePrompt({ requirement, diff, truncated, fullDiffBytes, runs, tests, cwd }) {
+/**
+ * The DISCLOSED list of other tickets' hunks inside a mixed-state candidate's files:
+ * ticket ids, paths and line ranges only — never a ticket's prose, never the fixer's
+ * report (the room strips the board, so an id is an opaque label).
+ */
+export function mixedDisclosureText(m) {
+  const d = m.disclosure || { files: [], hunks: [] };
+  const rng = (start, len) => (len === 0 ? `after line ${start}` : len === 1 ? `line ${start}` : `lines ${start}-${start + len - 1}`);
+  const lines = d.hunks.map((h) => `  ${h.path} ${rng(h.newStart, h.newLen)} (was ${rng(h.oldStart, h.oldLen)} at the last commit) — ${h.class === 'mixed' ? 'MIXED, partly' : 'NOT this change:'} ${h.owners.length ? h.owners.join(', ') : 'owner unknown'} (${h.basis})`);
+  const perFile = d.files.map((f) => `  ${f.path}: ${f.hunks} changed hunk(s); ${f.unattributed} not attributed to any other ticket${f.claimants.length ? `; also claimed by ${f.claimants.join(', ')} (which lines are theirs is not recorded)` : ''}`);
+  return `=== MIXED STATE — OTHER TICKETS' UNCOMMITTED WORK IN THESE FILES (disclosed) ===
+These files were frozen exactly as they sit in a shared working tree where other
+in-flight changes are also uncommitted, and your working copy is that whole tree.
+The diff below is each of these files against the last commit, so it ALSO holds
+other tickets' changes, which will be committed together with this one. Attack the
+REQUIREMENT in this real mixed state; a hunk below is in scope only where it breaks
+the requirement. Attribution is by matching each other ticket's own frozen copy, not
+line-level provenance: an unlisted hunk may still be another ticket's, and a listed
+one may also hold lines of the change under test.
+Per file:
+${perFile.join('\n') || '  (none)'}
+Hunks attributed to other tickets (line numbers are in your working copy):
+${lines.join('\n') || '  (none attributable — no other ticket\'s frozen change matches a hunk here)'}
+`;
+}
+
+function composePrompt({ requirement, diff, truncated, fullDiffBytes, runs, tests, cwd, mixed = null }) {
   // FEAT-062 model-compliance hardening: a real clean-room verifier (run
   // 791c0681) ran all its probes through its own Bash — never ./vrun.mjs — and
   // answered in free markdown, so its (real) substance was INVALID and lost.
@@ -1158,7 +1208,7 @@ ${runs.length ? runs.map((r) => `  ${r}`).join('\n') : '  (no command was suppli
 === THE EXISTING TEST CODE (written by the author — re-run it, do not trust it) ===
 ${tests.length ? tests.map((t) => `--- ${t.rel} ---\n${t.body}`).join('\n\n') : '(no test file supplied)'}
 
-=== THE DIFF UNDER TEST ===${truncated ? `\n[NOTE: diff TRUNCATED at ${diff.length} of ${fullDiffBytes} bytes — judge only what is shown]` : ''}
+${mixed ? `${mixed}\n` : ''}=== THE DIFF UNDER TEST ===${truncated ? `\n[NOTE: diff TRUNCATED at ${diff.length} of ${fullDiffBytes} bytes — judge only what is shown]` : ''}
 ${diff}
 
 === HOW TO FIND THE REAL DEFECT ===
@@ -1191,6 +1241,32 @@ async function main() {
   const repo = gitOk(opts.repo, 'rev-parse', '--show-toplevel').trim();
   let base, head;
   let candidate = null;
+  // FEAT-176: say LOUDLY, before anything is built, when a finished lane's work is
+  // gone from the live tree — a verify on that tree would judge the wrong code.
+  // Warning only; never changes this run's outcome.
+  warnIfLaneWorkLost({ top: repo });
+  // MIXED-STATE (no ticket of its own; see candidate-store freezeMixed): `--ticket T`
+  // uses T's clean candidate when every file is CURRENT, and otherwise freezes T's files
+  // AS THEY ARE in the shared tree, other tickets' hunks included and disclosed — never
+  // claiming, never refused for ownership. The clean `--candidate` path is unchanged.
+  let verifyMode = opts.candidate ? 'clean-candidate' : null;
+  if (opts.ticket) {
+    let why = ['--mixed was requested'];
+    if (!opts.mixed) {
+      let u;
+      try { u = cleanCandidateUsable(repo, opts.ticket, opts.files); }
+      catch (e) { die(e instanceof CandidateError ? `--ticket ${opts.ticket}: ${e.message}` : String(e?.stack || e)); }
+      if (u.usable) { opts.candidate = u.hash; verifyMode = 'clean-candidate'; console.error(`  mode       clean candidate ${u.hash.slice(0, 12)} for ${opts.ticket} (every file CURRENT)`); }
+      else why = u.reasons;
+    }
+    if (!opts.candidate) {
+      let mm;
+      try { mm = freezeMixed({ repo, id: opts.ticket, files: opts.files, why }); }
+      catch (e) { die(e instanceof CandidateError ? `--ticket ${opts.ticket} (mixed-state freeze): ${e.message}${e.detail?.length ? `\n  ${e.detail.join('\n  ')}` : ''}` : String(e?.stack || e)); }
+      opts.candidate = mm.hash; verifyMode = 'mixed-state';
+      console.error(`  mode       MIXED-STATE for ${opts.ticket} — no clean diff (${why.join('; ')}); froze ${mm.files.length} file(s) as they sit in the shared tree, no ownership taken; ${mm.disclosure.hunks.length} other-ticket hunk(s) disclosed to the verifier`);
+    }
+  }
   if (opts.candidate) {
     // FEAT-170: the room is the candidate's own tree — HEAD at freeze + exactly the
     // frozen files, re-materialised from the STORE (never the live tree) and asserted
@@ -1213,7 +1289,7 @@ async function main() {
     const m = candidate.manifest;
     console.error(`  candidate ${m.ticket} ${m.hash.slice(0, 12)} — base ${m.base.slice(0, 12)} → tree ${m.tree.slice(0, 12)}, ${m.files.length} frozen file(s)${m.deps.length ? `, group with ${m.deps.map((d) => d.ticket).join(', ')}` : ''}; live-tree edits after the freeze cannot reach this room`);
   } else if (opts.workingTree) {
-    console.error('  note       --working-tree hands the verifier EVERY in-flight ticket\'s code; freeze the ticket and use --candidate <TICKET> to verify only its own frozen files (FEAT-170)');
+    console.error('  note       --working-tree hands the verifier EVERY in-flight ticket\'s code; use --ticket <TICKET> to verify only that ticket\'s files as they are (its candidate, else a mixed-tree freeze)');
     // FEAT-134: base = HEAD, head = the snapshot TREE sha (NOT the dangling commit
     // — a commit is gc-collectable, the tree is the durable id the range line and
     // any record then carries). git diff / git archive both accept a bare tree, so
@@ -1284,7 +1360,10 @@ async function main() {
   const nameOnly = spawnSync('git', ['-C', repo, ...GIT_CFG, 'diff', ...DIFF_FLAGS, '--name-only', '-z', '--no-renames', base, head], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
   if ((nameOnly.status ?? 1) !== 0) die(`git diff --name-only failed in ${repo}: ${(nameOnly.stderr ? nameOnly.stderr.toString() : '').trim()}`);
   const changedPaths = (nameOnly.stdout ? nameOnly.stdout.toString('utf8') : '').split('\0').filter(Boolean);
-  const allowedPaths = changedPaths.filter(isDeclared);
+  // Mixed state: the room is the whole shared tree (so the ticket's code boots with its
+  // co-owners' companions), but the diff the verifier attacks is the ticket's own files.
+  const mixedFiles = candidate?.manifest.mode === 'mixed' ? new Set(candidate.manifest.files.map((f) => f.path)) : null;
+  const allowedPaths = changedPaths.filter(isDeclared).filter((p) => !mixedFiles || mixedFiles.has(p));
   if (!allowedPaths.length) {
     die(`range ${base.slice(0, 8)}..${head.slice(0, 8)} has no verifiable diff after excluding the board/methodology surface (${changedPaths.length} changed path(s), none the verifier may see) — nothing for the verifier to attack`);
   }
@@ -1362,7 +1441,8 @@ async function main() {
   // the verdict already cites, so a verdict can be read against its own inputs.
   const roomManifest = {
     base, head,
-    candidate: candidate ? { hash: candidate.manifest.hash, ticket: candidate.manifest.ticket, deps: candidate.manifest.deps, files: candidate.manifest.files.map((f) => ({ path: f.path, owner: f.owner, sha256: f.sha256, deleted: f.deleted })) } : null,
+    verifyMode: verifyMode ?? (opts.workingTree ? 'working-tree' : 'range'),
+    candidate: candidate ? { hash: candidate.manifest.hash, ticket: candidate.manifest.ticket, mode: candidate.manifest.mode === 'mixed' ? 'mixed-state' : 'clean-candidate', deps: candidate.manifest.deps, files: candidate.manifest.files.map((f) => ({ path: f.path, owner: f.owner, sha256: f.sha256, deleted: f.deleted })), ...(candidate.manifest.mode === 'mixed' ? { disclosure: candidate.manifest.disclosure } : {}) } : null,
     proseRoots: room.proseRoots,
     ambientStripped: AMBIENT_INSTRUCTION_NAMES,
     allowedInputs: room.allowed,
@@ -1377,6 +1457,7 @@ async function main() {
   const prompt = composePrompt({
     requirement: readRequirement(opts.requirement),
     diff, truncated, fullDiffBytes, runs: opts.runs, tests, cwd: room.dir,
+    mixed: candidate?.manifest.mode === 'mixed' ? mixedDisclosureText(candidate.manifest) : null,
   });
 
   if (opts.printPrompt) {
@@ -1436,7 +1517,7 @@ async function main() {
       '--meta-out', metaFile,
       ...(resumeId ? ['--resume', resumeId] : []),
       ...(viaStdin ? ['--prompt-stdin'] : ['--', safePrompt]),
-    ], { stdio: [viaStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
+    ], { stdio: [viaStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'], env: { ...process.env, ORCHARD_LANE_SNAPSHOT: '0' } }); // FEAT-176: the clean room is throwaway
     _activeDispatchChild = child; // BUG-250: a signal handler kills it before deleting the room it runs in
     child.once('exit', () => { if (_activeDispatchChild === child) _activeDispatchChild = null; });
     if (viaStdin) {
@@ -1571,7 +1652,7 @@ ${CITATION_CONTRACT}`;
     console.log(`  node scripts/board-tool.mjs verified --id=<TICKET> --provider=${opts.provider}` +
       `${opts.model ? ` --model=${opts.model}` : ''} --run=${runId ?? 'UNKNOWN-RUN-ID'} --verdict=${String(v.verdict ?? '').toUpperCase()}` +
       `${candidate ? ` --candidate=${candidate.manifest.hash}` : ''}`);
-    if (candidate) console.log(`  (bound to candidate ${candidate.manifest.hash.slice(0, 12)}: a later edit to its files makes a new candidate, which needs its own verdict)`);
+    if (candidate) console.log(`  (bound to ${candidate.manifest.mode === 'mixed' ? 'MIXED-STATE' : 'clean'} candidate ${candidate.manifest.hash.slice(0, 12)}: a later edit to its files makes a new candidate, which needs its own verdict; board-tool records the mode from the candidate itself)`);
     if (!runId) console.log('  WARNING: the dispatch printed no run id — the board tool will refuse the command above.');
   }
   process.exit(exit);

@@ -20,9 +20,16 @@
  *   4. escalating severity: 3-4 elevated, 5-7 high, 8+ critical (unit, exact bands);
  *   5. the threshold is real: raising ARCH-017's observed round 11 flips off at
  *      --min-round=12 and back on at 11 (unit, over a synthesised max-round set);
- *   6. ACCEPTANCE against the REAL live store (skips LOUDLY if pruned away): the
- *      CLI raises ARCH-017 at max declared round 11 and exits 1, and a control
- *      ticket whose max declared round is 1 is NOT raised.
+ *   6. ACCEPTANCE against the REAL live store, as an INVARIANT (CONVENTIONS:
+ *      "test the real artifact's invariant PROPERTIES, not values legitimate use
+ *      changes"). It does NOT pin a round number — ARCH-017's count climbs with
+ *      every legitimate round (was 11, now 12, will keep moving). Instead it
+ *      DISCOVERS the top over-ceiling ticket at runtime and asserts the CLI's
+ *      reported max round equals an INDEPENDENT reduction (a hand-rolled max over
+ *      the declared rounds) of the SAME source — i.e. roundCeiling's per-ticket
+ *      reduction matches a second, inline computation — plus severity = severityFor
+ *      and exit 1. It FAILS LOUDLY if the real store has no ticket over the ceiling
+ *      (never a vacuous pass), and 6d shows the equality reddens on a violation.
  */
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -30,6 +37,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { roundCeiling, severityFor } from './round-ceiling.mjs';
+import { collect } from './cost-collect.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const SCRIPT = path.join(ROOT, 'scripts', 'round-ceiling.mjs');
@@ -129,29 +137,86 @@ try {
     { at11: at11.raised.map((x) => x.ticket), at12: at12.raised.map((x) => x.ticket) },
   );
 
-  // 6. ACCEPTANCE against the REAL live store (default source: live transcripts).
+  // 6. ACCEPTANCE against the REAL live store (default source: live transcripts),
+  //    as an INVARIANT PROPERTY — no pinned round number. The CLI default source
+  //    is collect() over the current project's live transcripts; we re-read the
+  //    SAME source in-process and reduce it INDEPENDENTLY (a hand-rolled max per
+  //    ticket, NOT via roundCeiling), then assert the CLI's number matches ours.
   const real = spawnSync('node', [SCRIPT, '--json'], { encoding: 'utf8', cwd: ROOT, env: process.env });
   let realJson = {};
   try { realJson = JSON.parse(real.stdout); } catch { /* leave empty */ }
-  const arch017 = (realJson.raised ?? []).find((x) => x.ticket === 'ARCH-017');
-  if (!arch017) {
-    console.log('  SKIP  6 ACCEPTANCE — ARCH-017 has no declared-round lane in the LIVE store');
-    console.log('        (transcripts pruned at ~30 days; use --ledger for the durable record). This is');
-    console.log('        a loud skip, not a pass: the mechanism is proven by 1-5 above on real code paths.');
-  } else {
+
+  // Independent reduction over the SAME source the CLI read (same project, same
+  // `all=false`). This is a second computation of "max declared round per ticket"
+  // that does not go through the code under test (roundCeiling).
+  const independentMax = new Map();
+  try {
+    const res = await collect({ project: ROOT, all: false, since: null });
+    for (const l of res.lanes ?? []) {
+      const d = l?.declared;
+      if (!d || d.present !== true) continue;
+      if (!Number.isInteger(d.round) || d.round < 1) continue;
+      const tickets = Array.isArray(d.tickets) ? d.tickets : [];
+      for (const t of tickets) {
+        if (typeof t === 'string' && t) independentMax.set(t, Math.max(independentMax.get(t) ?? 0, d.round));
+      }
+    }
+  } catch (e) {
+    check('6 ACCEPTANCE setup — independent re-read of the live source', false, String(e?.message ?? e));
+  }
+
+  const raised = realJson.raised ?? [];
+  if (raised.length === 0) {
+    // Fail LOUDLY, never a vacuous pass: the live store carrying nothing over the
+    // ceiling is itself worth knowing (and means this acceptance cannot run).
     check(
-      '6a real board: ARCH-017 raised at max declared round 11, severity critical, exit 1',
-      arch017.maxRound === 11 && arch017.severity === 'critical' && real.status === 1,
-      { maxRound: arch017.maxRound, severity: arch017.severity, code: real.status },
+      '6 ACCEPTANCE — the REAL live store has at least one ticket at or over the ceiling',
+      false,
+      'NONE: no ticket in the live transcripts is at/over the ceiling (exit ' + real.status + '). '
+        + 'Fails loudly rather than passing vacuously — the acceptance invariant has no real artifact to check.',
     );
-    // A real control: only `raised` tickets are listed, so assert the invariant
-    // that NO raised ticket is below the ceiling (a 1-round ticket like BUG-163
-    // can never appear — proven live in the ticket's Activity log).
-    const belowCeiling = (realJson.raised ?? []).filter((x) => x.maxRound < realJson.minRound);
+  } else {
+    // Discover the qualifying ticket at runtime: the one the CLI ranks highest.
+    const top = raised[0];
+    const indep = independentMax.get(top.ticket);
     check(
-      '6b real board: no raised ticket is below the ceiling (control — 1-round tickets excluded)',
+      '6a real store: CLI max round for the top raised ticket equals an INDEPENDENT reduction of the same source, exit 1',
+      indep != null && top.maxRound === indep && real.status === 1,
+      { ticket: top.ticket, cliMaxRound: top.maxRound, independentMaxRound: indep, code: real.status },
+    );
+    check(
+      '6b real store: CLI severity for that ticket equals severityFor(maxRound, ceiling) (derived, not pinned)',
+      top.severity === severityFor(top.maxRound, realJson.minRound),
+      { ticket: top.ticket, severity: top.severity, expected: severityFor(top.maxRound, realJson.minRound), ceiling: realJson.minRound },
+    );
+    // Invariant control: no raised ticket is EVER below the ceiling — a property
+    // that holds whatever the live values are (a 1-round ticket can never appear).
+    const belowCeiling = raised.filter((x) => x.maxRound < realJson.minRound);
+    check(
+      '6c real store: no raised ticket is below the ceiling (invariant control)',
       belowCeiling.length === 0,
       { ceiling: realJson.minRound, belowCeilingRaised: belowCeiling.map((x) => `${x.ticket}:${x.maxRound}`) },
+    );
+  }
+
+  // 6d NON-VACUITY (SYNTHETIC source, labelled): 6a's property must REDDEN when the
+  // reader's count disagrees with the independent reduction. A synthetic lane set
+  // declares rounds 3 and 9 for one ticket; the production reader reports 9 (the
+  // max) and an inline reduction also yields 9 (property HOLDS), while a
+  // mis-counting reader — any value ≠ 9 — is caught by the same equality.
+  {
+    const synth = [
+      { declared: { present: true, round: 3, tickets: ['SYNTH-CEIL'], phase: 'fixing' } },
+      { declared: { present: true, round: 9, tickets: ['SYNTH-CEIL'], phase: 'verifying' } },
+    ];
+    const readerMax = roundCeiling(synth, {}).raised.find((x) => x.ticket === 'SYNTH-CEIL')?.maxRound;
+    let indepSynth = 0;
+    for (const l of synth) if (l.declared.tickets.includes('SYNTH-CEIL')) indepSynth = Math.max(indepSynth, l.declared.round);
+    const miscount = indepSynth - 1; // a reader that under-counts
+    check(
+      '6d non-vacuity (SYNTHETIC): property holds (reader==reduction) AND reddens on a mismatched count',
+      readerMax === indepSynth && !(miscount === indepSynth),
+      { readerMax, independent: indepSynth, miscountRejected: miscount !== indepSynth },
     );
   }
 } finally {

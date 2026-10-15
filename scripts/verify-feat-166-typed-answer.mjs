@@ -70,7 +70,7 @@ const inLane = (id) => (board().answeredAwaiting ?? []).some((i) => i.id === id)
 const inNeeds = (id) => board().needsYou.some((i) => i.id === id);
 const OPTS = ['A=first | changes a | gains a | costs a | why a', 'B=second | changes b | gains b | costs b | why b'];
 function decide(id, q, extra = []) {
-  const r = spawnSync(process.execPath, [path.join(REPO, 'scripts/board-tool.mjs'), 'decide', '--id', id, '--question', q,
+  const r = spawnSync(process.execPath, [path.join(REPO, 'scripts/board-tool.mjs'), 'decide', '--id', id, '--question', q, '--decider', 'taste', '--consequence', 'you will read this card every single day',
     ...OPTS.flatMap((o) => ['--option', o]), '--author', 'worker (fixing r3 test)', ...extra],
   { cwd: REPO, encoding: 'utf8', env: { ...process.env, ORCHARD_BOARD_TOOL_ROOT: WORK } });
   if (r.status !== 0) throw new Error(`decide ${id} failed: ${(r.stdout || r.stderr).slice(0, 400)}`);

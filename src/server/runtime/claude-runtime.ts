@@ -131,10 +131,13 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-function userMessage(text: string): SDKUserMessage {
+function userMessage(text: string, content?: ReadonlyArray<Record<string, unknown>>): SDKUserMessage {
   return {
     type: 'user',
-    message: { role: 'user', content: text },
+    // FEAT-177: when attachments are present the caller supplies the full
+    // content-block array; otherwise the body stays a bare string, so a
+    // text-only turn is byte-for-byte what it has always been.
+    message: { role: 'user', content: content ?? text },
     parent_tool_use_id: null,
     session_id: '',
   } as SDKUserMessage;
@@ -889,6 +892,8 @@ export class ClaudeRuntime implements AgentRuntime {
     // every background task alive right now (proven live in BUG-037's capture),
     // so this engine can answer "does work outlive this turn" both ways.
     backgroundLifetime: 'reported',
+    // FEAT-177: Claude receives image / document blocks natively as vision input.
+    imageAttachments: true,
   };
 
   #query: ReturnType<typeof query> | null = null;
@@ -910,7 +915,7 @@ export class ClaudeRuntime implements AgentRuntime {
   #holding = false;
   /** BUG-187 C2 — whether this runtime's initialize carried hooks. */
   #hooksSent = false;
-  #heldSends: string[] = [];
+  #heldSends: Array<{ text: string; content?: ReadonlyArray<Record<string, unknown>> }> = [];
   #closed = false;
   #mcpGate: { outcome: 'ready' | 'timeout' | 'settled'; waitedMs: number } | null = null;
   /**
@@ -1338,6 +1343,7 @@ export class ClaudeRuntime implements AgentRuntime {
                       toolInput: i.tool_input,
                       lockDir: fileLockDir,
                       repoRoot: config.gitRepoPath ?? null,
+                      pathAliases: config.fileLockPathAliases ?? [],
                       owner,
                     });
                     if (!lock.allow) {
@@ -1508,9 +1514,9 @@ export class ClaudeRuntime implements AgentRuntime {
     const budget = mcpReadyBudgetMs();
     if (config.mcpServers && Object.keys(config.mcpServers).length && budget > 0) {
       this.#holding = true;
-      void this.#releaseWhenMcpReady(config.firstPrompt, budget);
+      void this.#releaseWhenMcpReady(config.firstPrompt, budget, config.firstContent);
     } else {
-      this.#input.push(userMessage(config.firstPrompt));
+      this.#input.push(userMessage(config.firstPrompt, config.firstContent));
     }
   }
 
@@ -1522,7 +1528,7 @@ export class ClaudeRuntime implements AgentRuntime {
    * `send()`s buffered behind it, in order. A CLI too old for the control
    * request settles the gate on first error rather than burning the budget.
    */
-  async #releaseWhenMcpReady(firstPrompt: string, budgetMs: number): Promise<void> {
+  async #releaseWhenMcpReady(firstPrompt: string, budgetMs: number, firstContent?: ReadonlyArray<Record<string, unknown>>): Promise<void> {
     const t0 = Date.now();
     let outcome: 'ready' | 'timeout' | 'settled' = 'timeout';
     while (Date.now() - t0 < budgetMs) {
@@ -1541,8 +1547,8 @@ export class ClaudeRuntime implements AgentRuntime {
     this.#mcpGate = { outcome, waitedMs: Date.now() - t0 };
     this.#holding = false;
     if (this.#closed) return;
-    this.#input.push(userMessage(firstPrompt));
-    for (const text of this.#heldSends.splice(0)) this.#input.push(userMessage(text));
+    this.#input.push(userMessage(firstPrompt, firstContent));
+    for (const h of this.#heldSends.splice(0)) this.#input.push(userMessage(h.text, h.content));
   }
 
   /**
@@ -1569,10 +1575,10 @@ export class ClaudeRuntime implements AgentRuntime {
     }
   }
 
-  send(text: string): void {
+  send(text: string, content?: ReadonlyArray<Record<string, unknown>>): void {
     // FEAT-055: never let a follow-up overtake the held first prompt.
-    if (this.#holding) { this.#heldSends.push(text); return; }
-    this.#input.push(userMessage(text));
+    if (this.#holding) { this.#heldSends.push({ text, content }); return; }
+    this.#input.push(userMessage(text, content));
   }
 
   async interrupt(): Promise<void> {

@@ -5,15 +5,20 @@ import { ago, isDiffMeta, hunkMatch, durationLeftLabel } from './git-view-fmt.js
 const TEN_MINUTES = 600000, PAGE = 50;
 export function createGitView(ctx) {
   const root = document.createElement('section'); root.className = 'git-view slide-panel'; root.hidden = true;
-  root.innerHTML = `<header class="gt-top"><a class="gt-home" href="#/">← sessions</a><span class="gt-brand">Git</span><select class="gt-sel" aria-label="Project"></select><nav class="gt-views" aria-label="Git view"><button data-view="changes">Changes</button><button data-view="branches">Branches</button><button data-view="history">History</button><button data-view="stashes">Stashes</button></nav><span class="spacer"></span><span class="gt-error gt-view-error" role="status"></span><div class="gt-actions"><div class="gt-gitwrite" title="Whether AGENT sessions in this project may run git writes (commit/push). Your commits here are never blocked by this — it only governs agent git."><span class="gt-gw-dot"></span><span class="gt-gw-state">Agent git…</span><button class="gt-gw-allow" type="button" title="Allow agent commit/push in this project for 30 minutes">Allow 30 min</button><button class="gt-gw-perm" type="button" title="Allow agent commit/push in this project with no expiry, until you revoke it. Asks you to confirm.">Allow permanently…</button><button class="gt-gw-revoke" type="button" hidden>Revoke</button></div><span class="gt-branch"></span><div class="gt-sync"><button></button><small></small></div></div></header><div class="gt-filters"><label class="gt-all"><input type="checkbox"><span>Select all</span></label><input class="gt-find" type="search"><span class="gt-summary"></span></div><div class="gt-body"><aside class="gt-side"><div class="gt-files" role="list"></div><form class="gt-commit"><input class="gt-title" required aria-label="Commit summary" placeholder="Summary (required)"><textarea class="gt-description" rows="1" aria-label="Commit description" placeholder="Description (optional)"></textarea><button>Commit</button><span class="gt-reason"></span><div class="gt-error"></div></form><form class="gt-create"><label>New branch<input class="gt-new-branch" required placeholder="Branch name"></label><button>Create and switch</button><span class="gt-reason"></span><div class="gt-error"></div></form></aside><article class="gt-diff"></article></div>`;
+  root.innerHTML = `<header class="gt-top"><a class="gt-home" href="#/">← sessions</a><span class="gt-brand">Git</span><select class="gt-sel" aria-label="Project"></select><nav class="gt-views" aria-label="Git view"><button data-view="changes">Changes</button><button data-view="branches">Branches</button><button data-view="history">History</button><button data-view="stashes">Stashes</button></nav><span class="spacer"></span><span class="gt-error gt-view-error" role="status"></span><div class="gt-actions"><div class="gt-gitwrite" title="Whether AGENT sessions in this project may run git writes (commit/push). Your commits here are never blocked by this — it only governs agent git."><span class="gt-gw-dot"></span><span class="gt-gw-state">Agent git…</span><button class="gt-gw-allow" type="button" title="Allow agent commit/push in this project for 30 minutes">Allow 30 min</button><button class="gt-gw-settings" type="button" title="Manage agent git for this project — grant commit/push, scope note, soft releases, and which other repos the grant reaches.">Manage…</button><button class="gt-gw-revoke" type="button" hidden>Revoke</button></div><span class="gt-branch"></span><div class="gt-sync"><button></button><small></small></div></div></header><div class="gt-filters"><label class="gt-all"><input type="checkbox"><span>Select all</span></label><input class="gt-find" type="search"><span class="gt-summary"></span></div><div class="gt-body"><aside class="gt-side"><div class="gt-files" role="list"></div><form class="gt-commit"><input class="gt-title" required aria-label="Commit summary" placeholder="Summary (required)"><textarea class="gt-description" rows="1" aria-label="Commit description" placeholder="Description (optional)"></textarea><button>Commit</button><span class="gt-reason"></span><div class="gt-error"></div></form><form class="gt-create"><label>New branch<input class="gt-new-branch" required placeholder="Branch name"></label><button>Create and switch</button><span class="gt-reason"></span><div class="gt-error"></div></form></aside><article class="gt-diff"></article></div>`;
   document.body.append(root); const slide = createSlidePanel(root, { settledClass: 'git-open' });
   const q = s => root.querySelector(s), files = q('.gt-files'), diff = q('.gt-diff'), filter = q('.gt-find'), filters = q('.gt-filters');
   const allWrap=q('.gt-all'), all=q('.gt-all input'), allLabel=q('.gt-all span'), summary=q('.gt-summary'), commitForm=q('.gt-commit'), commit=q('.gt-commit button'), title=q('.gt-title'), description=q('.gt-description');
   const createForm=q('.gt-create'), create=q('.gt-create button'), branchName=q('.gt-new-branch'), error=q('.gt-commit .gt-error'), branchError=q('.gt-create .gt-error'), branchReason=q('.gt-create .gt-reason');
   const sync=q('.gt-sync button'), syncNote=q('.gt-sync small'), projectSelect=q('.gt-sel'), home=q('.gt-home'), viewError=q('.gt-view-error');
   // FEAT-108 r3 — the direct git-write permission toggle + visible state.
-  const gwWrap=q('.gt-gitwrite'), gwDot=q('.gt-gw-dot'), gwState=q('.gt-gw-state'), gwAllow=q('.gt-gw-allow'), gwRevoke=q('.gt-gw-revoke'), gwPerm=q('.gt-gw-perm');
-  let grant=null, gwBusy=false;
+  // FEAT-164 — the "Allow permanently…" arm/confirm button is gone; the standing
+  // policy (scoped commits / soft releases / cadence) lives in project Settings now,
+  // reached by the "Settings…" button. The pill still shows "Allow 30 min" + Revoke.
+  const gwWrap=q('.gt-gitwrite'), gwDot=q('.gt-gw-dot'), gwState=q('.gt-gw-state'), gwAllow=q('.gt-gw-allow'), gwRevoke=q('.gt-gw-revoke'), gwSettings=q('.gt-gw-settings');
+  let grant=null, policy=null, gwBusy=false;
+  // FEAT-190 — the agent-git policy is managed HERE (the git page) now, not the Settings drawer.
+  let gwPanelOpen=false, gwDraft=null, gwReached=[], gwSummary='', gwPanel=null, gwErr='', gwLoaded=false, gwLoadFailed=false, gwLoadSeq=0, gwRevision=null;
   let projectId, view='changes', data, stashData={stashes:[]}, branchData, historyData, filtered=[], selected, parent, request=0, generation=0, filterTimer, fetchTimer, fetchedAt;
   let loading=false, batching=false, committing=false, syncing=false, branchBusy=false, liveConfirmed=false, historyBusy=false, failures=0; const rows=new Map(), pending=new Set();
   const project=()=>ctx.getProject(projectId), fail=(m='')=>{(view==='branches'?branchError:error).textContent=m;viewError.textContent=m}, operation=(name,state,detail='')=>{root.dataset.lastOperation=name;root.dataset.lastResponse=state;root.dataset.lastDetail=detail}, stagedCount=()=>data?.changes.filter(c=>c.staged).length??0;
@@ -135,19 +140,114 @@ export function createGitView(ctx) {
   function clearFetch(){clearTimeout(fetchTimer);fetchTimer=null}function schedule(t){clearFetch();if(slide.isOpen()&&t===generation)fetchTimer=setTimeout(()=>void fetchNow(t),Math.min(TEN_MINUTES*(2**failures),3600000))}
   async function fetchNow(t,explicit=false){if(!slide.isOpen()||superseded(t))return;if(data?.status&&!data.status.remoteUrl&&!data.status.upstream)return;if(document.hidden||syncing){schedule(t);return}syncing=true;paint();try{const r=await guard(t,api.gitAction(project().id,'fetch'));data=data??{};data.status=r.status;fetchedAt=Date.now();failures=0;fail();ctx.onStatusChanged?.(r.status,projectId);syncing=false;paint();schedule(t)}catch(e){failures+=1;if(explicit)fail(e.message);syncing=false;paint();schedule(t)}}
   // FEAT-108 r3 — visible state: is agent git permitted for this project, until when?
-  // FEAT-164 — plus a PERMANENT per-project grant (a declared project setting on the
-  // server). Security-relevant, so it is never one click: the first click ARMS the
-  // button (it turns into an explicit "Confirm" and the state line says what it
-  // means), the second within 6 s grants. Revoke clears timed AND permanent.
-  let gwArmed=false, gwArmTimer=null;
-  function gwLabel(){if(!grant)return'Agent git blocked';if(grant.scope==='permanent')return'Agent git allowed · permanent';if(grant.scope==='once')return'Agent git: one write allowed';const ms=Math.max(0,Date.parse(grant.expiresAt)-Date.now());return`Agent git allowed · ${durationLeftLabel(ms)} left`}
-  function gwTitle(){if(!grant)return'agent commit/push is denied at the runtime hook';if(grant.scope==='permanent')return`PERMANENT for this project: agents may commit and push here until you revoke it. The leak gate still runs on every agent commit and push.${grant.grantedAt?` Set ${new Date(grant.grantedAt).toLocaleString()}.`:''}`;return`granted ${grant.grantedVia==='request-approval'?'by approving an agent request':'directly'}; expires ${new Date(grant.expiresAt).toLocaleString()}`}
-  function gwDisarm(){gwArmed=false;clearTimeout(gwArmTimer)}
-  function paintGrant(){const on=!!grant,perm=grant?.scope==='permanent';gwWrap.dataset.on=String(on);gwWrap.dataset.scope=grant?.scope??'none';gwWrap.dataset.armed=String(gwArmed);gwState.textContent=gwArmed?'Agents may commit and push here until you revoke':gwLabel();gwState.title=gwTitle();gwAllow.hidden=on||gwArmed;gwAllow.disabled=gwBusy||!projectId;gwPerm.hidden=perm;gwPerm.disabled=gwBusy||!projectId;gwPerm.textContent=gwArmed?'Confirm: allow permanently':on?'Make permanent…':'Allow permanently…';gwRevoke.hidden=!on||gwArmed;gwRevoke.disabled=gwBusy}
-  async function loadGrant(token=generation){gwDisarm();if(!projectId){grant=null;paintGrant();return}try{const r=await guard(token,api.gitWriteGrant(projectId));grant=r?.grant??null;paintGrant()}catch{grant=null;paintGrant()}}
+  // FEAT-164 — a STANDING grant is now a declared project policy (none | scoped |
+  // release). The pill reflects it: a timed grant keeps its "N left" text; a standing
+  // commit grant reads "Agent git · soft releases" (release mode) or "· scoped". The
+  // standing policy is set in project Settings ("Settings…"); the pill only offers the
+  // explicit 30-minute grant and a Revoke (which clears both, server-side).
+  const gwStanding=()=>policy&&policy.mode&&policy.mode!=='none'?policy.mode:null;
+  function gwLabel(){
+    if(grant&&grant.scope!=='permanent'){if(grant.scope==='once')return'Agent git: one write allowed';const ms=Math.max(0,Date.parse(grant.expiresAt)-Date.now());return`Agent git allowed · ${durationLeftLabel(ms)} left`}
+    const s=gwStanding();
+    if(s==='release')return'Agent git · soft releases';
+    if(s==='scoped')return'Agent git · scoped';
+    if(grant&&grant.scope==='permanent')return'Agent git · standing grant';
+    return'Agent git blocked';
+  }
+  function gwTitle(){
+    if(grant&&grant.scope!=='permanent')return`granted ${grant.grantedVia==='request-approval'?'by approving an agent request':'directly'}; expires ${new Date(grant.expiresAt).toLocaleString()}`;
+    const s=gwStanding();
+    if(s==='release')return'Soft releases: agents never commit to the real repo directly — finished, verified work is batched into versioned release commits. Manage in project Settings → Agent git.';
+    if(s==='scoped')return'Agents may commit here following the scope note you set in project Settings → Agent git. The leak gate still runs on every commit and push.';
+    if(grant&&grant.scope==='permanent')return'A standing agent git grant is set for this project. Manage it in project Settings → Agent git.';
+    return'agent commit/push is denied at the runtime hook';
+  }
+  // The pill is "on" for a timed grant OR a standing commit policy.
+  const gwOn=()=>!!grant||!!gwStanding();
+  function paintGrant(){const on=gwOn();const scope=grant?grant.scope:(gwStanding()?'permanent':'none');gwWrap.dataset.on=String(on);gwWrap.dataset.scope=scope;gwWrap.dataset.mode=gwStanding()??'none';gwState.textContent=gwLabel();gwState.title=gwTitle();gwAllow.hidden=on;gwAllow.disabled=gwBusy||!projectId;gwSettings.disabled=!projectId;gwRevoke.hidden=!on;gwRevoke.disabled=gwBusy}
+  // FEAT-190 r3 (IV run 01a13c5b BROKEN) — `gwLoaded` guards the panel against seeding a draft
+  // before the server policy has arrived. Opening "Manage" during the in-flight loadGrant used to
+  // seed gwDraftFrom(null) → a default-ON commit+push draft, so an untouched Save silently flipped
+  // an EXISTING push:false grant to push:true (a silent over-grant). The panel now shows a loading
+  // state until this resolves; on resolution, an open panel is RE-SEEDED from the real policy.
+  // FEAT-190 r3 (IV run 01a13c6d) — `gwLoadSeq` makes the LATEST loadGrant the sole authority over
+  // the shared grant state (policy/grant/gwLoaded/gwDraft). `guard`'s generation token only
+  // supersedes across navigations; two loadGrant calls within ONE generation (open()'s initial load
+  // AND the re-fetch when the panel opens) both resolve, and a LATE initial response used to re-seed
+  // the draft — discarding the user's in-progress push-OFF edit (silent over-grant). A superseded
+  // loadGrant (seq ≠ gwLoadSeq) now touches nothing. Same pattern as `request` for diffs.
+  async function loadGrant(token=generation){gwLoadSeq+=1;const seq=gwLoadSeq;if(!projectId){grant=null;policy=null;gwReached=[];gwSummary='';gwDraft=null;gwRevision=null;gwLoaded=true;gwLoadFailed=false;paintGrant();if(gwPanelOpen)paintGwPanel();return}try{const r=await guard(token,api.gitWriteGrant(projectId));if(seq!==gwLoadSeq)return;grant=r?.grant??null;policy=r?.policy??null;gwRevision=r?.revision??null;gwReached=Array.isArray(r?.reachedRepos)?r.reachedRepos:[];gwSummary=r?.summary??'';gwDraft=null;gwLoaded=true;gwLoadFailed=false;paintGrant();if(gwPanelOpen){gwDraft=gwDraftFrom(policy);paintGwPanel();}}catch{if(seq!==gwLoadSeq)return;grant=null;policy=null;gwReached=[];gwDraft=null;gwRevision=null;gwLoaded=false;gwLoadFailed=true;paintGrant();if(gwPanelOpen)paintGwPanel();}}
+  // FEAT-190 — the edit buffer the panel mutates, seeded from the server policy.
+  // FEAT-190 r3 — a FRESH grant (no stored policy yet, mode none) DEFAULTS commit AND push ON
+  // ("if i grant, then i have granted … default should allow"). An EXISTING policy reflects its
+  // stored flags exactly, so a previously-set push:false (an explicit opt-out, or a legacy
+  // release grant) is preserved and never silently re-enabled. Push is turned off only by the
+  // explicit push toggle below.
+  function gwDraftFrom(pol){const r=(pol&&pol.release)||{};const granted=!!(pol&&pol.mode&&pol.mode!=='none');return{commit:granted?!!pol.commit:true,push:granted?!!pol.push:true,scope:(pol&&typeof pol.scope==='string')?pol.scope:'',optIn:!!r.opt_in,minTickets:r.minTickets==null?'':String(r.minTickets),maxWaitHours:r.maxWaitHours==null?'':String(r.maxWaitHours),minIntervalHours:r.minIntervalHours==null?'':String(r.minIntervalHours),tagPrefix:r.tagPrefix==null?'':String(r.tagPrefix),overrides:{}};}
+  function gwPayload(){const d=gwDraft,int=s=>{const n=Number(s);return s!==''&&Number.isFinite(n)?n:undefined;},release={opt_in:d.optIn};for(const k of['minTickets','maxWaitHours','minIntervalHours']){const v=int(d[k]);if(v!==undefined)release[k]=v;}if(d.tagPrefix.trim())release.tagPrefix=d.tagPrefix.trim();const repoOverrides={};for(const[k,ov]of Object.entries(d.overrides))repoOverrides[k]=ov;return{commit:d.commit,push:d.commit&&d.push,scope:d.scope.trim()||null,release,...(Object.keys(repoOverrides).length?{repoOverrides}:{}),revision:gwRevision};}
   gwAllow.onclick=async()=>{if(gwBusy||!projectId)return;const token=generation;gwBusy=true;paintGrant();try{const r=await guard(token,api.grantGitWrite(projectId,{scope:'duration',minutes:30}));grant=r?.grant??null;ctx.notify('agent git writes allowed for 30 minutes');gwBusy=false;paintGrant()}catch(e){fail(e.message);gwBusy=false;paintGrant()}};
-  gwRevoke.onclick=async()=>{if(gwBusy||!projectId)return;const wasPerm=grant?.scope==='permanent';const token=generation;gwBusy=true;paintGrant();try{await guard(token,api.revokeGitWrite(projectId));grant=null;ctx.notify(wasPerm?'permanent agent git access revoked':'agent git writes revoked');gwBusy=false;paintGrant()}catch(e){fail(e.message);gwBusy=false;paintGrant()}};
-  gwPerm.onclick=async()=>{if(gwBusy||!projectId)return;if(!gwArmed){gwArmed=true;clearTimeout(gwArmTimer);gwArmTimer=setTimeout(()=>{gwDisarm();paintGrant()},6000);paintGrant();return}gwDisarm();const token=generation;gwBusy=true;paintGrant();try{const r=await guard(token,api.grantGitWrite(projectId,{scope:'permanent'}));grant=r?.grant??null;ctx.notify('agent git writes allowed permanently for this project (revoke any time)');gwBusy=false;paintGrant()}catch(e){fail(e.message);gwBusy=false;paintGrant()}};
+  gwRevoke.onclick=async()=>{if(gwBusy||!projectId)return;const token=generation;gwBusy=true;paintGrant();try{await guard(token,api.revokeGitWrite(projectId));grant=null;policy=null;ctx.notify('agent git writes revoked');gwBusy=false;paintGrant()}catch(e){fail(e.message);gwBusy=false;paintGrant()}};
+  // FEAT-190 — "Manage…" opens the agent-git panel IN PLACE (the controls moved off the Settings
+  // drawer). A tiny DOM helper keeps the panel readable without a framework.
+  function h(tag,props,...kids){const e=document.createElement(tag);for(const[k,v]of Object.entries(props||{})){if(k==='class')e.className=v;else if(k==='text')e.textContent=v;else if(k.startsWith('on')&&typeof v==='function')e[k.toLowerCase()]=v;else if(v!=null)e.setAttribute(k,String(v));}for(const kid of kids.flat())if(kid!=null)e.append(kid.nodeType?kid:document.createTextNode(String(kid)));return e;}
+  function gwToggle(label,on,disabled,onflip){const b=h('button',{type:'button',class:'gt-gw-sw','aria-pressed':String(!!on),'data-on':String(!!on)},on?'on':'off');b.disabled=!!disabled;if(!disabled)b.onclick=onflip;return h('label',{class:'gt-gw-row'},h('span',{text:label}),b);}
+  // FEAT-190 r3 — a save carries the rendered revision (gwPayload) so the server can reject a stale
+  // write (409). On 409 we NEVER auto-retry: we re-fetch the current policy (a fresh revision +
+  // values) and tell the user to review and save again. Revoke (body===null) is not revision-gated.
+  async function gwSave(body,msg){if(gwBusy||!projectId)return;const token=generation;gwBusy=true;gwErr='';paintGwPanel();try{const r=await guard(token,body===null?api.deleteGitWritePolicy(projectId):api.putGitWritePolicy(projectId,body));policy=r?.policy??null;gwRevision=r?.revision??gwRevision;gwSummary=r?.summary??gwSummary;if(Array.isArray(r?.reachedRepos))gwReached=r.reachedRepos;gwDraft=null;ctx.notify(msg);gwBusy=false;paintGrant();paintGwPanel();}catch(e){if(e&&e.status===409){gwErr='These settings changed in another tab or session — review the current values below, then save again.';gwBusy=false;gwDraft=null;gwLoaded=false;paintGwPanel();void loadGrant(token);}else{gwErr=e.message||String(e);gwBusy=false;paintGwPanel();}}}
+  function paintGwPanel(){
+    if(!gwPanel){gwPanel=h('div',{class:'gt-gw-panel',role:'dialog','aria-label':'Agent git'});root.append(gwPanel);}
+    gwPanel.hidden=!gwPanelOpen;gwWrap.dataset.panel=String(gwPanelOpen);
+    if(!gwPanelOpen){gwPanel.replaceChildren();return;}
+    // FEAT-190 r3 — until the server policy has loaded, show a loading state with NO toggles and
+    // NO Save, so the user cannot save a default-on draft over an unknown (possibly push:false)
+    // grant. loadGrant re-paints this panel once it resolves.
+    // FEAT-190 r3 (IV run 01a13c63 BROKEN) — a FAILED policy load must NOT be treated as "no grant".
+    // Show an error with NO toggles and NO Save, so a user cannot save a default-on draft over an
+    // existing (unknown, possibly push:false) grant when the GET errors.
+    if(gwLoadFailed){gwPanel.replaceChildren(h('div',{class:'gt-gw-head'},h('strong',{text:'Agent git for this project'}),h('button',{type:'button',class:'gt-gw-x',onclick:()=>{gwPanelOpen=false;paintGwPanel();}},'×')),h('p',{class:'gt-gw-err',text:'Couldn’t load the current agent-git policy — nothing was changed. Close and reopen to retry.'}));return;}
+    if(!gwLoaded){gwPanel.replaceChildren(h('div',{class:'gt-gw-head'},h('strong',{text:'Agent git for this project'}),h('button',{type:'button',class:'gt-gw-x',onclick:()=>{gwPanelOpen=false;paintGwPanel();}},'×')),h('p',{class:'gt-gw-sum',text:'Loading the current agent-git policy…'}));return;}
+    if(!gwDraft)gwDraft=gwDraftFrom(policy);const d=gwDraft;const mode=policy?.mode??'none';
+    const body=[];
+    body.push(h('div',{class:'gt-gw-head'},h('strong',{text:'Agent git for this project'}),h('button',{type:'button',class:'gt-gw-x',onclick:()=>{gwPanelOpen=false;paintGwPanel();}},'×')));
+    body.push(h('p',{class:'gt-gw-sum',text:gwSummary||'No agent commits (default). Granting lets agents commit and push here (and in the other repos this session works in) by default.'}));
+    // commit / push — default ON; each an opt-OUT. Turning commit ON brings push ON by default
+    // (FEAT-190 r3: a grant allows push unless the user explicitly toggles it off); turning commit
+    // OFF forces push off (push requires commit).
+    body.push(gwToggle('Agents may commit',d.commit,false,()=>{d.commit=!d.commit;d.push=d.commit;paintGwPanel();}));
+    body.push(gwToggle('…and push to the remote',d.commit&&d.push,!d.commit,()=>{d.push=!d.push;paintGwPanel();}));
+    // scope note — OPTIONAL guidance, never narrows the grant
+    const ta=h('textarea',{class:'gt-gw-scope',rows:'2',maxlength:'2000',placeholder:'Optional guidance for agents (free text). Leaving this blank does NOT reduce what the grant allows.'});ta.value=d.scope;ta.oninput=()=>{d.scope=ta.value;};
+    body.push(h('label',{class:'gt-gw-field'},h('span',{text:'Scope note (optional)'}),ta));
+    // release — EXPLICIT opt-in only
+    body.push(gwToggle('Soft releases — blocks agents’ direct pushes; verified work is batched into version-tagged release commits instead of committing or pushing directly',d.optIn,!d.commit,()=>{d.optIn=!d.optIn;paintGwPanel();}));
+    // reached repos (cross-repo), from the audit/reach log — per-repo opt-out
+    if(gwReached.length){const list=h('div',{class:'gt-gw-reached'},h('div',{class:'gt-gw-reached-h',text:`Other repos this grant reached (${gwReached.length})`}));
+      for(const rp of gwReached){const ov=d.overrides[rp.key]||{disabled:rp.disabled,commit:rp.commit,push:rp.push};d.overrides[rp.key]=ov;
+        const name=rp.toplevel||rp.key;const row=h('div',{class:'gt-gw-reached-row','data-disabled':String(!!ov.disabled)},
+          h('code',{class:'gt-gw-reached-name',title:name,text:name.length>52?'…'+name.slice(-50):name}),
+          gwToggle('commit',!ov.disabled&&ov.commit!==false,false,()=>{ov.commit=ov.commit===false;paintGwPanel();}),
+          gwToggle('push',!ov.disabled&&ov.push!==false,false,()=>{ov.push=ov.push===false;paintGwPanel();}),
+          gwToggle('off',!!ov.disabled,false,()=>{ov.disabled=!ov.disabled;paintGwPanel();}));
+        if(rp.remotes&&rp.remotes.length)row.append(h('span',{class:'gt-gw-reached-rem',title:rp.remotes.join(', '),text:`remote: ${rp.remotes[0]}${rp.remotes.length>1?` +${rp.remotes.length-1}`:''}`}));
+        list.append(row);}
+      body.push(list);}
+    // actions
+    const acts=h('div',{class:'gt-gw-acts'});
+    const save=h('button',{type:'button',class:'gt-gw-save',onclick:()=>void gwSave(gwPayload(),'agent git saved')},gwBusy?'Saving…':'Save');save.disabled=gwBusy;acts.append(save);
+    if(mode!=='none'){const rev=h('button',{type:'button',class:'gt-gw-revoke2',onclick:()=>void gwSave(null,'agent commits revoked')},'Revoke');rev.disabled=gwBusy;acts.append(rev);}
+    body.push(acts);
+    if(gwErr)body.push(h('div',{class:'gt-gw-err',text:gwErr}));
+    body.push(h('p',{class:'gt-gw-foot',text:'Every commit and push still runs the leak gate. A push goes to the remote the repo has configured; force-push, --all and preserved-history branches stay refused. Your own commits here are never blocked by this.'}));
+    gwPanel.replaceChildren(...body);
+  }
+  // FEAT-190 r3 (IV run 01a13c67 BROKEN) — opening "Manage" ALWAYS re-fetches the current policy
+  // from the server, never trusting the possibly-stale in-memory `policy` (a second tab may have
+  // changed the grant since this page loaded it). It drops to the loading state and re-seeds the
+  // draft from the fresh policy when loadGrant resolves, so an untouched Save cannot clobber another
+  // tab's push:false with a stale default-on draft. (Residual: a sub-second TOCTOU between this
+  // re-fetch and Save still needs a server-side optimistic-concurrency guard — flagged, not closed.)
+  gwSettings.onclick=()=>{if(!projectId)return;gwPanelOpen=!gwPanelOpen;if(gwPanelOpen){gwLoaded=false;gwLoadFailed=false;gwDraft=null;const token=generation;paintGwPanel();void loadGrant(token);}else paintGwPanel();};
   projectSelect.onchange=()=>ctx.navigate(projectSelect.value,{view});root.querySelectorAll('.gt-views button').forEach(b=>b.onclick=()=>{if(b.dataset.view!==view)ctx.navigate(projectId,{view:b.dataset.view})});title.oninput=paint;branchName.oninput=paint;filter.oninput=()=>{clearTimeout(filterTimer);filterTimer=setTimeout(applyFilter,180)};all.onchange=()=>void toggleAll();
   sync.onclick=async()=>{const action=sync.dataset.action;if(sync.disabled)return;if(action==='fetch')return void fetchNow(generation,true);const token=generation,serverAction=action==='publish'?'push':action;syncing=true;paint();try{const r=await guard(token,api.gitAction(project().id,serverAction));data.status=r.status;ctx.notify(action==='publish'?`published ${r.status?.branch??'branch'} to origin`:action==='push'?'pushed to origin':'pulled from origin');ctx.onStatusChanged?.(r.status,projectId);loadChanges(true,token);syncing=false;paint()}catch(e){fail(e.message);if(e.body?.status)data.status=e.body.status;syncing=false;paint()}};
   commitForm.onsubmit=async e=>{e.preventDefault();if(commit.disabled)return;const token=generation;committing=true;paint();try{const r=await guard(token,api.gitAction(project().id,'commit',{title:title.value,description:description.value}));title.value='';description.value='';ctx.notify(`committed ${r.committed}`);loadChanges(true,token);ctx.onStatusChanged?.(r.status,projectId);committing=false;paint()}catch(x){fail(x.message);committing=false;paint()}};
@@ -162,6 +262,6 @@ export function createGitView(ctx) {
   // (BUG-203 r3 — the projects() dropdown-wipe was exactly that suspend-then-run).
   // Any boolean/Set that gates the UI or tracks an in-flight request belongs in
   // the reset list below.
-  async function open(route={},returnHash='#/'){generation+=1;const token=generation;clearFetch();failures=0;fetchedAt=null;syncing=false;historyBusy=false;branchBusy=false;committing=false;loading=false;batching=false;gwBusy=false;liveConfirmed=false;pending.clear();stashData={stashes:[]};projectId=route.projectId||ctx.getProject()?.id||ctx.getProjects()[0]?.id||null;view=['changes','branches','history','stashes'].includes(route.view)?route.view:'changes';home.href=returnHash;root.setAttribute('aria-hidden','false');slide.open();const current=ctx.getProject(projectId);projectSelect.replaceChildren(...(current?[Object.assign(document.createElement('option'),{value:current.id,textContent:current.name,selected:true})]:[]));if(projectId){void loadGrant(token);void loadView(token);void projects(token);if(view!=='stashes')void loadStashCount(token);if(view==='changes')void fetchNow(token)}}
+  async function open(route={},returnHash='#/'){generation+=1;const token=generation;clearFetch();failures=0;fetchedAt=null;syncing=false;historyBusy=false;branchBusy=false;committing=false;loading=false;batching=false;gwBusy=false;gwPanelOpen=false;gwDraft=null;gwReached=[];gwErr='';gwLoaded=false;gwLoadFailed=false;gwRevision=null;if(gwPanel)gwPanel.hidden=true;liveConfirmed=false;pending.clear();stashData={stashes:[]};projectId=route.projectId||ctx.getProject()?.id||ctx.getProjects()[0]?.id||null;view=['changes','branches','history','stashes'].includes(route.view)?route.view:'changes';home.href=returnHash;root.setAttribute('aria-hidden','false');slide.open();const current=ctx.getProject(projectId);projectSelect.replaceChildren(...(current?[Object.assign(document.createElement('option'),{value:current.id,textContent:current.name,selected:true})]:[]));if(projectId){void loadGrant(token);void loadView(token);void projects(token);if(view!=='stashes')void loadStashCount(token);if(view==='changes')void fetchNow(token)}}
   function close(){generation+=1;clearFetch();clearTimeout(filterTimer);root.setAttribute('aria-hidden','true');slide.close()}return{root,home,open,close,isOpen:slide.isOpen};
 }

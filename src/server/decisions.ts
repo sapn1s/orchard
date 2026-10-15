@@ -198,6 +198,16 @@ export function listOpenForProject(projectId: string): DecisionRecord[] {
 }
 
 /**
+ * The newest record (open OR answered) for a project whose question starts with
+ * `prefix`, or null. For station-raised cards about a STANDING condition: once the
+ * user has seen it, it is not raised again every tick.
+ */
+export function latestForProject(projectId: string, prefix: string): DecisionRecord | null {
+  const rs = readAll().filter((r) => r.projectId === projectId && r.question.startsWith(prefix));
+  return rs.length ? rs.reduce((a, b) => (a.createdAt >= b.createdAt ? a : b)) : null;
+}
+
+/**
  * Mark a record resolved with the user's answer. Idempotent-ish: resolving an
  * already-resolved record just overwrites the answer/delivered fields. Returns
  * the updated record, or null when the id is unknown.

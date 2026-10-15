@@ -52,6 +52,7 @@ import {
 // the resolver too, so it finds docs/bugs (legacy) or .orchard/bugs (flat)
 // without assuming the layout.
 import { resolveBoardDir } from '../../scripts/lib/board-path.mjs';
+import { delegationsForTicket } from './delegations.ts'; // FEAT-184
 
 export type { ReplyKind } from './board.ts';
 
@@ -166,6 +167,8 @@ export interface TicketDetail extends TicketSummary {
    * state only when the server has recorded it (renderChosen discipline).
    */
   answer: TicketAnswerState | null;
+  /** FEAT-184 — delegations the user recorded that cover this ticket (display only). */
+  delegations?: { damaged: string | null; delegations: unknown[] };
 }
 
 /* ────────────────────────────────────────────────────────────────── reading */
@@ -305,6 +308,9 @@ export function readTicket(hostPath: string, id: string): TicketDetail {
     relPath: path.relative(hostPath, file),
     decision: ticketDecision(text),
     answer: ticketAnswerState(text, file),
+    // FEAT-184 — the user's delegations that cover this ticket (the Decide card shows
+    // them and offers to record one). Never authority by itself: adopt re-checks.
+    delegations: delegationsForTicket(hostPath, id),
   };
 }
 
@@ -405,6 +411,15 @@ function entryBody(text: string, label = 'Note'): string {
   return [`- **${label}:** ${first}`, ...rest.map((l) => (l.trim() ? `  ${l}` : ''))].join('\n');
 }
 
+/**
+ * BUG-259 — the ONE composer of an Activity-log entry's bytes, so a writer that
+ * must land the record and its log entry in a single atomic write (board-tool
+ * `own`, the user's decision reopen) produces exactly what appendNote appends.
+ */
+export function composeLogEntry(text: string, opts: { author: string; label?: string }): string {
+  return `\n### ${DATE()} — ${opts.author}\n${entryBody(String(text ?? '').trim(), opts.label || 'Note')}\n`;
+}
+
 /* ──────────────────────────────────────────────────────────────── writing */
 
 export interface WriteResult {
@@ -464,7 +479,7 @@ export function appendNote(
   // whose entries all claim to be the user is a worse record than none.
   const author = String(opts.author ?? '').trim() || USER_SIGNATURE;
   const label = String(opts.label ?? '').trim() || 'Note';
-  const entry = `\n### ${DATE()} — ${author}\n${entryBody(clean, label)}\n`;
+  const entry = composeLogEntry(clean, { author, label });
   fs.appendFileSync(file, entry);
   // A note changes no status, so the board cannot drift — but check anyway:
   // "still green after every write" is the guard, and a check is nearly free.

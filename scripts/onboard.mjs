@@ -613,6 +613,7 @@ const ORCHARD_LIB_SOURCES = [
   'scripts/lib/verdict-contract.mjs', // board.mjs dep
   'scripts/lib/verification-source.mjs', // board.mjs dep (BUG-225 r3 typed verification source)
   'scripts/lib/answer-source.mjs', // board.mjs dep (FEAT-166 r3 typed answer stores)
+  'scripts/lib/delegation-source.mjs', // board.mjs dep (FEAT-184 sealed delegation/answer store)
   'public/lib/ticket-record.js', // verification-source.mjs dep (the one proof rule)
   'scripts/lib/ticket-schema.mjs', // board.mjs + arch-watch.mjs dep
   'scripts/lib/board-path.mjs', // board.mjs + hook dep (FEAT-106 resolver)

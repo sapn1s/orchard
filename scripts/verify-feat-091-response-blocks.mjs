@@ -1851,9 +1851,11 @@ async function main() {
     // (+~440, observed 5687) and both went to 5900. FEAT-149 folded the
     // re-state-the-handoff-after-cleanup clause into that contract (+~200, observed
     // 6102); both pins are now 6200 and the maxChars cap is 6400 (templates.ts) so
-    // the core is delivered whole. Growing past this is a decision.
+    // the core is delivered whole. The ask-subject gate's `about:` clause (+~83,
+    // observed 6277) moved both pins to 6300, still under the 6400 cap.
+    // Growing past this is a decision.
     check('the injected core stays inside its stated budget',
-      sec.length <= 6200 && sec.length < 6400, { sectionChars: sec.length });
+      sec.length <= 6300 && sec.length < 6400, { sectionChars: sec.length });
   }
 
   if (docPresent) {

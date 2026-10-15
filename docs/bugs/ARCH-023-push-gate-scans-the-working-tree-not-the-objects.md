@@ -5,58 +5,90 @@
   "title": "Push gate scans the working tree, not the objects git transmits",
   "summary": "The agent push gate scans the working tree and the staged index and treats that as what the push publishes. But git transmits commit objects and blobs addressed by content, including path names. Three secrets slip past: one living only in a file name, one inside a .png blob bytes, and one committed then deleted but still in history.",
   "impact_if_we_wait": "A granted agent can publish a secret to a remote while the push gate returns a clean PASS, so the gate core promise is unmet. Allowlist curation unblocks benign old hits but closes none of the three holes.",
-  "current_need": "Decide how the push gate scopes a scan of the objects git actually transmits, including path names and binary bytes, given the host cannot trust its own computation of what the destination already has.",
+  "current_need": "Build A: scan every object reachable from the pushed refs, with the allowlist staged in the same change so pushes are not blocked.",
   "severity": "high",
   "area": "leak-gate / git-grant / push",
   "reported": "2026-10-07",
   "reported_by": "user",
-  "owner": "you",
-  "work_state": "blocked",
-  "human_action": "decide",
-  "updated": "2026-10-06",
-  "decision": {
-    "id": "14209afd-4cfc-400d-817f-7e8cfb28930d",
-    "mode": "single",
-    "question": "How should the push gate scope its scan of the objects a push transmits, given the host cannot trust its own view of the destination?",
-    "options": [
-      {
-        "key": "A",
-        "label": "Scan all objects reachable from pushed refs",
-        "what_changes": "Scan every commit, tree-entry name and blob reachable from the refs being pushed, plus binary bytes; do not subtract what the destination may already hold.",
-        "benefit": "Destination-independent, so env/config cannot make it miss; closes all three breaks.",
-        "cost": "Re-scans whole reachable history each push; benign old hits re-block until curated into the allowlist.",
-        "why_not_obvious": "Less precise than a destination-aware diff, but precision there is exactly what the agent can subvert."
+  "owner": "unassigned",
+  "work_state": "open",
+  "human_action": "none",
+  "updated": "2026-10-15",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": "14209afd-4cfc-400d-817f-7e8cfb28930d",
+      "asked_on": "2026-10-06",
+      "question": "How should the push gate scope its scan of the objects a push transmits, given the host cannot trust its own view of the destination?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C",
+        "C2"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-14",
+      "chosen_by": "agent",
+      "note": "Decided by the agent (worker (BUG-259 fixing r1)), not by you — recommendation: Makes the push gate stricter, not looser; A is the only destination-independent option.",
+      "owned": {
+        "by": "worker (BUG-259 fixing r1)",
+        "basis": "recommendation",
+        "ref": null,
+        "why": "Makes the push gate stricter, not looser; A is the only destination-independent option.",
+        "on": "2026-10-14",
+        "next": "Build A: scan every object reachable from the pushed refs, with the allowlist staged in the same change so pushes are not blocked.",
+        "handoff": null,
+        "prior": {
+          "human_action": "decide",
+          "work_state": "blocked",
+          "current_need": "Decide how the push gate scopes a scan of the objects git actually transmits, including path names and binary bytes, given the host cannot trust its own computation of what the destination already has."
+        }
       },
-      {
-        "key": "B",
-        "label": "Narrow to objects the destination lacks",
-        "what_changes": "Compute the outgoing set relative to the remote via dry-run or ls-remote and scan only that.",
-        "benefit": "Precise and fast; no re-block of old hits already on the remote.",
-        "cost": "Round 2 proved it unsafe: env/config and multiple pushurls make the host resolve a different destination than the real push.",
-        "why_not_obvious": "It looks like the right fix and the ticket first approved it, but it regresses push safety versus scanning everything."
-      },
-      {
-        "key": "C",
-        "label": "Enforce inside a forced pre-push hook",
-        "what_changes": "The pre-push hook receives the real resolved refs and shas; scan those objects there, forcing the hook on.",
-        "benefit": "Destination-aware and TOCTOU-free, because the hook receives the resolved destination, not the host.",
-        "cost": "Agent bypasses via --no-verify or core.hooksPath; forcing it is the argv parser ARCH-021 rejects.",
-        "why_not_obvious": "It is the only destination-truthful option, yet enforcing it recreates the shell/argv parser anti-pattern at a new layer."
-      },
-      {
-        "key": "C2",
-        "label": "Do nothing, keep scanning the working tree",
-        "what_changes": "Leave the gate scanning working tree and staged index only.",
-        "benefit": "No work; fast.",
-        "cost": "All three breaks stay reachable: a secret in a path, in a .png, or in removed history still publishes.",
-        "why_not_obvious": "The invariant is silently unmet; nothing fails loudly, which is how it has survived."
+      "snapshot": {
+        "id": "14209afd-4cfc-400d-817f-7e8cfb28930d",
+        "mode": "single",
+        "question": "How should the push gate scope its scan of the objects a push transmits, given the host cannot trust its own view of the destination?",
+        "options": [
+          {
+            "key": "A",
+            "label": "Scan all objects reachable from pushed refs",
+            "what_changes": "Scan every commit, tree-entry name and blob reachable from the refs being pushed, plus binary bytes; do not subtract what the destination may already hold.",
+            "benefit": "Destination-independent, so env/config cannot make it miss; closes all three breaks.",
+            "cost": "Re-scans whole reachable history each push; benign old hits re-block until curated into the allowlist.",
+            "why_not_obvious": "Less precise than a destination-aware diff, but precision there is exactly what the agent can subvert."
+          },
+          {
+            "key": "B",
+            "label": "Narrow to objects the destination lacks",
+            "what_changes": "Compute the outgoing set relative to the remote via dry-run or ls-remote and scan only that.",
+            "benefit": "Precise and fast; no re-block of old hits already on the remote.",
+            "cost": "Round 2 proved it unsafe: env/config and multiple pushurls make the host resolve a different destination than the real push.",
+            "why_not_obvious": "It looks like the right fix and the ticket first approved it, but it regresses push safety versus scanning everything."
+          },
+          {
+            "key": "C",
+            "label": "Enforce inside a forced pre-push hook",
+            "what_changes": "The pre-push hook receives the real resolved refs and shas; scan those objects there, forcing the hook on.",
+            "benefit": "Destination-aware and TOCTOU-free, because the hook receives the resolved destination, not the host.",
+            "cost": "Agent bypasses via --no-verify or core.hooksPath; forcing it is the argv parser ARCH-021 rejects.",
+            "why_not_obvious": "It is the only destination-truthful option, yet enforcing it recreates the shell/argv parser anti-pattern at a new layer."
+          },
+          {
+            "key": "C2",
+            "label": "Do nothing, keep scanning the working tree",
+            "what_changes": "Leave the gate scanning working tree and staged index only.",
+            "benefit": "No work; fast.",
+            "cost": "All three breaks stay reachable: a secret in a path, in a .png, or in removed history still publishes.",
+            "why_not_obvious": "The invariant is silently unmet; nothing fails loudly, which is how it has survived."
+          }
+        ],
+        "recommendation": "A",
+        "recommendation_reason": "A is the only destination-independent option, so it is the one the agent cannot subvert through env or config; it closes all three breaks and pairs with allowlist curation to unblock benign old hits.",
+        "prerequisite": null
       }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "A is the only destination-independent option, so it is the one the agent cannot subvert through env or config; it closes all three breaks and pairs with allowlist curation to unblock benign old hits.",
-    "prerequisite": null
-  },
-  "decision_history": [],
+    }
+  ],
   "success_criteria": [
     "A secret present only in a file name within a pushed commit is blocked.",
     "A secret embedded in a .png blob in a pushed commit is blocked.",
@@ -248,3 +280,14 @@ worth its risk.
 
 ### 2026-10-06 — redesign filing (FEAT-169 handoff)
 - **Decision declared:** How should the push gate scope its scan of the objects a push transmits, given the host cannot trust its own view of the destination? Options: A — Scan all objects reachable from pushed refs; B — Narrow to objects the destination lacks; C — Enforce inside a forced pre-push hook; C2 — Do nothing, keep scanning the working tree. Recommended: A — A is the only destination-independent option, so it is the one the agent cannot subvert through env or config; it closes all three breaks and pairs with allowlist curation to unblock benign old hits. Written to the record with board-tool decide; the Decide card reads the record, not this line.
+
+### 2026-10-14 — worker (BUG-259 fixing r1)
+- **Decided by agent (own):** Decided by the agent, not by you. Basis: recommendation. Chose: A. Why: Makes the push gate stricter, not looser; A is the only destination-independent option. Next: Build A: scan every object reachable from the pushed refs, with the allowlist staged in the same change so pushes are not blocked. You can reopen this decision from the ticket view.
+
+### 2026-10-15 — worker (plan+review, dispatched from FEAT-190 r11) — NEW EVIDENCE: option A is unworkable for Orchard; decision needs reopening
+- **This is the home of the FEAT-190 r11 IV finding.** FEAT-190's clean-room IV (runs cf10f5cb / 40ea8f5b / 8d65234c) re-surfaced break (c): on a push the gate scans the WORKING TREE + staged index (`runLeakGateForRepoAsync` → `leak-gate.mjs --summary` + `--staged`), never the pushed commits, so a leak only in history / on a non-checked-out branch / in a commit message / in author-committer identity publishes unscanned. This is ARCH-023, not a new bug, and it PREDATES FEAT-190: at committed HEAD (`ed92aff`, the batch that landed this ticket's filing) the push path already used the working-tree scan; `leak-gate.mjs:136` documents it ("PUSH keeps the full-tree scan"). FEAT-190's uncommitted work is grant policy/UI, orthogonal to gate scope. Recorded likewise on FEAT-190.
+- **Measured on the real repo (not a fixture) — option A (chosen) is UNWORKABLE for Orchard itself:** reachable history = 66 commits / 4535 objects; it carries 210 `/home/...` occurrences in old diffs AND the owner's real private email as the author/committer IDENTITY of 2 already-published commits. Identity tokens are NON-WAIVABLE (FEAT-156) — cannot go in `.leakgate-allow`. So "scan every object reachable from the pushed refs" would hit those 2 commits and REFUSE every Orchard push forever, with no allowlist escape. The ticket's own falsifier ("if a realistic repo's all-reachable scan is so noisy the user turns the gate off, A is the wrong call") FIRES here. By contrast the current 7-commit outgoing range (origin/main..HEAD) is clean (noreply identity, no leak in diffs/messages), so an outgoing-only scan passes.
+- **But the obvious outgoing scope (`--not --remotes`) is exactly the forgeable option B this ticket rejected:** remote-tracking refs are agent-writable local refs → false-empty range → leak slips. So neither the recorded A nor a naive B is shippable.
+- **Independent plan review (fresh-context Anthropic, skeptic) verdict: REVISE.** A viable "outgoing set against a NON-FORGEABLE host-computed baseline" exists but needs real infrastructure, each a blocker: (1) the grant binding stores a lossy normalized `networkKey`, NOT a fetchable URL — needs a new raw-URL field recorded at grant time + migration/re-grant; (2) make-or-break: a host `ls-remote` is config-forgeable via the repo's own `.git/config` (`insteadOf`/`sshCommand`/`http.proxy`/`credential.helper`/`url.*`) even with a scrubbed ENV — it must run OUTSIDE the repo with `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null` + protocol allowlist, consulting zero agent-controlled config, else B's hole reopens; (3) baseline must target the SPECIFIC authorized push destination (grants can bind >1), not "the" remote; (4) scope must be an all-refs superset (never let argv narrow — ARCH-021) plus a gate↔push ref-repoint TOCTOU binding the existing BUG-249 fingerprint does NOT cover (it checks index+worktree, not the commit graph/ref targets); the pushed-object-reachable-from-no-ref dangling-object case stays an accepted residual only A/C see. (5) baseline-uncomputable → fail-closed REFUSE ("refuse-only-new" is incoherent without a baseline); surfaces a credential/offline caveat for private remotes (host needs creds to `ls-remote`, else pushes get brittle). `ls-remote` (unlike a push dry-run) runs NO repo pre-push hook, so the LFS objection to B does not apply to a plain ls-remote.
+- **RECOMMENDATION — reopen this decision.** The recorded choice A should be revisited with the new self-block evidence. Candidate replacement: "scan the OUTGOING set (identity + message + diff/bytes) against a host-computed, config-neutralized, per-destination baseline; fail-closed refuse when the baseline can't be computed" — strictly better than A for real repos, but it reverses a recorded decision AND adds grant-binding infrastructure + a credential story, so it is a user/orchestrator-owned decision, not a round-1 build. A reviewer-proposed hybrid (scan-all per A, but apply the non-waivable identity rule only to the OUTGOING delta) was examined and does NOT escape blocker #2: its downgrade step still needs a non-forgeable "already-published" proof, so a forged-larger baseline could still hide a new identity leak.
+- **NOT fixed this round.** No code changed for this ticket. Every path is disqualified for an immediate build: A self-blocks Orchard, naive B is forgeable, the viable path reverses a settled decision and needs new infrastructure. Held for the reopened decision.

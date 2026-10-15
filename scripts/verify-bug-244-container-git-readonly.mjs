@@ -29,6 +29,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { assertIsolatedDocker } from './lib/docker-sandbox.mjs';
+import { repoIdentityOf } from './lib/repo-identity.mjs';
 
 assertIsolatedDocker('verify-bug-244-container-git-readonly');
 
@@ -79,7 +80,7 @@ if (!argv.includes('--single')) {
   want('M1 pre run: every P1 refusal check FAILS (the attack works on the old code)', p1pre.filter((k) => !/effective$|^P1\.reads/.test(k)).every((k) => R.pre.res[k] === 'FAIL') && p1pre.length > 10, `${p1pre.filter((k) => R.pre.res[k] === 'FAIL').length}/${p1pre.length} P1 checks fail on pre`);
   want('M1b pre run: every attack is shown to really change the repo on the old code (genuine control)', p1preEff.length > 10 && p1preEff.every((k) => R.pre.res[k] === 'PASS'), `${p1preEff.filter((k) => R.pre.res[k] === 'PASS').length}/${p1preEff.length}`);
   const p2 = keys(R.pre.res, /^P2\.granted/);
-  want('M2 pre run: the granted control passes on the old code too (a regression control, not a must-FAIL)', p2.length >= 3 && p2.every((k) => R.pre.res[k] === 'PASS'), p2.map((k) => `${k}=${R.pre.res[k]}`).join(' '));
+  want('M2 pre run: the granted control passes on the old code too (a regression control, not a must-FAIL)', p2.length >= 2 && p2.every((k) => R.pre.res[k] === 'PASS'), p2.map((k) => `${k}=${R.pre.res[k]}`).join(' '));
   const p3m = keys(R.mutant.res, /^P3\.(live|start|restart|idle)/);
   want('M3 mutant run: at least one P3 no-recreate/no-refusal check FAILS', p3m.some((k) => R.mutant.res[k] === 'FAIL') && mutantOk, `mutant line found=${mutantOk}; ${p3m.map((k) => `${k}=${R.mutant.res[k]}`).join(' ')}`);
   want('M3b mutant run: P1 still passes (the mutant differs only in drift handling)', keys(R.mutant.res, /^P1\./).every((k) => R.mutant.res[k] === 'PASS'), `${keys(R.mutant.res, /^P1\./).filter((k) => R.mutant.res[k] === 'PASS').length}/${keys(R.mutant.res, /^P1\./).length}`);
@@ -220,6 +221,9 @@ function restore() {
   ].join(' && '));
 }
 const gitDir = (k) => path.join(FX, REPOS[k], '.git');
+/** FEAT-164 grant binding: a REAL standing grant records the repo identity it is given for (setGitWritePolicy
+ * stores `repo` inside the seal; the container plan opens only that repository). Fixtures grant the same way. */
+const granted = (dir, extra = {}) => ({ permanent: true, ...extra, repo: repoIdentityOf(dir) });
 
 const DEV_PIN = { pinned: 'dev', skipped: [], deferred: null };
 const baseProject = (id, hostPath, extra = {}) => ({
@@ -234,7 +238,7 @@ const P1 = baseProject(`b244p1-${RUN_ID}`, path.join(FX, REPOS.proj), {
 });
 const Q = baseProject(`b244q-${RUN_ID}`, path.join(FX, REPOS.q));
 const P2 = baseProject(`b244p2-${RUN_ID}`, path.join(FX, REPOS.gproj), {
-  gitWrite: { permanent: true, grantedAt: new Date().toISOString(), grantedVia: 'test' },
+  gitWrite: granted(path.join(FX, REPOS.gproj), { grantedAt: new Date().toISOString(), grantedVia: 'test' }),
   mounts: [
     { hostPath: path.join(FX, REPOS.q), containerPath: '/workspace/q', readOnly: false },
     { hostPath: path.join(FX, REPOS.u), containerPath: '/workspace/u', readOnly: false },
@@ -350,7 +354,9 @@ try {
   }
   {
     const deep = cm.desiredBinds(P1).some((b) => b.containerPath.endsWith('/deep/a/b/.git'));
-    check('R1 documented residual: a repo three levels below a bind root gets no overlay (reduced guarantee, recorded)', !deep, `deep overlay=${deep}`);
+    // FEAT-164 (verify 1659cb7f): the guard's discovery is a capped walk (depth 8), so the old depth-1 residual is
+    // retired: a repo three levels below a bind root now gets its read-only overlay too.
+    check('R1 a repo three levels below a bind root gets a read-only overlay (capped walk; the depth-1 residual is retired)', deep, `deep overlay=${deep}`);
     const cr = ex(name1, 'test ! -e "$HOME/.ssh" && test -z "$SSH_AUTH_SOCK" && test ! -e "$HOME/.git-credentials" && test ! -e "$HOME/.config/gh" && echo NO-CREDS');
     check('R2 push residual: the container is given no host git credentials (no ~/.ssh, agent socket, credential store, gh config)', /NO-CREDS/.test(cr.out), cr.out);
   }
@@ -377,7 +383,7 @@ try {
       // BUG-244 IV r6 (run 33d49218): a grant flip on a project whose rw mount ROOT is a bare repo is a
       // gitguard-only (informational) change: not refused under a live lease, not recreated at an idle Start.
       const id4 = cid(name4);
-      const P4g = { ...P4, settings: { ...P4.settings, gitWrite: { permanent: true } } };
+      const P4g = { ...P4, settings: { ...P4.settings, gitWrite: granted(P4.hostPath) } };
       cm.invalidate(P4.id);
       const r4g = cm.statusOf(P4g).driftReasons ?? [];
       const a4g = await admit(P4g, tag('p4g')).then(() => null, (e) => e);
@@ -432,12 +438,22 @@ try {
   for (const [label, key, wd, cmd] of [
     ['granted.commit', 'gproj', wd2, `${G} commit -qm agent`],
     ['granted.update-ref', 'gproj', wd2, `${G} update-ref refs/heads/side HEAD~1`],
-    ['granted.unregistered-mount-commit', 'u', '/workspace/u', `${G} commit -qm agent`],
   ]) {
     restore();
     const before = digest(gitDir(key));
     const r = ex(name2, cmd, wd);
     check(`P2.${label}`, r.code === 0 && digest(gitDir(key)) !== before, `exit ${r.code} ${r.out.slice(0, 100)}`);
+  }
+  // FEAT-164 single authority (verify 1659cb7f): P2's grant covers ONLY the repository it was given for. An
+  // UNREGISTERED repo P2 mounts rw (u) is another repository, so it is read-only too. On the pre-fix code the
+  // grant unlocked it: a must-FAIL there (M1), with its effectiveness twin (M1b).
+  {
+    restore();
+    const before = digest(gitDir('u'));
+    const r = ex(name2, `${G} commit -qm agent`, '/workspace/u');
+    const after = digest(gitDir('u'));
+    check('P1.granted-unregistered-mount-commit.effective', r.code === 0 ? after !== before : true, `exit ${r.code}, repo ${before} -> ${after}`);
+    check('P1.granted-unregistered-mount-commit', r.code !== 0 && after === before, `exit ${r.code} (${r.out.slice(0, 110)})`);
   }
   for (const [label, cmd] of [['commit', `${G} commit -qm agent`], ['update-ref', `${G} update-ref refs/heads/main HEAD~1`]]) {
     restore();
@@ -470,7 +486,7 @@ try {
     const cmP = cmPre;
     const same = JSON.stringify(cm.desiredBinds(pn)) === JSON.stringify(cmP.desiredBinds(pn));
     check('U.non-git a non-git project\'s bind list is byte-identical to the pre-fix code (no drift for it)', same, `identical=${same}`);
-    const pg = { ...P3, settings: { ...P3.settings, gitWrite: { permanent: true } } };
+    const pg = { ...P3, settings: { ...P3.settings, gitWrite: granted(P3.hostPath) } };
     const sameG = JSON.stringify(cm.desiredBinds(pg)) === JSON.stringify(cmP.desiredBinds(pg));
     check('U.granted a granted project\'s bind list is byte-identical to the pre-fix code (granted keeps today\'s behaviour)', sameG, `identical=${sameG}`);
   }
@@ -490,7 +506,7 @@ try {
     for (const d of ['dist', 'build', 'target', 'venv']) check(`U.nested-name-${d} a repo at <project>/${d} gets a read-only overlay`, got.includes(`${wdA}/${d}/.git`), JSON.stringify(got));
     const Qs = baseProject(`b244qs-${RUN_ID}`, path.join(A, 'g', 'q'));
     fs.writeFileSync(path.join(DATA, 'registry.json'), JSON.stringify({ version: 1, projects: [Q, Qs] }, null, 2));
-    const pg = baseProject(`b244g-${RUN_ID}`, path.join(A, 'g'), { gitWrite: { permanent: true } });
+    const pg = baseProject(`b244g-${RUN_ID}`, path.join(A, 'g'), { gitWrite: granted(path.join(A, 'g')) });
     const gg = cm.desiredBinds(pg).filter((b) => b.why === cm.GIT_GUARD_WHY).map((b) => `${b.hostPath} -> ${b.containerPath}`);
     const qReal = fs.realpathSync(path.join(A, 'g', '.git', 'modules', 'q'));
     check('U.submodule-project registered ungranted submodule project Q inside granted G: Q\'s git dir (G/.git/modules/q) is overlaid read-only, G\'s own .git is not', gg.some((s) => s.startsWith(`${qReal} -> `)) && !gg.some((s) => s.startsWith(`${fs.realpathSync(path.join(A, 'g', '.git'))} -> `)), JSON.stringify(gg));
@@ -503,7 +519,7 @@ try {
     const Qwt = baseProject(`b244qwt-${RUN_ID}`, path.join(A, 'q-wt'));
     const Qmono = baseProject(`b244qmono-${RUN_ID}`, path.join(A, 'g2', 'mono', 'svc'));
     fs.writeFileSync(path.join(DATA, 'registry.json'), JSON.stringify({ version: 1, projects: [Q, Qwt, Qmono] }, null, 2));
-    const pg2 = baseProject(`b244g2-${RUN_ID}`, path.join(A, 'g2'), { gitWrite: { permanent: true } });
+    const pg2 = baseProject(`b244g2-${RUN_ID}`, path.join(A, 'g2'), { gitWrite: granted(path.join(A, 'g2')) });
     const g2 = cm.desiredBinds(pg2).filter((b) => b.why === cm.GIT_GUARD_WHY).map((b) => b.hostPath);
     check('U.worktree-project registered ungranted worktree project Q: the shared git dir it uses (main/.git) is read-only in granted G', g2.includes(fs.realpathSync(path.join(A, 'g2', 'main', '.git'))), JSON.stringify(g2));
     check('U.monorepo-project registered ungranted project Q in a monorepo subfolder: the monorepo .git is read-only in granted G', g2.includes(fs.realpathSync(path.join(A, 'g2', 'mono', '.git'))), JSON.stringify(g2));
@@ -521,7 +537,7 @@ try {
     const Qu = baseProject(`b244qu-${RUN_ID}`, path.join(A, 'umb'));
     fs.writeFileSync(path.join(DATA, 'registry.json'), JSON.stringify({ version: 1, projects: [Q, Q3, Qu] }, null, 2));
     const pg3 = baseProject(`b244g3-${RUN_ID}`, path.join(A, 'g3'), {
-      gitWrite: { permanent: true },
+      gitWrite: granted(path.join(A, 'g3')),
       mounts: [{ hostPath: path.join(A, 'q3'), containerPath: '/workspace/q3', readOnly: false }, { hostPath: path.join(A, 'umb'), containerPath: '/workspace/umb', readOnly: false }],
     });
     const g3 = cm.desiredBinds(pg3).filter((b) => b.why === cm.GIT_GUARD_WHY).map((b) => b.containerPath);
@@ -532,7 +548,7 @@ try {
     helper([`mkdir -p ${A}/umb2 ${A}/site`, `git init -q -b main ${A}/umb2/api`, `cd ${A}/site && git init -q -b main . && git init -q -b main dist`].join(' && '));
     fs.writeFileSync(path.join(DATA, 'registry.json'), JSON.stringify({ version: 1, projects: [Q, baseProject(`b244u2-${RUN_ID}`, path.join(A, 'umb2')), baseProject(`b244st-${RUN_ID}`, path.join(A, 'site'))] }, null, 2));
     for (const [nm, dir] of [['umbrella', path.join(A, 'umb2', 'api')], ['repo', path.join(A, 'site', 'dist')]]) {
-      const pgN = baseProject(`b244gn${nm}-${RUN_ID}`, dir, { gitWrite: { permanent: true } });
+      const pgN = baseProject(`b244gn${nm}-${RUN_ID}`, dir, { gitWrite: granted(dir) });
       const gN = cm.desiredBinds(pgN).filter((b) => b.why === cm.GIT_GUARD_WHY);
       check(`U.granted-nested-under-${nm} a granted project one level below an ungranted registered ${nm} keeps its own .git writable (no overlay)`, gN.length === 0, JSON.stringify(gN.map((b) => b.containerPath)));
     }
@@ -553,7 +569,12 @@ try {
     }
     const pg2u = { ...pg2, id: `b244g2u-${RUN_ID}` };
     fs.writeFileSync(path.join(DATA, 'registry.json'), JSON.stringify({ version: 1, projects: [Q] }, null, 2));
-    check('U.granted-unregistered with no ungranted registered user of them, the same repos stay writable for granted G', cm.desiredBinds(pg2u).every((b) => b.why !== cm.GIT_GUARD_WHY), 'no overlays');
+    // FEAT-164 single authority (verify 1659cb7f): with no registered user of them, the repos nested under granted G
+    // are STILL other repositories, so they are read-only; only G's own repository stays writable.
+    const gu = cm.desiredBinds(pg2u).filter((b) => b.why === cm.GIT_GUARD_WHY).map((b) => b.hostPath);
+    let g2own = null; try { g2own = fs.realpathSync(path.join(A, 'g2', '.git')); } catch { /* g2 is not itself a repo */ }
+    check('U.granted-unregistered unregistered repos nested under granted G are read-only too (the grant covers only G\'s repository)',
+      gu.includes(fs.realpathSync(path.join(A, 'g2', 'main', '.git'))) && gu.includes(fs.realpathSync(path.join(A, 'g2', 'mono', '.git'))) && (g2own === null || !gu.includes(g2own)), JSON.stringify(gu));
   }
 
   /* ======================================================= P3 ===== */
@@ -595,7 +616,7 @@ try {
   // A grant given while a session is live: kept; it rides the next natural recreate (a memory change, idle).
   const t35 = tag('p3g');
   await admit(P3, t35);
-  const P3g = { ...P3, settings: { ...P3.settings, gitWrite: { permanent: true } } };
+  const P3g = { ...P3, settings: { ...P3.settings, gitWrite: granted(P3.hostPath) } };
   cm.invalidate(P3.id);
   const r35 = cm.statusOf(P3g).driftReasons ?? [];
   const a35 = await admit(P3g, tag('p3g2')).then(() => null, (e) => e);

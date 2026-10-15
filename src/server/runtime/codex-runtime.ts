@@ -65,6 +65,17 @@ import type {
   RuntimeStartConfig,
 } from './runtime.ts';
 
+/**
+ * 2026-10-13 — the text of the composed system prompt (`RuntimeStartConfig.systemPrompt`,
+ * the one AgentSession builds for every engine) as Codex `developerInstructions`. Both
+ * shapes carry the same composed text: a bare string (replace mode) or the preset's
+ * `append`. Nothing composed → null (the wire is byte-identical to before).
+ */
+export function codexDeveloperInstructions(sp: RuntimeStartConfig['systemPrompt']): string | null {
+  const text = typeof sp === 'string' ? sp : sp && typeof sp === 'object' ? sp.append : '';
+  return typeof text === 'string' && text.trim() ? text : null;
+}
+
 /* ------------------------------------------------------------------ queue */
 
 /** Pushable async iterable — the outbound RuntimeMessage stream. */
@@ -318,6 +329,11 @@ export class CodexRuntime implements AgentRuntime {
     // detach — never destroy work on a guess); with every row settled it
     // answers `no` and the session closes exactly as before.
     backgroundLifetime: 'absent',
+    // FEAT-177: the app-server wire vocab has no `input_image` item, so this
+    // engine cannot receive images or PDFs. The send path refuses a message
+    // carrying one LOUDLY (never a silent text-only drop); text-file
+    // attachments are inlined as text blocks and ride fine.
+    imageAttachments: false,
   };
 
   #out = new MessageQueue();
@@ -333,7 +349,7 @@ export class CodexRuntime implements AgentRuntime {
   #turnActive = false;
   /** Follow-up turns queued while one is in flight — the adapter serialises
    *  turn/start calls, playing the role InputQueue plays for the Claude CLI. */
-  #sendQueue: string[] = [];
+  #sendQueue: Array<{ text: string; content?: ReadonlyArray<Record<string, unknown>> }> = [];
 
   #mode: CodexModeConfig | null = null;
   /** Model override for the NEXT turn; undefined = untouched, null = cleared. */
@@ -512,14 +528,23 @@ export class CodexRuntime implements AgentRuntime {
     });
     this.#notify('initialized', {});
 
+    // 2026-10-13 — the SAME composed instructions a Claude session gets (WA, conventions,
+    // response format, the per-project agent git policy note, …), built ONCE by
+    // AgentSession (composeInstructions + notes) and handed to every runtime as
+    // `config.systemPrompt`. Codex takes them as `developerInstructions`, which ADD to
+    // Codex's own base instructions (tool use, apply_patch) rather than replacing them —
+    // the analogue of Claude's `preset: claude_code, append`. Sent on start, resume and
+    // fork alike, as Claude's systemPrompt is.
+    const dev = codexDeveloperInstructions(config.systemPrompt);
+    const devParam = dev ? { developerInstructions: dev } : {};
     let threadResult: any;
     if (config.resume) {
       // resume → thread/resume; resume+forkSession → thread/fork (a new thread
       // branched off the old one) — the same pairing options.resume/forkSession
       // express for Claude.
       threadResult = config.forkSession
-        ? await this.#request('thread/fork', { threadId: config.resume })
-        : await this.#request('thread/resume', { threadId: config.resume });
+        ? await this.#request('thread/fork', { threadId: config.resume, ...devParam })
+        : await this.#request('thread/resume', { threadId: config.resume, ...devParam });
     } else {
       // Schema-validated (P2c): thread/start takes `sandbox` (SandboxMode
       // string) — NOT `sandboxMode` — and has NO reasoning-effort key at all;
@@ -531,6 +556,7 @@ export class CodexRuntime implements AgentRuntime {
         cwd: config.cwd,
         approvalPolicy: this.#mode!.approvalPolicy,
         sandbox: this.#mode!.sandbox,
+        ...devParam,
       });
     }
     this.#threadId = String(threadResult?.thread?.id ?? '');
@@ -550,7 +576,7 @@ export class CodexRuntime implements AgentRuntime {
       slash_commands: [], // Codex has no Claude-style slash-command list
     });
 
-    this.#startTurn(config.firstPrompt);
+    this.#startTurn(config.firstPrompt, config.firstContent);
   }
 
   /**
@@ -584,19 +610,19 @@ export class CodexRuntime implements AgentRuntime {
     if (pick) this.#fallbackModel = pick;
   }
 
-  send(text: string): void {
+  send(text: string, content?: ReadonlyArray<Record<string, unknown>>): void {
     if (this.#closed) throw new Error('runtime closed');
     if (!this.#threadId || this.#turnActive) {
       // Serialised like InputQueue: queued until the in-flight turn completes.
       // (turn/steer could inject into the live turn; deferred to P2c where the
       // real binary can prove its semantics.)
-      this.#sendQueue.push(text);
+      this.#sendQueue.push({ text, content });
       return;
     }
-    this.#startTurn(text);
+    this.#startTurn(text, content);
   }
 
-  #startTurn(text: string): void {
+  #startTurn(text: string, content?: ReadonlyArray<Record<string, unknown>>): void {
     this.#turnActive = true;
     this.#lastUsage = undefined; // per-turn: filled by thread/tokenUsage/updated
     /*
@@ -619,9 +645,26 @@ export class CodexRuntime implements AgentRuntime {
       }
       if (ensured.restored) console.warn(`[orchard] BUG-230: restored a missing git shim (${this.#gitShim.shimDir})`);
     }
+    // FEAT-177: when the message carries (text-file) attachments the bridge
+    // passes the resolved content blocks. The app-server only understands
+    // text items, so refuse loudly if a non-text block reached here (image/PDF
+    // should already have been refused upstream by the imageAttachments:false
+    // capability — this is defence in depth, never a silent drop).
+    let input: Array<Record<string, unknown>> = [{ type: 'text', text }];
+    if (content && content.length) {
+      const bad = content.find((b) => (b as { type?: unknown }).type !== 'text');
+      if (bad) {
+        this.#finishTurn({
+          type: 'result', subtype: 'error_during_execution', is_error: true, num_turns: 1,
+          result: 'This session runs on codex, which cannot receive image or document attachments — remove them or switch the session to a Claude provider.',
+        });
+        return;
+      }
+      input = content.map((b) => ({ type: 'text', text: String((b as { text?: unknown }).text ?? '') }));
+    }
     const params: Record<string, unknown> = {
       threadId: this.#threadId,
-      input: [{ type: 'text', text }],
+      input,
       // Mode/model overrides apply from THIS (next) turn — app-server has no
       // mid-turn switch, which is the honest permissionModes caveat.
       // Schema-validated (P2c): turn/start takes `sandboxPolicy` (an OBJECT
@@ -1119,7 +1162,7 @@ export class CodexRuntime implements AgentRuntime {
     for (const [id, a] of this.#collabAgents) { if (!a.settled) this.#settleAgent(id, verdict); }
     this.#out.push(resultMsg);
     const next = this.#sendQueue.shift();
-    if (next != null && !this.#closed) this.#startTurn(next);
+    if (next != null && !this.#closed) this.#startTurn(next.text, next.content);
   }
 
   /* ------------------------------------------------- subagents (FEAT-037) */

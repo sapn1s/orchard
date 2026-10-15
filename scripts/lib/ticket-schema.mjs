@@ -100,6 +100,7 @@
 /* ─────────────────────────────────────────────────────────── enums (§2.3–2.5) */
 
 /** Ticket type, derived from the id prefix but stored so no renderer re-derives. */
+
 export const TICKET_TYPES = ['bug', 'feature', 'architecture', 'deploy'];
 
 /** The machine work state. ARCH-004 option B: a fixed set, not prose. */
@@ -1288,8 +1289,48 @@ export const RETIRED_KEYS = {
 // `answers` (FEAT-166 r3) — the user's TYPED answers to THIS decision, written only
 // by the server's answer route (src/server/board.ts recordAnswer) and read only by
 // boundAnswers. OPTIONAL: absent on every decision nobody has answered since r3.
-const DECISION_KEYS = ['id', 'mode', 'question', 'options', 'recommendation', 'recommendation_reason', 'prerequisite', 'answers'];
+// BUG-259 — `stop` / `stop_consequence`: why the decision is the USER's, declared
+// by `board-tool decide --decider=…` against the ONE closed list (format-metrics
+// HARD_STOPS, shared with the turn-end ask check). OPTIONAL on read: a card
+// declared before the gate has none. `reopened_from`: the agent-owned decision
+// the USER reopened into this one (an agent may not own it again).
+const DECISION_KEYS = ['id', 'mode', 'question', 'options', 'recommendation', 'recommendation_reason', 'prerequisite', 'answers', 'stop', 'stop_consequence', 'reopened_from'];
 const ANSWER_ENTRY_KINDS = ['decision', 'question', 'counter'];
+/** BUG-259 — the typed reasons an agent may take a decision itself (`board-tool own`). */
+export const OWN_BASES = Object.freeze(['recommendation', 'judgement', 'criteria', 'settled', 'verify-owed']);
+/** Bases whose claim rests on something else on the board — `owned.ref` is required. */
+export const OWN_BASES_NEEDING_REF = Object.freeze(['criteria', 'settled']);
+/** BUG-263 — the basis of a withdrawn hard-stop card (board-tool withdraw). */
+export const WITHDRAW_BASIS = 'withdrawn';
+/** Every basis a decision_history `owned` entry may carry: `own`'s plus withdraw's. */
+export const OWNED_BASES = Object.freeze([...OWN_BASES, WITHDRAW_BASIS]);
+const OWNED_READS_AS_USER = /^\s*(you|user|the user)\b/i;
+/**
+ * BUG-259 — shape check for an agent-OWNED history entry (one carrying `owned`,
+ * written by `board-tool own`). Older entries with `chosen_by: "agent"` and no
+ * `owned` predate the verb and are not touched. `bad(msg)` records a violation.
+ */
+export function validateOwnedEntry(h, i, bad) {
+  if (h.owned === undefined) return;
+  const at = `decision_history[${i}]`;
+  const o = h.owned;
+  if (h.chosen_by !== 'agent') bad(`"${at}.chosen_by" must be "agent" on an owned decision`);
+  if (!o || typeof o !== 'object' || Array.isArray(o)) { bad(`"${at}.owned" must be an object: who decided, on what basis, and why`); return; }
+  if (typeof o.by !== 'string' || !o.by.trim()) bad(`"${at}.owned.by" must name the agent that decided`);
+  else if (OWNED_READS_AS_USER.test(o.by)) bad(`"${at}.owned.by" reads as the user — an owned decision is the agent's`);
+  // BUG-263 — `withdrawn` is the basis of a hard-stop card the agent took back as
+  // its own already-made call; it carries `owned.decided` (what shipped) instead
+  // of picking a card option. `own`'s bases stay as they were.
+  if (!OWNED_BASES.includes(o.basis)) bad(`"${at}.owned.basis" must be one of ${OWNED_BASES.join(', ')}`);
+  if (typeof o.why !== 'string' || !o.why.trim()) bad(`"${at}.owned.why" must state the reason`);
+  if (o.basis === WITHDRAW_BASIS && (typeof o.decided !== 'string' || !o.decided.trim())) bad(`"${at}.owned.decided" must say what the agent actually decided and built`);
+  if (OWN_BASES_NEEDING_REF.includes(o.basis) && !(typeof o.ref === 'string' && o.ref.trim())) bad(`"${at}.owned.ref" is required for basis "${o.basis}"`);
+  if (!h.snapshot || typeof h.snapshot !== 'object' || Array.isArray(h.snapshot)) bad(`"${at}.snapshot" must hold the decision as it was, so the user can reopen it`);
+  if (h.reopened !== undefined) {
+    const r = h.reopened;
+    if (!r || typeof r !== 'object' || r.by !== 'user' || typeof r.decision_id !== 'string') bad(`"${at}.reopened" must be { on, by: "user", decision_id }`);
+  }
+}
 const DECISION_MODE_KEYS = { multi: [], staged: ['stages'] };
 const OPTION_KEYS = ['key', 'label', 'what_changes', 'benefit', 'cost', 'why_not_obvious'];
 
@@ -1395,6 +1436,14 @@ export function validateTicket(record, opts = {}) {
       // string minted by `board-tool decide`) or ABSENT (legacy / prose decision).
       // Never null — absence is expressed by omitting the key, not by `null`.
       if (Object.prototype.hasOwnProperty.call(d, 'id')) str('decision.id', d.id);
+      // BUG-259 — a declared hard stop names one code of the shared list, with its consequence.
+      if (Object.prototype.hasOwnProperty.call(d, 'stop')) {
+        // Shape only here (this file is dependency-free): the CODE is checked against
+        // format-metrics HARD_STOPS by its one writer, board-tool decide.
+        str('decision.stop', d.stop);
+        str('decision.stop_consequence', d.stop_consequence);
+      } else if (Object.prototype.hasOwnProperty.call(d, 'stop_consequence')) bad('"decision.stop_consequence" is only valid with "decision.stop"');
+      if (Object.prototype.hasOwnProperty.call(d, 'reopened_from')) str('decision.reopened_from', d.reopened_from);
       // FEAT-166 r3 — typed answers: shape-checked as data. `by: user` and
       // `recorded_by: server` are what the one writer stamps.
       if (Object.prototype.hasOwnProperty.call(d, 'answers')) {
@@ -1403,8 +1452,16 @@ export function validateTicket(record, opts = {}) {
           if (a === null || typeof a !== 'object' || Array.isArray(a)) { bad(`"decision.answers[${i}]" must be an object`); return; }
           str(`decision.answers[${i}].answer_id`, a.answer_id);
           enumOf(`decision.answers[${i}].kind`, a.kind, ANSWER_ENTRY_KINDS);
-          if (a.by !== 'user') bad(`"decision.answers[${i}].by" must be "user"`);
+          // FEAT-184 — a discriminated entry: the user's answer, or an agent's
+          // adoption under a recorded delegation (which must name it).
+          if (a.by !== 'user' && a.by !== 'agent-under-delegation') bad(`"decision.answers[${i}].by" must be "user" or "agent-under-delegation"`);
           if (a.recorded_by !== 'server') bad(`"decision.answers[${i}].recorded_by" must be "server"`);
+          if (a.by === 'agent-under-delegation') {
+            str(`decision.answers[${i}].delegation_id`, a.delegation_id);
+            str(`decision.answers[${i}].delegation_statement`, a.delegation_statement);
+            str(`decision.answers[${i}].adopted_by`, a.adopted_by);
+            if (/^\s*(you|user|the user)\b/i.test(String(a.adopted_by ?? ''))) bad(`"decision.answers[${i}].adopted_by" reads as the user — an adoption is an agent's act`);
+          }
           str(`decision.answers[${i}].decision_key`, a.decision_key);
           if (typeof a.log_k !== 'number') bad(`"decision.answers[${i}].log_k" must be a number`);
         });
@@ -1489,6 +1546,7 @@ export function validateTicket(record, opts = {}) {
     record.decision_history.forEach((h, i) => {
       if (h === null || typeof h !== 'object' || Array.isArray(h)) { bad(`"decision_history[${i}]" must be an object`); return; }
       if (h.mode !== undefined) enumOf(`decision_history[${i}].mode`, h.mode, DECISION_MODES);
+      validateOwnedEntry(h, i, bad); // BUG-259 — an agent-owned decision says who, on what basis, why
     });
   }
 

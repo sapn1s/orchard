@@ -371,10 +371,23 @@ async function main() {
   ok(!!eDefault && eDefault.status === 400 && /default/.test(eDefault.message),
     "login is refused for the implicit 'default' account", { status: eDefault?.status, message: eDefault?.message });
 
-  let eReady = null;
-  try { login.startClaudeLogin(a7.id, () => {}); } catch (e) { eReady = e; }
-  ok(!!eReady && eReady.status === 409 && /already logged in/.test(eReady.message),
-    'login is refused for an account already in state:ready', { status: eReady?.status, message: eReady?.message });
+  // BUG-254 — a READY account is RE-authenticated IN PLACE, not refused. It
+  // starts a login against the SAME dir and keeps the same id; a cancelled
+  // reauth leaves the established account (and its credential) untouched. This
+  // replaces the old "refused for an account already in state:ready" contract,
+  // whose only remedy was delete + re-add, which minted a new id.
+  process.env.STUB_MODE = 'hang';
+  const rRe = runLogin(a7.id, { timeoutMs: 60_000, urlGraceMs: 30_000 });
+  await until(() => firstEvent(rRe.events, 'claude-login-url'), 8_000);
+  ok(login.activeClaudeLogin()?.accountId === a7.id && rRe.info.reauth === true,
+    'a ready account starts a RE-login in place (BUG-254), same id, reauth:true', { active: login.activeClaudeLogin(), reauth: rRe.info.reauth });
+  login.cancelClaudeLogin(a7.id, 'test cleanup');
+  const reDone = await rRe.done;
+  ok(reDone.ok === false && reDone.accountRemoved !== true,
+    'a cancelled RE-login does NOT remove the established account', { ok: reDone.ok, accountRemoved: reDone.accountRemoved });
+  const stillReady = accounts.readAccounts().find((r) => r.id === a7.id);
+  ok(!!stillReady && stillReady.state === 'ready',
+    'the re-logged-in account is unchanged (still ready, same id) after a cancelled reauth', { state: stillReady?.state });
 
   let eMissing = null;
   try { login.startClaudeLogin('deadbeefdeadbeefdeadbeef', () => {}); } catch (e) { eMissing = e; }

@@ -30,7 +30,26 @@ import * as path from 'node:path';
 import { readBoard, boardSummary } from '../src/server/board.ts';
 import { rankRows, readRankRecord, settlementGraph } from '../src/server/board-rank.ts';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+const REPO = path.resolve(import.meta.dirname, '..');
+// BUG-259 — the live rail shrank once agents recorded their own decisions (4 cards
+// left), which is too few to exercise ranking. Rank a SCRATCH COPY of the real board
+// with every agent-owned card rewound to its open, pre-own state (from its own
+// snapshot): the same real tickets, in the busy state this suite was written for.
+const ROOT = fs.mkdtempSync(path.join((await import('node:os')).tmpdir(), 'board-rank-'));
+fs.cpSync(path.join(REPO, 'docs', 'bugs'), path.join(ROOT, 'docs', 'bugs'), { recursive: true });
+{
+  const schema = await import('./lib/ticket-schema.mjs');
+  const { rewindOwnedMarkdown } = await import('./lib/owned-decision.mjs');
+  const { setBoardOwner } = await import('../src/server/tickets.ts');
+  const B = path.join(ROOT, 'docs', 'bugs');
+  for (const f of fs.readdirSync(B).filter((x) => /^[A-Z]+-\d+-.*\.md$/.test(x))) {
+    const back = rewindOwnedMarkdown(fs.readFileSync(path.join(B, f), 'utf8'), f, schema);
+    if (back === null) continue;
+    fs.writeFileSync(path.join(B, f), back);
+    setBoardOwner(ROOT, f.match(/^[A-Z]+-\d+/)[0], 'you');
+  }
+}
+process.on('exit', () => { try { fs.rmSync(ROOT, { recursive: true, force: true }); } catch { /* scratch */ } });
 let pass = 0, fail = 0;
 const failures = [];
 function check(name, ok, observed) {

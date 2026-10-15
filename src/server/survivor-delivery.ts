@@ -44,6 +44,7 @@ import * as net from 'node:net';
 import type { StationEvent } from './events.ts';
 import type { DeliveryEvidence } from './liveness.ts';
 import type { HostStatus } from './survival.ts';
+import { contentBlocksFor, type AttachmentRef } from './attachments.ts';
 
 type ClientSend = ((e: StationEvent | { t: 'ack'; [k: string]: unknown }) => void) | null;
 
@@ -310,8 +311,9 @@ export function deliverIntoSurvivor(opts: {
   sdkSessionId: string;
   prompt: string;
   client: ClientSend;
+  attachments?: AttachmentRef[]; // FEAT-177 — ride the delivered user frame as image/document/file blocks
 }): Promise<SurvivorDelivery | null | 'uncertain'> {
-  const { survivor, sdkSessionId, prompt, client } = opts;
+  const { survivor, sdkSessionId, prompt, client, attachments } = opts;
   if (active.has(sdkSessionId)) return Promise.resolve(null);
   return new Promise((resolve) => {
     let settled = false;
@@ -375,7 +377,9 @@ export function deliverIntoSurvivor(opts: {
           socket.on('close', () => d.finish('the survivor connection closed'));
           return d;
         };
-        const frame = { type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }] } };
+        // FEAT-177: a survivor is always a persisted-transcript engine (Claude), which takes image/document blocks.
+        const content = contentBlocksFor(prompt, attachments, { imageAttachments: true }) ?? [{ type: 'text', text: prompt }];
+        const frame = { type: 'user', message: { role: 'user', content } };
         if (hello && hello.protocol >= 2) {
           // Protocol 2: the envelope, then wait for the broker's positive acceptance.
           // Once the envelope is written, silence is NOT a refusal (BUG-191):

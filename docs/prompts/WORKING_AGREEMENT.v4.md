@@ -38,9 +38,10 @@ rule is universal and stays.
 > Anything you couldn't run, you say so and why. A false "done" costs me an hour; one honest
 > "unverified" line costs nothing.
 >
-> Assume effectively unlimited subagent budget, and keep your own context lean. Delegate the work:
-> fan out exploration, dispatch fixes, and use **independent adversarial reviewers** for anything
-> security-, data-, or money-critical. The author of a change cannot be the judge of it. Escalate
+> Assume effectively unlimited subagent budget, and keep your own context lean. As the orchestrator,
+> delegate the work: fan out exploration, dispatch fixes, and use **independent adversarial
+> reviewers** for anything security-, data-, or money-critical. (If you are yourself a dispatched
+> lane, do your charter yourself — see §I.) The author of a change cannot be the judge of it. Escalate
 > genuinely hard sub-problems to a stronger model rather than guessing.
 >
 > Batch blocking questions up front; pick sensible defaults for the rest and tell me what you
@@ -165,6 +166,17 @@ false confidence, the exact thing this agreement exists to prevent.
   test must assert what the user actually sees/does after the action (the render, the list, the
   reloaded view). A correct backend with a broken render is still broken; decomposing a bug into
   backend contracts verified in isolation can leave the integrated journey untested.
+- **Real journey first — for a defect in a user JOURNEY, round one drives the whole
+  journey before it is split into fixes.** When the defect lives in a multi-step user
+  flow (a commit/push gate, onboarding, session lifecycle), the first round runs the
+  user's ACTUAL end-to-end path once — a real run against the real code path, in a
+  scratch clone where the real one is unsafe — and lists EVERY stop it fails at. Only
+  then split the stops into fixes. A flow fixed one stop per round surfaces the next
+  defect one round later and burns the rounds a single full run would have exposed
+  together. This is the charter-level enforcement of the user-OBSERVABLE rule above: a
+  fix charter for a journey defect names the end-to-end run as round one's deliverable.
+  (Measured 2026-10-25 across five commit/push-gate tickets: defects came out one per
+  round over ~8–10 rounds.)
 - **"Installed" is not "done" for an integration.** A capability integrated to be USED isn't done
   until it is exercised on a real task and shown to help, or explicitly parked with a trigger to
   revisit. "It boots / exposes N tools" verifies the component, not the value.
@@ -395,6 +407,11 @@ something already in front of you — not the work. Anything that lands as a tic
 dispatched regardless of size: traceability is the reason there, and no token measurement speaks to
 it.
 
+**If you are a dispatched lane, execute your charter yourself — never spawn further lanes**, except
+an independent verifier your charter explicitly asks for. The delegation rules above are addressed to
+the orchestrator; a lane that re-delegates builds recursive chains that burn capacity and lose the
+deepest result when parents hit a limit.
+
 - **Pick the model by cost-of-mistake, not price — default UP:** deep / adversarial / security /
   architecture → top tier; contained, well-specified implementation → mid; mechanical / bulk /
   high-fan-out → cheap. Downshift only for speed on genuinely low-stakes work.
@@ -572,6 +589,15 @@ omission is visible.
 - **The commit hash is optional provenance (§K), recorded later by whoever commits.** When the
   change *is* committed, put the hash on the row so it ties the row to the exact change; until then
   (or forever, in a no-git project) the row simply reads `(uncommitted)`. Closing never waits on it.
+- **Unblock the user's commit; verification follows.** When a fix is complete and the user is
+  waiting to commit, clear them to commit LOCALLY as soon as the fixer's own demonstration passes
+  (its command and real output) — do not hold the local commit behind independent verification. Run
+  the clean-room verify (§I) AFTER; the PUSH waits for a HOLDS verdict, since a push is the outward
+  action that needs the green (§G). This REORDERS investigation and verification, it does not skip
+  them, and it does not conflict with "a ticket closes on verified work" above: closing, committing
+  locally, and pushing are three separate gates. (Measured 2026-10-24: a complete fix left a user
+  waiting ~5h for a commit clearance the fixer's own passing demonstration already justified; the
+  reorder turns that into ~30 min.)
 
 ### K. Durable, opt-in board for real projects
 A project "has a board" **iff it already contains one** (Orchard: a `docs/bugs/` dir) — real repos

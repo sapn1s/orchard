@@ -15,6 +15,9 @@ exactly.
 
 Standing rules that apply to every dispatch here:
 
+- **You are a lane: do your charter yourself; never re-dispatch** (no spawning further lanes),
+  except an independent verifier your charter explicitly asks for. Delegate-the-work rules are
+  addressed to the orchestrator, not to you.
 - Never end your turn while a background child you started (run_in_background Bash, Monitor,
   background Agent) is still running or unread: in a foreground lane the CLI kills it at hand-back
   (BUG-239). Wait in the foreground (Bash timeout 600000: `timeout 580 tail --pid=<PID> -f

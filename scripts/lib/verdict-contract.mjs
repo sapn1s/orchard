@@ -290,6 +290,34 @@ function honestProse(block, minChars) {
   return lines.filter((l) => !FILLER_RE.test(l)).join('\n').length >= minChars;
 }
 
+/**
+ * Collapse a command to its identity form: trim, fold ALL runs of whitespace to
+ * a single space, strip one outer wrapping quote. `canonCmd`/`sameCmd`/`bareCmd`
+ * build on this for citation-identity and distinctness.
+ *
+ * ACCEPTED LIMITATION (BUG-276, adjudicated 2026-10-25 — won't-fix-as-filed).
+ * The `/\s+/g -> ' '` collapse runs over the WHOLE string, so whitespace INSIDE
+ * a quoted token is folded too, not just between tokens. Two commands differing
+ * only by inner quoted whitespace — `--grep "a  b"` vs `--grep "a b"` — therefore
+ * canonicalize equal and compare as the SAME command. This is a KNOWN, ACCEPTED
+ * residual, not a bug to patch:
+ *  - N = 0 real harm. Every command this comparison sees (manifest `cmd`, cited
+ *    `RAN:`, harness `knownRuns`) comes from the one harness-supplied string; the
+ *    clean-room recorder only `.trim()`s it. Real citations are byte-identical
+ *    save trim + the BUG-066 `env`-prefix form. Audits across BUG-276 r1/r2 and
+ *    the adjudication found ZERO real fixer-test commands carrying inner quoted
+ *    whitespace. Exploiting the false-match would require a verifier to have
+ *    ACTUALLY RUN (through vrun, real output bound) a near-variant command — a
+ *    genuine execution, categorically outside the forgery threat model, not a
+ *    forged verdict.
+ *  - Do NOT re-attempt a quote-aware / env-value parser here. Hand-tracking shell
+ *    text is an enumeration that is never complete: this identity comparison broke
+ *    4 ways across 2 rounds trying (r1: escaped `\"` desync + backslash-escaped
+ *    space; r2: outer-quote strip + quoted env-VALUE inner whitespace in a
+ *    `splitEnvPrefix` helper). It is the exact class BUG-273 deleted a tokeniser
+ *    for. The cure (live parser bugs) was worse than the disease (a latent,
+ *    zero-incident hole). See BUG-276 and BUG-273.
+ */
 const normCmd = (c) => (c ?? '').trim().replace(/\s+/g, ' ').replace(/^["']|["']$/g, '');
 
 /**

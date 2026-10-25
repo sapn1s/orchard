@@ -1224,6 +1224,36 @@ nothing beyond the single disguised case here was probed today.
   }
 }
 {
+  // BUG-276 ACCEPTED LIMITATION (adjudicated 2026-10-25, won't-fix-as-filed).
+  // normCmd folds ALL whitespace, so a cited RAN differing from the recorded
+  // command ONLY by inner quoted whitespace (`--grep "a  b"` vs `"a b"`) is
+  // accepted as THE recorded command. This is NOT a bug to fix — see the normCmd
+  // doc comment and BUG-276/BUG-273: a quote/env parser to tighten it broke 4
+  // ways across 2 rounds and the realized harm is N=0 (a real near-variant
+  // execution, not forgery). This check PINS that documented behaviour so a
+  // future "fix" that silently re-tightens identity is caught and sent back to
+  // the adjudication, not merged. It asserts the MATCH, labelled accepted.
+  const recorded = 'node t.mjs --grep "a b"';
+  const entries = [{ id: 'aaaa11112222', cmd: recorded, exit: 0, sha256: 'deadbeefdeadbeef', output: 'PASS: ok\n' }];
+  const verdict = `VERDICT: BROKEN
+CLAIM: the thing must hold.
+
+=== FIXER-TEST ===
+RAN: node t.mjs --grep "a  b"
+EXIT: 0
+MANIFEST: aaaa11112222 sha256=deadbeefdeadbeef exit=0
+OUTPUT:
+PASS: ok
+
+=== UNTESTED ===
+nothing else probed today.
+`;
+  const v = validateVerdict(verdict, { manifest: entries, knownRuns: [recorded] });
+  const matched = !v.violations.some((x) => /is not the command manifest run|not the harness-supplied/.test(x));
+  check('BUG-276 ACCEPTED LIMITATION: a RAN differing only by inner quoted whitespace (`"a  b"` vs `"a b"`) is treated as the SAME command — documented, N=0-harm residual, NOT a defect to patch (normCmd folds whitespace; see BUG-276/BUG-273)',
+    matched === true, 'matched=false — identity was silently re-tightened; a tightening fix was ADJUDICATED out (do not re-introduce a quote/env parser), so route back to the BUG-276 adjudication');
+}
+{
   // THE MUST-FAIL, unit form — what the committed 6b5b061 pasted-output
   // contract demonstrably permits and the pivot removes: CURATED EXCERPTING.
   // Under validateVerdict's bound mode (kept verbatim as --check-only's

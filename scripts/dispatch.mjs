@@ -60,6 +60,7 @@
  *     below (mirrors claude-runtime.ts's ASSISTANT_ERROR_MAP kinds).
  */
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -85,7 +86,7 @@ import { recordSessionProvenance } from '../src/lib/session-provenance.mjs';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 
-const USAGE = `usage: node scripts/dispatch.mjs --provider openai|anthropic [--model <m>] [--cwd <dir>] [--sandbox read-only|workspace-write] [--timeout-min <n>] [--allow-tools "Bash Read Write"] [--resume <session-id>] [--meta-out <file>] [--prompt-stdin] [--tool-profile <name>] [--ticket <ID>] [--phase finding|fixing|verifying] [--round <n>] [--class trivial|fix|explore|plan+review|arch|verify] "task prompt"`;
+const USAGE = `usage: node scripts/dispatch.mjs --provider openai|anthropic [--model <m>] [--cwd <dir>] [--sandbox read-only|workspace-write] [--timeout-min <n>] [--allow-tools "Bash Read Write"] [--resume <session-id>] [--meta-out <file>] [--meta-nonce <N>] [--prompt-stdin] [--tool-profile <name>] [--ticket <ID>] [--phase finding|fixing|verifying] [--round <n>] [--class trivial|fix|explore|plan+review|arch|verify] "task prompt"`;
 
 const HELP = `${USAGE}
 
@@ -170,7 +171,7 @@ function die(msg, code = 2) {
 /* ------------------------------------------------------------------ args */
 
 const argv = process.argv.slice(2);
-const opts = { provider: null, model: null, cwd: process.cwd(), sandbox: 'read-only', timeoutMin: 15, allowTools: null, resume: null, metaOut: null, promptStdin: false, ticket: null, phase: null, round: null, dispatchClass: null,
+const opts = { provider: null, model: null, cwd: process.cwd(), sandbox: 'read-only', timeoutMin: 15, allowTools: null, resume: null, metaOut: null, metaNonce: null, promptStdin: false, ticket: null, phase: null, round: null, dispatchClass: null,
   // FEAT-141: env fallback so a systemd unit / wrapper can opt a recurring
   // dispatch into a cheaper profile without editing the consuming repo.
   toolProfile: process.env.ORCHARD_DISPATCH_TOOL_PROFILE || null };
@@ -189,6 +190,11 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--allow-tools') opts.allowTools = take();
   else if (a === '--resume') opts.resume = take();
   else if (a === '--meta-out') opts.metaOut = path.resolve(take());
+  // BUG-273 r5 (P2): a caller-supplied freshness token. The caller writes a
+  // unique nonce per attempt and reads back meta.nonce; a stale meta from a prior
+  // run (crash-before-write on a reused path) carries an OLD/absent nonce, so the
+  // reader rejects it (no wrong auto-fallback). See writeMeta + the init-invalidate.
+  else if (a === '--meta-nonce') opts.metaNonce = take();
   else if (a === '--prompt-stdin') opts.promptStdin = true;
   // FEAT-100: the four facts the dispatcher already knows. Declared, not inferred.
   else if (a === '--ticket') opts.ticket = take();
@@ -221,6 +227,14 @@ if (!Number.isFinite(opts.timeoutMin) || opts.timeoutMin <= 0) die('--timeout-mi
 if (opts.resume && opts.provider !== 'anthropic') {
   die('--resume is only supported on the anthropic path (claude -p --resume); the openai path has no session-resume surface here');
 }
+
+// BUG-273 r5 (P2): the per-run freshness token stamped into every meta write.
+// Caller-supplied (--meta-nonce) so the caller can match it back; a random UUID
+// otherwise, so a direct caller still gets a unique-per-run stamp. Stable for the
+// whole invocation — the init-invalidate write and every failure/success write
+// carry THIS value, so a reader can tell "the run I launched wrote this" from
+// "this is a leftover file on a reused path."
+const metaNonce = opts.metaNonce ?? randomUUID();
 
 const progress = (msg) => process.stderr.write(`[dispatch] ${msg}\n`);
 
@@ -298,6 +312,22 @@ try {
   if (notice) task = `${task}\n\n---\n\n${notice}`;
 }
 
+/* ----------------------------------- BUG-273 r5 (P2): meta-out init-invalidate
+ *
+ * THE single chokepoint that makes meta-out freshness true BY CONSTRUCTION. The
+ * FIRST thing done once --meta-out is resolved (after arg/profile validation,
+ * before ANY provider dispatch): overwrite whatever is at that path with an INIT
+ * record stamping THIS run's nonce and `failureKind:null`. So a reused meta path
+ * that held a prior run's `{failureKind:'rate-limited'}` no longer survives a
+ * crash-before-the-real-write: either this init write landed (nonce current,
+ * failureKind null ⇒ reader returns null ⇒ no fallback) or the process died even
+ * earlier (then the stale file still carries the OLD nonce ⇒ reader rejects on
+ * the nonce mismatch). Previously the freshness of a PRESENT meta was an implicit
+ * cross-file invariant the caller happened to uphold (unique mkdtemp paths); this
+ * enforces it at the owner for ANY caller. writeMeta is a best-effort no-op when
+ * --meta-out is unset, so this costs nothing on the no-meta path. */
+writeMeta({ exitCode: null, failureKind: null });
+
 /*
  * FEAT-176 — snapshot what this lane wrote when it exits, on EVERY exit path
  * (die, signal handlers, normal end, no --meta-out). `process.on('exit')` runs
@@ -345,6 +375,10 @@ function writeMeta({ sessionId = null, exitCode, failureKind = null, usage = nul
   try {
     fs.writeFileSync(opts.metaOut, JSON.stringify({
       provider: opts.provider, model: opts.model ?? null,
+      // BUG-273 r5 (P2): the freshness token. A reader honours failureKind only
+      // when this matches the nonce it passed — so a stale meta on a reused path
+      // (crash before this run ever wrote) is rejected rather than mis-read.
+      nonce: metaNonce,
       sessionId, exitCode, failureKind, resumed: Boolean(opts.resume), ts: new Date().toISOString(),
       // ARCH-017: per-lane cost attribution. The engine's own usage block,
       // carried VERBATIM and null when the engine reported none — the lane
@@ -580,6 +614,13 @@ async function dispatchOpenai() {
 
   const rt = new CodexRuntime();
   let exitCode = 1;
+  // BUG-273 r4 (P2): the dispatcher OWNS the failure kind — it already computes
+  // it in every failing branch below. Carry it into --meta-out directly (as the
+  // anthropic and sandbox-preflight paths already do) instead of writing a
+  // placeholder and forcing the reader to scrape the shared stderr channel
+  // (which also carries the verifier's own taxonomy-laden reasoning). ARCH-010:
+  // the reader must not re-derive what the owner can declare.
+  let terminalFailureKind = null;
   let timedOut = false;
   let openaiSessionId = null;
 
@@ -647,15 +688,19 @@ async function dispatchOpenai() {
           const pe = rt.classifyProviderError?.(m) ?? null;
           const kind = timedOut ? 'timeout' : (pe?.kind ?? 'internal');
           progress(`dispatch failed [${kind}] (provider openai${pe?.retryable ? ', retryable' : ''}): ${pe?.detail ?? m.result ?? 'turn failed'}`);
+          terminalFailureKind = kind;
           exitCode = 1;
         } else if (timedOut) {
           progress('dispatch failed [timeout]: turn was interrupted by the dispatch timeout');
+          terminalFailureKind = 'timeout';
           exitCode = 1;
         } else if (m.subtype === 'interrupted') {
           progress('dispatch failed [interrupted]: turn did not run to completion');
+          terminalFailureKind = 'interrupted';
           exitCode = 1;
         } else if (finalText == null) {
           progress('dispatch failed [internal]: turn completed but produced no assistant message');
+          terminalFailureKind = 'internal';
           exitCode = 1;
         } else {
           if (m.usage) progress(`tokens: ${JSON.stringify(m.usage)}`);
@@ -669,11 +714,12 @@ async function dispatchOpenai() {
     // Transport death (spawn ENOENT, app-server crash, protocol violation).
     clearTimeout(timer);
     progress(`dispatch failed [transport] (provider openai): ${err?.message ?? err}`);
+    terminalFailureKind = 'transport';
     exitCode = 1;
   }
 
   rt.close();
   if (recorder.filePath) progress(`transcript: ${recorder.filePath}`);
-  writeMeta({ sessionId: openaiSessionId, exitCode, failureKind: exitCode === 0 ? null : 'see stderr taxonomy line', usage: finalUsage });
+  writeMeta({ sessionId: openaiSessionId, exitCode, failureKind: exitCode === 0 ? null : terminalFailureKind, usage: finalUsage });
   process.exit(exitCode);
 }

@@ -354,10 +354,21 @@ const basename = (w) => (w.includes('/') && !w.startsWith('-') ? w.slice(w.lastI
 
 function headOf(tokens) {
   let i = 0;
-  while (i < tokens.length && (ASSIGNMENT.test(tokens[i]) || NOOP_HEADS.has(tokens[i]))) i++;
+  const assigns = [];
+  while (i < tokens.length && (ASSIGNMENT.test(tokens[i]) || NOOP_HEADS.has(tokens[i]))) {
+    if (ASSIGNMENT.test(tokens[i])) assigns.push(tokens[i]); // leading `VAR=val` env prefix of this command
+    i++;
+  }
   const rest = tokens.slice(i);
   if (!rest.length) return null;
-  return { head: basename(rest[0]), args: rest.slice(1) };
+  return { head: basename(rest[0]), args: rest.slice(1), assigns };
+}
+
+/** Does a command carry a `GIT_*=…` env prefix (GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/…)? Such a
+ *  prefix can redirect a git op (incl. `apply --cached`) off the plain repo index, so it disqualifies
+ *  the BUG-277 index-only exemption. Over-refusing a rare GIT_* prefix fails safe. */
+function hasGitEnvPrefix(assigns) {
+  return Array.isArray(assigns) && assigns.some((a) => /^GIT_/i.test(a));
 }
 
 /* git subcommands that mutate the WORKING TREE or index (can drop uncommitted work). */
@@ -377,13 +388,14 @@ const GIT_GLOBAL_VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree',
 function gitSubcommand(tokens) {
   let i = 0; // tokens here EXCLUDE the leading 'git'
   const cdirs = [];
+  let hadGlobal = false; // any git GLOBAL option (-c/-C/--git-dir/--work-tree/…) seen before the subcommand
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === '--version' || t === '--help' || t === '-h') return null;
-    if (t === '-C') { if (tokens[i + 1] != null) cdirs.push(tokens[i + 1]); i += 2; continue; }
-    if (GIT_GLOBAL_VALUE_OPTS.has(t)) { i += 2; continue; }
-    if (t.startsWith('-')) { i++; continue; }
-    return { sub: t, args: tokens.slice(i + 1), cdirs };
+    if (t === '-C') { if (tokens[i + 1] != null) cdirs.push(tokens[i + 1]); hadGlobal = true; i += 2; continue; }
+    if (GIT_GLOBAL_VALUE_OPTS.has(t)) { hadGlobal = true; i += 2; continue; }
+    if (t.startsWith('-')) { hadGlobal = true; i++; continue; }
+    return { sub: t, args: tokens.slice(i + 1), cdirs, hadGlobal };
   }
   return null;
 }
@@ -394,6 +406,43 @@ function gitSubcommand(tokens) {
  * whole tree. Fail toward TREE (the safe, deny-if-any-lock direction).
  */
 function gitMutationTarget(sub, args) {
+  // INDEX-ONLY apply (BUG-277). `git apply --cached` writes ONLY the index, never
+  // the working tree (git-apply(1): "apply the patch to just the index, without
+  // touching the working tree"), so it CANNOT clobber a concurrent lane's unsaved
+  // working-tree edits — the one hazard this lock guards. Signalled as
+  // `{ indexOnly: true }` so the caller drops it (not a tree op).
+  //
+  // r2 (openai BROKEN on run 01a173bb…): the r1 rule was a DENYLIST ("--cached
+  // present, --index absent") over git-apply's options, and it waved through every
+  // OTHER working-tree-writing form that happens to carry --cached — `--cached
+  // --reject` (writes .rej), `--cached --build-fake-ancestor=<f>` (writes <f>),
+  // `--cached --no-cached` (cancels --cached), and -C/--git-dir/GIT_* contexts.
+  // So this is now a strict ALLOWLIST of exactly ONE shape:
+  //     git apply --cached <path>...            (optionally `-- <path>...`)
+  // the only form the landing flow uses to stage repo patches. The exemption is
+  // REFUSED (→ fall through to TREE) for EVERY other apply form:
+  //   • any option other than `--cached` before `--` (incl. --index, --cached=…,
+  //     --cache abbreviation, --reject, --build-fake-ancestor=…, --no-cached,
+  //     --3way, a short-flag cluster) — git may then write the working tree;
+  //   • a patch path that starts with `-` before `--` (git reads it as an option);
+  //   • `--cached` only AFTER `--` (there it is a patch FILENAME, not the flag).
+  // A git GLOBAL option (-c/-C/--git-dir/--work-tree/alias) or a GIT_* env prefix
+  // additionally disqualifies the exemption, enforced at the single call site
+  // (they are stripped off `args`/the head before reaching here). Over-refusing a
+  // rare form fails safe (the tree check only denies when a lock is actually held);
+  // under-refusing is the defect the verdict caught.
+  if (sub === 'apply') {
+    let sawCached = false, onlyAllowed = true, afterDD = false;
+    for (const a of args) {
+      if (afterDD) continue;               // everything after `--` is a plain path
+      if (a === '--') { afterDD = true; continue; }
+      if (a === '--cached') { sawCached = true; continue; }
+      if (a.startsWith('-')) { onlyAllowed = false; break; } // any other option disqualifies
+      // else: a bare positional patch path before `--` — allowed
+    }
+    if (sawCached && onlyAllowed) return { indexOnly: true };
+    // not the exempt shape → fall through to the normal (tree-classified) logic
+  }
   const dd = args.indexOf('--');
   if (dd >= 0) {
     const paths = args.slice(dd + 1).filter((a) => a && a !== '.');
@@ -747,6 +796,15 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
       const parsed = gitSubcommand(args);
       if (parsed && GIT_TREE_MUTATORS.has(parsed.sub)) {
         const tgt = gitMutationTarget(parsed.sub, parsed.args);
+        if (tgt.indexOnly) {
+          // BUG-277 r2: the index-only apply exemption is the strict allowlist
+          // `git apply --cached <path>...`. It fails back to TREE the instant the
+          // command could redirect the apply off the plain repo index: any git
+          // GLOBAL option (-c/-C/--git-dir/--work-tree/alias — `hadGlobal`) or any
+          // GIT_* env prefix (which headOf strips off the head). Over-refuse = safe.
+          if (!parsed.hadGlobal && !hasGitEnvPrefix(h.assigns)) continue;
+          return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
+        }
         if (tgt.tree) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
         // `git -C a -C b …` resolves pathspecs under a/b (absolute -C resets the base).
         let pre = '';

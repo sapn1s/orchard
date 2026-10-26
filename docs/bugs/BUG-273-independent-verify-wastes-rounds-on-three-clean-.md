@@ -11,7 +11,7 @@
   "reported": "2026-10-25",
   "reported_by": "worker (dispatch, fixing r1)",
   "owner": "unassigned",
-  "work_state": "verified",
+  "work_state": "in_verification",
   "human_action": "none",
   "updated": "2026-10-25",
   "decision": null,
@@ -126,6 +126,18 @@
       "harness": "scripts/independent-verify.mjs",
       "candidate": "84d23ad12389780ca0b37103ee075798e1789610ef1f98ab23a012c7462855b7",
       "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a173aa-a5e2-7440-a80d-8b98203c237d",
+      "verdict": "broken",
+      "verdict_on": "2026-10-25",
+      "recorded_at": "2026-10-25T15:29:29.769Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Committed-range IV of commit 6b5d754. >1 --run hard check, nonce-fresh provider-abort fallback, seed hermeticity HOLD. BROKEN: seedScratchGit 'git add -A' omits tracked-but-.gitignore files from synthetic HEAD (HEAD:file exit 128). Not pushed. Fix: add -f exported set / use real tree."
     }
   ],
   "verification_class": "fix",
@@ -350,3 +362,18 @@ Built exactly the r5 adjudicator build spec (entry above). Did NOT touch `script
 
 ### 2026-10-25 — dispatch openai
 - **Verification recorded:** dispatch openai/codex run 01a1709a-edbe-75b2-92d1-5b641df0af61 — VERDICT: HOLDS — mixed-state candidate 84d23ad12389. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-25 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a173aa-a5e2-7440-a80d-8b98203c237d — VERDICT: BROKEN — Committed-range IV of commit 6b5d754. >1 --run hard check, nonce-fresh provider-abort fallback, seed hermeticity HOLD. BROKEN: seedScratchGit 'git add -A' omits tracked-but-.gitignore files from synthetic HEAD (HEAD:file exit 128). Not pushed. Fix: add -f exported set / use real tree.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-25 — worker (dispatch, fixing r6) — seed commits EXACTLY the exported file set (the r5 BROKEN)
+
+Fixed the r5 `BROKEN` (openai run `01a173aa-a5e2-7440-a80d-8b98203c237d`, committed-range IV of `6b5d754`): `seedScratchGit` used `git add -A`, which HONOURS `.gitignore` / nested `.gitignore` / `info/exclude` / `core.excludesFile`, so an exported-but-ignored TRACKED file was silently dropped from the synthetic HEAD while the seed still reported `ok` — then the verifier's `git show HEAD:<file>` died 128.
+
+- **Hypothesis verified FIRST.** There is NO captured list of exported paths at seed time (the export is `git archive | tar`, line ~1076, which keeps no manifest), and the commit must mirror the FINAL room tree — post-strip, post-stub, post-symlink-materialisation (docstring "ONE commit of the FINAL room tree") — NOT the pre-strip archive set. So the owner of "what to commit" is the room directory ON DISK after the pipeline. The fix enumerates it with a plain fs walk that applies NO ignore rules (not a git walk), then force-adds that explicit set so no ignore source can subtract from it. The "don't re-walk with ignore rules" caution is satisfied: the walk is ignore-free; only git applies ignore rules, and that is exactly what we removed.
+- **`independent-verify.mjs` — `seedScratchGit` (fix by construction).** Replaced `git add -A` with: a recursive `fs.readdirSync(withFileTypes)` walk of the room, skipping only top-level `.git` (our skeleton) and `node_modules` (the live-tree copy), emitting FILES and SYMLINKS (symlinks pushed, never followed; directories recursed, never listed so git can't re-expand them under ignore rules); then `git add -f --pathspec-from-file=- --pathspec-file-nul` fed the NUL-joined list on stdin. `-f` overrides every ignore source; `--pathspec-file-nul` takes each byte literally so a leading `-`, spaces, newlines, unicode cannot be misread as a flag or re-split. `node_modules` is simply never listed, so `-f` cannot pull it in; `info/exclude /node_modules/` is kept so `git status` stays clean. Empty `relFiles` → no-op status 0. Everything else (skeleton, temp-index plumbing, `buildRoomGitEnv`, HEAD-resolve) unchanged.
+- **Must-FAIL + pass-after (`verify-bug-273-iv-infra.mjs`).** Added `proveExportedFileSet(seed, label)` over a single REALISTIC-STATE adversarial room (`buildAttackRoom`) covering the whole verifier attack list, run under a HOSTILE HOME gitconfig whose `core.excludesFile` ignores `*.xf`. Anchored to a literal pre-fix `preSeedScratchGit` (byte-identical to shipped `6b5d754` except the one `git add -A` line). Pre-fix reddens EXACTLY the 3 ignored-but-exported items (`secret.env`, `dist/bundle.js`, `pkg/debug.log`); the real seed passes all 14. The pre-fix anchor now reddens 12 total across all causes (3 are this cause).
+- **Per-attack-item tally (POST-FIX real — all PASS):** tracked-but-ignored root file; ignored directory; nested `.gitignore`; the `.gitignore` files themselves; HOME/global `excludesFile` cannot matter (`thing.xf` committed under hostile HOME); leading-`-` name; spaces in path; unicode dir+file; empty dir absent from HEAD yet seed ok; symlink committed as mode 120000 with target not followed; stripped stub served (not real prose); node_modules absent from HEAD; `git status` clean after the seed. 13 attack checks + "seed reports ok" = 14 PASS.
+- **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **102 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 12 failures). `node scripts/verify-scratch-root.mjs` → **PASS 28 FAIL 0 SKIP 0** (real node_modules reflink-copy + cross-fs detection; the seed change did not perturb room build). `npm run gate` → **GATE: PASS (exit 0)**, read unpiped (leak-gate + check-nul + check-unicode-separators + prompt-privacy + pre-push-hook + typecheck).
+- **Bucket:** correctness / regression-prone clean-room harness. The seed is the exact surface the r5 IV refuted; a routine independent re-verify of the EXPORTED-FILE-SET property (`git show HEAD:<file>` for a tracked-but-ignored export) on the working tree atop `6b5d754` is warranted — NOT a security pass. Run the fixer test directly (`--run "node scripts/verify-bug-273-iv-infra.mjs"`); confined unnecessary (no git-write fixtures).
+- **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).

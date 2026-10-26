@@ -139,6 +139,51 @@ function preProviderAbortKind({ code, meta, stderr } = {}) {
 // overrides a caller added) — it leaks every inherited GIT_* name.
 const preBuildRoomGitEnv = (extra = {}) => ({ ...process.env, ...extra });
 
+// pre-r6 seedScratchGit: the SHIPPED (6b5d754) seed, written out literally, with the
+// ONE line r6 changes — `git add -A` instead of the explicit force-added file list.
+// `-A` HONOURS .gitignore / nested .gitignore / info/exclude / core.excludesFile, so
+// an exported-but-ignored TRACKED file is silently dropped from the synthetic HEAD
+// while the seed still reports ok — exactly the r5 INVALID. Everything else (the
+// skeleton, the temp-index plumbing, buildRoomGitEnv, the HEAD-resolve check) is
+// byte-identical to the shipped code so the attack suite grades ONLY the add step.
+function preSeedScratchGit(dir) {
+  try {
+    const gitDir = path.join(dir, '.git');
+    if (fs.existsSync(gitDir)) return { ok: false, error: '.git already present' };
+    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'objects', 'pack'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'heads'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'tags'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(path.join(gitDir, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n');
+    fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), '/node_modules/\n');
+    const idxTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'iv-gitidx-pre-'));
+    const env = buildRoomGitEnv({
+      GIT_DIR: gitDir, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(idxTmp, 'index'),
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
+      GIT_COMMITTER_NAME: 'independent-verify', GIT_COMMITTER_EMAIL: 'verify@example.invalid',
+    });
+    const g = (args) => spawnSync('git', args, { encoding: 'utf8', env });
+    try {
+      const add = g(['add', '-A']); // <-- the r6 defect: ignore rules subtract from HEAD
+      if ((add.status ?? 1) !== 0) return { ok: false, error: `git add: ${(add.stderr || '').trim().slice(0, 200)}` };
+      const wt = g(['write-tree']);
+      if ((wt.status ?? 1) !== 0) return { ok: false, error: `write-tree: ${(wt.stderr || '').trim()}` };
+      const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
+      if ((ct.status ?? 1) !== 0) return { ok: false, error: `commit-tree: ${(ct.stderr || '').trim()}` };
+      const commit = ct.stdout.trim();
+      fs.copyFileSync(path.join(idxTmp, 'index'), path.join(gitDir, 'index'));
+      fs.writeFileSync(path.join(gitDir, 'refs', 'heads', 'main'), commit + '\n');
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }) });
+      if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) return { ok: false, error: `HEAD resolve: ${(head.stderr || '').trim()}` };
+      return { ok: true, head: commit, error: null };
+    } finally { try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ } }
+  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+}
+
 /* ============================================================ CAUSE 1 ==== */
 // r3 contract: the ONLY hard error is `>1 --run`; the ONLY advisory is the plain
 // `npm run confined` note; the deleted double-`--`/env-prefix advisories now emit
@@ -307,6 +352,92 @@ function proveCause3Seed() {
   check('a stripped file is NOT recoverable via git show HEAD:', (showStripped.status ?? 1) !== 0, `exit ${showStripped.status}: ${(showStripped.stderr || '').trim().slice(0, 80)}`);
   const again = seedScratchGit(room);
   check('re-seeding a room that already has .git is refused', !again.ok, JSON.stringify(again));
+}
+
+/* ---- r6: the seed commits EXACTLY the exported file set (the r5 INVALID class) ----
+ * A REALISTIC post-strip room that exercises the whole verifier attack list in one
+ * tree: tracked-but-ignored files (root + a nested .gitignore), a leading-dash name,
+ * spaces + unicode paths, an empty dir, a committed symlink, a stripped inert stub,
+ * a `*.xf`-ignoring HOME gitconfig (the "excludesFile may still be read" worry), and
+ * the live-copy node_modules. `git add -A` (pre-r6) HONOURS every ignore source, so
+ * the ignored-but-exported files vanish from HEAD though the seed reports ok — the
+ * r5 `git show HEAD:<file>` 128. The r6 force-added explicit file set cannot be
+ * subtracted by any ignore rule. The STRIPPED_STUB const is defined below; this fn
+ * only runs from main() after the module has fully loaded. */
+function buildAttackRoom() {
+  const dir = tmp('iv-room-attack-');
+  const w = (rel, body) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
+  // real code + root .gitignore that ALSO matches two exported, tracked paths
+  w('package.json', '{"name":"x","version":"1.0.0"}\n');
+  w('.gitignore', 'secret.env\ndist/\n');
+  w('secret.env', 'API_KEY=273\n');              // tracked-but-ignored (root rule)
+  w('dist/bundle.js', 'built\n');                // tracked-but-ignored (ignored dir)
+  // nested .gitignore ignoring an exported, tracked sibling
+  w('pkg/.gitignore', '*.log\n');
+  w('pkg/app.mjs', 'export const x = 1;\n');
+  w('pkg/debug.log', 'noise\n');                 // tracked-but-ignored (nested rule)
+  // adversarial path shapes
+  w('-dashfile.txt', 'leading dash\n');          // name starts with '-'
+  w('a file with spaces.txt', 'spaces\n');       // spaces
+  w('café/münchen.txt', 'unicode\n');  // unicode dir + file
+  w('thing.xf', 'would match a HOME excludesFile *.xf\n'); // core.excludesFile target
+  fs.mkdirSync(path.join(dir, 'emptydir'), { recursive: true }); // empty dir (git can't track one)
+  fs.symlinkSync('pkg/app.mjs', path.join(dir, 'link.txt'));     // committed symlink (never followed)
+  // a stripped prose file replaced by the inert boot stub (must serve the stub, not real prose)
+  w('docs/prompts/METHODOLOGY.md', STRIPPED_STUB);
+  // the live-tree node_modules copy (must stay untracked)
+  w('node_modules/leftpad/index.js', 'module.exports=1;\n');
+  w('node_modules/leftpad/package.json', '{"name":"leftpad"}\n');
+  return dir;
+}
+
+// A HOME holding a gitconfig whose core.excludesFile ignores *.xf — the "HOME may
+// still point at a gitconfig with excludesFile" worry. The seed pins
+// GIT_CONFIG_GLOBAL=/dev/null, so this must NOT reach the seed's add; we set it live
+// across the seed call to PROVE it cannot matter.
+function hostileExcludesHome() {
+  const home = tmp('iv-hostile-home-');
+  fs.writeFileSync(path.join(home, 'xf.excludes'), '*.xf\n');
+  fs.writeFileSync(path.join(home, '.gitconfig'), `[core]\n\texcludesFile = ${path.join(home, 'xf.excludes')}\n`);
+  return home;
+}
+
+function proveExportedFileSet(seed, label) {
+  section(`CAUSE 3 / r6 — the seed commits EXACTLY the exported file set [${label}]`);
+  const room = buildAttackRoom();
+  // Seed under a HOSTILE HOME gitconfig (excludesFile ignores *.xf) to prove the
+  // seed's /dev/null config pin makes a HOME/global excludesFile unreadable.
+  const savedHome = process.env.HOME, savedXdg = process.env.XDG_CONFIG_HOME;
+  const home = hostileExcludesHome();
+  process.env.HOME = home; delete process.env.XDG_CONFIG_HOME;
+  let r;
+  try { r = seed(room); } finally { process.env.HOME = savedHome; if (savedXdg !== undefined) process.env.XDG_CONFIG_HOME = savedXdg; }
+  check('seed reports ok despite the adversarial tree', r.ok, JSON.stringify(r));
+  if (!r.ok) return;
+
+  // HEAD's real tree, NUL-delimited so odd names are never quoted/split.
+  const lt = gitRead(room, ['ls-tree', '-r', '-z', '--name-only', 'HEAD']);
+  const head = new Set(lt.stdout.split('\0').filter(Boolean));
+  const inHead = (p) => head.has(p);
+  const show = (p) => gitRead(room, ['show', `HEAD:${p}`]);
+
+  // --- the attack list, one check per item ---
+  check('[tracked-but-ignored root] secret.env committed to HEAD', inHead('secret.env') && show('secret.env').stdout === 'API_KEY=273\n', [...head].join(','));
+  check('[ignored directory] dist/bundle.js committed to HEAD', inHead('dist/bundle.js'), [...head].join(','));
+  check('[nested .gitignore] pkg/debug.log committed to HEAD', inHead('pkg/debug.log') && show('pkg/debug.log').stdout === 'noise\n', [...head].join(','));
+  check('[.gitignore files themselves] root + nested committed', inHead('.gitignore') && inHead('pkg/.gitignore'), [...head].join(','));
+  check('[HOME/global excludesFile cannot matter] thing.xf committed', inHead('thing.xf'), [...head].join(','));
+  check('[leading-dash name] -dashfile.txt committed to HEAD', inHead('-dashfile.txt') && show('-dashfile.txt').stdout === 'leading dash\n', [...head].join(','));
+  check('[spaces in path] "a file with spaces.txt" committed', inHead('a file with spaces.txt'), [...head].join(','));
+  check('[unicode in path] café/münchen.txt committed', inHead('café/münchen.txt'), [...head].join(','));
+  check('[empty dir] not in HEAD (git cannot track one), seed still ok', ![...head].some((p) => p === 'emptydir' || p.startsWith('emptydir/')), [...head].join(','));
+  const ltl = gitRead(room, ['ls-tree', '-r', 'HEAD', '--', 'link.txt']);
+  check('[symlink] committed AS a symlink (mode 120000), target not followed', ltl.stdout.startsWith('120000 ') && show('link.txt').stdout === 'pkg/app.mjs', ltl.stdout.trim());
+  const stub = show('docs/prompts/METHODOLOGY.md');
+  check('[stripped stub served] HEAD:<stripped> is the inert stub, not real prose', (stub.status ?? 1) === 0 && stub.stdout === STRIPPED_STUB && !/working agreement/i.test(stub.stdout), JSON.stringify(stub.stdout.slice(0, 60)));
+  check('[node_modules absent] no HEAD path under node_modules/', ![...head].some((p) => p.startsWith('node_modules/')), [...head].filter((p) => p.startsWith('node_modules/')).join(',') || '(none)');
+  const status = gitRead(room, ['status', '--porcelain']);
+  check('[git status clean] after the seed', (status.status ?? 1) === 0 && status.stdout.trim() === '', `exit ${status.status}, dirty: ${JSON.stringify(status.stdout.trim().slice(0, 120))}`);
 }
 
 /* ------- P3 (r3 RESCOPE): seed hermeticity + honest-case decorrelation hygiene --
@@ -619,6 +750,7 @@ try {
   proveCause1(preValidateRunForms, 'PRE-fix r2 shell-text advisory validator');
   proveCause2(preProviderAbortKind, 'PRE-fix scrape-through classifier');
   proveCause3Hermeticity(preBuildRoomGitEnv, 'PRE-fix ...process.env spread', facts);
+  proveExportedFileSet(preSeedScratchGit, 'PRE-fix r6 git add -A');
   const preFailures = fail - preStart;
   console.log(`\n  PRE-fix produced ${preFailures} failure(s) — a must-FAIL proof is only real if this is > 0.`);
   const preOk = preFailures > 0;
@@ -629,6 +761,7 @@ try {
   proveCause1(validateRunForms, 'POST-FIX real');
   proveCause2(providerAbortKind, 'POST-FIX real');
   proveCause3Seed();
+  proveExportedFileSet(seedScratchGit, 'POST-FIX real');
   proveBuildRoomGitEnvUnit();
   proveCause3Hermeticity(buildRoomGitEnv, 'POST-FIX real', facts);
   proveDispatchWritesTypedKind();

@@ -946,9 +946,41 @@ export function seedScratchGit(dir) {
       GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
       GIT_COMMITTER_NAME: 'independent-verify', GIT_COMMITTER_EMAIL: 'verify@example.invalid',
     });
-    const g = (args) => spawnSync('git', args, { encoding: 'utf8', env });
+    const g = (args, extra = {}) => spawnSync('git', args, { encoding: 'utf8', env, ...extra });
     try {
-      const add = g(['add', '-A']);
+      // Commit EXACTLY the files physically in the FINAL room tree (BUG-273 r6).
+      // NOT `git add -A`: that honours .gitignore / nested .gitignore / info/exclude
+      // / core.excludesFile, so an exported-but-ignored TRACKED file is SILENTLY
+      // dropped from HEAD — the seed still reports ok, then the verifier's
+      // `git show HEAD:<file>` dies 128 (the r5 INVALID). The authority is the room
+      // on disk: the post-strip, post-stub, post-symlink-materialisation tree this
+      // commit must mirror. We enumerate it with a plain fs walk that applies NO
+      // ignore rules, then force-add that explicit set, so ignore rules cannot
+      // subtract from it. node_modules (the 10k-file live-tree COPY) and the .git we
+      // just built are the only exclusions — matching the `/node_modules/`
+      // info/exclude kept above, which still holds `git status` clean.
+      const relFiles = [];
+      (function walk(relDir) {
+        let ents;
+        try { ents = fs.readdirSync(relDir ? path.join(dir, ...relDir.split('/')) : dir, { withFileTypes: true }); } catch { return; }
+        for (const e of ents) {
+          const rel = relDir ? `${relDir}/${e.name}` : e.name;
+          if (!relDir && (e.name === '.git' || e.name === 'node_modules')) continue; // our skeleton / live-tree copy
+          if (e.isSymbolicLink()) { relFiles.push(rel); continue; }   // commit the LINK itself, never follow it
+          if (e.isDirectory()) { walk(rel); continue; }               // recurse; an empty dir emits nothing (git cannot track one)
+          relFiles.push(rel);
+        }
+      })('');
+      // Force-add the explicit, NUL-separated set from stdin: `-f` overrides every
+      // ignore source (.gitignore / info/exclude / core.excludesFile) so none can
+      // drop a listed file; `--pathspec-file-nul` takes every byte literally, so a
+      // leading `-`, spaces, newlines or unicode in a path cannot be misread as a
+      // flag or re-split. Only FILES/symlinks are listed (never a directory), so git
+      // never re-expands a dir under ignore rules. node_modules is simply never
+      // listed, so `-f` cannot pull the live-tree copy in.
+      const add = relFiles.length === 0
+        ? { status: 0 }
+        : g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: relFiles.join('\0') });
       if ((add.status ?? 1) !== 0) return { ok: false, error: `git add (temp index): ${(add.stderr || add.stdout || '').trim().slice(0, 200)}` };
       const wt = g(['write-tree']);
       if ((wt.status ?? 1) !== 0) return { ok: false, error: `git write-tree: ${(wt.stderr || '').trim().slice(0, 200)}` };

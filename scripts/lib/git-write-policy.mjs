@@ -743,6 +743,12 @@ export function gitWriteRefusal(offender) {
     '`node scripts/git-grant.mjs <project> --once`) with no relaunch. An agent',
     'cannot lift this for itself; the grant comes from the user only.',
     '',
+    'If the git you need is THROWAWAY or SCRATCH (a fixture, a test repo, a',
+    'clean-room — nothing real), you do NOT need a grant: run it under the',
+    'confined runner, where git is unguarded against nothing that matters —',
+    '`npm run confined -- <cmd>` (inside Orchard), or',
+    '`node <orchard>/scripts/confined-run.mjs -- <cmd>` from another project.',
+    '',
     decisive,
   ].join('\n');
 }

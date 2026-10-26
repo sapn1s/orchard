@@ -479,3 +479,10 @@ Additive. A new module plus one branch in `resolveGitShim`, behind fail-closed r
 
 ### 2026-10-14 — worker (BUG-259 fixing r1)
 - **Note:** Correction: the Owner cell is back on 👤. board:check requires 👤 while the record still says human_action decide, and settling that record is outside BUG-259. The earlier note's 'stale drift' stands as an observation only; nothing else changed.
+
+### 2026-10-25 — worker (trivial, fixing r1)
+- **Understood:** the confined runner (`npm run confined`) was built and is the sanctioned venue for scratch/throwaway git (decision A above), but the git-write guard's own refusal message (`gitWriteRefusal` in scripts/lib/git-write-policy.mjs) named ONLY the grant path. A 2026-10-25 study found lanes hitting the guard on scratch repos and working around it by hand — the message never told them the runner exists.
+- **Changed:** `gitWriteRefusal` now adds one paragraph: if the git you need is throwaway/scratch (fixture, test repo, clean-room — nothing real) you do NOT need a grant; run it under the confined runner — `npm run confined -- <cmd>` (inside Orchard) or `node <orchard>/scripts/confined-run.mjs -- <cmd>` from another project. The gate-failed refusal (`gitWriteGateFailedRefusal`) is untouched: a FAILED gate is a real leak, not a scratch-venue case.
+- **Verified:** `node scripts/verify-feat-108-git-write-block.mjs` PASS 240/0/1 (was 237; +1 new assertion `refusal points scratch/throwaway git at the confined runner`, checking `npm run confined` + `confined-run.mjs` + `scratch`; the 3 prior refusal assertions still hold since lines were only added). Confirmed the live message contains the confined lines via a direct import. `npm run gate` exit 0 (leak-gate + typecheck, read unpiped).
+- **Files (unstaged):** scripts/lib/git-write-policy.mjs, scripts/verify-feat-108-git-write-block.mjs, docs/bugs/BUG-240-git-write-guard-refuses-writes-in-throwaway-scra.md.
+- **Open:** nothing for this follow-up. Ticket's decision state unchanged (no code/decision axis touched beyond the refusal copy). Symptom of a deeper design flaw? no — documentation/discoverability gap in one message string.

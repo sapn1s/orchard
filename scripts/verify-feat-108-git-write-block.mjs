@@ -355,6 +355,10 @@ ok('refusal tells the agent to report the file list', /report/i.test(r) && /file
 ok('refusal names the runtime grant surface for an instructed dispatch',
   /git-grant\.mjs/.test(r) && /grant git writes/i.test(r));
 ok('refusal makes clear the agent cannot lift it itself', /cannot lift this for itself/i.test(r));
+// BUG-240 follow-up — scratch/throwaway git needs no grant: point at the confined
+// runner so lanes stop working around the guard by hand on fixture repos.
+ok('refusal points scratch/throwaway git at the confined runner',
+  /npm run confined/.test(r) && /confined-run\.mjs/.test(r) && /scratch/i.test(r));
 
 /* ═══ 8. ROBUSTNESS — a policy bug must never take a session down ═══════════ */
 const hostile = [null, undefined, 12345, {}, 'x'.repeat(500_000), '$('.repeat(5000),

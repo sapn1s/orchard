@@ -46,6 +46,15 @@ export declare function classifyMutation(call?: { toolName?: string; toolInput?:
 /** Scan a Bash command string for whole-file / git-tree mutations and their targets. Pure. */
 export declare function scanBashMutation(command: string, depth?: number, ctx?: unknown): MutationClass;
 
+/**
+ * BUG-277 — is the WHOLE (trimmed) Bash command string exactly the sanctioned
+ * index-only form `git apply --cached <plain-path>…` (no leading `-` on any token,
+ * no shell metacharacter anywhere, no second command)? That form writes only the
+ * index, so it cannot clobber a concurrent lane's working-tree edits and is exempt
+ * from the lock. Anything else returns false → today's tree classification. Pure.
+ */
+export declare function isIndexOnlyApplyExempt(command: unknown): boolean;
+
 /** Normalise a raw target to its lock KEY (repo-relative when under the repo, else absolute). */
 export declare function lockKeyFor(rawPath: string, repoRoot?: string | null, aliases?: string[]): string;
 

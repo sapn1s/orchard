@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import {
   classifyMutation, scanBashMutation, evaluateFileLock, reclaimReason,
   fileLockEnabled, lockKeyFor, FILE_LOCK_TTL_MS,
-  refreshOwnedLocks, heartbeatIntervalMs,
+  refreshOwnedLocks, heartbeatIntervalMs, isIndexOnlyApplyExempt,
 } from './lib/file-lock.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -519,85 +519,106 @@ section('9c. round 4 — container (/workspace/<id>) vs host session on the same
   ok(/path\.join\(dataDir\(\), 'file-locks', fileLockProjectKey/.test(rt) && /gitGrantKey: opts\.project\.id/.test(br), 'the lock DIR is keyed by project id for both modes (one namespace)');
 }
 
-/* ──────── 10. BUG-277 — index-only `git apply --cached` exemption, as a strict ALLOWLIST
+/* ──────── 10. BUG-277 — index-only `git apply --cached` exemption, as a WHOLE-STRING match
  *
  * The live jam (2026-10-25): `git apply --cached` writes ONLY the index, yet the
  * classifier put every `apply` in GIT_TREE_MUTATORS and gitMutationTarget returned
- * {tree:true} for it (no `--` pathspec) — so `decideFileLock`→`checkTree` refused the
+ * {tree:true} for it (no `--` pathspec) — so `evaluateFileLock`→`checkTree` refused the
  * sanctioned index-only landing whenever ANY foreign lane held ANY live lock, even
  * on an out-of-repo scratch file.
  *
- * r1 fixed that with a DENYLIST ("--cached present, --index absent"). openai run
- * 01a173bb… returned BROKEN: the denylist waved through every OTHER apply form that
- * merely carries --cached — `--cached --reject` (writes .rej), `--cached
- * --build-fake-ancestor=<f>` (writes <f>), `--cached --no-cached` (cancels --cached),
- * and -C/--git-dir/GIT_* contexts — all index-exempted while they WRITE the tree, so
- * a foreign lock was bypassed.
+ * r1 (DENYLIST over git-apply flags) and r2 (TOKEN ALLOWLIST + a GIT_* / global
+ * option guard) both PARSED the command — both refuted, because the classifier cannot
+ * model what the SHELL does before git runs. openai run 01a173bb… broke r1 on
+ * `--cached --reject`/`--build-fake-ancestor`/`--no-cached`; anthropic run f02aa74c…
+ * broke r2 on SHELL-EXPANSION forms (`$(echo --reject)`, `{--reject,p.diff}`, `$VAR`,
+ * globs) and ENV set earlier on the line (`export GIT_WORK_TREE=…;`, `env GIT_DIR=…
+ * git …`) — all tokenised to the exempt shape yet redirect/rewrite the real apply.
  *
- * r2 RESCOPES to an ALLOWLIST of exactly ONE shape — `git apply --cached <path>...`
- * (optionally `-- <path>...`), the form the landing flow actually uses. EVERY other
- * apply form stays tree-classified (as before r1). Over-refusing a rare form fails
- * safe (the tree check only denies when a lock is actually held); under-refusing is
- * the defect. The cases below are the verdict's attack list; each `tree(...)` is a
- * must-FAIL synthesized from the r1 code (probed EXEMPT under r1, TREE under r2). */
-section('10. BUG-277 r2 — index-only apply exemption is a strict allowlist (`git apply --cached`)');
+ * r3 (this) STOPS parsing shell. The exemption fires ONLY when the WHOLE Bash command
+ * string, trimmed, matches EXACTLY `git apply --cached <plain-path>…` — no leading `-`
+ * on any token, NO shell metacharacter anywhere, no second command. Everything else
+ * falls back to today's tree classification (fail-safe: the tree check denies only
+ * when a lock is actually held). Over-refusal is acceptable and expected.
+ *
+ * Each `refused(...)` below is a must-FAIL synthesized from the r2 code: 21 of these
+ * attacks classified EXEMPT under r2 (probed live, r2 vs r3). `exempt(...)` fires on
+ * exactly one shape — the confirmed real landing form. */
+section('10. BUG-277 r3 — index-only apply exemption is a WHOLE-STRING match (`git apply --cached <path>…`)');
 {
   const APPLY = 'git' + ' apply'; // keep the literal out of any command-scanner's eye; this is a classifier arg, never run
-  const tree = (c) => scanBashMutation(c).tree === true;
-  const noMut = (c) => scanBashMutation(c).mutates === false;
+  // exempt = the lock never fires (mutates:false), via the REAL entry classifyMutation.
+  const cls = (c) => classifyMutation({ toolName: 'Bash', toolInput: { command: c } });
+  const exempt = (c) => cls(c).mutates === false;
+  const refused = (c) => cls(c).mutates === true; // not exempt → subject to the lock (tree or path)
 
-  // EXEMPT — the exact landing shape(s): --cached + only plain patch paths.
-  ok(noMut(`${APPLY} --cached p.diff`), '`apply --cached <path>` → index-only, EXEMPT (the live jam, now allowed)');
-  ok(noMut(`${APPLY} --cached a.patch b.patch c.patch`), '`apply --cached` with several patch paths → EXEMPT');
-  ok(noMut(`${APPLY} --cached /abs/path/bug240.patch`), '`apply --cached <abs path>` → EXEMPT');
-  ok(noMut(`${APPLY} --cached -- a.patch`), '`apply --cached -- <path>` → `--` then only paths → EXEMPT');
-  ok(noMut(`${APPLY} --cached < p.diff`), '`apply --cached` reading a patch from stdin → EXEMPT');
-  ok(noMut(`cat p.diff | ${APPLY} --cached`), '`cat p.diff | apply --cached` → EXEMPT');
-  ok(noMut(`${APPLY} --cached "my patch.diff"`), '`apply --cached "my patch.diff"` → a patch path with spaces → EXEMPT');
+  // EXEMPT — exactly the confirmed real landing form: `git apply --cached <plain path>…`.
+  ok(exempt(`${APPLY} --cached scripts/git-write-policy.mjs.patch`), 'the live landing shape `apply --cached <repo-rel path>` → EXEMPT (the live jam, now allowed)');
+  ok(exempt(`${APPLY} --cached a.patch b.patch c.patch`), '`apply --cached` with several plain patch paths → EXEMPT');
+  ok(exempt(`${APPLY} --cached /var/lib/station/scratch/landing/r1/bug240.patch`), 'the exact ABSOLUTE-path landing form (tilde already expanded) → EXEMPT');
+  // Predicate directly: trim strips a trailing newline; an EMBEDDED newline does not match.
+  ok(isIndexOnlyApplyExempt(`${APPLY} --cached a.patch\n`), 'predicate: a trailing newline is trimmed → still EXEMPT');
+  ok(!isIndexOnlyApplyExempt(`${APPLY} --cached a.patch\nrm x`), 'predicate: an embedded newline (2nd command) → NOT exempt');
+  ok(!isIndexOnlyApplyExempt(`${APPLY} --cached`), 'predicate: `apply --cached` with NO path → not the exempt shape');
 
-  // TREE — every r1 break: a second option beside --cached that writes the working tree.
-  ok(tree(`${APPLY} --cached --reject p.diff`), 'r1-break: `--cached --reject` writes .rej → TREE (not exempt)');
-  ok(tree(`${APPLY} --cached --build-fake-ancestor=f p.diff`), 'r1-break: `--cached --build-fake-ancestor=<f>` writes <f> → TREE');
-  ok(tree(`${APPLY} --cached --no-cached p.diff`), 'r1-break: `--cached --no-cached` cancels --cached → TREE');
-  ok(tree(`${APPLY} --cached --index p.diff`), '`--cached --index` writes the tree → TREE');
-  ok(tree(`${APPLY} --cached --3way p.diff`), '`--cached --3way` carries an extra option → TREE (over-refuse, fail-safe)');
+  // REFUSED — every r1/r2 flag break (an extra option beside --cached that writes the tree).
+  ok(refused(`${APPLY} --cached --reject p.diff`), 'r1-break: `--cached --reject` writes .rej → REFUSED');
+  ok(refused(`${APPLY} --cached --build-fake-ancestor=f p.diff`), 'r1-break: `--cached --build-fake-ancestor=<f>` writes <f> → REFUSED');
+  ok(refused(`${APPLY} --cached --no-cached p.diff`), 'r1-break: `--cached --no-cached` cancels --cached → REFUSED');
+  ok(refused(`${APPLY} --cached --index p.diff`), '`--cached --index` writes the tree → REFUSED');
+  ok(refused(`${APPLY} --cached --3way p.diff`), '`--cached --3way` carries an extra option → REFUSED');
+  ok(refused(`${APPLY} --cache p.diff`), '`--cache` abbreviation is NOT literal `--cached` → REFUSED');
+  ok(refused(`${APPLY} --cached=1 p.diff`), '`--cached=1` is not the bare flag → REFUSED');
+  ok(refused(`${APPLY} -Rp1 --cached p.diff`), 'a combined short-flag cluster beside --cached → REFUSED');
 
-  // TREE — abbreviations / malformed --cached (refusing a rare form is acceptable).
-  ok(tree(`${APPLY} --cache p.diff`), '`--cache` abbreviation is NOT literal `--cached` → TREE (refuse, acceptable)');
-  ok(tree(`${APPLY} --cached=1 p.diff`), '`--cached=1` is not the bare flag → TREE');
-  ok(tree(`${APPLY} -Rp1 --cached p.diff`), 'a combined short-flag cluster beside --cached → TREE');
+  // REFUSED — r2 breaks: git GLOBAL options & GIT_*/env prefixes (r2 tokenised these to exempt).
+  ok(refused(`git -c foo=bar apply --cached p.diff`), 'r2-break: a `-c` git global option → REFUSED');
+  ok(refused(`git -C /x apply --cached p.diff`), 'r2-break: a `-C <dir>` git global option → REFUSED');
+  ok(refused(`git --git-dir=/x/.git apply --cached p.diff`), 'r2-break: `--git-dir` git global option → REFUSED');
+  ok(refused(`git --work-tree=/x apply --cached p.diff`), 'r2-break: `--work-tree` git global option → REFUSED');
+  ok(refused(`GIT_WORK_TREE=/x ${APPLY} --cached p.diff`), 'r2-break: a `GIT_WORK_TREE=` env prefix → REFUSED');
+  ok(refused(`GIT_DIR=/x/.git ${APPLY} --cached p.diff`), 'r3-break: a `GIT_DIR=` env prefix → REFUSED');
+  ok(refused(`export GIT_WORK_TREE=/x; ${APPLY} --cached p.diff`), 'r3-break: `export GIT_WORK_TREE=…;` set earlier on the line → REFUSED (r2 EXEMPTED this)');
+  ok(refused(`env GIT_DIR=/x/.git ${APPLY} --cached p.diff`), 'r3-break: `env GIT_DIR=… git apply --cached` → REFUSED (r2 EXEMPTED this)');
+  ok(refused(`env X=y ${APPLY} --cached p.diff`), 'r3-break: any `env X=… git …` prefix → REFUSED');
 
-  // TREE — git GLOBAL options & GIT_* env prefixes redirect the apply off the plain index.
-  ok(tree(`git -c foo=bar apply --cached p.diff`), 'r1-break: a `-c` git global option → TREE (disqualifies exemption)');
-  ok(tree(`git -C /x apply --cached p.diff`), 'r1-break: a `-C <dir>` git global option → TREE');
-  ok(tree(`git --git-dir=/x/.git apply --cached p.diff`), 'r1-break: `--git-dir` git global option → TREE');
-  ok(tree(`git --work-tree=/x apply --cached p.diff`), 'r1-break: `--work-tree` git global option → TREE');
-  ok(tree(`GIT_WORK_TREE=/x ${APPLY} --cached p.diff`), 'r1-break: a `GIT_WORK_TREE=` env prefix → TREE');
-  ok(tree(`GIT_DIR=/x/.git ${APPLY} --cached p.diff`), 'a `GIT_DIR=` env prefix → TREE');
+  // REFUSED — r3 SHELL-EXPANSION attacks (what git RECEIVES differs from the literal text).
+  ok(refused(`${APPLY} --cached $(echo --reject) p.diff`), 'r3-break: `$(…)` command substitution → REFUSED (r2 EXEMPTED this)');
+  ok(refused(`${APPLY} --cached \`echo --reject\` p.diff`), 'r3-break: backtick substitution → REFUSED');
+  ok(refused(`${APPLY} --cached \${OPT} p.diff`), 'r3-break: `${…}` parameter expansion → REFUSED');
+  ok(refused(`${APPLY} --cached {--reject,p.diff}`), 'r3-break: brace list `{--reject,p.diff}` → REFUSED (r2 EXEMPTED this)');
+  ok(refused(`${APPLY} --cached $OPT p.diff`), 'r3-break: a `$VAR` reference → REFUSED');
+  ok(refused(`${APPLY} --cached *.patch`), 'r3-break: a `*` glob → REFUSED');
+  ok(refused(`${APPLY} --cached p?.patch`), 'r3-break: a `?` glob → REFUSED');
+  ok(refused(`${APPLY} --cached [ab].patch`), 'r3-break: a `[…]` glob → REFUSED');
+  ok(refused(`${APPLY} --cached ~/p.patch`), 'r3-break: a `~` (tilde) path → REFUSED (lander must use an absolute literal path)');
 
-  // NOT exempted via the apply path (as before r1): an ALIAS is not the `apply` subcommand.
-  ok(!scanBashMutation(`git -c alias.x=apply x --cached p.diff`).tree && noMut(`git -c alias.x=apply x --cached p.diff`),
-    '`git -c alias.x=apply x --cached` → `x` is not the `apply` subcommand, so the apply exemption never fires (unchanged from pre-r1: an unknown subcommand is not classified a mutation)');
+  // REFUSED — quoting / escaping (r2 EXEMPTED these; over-refusal is fine).
+  ok(refused(`${APPLY} --cached 'p.patch'`), "r3: single-quoted path → REFUSED");
+  ok(refused(`${APPLY} --cached "p.patch"`), 'r3: double-quoted path → REFUSED');
+  ok(refused(`${APPLY} --cached p\\ q.patch`), 'r3: a `\\` escape → REFUSED');
 
-  // TREE — plain / working-tree apply forms, unchanged.
-  ok(tree(`${APPLY} --reject p.diff`), '`apply --reject` without --cached → writes .rej → TREE');
-  ok(tree(`${APPLY} --3way p.diff`), '`apply --3way` without --cached → writes the tree → TREE');
-  ok(tree(`${APPLY} p.diff`), 'plain `apply` (no --cached) → writes the tree → TREE');
-  ok(tree('git am < p.mbox'), '`git am` has no --cached and commits → stays TREE');
+  // REFUSED — a second command on the line, whatever the separator.
+  ok(refused(`${APPLY} --cached p.diff\nrm -rf x`), 'r3: a newline-separated second command → REFUSED');
+  ok(refused(`${APPLY} --cached p.diff; rm -rf x`), 'r3: `; rm -rf x` second command → REFUSED');
+  ok(refused(`export X=1; ${APPLY} --cached p`), 'r3: `export X=1;` before the git → REFUSED');
 
-  // `--cached` AFTER `--` is a patch FILENAME, not the flag → not exempted (keyed as a path).
-  ok(scanBashMutation(`${APPLY} -- --cached`).paths?.includes('--cached'), '`apply -- --cached` → `--cached` after `--` is a patch FILENAME → not exempted');
-  // A patch path starting with `-` before `--` reads as an option → not exempted.
-  ok(tree(`${APPLY} --cached -weird.patch`), '`apply --cached -weird.patch` → a `-`-leading path reads as an option → TREE');
+  // REFUSED — whitespace: a doubled space or a tab is not the single-space shape.
+  ok(refused(`${APPLY}  --cached p.diff`), 'r3: a DOUBLE space (`git  apply`) → REFUSED (r2 EXEMPTED this)');
+  ok(refused(`${APPLY}\t--cached p.diff`), 'r3: a TAB between tokens → REFUSED');
+  ok(refused(`${APPLY} --cached\tp.diff`), 'r3: a TAB before the path → REFUSED');
 
-  // A non-git command that merely CONTAINS the literal text must not be misclassified.
-  ok(noMut(`echo "${APPLY} --cached foo"`), 'echo of the literal text is not a mutation');
-  ok(noMut(`grep -n "${APPLY} --cached" file.txt`), 'grep for the literal text is not a mutation');
+  // REFUSED — a unicode lookalike dash (U+2011) is not ASCII `--cached`.
+  ok(refused(`${APPLY} ‑‑cached p.diff`), 'r3: a unicode lookalike dash in `‑‑cached` → REFUSED');
 
-  // `&&`/`;`-joined: the index-only apply is dropped, but each later segment classifies on its OWN.
-  ok(tree(`${APPLY} --cached p.diff && git checkout-index -a -f`), '`apply --cached && checkout-index` → the trailing checkout-index still classifies TREE');
-  ok(scanBashMutation(`${APPLY} --cached p.diff && git checkout -- other.txt`).paths?.includes('other.txt'),
-    '`apply --cached && git checkout -- other.txt` → the second command is classified independently (keys `other.txt`, not swallowed)');
+  // Plain / working-tree apply forms stay tree-classified, as before.
+  ok(scanBashMutation(`${APPLY} --reject p.diff`).tree === true, '`apply --reject` without --cached → writes .rej → TREE');
+  ok(scanBashMutation(`${APPLY} p.diff`).tree === true, 'plain `apply` (no --cached) → writes the tree → TREE');
+  ok(scanBashMutation('git am < p.mbox').tree === true, '`git am` has no --cached and commits → stays TREE');
+
+  // A non-git command that merely CONTAINS the literal text must not be misclassified as a mutation.
+  ok(exempt(`echo "${APPLY} --cached foo"`), 'echo of the literal text is not a mutation');
+  ok(exempt(`grep -n "${APPLY} --cached" file.txt`), 'grep for the literal text is not a mutation');
 
   // END-TO-END (the user's reality): a foreign live lane holds a lock on an OUT-OF-REPO scratch
   // file (the FEAT-191 IV repro); the index-only landing must be ALLOWED, a WT-writing apply REFUSED.
@@ -611,6 +632,9 @@ section('10. BUG-277 r2 — index-only apply exemption is a strict allowlist (`g
   ok(landed.allow, 'POST: the sanctioned `apply --cached` landing is ALLOWED while the foreign lane holds its scratch lock (was REFUSED pre-fix — the live jam)');
   const wt = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
   ok(!wt.allow && wt.busy && wt.holder?.owner === A, 'POST: a working-tree-writing `apply` (no --cached) is still REFUSED under the foreign lock (names the holder)');
+  // And an EXPANSION-form apply is NOT exempted: it too is refused under the foreign lock.
+  const expo = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached $(echo scripts/x) p.diff` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!expo.allow && expo.busy, 'POST: an expansion-form `apply --cached $(…)` is REFUSED under the foreign lock (not index-exempted)');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);

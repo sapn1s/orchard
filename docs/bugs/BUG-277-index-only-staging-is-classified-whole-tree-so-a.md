@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "open",
   "human_action": "none",
-  "updated": "2026-10-25",
+  "updated": "2026-10-26",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -38,6 +38,18 @@
       "candidate": "3abffb706d113189195093457e3fc640feab0d4939e8d2c58f16c1c89bf6202e",
       "verify_mode": "mixed-state",
       "note": "Exempted forms write the working tree: --cached --reject (writes .rej), --cached --build-fake-ancestor=<f> (overwrites <f>), --cached --no-cached (writes tree). All classify mutates:false, so a foreign lock is bypassed. Narrow exemption."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "f02aa74c-d559-4080-9c2f-5e69d4c4e145",
+      "verdict": "broken",
+      "verdict_on": "2026-10-26",
+      "recorded_at": "2026-10-26T18:10:16.214Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "IV range 31d2fca^..31d2fca: exemption under-refuses — shell-expansion forms ($(echo --reject), {--reject,p.diff}) and env-prefix forms (env GIT_DIR=.. git apply --cached, export GIT_WORK_TREE=..;) classified index-only and ALLOWED under a foreign lock; manifest-backed adv-e2e."
     }
   ],
   "verification_class": "fix",
@@ -114,3 +126,19 @@ Either is sufficient:
 - **Suites:** `verify-feat-129-file-lock.mjs` → PASS 180/180 (run under `npm run confined --no-git`, since it writes scratch git repos — the session git shim blocks a scratch `git init` otherwise). `npm run gate` → PASS (exit 0): leak-gate + typecheck clean.
 - **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/verify-feat-129-file-lock.mjs`, this ticket.
 - **Risk bucket:** touches the shared-tree safety path (regression-prone) — an independent clean-room verify pass is warranted before close. The change only ever NARROWS the exemption relative to r1 (an allowlist strictly inside r1's denylist); every working-tree-writing form, `git am`, global-option/`GIT_*` contexts, and literal-text-in-a-non-git-command cases were proven TREE or not-a-mutation.
+
+### 2026-10-26 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run f02aa74c-d559-4080-9c2f-5e69d4c4e145 — VERDICT: BROKEN — IV range 31d2fca^..31d2fca: exemption under-refuses — shell-expansion forms ($(echo --reject), {--reject,p.diff}) and env-prefix forms (env GIT_DIR=.. git apply --cached, export GIT_WORK_TREE=..;) classified index-only and ALLOWED under a foreign lock; manifest-backed adv-e2e.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-26 — fixing lane (round 3)
+- **regressed-from:** BUG-277 r1 and r2 (same ticket). Both tried to RECOGNISE the index-only form by PARSING the command (r1 a denylist over git-apply flags; r2 a token allowlist + a GIT_* / global-option guard). Both were refuted because the classifier cannot model what the SHELL does before git runs: r2 (run f02aa74c…) was BROKEN by shell-expansion forms (`$(echo --reject)`, `{--reject,p.diff}`, `$VAR`, globs `* ? [`) and env set earlier on the line (`export GIT_WORK_TREE=…;`, `env GIT_DIR=… git …`) — all tokenised to the exempt shape yet redirect/rewrite the real apply.
+- **Decision (orchestrator):** STOP parsing shell. The exemption fires ONLY when the WHOLE Bash command string, trimmed, matches EXACTLY `^git apply --cached( <plain-path-token>)+$` — no leading `-` on any token, NO shell metacharacter anywhere (`$ \` ( ) { } [ ] * ? ; & | < > ' " \\ ~ ! newline tab`, or a doubled/odd space), and no second command on the line. Anything else falls back to today's tree classification. Over-refusal is acceptable; under-refusal is the defect.
+- **Landing-shape hypothesis — verified FIRST (within limits).** The live repro (this ticket) and the r2 Activity log record the real landing command as the bare form `git apply --cached <patch-file>` with PLAIN paths — quoted live as `git apply --cached scripts/git-write-policy.mjs.patch`, and the real staged patch files `bug240-git-write-policy.patch` / `bug240-ticket.patch` / `bug240-verify-feat-108.patch`. No `~`, no `$VAR`, no metacharacter → the strict regex exempts exactly this (repo-relative OR tilde-already-expanded absolute paths both match). NOTE: I could NOT list the live scratch dir `~/.local/state/claude-station/scratch/landing/` (sandbox permission timed out), so this rests on the command shapes recorded in the ticket/r2 log, not a fresh directory read. **Directive to the landing lane:** a command that literally contains `~` or `$L` (unexpanded) will NOT match and will be refused — landers must pass an ABSOLUTE LITERAL path (or a repo-relative plain path). The rule was NOT widened to accommodate `~`/vars.
+- **Fix (scripts/lib/file-lock.mjs):**
+  - New `INDEX_ONLY_APPLY_RE = /^git apply --cached( [A-Za-z0-9._/+][A-Za-z0-9._/+@=-]*)+$/` and exported `isIndexOnlyApplyExempt(command)` = `RE.test(command.trim())`. The char classes exclude every shell metacharacter, so the single regex both pins the shape AND rejects metacharacters by construction; the first token char excludes `-` (no option-leading path). A trailing newline is stripped by trim(); an embedded newline (2nd command) fails the anchored `$`.
+  - The exemption is decided ONCE, at the top of `scanBashMutation` gated on `depth === 0` (the RAW user command only — a `sh -c`/`eval`/subshell/command-substitution body gets no exemption). It returns `{ mutates:false }`.
+  - REVERTED all r1/r2 shell-parsing scaffolding: the `apply` allowlist block in `gitMutationTarget` (now every `git apply` reaching the classifier is tree-classified as pre-exemption), the `indexOnly` branch in the git head of `scanBashMutation`, `hasGitEnvPrefix`, `gitSubcommand`'s `hadGlobal`, and `headOf`'s `assigns`.
+- **Verification (must-FAIL synthesized from the r2 code, run r2 vs r3 side by side):** a 35-case attack probe (`/tmp/bug277probe/probe.mjs`, synthetic/throwaway) imported r2 (git `31d2fca:…`) and r3. r2 WRONGLY EXEMPTED 21 of the 32 attacks (every shell-expansion, env-prefix, quote, escape, second-command and whitespace form); r3 = 35/35 correct (the one landing form EXEMPT, all 32 attacks REFUSED). Attack list proven refused: every r1/r2/r3 break; `$(…)`, backticks, `${…}`, `{a,b}`, globs `* ? [`, `~`; single+double quotes; `\` escape; newline- and `;`-separated second command; `export X=…;`/`env X=…`/`GIT_DIR=` prefixes; `git  apply` double space; tab; a U+2011 lookalike dash. The exact absolute-path landing form is EXEMPT.
+- **Suites:** rewrote section 10 of `scripts/verify-feat-129-file-lock.mjs` for the r3 contract (predicate tests + the full attack list via the REAL `classifyMutation` entry + the out-of-repo-scratch-lock end-to-end: landing shape ALLOWED, working-tree apply REFUSED and names the holder, expansion-form apply REFUSED). Full suite → PASS 196/196 under `node scripts/confined-run.mjs -- sh -c 'mkdir -p "$HOME/scratch" && node scripts/verify-feat-129-file-lock.mjs'` (confined because it writes scratch git repos; the container HOME needs its scratch dir pre-made). `npm run gate` → PASS (exit 0): leak-gate + typecheck clean (one home-path leak in an example string was neutralised to `/var/lib/station/...`).
+- **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/lib/file-lock.d.mts` (declared the new export), `scripts/verify-feat-129-file-lock.mjs`, this ticket.
+- **Risk bucket:** touches the shared-tree safety path (regression-prone) — an independent clean-room verify pass is warranted before close. r3 strictly NARROWS the exemption to one metachar-free literal shape (a subset of r2's allowlist); every other form, incl. all r2 breaks, now classifies tree/path (refused under a lock).

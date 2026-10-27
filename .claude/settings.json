@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "permissions": {
+    "allow": [
+      "Bash(node scripts/board-tool.mjs:*)",
+      "Bash(node scripts/http-get.mjs:*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/orchestrator-surface-log.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Recording tool surface (log-only, blocks nothing)"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.orchard/hooks/response-format-gate.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Checking response format (advisory)"
+          },
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/ticket-leak-gate.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Scanning changed tickets for private tokens (blocking)"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/scripts/hooks/ticket-leak-gate.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Scanning changed tickets for private tokens (blocking)"
+          }
+        ]
+      }
+    ]
+  }
+}

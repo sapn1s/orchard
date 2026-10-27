@@ -514,6 +514,16 @@ the division of labour they both assume: the orchestrator dispatches the hunt, t
 lane runs `rg` and reports. If you are the orchestrator and you find yourself
 reaching for this rule, the rule you actually want is the working agreement's §I.
 
+## Tooling — HTTP to the local server goes through `http-get.mjs`, not `curl` (BUG-279)
+
+For an HTTP request to the Orchard loopback server, run
+`node scripts/http-get.mjs <url>` — it is pre-approved and loopback-only
+(it refuses any non-loopback host and any redirect off loopback, in code).
+A bare `curl` is NOT allowed and raises a permission card that can stall a
+lane for 30 minutes before it is denied. Fetches to REMOTE hosts stay
+prompt-gated by design — untrusted pages are a prompt-injection / exfiltration
+vector (BUG-279); do not add a blanket `curl`/WebFetch allow to get around it.
+
 ## Git — never put an identity on a commit command line (BUG-148, 2026-08-25)
 
 `git -c user.email=… -c user.name=… commit`, `--author=…`, and `GIT_AUTHOR_EMAIL` /

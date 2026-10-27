@@ -36,6 +36,22 @@
  *   (The r1 cause-3 `.git` SEEDING behaviour — proveCause3Seed — is retained as an
  *    anti-regression.)
  *
+ * BUG-273 r7 (P3/seed): the r6 seed fed exported file NAMES to `git add
+ * --pathspec-from-file` WITHOUT GIT_LITERAL_PATHSPECS, so a name beginning with
+ * pathspec magic was interpreted, not taken literally — `:(exclude)x`/`:!x` were read
+ * as EXCLUDE filters and SILENTLY dropped from the commit, and a `:/`-leading or
+ * `:(glob)` name matched nothing and ABORTED the whole add (ok=false). It also walked
+ * with a STRING readdir, so an invalid-UTF-8 filename decoded to U+FFFD and lost its
+ * bytes. The fix sets GIT_LITERAL_PATHSPECS=1 in the seed's room-set git env (survives
+ * the GIT* scrub because it is layered via buildRoomGitEnv's `extra`) and walks with a
+ * BUFFER-accurate readdir. The pre-r7 anchor (preR6SeedScratchGit, the r6 shipped seed
+ * written out literally) reddens the attack suite; the real seed commits every
+ * adversarial name verbatim. Attack list proven against REAL git (r7 dispatch log):
+ * `:(exclude)x`, `:!x`, `:/x`, `:(glob)*`, `*`, `?`, `[ab]`, a backslash, a leading
+ * `-`, a newline, invalid-UTF-8 bytes, a very long path, a stray nested `.git` (never
+ * committed), plus the whole r6 list (ignored files, nested .gitignore, hostile HOME,
+ * symlink, stub served, node_modules absent, status clean).
+ *
  * MUST-FAIL ANCHOR — synthesized from the PRE-fix behaviour, NOT anchored to HEAD
  * (docs/CONVENTIONS.md: a baseline that names the thing being changed stops
  * failing the moment the fix lands). The pre-fix code is written out literally
@@ -169,6 +185,67 @@ function preSeedScratchGit(dir) {
     const g = (args) => spawnSync('git', args, { encoding: 'utf8', env });
     try {
       const add = g(['add', '-A']); // <-- the r6 defect: ignore rules subtract from HEAD
+      if ((add.status ?? 1) !== 0) return { ok: false, error: `git add: ${(add.stderr || '').trim().slice(0, 200)}` };
+      const wt = g(['write-tree']);
+      if ((wt.status ?? 1) !== 0) return { ok: false, error: `write-tree: ${(wt.stderr || '').trim()}` };
+      const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
+      if ((ct.status ?? 1) !== 0) return { ok: false, error: `commit-tree: ${(ct.stderr || '').trim()}` };
+      const commit = ct.stdout.trim();
+      fs.copyFileSync(path.join(idxTmp, 'index'), path.join(gitDir, 'index'));
+      fs.writeFileSync(path.join(gitDir, 'refs', 'heads', 'main'), commit + '\n');
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }) });
+      if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) return { ok: false, error: `HEAD resolve: ${(head.stderr || '').trim()}` };
+      return { ok: true, head: commit, error: null };
+    } finally { try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ } }
+  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+}
+
+// pre-r7 seedScratchGit: the r6 SHIPPED (e11e6af) seed written out literally — the
+// STRING walk + `git add -f --pathspec-from-file=- --pathspec-file-nul` with NO
+// GIT_LITERAL_PATHSPECS. `--pathspec-file-nul` fixes SPLITTING but NOT pathspec MAGIC,
+// so a magic-prefixed exported name is read as a pathspec: `:(exclude)x`/`:!x` become
+// EXCLUDE filters (seed reports ok but the file is SILENTLY absent from HEAD), and a
+// `:/`-leading or `:(glob)` name matches nothing and ABORTS the whole add (ok=false).
+// The string walk ALSO mangles an invalid-UTF-8 name to U+FFFD → wrong bytes → loss.
+// The r7 attack suite grades exactly these; everything else is byte-identical to the
+// shipped code so the proof isolates the add step.
+function preR6SeedScratchGit(dir) {
+  try {
+    const gitDir = path.join(dir, '.git');
+    if (fs.existsSync(gitDir)) return { ok: false, error: '.git already present' };
+    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'objects', 'pack'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'heads'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'tags'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(path.join(gitDir, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n');
+    fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), '/node_modules/\n');
+    const idxTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'iv-gitidx-pre6-'));
+    const env = buildRoomGitEnv({ // <-- NO GIT_LITERAL_PATHSPECS: the r6 defect
+      GIT_DIR: gitDir, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(idxTmp, 'index'),
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
+      GIT_COMMITTER_NAME: 'independent-verify', GIT_COMMITTER_EMAIL: 'verify@example.invalid',
+    });
+    const g = (args, extra = {}) => spawnSync('git', args, { encoding: 'utf8', env, ...extra });
+    try {
+      const relFiles = []; // STRING walk (mangles invalid-UTF-8 bytes to U+FFFD)
+      (function walk(relDir) {
+        let ents;
+        try { ents = fs.readdirSync(relDir ? path.join(dir, ...relDir.split('/')) : dir, { withFileTypes: true }); } catch { return; }
+        for (const e of ents) {
+          const rel = relDir ? `${relDir}/${e.name}` : e.name;
+          if (!relDir && (e.name === '.git' || e.name === 'node_modules')) continue;
+          if (e.isSymbolicLink()) { relFiles.push(rel); continue; }
+          if (e.isDirectory()) { walk(rel); continue; }
+          relFiles.push(rel);
+        }
+      })('');
+      const add = relFiles.length === 0
+        ? { status: 0 }
+        : g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: relFiles.join('\0') });
       if ((add.status ?? 1) !== 0) return { ok: false, error: `git add: ${(add.stderr || '').trim().slice(0, 200)}` };
       const wt = g(['write-tree']);
       if ((wt.status ?? 1) !== 0) return { ok: false, error: `write-tree: ${(wt.stderr || '').trim()}` };
@@ -381,6 +458,31 @@ function buildAttackRoom() {
   w('a file with spaces.txt', 'spaces\n');       // spaces
   w('café/münchen.txt', 'unicode\n');  // unicode dir + file
   w('thing.xf', 'would match a HOME excludesFile *.xf\n'); // core.excludesFile target
+  // BUG-273 r7 — PATHSPEC-MAGIC + adversarial-byte names (the newest BROKEN verdict).
+  // A non-literal `git add <name>` reads these as magic, NOT as literal paths:
+  // `:(exclude)x`/`:!x` are read as EXCLUDE filters (silent drop from HEAD), while
+  // `:/x` and `:(glob)star` match nothing and ABORT the whole add. The wildcard /
+  // backslash / newline / long / invalid-UTF-8 names stress the byte-accurate walk and
+  // `--pathspec-file-nul`. GIT_LITERAL_PATHSPECS=1 + the Buffer walk commit them all
+  // verbatim. (Proven against real git in the r7 dispatch log.)
+  w(':(exclude)x', 'magic exclude\n');           // read as an exclude filter pre-fix → silent drop
+  w(':!x', 'magic bang-exclude\n');              // :! is shorthand exclude → silent drop
+  w(':/x', 'leading colon-slash\n');             // dir ':' + file 'x' → rel ':/x' → ABORTS the add pre-fix
+  w(':(glob)star', 'magic glob\n');              // :(glob) magic → matches nothing → ABORTS pre-fix
+  w('*', 'literal asterisk\n');
+  w('?', 'literal question\n');
+  w('[ab]', 'literal bracket\n');
+  w('back\\slash', 'literal backslash\n');       // a backslash in the name
+  w('name\nwith\nnewline', 'literal newline\n'); // --pathspec-file-nul must not re-split on the newline
+  w('deep/' + 'a'.repeat(200) + '.txt', 'very long path component\n');
+  // a genuinely INVALID-UTF-8 filename (a 0xff byte) via a Buffer path: a STRING walk
+  // decodes it to U+FFFD and feeds git the wrong bytes → silent loss. The Buffer walk
+  // round-trips the exact bytes. (fs string paths can't express this, so write raw.)
+  fs.writeFileSync(Buffer.concat([Buffer.from(dir + '/'), Buffer.from([0x62, 0xff, 0x62])]), 'invalid utf8 name\n');
+  // a STRAY exported .git directory (nested) — git must NEVER commit anything under it.
+  fs.mkdirSync(path.join(dir, 'nested', '.git'), { recursive: true });
+  w('nested/.git/config', '[core]\n');
+  w('nested/real.txt', 'kept beside the stray .git\n');
   fs.mkdirSync(path.join(dir, 'emptydir'), { recursive: true }); // empty dir (git can't track one)
   fs.symlinkSync('pkg/app.mjs', path.join(dir, 'link.txt'));     // committed symlink (never followed)
   // a stripped prose file replaced by the inert boot stub (must serve the stub, not real prose)
@@ -436,8 +538,59 @@ function proveExportedFileSet(seed, label) {
   const stub = show('docs/prompts/METHODOLOGY.md');
   check('[stripped stub served] HEAD:<stripped> is the inert stub, not real prose', (stub.status ?? 1) === 0 && stub.stdout === STRIPPED_STUB && !/working agreement/i.test(stub.stdout), JSON.stringify(stub.stdout.slice(0, 60)));
   check('[node_modules absent] no HEAD path under node_modules/', ![...head].some((p) => p.startsWith('node_modules/')), [...head].filter((p) => p.startsWith('node_modules/')).join(',') || '(none)');
+
+  // --- BUG-273 r7: pathspec-magic + adversarial-byte items, one check per item ---
+  check('[magic :(exclude)x] committed VERBATIM (not read as an exclude filter)', inHead(':(exclude)x') && show(':(exclude)x').stdout === 'magic exclude\n', [...head].filter((p) => p.startsWith(':')).join(','));
+  check('[magic :!x] committed VERBATIM (not read as a bang-exclude)', inHead(':!x') && show(':!x').stdout === 'magic bang-exclude\n', [...head].filter((p) => p.startsWith(':')).join(','));
+  check('[leading :/x] committed VERBATIM (did NOT abort the add)', inHead(':/x') && show(':/x').stdout === 'leading colon-slash\n', [...head].filter((p) => p.startsWith(':')).join(','));
+  check('[magic :(glob)star] committed VERBATIM (did NOT abort the add)', inHead(':(glob)star') && show(':(glob)star').stdout === 'magic glob\n', [...head].filter((p) => p.startsWith(':')).join(','));
+  check('[wildcard * ? [ab]] committed VERBATIM', inHead('*') && inHead('?') && inHead('[ab]'), [...head].filter((p) => ['*', '?', '[ab]'].includes(p)).join(','));
+  check('[backslash in name] back\\slash committed', inHead('back\\slash'), [...head].filter((p) => p.includes('\\')).join(',') || '(none)');
+  check('[newline in name] committed without re-splitting on the newline', inHead('name\nwith\nnewline'), JSON.stringify([...head].find((p) => p.includes('\n')) ?? null));
+  check('[very long path] deep/<200×a>.txt committed', inHead('deep/' + 'a'.repeat(200) + '.txt'), '(path len ' + ('deep/' + 'a'.repeat(200) + '.txt').length + ')');
+  // invalid-UTF-8: read HEAD byte-accurately (the utf8 `head` set above mangles it).
+  const ltb = spawnSync('git', ['-C', room, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } });
+  const headBufs = []; { const b = ltb.stdout ?? Buffer.alloc(0); let s = 0; for (let i = 0; i < b.length; i++) { if (b[i] === 0) { headBufs.push(b.subarray(s, i)); s = i + 1; } } if (s < b.length) headBufs.push(b.subarray(s)); }
+  const badBuf = Buffer.from([0x62, 0xff, 0x62]);
+  check('[invalid-UTF-8 name] exact bytes (b<0xff>b) committed to HEAD', headBufs.some((h) => h.equals(badBuf)), headBufs.map((h) => h.toString('latin1')).filter((x) => x.includes('\xff')).join(',') || '(absent)');
+  check('[stray nested .git] nothing under nested/.git committed, sibling kept', ![...head].some((p) => p === 'nested/.git/config' || p.startsWith('nested/.git/')) && inHead('nested/real.txt'), [...head].filter((p) => p.includes('.git') || p.startsWith('nested/')).join(',') || '(none)');
+
   const status = gitRead(room, ['status', '--porcelain']);
   check('[git status clean] after the seed', (status.status ?? 1) === 0 && status.stdout.trim() === '', `exit ${status.status}, dirty: ${JSON.stringify(status.stdout.trim().slice(0, 120))}`);
+}
+
+/* ---- r7: exclude-magic names SILENTLY DROP without literal pathspecs -------------
+ * The INSIDIOUS half of the newest BROKEN verdict (the other half is the `:/`-leading
+ * ABORT the comprehensive attack room covers). A room with ONLY plain files plus
+ * `:(exclude)x` / `:!x`: these magic prefixes trigger NO error, so the pre-r7 seed
+ * reports ok=true — but git read them as EXCLUDE filters, so the files are SILENTLY
+ * absent from HEAD, and the verifier's later `git show HEAD::(exclude)x` dies 128 (the
+ * INVALID class this ticket keeps re-breaking on). The post-fix seed commits them
+ * verbatim. Run against BOTH the pre-r7 anchor (reddens: ok but missing) and the real
+ * seed (green). */
+function buildSilentDropRoom() {
+  const dir = tmp('iv-room-silentdrop-');
+  const w = (rel, body) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
+  w('package.json', '{"name":"x","version":"1.0.0"}\n');
+  w('normal.txt', 'plainly kept\n');
+  w(':(exclude)x', 'must be committed verbatim, not read as an exclude\n');
+  w(':!x', 'must be committed verbatim, not read as a bang-exclude\n');
+  return dir;
+}
+function provePathspecMagicSilentDrop(seed, label) {
+  section(`BUG-273 r7 — exclude-magic names SILENTLY DROP without literal pathspecs [${label}]`);
+  const room = buildSilentDropRoom();
+  const r = seed(room);
+  // The pre-fix seed reports ok (no abort on an exclude filter) yet drops the files;
+  // if a future pre-fix variant aborted instead, the ok check still reddens.
+  check(`[${label}] seed reports ok (no error — exclude magic is silent)`, r.ok, JSON.stringify(r));
+  if (!r.ok) return;
+  const lt = gitRead(room, ['ls-tree', '-r', '-z', '--name-only', 'HEAD']);
+  const head = new Set(lt.stdout.split('\0').filter(Boolean));
+  const show = (p) => gitRead(room, ['show', `HEAD:${p}`]);
+  check(`[${label}] :(exclude)x committed verbatim (NOT silently dropped)`, head.has(':(exclude)x') && (show(':(exclude)x').status ?? 1) === 0, [...head].join(','));
+  check(`[${label}] :!x committed verbatim (NOT silently dropped)`, head.has(':!x') && (show(':!x').status ?? 1) === 0, [...head].join(','));
+  check(`[${label}] plain sibling normal.txt still committed`, head.has('normal.txt'), [...head].join(','));
 }
 
 /* ------- P3 (r3 RESCOPE): seed hermeticity + honest-case decorrelation hygiene --
@@ -751,6 +904,8 @@ try {
   proveCause2(preProviderAbortKind, 'PRE-fix scrape-through classifier');
   proveCause3Hermeticity(preBuildRoomGitEnv, 'PRE-fix ...process.env spread', facts);
   proveExportedFileSet(preSeedScratchGit, 'PRE-fix r6 git add -A');
+  proveExportedFileSet(preR6SeedScratchGit, 'PRE-fix r7 string-walk + non-literal pathspecs');
+  provePathspecMagicSilentDrop(preR6SeedScratchGit, 'PRE-fix r7 non-literal pathspecs');
   const preFailures = fail - preStart;
   console.log(`\n  PRE-fix produced ${preFailures} failure(s) — a must-FAIL proof is only real if this is > 0.`);
   const preOk = preFailures > 0;
@@ -762,6 +917,7 @@ try {
   proveCause2(providerAbortKind, 'POST-FIX real');
   proveCause3Seed();
   proveExportedFileSet(seedScratchGit, 'POST-FIX real');
+  provePathspecMagicSilentDrop(seedScratchGit, 'POST-FIX real');
   proveBuildRoomGitEnvUnit();
   proveCause3Hermeticity(buildRoomGitEnv, 'POST-FIX real', facts);
   proveDispatchWritesTypedKind();

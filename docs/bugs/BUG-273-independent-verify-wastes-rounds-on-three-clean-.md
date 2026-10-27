@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-10-25",
+  "updated": "2026-10-26",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -138,6 +138,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "Committed-range IV of commit 6b5d754. >1 --run hard check, nonce-fresh provider-abort fallback, seed hermeticity HOLD. BROKEN: seedScratchGit 'git add -A' omits tracked-but-.gitignore files from synthetic HEAD (HEAD:file exit 128). Not pushed. Fix: add -f exported set / use real tree."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "92003ab2-7979-4994-bc83-46bbf613c2ab",
+      "verdict": "broken",
+      "verdict_on": "2026-10-26",
+      "recorded_at": "2026-10-26T18:10:34.989Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "IV 6b5d754^..e11e6af: r6 seedScratchGit 'git add --pathspec-from-file' lacks literal-pathspecs (GIT_* stripped), so pathspec-magic filenames (:(exclude).., :!..) drop silently from HEAD and a :/-leading name aborts the seed (ok:false) — r5 INVALID recurs. r1-r5 --run/nonce PASS. Manifest-backed."
     }
   ],
   "verification_class": "fix",
@@ -376,4 +388,19 @@ Fixed the r5 `BROKEN` (openai run `01a173aa-a5e2-7440-a80d-8b98203c237d`, commit
 - **Per-attack-item tally (POST-FIX real — all PASS):** tracked-but-ignored root file; ignored directory; nested `.gitignore`; the `.gitignore` files themselves; HOME/global `excludesFile` cannot matter (`thing.xf` committed under hostile HOME); leading-`-` name; spaces in path; unicode dir+file; empty dir absent from HEAD yet seed ok; symlink committed as mode 120000 with target not followed; stripped stub served (not real prose); node_modules absent from HEAD; `git status` clean after the seed. 13 attack checks + "seed reports ok" = 14 PASS.
 - **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **102 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 12 failures). `node scripts/verify-scratch-root.mjs` → **PASS 28 FAIL 0 SKIP 0** (real node_modules reflink-copy + cross-fs detection; the seed change did not perturb room build). `npm run gate` → **GATE: PASS (exit 0)**, read unpiped (leak-gate + check-nul + check-unicode-separators + prompt-privacy + pre-push-hook + typecheck).
 - **Bucket:** correctness / regression-prone clean-room harness. The seed is the exact surface the r5 IV refuted; a routine independent re-verify of the EXPORTED-FILE-SET property (`git show HEAD:<file>` for a tracked-but-ignored export) on the working tree atop `6b5d754` is warranted — NOT a security pass. Run the fixer test directly (`--run "node scripts/verify-bug-273-iv-infra.mjs"`); confined unnecessary (no git-write fixtures).
+- **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).
+
+### 2026-10-26 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 92003ab2-7979-4994-bc83-46bbf613c2ab — VERDICT: BROKEN — IV 6b5d754^..e11e6af: r6 seedScratchGit 'git add --pathspec-from-file' lacks literal-pathspecs (GIT_* stripped), so pathspec-magic filenames (:(exclude).., :!..) drop silently from HEAD and a :/-leading name aborts the seed (ok:false) — r5 INVALID recurs. r1-r5 --run/nonce PASS. Manifest-backed.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-26 — worker (dispatch, fixing r7) — seed uses LITERAL pathspecs + a byte-accurate walk (the r6 BROKEN)
+
+Fixed the r6 `BROKEN` (anthropic run `92003ab2-7979-4994-bc83-46bbf613c2ab`, IV `6b5d754^..e11e6af`): `seedScratchGit` fed exported file NAMES to `git add -f --pathspec-from-file=- --pathspec-file-nul` WITHOUT literal pathspecs. `--pathspec-file-nul` fixes SPLITTING (NUL, never whitespace) but NOT pathspec MAGIC, so a name beginning with magic was interpreted: `:(exclude)x`/`:!x` read as EXCLUDE filters and SILENTLY dropped from HEAD (seed still `ok`), and a `:/`-leading or `:(glob)` name matched nothing and ABORTED the whole add (`ok:false`) — the r5 INVALID class recurs. The STRING `readdir` walk also mangled an invalid-UTF-8 filename to U+FFFD, feeding git the wrong bytes.
+
+- **Hypothesis verified FIRST against REAL git** (`/tmp` scratch skeleton mirroring the seed): BASELINE `git add -f --pathspec-from-file=- --pathspec-file-nul` over `[:(exclude)x, :!x, :/x, :(glob)star, *, ?, [ab], back\slash, -leadingdash, name\n.., café/münchen.txt, longpath/<200a>, normal.txt]` → **exit 128, `fatal: pathspec ':/x' did not match any files`, 0 of 15 added**. `GIT_LITERAL_PATHSPECS=1` AND `git --literal-pathspecs` → **both exit 0, all literal names added** (equivalence proven). A focused probe showed the SILENT half: `:(exclude)x`/`:!x` with a plain sibling → `git add` exit 0 but only the sibling in HEAD. And `readdirSync` of a `0xff`-byte name returns the string `b<U+FFFD>b` (bytes `62 ef bf bd 62`), so the string's UTF-8 re-encoding ≠ the on-disk bytes — the file cannot round-trip.
+- **Fix by construction (`independent-verify.mjs` `seedScratchGit`).** (1) Set `GIT_LITERAL_PATHSPECS: '1'` in the seed's shared git env (the `buildRoomGitEnv({…})` `extra`). It survives the `GIT*` scrub precisely because `extra` is spread LAST (`{...env, ...extra}`), the SAME mechanism that room-sets `GIT_DIR`/`GIT_WORK_TREE`; an inherited hostile `GIT_LITERAL_PATHSPECS=0` is dropped by the scrub then overridden to `1`. Every `g()` call in the seed shares this `env`, so no git call can forget it; added to the HEAD-resolve `rev-parse` env too for consistency. (2) Converted the walk to BYTE-accurate: `fs.readdirSync(absBuf, { withFileTypes: true, encoding: 'buffer' })` with Buffer path construction and a Buffer NUL-join, so arbitrary on-disk bytes (incl. invalid UTF-8) reach `git add` verbatim. `git add` still refuses any path under a `.git`, so a stray exported `.git` is never committed; `node_modules` is still never listed. `--pathspec-file-nul` + `-f` kept.
+- **Must-FAIL + pass-after (`verify-bug-273-iv-infra.mjs`).** New literal pre-fix anchor `preR6SeedScratchGit` (the r6 shipped seed written out: string walk + non-literal pathspec-from-file). Extended `buildAttackRoom` with all r7 adversarial names (pathspec-magic, wildcards, backslash, newline, very-long path, a Buffer-written invalid-UTF-8 name, a stray nested `.git`) + one check per item; added focused `provePathspecMagicSilentDrop` (a room of `normal.txt` + `:(exclude)x` + `:!x`). Pre-fix r7 anchor reddens BOTH ways: the comprehensive room ABORTS (`git add: fatal: pathspec ':/x' did not match any files`, `ok:false`), and the silent-drop room reports `ok:true` but `:(exclude)x`/`:!x` are MISSING from HEAD (2 reddening checks). Real seed commits every name verbatim.
+- **Per-attack-item tally (POST-FIX real — all PASS):** `:(exclude)x`, `:!x`, `:/x`, `:(glob)star` committed VERBATIM (no abort, no silent drop); `*` `?` `[ab]`; backslash name; newline name (no re-split); very-long path (205 chars); invalid-UTF-8 name (exact bytes `62 ff 62` in HEAD, byte-compared); stray nested `.git` not committed + sibling kept; plus the whole r6 list (ignored root file, ignored dir, nested `.gitignore`, the `.gitignore` files, hostile-HOME `excludesFile` cannot matter, leading-`-`, spaces, unicode, empty dir absent, symlink mode 120000 unfollowed, stripped stub served, node_modules absent, `git status` clean).
+- **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **116 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 15 failures). `node scripts/verify-scratch-root.mjs` → **PASS 28 FAIL 0 SKIP 0**. `npm run gate` → **GATE: PASS (exit 0)**, read unpiped (leak-gate + check-nul + check-unicode-separators + prompt-privacy + pre-push-hook + typecheck).
+- **Bucket:** correctness / regression-prone clean-room harness (the seed add has now broken r5→r6→r7). This is the construction fix — literal pathspecs set at the single env chokepoint + byte-accurate enumeration — so a routine independent re-verify of the PATHSPEC-LITERAL property (seed commits a magic-prefixed / invalid-UTF-8 exported name to HEAD; `git show HEAD:<name>` succeeds) on the working tree atop `e11e6af` is warranted — NOT a security pass. Run the fixer test directly (`--run "node scripts/verify-bug-273-iv-infra.mjs"`); confined unnecessary (no git-write fixtures). `independent-verify.mjs` also carries unrelated uncommitted FEAT-191 branch-flow hunks — leave them; this change touches only `seedScratchGit`.
 - **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).

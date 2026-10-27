@@ -941,6 +941,19 @@ export function seedScratchGit(dir) {
       GIT_INDEX_FILE: path.join(idxTmp, 'index'), // under os.tmpdir() → isTempIndex
       GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_SYSTEM: '/dev/null',
+      // BUG-273 r7: force LITERAL pathspecs for EVERY git call rooted here. The add
+      // below feeds exported file NAMES as pathspecs; `--pathspec-file-nul` fixes
+      // SPLITTING (NUL, never whitespace) but NOT pathspec MAGIC — so without this a
+      // name beginning with magic silently DROPS from the commit (`:(exclude)x`,
+      // `:!x` are read as exclude filters) or a `:/`-leading name ABORTS the whole
+      // add (`fatal: pathspec ':/x' did not match any files` → ok=false). Proven with
+      // real git. GIT_LITERAL_PATHSPECS=1 makes git treat every pathspec byte-for-byte
+      // literally. It is room-SET here via buildRoomGitEnv's `extra` (spread LAST), so
+      // it SURVIVES the GIT* scrub that drops every INHERITED GIT_* name — the same
+      // mechanism that room-sets GIT_DIR/GIT_WORK_TREE above. A hostile inherited
+      // GIT_LITERAL_PATHSPECS=0 is dropped by the scrub, then overridden to 1 here, so
+      // it cannot turn this off.
+      GIT_LITERAL_PATHSPECS: '1',
       // Synthetic throwaway identity — docs/CONVENTIONS.md sanctions this address
       // for scratch/fixture repos ONLY, and via env rather than the command line.
       GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
@@ -959,28 +972,44 @@ export function seedScratchGit(dir) {
       // subtract from it. node_modules (the 10k-file live-tree COPY) and the .git we
       // just built are the only exclusions — matching the `/node_modules/`
       // info/exclude kept above, which still holds `git status` clean.
-      const relFiles = [];
-      (function walk(relDir) {
+      // Enumerate the room's leaf paths as RAW BYTES (readdir encoding:'buffer'), not
+      // JS strings (BUG-273 r7): a filename carrying invalid-UTF-8 bytes (e.g. 0xff)
+      // decodes to the U+FFFD replacement char as a string, so a string walk would
+      // feed git the WRONG bytes and that file would be silently dropped from HEAD.
+      // Buffer names round-trip the exact on-disk bytes to `git add`, so an
+      // arbitrary-byte name commits faithfully.
+      const NUL = Buffer.from([0]), SLASH = Buffer.from('/');
+      const DOTGIT = Buffer.from('.git'), NODE_MODULES = Buffer.from('node_modules');
+      const dirBuf = Buffer.from(dir);
+      const relFiles = []; // repo-relative byte paths (Buffers)
+      (function walk(relBuf) {
+        const absBuf = relBuf.length ? Buffer.concat([dirBuf, SLASH, relBuf]) : dirBuf;
         let ents;
-        try { ents = fs.readdirSync(relDir ? path.join(dir, ...relDir.split('/')) : dir, { withFileTypes: true }); } catch { return; }
+        try { ents = fs.readdirSync(absBuf, { withFileTypes: true, encoding: 'buffer' }); } catch { return; }
         for (const e of ents) {
-          const rel = relDir ? `${relDir}/${e.name}` : e.name;
-          if (!relDir && (e.name === '.git' || e.name === 'node_modules')) continue; // our skeleton / live-tree copy
+          const nameBuf = e.name; // Buffer, because encoding:'buffer'
+          const rel = relBuf.length ? Buffer.concat([relBuf, SLASH, nameBuf]) : nameBuf;
+          if (relBuf.length === 0 && (nameBuf.equals(DOTGIT) || nameBuf.equals(NODE_MODULES))) continue; // our skeleton / live-tree copy
           if (e.isSymbolicLink()) { relFiles.push(rel); continue; }   // commit the LINK itself, never follow it
           if (e.isDirectory()) { walk(rel); continue; }               // recurse; an empty dir emits nothing (git cannot track one)
           relFiles.push(rel);
         }
-      })('');
-      // Force-add the explicit, NUL-separated set from stdin: `-f` overrides every
-      // ignore source (.gitignore / info/exclude / core.excludesFile) so none can
-      // drop a listed file; `--pathspec-file-nul` takes every byte literally, so a
-      // leading `-`, spaces, newlines or unicode in a path cannot be misread as a
-      // flag or re-split. Only FILES/symlinks are listed (never a directory), so git
-      // never re-expands a dir under ignore rules. node_modules is simply never
-      // listed, so `-f` cannot pull the live-tree copy in.
+      })(Buffer.alloc(0));
+      // Force-add the explicit, NUL-separated BYTE set from stdin: `-f` overrides every
+      // ignore source (.gitignore / nested .gitignore / info/exclude / core.excludesFile)
+      // so none can drop a listed file; `--pathspec-file-nul` splits ONLY on NUL (never
+      // whitespace), so spaces/newlines in a name cannot re-split it; and
+      // GIT_LITERAL_PATHSPECS=1 (set in `env` above) makes every listed name a LITERAL
+      // path — WITHOUT it a name beginning with pathspec magic silently drops
+      // (`:(exclude)x`, `:!x`) and a `:/`-leading name aborts the whole add (BUG-273
+      // r7). Only FILES/symlinks are listed (never a directory), so git never re-expands
+      // a dir under ignore rules; a path under a stray exported `.git` is refused by git
+      // itself (it never tracks a `.git`). node_modules is simply never listed, so `-f`
+      // cannot pull the live-tree copy in.
+      const nulJoinBuf = (bufs) => { const parts = []; bufs.forEach((b, i) => { if (i) parts.push(NUL); parts.push(b); }); return Buffer.concat(parts); };
       const add = relFiles.length === 0
         ? { status: 0 }
-        : g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: relFiles.join('\0') });
+        : g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: nulJoinBuf(relFiles) });
       if ((add.status ?? 1) !== 0) return { ok: false, error: `git add (temp index): ${(add.stderr || add.stdout || '').trim().slice(0, 200)}` };
       const wt = g(['write-tree']);
       if ((wt.status ?? 1) !== 0) return { ok: false, error: `git write-tree: ${(wt.stderr || '').trim().slice(0, 200)}` };
@@ -999,7 +1028,7 @@ export function seedScratchGit(dir) {
       // 4. Prove it resolves (a READ the shim always allows).
       // Same chokepoint: `-C dir` must discover the ROOM's .git, which it only
       // does when no inherited GIT_DIR/GIT_COMMON_DIR points elsewhere.
-      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }) });
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
       if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) {
         return { ok: false, error: `seeded repo does not resolve HEAD to the new commit (${(head.stderr || '').trim().slice(0, 160)})` };
       }

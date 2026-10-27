@@ -989,7 +989,15 @@ export function seedScratchGit(dir) {
         for (const e of ents) {
           const nameBuf = e.name; // Buffer, because encoding:'buffer'
           const rel = relBuf.length ? Buffer.concat([relBuf, SLASH, nameBuf]) : nameBuf;
-          if (relBuf.length === 0 && (nameBuf.equals(DOTGIT) || nameBuf.equals(NODE_MODULES))) continue; // our skeleton / live-tree copy
+          // A `.git` at ANY depth is NEVER a candidate exported file: it is our own
+          // top-level skeleton, OR a nested embedded repo's metadata (a `.git` dir OR a
+          // gitfile), which git never tracks and a real `git archive` export never
+          // contains (BUG-273 r9). Skipping it keeps the walked set = real candidate
+          // files, so a nested repo's INTERNAL files never pad the `skipped` list — only
+          // its real sibling content (e.g. sub/file.txt, silently dropped because git
+          // treats sub as a gitlink) is walked and then surfaced by the reconciliation.
+          if (nameBuf.equals(DOTGIT)) continue;
+          if (relBuf.length === 0 && nameBuf.equals(NODE_MODULES)) continue; // the 10k-file live-tree copy (top-level)
           if (e.isSymbolicLink()) { relFiles.push(rel); continue; }   // commit the LINK itself, never follow it
           if (e.isDirectory()) { walk(rel); continue; }               // recurse; an empty dir emits nothing (git cannot track one)
           relFiles.push(rel);
@@ -1039,7 +1047,11 @@ export function seedScratchGit(dir) {
         addRecursive(bufs.slice(mid));
       };
       addRecursive(relFiles);
-      const skipped = skippedBufs.map((b) => b.toString('utf8')); // display only; lossy for invalid-UTF-8 names is fine
+      void skippedBufs; // the bisect's refused-singletons are now a SUBSET of the
+                        // reconciliation below (every refused name is on disk and
+                        // absent from HEAD); we keep the bisect ONLY so one bad name
+                        // cannot abort the whole add and empty HEAD, but the final
+                        // `skipped` is computed by reconciliation, not from here.
       const wt = g(['write-tree']);
       if ((wt.status ?? 1) !== 0) return { ok: false, error: `git write-tree: ${(wt.stderr || '').trim().slice(0, 200)}` };
       const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
@@ -1061,6 +1073,37 @@ export function seedScratchGit(dir) {
       if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) {
         return { ok: false, error: `seeded repo does not resolve HEAD to the new commit (${(head.stderr || '').trim().slice(0, 160)})` };
       }
+      // 5. RECONCILE DISK AGAINST HEAD — the completeness guarantee (BUG-273 r9).
+      //    r1–r8 each died trying to PREDICT why a given name class would be omitted
+      //    from HEAD (gitignore, pathspec magic, NTFS/dotgit aliases, and finally a
+      //    nested EMBEDDED repo: a dir holding a valid `.git` makes `git add -f
+      //    sub/file.txt` exit 0 while SILENTLY dropping the file — git treats it as a
+      //    gitlink — so the bisect never fires and HEAD loses the file with no error,
+      //    the live BROKEN a5a2b7f5). We stop predicting WHY and verify the OUTCOME:
+      //    enumerate what HEAD ACTUALLY contains and declare EVERY walked file absent
+      //    from it `skipped`, for any reason present or future. That makes "skipped is
+      //    complete" true BY CONSTRUCTION — a file is either in HEAD or in skipped,
+      //    never silently lost. `-z --name-only` emits RAW path bytes (NUL-separated,
+      //    no core.quotePath escaping), so we compare on the exact on-disk bytes via a
+      //    latin1 round-trip (1:1 for all 256 byte values) — the same byte-fidelity the
+      //    buffer walk uses. Literal pathspecs + null config keep the read hermetic.
+      const headLs = spawnSync('git', ['-C', dir, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'],
+        { env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
+      if ((headLs.status ?? 1) !== 0) {
+        return { ok: false, error: `git ls-tree HEAD (reconcile): ${(headLs.stderr ? headLs.stderr.toString('utf8') : '').trim().slice(0, 200)}` };
+      }
+      const committed = new Set();
+      { // split the NUL-terminated byte stream into path Buffers, latin1-key each
+        const buf = headLs.stdout || Buffer.alloc(0);
+        let start = 0;
+        for (let i = 0; i < buf.length; i++) {
+          if (buf[i] === 0) { if (i > start) committed.add(buf.subarray(start, i).toString('latin1')); start = i + 1; }
+        }
+        if (start < buf.length) committed.add(buf.subarray(start).toString('latin1'));
+      }
+      const skipped = relFiles
+        .filter((b) => !committed.has(b.toString('latin1'))) // every walked file NOT in HEAD, for ANY reason
+        .map((b) => b.toString('utf8')); // display only; lossy for invalid-UTF-8 names is fine
       return { ok: true, head: commit, error: null, skipped };
     } finally {
       try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ }

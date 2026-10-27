@@ -328,6 +328,83 @@ function preR7SeedScratchGit(dir) {
   } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
 }
 
+/* BUG-273 r9 must-FAIL anchor — the r8 SHIPPED seed, written out literally: the
+ * BUFFER walk + GIT_LITERAL_PATHSPECS=1 + the bisecting per-ERROR add (r7/r8), and
+ * `skipped` taken STRAIGHT from the bisect's refused-singletons — with NO
+ * disk↔HEAD reconciliation and a walk that excludes `.git` ONLY at the top level.
+ * This is the r8 defect the r9 reconciliation closes: a nested EMBEDDED repo (a dir
+ * holding a VALID `.git`, or a `.git` GITFILE) makes `git add -f sub/file.txt` exit 0
+ * while git SILENTLY drops the file (it treats sub as a gitlink). The add never errors,
+ * so the bisect never fires, `skipped` stays empty, and sub/file.txt is absent from
+ * BOTH HEAD and the skip list — the verifier's later `git show HEAD:sub/file.txt` dies
+ * 128 (the live BROKEN, anthropic run a5a2b7f5). Grading the reconcile room against this
+ * anchor reddens on the partition property (a disk file in neither HEAD nor skipped). */
+function preR8SeedScratchGit(dir) {
+  try {
+    const gitDir = path.join(dir, '.git');
+    if (fs.existsSync(gitDir)) return { ok: false, error: '.git already present' };
+    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'objects', 'pack'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'heads'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'tags'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(path.join(gitDir, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n');
+    fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), '/node_modules/\n');
+    const idxTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'iv-gitidx-pre8-'));
+    const env = buildRoomGitEnv({
+      GIT_DIR: gitDir, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(idxTmp, 'index'),
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1',
+      GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
+      GIT_COMMITTER_NAME: 'independent-verify', GIT_COMMITTER_EMAIL: 'verify@example.invalid',
+    });
+    const g = (args, extra = {}) => spawnSync('git', args, { encoding: 'utf8', env, ...extra });
+    try {
+      const NUL = Buffer.from([0]), SLASH = Buffer.from('/');
+      const DOTGIT = Buffer.from('.git'), NODE_MODULES = Buffer.from('node_modules');
+      const dirBuf = Buffer.from(dir);
+      const relFiles = [];
+      (function walk(relBuf) {
+        const absBuf = relBuf.length ? Buffer.concat([dirBuf, SLASH, relBuf]) : dirBuf;
+        let ents;
+        try { ents = fs.readdirSync(absBuf, { withFileTypes: true, encoding: 'buffer' }); } catch { return; }
+        for (const e of ents) {
+          const nameBuf = e.name;
+          const rel = relBuf.length ? Buffer.concat([relBuf, SLASH, nameBuf]) : nameBuf;
+          if (relBuf.length === 0 && (nameBuf.equals(DOTGIT) || nameBuf.equals(NODE_MODULES))) continue; // r8: top-level only
+          if (e.isSymbolicLink()) { relFiles.push(rel); continue; }
+          if (e.isDirectory()) { walk(rel); continue; }
+          relFiles.push(rel);
+        }
+      })(Buffer.alloc(0));
+      const nulJoinBuf = (bufs) => { const parts = []; bufs.forEach((b, i) => { if (i) parts.push(NUL); parts.push(b); }); return Buffer.concat(parts); };
+      const addBatch = (bufs) => bufs.length === 0 ? 0 : (g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: nulJoinBuf(bufs) }).status ?? 1);
+      const skippedBufs = [];
+      const addRecursive = (bufs) => {
+        if (bufs.length === 0) return;
+        if (addBatch(bufs) === 0) return;
+        if (bufs.length === 1) { skippedBufs.push(bufs[0]); return; }
+        const mid = bufs.length >> 1;
+        addRecursive(bufs.slice(0, mid));
+        addRecursive(bufs.slice(mid));
+      };
+      addRecursive(relFiles);
+      const skipped = skippedBufs.map((b) => b.toString('utf8')); // r8: NO reconciliation — bisect refusals only
+      const wt = g(['write-tree']);
+      if ((wt.status ?? 1) !== 0) return { ok: false, error: `write-tree: ${(wt.stderr || '').trim()}` };
+      const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
+      if ((ct.status ?? 1) !== 0) return { ok: false, error: `commit-tree: ${(ct.stderr || '').trim()}` };
+      const commit = ct.stdout.trim();
+      fs.copyFileSync(path.join(idxTmp, 'index'), path.join(gitDir, 'index'));
+      fs.writeFileSync(path.join(gitDir, 'refs', 'heads', 'main'), commit + '\n');
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
+      if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) return { ok: false, error: `HEAD resolve: ${(head.stderr || '').trim()}` };
+      return { ok: true, head: commit, error: null, skipped };
+    } finally { try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ } }
+  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+}
+
 /* ============================================================ CAUSE 1 ==== */
 // r3 contract: the ONLY hard error is `>1 --run`; the ONLY advisory is the plain
 // `npm run confined` note; the deleted double-`--`/env-prefix advisories now emit
@@ -547,8 +624,10 @@ function buildAttackRoom() {
   // round-trips the exact bytes. (fs string paths can't express this, so write raw.)
   fs.writeFileSync(Buffer.concat([Buffer.from(dir + '/'), Buffer.from([0x62, 0xff, 0x62])]), 'invalid utf8 name\n');
   // a STRAY exported .git directory (nested) — git must NEVER commit anything under it.
-  // (git SILENTLY skips a `.git`-component path — exit 0, not an abort — so this one
-  // does NOT appear in the skip list; it is simply absent from HEAD, sibling kept.)
+  // (BUG-273 r9: the seed's walk now EXCLUDES any `.git` at any depth, so nested/.git/*
+  // is never a walked candidate — it is neither committed nor in the skip list; the
+  // sibling real.txt is kept. A dedicated embedded-repo partition proof lives in
+  // proveReconcileCompleteness below.)
   fs.mkdirSync(path.join(dir, 'nested', '.git'), { recursive: true });
   w('nested/.git/config', '[core]\n');
   w('nested/real.txt', 'kept beside the stray .git\n');
@@ -734,6 +813,111 @@ function provePerfBoundedAdds(seed, label) {
   check(`[perf] all ${N} good files committed to HEAD`, committedGood === N, `committed ${committedGood}/${N}`);
   check('[perf] the single untrackable name skipped + reported', (r.skipped || []).includes('big/.git.') && !head.has('big/.git.'), `skipped=[${(r.skipped || []).join(', ')}]`);
   check(`[perf] git spawned ${calls} times — bounded (< 100), NOT per-file (would exceed ${N})`, calls > 0 && calls < 100, `${calls} git invocations for ${N} good + 1 bad`);
+}
+
+/* ---- BUG-273 r9: disk↔HEAD RECONCILIATION — `skipped` is complete BY CONSTRUCTION --
+ * The r1–r8 rounds each died trying to PREDICT why a NAME class would be omitted from
+ * HEAD. The newest BROKEN (anthropic a5a2b7f5) was a nested EMBEDDED repo: a dir holding
+ * a valid `.git` (or a `.git` GITFILE) makes `git add -f sub/file.txt` exit 0 while git
+ * SILENTLY drops the file (it treats the dir as a gitlink). The add never errors, so the
+ * r8 bisect never fires and sub/file.txt is absent from BOTH HEAD and the skip list — the
+ * verifier's later `git show HEAD:sub/file.txt` dies 128. The r9 fix stops predicting WHY
+ * and verifies the OUTCOME: after committing, it lists what HEAD ACTUALLY contains and
+ * declares every walked file absent from it `skipped`, for ANY reason. We prove the
+ * PARTITION property directly, with an INDEPENDENT walk (not the seed's): every on-disk
+ * candidate file is in HEAD XOR in skipped — never silently lost, never double-counted —
+ * plus HEAD⊆disk and skipped⊆disk. ASCII names only (byte-fidelity is covered by the
+ * attack room's invalid-UTF-8 case), so a utf8 skip string compares 1:1. */
+function walkCandidates(dir) {
+  // The SAME exclusions the seed applies: a `.git` at ANY depth, node_modules at top.
+  const out = new Set();
+  (function rec(rel) {
+    const abs = rel ? path.join(dir, rel) : dir;
+    let ents; try { ents = fs.readdirSync(abs, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const r = rel ? `${rel}/${e.name}` : e.name;
+      if (e.name === '.git') continue;                 // any-depth embedded-repo metadata
+      if (!rel && e.name === 'node_modules') continue; // top-level live-tree copy
+      if (e.isSymbolicLink()) { out.add(r); continue; }
+      if (e.isDirectory()) { rec(r); continue; }
+      out.add(r);
+    }
+  })('');
+  return out;
+}
+
+function buildReconcileRoom() {
+  const dir = tmp('iv-room-reconcile-');
+  const w = (rel, body) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
+  const validGitSkeleton = (gd) => {
+    fs.mkdirSync(path.join(gd, 'objects'), { recursive: true });
+    fs.mkdirSync(path.join(gd, 'refs', 'heads'), { recursive: true });
+    fs.writeFileSync(path.join(gd, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(path.join(gd, 'config'), '[core]\n\trepositoryformatversion = 0\n');
+  };
+  // plain good files (must land in HEAD)
+  w('package.json', '{"name":"x","version":"1.0.0"}\n');
+  w('top.txt', 'top\n');
+  w('README.md', 'readme\n');
+  // (1) a VALID embedded repo: sub/ holds a complete `.git`, so git treats sub as a
+  //     gitlink and SILENTLY drops sub/file.txt from `git add -f` (exit 0, no error).
+  fs.mkdirSync(path.join(dir, 'sub'), { recursive: true });
+  validGitSkeleton(path.join(dir, 'sub', '.git'));
+  w('sub/file.txt', 'embedded-repo real file — silently dropped by git add\n');
+  // (2) a `.git` GITFILE (a FILE, not a dir) pointing at a gitdir OUTSIDE the room
+  //     (as a real worktree/submodule store would): git also treats subg as embedded,
+  //     so subg/inner.txt is silently dropped.
+  const gitfileTarget = tmp('iv-gitfile-target-');
+  validGitSkeleton(gitfileTarget);
+  fs.mkdirSync(path.join(dir, 'subg'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'subg', '.git'), `gitdir: ${gitfileTarget}\n`);
+  w('subg/inner.txt', 'gitfile-embedded real file — silently dropped by git add\n');
+  // (3) a nested `.git` DIR with NO HEAD — an INVALID repo, so NOT a gitlink: its
+  //     sibling real.txt must still be committed (the never-over-skip guard).
+  fs.mkdirSync(path.join(dir, 'nested', '.git'), { recursive: true });
+  w('nested/.git/config', '[core]\n');                 // excluded by the walk; never tracked
+  w('nested/real.txt', 'kept beside an invalid (no-HEAD) .git\n');
+  // (4) an NTFS/dotgit alias git REFUSES (a DIFFERENT reason for absence from HEAD):
+  //     the any-reason rule must also surface it in skipped.
+  w('.git.', 'untrackable NTFS/dotgit alias\n');
+  return dir;
+}
+
+function proveReconcileCompleteness(seed, label) {
+  section(`BUG-273 r9 — disk↔HEAD reconciliation: skipped is COMPLETE by construction [${label}]`);
+  const room = buildReconcileRoom();
+  const r = seed(room);
+  check(`[${label}] seed reports ok on embedded repos / gitfile / nested .git`, r.ok, JSON.stringify({ ok: r.ok, error: r.error }));
+  if (!r.ok) return;
+  // HEAD, byte-accurate (ASCII room → latin1 == the on-disk name)
+  const ltb = spawnSync('git', ['-C', room, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } });
+  const headSet = new Set();
+  { const b = ltb.stdout ?? Buffer.alloc(0); let s = 0; for (let i = 0; i < b.length; i++) { if (b[i] === 0) { if (i > s) headSet.add(b.subarray(s, i).toString('latin1')); s = i + 1; } } if (s < b.length) headSet.add(b.subarray(s).toString('latin1')); }
+  const skipSet = new Set(r.skipped || []);
+  const onDisk = walkCandidates(room);
+
+  // THE partition property — the completeness guarantee, proven against an INDEPENDENT walk.
+  const neither = [...onDisk].filter((p) => !headSet.has(p) && !skipSet.has(p));
+  const both = [...onDisk].filter((p) => headSet.has(p) && skipSet.has(p));
+  check('[partition] every on-disk candidate is in HEAD or in skipped — NONE silently lost', neither.length === 0, neither.length ? `silently lost: ${neither.join(', ')}` : '(none lost)');
+  check('[partition] NO file is in BOTH HEAD and skipped', both.length === 0, both.join(', ') || '(none)');
+  const phantom = [...headSet].filter((p) => !onDisk.has(p));
+  check('[HEAD⊆disk] HEAD contains nothing that is not a real on-disk file', phantom.length === 0, phantom.join(', ') || '(none)');
+  const ghostSkip = [...skipSet].filter((p) => !fs.existsSync(path.join(room, p)));
+  check('[skip⊆disk] every skipped name exists on disk (left in place)', ghostSkip.length === 0, ghostSkip.join(', ') || '(none)');
+
+  // the SPECIFIC silent drops pre-fix missed — surfaced in skipped, not lost.
+  check('[embedded repo] sub/file.txt silently dropped by git add → in skipped, absent from HEAD',
+    skipSet.has('sub/file.txt') && !headSet.has('sub/file.txt'), `skipped=${skipSet.has('sub/file.txt')} inHead=${headSet.has('sub/file.txt')}`);
+  check('[gitfile embedded] subg/inner.txt silently dropped → in skipped, absent from HEAD',
+    skipSet.has('subg/inner.txt') && !headSet.has('subg/inner.txt'), `skipped=${skipSet.has('subg/inner.txt')} inHead=${headSet.has('subg/inner.txt')}`);
+  check('[refused alias] .git. absent from HEAD → in skipped (any-reason rule, not just embedded)',
+    skipSet.has('.git.') && !headSet.has('.git.'), `skipped=${skipSet.has('.git.')} inHead=${headSet.has('.git.')}`);
+
+  // never over-skip a committable file.
+  for (const good of ['package.json', 'top.txt', 'README.md', 'nested/real.txt']) {
+    check(`[committed] ${good} in HEAD, NOT skipped`, headSet.has(good) && !skipSet.has(good), `inHead=${headSet.has(good)} skipped=${skipSet.has(good)}`);
+  }
 }
 
 /* ------- P3 (r3 RESCOPE): seed hermeticity + honest-case decorrelation hygiene --
@@ -1053,6 +1237,7 @@ try {
   proveExportedFileSet(preSeedScratchGit, 'PRE-fix r6 git add -A');
   proveExportedFileSet(preR6SeedScratchGit, 'PRE-fix r7 string-walk + non-literal pathspecs');
   proveExportedFileSet(preR7SeedScratchGit, 'PRE-fix r7 single-batch add (aborts on one untrackable name)');
+  proveReconcileCompleteness(preR8SeedScratchGit, 'PRE-fix r8 bisect-only skip (embedded repo silently drops a file)');
   provePathspecMagicSilentDrop(preR6SeedScratchGit, 'PRE-fix r7 non-literal pathspecs');
   const preFailures = fail - preStart;
   console.log(`\n  PRE-fix produced ${preFailures} failure(s) — a must-FAIL proof is only real if this is > 0.`);
@@ -1067,6 +1252,7 @@ try {
   proveExportedFileSet(seedScratchGit, 'POST-FIX real');
   provePathspecMagicSilentDrop(seedScratchGit, 'POST-FIX real');
   provePerfBoundedAdds(seedScratchGit, 'POST-FIX real');
+  proveReconcileCompleteness(seedScratchGit, 'POST-FIX real');
   proveBuildRoomGitEnvUnit();
   proveCause3Hermeticity(buildRoomGitEnv, 'POST-FIX real', facts);
   proveDispatchWritesTypedKind();

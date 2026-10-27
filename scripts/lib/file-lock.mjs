@@ -430,6 +430,7 @@ export function isSimpleLine(command) {
   if (/[;&|\n]/.test(c)) return false;              // a separator / background / pipe
   if (/\$\(|`|<\(|>\(/.test(c)) return false;        // command or process substitution
   if (/['"\\]/.test(c)) return false;                // any quote or escape (could split a word)
+  if (/[()]/.test(c)) return false;                  // a subshell or an EXTGLOB pattern (`!(x)`, `+(s)rc` — BUG-281 IV run e44274b0: the tokenizer splits on `(`/`)`, keying only the leading `!`/`+` narrow while bash expands the extglob tree-wide)
   if (!/^(?:\S*\/)?git[ \t]/.test(c)) return false;  // head must be a bare `git`, not a wrapper
   return true;
 }
@@ -533,25 +534,86 @@ const GIT_GLOBAL_VALUE_OPTS = new Set(['-C', '-c', '--git-dir', '--work-tree',
  * `-C <dir>` chain (round 4, 10-11 verify): git resolves pathspecs against the
  * `-C` dir, so `git -C sub checkout -- f` rewrites `sub/f` — keying it `f` let a
  * lock on `sub/f` be bypassed. Successive `-C`s compose, as git documents.
+ *
+ * BUG-281 (IV, anthropic run 389a503c): `unsafeGlobal` flags ANY global option other
+ * than `-C` — a GLOBAL pathspec-MODE option (`--icase-pathspecs` matches case-
+ * INSENSITIVELY so a literal key aliases a different file; `--glob-pathspecs`,
+ * `--literal-pathspecs`, `--noglob-pathspecs`), or any of these in an unambiguous
+ * ABBREVIATION (`--icase`, `--glob`…), or a config/work-tree override. Exact-name
+ * matching cannot catch abbreviations (the BUG-277 lesson), so deny-by-default: any
+ * global but `-C` makes the pathspec key untrustworthy → caller widens to whole tree.
+ * Values are still skipped correctly so the subcommand is located for `GIT_TREE_MUTATORS`.
  */
 function gitSubcommand(tokens) {
   let i = 0; // tokens here EXCLUDE the leading 'git'
   const cdirs = [];
+  let unsafeGlobal = false;
   while (i < tokens.length) {
     const t = tokens[i];
     if (t === '--version' || t === '--help' || t === '-h') return null;
     if (t === '-C') { if (tokens[i + 1] != null) cdirs.push(tokens[i + 1]); i += 2; continue; }
-    if (GIT_GLOBAL_VALUE_OPTS.has(t)) { i += 2; continue; }
-    if (t.startsWith('-')) { i++; continue; }
-    return { sub: t, args: tokens.slice(i + 1), cdirs };
+    if (GIT_GLOBAL_VALUE_OPTS.has(t)) { unsafeGlobal = true; i += 2; continue; } // value-consuming global (not -C) → widen, skip value
+    if (t.startsWith('-')) { unsafeGlobal = true; i++; continue; }               // any other global flag (incl. mode-option abbreviations) → widen
+    return { sub: t, args: tokens.slice(i + 1), cdirs, unsafeGlobal };
   }
   return null;
 }
 
+/* ── BUG-281: a pathspec may be keyed NARROW only if it is a plain literal path ──
+ * The IV (anthropic run 2c55fd7b, BUG-277 r9) found gitMutationTarget keyed
+ * WHOLE-REPO pathspecs as narrow per-file keys on a SIMPLE line, so a real-git
+ * `checkout`/`restore`/`rm` with `:/`, `.`-equivalent, `$PWD` or a glob slipped a
+ * foreign lock and wiped another lane's uncommitted work. The lock key is an EXACT
+ * per-file path and claimPaths cannot prefix-match, so a pathspec that resolves to
+ * anything WIDER than one literal file cannot be guarded narrow — it must widen to
+ * whole-tree (checkTree, which denies if ANY lock in the tree is held).
+ *
+ * A pathspec stays narrow ONLY when it is a plain relative path that, after
+ * normalisation, lies strictly INSIDE the repo and below its root, with:
+ *   • no git MAGIC prefix — any leading `:` (`:/`, `:(top)`, `:(glob)`, `:!x`);
+ *   • no GLOB metacharacter (`*` `?` `[`) — the shell OR git `:(glob)` would expand
+ *     it beyond the literal, and claimPaths keys the literal text, not the matches;
+ *   • no `$` or leading `~` — a shell expansion we must not trust as a literal path
+ *     (on a SIMPLE line `$PWD`/`~/x` reach here unexpanded — isSimpleLine permits
+ *     `$`/`~`, only quotes/substitution/separators make a line non-simple);
+ *   • not ABSOLUTE — we cannot verify an absolute path is inside THIS repo here (no
+ *     repoRoot), and the repo-root absolute wiped a lock in the IV; conservative →
+ *     tree (a real narrow absolute checkout is refused only under a foreign lock);
+ *   • no trailing `/` — an explicit DIRECTORY scope touches every file under it, and
+ *     claimPaths keys the exact dir only (cannot prefix-match the files beneath) → tree;
+ *   • a normalisation that is NOT the repo root (`.`, `./`, `src/..`) nor at/above it
+ *     (`..`, `../x`).
+ * Over-refusal is the ACCEPTED direction (BUG-281 contract); a false ALLOW is the break.
+ * A BARE directory with no trailing slash (`git checkout -- src` where `src` is a dir)
+ * is indistinguishable from a file WITHOUT a stat, so it still keys narrow HERE — but
+ * evaluateFileLock then checks a git mutation's keys PREFIX-aware (checkScope), so a
+ * foreign lock UNDER such a directory is still caught (BUG-281 IV finding 2).
+ */
+function isNarrowPathspec(raw) {
+  if (typeof raw !== 'string' || raw === '') return false;
+  if (raw.startsWith(':')) return false;        // git magic pathspec
+  if (raw.startsWith('~')) return false;        // tilde (home) expansion
+  if (raw.includes('$')) return false;          // shell variable / command expansion
+  if (/[{}]/.test(raw)) return false;           // brace expansion (`{.,.}` → `.` `.`; IV run bcfd0d07)
+  if (/[*?[]/.test(raw)) return false;          // glob metacharacters
+  if (path.posix.isAbsolute(raw)) return false; // absolute: cannot verify it is inside the repo here
+  // A trailing `/`, `/.` or `/..` (or a bare `.`/`..`) is an explicit DIRECTORY
+  // reference: the last path segment is empty / `.` / `..`. git scopes it to the
+  // whole directory, but claimPaths keys the exact text and cannot prefix-match the
+  // files beneath (`src/.` normalises to `src`, keyed narrow, missing `src/a.js`) → tree.
+  const last = raw.split('/').pop();
+  if (last === '' || last === '.' || last === '..') return false;
+  const norm = path.posix.normalize(raw);
+  if (norm === '.' || norm === './' || norm === '') return false;        // the repo root
+  if (norm === '..' || norm === '../' || norm.startsWith('../')) return false; // at/above the root
+  return true;
+}
+
 /**
  * A git tree-mutator's target: explicit pathspecs after `--` (or trailing bare
- * paths for pathspec-only verbs) → those paths; anything wider or ambiguous →
- * whole tree. Fail toward TREE (the safe, deny-if-any-lock direction).
+ * paths for pathspec-only verbs) → those paths, but ONLY when EVERY one is a plain
+ * literal path (isNarrowPathspec); anything wider or ambiguous → whole tree. Fail
+ * toward TREE (the safe, deny-if-any-lock direction).
  */
 function gitMutationTarget(sub, args) {
   // NOTE (BUG-277): the index-only `git apply --cached` exemption is NOT decided
@@ -571,22 +633,54 @@ function gitMutationTarget(sub, args) {
   // `git apply --cached <path>…` writing only the index — is handled earlier, as a
   // whole-command-string exemption at the top of scanBashMutation, never here.
   if (sub === 'apply' || sub === 'am') return { tree: true };
+  // BUG-281: `read-tree` never takes a pathspec — its args are tree-ishes — and
+  // `read-tree -m -u` rewrites the WHOLE working tree from a tree. A post-`--` token
+  // is a tree-ish, not a file, so it must NOT be keyed narrow → always whole-tree.
+  if (sub === 'read-tree') return { tree: true };
+  const unsafeOpt = (a) => a.startsWith('-') && a !== '--' && !SAFE_GIT_PATHSPEC_FLAGS.has(a);
   const dd = args.indexOf('--');
+  // BUG-281 (IV, run 13eb5ef4): post-`--` tokens are WORKING-TREE PATHSPECS only for the
+  // verbs below. For `switch`/`merge`/`rebase`/`cherry-pick`/`revert`/`pull`/`stash`/
+  // `clean`/`mv` a post-`--` token is a BRANCH/REF/other-file, so `git switch -f -- other`
+  // (a branch switch that DISCARDS the working tree) must NOT be keyed narrow — it is a
+  // whole-tree clobber. Only these verbs narrow after `--`.
   if (dd >= 0) {
-    const paths = args.slice(dd + 1).filter((a) => a && a !== '.');
-    if (args.slice(dd + 1).includes('.')) return { tree: true };
-    return paths.length ? { paths } : { tree: true };
+    if (!GIT_DASHDASH_PATHSPEC_VERBS.has(sub)) return { tree: true };
+    // BUG-281 (IV, run 79ff4718): DENY-BY-DEFAULT on options. git accepts unambiguous
+    // long-option ABBREVIATIONS (`--pathspec-from` ≡ `--pathspec-from-file`, reading the
+    // pathspec list from a file/stdin we cannot see), and other options change WHICH/WHERE
+    // files are written (`--prefix`, `-a`/`--all`, `--source`/`-s <tree>`). Exact-name
+    // matching is unsound (the BUG-277 lesson), so a path-scope survives ONLY when every
+    // OPTION token (before `--`) is in a tiny known-safe set; ANY other option → whole tree.
+    if (args.slice(0, dd).some(unsafeOpt)) return { tree: true };
+    const after = args.slice(dd + 1).filter((a) => a);
+    // BUG-281: every post-`--` token must be a plain literal path; a magic/glob/root/
+    // expansion/absolute/dir pathspec resolves wider than its literal key → tree.
+    if (!after.length || after.some((p) => !isNarrowPathspec(p))) return { tree: true };
+    return { paths: after };
   }
-  // Pathspec-only verbs where trailing bare args are FILES (no branch ambiguity).
-  if (sub === 'restore' || sub === 'rm' || sub === 'checkout-index') {
-    const paths = args.filter((a) => !a.startsWith('-') && a !== '.');
-    if (args.includes('.')) return { tree: true };
-    return paths.length ? { paths } : { tree: true };
+  // Pathspec-only verbs where trailing bare args are FILES (no branch ambiguity). For
+  // every other verb WITHOUT `--` (checkout <branch>, reset <tree>, switch, …) the bare
+  // arg is a ref → whole tree.
+  if (GIT_BARE_PATHSPEC_VERBS.has(sub)) {
+    if (args.some(unsafeOpt)) return { tree: true };            // deny-by-default on options (abbrev-safe)
+    const paths = args.filter((a) => !a.startsWith('-'));
+    if (!paths.length || paths.some((p) => !isNarrowPathspec(p))) return { tree: true };
+    return { paths };
   }
   // checkout/switch/reset/stash/clean/merge/rebase/revert/… without `--`:
   // could switch branches or touch the whole tree → TREE (fail safe).
   return { tree: true };
 }
+/* BUG-281: options that do NOT change which/where a pathspec writes — safe to keep a
+ * path-scope. Everything else (incl. any long-option abbreviation) widens to whole-tree. */
+const SAFE_GIT_PATHSPEC_FLAGS = new Set(['-f', '--force', '-q', '--quiet', '-n', '--dry-run']);
+/* BUG-281 (IV): verbs whose tokens AFTER `--` are working-tree PATHSPECS (narrow-able).
+ * `reset -- <paths>` only unstages (index), still safe to key narrow. Every other
+ * tree-mutator takes a branch/ref/other-file after `--` → whole tree. */
+const GIT_DASHDASH_PATHSPEC_VERBS = new Set(['checkout', 'restore', 'rm', 'checkout-index', 'reset']);
+/* Verbs whose trailing BARE args (no `--`) are pathspecs, not a branch/ref. */
+const GIT_BARE_PATHSPEC_VERBS = new Set(['restore', 'rm', 'checkout-index']);
 
 /* ── Redirect targets that DISCARD, not clobber (BUG-176) ─────────────────────
  * A redirect whose target is `/dev/null` or another std stream / character device
@@ -928,12 +1022,22 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
     if (head === 'git') {
       const parsed = gitSubcommand(args);
       if (parsed && GIT_TREE_MUTATORS.has(parsed.sub)) {
+        // BUG-281: any global option but `-C` (a pathspec-mode option like
+        // `--icase-pathspecs`, an abbreviation, or a config/work-tree override) can
+        // change how every pathspec matches, so no literal key is trustworthy → tree.
+        if (parsed.unsafeGlobal) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
         const tgt = gitMutationTarget(parsed.sub, parsed.args);
         if (tgt.tree) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
         // `git -C a -C b …` resolves pathspecs under a/b (absolute -C resets the base).
         let pre = '';
         for (const d of parsed.cdirs) pre = path.posix.isAbsolute(d) ? d : (pre ? `${pre}/${d}` : d);
-        for (const p of tgt.paths) push(pre && !path.posix.isAbsolute(p) ? `${pre}/${p}` : p);
+        const composed = tgt.paths.map((p) => (pre && !path.posix.isAbsolute(p) ? `${pre}/${p}` : p));
+        // BUG-281 (IV, run 47655bb7): the `-C` chain can carry the pathspec OUT of (or
+        // back to the root of) the repo — `git -C .. checkout -- repo` composes `../repo`,
+        // the whole repo. isNarrowPathspec must re-judge the COMPOSED path (not just the
+        // bare pathspec); any composed path that is no longer a plain in-repo literal → tree.
+        if (composed.some((p) => !isNarrowPathspec(p))) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
+        for (const p of composed) push(p);
         kind = `git ${parsed.sub}`;
       }
       continue;
@@ -1274,6 +1378,19 @@ export function evaluateFileLock({
     const resolved = (cls.paths || []).flatMap((p) => expandGlob(p, repoRoot, pathAliases));
     const keys = [...new Set(resolved.map((p) => lockKeyFor(p, repoRoot, pathAliases)))];
     if (!keys.length) return { allow: true, kind: cls.kind };
+    // BUG-281 (IV finding 2): a git tree-mutator pathspec may be a DIRECTORY with NO
+    // trailing slash (`git checkout -- src`), which the no-fs classifier cannot tell
+    // from a file. git restores every file UNDER it, but claimPaths keys the exact
+    // path and cannot prefix-match, so a lock on `src/shared.ts` was slipped and wiped.
+    // A git mutation is a one-shot (owns no path going forward); for it we ALSO check
+    // prefix-aware (checkScope: deny if any foreign lock sits AT or UNDER the key),
+    // exactly as checkTree guards a whole-tree git op. Write/Edit still claim-and-hold.
+    if (typeof cls.kind === 'string' && cls.kind.startsWith('git ')) {
+      for (const key of keys) {
+        const sc = checkScope(lockDir, owner, key, now, ttlMs);
+        if (!sc.ok) return { allow: false, busy: true, holder: sc.holder, kind: cls.kind, reason: busyRefusal(cls.kind, sc.holder, {}) };
+      }
+    }
     const r = claimPaths(lockDir, keys, meta, now, ttlMs);
     if (r.ok) return { allow: true, kind: cls.kind };
     if (r.exhausted || r.error) return { allow: false, busy: true, kind: cls.kind, reason: busyRefusal(cls.kind, null, { exhausted: true, error: r.error }) };
@@ -1408,4 +1525,20 @@ export function busyRefusal(kind, holder, { tree = false, exhausted = false, err
   return [head, '', tail, '',
     'This is FEAT-129\'s advisory file lock: many sessions/lanes share ONE working tree, and a whole-file or git-tree write here would clobber a concurrent lane\'s unsaved edits with no staleness check. The lock is per-path and auto-releases when the owner dies or its TTL lapses, so it can never wedge a file forever.',
   ].join('\n');
+}
+
+/**
+ * FEAT-191 land preflight (step 5): are a SET of repo-relative paths free of any LIVE foreign
+ * file-lock? Read-only (it claims nothing) — a one-shot land checks obstruction the same way a
+ * whole-tree op does, per path. Returns { ok:true } or { ok:false, holder, path }. A dead/stale
+ * holder is reclaimed in passing. `owner` is the land's own owner key (its locks, if any, are skipped).
+ */
+export function checkPathsFree({ lockDir, owner = 'ticket-branch-land', paths = [], repoRoot = null, pathAliases = [], now = Date.now(), ttlMs = FILE_LOCK_TTL_MS } = {}) {
+  if (!lockDir) return { ok: true };
+  for (const raw of paths) {
+    const key = lockKeyFor(raw, repoRoot, pathAliases);
+    const r = checkScope(lockDir, owner, key, now, ttlMs);
+    if (!r.ok) return { ok: false, holder: r.holder, path: raw };
+  }
+  return { ok: true };
 }

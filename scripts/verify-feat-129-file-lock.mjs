@@ -30,6 +30,15 @@ import {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..');
+
+/* This suite DRIVES real git on throwaway scratch repos it creates (sections 2, 9,
+ * 10, 11) — it never writes the real repo. In an agent session the FEAT-135 git-shim
+ * sits first on PATH and refuses git writes, which would block the scratch `git init`.
+ * Drop ONLY the shim dir so `git` resolves to the real binary; in the gate/CI (no
+ * shim) this is a no-op. Scoped to this process; the parent PATH is untouched. */
+if (process.env.PATH) {
+  process.env.PATH = process.env.PATH.split(path.delimiter).filter((d) => !/orchard-git-shim/.test(d)).join(path.delimiter);
+}
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; } else { fail++; console.error('  FAIL:', m); } };
 const section = (s) => console.log(`\n== ${s}`);
@@ -865,6 +874,261 @@ section('10. BUG-277 r3–r9 — index-only apply exemption + wrapper-hole/compo
   ok(!decoy.allow && decoy.busy && decoy.holder?.owner === A, 'r9 POST: the decoy-split `git "che"ckout … ; xargs git reset --hard` is REFUSED under the foreign lock (r8 keyed it to other.txt and ALLOWED the reset)');
   const r9Landed = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
   ok(r9Landed.allow, 'r9 POST: the bare `git apply --cached <path>` landing (a SIMPLE line) is STILL ALLOWED under the foreign lock (the exemption survives r9)');
+}
+
+/* ───────────────────────── 11. BUG-281 — whole-repo pathspecs on a SIMPLE line ──
+ * The IV (anthropic run 2c55fd7b, BUG-277 r9) found gitMutationTarget keyed
+ * WHOLE-REPO pathspecs as narrow per-file keys on a SIMPLE line — git magic (`:/`,
+ * `:(top)`, `:(glob)`, `:!`), paths normalising to the repo root or above (`./`,
+ * `src/..`, `$PWD`, `../x`, the absolute repo root), globs (`*`, `?`, `[`), a
+ * trailing-slash directory, and `--pathspec-from-file`. A real-git wipe passed a
+ * foreign lock. Each case is a MEASURED must-FAIL on the PRE-fix code (captured on
+ * HEAD before the fix: every one returned `{paths:[<literal>]}`, NOT tree — e.g.
+ * `git checkout -- :/` → `paths:[":/"]`, `git checkout -- $PWD` → `paths:["."]`,
+ * `git checkout -- *` → `paths:["*"]`; only `.` and `--pathspec-from-file` were
+ * already tree). Post-fix they classify whole-tree. */
+section('11. BUG-281 — whole-repo pathspecs on a SIMPLE line → whole-tree (anthropic run 2c55fd7b)');
+{
+  // Every one of these was NARROW (false-ALLOW shape) on the pre-fix code.
+  const treeAttacks = [
+    ['git checkout -- :/', 'magic :/ — whole repo from root (pre: paths:[":/"])'],
+    ['git checkout -- :(top)f', 'magic :(top) (pre: paths:[":"])'],
+    ['git checkout -- :(glob)*.js', 'magic :(glob) (pre: paths:[":"])'],
+    ['git checkout -- :!f', 'magic :! exclude (pre: paths:[":!f"])'],
+    ['git checkout -- ./', 'trailing-slash repo root (pre: paths:["./"])'],
+    ['git checkout -- src/..', 'normalises to repo root (pre: paths:["."])'],
+    ['git checkout -- $PWD', '$PWD → repo root (pre: paths:["."])'],
+    ['git checkout -- ../x', 'escapes above the root (pre: paths:["../x"])'],
+    ['git checkout -- *', 'shell glob * (pre: paths:["*"])'],
+    ['git checkout -- *.js', 'shell glob *.js (pre: paths:["*.js"])'],
+    ['git checkout -- src/?', 'glob ? (pre: paths:["src/?"])'],
+    ['git checkout -- [ab]', 'glob [..] (pre: paths:["[ab]"])'],
+    ['git restore :/', 'restore magic :/ (pre: paths:[":/"])'],
+    ['git rm *', 'rm glob (pre: paths:["*"])'],
+    ['git restore src/', 'restore trailing-slash dir (pre: paths:["src/"])'],
+    ['git checkout-index :/', 'checkout-index magic (pre: paths:[":/"])'],
+    ['git checkout --pathspec-from-file=list', 'pathspec list from a file we cannot see'],
+    ['git restore --pathspec-from-file=-', 'pathspec list from stdin'],
+    [`git checkout -- ${REPO_ROOT}`, 'the absolute repo root (pre: paths:[<abs>])'],
+    ['git checkout -- ~/f', 'tilde (home) expansion (pre: paths:["~/f"])'],
+    ['git checkout -- src/.', 'dot-suffixed DIRECTORY ref — normalises to `src` (pre: paths:["src"]; IV-found)'],
+    ['git checkout -- src/./', 'dot-slash directory ref'],
+    ['git checkout -- foo/..', 'parent ref normalises to root'],
+    ['git read-tree -- HEAD', 'read-tree takes a tree-ish, never a pathspec (pre: paths:["HEAD"]; IV-found)'],
+    ['git read-tree -m -u HEAD', 'read-tree -m -u rewrites the whole working tree'],
+  ];
+  for (const [cmd, why] of treeAttacks) ok(scanBashMutation(cmd).tree === true, `BUG-281: \`${cmd}\` → whole-tree (${why})`);
+  // A `.`/`..` segment MID-path is just noise and must NOT widen a real file.
+  ok(scanBashMutation('git checkout -- src/./a.js').paths?.[0] === 'src/a.js' && !scanBashMutation('git checkout -- src/./a.js').tree, 'BUG-281 guard: a mid-path `.` segment normalises away; the literal file stays scoped');
+  ok(scanBashMutation('git checkout -- .').tree === true, 'BUG-281 guard: `git checkout -- .` stays whole-tree (was already caught)');
+
+  // REGRESSION GUARDS — a genuine narrow literal path must stay path-scoped.
+  ok(scanBashMutation('git checkout -- src/a.js').paths?.[0] === 'src/a.js' && !scanBashMutation('git checkout -- src/a.js').tree, 'BUG-281 guard: a plain relative file stays path-scoped');
+  ok(scanBashMutation('git restore src/b.ts').paths?.[0] === 'src/b.ts', 'BUG-281 guard: `git restore <plain file>` stays scoped');
+  ok(scanBashMutation('git -C sub checkout -- c.txt').paths?.[0] === 'sub/c.txt', 'BUG-281 guard: `-C sub` + plain file keeps its narrow key');
+  ok(scanBashMutation('git checkout -- src/sub/../a.js').paths?.[0] === 'src/a.js', 'BUG-281 guard: an internal `..` that stays inside normalises and stays scoped');
+  ok(scanBashMutation('git -C a -C b restore x').paths?.[0] === 'a/b/x', 'BUG-281 guard: composed `-C` dirs + plain file still path-scoped');
+  // The exempt landing form is unaffected (returns before the classifier).
+  ok(classifyMutation({ toolName: 'Bash', toolInput: { command: 'git apply --cached scripts/x.patch' } }).mutates === false, 'BUG-281 guard: the `git apply --cached <path>` landing is still EXEMPT');
+
+  // END-TO-END on a REAL scratch repo (the user's reality): lane A holds an
+  // uncommitted hunk; lane B runs a whole-repo pathspec. must-FAIL (hatch open =
+  // pre-fix behaviour) DRIVES the real git wipe; must-PASS (lock on) DENIES it.
+  // Specs git expands ITSELF (no shell needed through execFileSync): `:/`, the
+  // absolute repo root, `src/..`, `./` — all verified to wipe real uncommitted work.
+  const repo = makeRepo('repo-bug281');
+  const file = path.join(repo, 'shared.ts');
+  write(file, 'committed\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'base');
+  const lockDir = path.join(SCRATCH, 'locks-bug281');
+  const A = 'session-A-281', B = 'session-B-281';
+  const realWipeSpecs = [':/', repo, 'src/..', './'];
+  for (const spec of realWipeSpecs) {
+    const cmd = `git checkout -- ${spec}`;
+    // must-FAIL: hatch open → B allowed → run the REAL checkout → A's work is lost.
+    write(file, 'A-uncommitted-work\n');
+    evaluateFileLock({ toolName: 'Write', toolInput: { file_path: file }, lockDir, repoRoot: repo, owner: A });
+    const hatch = evaluateFileLock({ toolName: 'Bash', toolInput: { command: cmd }, lockDir, repoRoot: repo, owner: B, env: { ORCHARD_ALLOW_FILE_CLOBBER: '1' } });
+    ok(hatch.allow, `BUG-281 PRE (hatch open): B's \`${cmd}\` is ALLOWED (pre-fix narrow key → no protection)`);
+    git(repo, 'checkout', '--', spec); // the actual clobbering command, run by real git
+    ok(read(file) === 'committed\n', `BUG-281 PRE: A's uncommitted work was CLOBBERED by \`${cmd}\` (real wipe reproduced)`);
+    // must-PASS: lock on → B denied as busy (whole-tree) → good-citizen B does not run it → A survives.
+    write(file, 'A-uncommitted-work\n');
+    evaluateFileLock({ toolName: 'Write', toolInput: { file_path: file }, lockDir, repoRoot: repo, owner: A });
+    const locked = evaluateFileLock({ toolName: 'Bash', toolInput: { command: cmd }, lockDir, repoRoot: repo, owner: B });
+    ok(!locked.allow && locked.busy && locked.tree === true && locked.holder?.owner === A, `BUG-281 POST: B's \`${cmd}\` is DENIED whole-tree, names holder A`);
+    ok(read(file) === 'A-uncommitted-work\n', `BUG-281 POST: A's uncommitted work SURVIVES \`${cmd}\``);
+  }
+  // A genuine NARROW checkout of a DIFFERENT file is still allowed under A's lock —
+  // the fix does not over-refuse an unrelated literal path.
+  const other = path.join(repo, 'other.ts');
+  write(other, 'x\n'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'two');
+  write(file, 'A-uncommitted-work\n');
+  evaluateFileLock({ toolName: 'Write', toolInput: { file_path: file }, lockDir, repoRoot: repo, owner: A });
+  const narrowOk = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'git checkout -- other.ts' }, lockDir, repoRoot: repo, owner: B });
+  ok(narrowOk.allow, 'BUG-281 POST: a NARROW `git checkout -- other.ts` (A holds shared.ts) is still ALLOWED — no over-refusal of an unrelated literal path');
+
+  /* ── IV findings (anthropic run 389a503c, r1 BROKEN) — driven on REAL git ──────
+   * (1) `--icase-pathspecs` matches case-INSENSITIVELY, so the literal key
+   *     `src/SHARED.TS` aliases a lock on `src/shared.ts` and real git wiped it;
+   *     gitSubcommand silently skipped the option (pre-fix narrow:["src/SHARED.TS"]).
+   * (2) `git checkout -- src` (bare DIRECTORY, no trailing slash) is keyed narrow
+   *     `src` but real git restores every file UNDER it, wiping a lock on
+   *     `src/shared.ts` (pre-fix narrow:["src"], ALLOWED). */
+  // Classifier: global pathspec-mode options widen matching → whole-tree.
+  ok(scanBashMutation('git --icase-pathspecs checkout -- src/SHARED.TS').tree === true, 'BUG-281 IV#1: `git --icase-pathspecs checkout -- src/SHARED.TS` → whole-tree (case-insensitive aliasing; pre: narrow)');
+  ok(scanBashMutation('git --glob-pathspecs checkout -- src/a').tree === true, 'BUG-281 IV#1: `--glob-pathspecs` (wildcard matching on) → whole-tree');
+  ok(scanBashMutation('git --literal-pathspecs restore x').tree === true, 'BUG-281 IV#1: `--literal-pathspecs` (semantics altered) → whole-tree (conservative)');
+  ok(scanBashMutation('git --noglob-pathspecs rm x').tree === true, 'BUG-281 IV#1: `--noglob-pathspecs` → whole-tree (conservative)');
+  // REAL-git end-to-end for BOTH findings on a repo with a nested src/ dir.
+  const ivRepo = makeRepo('repo-bug281-iv');
+  fs.mkdirSync(path.join(ivRepo, 'src'), { recursive: true });
+  const nested = path.join(ivRepo, 'src', 'shared.ts');
+  write(nested, 'committed\n'); git(ivRepo, 'add', '.'); git(ivRepo, 'commit', '-qm', 'base');
+  const ivLock = path.join(SCRATCH, 'locks-bug281-iv');
+  const ivDrives = [
+    ['git --icase-pathspecs checkout -- src/SHARED.TS', ['--icase-pathspecs', 'checkout', '--', 'src/SHARED.TS'], 'IV#1 icase-alias'],
+    ['git checkout -- src', ['checkout', '--', 'src'], 'IV#2 bare-directory'],
+  ];
+  for (const [cmd, realArgs, label] of ivDrives) {
+    // must-FAIL (hatch open): B allowed → real git wipes A's nested work.
+    write(nested, 'A-uncommitted-work\n');
+    evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+    const hatch = evaluateFileLock({ toolName: 'Bash', toolInput: { command: cmd }, lockDir: ivLock, repoRoot: ivRepo, owner: B, env: { ORCHARD_ALLOW_FILE_CLOBBER: '1' } });
+    ok(hatch.allow, `BUG-281 ${label} PRE (hatch open): B's \`${cmd}\` ALLOWED`);
+    git(ivRepo, ...realArgs);
+    ok(read(nested) === 'committed\n', `BUG-281 ${label} PRE: real git WIPED A's nested src/shared.ts (false-ALLOW reproduced)`);
+    // must-PASS (lock on): denied, names A, A survives.
+    write(nested, 'A-uncommitted-work\n');
+    evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+    const locked = evaluateFileLock({ toolName: 'Bash', toolInput: { command: cmd }, lockDir: ivLock, repoRoot: ivRepo, owner: B });
+    ok(!locked.allow && locked.busy && locked.holder?.owner === A, `BUG-281 ${label} POST: B's \`${cmd}\` DENIED, names holder A`);
+    ok(read(nested) === 'A-uncommitted-work\n', `BUG-281 ${label} POST: A's nested work SURVIVES`);
+  }
+  // Guard: a bare-directory checkout of an UNLOCKED sibling dir is still allowed.
+  fs.mkdirSync(path.join(ivRepo, 'docs'), { recursive: true });
+  // stage ONLY docs/ — a `git add .` here would capture the modified src/shared.ts into
+  // HEAD and break the later real-wipe baseline (it must stay `committed\n`).
+  write(path.join(ivRepo, 'docs', 'r.md'), 'x\n'); git(ivRepo, 'add', 'docs'); git(ivRepo, 'commit', '-qm', 'docs');
+  write(nested, 'A-uncommitted-work\n');
+  evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+  const sibling = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'git checkout -- docs' }, lockDir: ivLock, repoRoot: ivRepo, owner: B });
+  ok(sibling.allow, 'BUG-281 IV guard: a bare-dir `git checkout -- docs` (A holds src/shared.ts, nothing under docs/) is still ALLOWED — prefix check does not over-refuse an unrelated dir');
+
+  /* ── IV r1 finding (anthropic run 79ff4718, BROKEN) — git long-option ABBREVIATIONS
+   * defeat exact-name matching. git accepts any unambiguous prefix, so
+   * `git restore --pathspec-from list` ≡ `--pathspec-from-file` and read the list file
+   * (keyed narrow:["list"], ALLOWED, real git wiped). The robust fix is deny-by-default
+   * on options: a path-scope survives only with a known-safe option set (BUG-277 lesson:
+   * precise git-option parsing is unsound). Other wideners: `--prefix`, `-a`/`--all`,
+   * `--source`/`-s <tree>`, and global pathspec-mode options + their abbreviations. */
+  const optAttacks = [
+    ['git restore --pathspec-from list', '--pathspec-from (abbrev of --pathspec-from-file; pre: narrow:["list"])'],
+    ['git restore --pathspec-from-fi list', 'a shorter abbrev of --pathspec-from-file'],
+    ['git restore --pathspec-fr list', 'the minimal unambiguous abbrev'],
+    ['git rm --pathspec-from-file list', '--pathspec-from-file on rm'],
+    ['git checkout-index --prefix=out/ src/a.js', '--prefix writes to a DIFFERENT path'],
+    ['git checkout-index -a src/a.js', '-a/--all checks out EVERY file'],
+    ['git checkout-index --all', '--all with no pathspec'],
+    ['git restore -s HEAD src/a.js', '-s <tree> source; HEAD is a tree-ish not a pathspec'],
+    ['git restore --source=HEAD src/a.js', '--source=<tree>'],
+    ['git --icase checkout -- src/A.TS', 'global --icase (abbrev of --icase-pathspecs)'],
+    ['git -c core.ignorecase=true checkout -- src/A.TS', 'a -c config override — unsafe global'],
+    ['git --work-tree=/x checkout -- a', '--work-tree relocates the tree'],
+  ];
+  for (const [cmd, why] of optAttacks) ok(scanBashMutation(cmd).tree === true, `BUG-281 IV#3: \`${cmd}\` → whole-tree (${why})`);
+  // REGRESSION GUARDS — the safe-flag allowlist keeps the common narrow forms scoped.
+  ok(scanBashMutation('git checkout -f -- src/a.js').paths?.[0] === 'src/a.js', 'BUG-281 IV#3 guard: `-f`/`--force` is safe → `git checkout -f -- src/a.js` stays scoped');
+  ok(scanBashMutation('git restore -q src/b.ts').paths?.[0] === 'src/b.ts', 'BUG-281 IV#3 guard: `-q`/`--quiet` is safe → stays scoped');
+  ok(scanBashMutation('git rm -f src/b.ts').paths?.[0] === 'src/b.ts', 'BUG-281 IV#3 guard: `git rm -f <file>` stays scoped');
+  // REAL-git end-to-end: the abbreviated pathspec-from-file wipe is DENIED under A's lock.
+  write(nested, 'A-uncommitted-work\n');
+  fs.writeFileSync(path.join(ivRepo, 'plist'), 'src/shared.ts\n');
+  evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+  const abbrev = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'git restore --pathspec-from plist' }, lockDir: ivLock, repoRoot: ivRepo, owner: B });
+  ok(!abbrev.allow && abbrev.busy && abbrev.holder?.owner === A, 'BUG-281 IV#3 POST: `git restore --pathspec-from <list>` (abbrev) is DENIED whole-tree under A\'s lock, names A');
+
+  /* ── IV r2 finding (anthropic run 13eb5ef4, BROKEN) — post-`--` is a PATHSPEC only for
+   * pathspec verbs. `git switch -f -- other` means switch to BRANCH `other` (discards the
+   * working tree), yet the old `--` branch keyed it narrow `["other"]` and ALLOWED it
+   * under a foreign lock (real git threw A's work away). Only checkout/restore/rm/
+   * checkout-index/reset take working-tree pathspecs after `--`; every other verb → tree. */
+  const refVerbAttacks = [
+    ['git switch -f -- other', 'switch -f -- BRANCH discards the worktree (pre: narrow:["other"])'],
+    ['git switch -- other', 'switch -- BRANCH (`--` disambiguates a branch name)'],
+    ['git switch other', 'bare switch to a branch'],
+    ['git merge -- topic', 'merge ref after `--`'],
+    ['git rebase -- upstream', 'rebase ref after `--`'],
+    ['git cherry-pick -- abc123', 'cherry-pick ref after `--`'],
+    ['git revert -- abc123', 'revert ref after `--`'],
+    ['git pull -- origin main', 'pull refspec after `--`'],
+    ['git stash push -- file', 'stash is not a narrow pathspec verb here (over-refusal)'],
+    ['git clean -- dir', 'clean after `--`'],
+    ['git mv -- a b', 'mv after `--`'],
+    ['git reset --hard', 'reset --hard (no `--`) → whole tree'],
+    ['git reset HEAD~1', 'reset to a commit-ish (no `--`) → whole tree'],
+  ];
+  for (const [cmd, why] of refVerbAttacks) ok(scanBashMutation(cmd).tree === true, `BUG-281 IV#4: \`${cmd}\` → whole-tree (${why})`);
+  // Guards: reset of explicit index paths stays narrow; checkout <branch> is tree (pinned by section 1).
+  ok(scanBashMutation('git reset -- src/a.js').paths?.[0] === 'src/a.js', 'BUG-281 IV#4 guard: `git reset -- <file>` (index unstage) stays path-scoped');
+  // REAL-git end-to-end: a branch-switching clobber is DENIED under A's nested lock.
+  git(ivRepo, 'branch', 'feature');
+  write(nested, 'A-uncommitted-work\n');
+  evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+  const sw = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'git switch -f -- feature' }, lockDir: ivLock, repoRoot: ivRepo, owner: B });
+  ok(!sw.allow && sw.busy && sw.holder?.owner === A, 'BUG-281 IV#4 POST: `git switch -f -- feature` is DENIED whole-tree under A\'s lock (pre-fix keyed narrow:["feature"] and wiped), names A');
+
+  /* ── IV r3 findings (anthropic run 227692c8, BROKEN) ──────────────────────────
+   * (A) BRACE expansion: `{.,.}` / `{:/,.}` passed isNarrowPathspec (no brace check)
+   *     but bash expands it to `.`/`:/` and real git wiped (run bcfd0d07).
+   * (B) `-C ..` chain back to the repo root: `git -C .. checkout -- repo` composes
+   *     `../repo` (the whole repo) but was keyed narrow — isNarrowPathspec judged only
+   *     the bare pathspec, not the `-C`-composed effective path (run 47655bb7). */
+  const r3Attacks = [
+    ['git checkout -- {.,.}', 'brace expands to `.` `.` → repo root'],
+    ['git checkout -- {:/,.}', 'brace expands to `:/` (magic) and `.`'],
+    ['git restore {.,.}', 'brace on restore'],
+    ['git checkout -- {a,b}', 'any brace list is unresolved-wide → tree (over-refusal)'],
+    ['git -C .. checkout -- repo', '-C .. composes `../repo` = the whole repo'],
+    ['git -C .. restore r1/src', '-C .. composes `../r1/src` (escapes this repo)'],
+    ['git -C x/.. -C .. checkout -- repo', 'composed `-C` chain climbs to the parent'],
+  ];
+  for (const [cmd, why] of r3Attacks) ok(scanBashMutation(cmd).tree === true, `BUG-281 IV#5: \`${cmd}\` → whole-tree (${why})`);
+  // Guards: a `-C` chain that stays INSIDE the repo keeps its narrow key.
+  ok(scanBashMutation('git -C x/.. checkout -- shared.ts').paths?.[0] === 'shared.ts', 'BUG-281 IV#5 guard: `-C x/..` (net cwd = repo root) + a plain file stays path-scoped');
+  ok(scanBashMutation('git -C a -C b restore x').paths?.[0] === 'a/b/x', 'BUG-281 IV#5 guard: an in-repo `-C` chain still composes a narrow key');
+  // The shell expands `{.,.}` to `. .` BEFORE git runs; real git then wipes the whole
+  // tree (the `.`/`:/`/`src/..` forms are already driven on real git in realWipeSpecs
+  // above). Here we DRIVE the expanded form on real git to pin the wipe, then confirm
+  // the classifier refuses the braced form under a foreign lock.
+  write(nested, 'A-uncommitted-work\n');
+  git(ivRepo, 'checkout', '--', '.', '.'); // the shell-expansion of `{.,.}`, run by real git
+  ok(read(nested) === 'committed\n', 'BUG-281 IV#5: the brace-expansion of `{.,.}` → `git checkout -- . .` real-git WIPES A\'s work (why `{.,.}` must be whole-tree)');
+  write(nested, 'A-uncommitted-work\n');
+  evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+  const braceLocked = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'git checkout -- {.,.}' }, lockDir: ivLock, repoRoot: ivRepo, owner: B });
+  ok(!braceLocked.allow && braceLocked.busy && braceLocked.tree === true && braceLocked.holder?.owner === A, 'BUG-281 IV#5 POST: `git checkout -- {.,.}` DENIED whole-tree under A\'s lock, names A');
+
+  /* ── IV r4 finding (anthropic run e44274b0, BROKEN) — EXTGLOB patterns. The
+   * tokenizer splits on `(`/`)`, so `git checkout -- !(x)` / `+(s)rc` kept only the
+   * leading `!`/`+` as a narrow key while bash (extglob on) expands the pattern
+   * tree-wide and real git wiped. isSimpleLine now rejects `(`/`)`, so the line is
+   * non-simple and the whole-tree net classifies it. */
+  const extglobAttacks = [
+    ['git checkout -- !(x)', 'negated extglob (everything but x) — pre: narrow:["!"]'],
+    ['git restore !(keep)', 'negated extglob on restore'],
+    ['git checkout -- +(s)rc', 'one-or-more extglob — pre: narrow:["+"]'],
+    ['git checkout -- @(src)', 'exactly-one extglob'],
+    ['git checkout -- *(src)', 'zero-or-more extglob'],
+    ['git checkout -- ?(src)', 'zero-or-one extglob'],
+  ];
+  for (const [cmd, why] of extglobAttacks) ok(scanBashMutation(cmd).tree === true, `BUG-281 IV#6: \`${cmd}\` → whole-tree (${why})`);
+  ok(isSimpleLine('git checkout -- !(x)') === false, 'BUG-281 IV#6 predicate: a `(`/`)` (subshell/extglob) makes the line NON-simple');
+  ok(isSimpleLine('git checkout -- src/a.js') === true, 'BUG-281 IV#6 guard: a plain line with no parens stays simple');
+  // REAL-git end-to-end: the extglob wipe is DENIED under A's lock.
+  write(nested, 'A-uncommitted-work\n');
+  evaluateFileLock({ toolName: 'Write', toolInput: { file_path: nested }, lockDir: ivLock, repoRoot: ivRepo, owner: A });
+  const extg = evaluateFileLock({ toolName: 'Bash', toolInput: { command: 'git checkout -- !(nothere)' }, lockDir: ivLock, repoRoot: ivRepo, owner: B });
+  ok(!extg.allow && extg.busy && extg.tree === true && extg.holder?.owner === A, 'BUG-281 IV#6 POST: `git checkout -- !(nothere)` DENIED whole-tree under A\'s lock, names A');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);

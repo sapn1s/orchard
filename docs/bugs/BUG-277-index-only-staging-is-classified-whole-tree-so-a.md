@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "open",
   "human_action": "none",
-  "updated": "2026-10-26",
+  "updated": "2026-10-27",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -50,6 +50,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "IV range 31d2fca^..31d2fca: exemption under-refuses — shell-expansion forms ($(echo --reject), {--reject,p.diff}) and env-prefix forms (env GIT_DIR=.. git apply --cached, export GIT_WORK_TREE=..;) classified index-only and ALLOWED under a foreign lock; manifest-backed adv-e2e."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "7fe2cf90-da81-4128-8969-3d28d4a50821",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T11:47:56.900Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "IV 31d2fca^..c8fb8a7 (r2+r3), VALID, exit 1. r3 regex refuses all shell/wrapper/metachar forms; but upstream gitMutationTarget reads post-double-dash tokens as written paths when for git-apply they are patch files. So 'apply -- p' & '--cached -- p' write the tree yet are ALLOWED over a lock."
     }
   ],
   "verification_class": "fix",
@@ -142,3 +154,22 @@ Either is sufficient:
 - **Suites:** rewrote section 10 of `scripts/verify-feat-129-file-lock.mjs` for the r3 contract (predicate tests + the full attack list via the REAL `classifyMutation` entry + the out-of-repo-scratch-lock end-to-end: landing shape ALLOWED, working-tree apply REFUSED and names the holder, expansion-form apply REFUSED). Full suite → PASS 196/196 under `node scripts/confined-run.mjs -- sh -c 'mkdir -p "$HOME/scratch" && node scripts/verify-feat-129-file-lock.mjs'` (confined because it writes scratch git repos; the container HOME needs its scratch dir pre-made). `npm run gate` → PASS (exit 0): leak-gate + typecheck clean (one home-path leak in an example string was neutralised to `/var/lib/station/...`).
 - **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/lib/file-lock.d.mts` (declared the new export), `scripts/verify-feat-129-file-lock.mjs`, this ticket.
 - **Risk bucket:** touches the shared-tree safety path (regression-prone) — an independent clean-room verify pass is warranted before close. r3 strictly NARROWS the exemption to one metachar-free literal shape (a subset of r2's allowlist); every other form, incl. all r2 breaks, now classifies tree/path (refused under a lock).
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 7fe2cf90-da81-4128-8969-3d28d4a50821 — VERDICT: BROKEN — IV 31d2fca^..c8fb8a7 (r2+r3), VALID, exit 1. r3 regex refuses all shell/wrapper/metachar forms; but upstream gitMutationTarget reads post-double-dash tokens as written paths when for git-apply they are patch files. So 'apply -- p' & '--cached -- p' write the tree yet are ALLOWED over a lock.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — fixing lane (round 4)
+- **regressed-from:** BUG-277 r1/r2/r3 (same ticket). r3's whole-string exemption was sound, but it left the UPSTREAM classifier untouched — and that is where anthropic run 7fe2cf90-da81-4128-8969-3d28d4a50821 (BROKEN) found two holes.
+- **Hypothesis verified FIRST (probe vs the r3 code at HEAD):** the wrapper hole is PER-WRAPPER, not per-verb. A probe imported the HEAD (r3) `file-lock.mjs` and ran 13 attacks: **12/13 SLIP a foreign lock** (classify not-a-mutation OR path-scoped-to-the-patch-file). The 13th (nohup form) was already caught because `nohup` is a NOOP head. The slips span apply AND checkout/restore/reset/stash/clean — confirming the hole is the wrapper, not the verb.
+- **Two defects:**
+  1. `gitMutationTarget` read git-apply's tokens after the double-dash as WRITTEN pathspecs. For git-apply they are PATCH FILES to READ; the apply still writes the whole tree. So the post-double-dash apply forms keyed the lock to the patch file and were ALLOWED over a lock on any other file. (The verdict's exact break.)
+  2. A git tree-mutator reached through a wrapper the tokenizer does not unwrap (exec/xargs/timeout prefixes) never reaches the `head==='git'` branch, so the segment classified as NO mutation and slipped every lock. (nohup/command/sh -c/env were already unwrapped; the rest were not.)
+- **Fix (scripts/lib/file-lock.mjs — `gitMutationTarget` and its caller `scanBashMutation` only):**
+  - `gitMutationTarget`: `apply` and `am` now return `{tree:true}` UNCONDITIONALLY — neither ever writes a named pathspec (their args are patch/mbox files to read), so the generic double-dash path-scoping branch must not apply to them. Fixes defect 1 via the tokenizer (incl. the `-C` form).
+  - New `WRAPPED_GIT_TREE_MUTATOR_RE` + exported `hasWrappedGitTreeMutator(command)`: a plain WHOLE-STRING regex (no tokenizing — the r3 lesson) matching a standalone/path-qualified `git` token followed, after only git's own global options, by any GIT_TREE_MUTATORS verb. Wired into `scanBashMutation` at the SINGLE top-level (`depth===0`) `mutates:false` exit: if the ordinary scan found nothing but the raw string carries a wrapped git mutator, return whole-tree. Fixes defect 2 for every mutator.
+  - Gated on `mutates:false` so a CLEAN path-scoped checkout keeps its narrow per-file key (not widened to the tree); and the verb must sit in the subcommand position, so a mutator WORD inside an arg (a commit message) does NOT trip it — the landing commit is never refused. Over-refusal (e.g. an echo of the literal text) is accepted by design.
+  - **Known residual (noted in code):** a command that is BOTH a detected non-git mutation AND a wrapped git mutator nets on the first only (the net is gated on mutates:false to protect path-scoping). Not in the attack surface; closing it would need scan-state, not a bigger regex.
+- **Verification (must-FAIL from the r3 code, run both ways):** r3 baseline probe = 12/13 attacks slip (above). Post-fix, the full r4 attack list classifies whole-tree: the post-double-dash apply forms, exec/xargs/timeout/command/nohup around apply, the -C apply form, a path-qualified git-apply, and the same wrappers around checkout/restore/reset/stash/clean. The exact exempt form stays exempt; all r1–r3 cases unchanged. Regression guards hold: clean checkout/restore/rm stay path-scoped; commit-message/status/log/diff/add stay not-a-mutation; a `digit` substring does not match. End-to-end over the OUT-OF-REPO foreign scratch lock: the post-double-dash apply, the exec-wrapped apply, and a timeout-wrapped checkout are now all REFUSED (were allowed), while the bare index-only landing is STILL ALLOWED.
+- **Suites:** `verify-feat-129-file-lock.mjs` → PASS 224/224 (confined runner, scratch HOME pre-made). `npm run gate` → PASS (exit 0, read unpiped): leak-gate + typecheck clean.
+- **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/verify-feat-129-file-lock.mjs`, this ticket. (Did NOT touch `file-lock.d.mts` — typecheck passes without declaring the new export; stayed inside the charter's file list.)
+- **Risk bucket:** shared-tree safety path (regression-prone) — an independent clean-room verify pass IS warranted before close. r4 only ever WIDENS refusal (apply/am always tree; wrapped mutators tree); it never newly allows anything, so it cannot reintroduce a clobber. The one preserved allow (bare index-only landing) and all path-scoping are pinned by the suite.

@@ -312,6 +312,46 @@ export function isIndexOnlyApplyExempt(command) {
   return typeof command === 'string' && INDEX_ONLY_APPLY_RE.test(command.trim());
 }
 
+/* ── BUG-277 r4: the WRAPPER-HOLE whole-tree safety net ───────────────────────
+ *
+ * The tokenizer only reaches git's classifier when `git` is the segment HEAD (or a
+ * NOOP-head/`sh -c`/`env` preamble it unwraps). A WRAPPER that passes its args to git
+ * without being one of those — `exec git …`, `xargs git …`, `timeout 5 git …`,
+ * `nohup`/`command`-around forms not already unwrapped — never reaches the git branch,
+ * so the segment classifies as NO mutation and a tree-wiping `git checkout`/`reset`/
+ * `apply`/… slips every lock (proven live: run 7fe2cf90… for apply; and the r4 probe
+ * showed the SAME hole for checkout/restore/reset/stash/clean — it is per-wrapper, not
+ * per-verb). We do NOT try to model which wrapper it is: per the r3 lesson (the shell
+ * does arbitrary things before git runs), we take a plain WHOLE-STRING regex. If the
+ * raw command contains a `git` token followed — after only git's own global options —
+ * by any GIT_TREE_MUTATORS verb, and the normal scan found NO mutation, it is a
+ * wrapped tree mutation → whole-tree. Over-refusal is acceptable and expected (e.g.
+ * `echo "git apply …"` is refused); under-refusal is the defect this closes.
+ *
+ * It fires ONLY when the ordinary scan returned `{mutates:false}` (the wrapper hole),
+ * so a CLEAN `git checkout -- f` the tokenizer already path-scoped is untouched — its
+ * narrow per-file key is preserved, not widened to the whole tree. The verb must sit
+ * in the SUBCOMMAND position (after `git` and its global options only), so a mutator
+ * word inside a later arg — `git commit -m "apply the reset fix"` — does NOT match and
+ * a benign commit is never refused. Global value-options (`-C <dir>`, `-c <cfg>`, …)
+ * consume their following value so `git -C . apply` still matches. `git` must be a
+ * standalone/pathed token (`/usr/bin/git`, `(git …`, `` `git … ``), never a substring
+ * (`digit`, `mygit`). A known residual: a command that is BOTH a detected non-git
+ * mutation AND a wrapped git mutator (`sed -i x f; exec git reset --hard`) nets on the
+ * first only — the net is gated on mutates:false to protect path-scoping; such a
+ * combined form is not in the attack surface and over-refusal there would need state.
+ */
+const _GIT_GLOBAL_VALUE_OPT = '-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env|--super-prefix|--attr-source';
+const _GIT_GLOBAL_OPT = `(?:(?:${_GIT_GLOBAL_VALUE_OPT})[ \\t]+\\S+|--?[^\\s]+)`;
+// longest-first where a verb is a prefix of another (checkout-index before checkout).
+const _GIT_TREE_MUTATOR_VERB = 'checkout-index|checkout|cherry-pick|read-tree|switch|restore|reset|rebase|revert|stash|clean|rm|mv|merge|pull|apply|am';
+const WRAPPED_GIT_TREE_MUTATOR_RE = new RegExp(
+  `(?<![\\w-])git[ \\t]+(?:${_GIT_GLOBAL_OPT}[ \\t]+)*(?:${_GIT_TREE_MUTATOR_VERB})(?![\\w-])`,
+);
+export function hasWrappedGitTreeMutator(command) {
+  return typeof command === 'string' && WRAPPED_GIT_TREE_MUTATOR_RE.test(command);
+}
+
 export function classifyMutation({ toolName, toolInput } = {}) {
   const ti = toolInput && typeof toolInput === 'object' ? toolInput : {};
   if (toolName === 'Write' || toolName === 'Edit') {
@@ -439,6 +479,16 @@ function gitMutationTarget(sub, args) {
   // a whole-command-string match at the top of `scanBashMutation`
   // (`isIndexOnlyApplyExempt`); EVERY `git apply` that reaches this classifier is
   // treated as a potential working-tree write, exactly as it was pre-exemption.
+  //
+  // BUG-277 r4: `apply` and `am` read PATCH/MBOX files — their tokens after `--`
+  // are files to READ, NOT written pathspecs. The generic `--` branch below wrongly
+  // keyed `git apply -- p.patch` / `git apply --cached -- p.patch` to the patch file
+  // `p`, so a foreign lock on any OTHER file was slipped and the tree-writing apply
+  // was ALLOWED (anthropic run 7fe2cf90…). Neither verb ever writes a NAMED pathspec,
+  // so both are unconditionally whole-tree here. The one sanctioned exception —
+  // `git apply --cached <path>…` writing only the index — is handled earlier, as a
+  // whole-command-string exemption at the top of scanBashMutation, never here.
+  if (sub === 'apply' || sub === 'am') return { tree: true };
   const dd = args.indexOf('--');
   if (dd >= 0) {
     const paths = args.slice(dd + 1).filter((a) => a && a !== '.');
@@ -935,7 +985,15 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
       continue;
     }
   }
-  if (!allPaths.length && !scopes.length) return { mutates: false };
+  if (!allPaths.length && !scopes.length) {
+    // BUG-277 r4: the wrapper-hole net. At the top level only, a raw command that
+    // smuggles a git tree-mutator past the tokenizer through a wrapper (`exec`/
+    // `xargs`/`timeout`/…) classifies whole-tree rather than slipping every lock.
+    // See hasWrappedGitTreeMutator. Gated on mutates:false so a clean, already
+    // path-scoped `git checkout -- f` keeps its narrow key.
+    if (depth === 0 && hasWrappedGitTreeMutator(command)) return { mutates: true, tree: true, kind: 'git (wrapped tree mutation)' };
+    return { mutates: false };
+  }
   return { mutates: true, paths: allPaths, scopes, kind: kind ?? 'write' };
 }
 

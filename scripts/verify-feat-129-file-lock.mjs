@@ -616,9 +616,54 @@ section('10. BUG-277 r3 — index-only apply exemption is a WHOLE-STRING match (
   ok(scanBashMutation(`${APPLY} p.diff`).tree === true, 'plain `apply` (no --cached) → writes the tree → TREE');
   ok(scanBashMutation('git am < p.mbox').tree === true, '`git am` has no --cached and commits → stays TREE');
 
-  // A non-git command that merely CONTAINS the literal text must not be misclassified as a mutation.
-  ok(exempt(`echo "${APPLY} --cached foo"`), 'echo of the literal text is not a mutation');
-  ok(exempt(`grep -n "${APPLY} --cached" file.txt`), 'grep for the literal text is not a mutation');
+  // r4: `echo`/`grep` of the literal `git <mutator>` text is now caught by the
+  // whole-string wrapper-hole net and REFUSED. This is deliberate over-refusal (the
+  // net cannot distinguish quoted data from a real wrapped invocation without
+  // tokenizing, which r1/r2/r3 proved unsound); the tree check still only denies
+  // when a lock is actually held, so a read command refused here is benign.
+  ok(refused(`echo "${APPLY} --cached foo"`), 'r4: echo of the literal `git apply` text → REFUSED (deliberate over-refusal, net cannot tell data from code)');
+  ok(refused(`grep -n "${APPLY} --cached" file.txt`), 'r4: grep for the literal `git apply` text → REFUSED (deliberate over-refusal)');
+
+  /* ──────── r4 — the WRAPPER HOLE (anthropic run 7fe2cf90…) ────────────────────
+   * r3 recognised the index-only form by a whole-string regex, but the UPSTREAM
+   * classifier still (a) read git-apply's post-`--` tokens as WRITTEN pathspecs —
+   * they are patch files to READ — so `git apply -- p` / `--cached -- p` keyed the
+   * lock to the patch file and slipped every foreign lock; and (b) never reached
+   * git at all when git was wrapped (`exec`/`xargs`/`timeout`/…), so a tree-wiping
+   * mutator slipped silently. The r4 probe showed 12/13 of these SLIP on the r3
+   * code (nohup alone was already a NOOP-head). Each `refused(...)` below is a
+   * must-FAIL synthesized from that r3 baseline; `.tree === true` pins whole-tree. */
+  // apply's post-`--` tokens are patch files to READ, never written pathspecs → whole tree.
+  ok(scanBashMutation(`${APPLY} -- p.patch`).tree === true, 'r4: `apply -- p` (no --cached) → patch file is READ, writes the tree → TREE (r3 keyed it to `p`)');
+  ok(scanBashMutation(`${APPLY} --cached -- p.patch`).tree === true, 'r4: `apply --cached -- p` → `--` token is the patch FILE, not a pathspec → TREE (r3 keyed it to `p`, slipping locks)');
+  ok(refused(`${APPLY} --cached -- p.patch`), 'r4: `apply --cached -- p` is a mutation (TREE), not index-exempt');
+  // The `--` patch-file hole also slips behind a `-C` global option.
+  ok(scanBashMutation(`git -C . apply --cached -- p.patch`).tree === true, 'r4: `git -C . apply --cached -- p` → TREE (r3 keyed it to `p`)');
+  // Wrapper forms: git never reaches the tokenizer's git branch → whole-string net catches it.
+  ok(scanBashMutation(`exec ${APPLY} p.patch`).tree === true, 'r4 wrapper: `exec git apply p` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`xargs ${APPLY} < list`).tree === true, 'r4 wrapper: `xargs git apply < list` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`timeout 5 ${APPLY} p.patch`).tree === true, 'r4 wrapper: `timeout 5 git apply p` → TREE (r3: not-a-mutation)');
+  // The wrapper hole is PER-WRAPPER, not per-verb: every GIT_TREE_MUTATOR slips the same way.
+  ok(scanBashMutation(`exec git checkout -- f`).tree === true, 'r4 wrapper: `exec git checkout -- f` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`xargs git checkout`).tree === true, 'r4 wrapper: `xargs git checkout` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`timeout 5 git reset --hard`).tree === true, 'r4 wrapper: `timeout 5 git reset --hard` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`exec git restore f`).tree === true, 'r4 wrapper: `exec git restore f` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`timeout 5 git stash`).tree === true, 'r4 wrapper: `timeout 5 git stash` → TREE (r3: not-a-mutation)');
+  ok(scanBashMutation(`exec git clean -fd`).tree === true, 'r4 wrapper: `exec git clean -fd` → TREE (r3: not-a-mutation)');
+  // Already-caught wrapper forms (NOOP-head / sh -c / env) stay TREE — unchanged.
+  ok(scanBashMutation(`command ${APPLY} p.patch`).tree === true, 'r4: `command git apply p` → TREE (NOOP-head, already caught)');
+  ok(scanBashMutation(`nohup git reset --hard`).tree === true, 'r4: `nohup git reset --hard` → TREE (NOOP-head, already caught)');
+  ok(scanBashMutation(`/usr/bin/git apply p.patch`).tree === true, 'r4: a path-qualified `/usr/bin/git apply` → TREE');
+
+  // REGRESSION GUARDS: the net must NOT widen any of these.
+  ok(scanBashMutation(`git checkout -- src/a`).paths?.[0] === 'src/a' && !scanBashMutation(`git checkout -- src/a`).tree, 'r4 guard: a CLEAN `git checkout -- f` keeps its narrow per-file key (net gated on mutates:false)');
+  ok(scanBashMutation(`git restore src/b`).paths?.[0] === 'src/b', 'r4 guard: `git restore f` stays path-scoped');
+  ok(!scanBashMutation(`git commit -m "apply the reset fix"`).mutates, 'r4 guard: a mutator WORD inside a commit message does NOT trip the net (`git commit` stays not-a-mutation — the landing commit)');
+  ok(!scanBashMutation(`git status`).mutates, 'r4 guard: `git status` is not a mutation');
+  ok(!scanBashMutation(`git log --oneline`).mutates, 'r4 guard: `git log` is not a mutation');
+  ok(!scanBashMutation(`git diff HEAD`).mutates, 'r4 guard: `git diff` is not a mutation');
+  ok(!scanBashMutation(`git add -A`).mutates, 'r4 guard: `git add` is not a mutation');
+  ok(!scanBashMutation(`digit apply p`).mutates, 'r4 guard: `digit apply` (git is a substring) does NOT match the net');
 
   // END-TO-END (the user's reality): a foreign live lane holds a lock on an OUT-OF-REPO scratch
   // file (the FEAT-191 IV repro); the index-only landing must be ALLOWED, a WT-writing apply REFUSED.
@@ -635,6 +680,19 @@ section('10. BUG-277 r3 — index-only apply exemption is a WHOLE-STRING match (
   // And an EXPANSION-form apply is NOT exempted: it too is refused under the foreign lock.
   const expo = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached $(echo scripts/x) p.diff` }, lockDir, repoRoot: repo, owner: LANDER });
   ok(!expo.allow && expo.busy, 'POST: an expansion-form `apply --cached $(…)` is REFUSED under the foreign lock (not index-exempted)');
+
+  // r4 END-TO-END: the two forms the newest verdict (7fe2cf90…) proved slipped the
+  // lock. Each must now be REFUSED under the SAME foreign scratch lock. The holder
+  // is the out-of-repo IV lane, so this is the user's real landing reality.
+  const ddApply = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached -- scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!ddApply.allow && ddApply.busy, 'r4 POST: `git apply --cached -- p` (patch file after `--`) is REFUSED under the foreign lock (r3 keyed it to `p` and ALLOWED it — the verdict)');
+  const wrapped = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `exec ${APPLY} scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!wrapped.allow && wrapped.busy, 'r4 POST: a WRAPPED `exec git apply p` is REFUSED under the foreign lock (r3: slipped as not-a-mutation)');
+  const wrappedCo = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `timeout 5 git checkout -- scripts/other.txt` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!wrappedCo.allow && wrappedCo.busy, 'r4 POST: a WRAPPED `timeout 5 git checkout` is REFUSED under the foreign lock (per-wrapper hole, any mutator)');
+  // And the sanctioned bare index-only landing is STILL allowed (the whole point).
+  const stillAllowed = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(stillAllowed.allow, 'r4 POST: the bare `git apply --cached <path>` landing is STILL ALLOWED under the foreign lock (the exemption survives)');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);

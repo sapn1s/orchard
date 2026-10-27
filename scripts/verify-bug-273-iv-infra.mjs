@@ -79,7 +79,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  validateRunForms, providerAbortKind, seedScratchGit, buildRoomGitEnv,
+  validateRunForms, providerAbortKind, seedScratchGit, buildRoomGitEnv, renderByteName,
 } from './independent-verify.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -400,6 +400,91 @@ function preR8SeedScratchGit(dir) {
       fs.writeFileSync(path.join(gitDir, 'refs', 'heads', 'main'), commit + '\n');
       const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
       if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) return { ok: false, error: `HEAD resolve: ${(head.stderr || '').trim()}` };
+      return { ok: true, head: commit, error: null, skipped };
+    } finally { try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ } }
+  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+}
+
+/* BUG-273 r10 must-FAIL anchor — the r9 SHIPPED seed (7e5bd8e), written out
+ * literally: the BUFFER walk, the bisecting add, AND the disk↔HEAD reconciliation
+ * — but with the r9 LOSSY tail: `skipped` is `relFiles.filter(...).map(toString('utf8'))`
+ * and there is NO byte-exact `skippedBytes` field. That is the exact r9 defect r10
+ * closes: an invalid-UTF-8 name that is SKIPPED (an embedded-repo file with 0xFF /
+ * overlong / lone-surrogate bytes in its path) renders to a string carrying U+FFFD,
+ * so the name is byte-exactly in NEITHER HEAD nor the skip list and completeness
+ * silently fails for it (the live BROKEN, openai run 01a17e1f). The partition is
+ * reconciled byte-exactly INTERNALLY here, same as r9 — the loss is only at the
+ * utf8 RENDER and the missing byte-exact caller list. Grading the byte-fidelity room
+ * against this anchor reddens on the byte-exact partition + the injective-render +
+ * the missing-skippedBytes properties. */
+function preR9SeedScratchGit(dir) {
+  try {
+    const gitDir = path.join(dir, '.git');
+    if (fs.existsSync(gitDir)) return { ok: false, error: '.git already present' };
+    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'objects', 'pack'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'heads'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'tags'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(path.join(gitDir, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n');
+    fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), '/node_modules/\n');
+    const idxTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'iv-gitidx-pre9-'));
+    const env = buildRoomGitEnv({
+      GIT_DIR: gitDir, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(idxTmp, 'index'),
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1',
+      GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
+      GIT_COMMITTER_NAME: 'independent-verify', GIT_COMMITTER_EMAIL: 'verify@example.invalid',
+    });
+    const g = (args, extra = {}) => spawnSync('git', args, { encoding: 'utf8', env, ...extra });
+    try {
+      const NUL = Buffer.from([0]), SLASH = Buffer.from('/');
+      const DOTGIT = Buffer.from('.git'), NODE_MODULES = Buffer.from('node_modules');
+      const dirBuf = Buffer.from(dir);
+      const relFiles = [];
+      (function walk(relBuf) {
+        const absBuf = relBuf.length ? Buffer.concat([dirBuf, SLASH, relBuf]) : dirBuf;
+        let ents;
+        try { ents = fs.readdirSync(absBuf, { withFileTypes: true, encoding: 'buffer' }); } catch { return; }
+        for (const e of ents) {
+          const nameBuf = e.name;
+          const rel = relBuf.length ? Buffer.concat([relBuf, SLASH, nameBuf]) : nameBuf;
+          if (nameBuf.equals(DOTGIT)) continue;                              // any-depth embedded-repo metadata (r9)
+          if (relBuf.length === 0 && nameBuf.equals(NODE_MODULES)) continue; // top-level live-tree copy
+          if (e.isSymbolicLink()) { relFiles.push(rel); continue; }
+          if (e.isDirectory()) { walk(rel); continue; }
+          relFiles.push(rel);
+        }
+      })(Buffer.alloc(0));
+      const nulJoinBuf = (bufs) => { const parts = []; bufs.forEach((b, i) => { if (i) parts.push(NUL); parts.push(b); }); return Buffer.concat(parts); };
+      const addBatch = (bufs) => bufs.length === 0 ? 0 : (g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: nulJoinBuf(bufs) }).status ?? 1);
+      const addRecursive = (bufs) => {
+        if (bufs.length === 0) return;
+        if (addBatch(bufs) === 0) return;
+        if (bufs.length === 1) return;
+        const mid = bufs.length >> 1;
+        addRecursive(bufs.slice(0, mid));
+        addRecursive(bufs.slice(mid));
+      };
+      addRecursive(relFiles);
+      const wt = g(['write-tree']);
+      if ((wt.status ?? 1) !== 0) return { ok: false, error: `write-tree: ${(wt.stderr || '').trim()}` };
+      const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
+      if ((ct.status ?? 1) !== 0) return { ok: false, error: `commit-tree: ${(ct.stderr || '').trim()}` };
+      const commit = ct.stdout.trim();
+      fs.copyFileSync(path.join(idxTmp, 'index'), path.join(gitDir, 'index'));
+      fs.writeFileSync(path.join(gitDir, 'refs', 'heads', 'main'), commit + '\n');
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
+      if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) return { ok: false, error: `HEAD resolve: ${(head.stderr || '').trim()}` };
+      const headLs = spawnSync('git', ['-C', dir, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'],
+        { env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
+      if ((headLs.status ?? 1) !== 0) return { ok: false, error: `ls-tree HEAD: ${(headLs.stderr ? headLs.stderr.toString('utf8') : '').trim()}` };
+      const committed = new Set();
+      { const b = headLs.stdout || Buffer.alloc(0); let s = 0; for (let i = 0; i < b.length; i++) { if (b[i] === 0) { if (i > s) committed.add(b.subarray(s, i).toString('latin1')); s = i + 1; } } if (s < b.length) committed.add(b.subarray(s).toString('latin1')); }
+      const skipped = relFiles
+        .filter((b) => !committed.has(b.toString('latin1')))
+        .map((b) => b.toString('utf8')); // r9: LOSSY render, NO byte-exact skippedBytes
       return { ok: true, head: commit, error: null, skipped };
     } finally { try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ } }
   } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
@@ -920,6 +1005,142 @@ function proveReconcileCompleteness(seed, label) {
   }
 }
 
+/* ---- BUG-273 r10: BYTE-FIDELITY of the reconciled `skipped` partition ---------
+ * r9 reconciled the partition byte-exactly INTERNALLY (latin1 keys) but returned
+ * `skipped` as `.map(toString('utf8'))` — collapsing every invalid-UTF-8 byte to
+ * U+FFFD — and exposed NO byte-exact list to the caller. So an invalid-byte name
+ * that is SKIPPED was byte-exactly in NEITHER HEAD nor skipped, and completeness
+ * silently failed for it (the live BROKEN, openai run 01a17e1f). r10 renders
+ * `skipped` through the injective `\xNN` escape (renderByteName) and returns a
+ * byte-exact `skippedBytes` (Buffers). We force four invalid-byte names to be
+ * SKIPPED by putting them inside an embedded repo (git drops gitlink-interior
+ * files silently, so they land in neither the index nor HEAD — exactly the
+ * skipped case), and prove the partition holds BYTE-EXACTLY for each: 0xFF, an
+ * overlong UTF-8 sequence, a lone-surrogate (WTF-8) encoding, and an ASCII+invalid
+ * mix. A top-level invalid-byte name that git COMMITS proves the committed side is
+ * also byte-exact. This reddens on preR9SeedScratchGit (lossy map, no skippedBytes)
+ * and passes on the real r10 seed. */
+const INVALID_BYTE_NAMES = {
+  '0xFF': Buffer.from([0x62, 0xff, 0x62]),                      // b<FF>b
+  'overlong-UTF-8': Buffer.concat([Buffer.from('ov-'), Buffer.from([0xc1, 0x81])]), // overlong 'A'
+  'lone-surrogate': Buffer.concat([Buffer.from('sur-'), Buffer.from([0xed, 0xa0, 0x80])]), // WTF-8 U+D800
+  'ascii+invalid mix': Buffer.from([0x6d, 0x69, 0x78, 0xff, 0xfe, 0x6d]), // mix<FF><FE>m
+};
+function byteWalkCandidates(dir) {
+  // The SAME exclusions the seed applies, but BYTE-accurate: `.git` at ANY depth,
+  // node_modules at top. Returns an array of repo-relative path Buffers.
+  const DOTGIT = Buffer.from('.git'), NODE_MODULES = Buffer.from('node_modules'), SLASH = Buffer.from('/');
+  const dirBuf = Buffer.from(dir);
+  const out = [];
+  (function rec(relBuf) {
+    const absBuf = relBuf.length ? Buffer.concat([dirBuf, SLASH, relBuf]) : dirBuf;
+    let ents; try { ents = fs.readdirSync(absBuf, { withFileTypes: true, encoding: 'buffer' }); } catch { return; }
+    for (const e of ents) {
+      const nameBuf = e.name;
+      const rel = relBuf.length ? Buffer.concat([relBuf, SLASH, nameBuf]) : nameBuf;
+      if (nameBuf.equals(DOTGIT)) continue;
+      if (relBuf.length === 0 && nameBuf.equals(NODE_MODULES)) continue;
+      if (e.isSymbolicLink()) { out.push(rel); continue; }
+      if (e.isDirectory()) { rec(rel); continue; }
+      out.push(rel);
+    }
+  })(Buffer.alloc(0));
+  return out;
+}
+function buildByteFidelityRoom() {
+  const dir = tmp('iv-room-bytefidelity-');
+  const w = (rel, body) => { const p = path.join(dir, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
+  // plain good files (committed, ASCII)
+  w('package.json', '{"name":"x","version":"1.0.0"}\n');
+  w('top.txt', 'top\n');
+  // An embedded repo `bad/` — git treats it as a gitlink, so every interior file is
+  // SILENTLY dropped (exit 0, never staged): the way to force a name into `skipped`.
+  const gd = path.join(dir, 'bad', '.git');
+  fs.mkdirSync(path.join(gd, 'objects'), { recursive: true });
+  fs.mkdirSync(path.join(gd, 'refs', 'heads'), { recursive: true });
+  fs.writeFileSync(path.join(gd, 'HEAD'), 'ref: refs/heads/main\n');
+  fs.writeFileSync(path.join(gd, 'config'), '[core]\n\trepositoryformatversion = 0\n');
+  // The four invalid-byte names, inside the embedded repo → all skipped.
+  const badPrefix = Buffer.from(dir + '/bad/');
+  for (const nameBuf of Object.values(INVALID_BYTE_NAMES)) {
+    fs.writeFileSync(Buffer.concat([badPrefix, nameBuf]), 'embedded-repo interior — silently dropped by git add\n');
+  }
+  // A TOP-LEVEL invalid-byte name that git COMMITS (arbitrary bytes are a legal
+  // filename): proves the COMMITTED side of the partition is byte-exact too.
+  const keepBuf = Buffer.concat([Buffer.from(dir + '/keep-'), Buffer.from([0xff])]);
+  fs.writeFileSync(keepBuf, 'top-level invalid-byte name — committed faithfully\n');
+  return dir;
+}
+function proveReconcileByteFidelity(seed, label) {
+  section(`BUG-273 r10 — reconciled \`skipped\` is BYTE-FAITHFUL (invalid-UTF-8 names) [${label}]`);
+  const room = buildByteFidelityRoom();
+  const r = seed(room);
+  check(`[${label}] seed reports ok on a room with invalid-byte names`, r.ok, JSON.stringify({ ok: r.ok, error: r.error }));
+  if (!r.ok) return;
+  const k = (b) => b.toString('latin1'); // 1:1 byte key
+
+  // HEAD, byte-accurate.
+  const ltb = spawnSync('git', ['-C', room, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' } });
+  const headSet = new Set();
+  { const b = ltb.stdout ?? Buffer.alloc(0); let s = 0; for (let i = 0; i < b.length; i++) { if (b[i] === 0) { if (i > s) headSet.add(k(b.subarray(s, i))); s = i + 1; } } if (s < b.length) headSet.add(k(b.subarray(s))); }
+
+  // THE byte-exact caller list r10 adds — r9 does not return it (undefined ⇒ empty).
+  check('[byte list present] seed returns a byte-exact skippedBytes Buffer[] for the caller', Array.isArray(r.skippedBytes), `typeof skippedBytes=${typeof r.skippedBytes}`);
+  const skipBytesSet = new Set((r.skippedBytes || []).map(k));
+
+  // THE partition property, BYTE-EXACT, against an INDEPENDENT byte walk.
+  const onDisk = byteWalkCandidates(room);
+  const neither = onDisk.filter((b) => !headSet.has(k(b)) && !skipBytesSet.has(k(b)));
+  const both = onDisk.filter((b) => headSet.has(k(b)) && skipBytesSet.has(k(b)));
+  check('[byte partition] every on-disk candidate is BYTE-EXACTLY in HEAD or in skippedBytes — NONE lost', neither.length === 0, neither.length ? `byte-lost: ${neither.map(renderByteName).join(', ')}` : '(none lost)');
+  check('[byte partition] NO file is in BOTH HEAD and skippedBytes (byte-exact)', both.length === 0, both.map(renderByteName).join(', ') || '(none)');
+
+  // Each specific invalid-byte name is SKIPPED byte-exactly and ABSENT from HEAD.
+  for (const [cls, nameBuf] of Object.entries(INVALID_BYTE_NAMES)) {
+    const key = k(Buffer.concat([Buffer.from('bad/'), nameBuf]));
+    check(`[${cls}] skipped byte-exactly (in skippedBytes, absent from HEAD)`,
+      skipBytesSet.has(key) && !headSet.has(key),
+      `inSkippedBytes=${skipBytesSet.has(key)} inHead=${headSet.has(key)}`);
+  }
+  // The committed side is byte-exact too.
+  const keepKey = k(Buffer.concat([Buffer.from('keep-'), Buffer.from([0xff])]));
+  check('[committed invalid-byte] top-level `keep-<0xFF>` in HEAD byte-exactly, NOT skipped', headSet.has(keepKey) && !skipBytesSet.has(keepKey), `inHead=${headSet.has(keepKey)} inSkipped=${skipBytesSet.has(keepKey)}`);
+
+  // The DISPLAY render is INJECTIVE and carries no U+FFFD — the exact r9 loss.
+  const display = r.skipped || [];
+  const noFFFD = display.every((s) => !s.includes('�'));
+  check('[render lossless] no skipped display name collapses to U+FFFD', noFFFD, display.join(', '));
+  check('[render injective] skipped display strings are all DISTINCT (no two invalid names collapse)', new Set(display).size === display.length, `count=${display.length} distinct=${new Set(display).size}`);
+  check('[render ↔ bytes] display count equals byte-exact count (no name dropped at render)', display.length === (r.skippedBytes || []).length, `display=${display.length} bytes=${(r.skippedBytes || []).length}`);
+}
+
+/* ---- BUG-273 r10: the reconcile ls-tree read must NOT abort on a LARGE room ----
+ * openai run 01a17e2b-db60 (BROKEN): with ~4,600 long valid names the reconcile's
+ * `git ls-tree -r -z HEAD` output exceeds spawnSync's DEFAULT 1 MiB maxBuffer, so it
+ * returns status null, the seed reads that as an abort and returns ok:false with NO
+ * skip list — breaking the "never aborting" + completeness contract even though HEAD
+ * is fine. The fix raises the read to the 256 MiB ceiling the diff reads already use.
+ * Pre-fix (preR9, no maxBuffer) reddens: ok:false. Post-fix: ok:true, every name
+ * committed, partition complete. 5,000 × 240-byte names ⇒ ~1.2 MiB of ls-tree output,
+ * safely over the old 1 MiB default. */
+function proveReconcileLargeRoom(seed, label) {
+  section(`BUG-273 r10 — reconcile does not abort on a LARGE room (ls-tree maxBuffer) [${label}]`);
+  const dir = tmp('iv-room-largelst-');
+  fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"x","version":"1.0.0"}\n');
+  const N = 5000;
+  for (let i = 0; i < N; i++) {
+    const n = ('f' + String(i).padStart(6, '0')).padEnd(240, 'x'); // 240-byte valid name
+    fs.writeFileSync(path.join(dir, n), 'x');
+  }
+  const r = seed(dir);
+  check(`[${label}] seed reports ok on ${N} long names (ls-tree output > 1 MiB)`, r.ok, JSON.stringify({ ok: r.ok, error: r.error }));
+  if (!r.ok) return;
+  check(`[${label}] nothing wrongly skipped (all ${N} valid names committed)`, (r.skipped || []).length === 0, `skipped=${(r.skipped || []).length}`);
+  const ltb = spawnSync('git', ['-C', dir, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' }, maxBuffer: 256 * 1024 * 1024 });
+  const headCount = (ltb.stdout ? ltb.stdout.toString('utf8') : '').split('\0').filter(Boolean).length;
+  check(`[${label}] HEAD contains all ${N} names + package.json (reconcile saw the full listing)`, headCount === N + 1, `headCount=${headCount}`);
+}
+
 /* ------- P3 (r3 RESCOPE): seed hermeticity + honest-case decorrelation hygiene --
  * NOT a containment/exfiltration boundary. The adjudicator ran the REAL verifier
  * sandbox (`codex sandbox -c sandbox_mode=workspace-write`, cwd a scratch room) and
@@ -1238,6 +1459,8 @@ try {
   proveExportedFileSet(preR6SeedScratchGit, 'PRE-fix r7 string-walk + non-literal pathspecs');
   proveExportedFileSet(preR7SeedScratchGit, 'PRE-fix r7 single-batch add (aborts on one untrackable name)');
   proveReconcileCompleteness(preR8SeedScratchGit, 'PRE-fix r8 bisect-only skip (embedded repo silently drops a file)');
+  proveReconcileByteFidelity(preR9SeedScratchGit, 'PRE-fix r9 lossy utf8 skip render (no byte-exact list)');
+  proveReconcileLargeRoom(preR9SeedScratchGit, 'PRE-fix r9 default 1 MiB maxBuffer (ls-tree overflows → abort)');
   provePathspecMagicSilentDrop(preR6SeedScratchGit, 'PRE-fix r7 non-literal pathspecs');
   const preFailures = fail - preStart;
   console.log(`\n  PRE-fix produced ${preFailures} failure(s) — a must-FAIL proof is only real if this is > 0.`);
@@ -1253,6 +1476,8 @@ try {
   provePathspecMagicSilentDrop(seedScratchGit, 'POST-FIX real');
   provePerfBoundedAdds(seedScratchGit, 'POST-FIX real');
   proveReconcileCompleteness(seedScratchGit, 'POST-FIX real');
+  proveReconcileByteFidelity(seedScratchGit, 'POST-FIX real');
+  proveReconcileLargeRoom(seedScratchGit, 'POST-FIX real');
   proveBuildRoomGitEnvUnit();
   proveCause3Hermeticity(buildRoomGitEnv, 'POST-FIX real', facts);
   proveDispatchWritesTypedKind();

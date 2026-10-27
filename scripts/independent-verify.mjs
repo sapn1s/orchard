@@ -906,6 +906,31 @@ export function buildRoomGitEnv(extra = {}) {
   return { ...env, ...extra };
 }
 
+/**
+ * Render an on-disk path BYTE buffer as an UNAMBIGUOUS, byte-faithful display
+ * string (BUG-273 r10). A filename can carry ARBITRARY bytes — a lone 0xFF, an
+ * overlong UTF-8 sequence, a lone-surrogate (WTF-8/CESU-8) encoding, or valid
+ * ASCII mixed with any of these — and `buf.toString('utf8')` collapses every
+ * invalid byte to the SAME U+FFFD replacement char. That made the returned
+ * `skipped` list lossy: a `sub/refused-<0xFF>` name was byte-exactly in NEITHER
+ * HEAD nor `skipped`, so "skipped is complete" quietly stopped holding for such
+ * names (the live BROKEN, openai run 01a17e1f-4b4e-7053-9665-49185a94e31e).
+ * Escape any byte outside printable ASCII — and backslash itself — as `\xNN`, so
+ * the mapping is INJECTIVE: distinct byte sequences always render distinctly and
+ * the exact bytes are recoverable from the string. A byte-exact Buffer list is
+ * returned alongside (seedScratchGit's `skippedBytes`) for any caller that needs
+ * to reconcile on bytes rather than this display form.
+ */
+export function renderByteName(buf) {
+  let out = '';
+  for (const byte of buf) {
+    if (byte === 0x5c) { out += '\\\\'; continue; }                 // backslash → \\ (keep \xNN unambiguous)
+    if (byte >= 0x20 && byte <= 0x7e) { out += String.fromCharCode(byte); continue; } // printable ASCII, verbatim
+    out += '\\x' + byte.toString(16).toUpperCase().padStart(2, '0'); // any other byte → \xNN (upper-hex, 2 digits)
+  }
+  return out;
+}
+
 export function seedScratchGit(dir) {
   try {
     const gitDir = path.join(dir, '.git');
@@ -1087,8 +1112,13 @@ export function seedScratchGit(dir) {
       //    no core.quotePath escaping), so we compare on the exact on-disk bytes via a
       //    latin1 round-trip (1:1 for all 256 byte values) — the same byte-fidelity the
       //    buffer walk uses. Literal pathspecs + null config keep the read hermetic.
+      //    maxBuffer is raised to 256 MiB (BUG-273 r10): the default 1 MiB overflows
+      //    on a large room — ~4,600 long names already exceed it — leaving status
+      //    null, which the check below would read as an ABORT (ok:false, no skip list)
+      //    even though HEAD is fine, breaking the "never aborting" contract. The diff
+      //    reads already use this ceiling; the reconcile read must too.
       const headLs = spawnSync('git', ['-C', dir, 'ls-tree', '-r', '-z', '--name-only', 'HEAD'],
-        { env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
+        { env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }), maxBuffer: 256 * 1024 * 1024 });
       if ((headLs.status ?? 1) !== 0) {
         return { ok: false, error: `git ls-tree HEAD (reconcile): ${(headLs.stderr ? headLs.stderr.toString('utf8') : '').trim().slice(0, 200)}` };
       }
@@ -1101,10 +1131,17 @@ export function seedScratchGit(dir) {
         }
         if (start < buf.length) committed.add(buf.subarray(start).toString('latin1'));
       }
-      const skipped = relFiles
-        .filter((b) => !committed.has(b.toString('latin1'))) // every walked file NOT in HEAD, for ANY reason
-        .map((b) => b.toString('utf8')); // display only; lossy for invalid-UTF-8 names is fine
-      return { ok: true, head: commit, error: null, skipped };
+      // Reconcile the partition ON BYTES (latin1 is 1:1 for all 256 byte values),
+      // then carry the result out BYTE-FAITHFULLY (BUG-273 r10). The previous
+      // `.toString('utf8')` render collapsed every invalid-UTF-8 byte to U+FFFD, so
+      // a `sub/refused-<0xFF>` name was byte-exactly in NEITHER HEAD nor skipped and
+      // completeness quietly failed for such names (openai run 01a17e1f). We keep the
+      // exact on-disk bytes in `skippedBytes` (Buffers, for a caller that reconciles
+      // on bytes) and render `skipped` through the injective `\xNN` escape so the
+      // human-facing list is unambiguous and loses no name to a replacement char.
+      const skippedBytes = relFiles.filter((b) => !committed.has(b.toString('latin1'))); // every walked file NOT in HEAD, for ANY reason
+      const skipped = skippedBytes.map(renderByteName); // byte-faithful, injective display form
+      return { ok: true, head: commit, error: null, skipped, skippedBytes };
     } finally {
       try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ }
     }

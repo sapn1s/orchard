@@ -11,7 +11,7 @@
   "reported": "2026-10-25",
   "reported_by": "worker (dispatch, fixing r1)",
   "owner": "unassigned",
-  "work_state": "in_verification",
+  "work_state": "verified",
   "human_action": "none",
   "updated": "2026-10-27",
   "decision": null,
@@ -173,6 +173,46 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "IV 6b5d754^..fefed25 (r8), VALID manifest-backed (openai quota→anthropic). NEW break: a file in a nested embedded repo (sub/.git/HEAD + sub/file.txt) → git add exits 0, bisect never runs, sub/file.txt absent from HEAD, seed ok skipped=[], show HEAD dies 128. Stray nested .git paths dropped+unlisted."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a17e1f-4b4e-7053-9665-49185a94e31e",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T16:12:51.841Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "IV 6b5d754^..7e5bd8e (r9), openai/codex cross-provider, VALID. Reconcile holds 141/141 for valid-UTF-8 + embedded/gitlink. BROKEN: returned skipped maps invalid-UTF-8 byte FF -> U+FFFD (utf8 display), so sub/refused-<FF> is byte-exactly in NEITHER HEAD nor skipped; completeness lossy for such names."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a17e2b-db60-7371-8c29-cd50000e4f96",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T16:29:49.958Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "92385ddce8b30de5677ce735b81859cfae4d700557645af0e91b4f73782675c0",
+      "verify_mode": "mixed-state",
+      "note": "IV r10 byte-fidelity candidate, openai/codex, VALID. Byte-fidelity HOLDS. NEW break: reconcile ls-tree uses default 1MiB maxBuffer, ~4600 long names overflow → status null → ok:false, no skip list (breaks never-aborting). FIXED this round (256MiB) + regression; re-verified after."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a17e33-afd9-7253-9eb9-2228e3f879f7",
+      "verdict": "holds",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T16:33:20.585Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "694e335c8237acab8e79404d61c3d85aee5067c9d2e1f03fdaaf34d6e5bfd491",
+      "verify_mode": "mixed-state",
+      "note": "IV r10 (byte-fidelity + ls-tree maxBuffer) candidate, openai/codex cross-provider, VALID. HOLDS. Adversarial: empty/all-skipped and exhaustive single-byte + \\xNN escape-collision — byte-exact partition + injective render hold; large-room reconcile no longer aborts."
     }
   ],
   "verification_class": "fix",
@@ -458,4 +498,24 @@ Fixed the r8 `BROKEN` (anthropic run `a5a2b7f5-4180-4587-b148-88b41145fda0`): a 
 - **Per-item tally (POST-FIX real — all PASS):** `[partition] none silently lost`; `[partition] no file in both`; `[HEAD⊆disk]` (HEAD never contains anything not on disk); `[skip⊆disk]`; `[embedded repo] sub/file.txt → skipped, absent from HEAD`; `[gitfile embedded] subg/inner.txt → skipped`; `[refused alias] .git. → skipped (any-reason rule)`; `package.json`/`top.txt`/`README.md`/`nested/real.txt` committed, not over-skipped. Plus the whole r1–r8 suite still green (pathspec-magic, wildcards, backslash/newline/long/invalid-UTF-8 names, NTFS/dotgit aliases skipped-not-aborted, perf 1000+1 bounded at 22 git spawns, stray nested `.git`, symlink, stub, node_modules, status-clean) and the P1/P2 causes.
 - **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **141 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 17 failures). `node scripts/verify-scratch-root.mjs` → **PASS 28 FAIL 0 SKIP 0**. `npm run gate` → **GATE: PASS (exit 0)**, read unpiped (leak-gate + check-nul + check-unicode-separators + prompt-privacy + pre-push-hook + typecheck).
 - **Bucket:** correctness / regression-prone clean-room harness (the seed add has now broken r5→r6→r7→r8→r9). regressed-from: BUG-273 r8 (the bisect-only skip it shipped). This is a STRUCTURAL guarantee (reconcile the outcome), not another name-class patch, so an independent clean-room re-verify of the COMPLETENESS property (a room with a nested embedded repo / gitfile seeds a HEAD from which no walked file is silently absent-and-unlisted; every absent file is in `skipped`) on the working tree is warranted — NOT a security pass. Run the fixer test directly (`--run "node scripts/verify-bug-273-iv-infra.mjs"`); confined unnecessary (the suite drives git through the installed shim as the gate does).
+- **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).
+
+### 2026-10-27 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a17e1f-4b4e-7053-9665-49185a94e31e — VERDICT: BROKEN — IV 6b5d754^..7e5bd8e (r9), openai/codex cross-provider, VALID. Reconcile holds 141/141 for valid-UTF-8 + embedded/gitlink. BROKEN: returned skipped maps invalid-UTF-8 byte FF -> U+FFFD (utf8 display), so sub/refused-<FF> is byte-exactly in NEITHER HEAD nor skipped; completeness lossy for such names.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a17e2b-db60-7371-8c29-cd50000e4f96 — VERDICT: BROKEN — mixed-state candidate 92385ddce8b3 — IV r10 byte-fidelity candidate, openai/codex, VALID. Byte-fidelity HOLDS. NEW break: reconcile ls-tree uses default 1MiB maxBuffer, ~4600 long names overflow → status null → ok:false, no skip list (breaks never-aborting). FIXED this round (256MiB) + regression; re-verified after.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a17e33-afd9-7253-9eb9-2228e3f879f7 — VERDICT: HOLDS — mixed-state candidate 694e335c8237 — IV r10 (byte-fidelity + ls-tree maxBuffer) candidate, openai/codex cross-provider, VALID. HOLDS. Adversarial: empty/all-skipped and exhaustive single-byte + \xNN escape-collision — byte-exact partition + injective render hold; large-room reconcile no longer aborts.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — worker (dispatch, fixing r10) — byte-faithful `skipped` + reconcile never aborts on a large room
+
+Fixed the r9 `BROKEN` (openai run `01a17e1f-4b4e-7053-9665-49185a94e31e`): the r9 reconcile partitioned byte-exactly INTERNALLY (latin1 keys) but returned `skipped` as `.map(toString('utf8'))`, collapsing every invalid-UTF-8 byte to U+FFFD and exposing NO byte-exact list to the caller — so a skipped `sub/refused-<0xFF>` name was byte-exactly in NEITHER HEAD nor `skipped` and completeness quietly failed for such names.
+
+- **Byte-fidelity fix (`independent-verify.mjs`).** New exported `renderByteName(buf)`: an INJECTIVE display escape — printable ASCII verbatim, backslash → `\\`, every other byte → `\xNN` (upper-hex) — so distinct byte sequences always render distinctly and the exact bytes are recoverable. `seedScratchGit` now returns the reconciled partition BOTH ways: `skippedBytes` (a byte-exact `Buffer[]` for a caller reconciling on bytes) and `skipped` (the `renderByteName` display form). The internal filter was already byte-exact (`relFiles.filter(b => !committed.has(b.toString('latin1')))`); only the lossy tail changed. ASCII names render identically, so every r1–r9 assertion is unchanged.
+- **NEW break found by the step-3 IV (openai run `01a17e2b-db60-7371-8c29-cd50000e4f96`, BROKEN) and fixed in the SAME round:** the reconcile's `git ls-tree -r -z --name-only HEAD` used spawnSync's DEFAULT 1 MiB maxBuffer, so ~4,600 long valid names overflow → status null → the seed read that as an ABORT and returned `ok:false` with no skip list, violating the "never aborting"/completeness contract even though HEAD was fine. Fix: raise that read to the 256 MiB ceiling the diff reads already use. This is a one-line robustness fix squarely inside this round's contract; the first step-3 verdict (BROKEN) and the re-verify (HOLDS) are both recorded above as the honest iteration.
+- **Must-FAIL + pass-after (`verify-bug-273-iv-infra.mjs`).** New literal pre-fix anchor `preR9SeedScratchGit` (the r9 shipped seed: buffer walk + bisecting add + reconcile, but the LOSSY utf8 render and NO `skippedBytes`). New `proveReconcileByteFidelity(seed,label)` forces four invalid-byte names SKIPPED (inside an embedded repo → gitlink-interior silent drop): 0xFF (`b<FF>b`), an overlong UTF-8 seq (`ov-\xC1\x81`), a lone-surrogate/WTF-8 (`sur-\xED\xA0\x80`), an ASCII+invalid mix (`mix\xFF\xFEm`), plus a top-level COMMITTED invalid-byte name — and proves the partition BYTE-EXACTLY (independent byte walk; in HEAD-bytes XOR `skippedBytes`), the byte-exact list is present, and the display render is lossless/injective. New `proveReconcileLargeRoom(seed,label)` (5,000 × 240-byte names ⇒ >1 MiB ls-tree output). Both anchored on `preR9SeedScratchGit` (lossy render + default maxBuffer) which reddens; the real seed passes.
+- **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **156 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 25 failures, reddening exactly the byte-fidelity + large-room + the prior r1–r9 anchors). `npm run gate` → **GATE: PASS (exit 0)**, read unpiped. Re-verify IV (working-tree candidate `694e335c8237`) → **HOLDS**, openai/codex cross-provider, VALID; the verifier additionally attacked the `\xNN` escape for a collision (two inputs rendering alike) and it held.
+- **Bucket:** correctness / regression-prone clean-room harness (the seed add/reconcile has broken r5→r10). regressed-from: BUG-273 r9 (the lossy-utf8 render it shipped; the maxBuffer gap predates r9 but surfaced now). Only `seedScratchGit` + the new `renderByteName` export touched; FEAT-191 branch-flow hunks in `independent-verify.mjs`/`file-lock.mjs` left alone. An independent clean-room re-verify was run and HOLDS; no further pass needed unless the orchestrator wants a second provider.
 - **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).

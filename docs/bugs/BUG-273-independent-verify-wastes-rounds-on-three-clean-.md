@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-10-26",
+  "updated": "2026-10-27",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -150,6 +150,17 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "IV 6b5d754^..e11e6af: r6 seedScratchGit 'git add --pathspec-from-file' lacks literal-pathspecs (GIT_* stripped), so pathspec-magic filenames (:(exclude).., :!..) drop silently from HEAD and a :/-leading name aborts the seed (ok:false) — r5 INVALID recurs. r1-r5 --run/nonce PASS. Manifest-backed."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "e918e853-2fc9-4bd1-8586-996211e12b25",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T11:41:19.009Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
     }
   ],
   "verification_class": "fix",
@@ -403,4 +414,20 @@ Fixed the r6 `BROKEN` (anthropic run `92003ab2-7979-4994-bc83-46bbf613c2ab`, IV 
 - **Per-attack-item tally (POST-FIX real — all PASS):** `:(exclude)x`, `:!x`, `:/x`, `:(glob)star` committed VERBATIM (no abort, no silent drop); `*` `?` `[ab]`; backslash name; newline name (no re-split); very-long path (205 chars); invalid-UTF-8 name (exact bytes `62 ff 62` in HEAD, byte-compared); stray nested `.git` not committed + sibling kept; plus the whole r6 list (ignored root file, ignored dir, nested `.gitignore`, the `.gitignore` files, hostile-HOME `excludesFile` cannot matter, leading-`-`, spaces, unicode, empty dir absent, symlink mode 120000 unfollowed, stripped stub served, node_modules absent, `git status` clean).
 - **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **116 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 15 failures). `node scripts/verify-scratch-root.mjs` → **PASS 28 FAIL 0 SKIP 0**. `npm run gate` → **GATE: PASS (exit 0)**, read unpiped (leak-gate + check-nul + check-unicode-separators + prompt-privacy + pre-push-hook + typecheck).
 - **Bucket:** correctness / regression-prone clean-room harness (the seed add has now broken r5→r6→r7). This is the construction fix — literal pathspecs set at the single env chokepoint + byte-accurate enumeration — so a routine independent re-verify of the PATHSPEC-LITERAL property (seed commits a magic-prefixed / invalid-UTF-8 exported name to HEAD; `git show HEAD:<name>` succeeds) on the working tree atop `e11e6af` is warranted — NOT a security pass. Run the fixer test directly (`--run "node scripts/verify-bug-273-iv-infra.mjs"`); confined unnecessary (no git-write fixtures). `independent-verify.mjs` also carries unrelated uncommitted FEAT-191 branch-flow hunks — leave them; this change touches only `seedScratchGit`.
+- **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run e918e853-2fc9-4bd1-8586-996211e12b25 — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — worker (dispatch, fixing r8) — RESCOPED seed contract: batch add with a bisecting per-error fallback (the r7 BROKEN)
+
+Fixed the r7 `BROKEN` (anthropic run `e918e853-2fc9-4bd1-8586-996211e12b25`): the r7 seed fed the whole exported byte-list to ONE `git add -f --pathspec-from-file=- --pathspec-file-nul`. That add is ATOMIC — one name git's `verify_path` refuses (an NTFS/dotgit alias `git~1`/`GIT~1`/`.git.`/`.git `/`.GIT`, a nested one, a `.git`-component) returns non-zero and rolls the WHOLE add back, so `relFiles` committed NOTHING, HEAD came out empty, and the verifier's `git show HEAD:<file>` died 128. r5→r6→r7→r8 each broke on a NEW adversarial NAME class, so per-name-class patching was abandoned.
+
+- **Orchestrator RESCOPE adopted.** The export comes from a git tree, so every REAL exported name is one git already accepted — only a hand-crafted fixture can hold a name git refuses. New contract: the seed commits every ACCEPTED name, SKIPS the refused ones (recorded + listed on the output line + left on disk), and never aborts the commit because of one name; if it fails outright the room still works without `.git` and says so.
+- **Hypothesis verified FIRST against REAL git** (confined container, git 2.39.5, `core.protectNTFS` UNSET). A batch add of `[good1, good2, sub/good3, git~1]` → **exit 128, `error: invalid path 'git~1'`, 0 staged** (atomic rollback — proven with the bad name at HEAD, MIDDLE and TAIL of the list, index empty each time). Adding the SAME names one-by-one → the 3 good staged, `git~1` isolated and skipped. Per-alias probe: `git~1`,`GIT~1`,`.git.`,`.git `,`.GIT` all REFUSED by default (top-level AND nested); `..foo` ACCEPTED (only an exact `..` component is refused); a nested `.git/config` is SILENTLY skipped (exit 0, not an abort — why r7 passed on it). `git status --porcelain` lists an untrackable left on disk as `?? <name>`.
+- **Fix by construction (`independent-verify.mjs` `seedScratchGit`).** Replaced the single `git add <list>` with a divide-and-conquer: try the whole byte-list in ONE add (common all-good case → exactly one call, NO perf regression); on any non-zero, split the slice in half and recurse, narrowing to the singleton git refuses, which is pushed to `skipped` rather than aborting. A failed add stages nothing (atomic), so a retried half never double-adds and good names stay in LARGE batches — 1000 files + 1 bad name costs ~21 adds, never 1001. `seedScratchGit` now returns `{ ok, head, error, skipped }`; the room-build output line reports `; skipped N untrackable name(s): …` on success and `NOT seeded — … (the room still works WITHOUT .git, as it did before BUG-273)` on failure. Simplest-robust approach chosen (NOT a JS re-implementation of `verify_path`, which would be the forbidden per-name-class patching and is config-dependent). Only `seedScratchGit` touched; FEAT-191 branch-flow hunks left alone.
+- **Must-FAIL + pass-after (`verify-bug-273-iv-infra.mjs`).** New literal pre-fix anchor `preR7SeedScratchGit` (the r7 shipped seed written out: buffer walk + `GIT_LITERAL_PATHSPECS=1` but a SINGLE batch add). Extended `buildAttackRoom` with the five top-level NTFS/dotgit aliases, two nested ones, and an accepted `..foo`. Added a perf proof `provePerfBoundedAdds` that counts EVERY `git` spawn via a PATH-prepended counting shim across the seed call. Pre-fix anchor reddens on `seed reports ok despite the adversarial tree` (aborts → `ok:false`); real seed passes.
+- **Per-item tally (POST-FIX real — all PASS):** each of the 7 untrackable aliases (`git~1`,`GIT~1`,`.git.`,`.git `,`.GIT`,`aliasnest/git~1`,`aliasnest/.git.`) absent from HEAD + in the skip list + left on disk; skip list EXACT (no accepted name skipped); `..foo` committed, not over-skipped; `git status` dirty set is EXACTLY the skip-list (untracked), nothing else; perf — all 1000 good committed, the 1 bad skipped+reported, **git spawned 22 times** (< 100, not per-file); plus the whole r1–r7 list still green (ignored/nested-ignore/magic/wildcard/backslash/newline/long/invalid-UTF-8/stray-nested-.git/symlink/stub/node_modules/status-clean).
+- **Verification (real outputs):** `node scripts/verify-bug-273-iv-infra.mjs` → **129 passed, 0 failed** (MUST-FAIL anchor held: pre-fix produced 14 failures). `node scripts/verify-scratch-root.mjs` → **PASS 28 FAIL 0 SKIP 0**. `npm run gate` → **GATE: PASS (exit 0)**, read unpiped (leak-gate + check-nul + check-unicode-separators + prompt-privacy + pre-push-hook + typecheck).
+- **Bucket:** correctness / regression-prone clean-room harness (the seed add has now broken r5→r6→r7→r8). regressed-from: BUG-273 r7 (the single-batch add it shipped). This is a STRUCTURAL rescope, not another name-class patch, so an independent clean-room re-verify of the SKIP-NOT-ABORT property (a room with one untrackable alias seeds a non-empty HEAD; every accepted name resolves via `git show HEAD:<name>`; the alias is reported skipped) on the working tree is warranted — NOT a security pass. Run the fixer test directly (`--run "node scripts/verify-bug-273-iv-infra.mjs"`); confined unnecessary (the suite drives git through the installed shim as the gate does).
 - **Files changed (unstaged, for the user to commit):** `scripts/independent-verify.mjs`, `scripts/verify-bug-273-iv-infra.mjs`, `docs/bugs/BUG-273-…md` (this entry + INDEX via board:gen).

@@ -261,6 +261,73 @@ function preR6SeedScratchGit(dir) {
   } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
 }
 
+/* BUG-273 r8 must-FAIL anchor — the r7 SHIPPED seed, written out literally: a BUFFER
+ * walk + GIT_LITERAL_PATHSPECS=1 (r7's fixes) but a SINGLE `git add <whole list>`. That
+ * add is ATOMIC: one name git's verify_path refuses (an NTFS/dotgit alias git~1/.git.)
+ * returns non-zero and rolls the WHOLE add back, so the seed returns ok:false, HEAD is
+ * never written, and the verifier's `git show HEAD:<file>` dies 128 (the live BROKEN,
+ * anthropic run e918e853). Grading the attack room (which now plants those aliases)
+ * against this anchor reddens on `r.ok` — the exact regression r8 closes by adding in
+ * batches with a bisecting per-error fallback that SKIPS the refused names instead. */
+function preR7SeedScratchGit(dir) {
+  try {
+    const gitDir = path.join(dir, '.git');
+    if (fs.existsSync(gitDir)) return { ok: false, error: '.git already present' };
+    fs.mkdirSync(path.join(gitDir, 'objects', 'info'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'objects', 'pack'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'heads'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'refs', 'tags'), { recursive: true });
+    fs.mkdirSync(path.join(gitDir, 'info'), { recursive: true });
+    fs.writeFileSync(path.join(gitDir, 'HEAD'), 'ref: refs/heads/main\n');
+    fs.writeFileSync(path.join(gitDir, 'config'),
+      '[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n\tlogallrefupdates = false\n');
+    fs.writeFileSync(path.join(gitDir, 'info', 'exclude'), '/node_modules/\n');
+    const idxTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'iv-gitidx-pre7-'));
+    const env = buildRoomGitEnv({
+      GIT_DIR: gitDir, GIT_WORK_TREE: dir, GIT_INDEX_FILE: path.join(idxTmp, 'index'),
+      GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1',
+      GIT_AUTHOR_NAME: 'independent-verify', GIT_AUTHOR_EMAIL: 'verify@example.invalid',
+      GIT_COMMITTER_NAME: 'independent-verify', GIT_COMMITTER_EMAIL: 'verify@example.invalid',
+    });
+    const g = (args, extra = {}) => spawnSync('git', args, { encoding: 'utf8', env, ...extra });
+    try {
+      const NUL = Buffer.from([0]), SLASH = Buffer.from('/');
+      const DOTGIT = Buffer.from('.git'), NODE_MODULES = Buffer.from('node_modules');
+      const dirBuf = Buffer.from(dir);
+      const relFiles = [];
+      (function walk(relBuf) {
+        const absBuf = relBuf.length ? Buffer.concat([dirBuf, SLASH, relBuf]) : dirBuf;
+        let ents;
+        try { ents = fs.readdirSync(absBuf, { withFileTypes: true, encoding: 'buffer' }); } catch { return; }
+        for (const e of ents) {
+          const nameBuf = e.name;
+          const rel = relBuf.length ? Buffer.concat([relBuf, SLASH, nameBuf]) : nameBuf;
+          if (relBuf.length === 0 && (nameBuf.equals(DOTGIT) || nameBuf.equals(NODE_MODULES))) continue;
+          if (e.isSymbolicLink()) { relFiles.push(rel); continue; }
+          if (e.isDirectory()) { walk(rel); continue; }
+          relFiles.push(rel);
+        }
+      })(Buffer.alloc(0));
+      const nulJoinBuf = (bufs) => { const parts = []; bufs.forEach((b, i) => { if (i) parts.push(NUL); parts.push(b); }); return Buffer.concat(parts); };
+      // THE r7 DEFECT: ONE add of the whole list — atomic abort on a single bad name.
+      const add = relFiles.length === 0
+        ? { status: 0 }
+        : g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: nulJoinBuf(relFiles) });
+      if ((add.status ?? 1) !== 0) return { ok: false, error: `git add (temp index): ${(add.stderr || add.stdout || '').trim().slice(0, 200)}` };
+      const wt = g(['write-tree']);
+      if ((wt.status ?? 1) !== 0) return { ok: false, error: `write-tree: ${(wt.stderr || '').trim()}` };
+      const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
+      if ((ct.status ?? 1) !== 0) return { ok: false, error: `commit-tree: ${(ct.stderr || '').trim()}` };
+      const commit = ct.stdout.trim();
+      fs.copyFileSync(path.join(idxTmp, 'index'), path.join(gitDir, 'index'));
+      fs.writeFileSync(path.join(gitDir, 'refs', 'heads', 'main'), commit + '\n');
+      const head = spawnSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf8', env: buildRoomGitEnv({ GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null', GIT_LITERAL_PATHSPECS: '1' }) });
+      if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) return { ok: false, error: `HEAD resolve: ${(head.stderr || '').trim()}` };
+      return { ok: true, head: commit, error: null, skipped: [] };
+    } finally { try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ } }
+  } catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
+}
+
 /* ============================================================ CAUSE 1 ==== */
 // r3 contract: the ONLY hard error is `>1 --run`; the ONLY advisory is the plain
 // `npm run confined` note; the deleted double-`--`/env-prefix advisories now emit
@@ -480,9 +547,25 @@ function buildAttackRoom() {
   // round-trips the exact bytes. (fs string paths can't express this, so write raw.)
   fs.writeFileSync(Buffer.concat([Buffer.from(dir + '/'), Buffer.from([0x62, 0xff, 0x62])]), 'invalid utf8 name\n');
   // a STRAY exported .git directory (nested) — git must NEVER commit anything under it.
+  // (git SILENTLY skips a `.git`-component path — exit 0, not an abort — so this one
+  // does NOT appear in the skip list; it is simply absent from HEAD, sibling kept.)
   fs.mkdirSync(path.join(dir, 'nested', '.git'), { recursive: true });
   w('nested/.git/config', '[core]\n');
   w('nested/real.txt', 'kept beside the stray .git\n');
+  // BUG-273 r8 — NTFS short-name / dotgit ALIASES git's verify_path REFUSES with a
+  // NON-ZERO status, which under a single-batch `git add <list>` ABORTS the whole add
+  // (empty index → empty HEAD → the verifier's `git show HEAD:<file>` dies 128 — the
+  // live BROKEN, anthropic run e918e853). The rescoped seed must commit every ACCEPTED
+  // name and SKIP these (report + leave on disk), never aborting. Refused under git's
+  // compiled-in default on every platform (protectNTFS effectively on — proven against
+  // git 2.39.5 with core.protectNTFS UNSET), both top-level and nested.
+  for (const n of NTFS_ALIAS_NAMES) w(n, `untrackable NTFS alias ${JSON.stringify(n)}\n`);
+  fs.mkdirSync(path.join(dir, 'aliasnest'), { recursive: true });
+  w('aliasnest/git~1', 'nested NTFS alias\n');
+  w('aliasnest/.git.', 'nested dotgit alias\n');
+  // `..`-PREFIXED but otherwise VALID name: git ACCEPTS it (only an exact `..`
+  // component is refused), so it must be COMMITTED, never over-skipped.
+  w('..foo', 'dotdot-prefixed valid name\n');
   fs.mkdirSync(path.join(dir, 'emptydir'), { recursive: true }); // empty dir (git can't track one)
   fs.symlinkSync('pkg/app.mjs', path.join(dir, 'link.txt'));     // committed symlink (never followed)
   // a stripped prose file replaced by the inert boot stub (must serve the stub, not real prose)
@@ -555,8 +638,28 @@ function proveExportedFileSet(seed, label) {
   check('[invalid-UTF-8 name] exact bytes (b<0xff>b) committed to HEAD', headBufs.some((h) => h.equals(badBuf)), headBufs.map((h) => h.toString('latin1')).filter((x) => x.includes('\xff')).join(',') || '(absent)');
   check('[stray nested .git] nothing under nested/.git committed, sibling kept', ![...head].some((p) => p === 'nested/.git/config' || p.startsWith('nested/.git/')) && inHead('nested/real.txt'), [...head].filter((p) => p.includes('.git') || p.startsWith('nested/')).join(',') || '(none)');
 
-  const status = gitRead(room, ['status', '--porcelain']);
-  check('[git status clean] after the seed', (status.status ?? 1) === 0 && status.stdout.trim() === '', `exit ${status.status}, dirty: ${JSON.stringify(status.stdout.trim().slice(0, 120))}`);
+  // --- BUG-273 r8: untrackable NTFS/dotgit aliases — SKIPPED, not aborted on ---
+  const skippedSet = new Set(r.skipped || []);
+  for (const n of EXPECTED_SKIP) {
+    check(`[untrackable alias] ${JSON.stringify(n)}: absent from HEAD, in skip list, left on disk`,
+      !inHead(n) && skippedSet.has(n) && fs.existsSync(path.join(room, n)),
+      `inHead=${inHead(n)} skipped=${skippedSet.has(n)} onDisk=${fs.existsSync(path.join(room, n))}; skip list=[${(r.skipped || []).join(', ')}]`);
+  }
+  check('[skip list EXACT] seed skipped PRECISELY the untrackable names (no accepted name skipped)',
+    skippedSet.size === EXPECTED_SKIP.length && EXPECTED_SKIP.every((n) => skippedSet.has(n)),
+    `skipped=[${[...skippedSet].join(', ')}]`);
+  check('[not over-skipped] `..foo` (a VALID name) committed, not skipped', inHead('..foo') && show('..foo').stdout === 'dotdot-prefixed valid name\n' && !skippedSet.has('..foo'), `inHead=${inHead('..foo')}`);
+
+  // git status: the ONLY dirty entries are the skipped untrackable names (left on disk,
+  // so untracked `??`), and NOTHING else — every committed name (incl. the ignored,
+  // magic, unicode and invalid-UTF-8 ones) is clean. Byte-parse of `-z -uall`.
+  const st = spawnSync('git', ['-C', room, 'status', '--porcelain', '-z', '-uall'], { env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } });
+  const stRecs = []; { const b = st.stdout ?? Buffer.alloc(0); let s = 0; for (let i = 0; i < b.length; i++) { if (b[i] === 0) { stRecs.push(b.subarray(s, i)); s = i + 1; } } if (s < b.length) stRecs.push(b.subarray(s)); }
+  const stEntries = stRecs.map((rb) => rb.toString('utf8')).filter(Boolean).map((e) => ({ xy: e.slice(0, 2), name: e.slice(3) }));
+  const stNames = new Set(stEntries.map((e) => e.name));
+  check('[status] dirty set is EXACTLY the skip-list (untracked), nothing else',
+    (st.status ?? 1) === 0 && stEntries.every((e) => e.xy === '??') && stNames.size === EXPECTED_SKIP.length && EXPECTED_SKIP.every((n) => stNames.has(n)),
+    `exit ${st.status}; entries=${JSON.stringify(stEntries.map((e) => `${e.xy} ${e.name}`))}`);
 }
 
 /* ---- r7: exclude-magic names SILENTLY DROP without literal pathspecs -------------
@@ -593,6 +696,46 @@ function provePathspecMagicSilentDrop(seed, label) {
   check(`[${label}] plain sibling normal.txt still committed`, head.has('normal.txt'), [...head].join(','));
 }
 
+/* BUG-273 r8 — PERFORMANCE: 1000 good files + ONE untrackable name must NOT degrade to
+ * a per-file add. The seed adds in BATCHES and only BISECTS on error, so the good names
+ * stay in large batches — the whole seed costs O(bad · log n) git calls, never O(n). We
+ * count EVERY `git` spawn by prepending a COUNTING SHIM to PATH across the seed call
+ * (the seed inherits PATH through buildRoomGitEnv), and assert the count is bounded far
+ * below the file count: a per-file fallback would spend >1000 adds. (Proven against real
+ * git: 1000 good + 1 bad ⇒ ~21 adds + a handful of plumbing calls.) Post-fix only — the
+ * pre-fix single-batch seed ABORTS on the one bad name (covered by proveExportedFileSet). */
+function provePerfBoundedAdds(seed, label) {
+  section(`BUG-273 r8 — bounded git-add count on 1000 files + 1 untrackable name [${label}]`);
+  const N = 1000;
+  const room = tmp('iv-room-perf-');
+  fs.writeFileSync(path.join(room, 'package.json'), '{"name":"x"}\n');
+  const big = path.join(room, 'big'); fs.mkdirSync(big, { recursive: true });
+  for (let i = 0; i < N; i++) fs.writeFileSync(path.join(big, `f${i}.txt`), `data ${i}\n`);
+  fs.writeFileSync(path.join(big, '.git.'), 'the one untrackable name among 1000\n'); // refused → skipped
+  // Counting shim: a `git` wrapper that bumps a counter file, then execs the REAL git
+  // (resolved BEFORE PATH is shimmed, so the exec never re-enters the shim).
+  const realGit = (spawnSync('bash', ['-lc', 'command -v git'], { encoding: 'utf8' }).stdout || '').trim() || 'git';
+  const shimDir = tmp('iv-gitshim-');
+  const counter = path.join(shimDir, 'count');
+  fs.writeFileSync(counter, '');
+  const shim = path.join(shimDir, 'git');
+  fs.writeFileSync(shim, `#!/bin/sh\nprintf 'x' >> ${JSON.stringify(counter)}\nexec ${JSON.stringify(realGit)} "$@"\n`);
+  fs.chmodSync(shim, 0o755);
+  const savedPath = process.env.PATH;
+  process.env.PATH = `${shimDir}:${savedPath}`;
+  let r;
+  try { r = seed(room); } finally { process.env.PATH = savedPath; }
+  const calls = fs.readFileSync(counter, 'utf8').length;
+  check('[perf] seed reports ok with 1000 good files + 1 untrackable', r.ok, JSON.stringify({ ok: r.ok, error: r.error, skipped: r.skipped }));
+  if (!r.ok) return;
+  const lt = gitRead(room, ['ls-tree', '-r', '-z', '--name-only', 'HEAD']);
+  const head = new Set(lt.stdout.split('\0').filter(Boolean));
+  let committedGood = 0; for (let i = 0; i < N; i++) if (head.has(`big/f${i}.txt`)) committedGood++;
+  check(`[perf] all ${N} good files committed to HEAD`, committedGood === N, `committed ${committedGood}/${N}`);
+  check('[perf] the single untrackable name skipped + reported', (r.skipped || []).includes('big/.git.') && !head.has('big/.git.'), `skipped=[${(r.skipped || []).join(', ')}]`);
+  check(`[perf] git spawned ${calls} times — bounded (< 100), NOT per-file (would exceed ${N})`, calls > 0 && calls < 100, `${calls} git invocations for ${N} good + 1 bad`);
+}
+
 /* ------- P3 (r3 RESCOPE): seed hermeticity + honest-case decorrelation hygiene --
  * NOT a containment/exfiltration boundary. The adjudicator ran the REAL verifier
  * sandbox (`codex sandbox -c sandbox_mode=workspace-write`, cwd a scratch room) and
@@ -625,6 +768,10 @@ function realRepoFacts() {
 // The clean-room stub that REPLACES a stripped prose file (mirrors buildCleanroom's
 // boot seeding). It must NOT contain the real prose's marker ("working agreement").
 const STRIPPED_STUB = '<!-- inert clean-room boot stub (BUG-273); real prose stripped -->\n';
+// BUG-273 r8 — the exact set of untrackable names the attack room plants and the
+// rescoped seed must SKIP (not abort on). `.git ` carries a trailing space.
+const NTFS_ALIAS_NAMES = ['git~1', 'GIT~1', '.git.', '.git ', '.GIT'];
+const EXPECTED_SKIP = [...NTFS_ALIAS_NAMES, 'aliasnest/git~1', 'aliasnest/.git.'];
 function buildStrippedRoomTree(strippedPath) {
   const dir = buildExportedTree();
   const full = path.join(dir, strippedPath);
@@ -905,6 +1052,7 @@ try {
   proveCause3Hermeticity(preBuildRoomGitEnv, 'PRE-fix ...process.env spread', facts);
   proveExportedFileSet(preSeedScratchGit, 'PRE-fix r6 git add -A');
   proveExportedFileSet(preR6SeedScratchGit, 'PRE-fix r7 string-walk + non-literal pathspecs');
+  proveExportedFileSet(preR7SeedScratchGit, 'PRE-fix r7 single-batch add (aborts on one untrackable name)');
   provePathspecMagicSilentDrop(preR6SeedScratchGit, 'PRE-fix r7 non-literal pathspecs');
   const preFailures = fail - preStart;
   console.log(`\n  PRE-fix produced ${preFailures} failure(s) — a must-FAIL proof is only real if this is > 0.`);
@@ -918,6 +1066,7 @@ try {
   proveCause3Seed();
   proveExportedFileSet(seedScratchGit, 'POST-FIX real');
   provePathspecMagicSilentDrop(seedScratchGit, 'POST-FIX real');
+  provePerfBoundedAdds(seedScratchGit, 'POST-FIX real');
   proveBuildRoomGitEnvUnit();
   proveCause3Hermeticity(buildRoomGitEnv, 'POST-FIX real', facts);
   proveDispatchWritesTypedKind();

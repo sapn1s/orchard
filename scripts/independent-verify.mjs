@@ -1006,11 +1006,40 @@ export function seedScratchGit(dir) {
       // a dir under ignore rules; a path under a stray exported `.git` is refused by git
       // itself (it never tracks a `.git`). node_modules is simply never listed, so `-f`
       // cannot pull the live-tree copy in.
+      //
+      // RESCOPED SEED CONTRACT (BUG-273 r8). The r1–r7 rounds each died on a new
+      // adversarial NAME class (gitignore, pathspec magic, then the NTFS/HFS aliases
+      // `git~1`/`GIT~1`/`.git.`/`.git `/`.GIT`), because ONE name git's verify_path
+      // refuses makes `git add <whole list>` abort ATOMICALLY — the index is left
+      // EMPTY, HEAD comes out empty, and the verifier's `git show HEAD:<file>` dies 128
+      // (the live BROKEN, anthropic run e918e853). No more per-name-class patching: the
+      // export comes from a git tree, so every REAL exported name is one git already
+      // accepted — only a HAND-CRAFTED fixture can hold a name git refuses. So we stop
+      // trying to pre-classify names and instead add in BATCHES with a bisecting
+      // per-ERROR fallback: try the whole list in one `git add` (the common all-good
+      // case → exactly ONE call, no perf regression); on ANY non-zero, split the slice
+      // in half and recurse, narrowing to the singleton git refuses, which is SKIPPED
+      // (recorded + left on disk) rather than aborting the commit. A failed add stages
+      // NOTHING (git rolls the whole operation back — proven against real git with the
+      // bad name at the head, middle and tail of the list), so a retried half never
+      // double-adds and good names stay in LARGE batches: 1000 files + 1 bad name costs
+      // ~21 adds, never 1001. Names git accepts are therefore ALL committed; names it
+      // refuses are skipped and surfaced on the seed's output line.
       const nulJoinBuf = (bufs) => { const parts = []; bufs.forEach((b, i) => { if (i) parts.push(NUL); parts.push(b); }); return Buffer.concat(parts); };
-      const add = relFiles.length === 0
-        ? { status: 0 }
-        : g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: nulJoinBuf(relFiles) });
-      if ((add.status ?? 1) !== 0) return { ok: false, error: `git add (temp index): ${(add.stderr || add.stdout || '').trim().slice(0, 200)}` };
+      const addBatch = (bufs) => bufs.length === 0
+        ? 0
+        : (g(['add', '-f', '--pathspec-from-file=-', '--pathspec-file-nul'], { input: nulJoinBuf(bufs) }).status ?? 1);
+      const skippedBufs = [];
+      const addRecursive = (bufs) => {
+        if (bufs.length === 0) return;
+        if (addBatch(bufs) === 0) return;                             // whole slice accepted
+        if (bufs.length === 1) { skippedBufs.push(bufs[0]); return; } // the single name git refuses
+        const mid = bufs.length >> 1;
+        addRecursive(bufs.slice(0, mid));
+        addRecursive(bufs.slice(mid));
+      };
+      addRecursive(relFiles);
+      const skipped = skippedBufs.map((b) => b.toString('utf8')); // display only; lossy for invalid-UTF-8 names is fine
       const wt = g(['write-tree']);
       if ((wt.status ?? 1) !== 0) return { ok: false, error: `git write-tree: ${(wt.stderr || '').trim().slice(0, 200)}` };
       const ct = g(['commit-tree', wt.stdout.trim(), '-m', 'clean-room base (synthetic — independent-verify)']);
@@ -1032,7 +1061,7 @@ export function seedScratchGit(dir) {
       if ((head.status ?? 1) !== 0 || head.stdout.trim() !== commit) {
         return { ok: false, error: `seeded repo does not resolve HEAD to the new commit (${(head.stderr || '').trim().slice(0, 160)})` };
       }
-      return { ok: true, head: commit, error: null };
+      return { ok: true, head: commit, error: null, skipped };
     } finally {
       try { fs.rmSync(idxTmp, { recursive: true, force: true }); } catch { /* best effort */ }
     }
@@ -1808,7 +1837,7 @@ async function main() {
   if (opts.printPrompt) {
     // Seam for the clean-room test: prove the composed prompt carries no
     // methodology/board/routing payload, and show what was stripped.
-    process.stderr.write(`scratch root: ${room.scratch.dir} (${room.scratch.source})${room.scratch.degraded ? ' — DEGRADED: this is a boot-wiped temp dir; set $' + SCRATCH_ENV : ''}\n${room.modules.fsCheck ? room.modules.fsCheck.message + '\n' : ''}clean room: ${room.dir}\nrecord dir: ${room.recordDir}\nprose roots: ${room.proseRoots.join(', ') || '(none declared)'}\nallowed inputs: ${room.allowed.join(', ') || '(none — the room was given only code, config and tests)'}\nstripped: ${room.stripped.length ? `${room.stripped.slice(0, 30).join(', ')}${room.stripped.length > 30 ? ` … (+${room.stripped.length - 30} more)` : ''}` : '(nothing present to strip)'}\ndiff: allow-list of ${allowedPaths.length}/${changedPaths.length} changed path(s) the verifier may see (byte-exact, predicate-filtered)\nroom manifest: ${path.join(room.recordDir, 'room-manifest.json')}\nboot stubs seeded: ${room.seededStubs.join(', ') || '(none needed)'}\nnode_modules: ${room.modules.mode}${room.modules.ms ? ` in ${room.modules.ms}ms` : ''} — NEVER a symlink into the live repo (BUG-112)\nescaping symlinks removed: ${room.escapes.length ? room.escapes.join(', ') : '(none)'}\nscratch git: ${room.gitSeed?.ok ? `seeded HEAD ${room.gitSeed.head.slice(0, 12)} (synthetic identity verify@example.invalid, no remote)` : `NOT seeded — ${room.gitSeed?.error ?? 'unknown'}`}\n`);
+    process.stderr.write(`scratch root: ${room.scratch.dir} (${room.scratch.source})${room.scratch.degraded ? ' — DEGRADED: this is a boot-wiped temp dir; set $' + SCRATCH_ENV : ''}\n${room.modules.fsCheck ? room.modules.fsCheck.message + '\n' : ''}clean room: ${room.dir}\nrecord dir: ${room.recordDir}\nprose roots: ${room.proseRoots.join(', ') || '(none declared)'}\nallowed inputs: ${room.allowed.join(', ') || '(none — the room was given only code, config and tests)'}\nstripped: ${room.stripped.length ? `${room.stripped.slice(0, 30).join(', ')}${room.stripped.length > 30 ? ` … (+${room.stripped.length - 30} more)` : ''}` : '(nothing present to strip)'}\ndiff: allow-list of ${allowedPaths.length}/${changedPaths.length} changed path(s) the verifier may see (byte-exact, predicate-filtered)\nroom manifest: ${path.join(room.recordDir, 'room-manifest.json')}\nboot stubs seeded: ${room.seededStubs.join(', ') || '(none needed)'}\nnode_modules: ${room.modules.mode}${room.modules.ms ? ` in ${room.modules.ms}ms` : ''} — NEVER a symlink into the live repo (BUG-112)\nescaping symlinks removed: ${room.escapes.length ? room.escapes.join(', ') : '(none)'}\nscratch git: ${room.gitSeed?.ok ? `seeded HEAD ${room.gitSeed.head.slice(0, 12)} (synthetic identity verify@example.invalid, no remote)${room.gitSeed.skipped?.length ? `; skipped ${room.gitSeed.skipped.length} untrackable name(s): ${room.gitSeed.skipped.slice(0, 20).join(', ')}${room.gitSeed.skipped.length > 20 ? ` … (+${room.gitSeed.skipped.length - 20} more)` : ''}` : ''}` : `NOT seeded — ${room.gitSeed?.error ?? 'unknown'} (the room still works WITHOUT .git, as it did before BUG-273)`}\n`);
     process.stdout.write(prompt);
     // No dispatch will run against this room, so the recorder is done: stop the
     // heartbeat now, so a kept room's vrun sees a dead recorder at once rather

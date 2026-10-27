@@ -49,6 +49,7 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { isFixturePath } from './agent-git-policy.mjs';
 
 /** projectKey → active grant. Memory-only; see the header. */
 const grants = new Map();
@@ -104,8 +105,16 @@ export const WRITE_OUTCOMES = new Set(['permitted', 'executed', 'failed', 'block
 /** Optional durable sink (index.ts wires this to append a host-side log file). */
 let auditSink = null;
 
-/** A hard ceiling so even a "single-use" grant cannot sit armed forever. */
-export const MAX_GRANT_MS = 6 * 60 * 60 * 1000; // 6h
+/** A hard ceiling so even a "single-use" grant cannot sit armed forever.
+ *  FEAT-201 — raised 6h → 24h so a TIMED pass can span a long autonomous run (the
+ *  user asked to grant 1h/8h/24h without re-granting every 30 min). 24h is the
+ *  largest named preset in the Git-tab picker; anything longer than a day is served
+ *  by the "until I turn it off" standing grant (permanentGrantOf, survives restart),
+ *  so a timed pass genuinely never needs more, and this ceiling still guarantees a
+ *  timed pass cannot linger indefinitely. Note this constant is ALSO the fallback
+ *  ttl for a `scope:'once'` grant when the caller names none (below); widening it to
+ *  24h is cosmetic there — a once-grant self-expires on its first permitted write. */
+export const MAX_GRANT_MS = 24 * 60 * 60 * 1000; // 24h
 /** Default window for a duration grant when the caller names no ttl. */
 export const DEFAULT_GRANT_MS = 30 * 60 * 1000; // 30m
 
@@ -664,6 +673,20 @@ let crossRepoReachSink = null;
 function reachKey(sourceProjectKey, targetCommonDir) {
   return sourceProjectKey && targetCommonDir ? `${sourceProjectKey}\0${targetCommonDir}` : null;
 }
+/* FEAT-190 follow-up (2026-10-16, "Other repos" showed 8–15 hash-named entries) — throwaway repos
+ * are NEVER recorded, replayed or listed. The live log held only `/tmp/claude-<uid>/bash-edit-diff/
+ * <hash>` repos: the Claude CLI's own per-edit diff repos, written under a session's grant. Any
+ * repo under a fixture root (scratch / system tmp / confined work — defaultFixtureRoots) is a test
+ * or tool fixture, not a repo the user governs, so it has no place in the opt-out list. Display
+ * only: no decision reads this log. `reachFixtureRoots` null = the live defaults; tests pin it. */
+let reachFixtureRoots = null;
+/** Test hook: pin the fixture roots the reach filter uses (null = defaultFixtureRoots()). */
+export function _setReachFixtureRootsForTest(roots) { reachFixtureRoots = Array.isArray(roots) ? roots : null; }
+/** TRUE iff a reach entry/target is a throwaway (fixture-root) repo that must not be recorded. */
+export function isFixtureReach({ targetCommonDir = null, targetToplevel = null } = {}) {
+  const roots = reachFixtureRoots ?? undefined;
+  return isFixturePath(targetCommonDir, roots) || isFixturePath(targetToplevel, roots);
+}
 /** Register (or clear) the durable sink for reach records. */
 export function setCrossRepoReachSink(fn) { crossRepoReachSink = typeof fn === 'function' ? fn : null; }
 /** Replay a durable reach record on boot (index.ts reads the jsonl). First-writer wins, so a
@@ -673,6 +696,7 @@ export function loadCrossRepoReach(rec) {
   if (!rec || typeof rec !== 'object') return;
   const k = reachKey(rec.sourceProjectKey, rec.targetCommonDir);
   if (!k || crossRepoReach.has(k)) return;
+  if (isFixtureReach(rec)) return; // a stale throwaway entry from before the filter: never replayed
   crossRepoReach.set(k, {
     sourceProjectKey: rec.sourceProjectKey, targetCommonDir: rec.targetCommonDir,
     targetToplevel: typeof rec.targetToplevel === 'string' ? rec.targetToplevel : null,
@@ -690,6 +714,7 @@ export function loadCrossRepoReach(rec) {
 export function recordCrossRepoReach(sourceProjectKey, { targetCommonDir, targetToplevel = null, resolved = null } = {}, now = Date.now()) {
   const k = reachKey(sourceProjectKey, targetCommonDir);
   if (!k) return null;
+  if (isFixtureReach({ targetCommonDir, targetToplevel })) return null; // throwaway repo: never recorded
   const hit = crossRepoReach.get(k);
   if (hit) return hit;
   const entry = {
@@ -708,7 +733,7 @@ export function crossRepoReachOf(sourceProjectKey, targetCommonDir) {
 }
 /** Every reach entry for a source project (git page: "repos this grant reached"). */
 export function crossRepoReachFor(sourceProjectKey) {
-  return [...crossRepoReach.values()].filter((e) => e.sourceProjectKey === sourceProjectKey);
+  return [...crossRepoReach.values()].filter((e) => e.sourceProjectKey === sourceProjectKey && !isFixtureReach(e));
 }
 
 /** Most-recent-first copy of the ledger, optionally filtered to one project. */
@@ -740,7 +765,7 @@ export function timedGrantView(projectKey, now = Date.now()) {
 export function setGitWriteAuditSink(fn) { auditSink = typeof fn === 'function' ? fn : null; }
 
 /** TEST-ONLY: forget every grant and clear the ledger. */
-export function _resetGitGrantsForTest() { grants.clear(); revocationGen.clear(); calls.clear(); lastGlobalSweep = 0; authorisations = 0; ledger.length = 0; ledgerSeq = 0; confirmCaps.clear(); auditSink = null; permanentSource = null; crossRepoReach.clear(); crossRepoReachSink = null; }
+export function _resetGitGrantsForTest() { grants.clear(); revocationGen.clear(); calls.clear(); lastGlobalSweep = 0; authorisations = 0; ledger.length = 0; ledgerSeq = 0; confirmCaps.clear(); auditSink = null; permanentSource = null; crossRepoReach.clear(); crossRepoReachSink = null; reachFixtureRoots = null; }
 
 function viewGrant(g, now) {
   const bounded = g.remainingUses !== Infinity;

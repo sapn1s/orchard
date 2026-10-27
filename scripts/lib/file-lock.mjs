@@ -312,7 +312,7 @@ export function isIndexOnlyApplyExempt(command) {
   return typeof command === 'string' && INDEX_ONLY_APPLY_RE.test(command.trim());
 }
 
-/* ── BUG-277 r4: the WRAPPER-HOLE whole-tree safety net ───────────────────────
+/* ── BUG-277 r4/r5: the WRAPPER-HOLE whole-tree safety net ─────────────────────
  *
  * The tokenizer only reaches git's classifier when `git` is the segment HEAD (or a
  * NOOP-head/`sh -c`/`env` preamble it unwraps). A WRAPPER that passes its args to git
@@ -322,34 +322,60 @@ export function isIndexOnlyApplyExempt(command) {
  * `apply`/… slips every lock (proven live: run 7fe2cf90… for apply; and the r4 probe
  * showed the SAME hole for checkout/restore/reset/stash/clean — it is per-wrapper, not
  * per-verb). We do NOT try to model which wrapper it is: per the r3 lesson (the shell
- * does arbitrary things before git runs), we take a plain WHOLE-STRING regex. If the
- * raw command contains a `git` token followed — after only git's own global options —
- * by any GIT_TREE_MUTATORS verb, and the normal scan found NO mutation, it is a
- * wrapped tree mutation → whole-tree. Over-refusal is acceptable and expected (e.g.
+ * does arbitrary things before git runs), we take a plain WHOLE-STRING regex. It
+ * matches a `git` token followed — after only git's own global options — by any
+ * GIT_TREE_MUTATORS verb. Over-refusal is acceptable and expected (e.g.
  * `echo "git apply …"` is refused); under-refusal is the defect this closes.
  *
- * It fires ONLY when the ordinary scan returned `{mutates:false}` (the wrapper hole),
- * so a CLEAN `git checkout -- f` the tokenizer already path-scoped is untouched — its
- * narrow per-file key is preserved, not widened to the whole tree. The verb must sit
- * in the SUBCOMMAND position (after `git` and its global options only), so a mutator
- * word inside a later arg — `git commit -m "apply the reset fix"` — does NOT match and
- * a benign commit is never refused. Global value-options (`-C <dir>`, `-c <cfg>`, …)
- * consume their following value so `git -C . apply` still matches. `git` must be a
- * standalone/pathed token (`/usr/bin/git`, `(git …`, `` `git … ``), never a substring
- * (`digit`, `mygit`). A known residual: a command that is BOTH a detected non-git
- * mutation AND a wrapped git mutator (`sed -i x f; exec git reset --hard`) nets on the
- * first only — the net is gated on mutates:false to protect path-scoping; such a
- * combined form is not in the attack surface and over-refusal there would need state.
+ * r5 — run the net on EVERY top-level command, NOT only at the `mutates:false` exit.
+ * r4 gated it on `mutates:false`, so a COMBINED line that carries BOTH a path-scoped
+ * mutation AND a wrapped whole-tree mutator (`git checkout -- f; xargs git reset
+ * --hard`) keyed the lock to `f` only and the wrapped `reset --hard` slipped (anthropic
+ * run 648f8f34…). Now `scanBashMutation` COUNTS git-tree-mutator occurrences in the raw
+ * string (`countGitTreeMutators`) and compares that with how many it classified as a
+ * head `git` (scoped, or early-returned whole-tree). A SURPLUS means a git mutator the
+ * tokenizer never saw — wrapped, or sitting beside an already-scoped one — so the line
+ * mutates the whole tree: the union of what we scoped and the wrapped mutator, the
+ * strongest wins. EQUAL counts mean every git mutator was seen and individually
+ * classified, so a CLEAN `git checkout -- f` (count 1 = head 1) keeps its narrow
+ * per-file key, not widened to the tree.
+ *
+ * The verb must sit in the SUBCOMMAND position (after `git` and its global options
+ * only), so a mutator word inside a later arg — `git commit -m "apply the reset fix"`
+ * — does NOT match and a benign commit is never refused. Global value-options
+ * (`-C <dir>`, `-c <cfg>`, …) consume their following value so `git -C . apply` still
+ * matches. `git` must be a standalone/pathed token (`/usr/bin/git`, `(git …`,
+ * `` `git … ``), never a substring (`digit`, `mygit`).
+ *
+ * ── OUT OF CONTRACT (accepted residual, pinned below) ────────────────────────
+ * This guard protects against MISTAKES by non-malicious agents (the user's stated
+ * intent: "stop autonomous noise and broken main, not malicious agents"). DELIBERATELY
+ * OBFUSCATED shell is out of contract and NOT closed here — a text classifier cannot
+ * close shell obfuscation, and no agent writes these by accident:
+ *   • a quoted or escaped command word — `exec 'git' reset`, `g\it reset`;
+ *   • an ANSI-C quoted verb — `exec git $'reset'`;
+ *   • a backslash-newline inside the command word — `g\<newline>it reset`;
+ *   • a `-C` global value that itself contains a space — `exec git -C 'a b' reset`.
+ * Each tokenises/reads to something the whole-string regex does not match, so it
+ * classifies NOT-whole-tree and would slip a foreign lock. The forms are PINNED as
+ * "accepted out-of-contract" in the verify suite (section 10) so a silent change to
+ * their classification is noticed; they are documented, not silently ignored.
  */
 const _GIT_GLOBAL_VALUE_OPT = '-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env|--super-prefix|--attr-source';
 const _GIT_GLOBAL_OPT = `(?:(?:${_GIT_GLOBAL_VALUE_OPT})[ \\t]+\\S+|--?[^\\s]+)`;
 // longest-first where a verb is a prefix of another (checkout-index before checkout).
 const _GIT_TREE_MUTATOR_VERB = 'checkout-index|checkout|cherry-pick|read-tree|switch|restore|reset|rebase|revert|stash|clean|rm|mv|merge|pull|apply|am';
-const WRAPPED_GIT_TREE_MUTATOR_RE = new RegExp(
-  `(?<![\\w-])git[ \\t]+(?:${_GIT_GLOBAL_OPT}[ \\t]+)*(?:${_GIT_TREE_MUTATOR_VERB})(?![\\w-])`,
-);
+const _WRAPPED_GIT_TREE_MUTATOR_SRC = `(?<![\\w-])git[ \\t]+(?:${_GIT_GLOBAL_OPT}[ \\t]+)*(?:${_GIT_TREE_MUTATOR_VERB})(?![\\w-])`;
+const WRAPPED_GIT_TREE_MUTATOR_RE = new RegExp(_WRAPPED_GIT_TREE_MUTATOR_SRC);
+const WRAPPED_GIT_TREE_MUTATOR_RE_G = new RegExp(_WRAPPED_GIT_TREE_MUTATOR_SRC, 'g');
 export function hasWrappedGitTreeMutator(command) {
   return typeof command === 'string' && WRAPPED_GIT_TREE_MUTATOR_RE.test(command);
+}
+/** How many `git <global-opts> <tree-mutator-verb>` occurrences the raw string carries (r5). */
+export function countGitTreeMutators(command) {
+  if (typeof command !== 'string') return 0;
+  const m = command.match(WRAPPED_GIT_TREE_MUTATOR_RE_G);
+  return m ? m.length : 0;
 }
 
 export function classifyMutation({ toolName, toolInput } = {}) {
@@ -753,6 +779,10 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
   const allPaths = [];
   const scopes = [];
   let kind = null;
+  // r5: how many git tree-mutators the tokenizer saw as a head `git` subcommand.
+  // Compared at the exit with countGitTreeMutators(command): a surplus in the raw
+  // string is a wrapped/combined-line mutator the tokenizer missed → whole-tree.
+  let gitHeadMutators = 0;
   /*
    * The command's EFFECTIVE cwd, tracked across `&&`/`;`-joined segments so a
    * `cd sub && sed -i f` keys `f` as `sub/f`, not `f` (round-1 gap #b), and
@@ -772,6 +802,11 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
   const merge = (r) => {
     if (!r || !r.mutates) return null;
     if (r.tree) return r;
+    // r5: carry the child's resolved git-mutator count up so the depth-0 net
+    // discounts a git mutator classified through recursion (`sh -c "git checkout
+    // -- f"`), not just a direct head `git`. Else the raw-string regex count would
+    // exceed the (direct-only) head count and falsely widen the recursed scope.
+    gitHeadMutators += r.gitMutators || 0;
     for (const p of r.paths || []) place(p, p);
     for (const s of r.scopes || []) {
       if (s.dir == null) scopes.push(s);
@@ -846,6 +881,7 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
     if (head === 'git') {
       const parsed = gitSubcommand(args);
       if (parsed && GIT_TREE_MUTATORS.has(parsed.sub)) {
+        gitHeadMutators++; // seen as a head git subcommand; the net discounts it
         const tgt = gitMutationTarget(parsed.sub, parsed.args);
         if (tgt.tree) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
         // `git -C a -C b …` resolves pathspecs under a/b (absolute -C resets the base).
@@ -985,16 +1021,21 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
       continue;
     }
   }
-  if (!allPaths.length && !scopes.length) {
-    // BUG-277 r4: the wrapper-hole net. At the top level only, a raw command that
-    // smuggles a git tree-mutator past the tokenizer through a wrapper (`exec`/
-    // `xargs`/`timeout`/…) classifies whole-tree rather than slipping every lock.
-    // See hasWrappedGitTreeMutator. Gated on mutates:false so a clean, already
-    // path-scoped `git checkout -- f` keeps its narrow key.
-    if (depth === 0 && hasWrappedGitTreeMutator(command)) return { mutates: true, tree: true, kind: 'git (wrapped tree mutation)' };
-    return { mutates: false };
+  // BUG-277 r5: the wrapper-hole net, run on EVERY top-level command (not only at
+  // the mutates:false exit as r4 did). If the raw string carries MORE git tree-mutator
+  // occurrences than the tokenizer classified as a head `git`, the surplus is a mutator
+  // smuggled past the tokenizer by a wrapper (`exec`/`xargs`/`timeout`/…) OR sitting on
+  // a COMBINED line beside an already-path-scoped one (`git checkout -- f; xargs git
+  // reset --hard`). Either way the line mutates the whole tree — the union, strongest
+  // wins. Equal counts leave a clean path-scoped `git checkout -- f` narrow. Depth 0
+  // only (the raw command, not a recursively-scanned fragment).
+  if (depth === 0 && countGitTreeMutators(command) > gitHeadMutators) {
+    return { mutates: true, tree: true, kind: 'git (wrapped tree mutation)' };
   }
-  return { mutates: true, paths: allPaths, scopes, kind: kind ?? 'write' };
+  // `gitMutators` is internal: it lets a parent scan discount git mutators this
+  // (recursive) scan already resolved (see merge). Harmless on the public result.
+  if (!allPaths.length && !scopes.length) return { mutates: false, gitMutators: gitHeadMutators };
+  return { mutates: true, paths: allPaths, scopes, kind: kind ?? 'write', gitMutators: gitHeadMutators };
 }
 
 /* ─────────────────────────────────────────────────────── the top-level decision */

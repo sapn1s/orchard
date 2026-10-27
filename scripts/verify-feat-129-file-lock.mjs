@@ -544,7 +544,7 @@ section('9c. round 4 — container (/workspace/<id>) vs host session on the same
  * Each `refused(...)` below is a must-FAIL synthesized from the r2 code: 21 of these
  * attacks classified EXEMPT under r2 (probed live, r2 vs r3). `exempt(...)` fires on
  * exactly one shape — the confirmed real landing form. */
-section('10. BUG-277 r3 — index-only apply exemption is a WHOLE-STRING match (`git apply --cached <path>…`)');
+section('10. BUG-277 r3/r4/r5 — index-only apply exemption + wrapper-hole & combined-line whole-tree net');
 {
   const APPLY = 'git' + ' apply'; // keep the literal out of any command-scanner's eye; this is a classifier arg, never run
   // exempt = the lock never fires (mutates:false), via the REAL entry classifyMutation.
@@ -656,7 +656,7 @@ section('10. BUG-277 r3 — index-only apply exemption is a WHOLE-STRING match (
   ok(scanBashMutation(`/usr/bin/git apply p.patch`).tree === true, 'r4: a path-qualified `/usr/bin/git apply` → TREE');
 
   // REGRESSION GUARDS: the net must NOT widen any of these.
-  ok(scanBashMutation(`git checkout -- src/a`).paths?.[0] === 'src/a' && !scanBashMutation(`git checkout -- src/a`).tree, 'r4 guard: a CLEAN `git checkout -- f` keeps its narrow per-file key (net gated on mutates:false)');
+  ok(scanBashMutation(`git checkout -- src/a`).paths?.[0] === 'src/a' && !scanBashMutation(`git checkout -- src/a`).tree, 'r4 guard: a CLEAN `git checkout -- f` keeps its narrow per-file key (count 1 = head 1, net does not widen)');
   ok(scanBashMutation(`git restore src/b`).paths?.[0] === 'src/b', 'r4 guard: `git restore f` stays path-scoped');
   ok(!scanBashMutation(`git commit -m "apply the reset fix"`).mutates, 'r4 guard: a mutator WORD inside a commit message does NOT trip the net (`git commit` stays not-a-mutation — the landing commit)');
   ok(!scanBashMutation(`git status`).mutates, 'r4 guard: `git status` is not a mutation');
@@ -693,6 +693,47 @@ section('10. BUG-277 r3 — index-only apply exemption is a WHOLE-STRING match (
   // And the sanctioned bare index-only landing is STILL allowed (the whole point).
   const stillAllowed = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
   ok(stillAllowed.allow, 'r4 POST: the bare `git apply --cached <path>` landing is STILL ALLOWED under the foreign lock (the exemption survives)');
+
+  /* ──────── r5 — the COMBINED LINE (anthropic run 648f8f34…) ───────────────────
+   * r4 gated the wrapper-hole net on `mutates:false`, so a line carrying BOTH a
+   * path-scoped mutation AND a wrapped whole-tree mutator keyed the lock to the
+   * scoped file only and the wrapped mutator slipped. r5 runs the net on EVERY
+   * top-level command by COUNTING git tree-mutator occurrences vs those seen as a
+   * head `git`; a surplus → whole-tree (the union, strongest wins). Each case was a
+   * must-FAIL on the r4 code (verified: it returned `paths:["f"]`, keying `f` only). */
+  ok(scanBashMutation(`git checkout -- f; xargs git reset --hard`).tree === true, 'r5: `git checkout -- f; xargs git reset --hard` → TREE (r4 keyed it to `f`, slipping the wrapped reset)');
+  ok(scanBashMutation(`git checkout -- f && exec git reset --hard`).tree === true, 'r5: scoped `&&` wrapped → TREE');
+  ok(scanBashMutation(`git checkout -- f || exec git reset --hard`).tree === true, 'r5: scoped `||` wrapped → TREE');
+  ok(scanBashMutation(`git checkout -- f\nexec git reset --hard`).tree === true, 'r5: scoped + newline + wrapped → TREE');
+  ok(scanBashMutation(`git checkout -- f | xargs git reset --hard`).tree === true, 'r5: scoped `|` wrapped → TREE');
+  ok(scanBashMutation(`xargs git reset --hard; git checkout -- f`).tree === true, 'r5: wrapped-FIRST then scoped → TREE (order-independent)');
+  ok(scanBashMutation(`sed -i s/a/b/ f; exec git reset --hard`).tree === true, 'r5: a non-git scoped mutation (`sed -i`) beside a wrapped git mutator → TREE (closes the r4-noted residual)');
+  ok(scanBashMutation(`git checkout -- f; exec git clean -fd`).tree === true, 'r5: scoped checkout + wrapped `git clean` → TREE (any mutator verb)');
+  // Guard: two CLEAN head-git scoped mutators are NOT widened (count 2 = head 2).
+  ok(scanBashMutation(`git checkout -- f && git checkout -- g`).paths?.includes('f') && scanBashMutation(`git checkout -- f && git checkout -- g`).paths?.includes('g') && !scanBashMutation(`git checkout -- f && git checkout -- g`).tree, 'r5 guard: two CLEAN scoped checkouts stay path-scoped (count 2 = head 2, not widened)');
+  // Guard: a benign second command beside a scoped checkout does NOT widen it.
+  ok(scanBashMutation(`git status && git checkout -- f`).paths?.[0] === 'f' && !scanBashMutation(`git status && git checkout -- f`).tree, 'r5 guard: `git status && git checkout -- f` stays scoped (status is not a tree-mutator)');
+  // r5 END-TO-END: the combined line is REFUSED under the foreign out-of-repo lock.
+  const combined = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `git checkout -- scripts/other.txt; xargs git reset --hard` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!combined.allow && combined.busy, 'r5 POST: the combined `checkout -- f; xargs git reset --hard` is REFUSED under the foreign lock (r4 ALLOWED it — keyed to `other.txt` only)');
+
+  /* ──────── r5 — ACCEPTED OUT-OF-CONTRACT (pinned, documented residual) ────────
+   * Orchestrator decision (WA §N rescope): this guard protects against MISTAKES by
+   * NON-malicious agents ("stop autonomous noise and broken main, not malicious
+   * agents"). DELIBERATELY OBFUSCATED shell — a quoted/escaped command word, an
+   * ANSI-C quoted verb, a backslash-newline inside the command word, a `-C` value
+   * with an embedded space — is OUT of contract: no agent writes `exec 'git' reset`
+   * by accident, and a text classifier cannot close shell obfuscation (r1/r2/r3
+   * proved parsing the shell unsound). These are NOT fixed. They are pinned here so
+   * a SILENT change to their classification is noticed — documenting the residual,
+   * not hiding it. Each currently classifies NOT-whole-tree (it would slip a lock);
+   * if a future change makes one whole-tree, that is a WELCOME tightening and this
+   * pin must be updated deliberately. */
+  ok(!scanBashMutation(`exec 'git' reset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): a QUOTED command word `exec \'git\' reset` is not caught (obfuscation, documented residual)');
+  ok(!scanBashMutation(`exec g\\it reset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): an ESCAPED command word `exec g\\it reset` is not caught (documented residual)');
+  ok(!scanBashMutation(`exec git $'reset' --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): an ANSI-C quoted verb `$\'reset\'` is not caught (documented residual)');
+  ok(!scanBashMutation(`exec git re\\\nset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): a backslash-newline inside the verb is not caught (documented residual)');
+  ok(!scanBashMutation(`exec git -C 'a b' reset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): a `-C` value with an embedded space is not caught (documented residual)');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);

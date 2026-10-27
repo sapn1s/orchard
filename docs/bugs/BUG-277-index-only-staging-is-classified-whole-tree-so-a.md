@@ -62,6 +62,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "IV 31d2fca^..c8fb8a7 (r2+r3), VALID, exit 1. r3 regex refuses all shell/wrapper/metachar forms; but upstream gitMutationTarget reads post-double-dash tokens as written paths when for git-apply they are patch files. So 'apply -- p' & '--cached -- p' write the tree yet are ALLOWED over a lock."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "648f8f34-9b53-4195-854d-9b6911013dbb",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T12:23:05.104Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "IV 31d2fca^..55dd2dd (r4), VALID manifest-backed (openai quota→anthropic). r4 wrapped-mutator net slips: quoted/escaped git word, quoted/ANSI-C verb, backslash-newline before verb, quoted -C value w/space → mutates:false, ALLOWED under foreign lock. Plus r4-noted combined-line residual."
     }
   ],
   "verification_class": "fix",
@@ -173,3 +185,18 @@ Either is sufficient:
 - **Suites:** `verify-feat-129-file-lock.mjs` → PASS 224/224 (confined runner, scratch HOME pre-made). `npm run gate` → PASS (exit 0, read unpiped): leak-gate + typecheck clean.
 - **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/verify-feat-129-file-lock.mjs`, this ticket. (Did NOT touch `file-lock.d.mts` — typecheck passes without declaring the new export; stayed inside the charter's file list.)
 - **Risk bucket:** shared-tree safety path (regression-prone) — an independent clean-room verify pass IS warranted before close. r4 only ever WIDENS refusal (apply/am always tree; wrapped mutators tree); it never newly allows anything, so it cannot reintroduce a clobber. The one preserved allow (bare index-only landing) and all path-scoping are pinned by the suite.
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 648f8f34-9b53-4195-854d-9b6911013dbb — VERDICT: BROKEN — IV 31d2fca^..55dd2dd (r4), VALID manifest-backed (openai quota→anthropic). r4 wrapped-mutator net slips: quoted/escaped git word, quoted/ANSI-C verb, backslash-newline before verb, quoted -C value w/space → mutates:false, ALLOWED under foreign lock. Plus r4-noted combined-line residual.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — fixing lane (round 5)
+- **regressed-from:** BUG-277 r4 (same ticket). r4's wrapper-hole net was gated on `mutates:false`, so a COMBINED LINE carrying BOTH a path-scoped mutation AND a wrapped whole-tree mutator never reached the net — it keyed the lock to the scoped file only and the wrapped mutator slipped (the r4-noted residual, now confirmed live by run 648f8f34-9b53-4195-854d-9b6911013dbb).
+- **Orchestrator decision (WA §N RESCOPE, recorded as the agent's call):** this guard protects against MISTAKES by NON-malicious agents — the user's stated intent for these guards ("stop autonomous noise and broken main, not malicious agents"). Deliberately OBFUSCATED shell is OUT of contract and NOT closed here: a quoted or escaped command word (`exec 'git' reset`, `exec g\it reset`), an ANSI-C quoted verb (`git $'reset'`), a backslash-newline inside the command word, and a `-C` global value with an embedded space (`exec git -C 'a b' reset`). No agent writes these by accident, and a text classifier cannot close shell obfuscation (r1/r2/r3 proved parsing the shell unsound). Of the newest verdict's 14 slips, ONLY the combined line is in-contract; the rest are the obfuscation forms above. Documented in `file-lock.mjs`'s wrapper-net header AND pinned in the suite as "accepted out-of-contract" so a silent change to their classification is noticed.
+- **Hypothesis verified FIRST (probe vs the r4 code):** copied the working-tree `file-lock.mjs` (= r4 + the untouched FEAT-191 hunk) to a scratch file and ran the combined forms. All SLIP: `git checkout -- f; xargs git reset --hard`, the `&&`/`||`/`|`/newline variants, the wrapped-first order, and `sed -i f; exec git reset --hard` ALL returned `paths:["f"]` — keying the lock to `f` only. Clean single/double scoped checkouts stayed correctly scoped. Confirms the net-gating hypothesis exactly.
+- **Fix (scripts/lib/file-lock.mjs — the wrapper net + `scanBashMutation` only):**
+  - The net now runs on EVERY top-level command, not only the `mutates:false` exit. `scanBashMutation` counts the git tree-mutators it classified as a head `git` (`gitHeadMutators`, incremented in the git branch AND carried up from recursive sub-scans via `merge` so `sh -c "git checkout -- f"` is counted once, not double-widened) and compares that with `countGitTreeMutators(command)` — a new exported global-regex count of git-tree-mutator occurrences in the RAW string. A SURPLUS means a mutator the tokenizer never saw (wrapped, or beside an already-scoped one) → whole-tree, the union/strongest-wins. EQUAL counts keep a clean `git checkout -- f` narrow (count 1 = head 1).
+  - Kept `hasWrappedGitTreeMutator` exported (unused by the net now, still a documented predicate); added `countGitTreeMutators`. Threaded an internal `gitMutators` field on the scan result so a parent discounts recursively-resolved git mutators. No shell parsing added; the net stays a whole-string regex (the r3 lesson).
+- **Verification (must-FAIL from the r4 code, run both ways):** r4 baseline probe = every combined form slips to `paths:["f"]` (above). Post-fix, the full r5 attack list classifies whole-tree: scoped+wrapped across `;`/`&&`/`||`/newline/pipe, wrapped-first, `sed -i`+wrapped, scoped-checkout+wrapped-`clean`; all r1–r4 cases unchanged (wrapped-only, `apply --cached -- p`, unwrapped reset/stash). The exact exempt bare landing STAYS exempt. Regression guards hold: single + double clean scoped checkouts stay path-scoped; `sh -c "git checkout -- f"` stays scoped (the recursion-count fix); `git status && git checkout -- f` stays scoped; status/log/diff/add/commit-message/`digit` stay not-a-mutation. The five obfuscation forms are PINNED as accepted out-of-contract (each still not-whole-tree; a tightening would be welcome and must update the pin). End-to-end over the OUT-OF-REPO foreign scratch lock: the combined `checkout -- other.txt; xargs git reset --hard` is now REFUSED (r4 ALLOWED it), while the bare index-only landing is STILL ALLOWED.
+- **Suites:** `verify-feat-129-file-lock.mjs` → PASS 240/240 (confined runner, scratch HOME pre-made). `npm run gate` → PASS (exit 0, read unpiped): leak-gate + typecheck clean.
+- **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/verify-feat-129-file-lock.mjs`, this ticket. (Did NOT touch `file-lock.d.mts`; left the FEAT-191 `checkPathsFree` hunk alone, per charter.)
+- **Risk bucket:** shared-tree safety path (regression-prone) — an independent clean-room verify pass IS warranted before close. r5 only ever WIDENS refusal for the combined/wrapped surplus; it never newly ALLOWS anything (the one preserved allow is the bare index-only landing, pinned). The obfuscation residual is explicitly OUT of contract per the orchestrator rescope, documented and pinned, not silently dropped.

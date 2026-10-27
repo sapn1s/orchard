@@ -25,7 +25,7 @@ import { fileURLToPath } from 'node:url';
 import {
   classifyMutation, scanBashMutation, evaluateFileLock, reclaimReason,
   fileLockEnabled, lockKeyFor, FILE_LOCK_TTL_MS,
-  refreshOwnedLocks, heartbeatIntervalMs, isIndexOnlyApplyExempt,
+  refreshOwnedLocks, heartbeatIntervalMs, isIndexOnlyApplyExempt, isSimpleLine,
 } from './lib/file-lock.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -34,7 +34,9 @@ let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; } else { fail++; console.error('  FAIL:', m); } };
 const section = (s) => console.log(`\n== ${s}`);
 
-const SCRATCH = fs.mkdtempSync(path.join(process.env.HOME || os.tmpdir(), 'scratch', 'feat129-'));
+const SCRATCH_PARENT = path.join(process.env.HOME || os.tmpdir(), 'scratch');
+fs.mkdirSync(SCRATCH_PARENT, { recursive: true }); // self-sufficient: no external `mkdir $HOME/scratch` needed
+const SCRATCH = fs.mkdtempSync(path.join(SCRATCH_PARENT, 'feat129-'));
 const cleanup = () => { try { fs.rmSync(SCRATCH, { recursive: true, force: true }); } catch {} };
 process.on('exit', cleanup);
 
@@ -63,7 +65,7 @@ ok(scanBashMutation('echo x > src/a').paths?.includes('src/a'), 'echo > f → cl
 ok(!scanBashMutation('echo x >> src/a').mutates, 'echo >> f (append) → NOT a clobber');
 ok(scanBashMutation('sed -i s/a/b/ src/a').paths?.includes('src/a'), 'sed -i → clobber');
 ok(scanBashMutation('cp /t/x src/a').paths?.includes('src/a'), 'cp → dest clobber');
-ok(scanBashMutation('sh -c "git checkout -- src/a"').paths?.includes('src/a'), 'sh -c hides nothing');
+ok(scanBashMutation('sh -c "git checkout -- src/a"').tree === true, 'sh -c wrapping a git mutator is a non-SIMPLE line → whole-tree (r9 over-refusal; was path-scoped — sh -c can hide a second mutator so it is never eligible for a narrow key)');
 // Round-2: the in-place editors round-1 MISSED (sed -i was covered; these were not).
 ok(scanBashMutation("perl -i -pe 's/a/b/' src/a").paths?.includes('src/a'), 'perl -i → clobber (round-2 gap)');
 ok(scanBashMutation("perl -i.bak -pe 's/a/b/' src/a").paths?.includes('src/a'), 'perl -i.bak → clobber');
@@ -544,7 +546,7 @@ section('9c. round 4 — container (/workspace/<id>) vs host session on the same
  * Each `refused(...)` below is a must-FAIL synthesized from the r2 code: 21 of these
  * attacks classified EXEMPT under r2 (probed live, r2 vs r3). `exempt(...)` fires on
  * exactly one shape — the confirmed real landing form. */
-section('10. BUG-277 r3/r4/r5 — index-only apply exemption + wrapper-hole & combined-line whole-tree net');
+section('10. BUG-277 r3–r9 — index-only apply exemption + wrapper-hole/compound-line whole-tree net (SIMPLE-line rule)');
 {
   const APPLY = 'git' + ' apply'; // keep the literal out of any command-scanner's eye; this is a classifier arg, never run
   // exempt = the lock never fires (mutates:false), via the REAL entry classifyMutation.
@@ -658,7 +660,7 @@ section('10. BUG-277 r3/r4/r5 — index-only apply exemption + wrapper-hole & co
   // REGRESSION GUARDS: the net must NOT widen any of these.
   ok(scanBashMutation(`git checkout -- src/a`).paths?.[0] === 'src/a' && !scanBashMutation(`git checkout -- src/a`).tree, 'r4 guard: a CLEAN `git checkout -- f` keeps its narrow per-file key (count 1 = head 1, net does not widen)');
   ok(scanBashMutation(`git restore src/b`).paths?.[0] === 'src/b', 'r4 guard: `git restore f` stays path-scoped');
-  ok(!scanBashMutation(`git commit -m "apply the reset fix"`).mutates, 'r4 guard: a mutator WORD inside a commit message does NOT trip the net (`git commit` stays not-a-mutation — the landing commit)');
+  ok(scanBashMutation(`git commit -m "apply the reset fix"`).tree === true, 'r6 over-refusal (was r4 guard): a mutator WORD after `git` (here inside a commit message) NOW trips the net → TREE; r5 needed literal `git <mutator>` adjacency, r6 does not (accepted broadening, fails safe under a foreign lock)');
   ok(!scanBashMutation(`git status`).mutates, 'r4 guard: `git status` is not a mutation');
   ok(!scanBashMutation(`git log --oneline`).mutates, 'r4 guard: `git log` is not a mutation');
   ok(!scanBashMutation(`git diff HEAD`).mutates, 'r4 guard: `git diff` is not a mutation');
@@ -709,31 +711,160 @@ section('10. BUG-277 r3/r4/r5 — index-only apply exemption + wrapper-hole & co
   ok(scanBashMutation(`xargs git reset --hard; git checkout -- f`).tree === true, 'r5: wrapped-FIRST then scoped → TREE (order-independent)');
   ok(scanBashMutation(`sed -i s/a/b/ f; exec git reset --hard`).tree === true, 'r5: a non-git scoped mutation (`sed -i`) beside a wrapped git mutator → TREE (closes the r4-noted residual)');
   ok(scanBashMutation(`git checkout -- f; exec git clean -fd`).tree === true, 'r5: scoped checkout + wrapped `git clean` → TREE (any mutator verb)');
-  // Guard: two CLEAN head-git scoped mutators are NOT widened (count 2 = head 2).
-  ok(scanBashMutation(`git checkout -- f && git checkout -- g`).paths?.includes('f') && scanBashMutation(`git checkout -- f && git checkout -- g`).paths?.includes('g') && !scanBashMutation(`git checkout -- f && git checkout -- g`).tree, 'r5 guard: two CLEAN scoped checkouts stay path-scoped (count 2 = head 2, not widened)');
-  // Guard: a benign second command beside a scoped checkout does NOT widen it.
-  ok(scanBashMutation(`git status && git checkout -- f`).paths?.[0] === 'f' && !scanBashMutation(`git status && git checkout -- f`).tree, 'r5 guard: `git status && git checkout -- f` stays scoped (status is not a tree-mutator)');
+  // r9 REVISION of the r5 guards: a COMPOUND line (has `&&`) is NON-SIMPLE, so a git
+  // mutator on it is NEVER path-scoped — it widens to whole-tree. This is the accepted
+  // r9 over-refusal that replaces the deflatable count comparison. (Under r5 these two
+  // stayed path-scoped via count==head; r9 drops counting, so they are whole-tree.)
+  ok(scanBashMutation(`git checkout -- f && git checkout -- g`).tree === true, 'r9 over-refusal (was r5 guard): two CLEAN scoped checkouts on a `&&` line → whole-tree (compound line is non-simple; no narrow key)');
+  ok(scanBashMutation(`git status && git checkout -- f`).tree === true, 'r9 over-refusal (was r5 guard): `git status && git checkout -- f` → whole-tree (the `&&` makes it non-simple; the net matches `git … checkout`)');
+  // But a SIMPLE clean scoped mutator is still path-scoped (the common case, unchanged).
+  ok(scanBashMutation(`git checkout -- f`).paths?.[0] === 'f' && !scanBashMutation(`git checkout -- f`).tree, 'r9: a SIMPLE clean `git checkout -- f` still keeps its narrow per-file key (single command, no separator/quote/wrapper)');
   // r5 END-TO-END: the combined line is REFUSED under the foreign out-of-repo lock.
   const combined = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `git checkout -- scripts/other.txt; xargs git reset --hard` }, lockDir, repoRoot: repo, owner: LANDER });
   ok(!combined.allow && combined.busy, 'r5 POST: the combined `checkout -- f; xargs git reset --hard` is REFUSED under the foreign lock (r4 ALLOWED it — keyed to `other.txt` only)');
 
-  /* ──────── r5 — ACCEPTED OUT-OF-CONTRACT (pinned, documented residual) ────────
-   * Orchestrator decision (WA §N rescope): this guard protects against MISTAKES by
-   * NON-malicious agents ("stop autonomous noise and broken main, not malicious
-   * agents"). DELIBERATELY OBFUSCATED shell — a quoted/escaped command word, an
-   * ANSI-C quoted verb, a backslash-newline inside the command word, a `-C` value
-   * with an embedded space — is OUT of contract: no agent writes `exec 'git' reset`
-   * by accident, and a text classifier cannot close shell obfuscation (r1/r2/r3
-   * proved parsing the shell unsound). These are NOT fixed. They are pinned here so
-   * a SILENT change to their classification is noticed — documenting the residual,
-   * not hiding it. Each currently classifies NOT-whole-tree (it would slip a lock);
-   * if a future change makes one whole-tree, that is a WELCOME tightening and this
+  /* ──────── r6 — SPACED GLOBAL-OPTION VALUE: the r5 false-ALLOW, now CLOSED ─────
+   * r5 skipped git's global options token by token (`(?:-C|-c|…)[ \t]+\S+`), so a
+   * global-option VALUE with a SPACE broke the `\S+` match and the WRAPPED tree-wipe
+   * classified NON-mutating — a false ALLOW from natural non-obfuscated shell (openai
+   * run 01a17e2b…, BROKEN). Each case below was a MEASURED must-FAIL on the r5 code:
+   * `scanBashMutation(...)` returned `{mutates:false}` (confirmed live pre-fix, count
+   * 0 vs head 0). r6's lazy `\bgit\b[\s\S]*?\b(verb)\b` net spans the spaced value and
+   * classifies them whole-tree. These are the user's reality: a lane that wraps git
+   * through xargs/exec/timeout with a configured identity/config value that has a
+   * space must NOT slip a foreign lock. */
+  ok(scanBashMutation(`xargs git -c 'core.x=a b' reset --hard`).tree === true, 'r6: `xargs git -c \'a b\' reset` (SPACED single-quoted -c value, wrapped) → TREE (r5 ALLOWED it — the openai 01a17e2b break)');
+  ok(scanBashMutation(`exec git -c "user.name=A B" reset --hard`).tree === true, 'r6: `exec git -c "A B" reset` (SPACED double-quoted -c value, wrapped) → TREE (r5 ALLOWED)');
+  ok(scanBashMutation(`exec git -c core.x=a\\ b reset --hard`).tree === true, 'r6: `exec git -c core.x=a\\ b reset` (ESCAPED-space -c value, wrapped) → TREE (r5 ALLOWED)');
+  ok(scanBashMutation(`timeout 5 git -C 'a b' checkout -- f`).tree === true, 'r6: `timeout 5 git -C \'a b\' checkout -- f` (SPACED -C dir value, wrapped) → TREE (r5 ALLOWED)');
+  ok(scanBashMutation(`exec git -C 'a b' reset --hard`).tree === true, 'r6: `exec git -C \'a b\' reset` — the r5-PINNED residual, now CLOSED (was accepted out-of-contract, now caught)');
+
+  /* ──────── r6 — OBFUSCATION forms r5 could not catch, now CLOSED (welcome tightening)
+   * r6's wider net (`git` as a word + any mutator word after it) catches forms r5's
+   * option-skipping regex missed, because the LITERAL words `git`/`reset` are present
+   * in the text even when quoted. These moved from "accepted out-of-contract" (r5) to
+   * CLOSED. If a future change stops catching one WITHOUT reopening a wrapper hole, the
    * pin must be updated deliberately. */
-  ok(!scanBashMutation(`exec 'git' reset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): a QUOTED command word `exec \'git\' reset` is not caught (obfuscation, documented residual)');
-  ok(!scanBashMutation(`exec g\\it reset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): an ESCAPED command word `exec g\\it reset` is not caught (documented residual)');
-  ok(!scanBashMutation(`exec git $'reset' --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): an ANSI-C quoted verb `$\'reset\'` is not caught (documented residual)');
-  ok(!scanBashMutation(`exec git re\\\nset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): a backslash-newline inside the verb is not caught (documented residual)');
-  ok(!scanBashMutation(`exec git -C 'a b' reset --hard`).tree, 'r5 OUT-OF-CONTRACT (pinned): a `-C` value with an embedded space is not caught (documented residual)');
+  ok(scanBashMutation(`exec 'git' reset --hard`).tree === true, 'r6 CLOSED (was r5 out-of-contract): a QUOTED command word `exec \'git\' reset` → TREE (the word `git` is still in the text)');
+  ok(scanBashMutation(`exec git $'reset' --hard`).tree === true, 'r6 CLOSED (was r5 out-of-contract): an ANSI-C quoted verb `exec git $\'reset\'` → TREE (the word `reset` is still in the text)');
+
+  /* ──────── r6 — OUT-OF-CONTRACT that REMAINS (pinned, documented residual) ─────
+   * What r6 still cannot catch is only a form that breaks the LETTERS of `git` or the
+   * verb itself, so the word is NEVER present in the text — a backslash INSIDE the
+   * word. No agent writes these by accident (the user's intent: stop mistakes by
+   * NON-malicious agents, not malicious ones), and a text classifier cannot close
+   * shell obfuscation (r1/r2/r3 proved parsing the shell unsound). Each classifies
+   * NOT-whole-tree (it would slip a lock); pinned so a SILENT change is noticed. */
+  ok(scanBashMutation(`exec g\\it reset --hard`).tree === true, 'r9 CLOSED (was r6 out-of-contract): a backslash INSIDE the `git` word `exec g\\it reset` — the dequoted-copy net removes `\\` → `git` reassembled → TREE');
+  ok(!scanBashMutation(`exec git re\\\nset --hard`).tree, 'r9 OUT-OF-CONTRACT (pinned, residual): a backslash-NEWLINE inside the verb `re\\<nl>set` — removing `\\` leaves the newline, so `reset` is still not a contiguous word → not caught (documented residual)');
+
+  /* ──────── r7 — INDIRECTION: the documented limit (pinned, orchestrator option C) ─
+   * A shell-TEXT scan sees only a verb LITERALLY present in the command text. A verb
+   * produced by the shell at RUN time — a variable, stdin into a verb-reading wrapper,
+   * a loop var — is unknowable to any text classifier and out of contract (the user's
+   * intent: stop MISTAKES by non-malicious agents; these forms do not arise by accident,
+   * and the structural protection for real concurrent work is lane snapshots/worktrees,
+   * not this heuristic). r1/r2/r3 proved PARSING the shell to recover them is unsound.
+   * Refuted live: openai/anthropic run 317f770a — these 3 cases are the ones it found.
+   * Each classifies NOT-whole-tree today; PINNED so a SILENT change is noticed. If a
+   * future change DOES catch one without reopening a wrapper hole, update this pin. */
+  ok(!scanBashMutation(`echo reset --hard | xargs git`).tree, 'r7 INDIRECTION (pinned, out-of-contract): verb via STDIN `echo reset --hard | xargs git` — the verb sits BEFORE `git`, fed by xargs; no `git <verb>` in the text → not caught (documented residual, run 317f770a)');
+  ok(!scanBashMutation(`OP=reset; git $OP --hard`).tree, 'r7 INDIRECTION (pinned, out-of-contract): verb via a shell VARIABLE `OP=reset; git $OP --hard` (even UNWRAPPED — the head-git branch does not expand vars) → not caught (documented residual, run 317f770a)');
+  ok(scanBashMutation(`git checkout -- held2.txt; echo reset --hard | xargs git`).tree === true, 'r9 (was r7 residual): a COMBINED line carrying a LITERAL `git checkout` beside a stdin-fed wrapped reset → whole-tree (the `;` makes it non-simple and the net matches the literal `git … checkout`; the indirection-borne wipe is still not individually detected, but the line as a whole is now caught — a strict improvement, run 317f770a)');
+
+  /* ──────── r6 — ACCEPTED OVER-REFUSAL (pinned, now BROADER than r5) ────────────
+   * The net is a TEXT scan with no subcommand-position parse (r1/r2/r3 proved parsing
+   * the raw string unsound — it is what let wrappers through). So ANY command whose
+   * text has the word `git` followed later by a tree-mutator word classifies whole-tree.
+   * r5 needed a literal `git <mutator>` adjacency; r6 needs only a mutator WORD anywhere
+   * after `git` — so a commit MESSAGE with ordinary prose containing `apply`/`merge`/…
+   * now over-refuses. The ONLY consequence is a refusal while a FOREIGN lock is held; it
+   * fails safe and costs a reworded message or a retry. The orchestrator ACCEPTS this
+   * broadening (over-refusal is a documented residual; a false ALLOW is the real break).
+   * If a future change narrows it WITHOUT reopening a wrapper hole, update this pin. */
+  ok(scanBashMutation(`git commit -m "Document git reset usage"`).tree === true, 'r6 OVER-REFUSAL (pinned, accepted): `git commit -m "...git reset..."` → whole-tree (r5 also caught this; fails safe)');
+  ok(scanBashMutation(`git log --grep "git reset"`).tree === true, 'r6 OVER-REFUSAL (pinned, accepted): `git log --grep "git reset"` → whole-tree (fails safe)');
+  ok(scanBashMutation(`git commit -m "fix the apply bug"`).tree === true, 'r6 OVER-REFUSAL (pinned, NEW in r6): a commit message with a lone mutator word (`apply`) and NO `git <mutator>` adjacency NOW → whole-tree (r5 left this a non-mutation; accepted broadening)');
+  // The over-refusal still does NOT fire without a mutator WORD after `git`: an
+  // ordinary message with no tree-mutator word is NOT a mutation.
+  ok(!scanBashMutation(`git commit -m "normal message"`).mutates, 'r6 guard: an ordinary commit message (no tree-mutator word after `git`) is NOT a mutation');
+  ok(!scanBashMutation(`git commit -m "update the docs and tests"`).mutates, 'r6 guard: a benign message with no mutator word stays a non-mutation (over-refusal needs a mutator word to fire)');
+
+  /* ──────── r8 — SUBSTITUTION DEFLATES THE COUNT (anthropic run d3bcfc7e…) ───────
+   * r6's surplus-count net could be DEFLATED: a command substitution in a git
+   * GLOBAL-OPTION VALUE carries a path-scoped git mutator INSIDE the substitution.
+   * Its recursive scan raised the head-`git` count to EQUAL the raw-string count, so
+   * `count > head` was false and the LITERAL outer tree-wipe (`reset --hard`, `clean
+   * -fdx`) was dropped → ALLOWED under a foreign lock. Both the git word AND the
+   * mutator verb are literally on the line, so this is an IN-CONTRACT false ALLOW.
+   * The orchestrator's rule (a): a line carrying ANY substitution (`$(`, a backtick,
+   * `<(`, `>(`) AND ANY git-tree-mutator match → WHOLE-TREE, uncounted. Each of the 3
+   * cited forms (+ backtick and process-substitution variants) was a must-FAIL on the
+   * r6/r7 code (verified: returned `paths:[…]`, keying the scoped decoy only). */
+  ok(scanBashMutation(`timeout 60 git -C "$(git restore scripts/other.txt; pwd)" reset --hard`).tree === true, 'r8 cited#1: a `$(…)` in a `-C` VALUE holding a scoped `git restore`, beside a literal `reset --hard` → TREE (r7 keyed it to other.txt and ALLOWED the reset)');
+  ok(scanBashMutation(`xargs git -c user.name="$(git checkout -- scripts/other.txt; echo bot)" reset --hard`).tree === true, 'r8 cited#2: a `$(…)` in a `-c` config VALUE holding a scoped `git checkout`, beside a literal `reset --hard` → TREE (r7 keyed it to other.txt and ALLOWED the reset)');
+  ok(scanBashMutation(`exec git -C \`git rm --cached scripts/other.txt; pwd\` clean -fdx`).tree === true, 'r8 cited#3: a BACKTICK substitution in a `-C` value holding a scoped `git rm`, beside a literal `clean -fdx` → TREE (r7 keyed it to other.txt and ALLOWED the clean)');
+  ok(scanBashMutation(`git checkout -- scripts/other.txt < <(git reset --hard)`).tree === true, 'r8 `<(` process-substitution variant: a scoped checkout with a tree-wipe in a `<(…)` → TREE');
+  ok(scanBashMutation(`git checkout -- scripts/other.txt > >(git reset --hard)`).tree === true, 'r8 `>(` process-substitution variant → TREE');
+  // Over-refusals ADDED by rule (a): a CLEAN scoped git mutator whose argument comes
+  // from a substitution, and a substitution BODY that is itself a scoped mutator, now
+  // classify whole-tree. Accepted direction (refused only while a foreign lock is held).
+  ok(scanBashMutation(`git checkout -- "$(cat paths.txt)"`).tree === true, 'r8 OVER-REFUSAL (accepted, NEW): a clean scoped `git checkout -- "$(cat paths.txt)"` now → whole-tree (was path-scoped; fails safe under a lock)');
+  ok(scanBashMutation(`git restore "$(echo src/a.ts)"`).tree === true, 'r8 OVER-REFUSAL (accepted, NEW): a clean scoped `git restore "$(…)"` now → whole-tree');
+  ok(scanBashMutation(`echo "$(git checkout -- f)"`).tree === true, 'r8 OVER-REFUSAL (accepted, NEW): a benign `echo "$(git checkout -- f)"` wrapping a scoped mutator now → whole-tree');
+  // Guards: rule (a) needs BOTH a substitution AND a git+mutator word. Neither alone trips it.
+  ok(!scanBashMutation(`S=$(mktemp -d); echo x > $S/out.txt`).mutates, 'r8 guard: a substitution with NO git+mutator word (`$(mktemp -d)`) is unaffected (stays a non-mutation)');
+  ok(!scanBashMutation(`git commit -m "$(cat msg.txt)"`).mutates, 'r8 guard: a `$(…)` in a commit message with NO tree-mutator word stays a non-mutation (needs a mutator word to trip)');
+  ok(scanBashMutation(`git checkout -- src/a`).paths?.[0] === 'src/a' && !scanBashMutation(`git checkout -- src/a`).tree, 'r8 guard: a git+mutator with NO substitution stays path-scoped (rule (a) needs a substitution token)');
+  // r8 indirection pins UNCHANGED: a verb produced ONLY by a variable/STDIN, with no
+  // literal git+verb AND no substitution token on the line, still is NOT caught.
+  ok(!scanBashMutation(`OP=reset; git $OP --hard`).tree, 'r8 guard: the r7 `$OP` variable pin is NOT a substitution (`$O`≠`$(`) and stays out-of-contract (not tree)');
+  ok(!scanBashMutation(`echo reset --hard | xargs git`).tree, 'r8 guard: the r7 STDIN indirection pin (no substitution token) stays out-of-contract (not tree)');
+  // r8 END-TO-END (the user's reality): the 3 cited forms are REFUSED under the SAME
+  // foreign out-of-repo scratch lock that the live jam involved.
+  const subC = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `timeout 60 git -C "$(git restore scripts/other.txt; pwd)" reset --hard` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!subC.allow && subC.busy && subC.holder?.owner === A, 'r8 POST: the `-C "$(…)"` deflation form is REFUSED under the foreign lock (r7 ALLOWED it — keyed to other.txt)');
+  const subc = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `xargs git -c user.name="$(git checkout -- scripts/other.txt; echo bot)" reset --hard` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!subc.allow && subc.busy, 'r8 POST: the `-c "$(…)"` deflation form is REFUSED under the foreign lock (r7 ALLOWED it)');
+  const btick = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `exec git -C \`git rm --cached scripts/other.txt; pwd\` clean -fdx` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!btick.allow && btick.busy, 'r8 POST: the backtick deflation form is REFUSED under the foreign lock (r7 ALLOWED it)');
+  // And the sanctioned bare index-only landing (no substitution) is STILL allowed.
+  const stillLanded = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(stillLanded.allow, 'r8 POST: the bare `git apply --cached <path>` landing (no substitution) is STILL ALLOWED under the foreign lock (the exemption survives r8)');
+
+  /* ──────── r9 — DECOY-SPLIT deflates the count; the count is REMOVED (run 4791d92b…)
+   * r5–r8 compared a raw-string mutator COUNT with the tokenizer's head-`git` count. The
+   * raw count ran the verb regex on STILL-QUOTED text while the head count was taken on the
+   * UNQUOTED word, so a quote/escape-SPLIT decoy verb (`git "che"ckout -- f`) UNDER-COUNTED
+   * the raw side, equalised the counts, and a LITERAL wrapped tree-wipe beside it slipped a
+   * foreign lock (the un-split control WAS refused). r9 removes counting entirely: a git
+   * mutator is path-scoped ONLY on a SIMPLE line (isSimpleLine); every OTHER net match —
+   * tested on the RAW text AND a quote/escape-stripped copy — is whole-tree. Each decoy case
+   * below was a MEASURED must-FAIL on the r8 code (probed live: returned `paths:["f"]`). */
+  ok(scanBashMutation(`git "che"ckout -- f; xargs git reset --hard`).tree === true, 'r9 cited: a QUOTE-SPLIT decoy verb `git "che"ckout` beside a wrapped `reset --hard` → TREE (r8 keyed it to `f`; the dequoted-copy net reassembles `checkout` and the `;` makes the line non-simple)');
+  ok(scanBashMutation(`git ""checkout -- f; xargs git reset --hard`).tree === true, 'r9: an EMPTY-QUOTE split `git ""checkout` beside a wrapped reset → TREE');
+  ok(scanBashMutation(`git che\\ckout -- f; xargs git reset --hard`).tree === true, 'r9 cited: a BACKSLASH-split verb `git che\\ckout` beside a wrapped reset → TREE (the dequoted copy removes `\\`)');
+  ok(scanBashMutation(`git "che"ckout -- f; xargs git stash`).tree === true, 'r9 cited: the same decoy split beside a wrapped `stash` → TREE (any mutator verb)');
+  ok(scanBashMutation(`git checkout -- f; xargs git reset --hard`).tree === true, 'r9: the un-split control (combined wrapped reset) stays TREE');
+
+  // r9 SIMPLE-line predicate + the forms that keep a narrow path-scoped key.
+  ok(isSimpleLine(`git checkout -- src/a`) === true, 'r9 predicate: a bare single git command, no separator/quote/substitution/wrapper → SIMPLE');
+  ok(isSimpleLine(`git -C a -C b restore x`) === true, 'r9 predicate: git global options do NOT make a line non-simple → SIMPLE');
+  ok(isSimpleLine(`git checkout -- f && git checkout -- g`) === false, 'r9 predicate: a `&&` separator → NOT simple');
+  ok(isSimpleLine(`git checkout -- f | xargs git reset`) === false, 'r9 predicate: a `|` pipe → NOT simple');
+  ok(isSimpleLine(`sh -c "git checkout -- f"`) === false, 'r9 predicate: a wrapper head (sh -c) → NOT simple');
+  ok(isSimpleLine(`exec git checkout -- f`) === false, 'r9 predicate: a wrapper head (exec) → NOT simple');
+  ok(isSimpleLine(`git checkout -- "a b.txt"`) === false, 'r9 predicate: a quote (even only in a path) → NOT simple (conservative; accepted over-refusal)');
+  ok(isSimpleLine(`git checkout -- "$(cat p)"`) === false, 'r9 predicate: a command substitution → NOT simple');
+  ok(scanBashMutation(`git checkout -- src/a`).paths?.[0] === 'src/a' && !scanBashMutation(`git checkout -- src/a`).tree, 'r9 guard: a SIMPLE `git checkout -- f` is path-scoped');
+  ok(scanBashMutation(`git restore src/b`).paths?.[0] === 'src/b', 'r9 guard: a SIMPLE `git restore f` is path-scoped');
+  ok(scanBashMutation(`git -C a -C b restore x`).paths?.[0] === 'a/b/x', 'r9 guard: a SIMPLE `git -C a -C b restore x` is path-scoped (global options composed)');
+
+  // r9 END-TO-END: the decoy-split is REFUSED under the SAME foreign out-of-repo scratch lock.
+  const decoy = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `git "che"ckout -- scripts/other.txt; xargs git reset --hard` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(!decoy.allow && decoy.busy && decoy.holder?.owner === A, 'r9 POST: the decoy-split `git "che"ckout … ; xargs git reset --hard` is REFUSED under the foreign lock (r8 keyed it to other.txt and ALLOWED the reset)');
+  const r9Landed = evaluateFileLock({ toolName: 'Bash', toolInput: { command: `${APPLY} --cached scripts/git-write-policy.mjs.patch` }, lockDir, repoRoot: repo, owner: LANDER });
+  ok(r9Landed.allow, 'r9 POST: the bare `git apply --cached <path>` landing (a SIMPLE line) is STILL ALLOWED under the foreign lock (the exemption survives r9)');
 }
 
 console.log(`\n${fail === 0 ? 'PASS' : 'FAIL'} — ${pass} passed, ${fail} failed`);

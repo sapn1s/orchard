@@ -312,70 +312,126 @@ export function isIndexOnlyApplyExempt(command) {
   return typeof command === 'string' && INDEX_ONLY_APPLY_RE.test(command.trim());
 }
 
-/* ── BUG-277 r4/r5: the WRAPPER-HOLE whole-tree safety net ─────────────────────
+/* ── BUG-277 r4–r9: the WRAPPER-HOLE / COMPOUND-LINE whole-tree safety net ─────
  *
  * The tokenizer only reaches git's classifier when `git` is the segment HEAD (or a
  * NOOP-head/`sh -c`/`env` preamble it unwraps). A WRAPPER that passes its args to git
- * without being one of those — `exec git …`, `xargs git …`, `timeout 5 git …`,
- * `nohup`/`command`-around forms not already unwrapped — never reaches the git branch,
- * so the segment classifies as NO mutation and a tree-wiping `git checkout`/`reset`/
- * `apply`/… slips every lock (proven live: run 7fe2cf90… for apply; and the r4 probe
- * showed the SAME hole for checkout/restore/reset/stash/clean — it is per-wrapper, not
- * per-verb). We do NOT try to model which wrapper it is: per the r3 lesson (the shell
- * does arbitrary things before git runs), we take a plain WHOLE-STRING regex. It
- * matches a `git` token followed — after only git's own global options — by any
- * GIT_TREE_MUTATORS verb. Over-refusal is acceptable and expected (e.g.
- * `echo "git apply …"` is refused); under-refusal is the defect this closes.
+ * without being one of those — `exec git …`, `xargs git …`, `timeout 5 git …` — never
+ * reaches the git branch, so a tree-wiping `git checkout`/`reset`/`apply`/… would slip
+ * every lock (proven live: run 7fe2cf90… for apply; the r4 probe showed the SAME hole
+ * for checkout/restore/reset/stash/clean — it is per-wrapper, not per-verb). And a
+ * COMBINED line can carry a wrapped tree-wipe BESIDE a path-scoped mutator (`git
+ * checkout -- f; xargs git reset --hard`, run 648f8f34…). We do NOT model which wrapper
+ * it is: per the r3 lesson (the shell does arbitrary things before git runs), we use a
+ * plain WHOLE-STRING lazy regex `\bgit\b[\s\S]*?\b(verb)\b` (hasWrappedGitTreeMutator):
+ * `git` as a WORD followed anywhere later by any GIT_TREE_MUTATORS verb as a word. The
+ * lazy span swallows every global option and value, so no spaced/unknown option value
+ * can evade it (the r5→r6 lesson: openai run 01a17e2b…).
  *
- * r5 — run the net on EVERY top-level command, NOT only at the `mutates:false` exit.
- * r4 gated it on `mutates:false`, so a COMBINED line that carries BOTH a path-scoped
- * mutation AND a wrapped whole-tree mutator (`git checkout -- f; xargs git reset
- * --hard`) keyed the lock to `f` only and the wrapped `reset --hard` slipped (anthropic
- * run 648f8f34…). Now `scanBashMutation` COUNTS git-tree-mutator occurrences in the raw
- * string (`countGitTreeMutators`) and compares that with how many it classified as a
- * head `git` (scoped, or early-returned whole-tree). A SURPLUS means a git mutator the
- * tokenizer never saw — wrapped, or sitting beside an already-scoped one — so the line
- * mutates the whole tree: the union of what we scoped and the wrapped mutator, the
- * strongest wins. EQUAL counts mean every git mutator was seen and individually
- * classified, so a CLEAN `git checkout -- f` (count 1 = head 1) keeps its narrow
- * per-file key, not widened to the tree.
+ * ── r9 (anthropic run 4791d92b…): a SIMPLE line is the ONLY path-scope, no counting ──
+ * r5–r8 decided wrap-vs-clean by COMPARING a raw-string mutator COUNT with the
+ * tokenizer's head-`git` count. That comparison is DEFLATABLE BY CONSTRUCTION: the raw
+ * count ran the verb regex on still-QUOTED text while the head count was taken on the
+ * UNQUOTED word, so a quote/escape-SPLIT decoy verb (`git "che"ckout -- f`) under-counted
+ * the raw side, equalised the counts, and a LITERAL wrapped tree-wipe beside it slipped a
+ * foreign lock. Every r5–r8 break was one more deflation (wrapped verb, spaced option
+ * value, substitution-in-value, decoy-split). So the COUNT IS GONE. The r9 rule:
+ *   • A git tree-mutator keeps a narrow PATH-SCOPED key ONLY on a SIMPLE line
+ *     (isSimpleLine — see that function): one command, no separator, no substitution,
+ *     no quote/escape, a bare `git` head. Nothing on such a line can hide or split a
+ *     second mutator, so the tokenizer's path-scoping is trustworthy.
+ *   • EVERY OTHER line on which the net matches is WHOLE-TREE — the net tested on the
+ *     RAW text AND on a copy with `"`, `'` and `\` removed, so a quote/escape-split
+ *     `git`/verb word is reassembled and caught. A compound or wrapped git-mutator line
+ *     cannot be path-scoped at all, so NO decoy can narrow it back to one key.
+ *   • A line with no net match is unchanged (not a git mutation, or already classified).
  *
- * The verb must sit in the SUBCOMMAND position (after `git` and its global options
- * only), so a mutator word inside a later arg — `git commit -m "apply the reset fix"`
- * — does NOT match and a benign commit is never refused. Global value-options
- * (`-C <dir>`, `-c <cfg>`, …) consume their following value so `git -C . apply` still
- * matches. `git` must be a standalone/pathed token (`/usr/bin/git`, `(git …`,
- * `` `git … ``), never a substring (`digit`, `mygit`).
+ * ── ACCEPTED OVER-REFUSAL (now WIDER than r8, still fails safe) ───────────────
+ * The net is a TEXT scan with no subcommand-position parse (r1/r2/r3 proved parsing the
+ * raw string unsound — it is what let wrappers through). So ANY non-simple line whose
+ * text has `git` followed later by a tree-mutator word classifies whole-tree, whether
+ * that word is a real subcommand, ordinary prose in a quoted argument, OR a clean mutator
+ * on a compound/wrapped line:
+ *   • `git commit -m "Document git reset usage"`, `git log --grep "git reset"`, a commit
+ *     message with a lone mutator word (`apply`, `merge`, `pull`, `clean`, … are common
+ *     English) — the quotes make the line non-simple, and the net matches;
+ *   • NEW in r9 — a clean but COMPOUND/WRAPPED git mutator: `git checkout -- f && git
+ *     checkout -- g`, `git status && git checkout -- f`, `sh -c "git checkout -- f"`, or
+ *     a git mutator with a QUOTED path. r5–r8 kept these path-scoped; r9 widens them to
+ *     whole-tree because a non-simple line is never eligible for a narrow key.
+ * The ONLY consequence is a refusal while a FOREIGN lock is held — a retry or a reworded
+ * command passes, and it FAILS SAFE. The orchestrator ACCEPTS this (over-refusal is a
+ * documented residual; a false ALLOW is the real break). A benign SIMPLE
+ * `git status`/`git add`/`git log`/`git diff` with no mutator verb stays a non-mutation.
+ * Pinned in the verify suite (section 10).
  *
  * ── OUT OF CONTRACT (accepted residual, pinned below) ────────────────────────
  * This guard protects against MISTAKES by non-malicious agents (the user's stated
- * intent: "stop autonomous noise and broken main, not malicious agents"). DELIBERATELY
- * OBFUSCATED shell is out of contract and NOT closed here — a text classifier cannot
- * close shell obfuscation, and no agent writes these by accident:
- *   • a quoted or escaped command word — `exec 'git' reset`, `g\it reset`;
- *   • an ANSI-C quoted verb — `exec git $'reset'`;
- *   • a backslash-newline inside the command word — `g\<newline>it reset`;
- *   • a `-C` global value that itself contains a space — `exec git -C 'a b' reset`.
- * Each tokenises/reads to something the whole-string regex does not match, so it
- * classifies NOT-whole-tree and would slip a foreign lock. The forms are PINNED as
- * "accepted out-of-contract" in the verify suite (section 10) so a silent change to
- * their classification is noticed; they are documented, not silently ignored.
+ * intent: "stop autonomous noise and broken main, not malicious agents"). What the r9
+ * net still cannot catch is only a form in which NO literal `git`+verb words survive even
+ * after quote/escape removal, so the net never matches:
+ *   • a backslash-NEWLINE inside the verb — `exec git re\<nl>set` — removing `\` leaves
+ *     the newline, so `reset` is still not a contiguous word (the LETTERS are broken by a
+ *     real line break, not just a quote). The quote/escape-split and backslash-in-word
+ *     forms r5/r6 could NOT catch (`exec g\it reset`, `git "che"ckout`) ARE now caught by
+ *     the dequoted net.
+ *   • INDIRECTION — the verb (or the `git` word) is produced by the shell at RUN time,
+ *     never typed: a shell VARIABLE (`OP=reset; git $OP --hard`, even unwrapped), STDIN
+ *     into a verb-reading wrapper (`echo reset --hard | xargs git` — the verb sits BEFORE
+ *     `git`), command substitution / eval / a script file / `python -c` bodies. These do
+ *     not arise by accident; the structural protection for real concurrent work is the
+ *     lane snapshots (FEAT-176) and per-ticket worktrees (FEAT-191), NOT this heuristic.
+ *     (A combined line whose INDIRECTION-borne wipe sits beside a LITERAL `git <verb>` is
+ *     now caught via that literal — the line as a whole is non-simple + matches the net;
+ *     only the pure-indirection line, with no literal verb after `git`, stays uncaught.)
+ * r1/r2/r3 proved the inverse — PARSING the shell to recover these — is unsound and is
+ * exactly what let wrappers through. Refuted live across the round history: runs
+ * 317f770a (indirection), d3bcfc7e (substitution), 4791d92b (decoy-split). All PINNED
+ * "accepted out-of-contract / indirection" in the verify suite (section 10) so a SILENT
+ * change to their classification is noticed; documented, not hidden.
  */
-const _GIT_GLOBAL_VALUE_OPT = '-C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env|--super-prefix|--attr-source';
-const _GIT_GLOBAL_OPT = `(?:(?:${_GIT_GLOBAL_VALUE_OPT})[ \\t]+\\S+|--?[^\\s]+)`;
 // longest-first where a verb is a prefix of another (checkout-index before checkout).
 const _GIT_TREE_MUTATOR_VERB = 'checkout-index|checkout|cherry-pick|read-tree|switch|restore|reset|rebase|revert|stash|clean|rm|mv|merge|pull|apply|am';
-const _WRAPPED_GIT_TREE_MUTATOR_SRC = `(?<![\\w-])git[ \\t]+(?:${_GIT_GLOBAL_OPT}[ \\t]+)*(?:${_GIT_TREE_MUTATOR_VERB})(?![\\w-])`;
+const _WRAPPED_GIT_TREE_MUTATOR_SRC = `\\bgit\\b[\\s\\S]*?\\b(?:${_GIT_TREE_MUTATOR_VERB})\\b`;
 const WRAPPED_GIT_TREE_MUTATOR_RE = new RegExp(_WRAPPED_GIT_TREE_MUTATOR_SRC);
-const WRAPPED_GIT_TREE_MUTATOR_RE_G = new RegExp(_WRAPPED_GIT_TREE_MUTATOR_SRC, 'g');
+/**
+ * Does any `git <...> <tree-mutator-verb>` match appear anywhere on the line? The lazy
+ * span between `git` and the verb swallows every global option and value (incl. spaced
+ * ones), so it cannot be evaded by an option-value trick (the r5/r6 lesson). `git` and
+ * the verb are matched as WORDS, never substrings (`digit`, `mygit` do not match). The
+ * r9 net runs this on the RAW command AND on a quote/escape-stripped copy, so a
+ * quote/escape-SPLIT `git` or verb word is reassembled and still caught.
+ */
 export function hasWrappedGitTreeMutator(command) {
   return typeof command === 'string' && WRAPPED_GIT_TREE_MUTATOR_RE.test(command);
 }
-/** How many `git <global-opts> <tree-mutator-verb>` occurrences the raw string carries (r5). */
-export function countGitTreeMutators(command) {
-  if (typeof command !== 'string') return 0;
-  const m = command.match(WRAPPED_GIT_TREE_MUTATOR_RE_G);
-  return m ? m.length : 0;
+/*
+ * BUG-277 r9: a SIMPLE line is the ONLY shape on which a git tree-mutator may keep a
+ * narrow PATH-SCOPED key instead of widening to the whole tree. It is exactly ONE
+ * command with nothing that can hide or split a second mutator from the tokenizer:
+ *   • no command separator (`;` `&&` `||` `|` newline `&`) — so it is a single command;
+ *   • no command or process substitution (`$(` ` ` `` ` <(` `>(`) — so a value cannot
+ *     carry a smuggled decoy mutator (the r8 deflation);
+ *   • no quote or escape character ANYWHERE — so neither the `git` word nor the verb
+ *     word can be split (`git "che"ckout`, `exec g\it reset` — the r8 decoy / r6 word
+ *     obfuscation), and a quoted argument cannot mask structure;
+ *   • a BARE `git` head (optionally path-qualified `…/git`), never a wrapper
+ *     (exec/xargs/env/timeout/command/nohup/sh -c/…) — so the one command IS the git
+ *     invocation the tokenizer parsed, not a wrapper hiding it.
+ * On such a line the tokenizer saw the git subcommand directly, so its path-scoping is
+ * trustworthy. Every OTHER line that carries a git+mutator match is whole-tree (see the
+ * depth-0 net in scanBashMutation). Deliberately conservative: a quoted path, a leading
+ * env-assignment, or any compound/wrapped form is non-simple and widens to the net —
+ * an ACCEPTED over-refusal (it only ever refuses MORE under a foreign lock).
+ */
+export function isSimpleLine(command) {
+  if (typeof command !== 'string') return false;
+  const c = command.trim();
+  if (/[;&|\n]/.test(c)) return false;              // a separator / background / pipe
+  if (/\$\(|`|<\(|>\(/.test(c)) return false;        // command or process substitution
+  if (/['"\\]/.test(c)) return false;                // any quote or escape (could split a word)
+  if (!/^(?:\S*\/)?git[ \t]/.test(c)) return false;  // head must be a bare `git`, not a wrapper
+  return true;
 }
 
 export function classifyMutation({ toolName, toolInput } = {}) {
@@ -779,10 +835,6 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
   const allPaths = [];
   const scopes = [];
   let kind = null;
-  // r5: how many git tree-mutators the tokenizer saw as a head `git` subcommand.
-  // Compared at the exit with countGitTreeMutators(command): a surplus in the raw
-  // string is a wrapped/combined-line mutator the tokenizer missed → whole-tree.
-  let gitHeadMutators = 0;
   /*
    * The command's EFFECTIVE cwd, tracked across `&&`/`;`-joined segments so a
    * `cd sub && sed -i f` keys `f` as `sub/f`, not `f` (round-1 gap #b), and
@@ -802,11 +854,6 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
   const merge = (r) => {
     if (!r || !r.mutates) return null;
     if (r.tree) return r;
-    // r5: carry the child's resolved git-mutator count up so the depth-0 net
-    // discounts a git mutator classified through recursion (`sh -c "git checkout
-    // -- f"`), not just a direct head `git`. Else the raw-string regex count would
-    // exceed the (direct-only) head count and falsely widen the recursed scope.
-    gitHeadMutators += r.gitMutators || 0;
     for (const p of r.paths || []) place(p, p);
     for (const s of r.scopes || []) {
       if (s.dir == null) scopes.push(s);
@@ -881,7 +928,6 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
     if (head === 'git') {
       const parsed = gitSubcommand(args);
       if (parsed && GIT_TREE_MUTATORS.has(parsed.sub)) {
-        gitHeadMutators++; // seen as a head git subcommand; the net discounts it
         const tgt = gitMutationTarget(parsed.sub, parsed.args);
         if (tgt.tree) return { mutates: true, tree: true, kind: `git ${parsed.sub}` };
         // `git -C a -C b …` resolves pathspecs under a/b (absolute -C resets the base).
@@ -1029,13 +1075,44 @@ export function scanBashMutation(command, depth = 0, ctx = null) {
   // reset --hard`). Either way the line mutates the whole tree — the union, strongest
   // wins. Equal counts leave a clean path-scoped `git checkout -- f` narrow. Depth 0
   // only (the raw command, not a recursively-scanned fragment).
-  if (depth === 0 && countGitTreeMutators(command) > gitHeadMutators) {
-    return { mutates: true, tree: true, kind: 'git (wrapped tree mutation)' };
+  if (depth === 0) {
+    // BUG-277 r9 (anthropic run 4791d92b…): the r5–r8 SURPLUS-COUNT comparison is
+    // DEFLATABLE BY CONSTRUCTION, so it is gone. countGitTreeMutators ran the verb
+    // regex on the RAW (still-quoted) string while the head-`git` count was taken
+    // AFTER the tokenizer UNQUOTES the word — so a quote/escape-SPLIT decoy verb
+    // (`git "che"ckout -- f`) under-counted the raw side, equalised the two counts,
+    // and a LITERAL wrapped tree-wipe beside it slipped a foreign lock. Each r5–r8
+    // break was simply one more way to deflate that count (wrapped verb, spaced
+    // option value, substitution-in-value, decoy-split). The replacement rule cannot
+    // be deflated because it never counts:
+    //   • A git tree-mutator stays PATH-SCOPED only on a SIMPLE line (isSimpleLine):
+    //     one command, no separator, no substitution, no quote/escape, a bare `git`
+    //     head. Nothing on such a line can hide or split a second mutator, so the
+    //     tokenizer's path-scoping (allPaths/scopes, computed above) is trusted.
+    //   • EVERY other line on which the lazy net matches is WHOLE-TREE. The net is
+    //     tested on the RAW text AND on a copy with `"`, `'` and `\` removed, so a
+    //     quote/escape-split `git` or verb word is reassembled and caught (closing the
+    //     r8 decoy-split and the r6 `exec g\it reset` word obfuscation). A compound or
+    //     wrapped line that carries a git+mutator cannot be path-scoped at all — so no
+    //     decoy can narrow it back to a single key (the whole class of r5–r8 breaks).
+    //   • A line with no net match is unchanged (not a git mutation, or already
+    //     classified above). The pure-INDIRECTION residuals — a verb reaching git only
+    //     via a variable/stdin with NO literal verb after `git` — produce no match and
+    //     stay OUT OF CONTRACT (documented + pinned; see the header block above).
+    //
+    // Over-refusal is the ACCEPTED direction and is WIDER than r8: a clean but
+    // COMPOUND/WRAPPED git mutator (`git checkout -- f && git checkout -- g`, `git
+    // status && git checkout -- f`, `sh -c "git checkout -- f"`, or a quoted path) now
+    // classifies whole-tree rather than path-scoped — refused only while a FOREIGN lock
+    // is held, costing a retry. The exempt bare landing (`git apply --cached <path>`, a
+    // simple line) returned at the top of this function and never reaches here.
+    const dequoted = command.replace(/['"\\]/g, '');
+    if ((hasWrappedGitTreeMutator(command) || hasWrappedGitTreeMutator(dequoted)) && !isSimpleLine(command)) {
+      return { mutates: true, tree: true, kind: 'git (compound/wrapped tree mutation)' };
+    }
   }
-  // `gitMutators` is internal: it lets a parent scan discount git mutators this
-  // (recursive) scan already resolved (see merge). Harmless on the public result.
-  if (!allPaths.length && !scopes.length) return { mutates: false, gitMutators: gitHeadMutators };
-  return { mutates: true, paths: allPaths, scopes, kind: kind ?? 'write', gitMutators: gitHeadMutators };
+  if (!allPaths.length && !scopes.length) return { mutates: false };
+  return { mutates: true, paths: allPaths, scopes, kind: kind ?? 'write' };
 }
 
 /* ─────────────────────────────────────────────────────── the top-level decision */

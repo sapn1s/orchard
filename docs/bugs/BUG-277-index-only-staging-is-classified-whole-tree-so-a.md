@@ -74,6 +74,87 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "IV 31d2fca^..55dd2dd (r4), VALID manifest-backed (openai quota→anthropic). r4 wrapped-mutator net slips: quoted/escaped git word, quoted/ANSI-C verb, backslash-newline before verb, quoted -C value w/space → mutates:false, ALLOWED under foreign lock. Plus r4-noted combined-line residual."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a17e1f-44de-7020-a002-78215f0bf82d",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T16:12:38.818Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "IV 31d2fca^..80ec84b (r5), openai/codex cross-provider, VALID. r5 count net over-refuses IN-CONTRACT benign text: git commit -m / git log --grep whose arg literally contains 'git <verb>' (e.g. git reset) -> whole-tree, refused under foreign lock. Combined-line close holds."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a17e2b-fa2b-7531-b1a2-4e4939432915",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T16:30:58.933Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "07265df4722ae57f36f3e34cc5ead256f051b9c5efdf8348d8aaf601fa4999af",
+      "verify_mode": "mixed-state",
+      "note": "IV r5+doc candidate, openai/codex, VALID. NEW FALSE-ALLOW (break, not the accepted over-refusal): a wrapped reset with a -c config value containing a SPACE is non-mutating and slips a foreign lock (spaced global-value defeats the net; same class as pinned -C space). Orchestrator decision needed."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "317f770a-9c30-45c0-b7d9-64e44706f372",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T16:55:18.025Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "f4f54cf7836e01b31145a5a835cd9e79f55eaf0b8ebf3b18234a311c2bb294c6",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "d3bcfc7e-0e24-4b74-9a31-89770bfba6b6",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T17:07:41.247Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "8ac18b339d725d8286cce4f667bd87866a256c415490f393d49bd3c4f4fab710",
+      "verify_mode": "mixed-state",
+      "note": "IV r7 doc/pin candidate (anthropic ran, openai req), VALID. Pins land 252/252. NEW false ALLOW in KEPT r6 code: literal wrapped tree-wipe ALLOWED under a foreign lock when a cmd-SUBSTITUTION in a -C/-c value holds a path-scoped git mutator (count deflates, net misses). Orchestrator call needed."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "4791d92b-e5b5-4364-a3c9-1994a73abad4",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T17:25:04.821Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "68718b7db3cdde871c3de7b9f50752389a6d833509d0f9589aa90ad26f4c607e",
+      "verify_mode": "mixed-state",
+      "note": "IV r8 VALID (anthropic; openai req). Rule (a) closes the 3 substitution forms. NEW break: a quote/escape-SPLIT decoy verb deflates the same count net with NO substitution (regex counts RAW quoted text; head uses unquoted word) so a literal wrapped reset slips. Orchestrator call needed."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "2c55fd7b-f20a-4615-9438-188da5e8d924",
+      "verdict": "broken",
+      "verdict_on": "2026-10-27",
+      "recorded_at": "2026-10-27T17:46:25.637Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "11dcf7fb3dc10bb15c89b234cb6af984a0116260586d4e0c982c6331e5dc878a",
+      "verify_mode": "mixed-state",
+      "note": "IV r9 VALID (anthropic; openai quota-spent). Charter CLOSED: count removed, SIMPLE-line rule, decoy-split class gone, 288/288. NEW pre-existing vector: gitMutationTarget keys WHOLE-REPO pathspecs narrow on a SIMPLE line -> false ALLOW, real-git wipe confirmed (restore :/ ; checkout -- * ; src/..)."
     }
   ],
   "verification_class": "fix",
@@ -200,3 +281,65 @@ Either is sufficient:
 - **Suites:** `verify-feat-129-file-lock.mjs` → PASS 240/240 (confined runner, scratch HOME pre-made). `npm run gate` → PASS (exit 0, read unpiped): leak-gate + typecheck clean.
 - **Files (unstaged):** `scripts/lib/file-lock.mjs`, `scripts/verify-feat-129-file-lock.mjs`, this ticket. (Did NOT touch `file-lock.d.mts`; left the FEAT-191 `checkPathsFree` hunk alone, per charter.)
 - **Risk bucket:** shared-tree safety path (regression-prone) — an independent clean-room verify pass IS warranted before close. r5 only ever WIDENS refusal for the combined/wrapped surplus; it never newly ALLOWS anything (the one preserved allow is the bare index-only landing, pinned). The obfuscation residual is explicitly OUT of contract per the orchestrator rescope, documented and pinned, not silently dropped.
+
+### 2026-10-27 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a17e1f-44de-7020-a002-78215f0bf82d — VERDICT: BROKEN — IV 31d2fca^..80ec84b (r5), openai/codex cross-provider, VALID. r5 count net over-refuses IN-CONTRACT benign text: git commit -m / git log --grep whose arg literally contains 'git <verb>' (e.g. git reset) -> whole-tree, refused under foreign lock. Combined-line close holds.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a17e2b-fa2b-7531-b1a2-4e4939432915 — VERDICT: BROKEN — mixed-state candidate 07265df4722a — IV r5+doc candidate, openai/codex, VALID. NEW FALSE-ALLOW (break, not the accepted over-refusal): a wrapped reset with a -c config value containing a SPACE is non-mutating and slips a foreign lock (spaced global-value defeats the net; same class as pinned -C space). Orchestrator decision needed.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — worker (dispatch, round 5 residual doc) — accepted OVER-refusal documented; a NEW false-ALLOW surfaced (orchestrator decision)
+
+Charter task (no code change): record the r5 over-refusal (openai run `01a17e1f-44de-7020-a002-78215f0bf82d`) as an ACCEPTED residual per WA §N KEEP.
+
+- **Over-refusal residual — DOCUMENTED (KEEP).** The whole-string count net is a TEXT scan: it cannot tell a git tree-mutator in the SUBCOMMAND position from the same two words inside a QUOTED ARGUMENT. So a benign command whose argument literally contains a git-mutator verb — a commit `-m` message or a `log --grep` pattern that mentions one — counts as a surplus and classifies whole-tree, refused only while a FOREIGN lock is held. It FAILS SAFE (a reworded message or a retry after the lock clears); the alternative (subcommand-position parsing of the raw string) is exactly the shell parsing r1/r2/r3 proved unsound and what let wrappers through in r3/r4. Added a header block in `scripts/lib/file-lock.mjs` (the wrapper-net comment) stating the residual and why, and PINNED it in `scripts/verify-feat-129-file-lock.mjs` section 10: the two over-refusal forms assert `tree === true` (accepted), plus two guards that an ordinary message WITHOUT a literal git-mutator verb stays not-a-mutation (the over-refusal is narrow). No behavioural code change. Suite → **PASS 244/244** (was 240, +4 pins), confined runner. `npm run gate` → PASS (exit 0).
+- **NEW break the step-3 IV surfaced — a FALSE ALLOW, escalated (NOT accepted by this lane).** The re-verification (openai/codex run `01a17e2b-fa2b-7531-b1a2-4e4939432915`, VALID) returned BROKEN on something the charter did NOT contemplate: a wrapped reset carrying a `-c` config value whose value contains a SPACE (a display name like `"First Last"`) classifies NON-mutating and slips a foreign lock — the whole-string net's global-value-option branch consumes only `\S+`, so it stops at the space and the verb after it never matches. A combined-line variant (`checkout -- f; <that wrapped reset>`) is also cited. This is the SAME mechanism as the r5-pinned `-C 'a b'` obfuscation residual, but a `-c <spaced value>` is a plausible, non-obfuscated form, and a false ALLOW is the defect this ticket exists to prevent. **This lane made NO code change for it** (charter said no code change) and does NOT fold it into the accepted-residual pins on its own authority. **Orchestrator decision required:** either (a) accept it as the same spaced-global-value residual class already pinned for `-C` (consistent with the r5 rescope), or (b) open a tightening round to make any global value-option carrying a quote/space force whole-tree. The ticket stays in_verification pending that call.
+- **Files changed (unstaged, for the user to commit):** `scripts/lib/file-lock.mjs` (header comment only — no behaviour change), `scripts/verify-feat-129-file-lock.mjs` (the accepted-over-refusal pins), `docs/bugs/BUG-277-…md` (this entry + INDEX via board:gen).
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 317f770a-9c30-45c0-b7d9-64e44706f372 — VERDICT: BROKEN — mixed-state candidate f4f54cf7836e. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — worker (dispatch, round 7) — INDIRECTION documented as the limit; NO code change (orchestrator option C, KEEP r6)
+Charter task (comments + pins only — r6's CODE stays as is): record the run-317f770a false-ALLOWs as an ACCEPTED out-of-contract residual, per the orchestrator's option-C decision.
+
+- **Orchestrator decision (WA §N, recorded as the agent's call — option C):** KEEP r6's code. The rule: a shell-TEXT scan can only see a mutator verb that is LITERALLY present in the command text. A verb that arrives by INDIRECTION is unknowable to ANY text classifier, so it is OUT of contract. Indirection = a shell variable (OP=reset then `git $OP`), stdin (`echo reset | xargs git`), command substitution, eval, a script file, or `python`/`node -c`. Why: this guard prevents MISTAKES by non-malicious agents, and these forms do not arise by accident; the structural protections for real concurrent work are the lane snapshots (FEAT-176) and per-ticket worktrees (FEAT-191), NOT this heuristic. r1/r2/r3 already proved the inverse (PARSING the shell to recover the verb) is unsound and is what let wrappers through.
+- **The 3 run-317f770a cases (openai/anthropic run `317f770a-9c30-45c0-b7d9-64e44706f372`, VALID, verdict BROKEN) — all INDIRECTION, now PINNED as accepted residual.** Confirmed current classification against the working-tree code (scratch probe, not a git command — the hook blocks a literal mutating git): (1) STDIN into a verb-reading wrapper — `echo reset --hard | xargs git` -> `{mutates:false}`; (2) a shell VARIABLE as the subcommand — OP=reset then `git $OP --hard` -> `{mutates:false}` (even UNWRAPPED; the head-git branch never expands vars); (3) a COMBINED line — a path-scoped `git checkout` of held2.txt beside a stdin-fed wrapped reset -> scoped to held2.txt only (count 1 = head 1), so the stdin-fed tree-wipe is not seen. Each is NOT-whole-tree today.
+- **Documentation (no behaviour change):** added a "THE DOCUMENTED LIMIT (r7)" block to `scripts/lib/file-lock.mjs`'s OUT-OF-CONTRACT header (the wrapper-net comment), naming indirection as the class and the run id. PINNED the 3 cases in `scripts/verify-feat-129-file-lock.mjs` section 10 under an r7 INDIRECTION header: each asserts NOT-whole-tree today so a SILENT change to their classification is noticed (a future tightening that catches one without reopening a wrapper hole must update the pin).
+- **Suites:** `verify-feat-129-file-lock.mjs` -> PASS (confined runner). `npm run gate` -> PASS (exit 0, read unpiped): leak-gate + typecheck clean.
+- **Independent verify:** re-ran on the working-tree files (comments+pins candidate) with the full in/out-of-contract brief; verdict recorded in verification[] below. See that line for the provider + run id.
+- **Files (unstaged, for the user to commit):** `scripts/lib/file-lock.mjs` (comments only — NO behaviour change), `scripts/verify-feat-129-file-lock.mjs` (the r7 indirection pins), this ticket (+ INDEX via board:gen).
+- **Risk bucket:** shared-tree safety path, but this round is a pure DOC/PIN change (no classifier logic touched); the residual is explicitly OUT of contract per the orchestrator's option-C call, documented and pinned, not silently dropped.
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run d3bcfc7e-0e24-4b74-9a31-89770bfba6b6 — VERDICT: BROKEN — mixed-state candidate 8ac18b339d72 — IV r7 doc/pin candidate (anthropic ran, openai req), VALID. Pins land 252/252. NEW false ALLOW in KEPT r6 code: literal wrapped tree-wipe ALLOWED under a foreign lock when a cmd-SUBSTITUTION in a -C/-c value holds a path-scoped git mutator (count deflates, net misses). Orchestrator call needed.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — fixing lane (round 8)
+- **regressed-from:** BUG-277 r6 (same ticket). r6's surplus-count net was deflatable by a command substitution in a git global-option VALUE (anthropic run d3bcfc7e-0e24-4b74-9a31-89770bfba6b6, BROKEN).
+- **Orchestrator decision implemented:** replace the fragile COUNT comparison with a conservative rule that can't be deflated by a substitution. (a) If the raw line (depth 0) carries ANY command/process substitution (dollar-paren, a backtick, less-than-paren, greater-than-paren) AND the r6 whole-string net (hasWrappedGitTreeMutator) finds any git-tree-mutator match, classify WHOLE-TREE. (b) Otherwise keep r6's surplus-count net. Over-refusal is the accepted direction.
+- **Hypothesis VERIFIED FIRST (probe vs the r7/HEAD code, synthetic throwaway):** the 3 cited forms all FALSE-ALLOWED pre-fix (a dollar-paren substitution in a -C value holding a scoped restore, beside a literal tree-wipe → keyed to the scoped path only; the -c config-value form; the backtick -C form) — reproduced from the live IV probe. Post-fix all 3 (+ process-substitution variants) → TREE. The r7 indirection pins (variable-as-subcommand, stdin-fed wrapper, the combined indirection line) and the r5 obfuscation pins (split git word, split verb) are UNCHANGED (no substitution token). The exempt bare index-only apply landing is UNCHANGED (no substitution).
+- **Over-refusals ADDED by rule (a) (accepted, listed):** a clean scoped git mutator whose argument comes from a substitution — a checkout/restore of a path produced by a substitution — and a benign command wrapping a scoped mutator in a substitution — an echo of a scoped checkout — now classify whole-tree (previously path-scoped). Refused only while a foreign lock is held; a reworded command or a retry passes. No prior in-contract PASS case changed other than these.
+- **Fix (scripts/lib/file-lock.mjs — the depth-0 net + its header only):** the net at the scan exit is now a two-part depth-0 block (rule (a) substitution-co-occurrence, then r6's count net). Header blocks updated: the r7 "DOCUMENTED LIMIT" now notes the r8 narrowing, and a new "r8 NARROWING" block explains the deflation and rule (a). No other classifier logic touched; hasWrappedGitTreeMutator / countGitTreeMutators unchanged. Left the FEAT-191 checkPathsFree hunk alone; did NOT touch file-lock.d.mts (no new export).
+- **Suites:** verify-feat-129-file-lock.mjs → PASS 269/269 (was 252; +17 r8 asserts: 5 cited/variant → TREE, 3 over-refusal pins, 4 guards, 2 indirection-unchanged pins, 3 end-to-end foreign-lock refusals, 1 landing-still-allowed) under the confined runner with a pre-made scratch HOME. npm run gate → PASS (exit 0, read unpiped): leak-gate + typecheck clean.
+- **Independent verify → BROKEN (VALID), a NEW vector:** anthropic run 4791d92b-e5b5-4364-a3c9-1994a73abad4 (openai requested; anthropic ran), candidate 68718b7db3cd, VALID. Rule (a) closes the 3 substitution forms, but the IV found a DIFFERENT deflation of the SAME count comparison that needs NO substitution: a quote/escape-SPLIT decoy verb. A path-scoped checkout whose verb word is quote-split (a quoted fragment inside the word), on a combined line beside a literal wrapped tree-wipe, classifies to the scoped path only and is ALLOWED under a foreign lock (the un-split control is REFUSED). Same with an empty-quote split and a backslash split, across clean/stash. REPRODUCED directly (scratch probe). Root cause: countGitTreeMutators runs the regex on the RAW quoted text (so a quote-split verb does not match the word-boundary verb pattern → UNDERCOUNTS), while gitHeadMutators is counted AFTER the tokenizer UNQUOTES the word (so it counts the decoy). count==head, so neither rule (a) (no substitution token) nor rule (b) (no surplus) fires — the literal wrapped wipe slips.
+- **In/out of contract:** the tree-wiping verb (reset --hard / clean -fdx / stash) is FULLY LITERAL and wrapped on a combined line → IN contract per the brief ("a git word and a tree-mutator verb literally present, wrapped or not, on combined lines"). The obfuscation is only in the harmless DECOY. So this is a real in-contract FALSE ALLOW, not the accepted out-of-contract "obfuscation inside the verb word" (that exemption is for the WIPE being obfuscated, not a decoy masking a literal wipe).
+- **Escalation (orchestrator decision needed):** rule (a) was the orchestrator's dictated rule for the substitution vector and it holds for that vector; the decoy-split is a distinct deflation requiring a counting-semantics decision. Proposed direction (conservative, over-refusal-accepted): run countGitTreeMutators on a copy of the command with word-splitting quote/escape characters removed, so a quote-split decoy verb is counted and the surplus net fires — this makes the decoy case match its already-TREE control. This lane made NO code change for the new vector (beyond rule (a)) and does not pick the counting change on its own authority on a data-loss safety path.
+- **Files (unstaged, for the user to commit):** scripts/lib/file-lock.mjs, scripts/verify-feat-129-file-lock.mjs, this ticket (+ INDEX via board:gen).
+- **Risk bucket:** shared-tree safety path (regression-prone, data-loss). r8's rule (a) only ever WIDENS refusal (never newly allows); it is a strict improvement over r6 that closes the 3 cited substitution false-allows. The ticket stays BROKEN pending the orchestrator's call on the decoy-split deflation. An independent clean-room verify pass IS warranted on whatever closes it.
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 4791d92b-e5b5-4364-a3c9-1994a73abad4 — VERDICT: BROKEN — mixed-state candidate 68718b7db3cd — IV r8 VALID (anthropic; openai req). Rule (a) closes the 3 substitution forms. NEW break: a quote/escape-SPLIT decoy verb deflates the same count net with NO substitution (regex counts RAW quoted text; head uses unquoted word) so a literal wrapped reset slips. Orchestrator call needed.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 2c55fd7b-f20a-4615-9438-188da5e8d924 — VERDICT: BROKEN — mixed-state candidate 11dcf7fb3dc1 — IV r9 VALID (anthropic; openai quota-spent). Charter CLOSED: count removed, SIMPLE-line rule, decoy-split class gone, 288/288. NEW pre-existing vector: gitMutationTarget keys WHOLE-REPO pathspecs narrow on a SIMPLE line -> false ALLOW, real-git wipe confirmed (restore :/ ; checkout -- * ; src/..).. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-27 — fixing lane (round 9)
+- **regressed-from:** BUG-277 r5-r8 (same ticket). Every one of r5/r6/r7/r8 was a different way to DEFLATE the same surplus-COUNT comparison; the r8 IV (anthropic run 4791d92b) found the last one — a quote/escape-SPLIT decoy verb (`git "che"ckout -- f`) that under-counts the RAW side (regex on still-quoted text) while the head count is taken on the UNQUOTED word, so count==head and a LITERAL wrapped tree-wipe beside it slipped.
+- **Orchestrator decision implemented:** REMOVE the count comparison entirely (deflatable by construction). New rule, no counting: (1) a git tree-mutator stays PATH-SCOPED only on a SIMPLE line — one command, no separator (`;`/`&&`/`||`/pipe/newline/`&`), no command/process substitution (`$(`/backtick/`<(`/`>(`), no quote or escape anywhere, a bare `git` head (optionally path-qualified), never a wrapper (exec/xargs/env/timeout/command/nohup/sh -c); (2) EVERY other line on which the lazy net matches — tested on the RAW text AND on a copy with `"`,`'`,`\` removed — is WHOLE-TREE; (3) a line with no net match is unchanged. New exported predicate `isSimpleLine`.
+- **Hypothesis VERIFIED FIRST (probe vs the working-tree r8 code, synthetic throwaway):** the 3 decoy-split forms (+ empty-quote and stash variants) all FALSE-ALLOWED pre-fix (returned paths=["f"], keying the scoped decoy only; the un-split control was already TREE). Post-fix all → TREE. Hypothesis CONFIRMED: this closes the count-deflation class from r5-r8 — decoy-split (r8), wrapped verb (r4), spaced option value (r6), substitution-in-value (r8 rule a) — because a compound/wrapped git-mutator line can no longer be path-scoped AT ALL. The r6 backslash-in-git-word obfuscation is now ALSO caught by the dequoted copy (moved from residual to closed).
+- **Over-refusals ADDED (accepted, listed):** a clean but COMPOUND/WRAPPED git mutator now classifies whole-tree instead of path-scoped — two scoped checkouts joined by `&&`, a status-then-scoped-checkout line, an sh -c wrapping a scoped checkout, a git mutator with a QUOTED path, a leading env-assignment, or any pipe/separator beside a git mutator. r5-r8 kept these narrow via count==head; r9 widens them (refused only while a FOREIGN lock is held; a retry passes). Non-git compound mutations (cd sub && sed -i f) are UNAFFECTED (the net only matches git). Residuals KEPT as documented pins: pure INDIRECTION (OP=reset then git $OP; echo reset piped to xargs git) and a backslash-NEWLINE inside the verb — no literal git+verb survives even after dequoting.
+- **Fix (scripts/lib/file-lock.mjs only):** replaced the depth-0 two-part count block with the SIMPLE-line net; added `isSimpleLine` (exported) beside `hasWrappedGitTreeMutator`; DELETED the now-unused `countGitTreeMutators` + the global regex and the `gitHeadMutators`/`gitMutators` threading (counter, the merge carry-up, the git-branch increment, and the field on both return shapes). Rewrote the r4-r8 net header block to the r9 story. Left the FEAT-191 checkPathsFree hunk alone; did NOT touch file-lock.d.mts (neither deleted name was declared there; the new isSimpleLine is consumed only by the verify suite, not src, so no declaration needed — typecheck clean).
+- **Suites:** verify-feat-129-file-lock.mjs → PASS 288/288 (flipped 5 pins to the r9 behaviour — the two r5 clean-compound guards and the sh -c section-1 case to TREE over-refusals, the r6 backslash-in-word pin to CLOSED, the r7 combined-indirection pin to TREE; added an r9 block: 4 decoy-split must-FAILs, 8 isSimpleLine predicate asserts, 3 path-scope guards, 1 decoy end-to-end foreign-lock refusal, landing-still-allowed). Also made the suite self-sufficient for its scratch dir so it runs as a single node command. Confined runner. npm run gate → PASS (exit 0, read unpiped): leak-gate + typecheck clean.
+- **Independent verify → BROKEN (VALID), a NEW DISTINCT vector (NOT a count deflation):** anthropic run 2c55fd7b-f20a-4615-9438-188da5e8d924 (openai requested but quota-spent until ~20:31 → anthropic ran; author anthropic too, so cross-provider decorrelation is reduced this round — a fresh openai pass is warranted on whatever closes the new vector), candidate 11dcf7fb3dc1, VALID. The r9 rule CLOSES the charter target (every count-deflation break). The IV found a PRE-EXISTING hole (present identically in r1-r8, orthogonal to the count): `gitMutationTarget` keys a WHOLE-REPO pathspec to a narrow literal path on a SIMPLE line, so it is ALLOWED under a foreign lock — an IN-CONTRACT false ALLOW, real-git wipe CONFIRMED (the verifier ran real git and watched src/held.txt get overwritten). Cases: (1) git's magic `:/` = repo root — restore/checkout/rm/restore-worktree with `:/` keyed to literal `:/`; (2) `git restore src/..` and `git restore $PWD` normalize to `.` but are keyed as a path entry, not tree (the a!=='.' check sees only the raw token, before normalization); (3) `git checkout -- *` (glob over the repo top level) keyed to literal `*` (isSimpleLine does not reject glob chars). Also noted-untested: shell/config aliases (alias g=git, git co) which hide the verb by indirection (likely out of contract), and CR/U+2028 passing isSimpleLine (bash does not treat them as separators).
+- **Escalation (orchestrator decision needed) — this lane made NO code change for the new vector.** It is a DISTINCT mechanism from the charter's count removal (it is in gitMutationTarget's pathspec→path mapping, not the net), it is pre-existing (r1-r8 keyed these the same way), and it is a data-loss safety path, so per the r8 precedent this lane does not pick the pathspec/glob fix on its own authority. Proposed direction (conservative, over-refusal-accepted): in gitMutationTarget, classify as TREE any pathspec that is a git MAGIC pathspec (:/..., :(...), a leading :), that NORMALIZES to the repo root or above (., .., src/.., $PWD, an absolute path), or that carries a GLOB metacharacter (* ? [) — and/or reject glob chars in isSimpleLine. Needs the orchestrator's call because it touches pathspec semantics and must interact cleanly with the legitimate narrow-scoping of real single files and with the existing glob-expansion (expandGlob).
+- **Files (unstaged, for the user to commit):** scripts/lib/file-lock.mjs, scripts/verify-feat-129-file-lock.mjs, this ticket (+ INDEX via board:gen).
+- **Risk bucket:** shared-tree safety path (regression-prone, data-loss). r9 only ever WIDENS refusal relative to the count net (never newly allows); it is a strict improvement that closes the whole count-deflation class and makes the classifier non-deflatable by construction. The ticket stays BROKEN pending the orchestrator's call on the whole-repo-pathspec/glob false-allow. An independent clean-room verify pass (ideally cross-provider openai once quota resets) IS warranted on whatever closes it.

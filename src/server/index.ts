@@ -498,17 +498,116 @@ function boundAccountField(sessionId: string): { boundAccount?: string | null } 
   return bound === undefined ? {} : { boundAccount: bound.account };
 }
 
-function sessionsForProject(p: reg.Project) {
-  const encoded = hist.encodeCwd(p.hostPath);
+function sessionsForProject(p: reg.Project): { sessions: hist.SessionMeta[]; dirs: string[] } {
   /*
-   * FEAT-155 — a container store whose newest session ran at BARE `/workspace`
-   * records a cwd that names no project; grouped on it, every such store (and
-   * the legacy shared `-workspace`) would land in one "workspace" group. So a
-   * per-project store is grouped on its own ADDRESS (`/workspace/<id>`, the
-   * owner's declaration via `containerStoreAddressOfDir`) — exactly the key it
-   * had before it ever ran at the bare root, so moving, re-registering or
-   * toggling behaves as it always did.
+   * FEAT-199 r5 — ONE derivation of the canonical copy. The full list, the
+   * paginated page (`sessionPageForProject`) and the by-id deep link
+   * (`sessionByIdForProject`) ALL read the SAME candidate pool
+   * (`buildSessionCandidatePool` → `hist.canonicalSessionIndex` over the
+   * COMPLETE claude dir set — the logical group, the container store AND every
+   * past-path store — then the Orchard-owned / native-codex merge). ARCH-010:
+   * the choice of WHICH copy of a same-id cross-store twin is canonical is made
+   * in exactly one place and read everywhere; this function chooses nothing, it
+   * only PARSES each pool entry.
+   *
+   * Before this (run 0675f242, BROKEN): the full list ran
+   * `canonicalSessionIndex` over the GROUP dirs only, then merged the container,
+   * past-path and Orchard dirs with its OWN first-seen-wins dedupe. That was a
+   * second derivation — the host-dir copy, already "seen", shadowed the real
+   * past-dir/container transcript, so the full list could serve a truncated host
+   * stub while the page and the deep link (which read the complete index) served
+   * the real transcript. The page/resolver were correct; the full list was the
+   * laggard. Now they cannot diverge: one pool, one choice.
+   *
+   * The grouping / container-address / shared-bare-dir handling and the
+   * Orchard/native merge all live in `buildSessionCandidatePool`; nothing is
+   * dropped, only unified.
    */
+  const { byId, contributingDirs } = buildSessionCandidatePool(p);
+  const sessions: hist.SessionMeta[] = [];
+  for (const cand of byId.values()) {
+    // An Orchard/native row is already a parsed SessionMeta; a claude candidate
+    // is parsed here (memoised, so the page's later parse of the same winner is
+    // a cache hit).
+    const base = cand.row ?? (cand.file ? hist.readSessionMeta(cand.file.filePath, cand.file.encodedDir) : null);
+    if (!base) continue;
+    // The full list's "duplicate copy ignored" warnings: the twins the canonical
+    // index beat for this id. Copy before attaching — never mutate the
+    // memo-cached meta (set only on claude `file` candidates).
+    const meta =
+      cand.droppedCopies && cand.droppedCopies.length
+        ? {
+            ...base,
+            warnings: base.warnings.concat(
+              cand.droppedCopies.map((d) => `duplicate copy ignored: ${d.encodedDir}/${d.sessionId}.jsonl`),
+            ),
+          }
+        : base;
+    sessions.push(meta);
+  }
+  sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
+  return { sessions, dirs: Array.from(contributingDirs) };
+}
+
+/*
+ * FEAT-199 — the CHEAP, paginated sibling of `sessionsForProject`. The full
+ * function above samples ~512 KB from EVERY session file (cold list ≈ 3.2 s on a
+ * 2.6 k-session project) and the list route then reads a title window from every
+ * one of those files too (cold readTitleMeta ≈ 6 s) — the whole cost scales with
+ * the file count, and it is all paid before the first row can paint.
+ *
+ * This returns only the page the sidebar shows first. It enumerates the SAME
+ * store dirs and the same Orchard-owned / native-codex sources as the full
+ * function (so the union of all pages is the same set — none lost), but the
+ * claude-store dirs are read STAT-ONLY (`listSessionStubs`) and ordered by file
+ * mtime; only the files that fall inside the requested `[offset, offset+limit)`
+ * window are actually parsed. Orchard-owned and native-codex rows are already
+ * cheap head-only scans, so they are gathered in full and compete for the page
+ * by recency exactly like the claude rows.
+ *
+ * Deliberately a SEPARATE function, not a mode flag on `sessionsForProject`: the
+ * full path is carried-over, regression-covered code that search and several
+ * internal callers depend on, and it stays byte-for-byte unchanged. The
+ * union-equivalence (every paged session is also in the full set) is asserted in
+ * verify-feat-199-pagination.mjs so the two cannot silently diverge.
+ */
+/*
+ * FEAT-199 — an OPAQUE keyset cursor. The page is a window of the total order
+ * (recency desc, true-sessionId asc as a stable, store-dir-independent
+ * tiebreak); the cursor is the (recency, id) of the LAST row a page returned, so
+ * the next page is the rows STRICTLY AFTER it in that order. Unlike an offset,
+ * an insertion or deletion ABOVE the cursor between fetches cannot shift a later
+ * page (no row skipped, none doubled). Encoded base64url so the client treats it
+ * as a token; decode validates the shape and returns null for anything forged or
+ * garbage (the route answers 400, never crashes).
+ */
+/*
+ * FEAT-199 — the SINGLE recency/true-id index both the paginated list and the
+ * by-id resolver read from. Keyed by the IN-FILE sessionId (recovered cheaply
+ * from each file's head, no full parse), so a session occupies ONE slot however
+ * its file was named/copied, and both callers agree on which twin a given id
+ * maps to — the row the list SHOWS is the row a deep link OPENS. The resolver
+ * used to derive its answer independently through resolveSessionFile
+ * (filename→file), which missed any file whose stem ≠ its in-file id (the
+ * off-page deep-link break in run b757f33e). One index, one derivation; a stem
+ * match is just the common case where a file's name already equals its id.
+ */
+type SessionPoolCand = {
+  sessionId: string;
+  recencyMs: number;
+  file?: { filePath: string; encodedDir: string };
+  row?: hist.SessionMeta;
+  // FEAT-199 r5 — the same-id twins canonicalSessionIndex beat for this id, so
+  // the FULL list (which reads this pool) can emit the "duplicate copy ignored"
+  // warnings it always has. Only ever set on a claude `file` candidate.
+  droppedCopies?: { encodedDir: string; sessionId: string }[];
+};
+function buildSessionCandidatePool(p: reg.Project): {
+  byId: Map<string, SessionPoolCand>;
+  contributingDirs: Set<string>;
+  encoded: string;
+} {
+  const encoded = hist.encodeCwd(p.hostPath);
   const projects = hist.groupByLogicalProject(hist.listProjectDirs().map((d) => {
     if ((d.cwd ?? d.cwdGuess) !== cm.CONTAINER_WORKSPACE) return d;
     const address = cm.containerStoreAddressOfDir(d.encodedDir);
@@ -517,108 +616,172 @@ function sessionsForProject(p: reg.Project) {
   const logical =
     projects.find((lp) => lp.dirs.some((d) => d.encodedDir === encoded)) ??
     projects.find((lp) => lp.key === hist.logicalKeyForCwd(p.hostPath));
-
-  /*
-   * FEAT-155 — one exclusion from basename grouping: the legacy shared
-   * `-workspace` dir (bare-root runs from before per-project stores) names no
-   * project and joins none. Everything else groups exactly as before. (An
-   * extra "another live project's store never joins" filter was tried and
-   * refuted: after an id is reused, it hid a re-registered owner's history.)
-   */
   const containerDir = cm.containerStoreDirName(p);
   const sharedBareDir = cm.encodeCwdForStore(cm.CONTAINER_WORKSPACE);
-  const groupDirs = logical ? logical.dirs.filter((d) => d.encodedDir !== sharedBareDir || d.encodedDir === encoded) : [];
-  const sessions = logical ? hist.listLogicalProjectSessions({ ...logical, dirs: groupDirs }) : [];
-  const dirs = groupDirs.map((d) => d.encodedDir);
-
-  for (const storeDir of [containerDir]) {
-    if (dirs.includes(storeDir)) continue;
-    let extra: ReturnType<typeof hist.listSessions> = [];
-    try {
-      extra = hist.listSessions(storeDir);
-    } catch {
-      extra = []; // dir absent — the project has simply never run in a container
-    }
-    if (extra.length) {
-      const seen = new Set(sessions.map((s) => s.sessionId));
-      for (const s of extra) if (!seen.has(s.sessionId)) sessions.push(s);
-      dirs.push(storeDir);
-      sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
-    }
-  }
-  /*
-   * BUG-138 — THE PATHS THIS PROJECT USED TO LIVE AT.
-   *
-   * History is indexed by the working directory and grouped on that path's
-   * BASENAME, so renaming a directory (not merely moving it) puts every past
-   * session under a key the current path no longer reaches. The files are never
-   * deleted — they are stranded. `pastPaths` is the registry's record of where
-   * this project used to be, and merging those store dirs here is what makes a
-   * repoint carry its sessions instead of losing them. De-duplicated by
-   * sessionId like every other merge above, so renaming BACK cannot double-list
-   * anything.
-   */
+  const groupDirs = logical ? logical.dirs.filter((d) => d.encodedDir !== sharedBareDir || d.encodedDir === encoded).map((d) => d.encodedDir) : [];
   const pastDirs = reg.pastPathsOf(p).map((q) => hist.encodeCwd(q));
-  for (const d of pastDirs) {
-    if (dirs.includes(d)) continue;
-    let extra: ReturnType<typeof hist.listSessions> = [];
-    try {
-      extra = hist.listSessions(d);
-    } catch {
-      extra = []; // the old store dir is gone too — nothing to carry
-    }
-    if (!extra.length) continue;
-    const seen = new Set(sessions.map((s) => s.sessionId));
-    for (const s of extra) if (!seen.has(s.sessionId)) sessions.push(s);
-    dirs.push(d);
-    sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
+
+  // The claude-store dirs to read, in the same order the full path merges them:
+  // the logical group, then the container store, then the past-path stores. A
+  // dir joins only when it actually holds session files (mirrors the full path's
+  // "only when listSessions returned rows" guard).
+  const claudeDirs: string[] = [];
+  const addDir = (d: string): void => { if (d && !claudeDirs.includes(d)) claudeDirs.push(d); };
+  for (const d of groupDirs) addDir(d);
+  for (const d of [containerDir, ...pastDirs]) {
+    if (claudeDirs.includes(d)) continue;
+    if (hist.listSessionStubs(d).length) addDir(d);
   }
-  /*
-   * FEAT-037 P2b — Orchard-owned transcripts (engines with no store of their
-   * own, e.g. Codex). Same layout under dataDir()/transcripts/<provider>/, so
-   * the SAME encoded dirs apply; each recovered session carries its `provider`
-   * so the sidebar can name the engine and the resume path can pick it.
-   */
-  {
-    const seen = new Set(sessions.map((s) => s.sessionId));
-    let merged = false;
-    for (const d of new Set([...dirs, encoded, containerDir, ...pastDirs])) {
-      for (const s of ot.listOrchardSessions(d)) {
-        if (seen.has(s.sessionId)) continue;
-        seen.add(s.sessionId);
-        sessions.push(s);
-        merged = true;
-        if (!dirs.includes(d)) dirs.push(d);
-      }
-    }
-    if (merged) sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
+
+  // Unified recency-ordered candidate pool, keyed by the TRUE in-file
+  // sessionId. The choice of which copy of a same-id cross-dir twin is canonical
+  // is owned by hist.canonicalSessionIndex and READ here — ARCH-010: the SAME
+  // index the full list (listLogicalProjectSessions) and the by-id resolver read,
+  // so a session occupies ONE slot however its file was named/copied and the row
+  // the list SHOWS is the row a deep link OPENS. No second tie-break here (an
+  // earlier host-dir proxy rule chose a different twin than the full list: runs
+  // b757f33e / c44745cb). Claude rows win over an Orchard/native twin of the same
+  // id (the full path's precedence) via mergeRow's "already owns this id" guard.
+  const byId = new Map<string, SessionPoolCand>();
+  // Every scanned claude source dir contributes — matching the full list's
+  // historical `dirs` (all group dirs plus any container/past store that held
+  // files), so memories/search/dir-GC still see a store dir whose every session
+  // lost a twin tie-break. Orchard/native dirs are added by mergeRow below.
+  const contributingDirs = new Set<string>(claudeDirs);
+  for (const entry of hist.canonicalSessionIndex(claudeDirs).values()) {
+    byId.set(entry.sessionId, {
+      sessionId: entry.sessionId,
+      recencyMs: entry.mtimeMs,
+      file: { filePath: entry.filePath, encodedDir: entry.encodedDir },
+      droppedCopies: entry.droppedCopies,
+    });
+    contributingDirs.add(entry.encodedDir);
   }
-  /*
-   * FEAT-078 — NATIVE (external) codex sessions. Scanned head-only from codex's
-   * own store ($CODEX_HOME/sessions), matched by `session_meta.cwd` to this
-   * project's hostPath, tagged provider:'openai' so the sidebar badges them
-   * exactly like Orchard-run codex rows. De-duplicated against everything
-   * above by sessionId: a session already imported into the Orchard transcript
-   * store (on a prior open/resume) is an 'openai' row up there already, so its
-   * native twin is skipped and no duplicate appears.
-   */
-  {
-    const seen = new Set(sessions.map((s) => s.sessionId));
-    let added = false;
-    // BUG-138: past paths count here too — a native codex session recorded
-    // against the pre-rename cwd belongs to this project just as much.
-    for (const cwd of [p.hostPath, ...reg.pastPathsOf(p)]) {
-      for (const s of cn.listNativeCodexSessions(cwd)) {
-        if (seen.has(s.sessionId)) continue;
-        seen.add(s.sessionId);
-        sessions.push(s);
-        added = true;
-        if (!dirs.includes(s.encodedDir)) dirs.push(s.encodedDir);
-      }
-    }
-    if (added) sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
+  const mergeRow = (s: hist.SessionMeta): void => {
+    if (byId.has(s.sessionId)) return; // a claude (or earlier) row already owns this id
+    byId.set(s.sessionId, { sessionId: s.sessionId, recencyMs: Date.parse(s.lastActivityAt ?? '') || 0, row: s });
+    if (s.encodedDir) contributingDirs.add(s.encodedDir);
+  };
+  for (const d of new Set([...claudeDirs, encoded, containerDir, ...pastDirs])) {
+    for (const s of ot.listOrchardSessions(d)) mergeRow(s);
   }
-  return { sessions, dirs };
+  for (const cwd of [p.hostPath, ...reg.pastPathsOf(p)]) {
+    for (const s of cn.listNativeCodexSessions(cwd)) mergeRow(s);
+  }
+  return { byId, contributingDirs, encoded };
+}
+
+type PageCursor = { m: number; s: string };
+function encodePageCursor(c: PageCursor): string {
+  return Buffer.from(JSON.stringify({ m: c.m, s: c.s }), 'utf8').toString('base64url');
+}
+function decodePageCursor(raw: string): PageCursor | null {
+  try {
+    const obj = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8')) as unknown;
+    if (
+      obj &&
+      typeof obj === 'object' &&
+      typeof (obj as { m?: unknown }).m === 'number' &&
+      Number.isFinite((obj as { m: number }).m) &&
+      typeof (obj as { s?: unknown }).s === 'string'
+    ) {
+      return { m: (obj as PageCursor).m, s: (obj as PageCursor).s };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function sessionPageForProject(
+  p: reg.Project,
+  { limit, cursor, since = null }: { limit: number; cursor: PageCursor | null; since?: PageCursor | null },
+): {
+  sessions: ReturnType<typeof hist.listSessions>;
+  newer: ReturnType<typeof hist.listSessions>;
+  dirs: string[];
+  total: number;
+  hasMore: boolean;
+  nextCursor: string | null;
+  headCursor: string | null;
+} {
+  const { byId, contributingDirs } = buildSessionCandidatePool(p);
+
+  // Total order: recency desc, then id asc. The sort tiebreak and the cursor
+  // filter below MUST use the SAME id comparison, or the "strictly after"
+  // boundary falls on a different row than the sort placed there and the keyset
+  // partition leaks (anthropic run 0ebe209e: localeCompare in the sort vs a
+  // code-unit `>` in the filter dropped/doubled rows at equal mtimes with
+  // mixed-case ids). One code-unit comparator, used in both places.
+  const cmpId = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+  const ordered = Array.from(byId.values()).sort((a, b) =>
+    b.recencyMs - a.recencyMs || cmpId(a.sessionId, b.sessionId),
+  );
+  const total = ordered.length;
+  // Keyset: the rows STRICTLY AFTER the cursor in the total order. Because the
+  // order is already sorted, these form a contiguous suffix — so a delete or an
+  // insert ABOVE the cursor between page fetches cannot skip or double a row the
+  // way an offset would.
+  const afterCursor = (c: SessionPoolCand): boolean =>
+    cursor === null || c.recencyMs < cursor.m || (c.recencyMs === cursor.m && cmpId(c.sessionId, cursor.s) > 0);
+  const rest = ordered.filter(afterCursor);
+  const window = rest.slice(0, limit);
+  const hasMore = rest.length > window.length;
+  // The next cursor is the (recency, id) of the last candidate in this window,
+  // taken from the MTIME order (not the display re-sort below), so the client
+  // echoes back a token anchored in the server's own ordering.
+  const tail = window[window.length - 1];
+  const nextCursor = tail ? encodePageCursor({ m: tail.recencyMs, s: tail.sessionId }) : null;
+  // FEAT-199 (r8) — the NEWEST row in the total order, encoded as the client's
+  // initial high-water mark. The client captures it on the first page and echoes
+  // it back as `since` on every load-more; the server then also returns rows
+  // STRICTLY NEWER than that mark (below). This closes the hole the cursor walk
+  // alone leaves: a session an EXTERNAL process (a CLI outside Orchard, firing no
+  // live tick) bumps above the already-consumed cursor between fetches jumps from
+  // below the cursor to above it, so the "rows after cursor" slices never include
+  // it and the page-1 refresh that would have surfaced it never fires. "Rows
+  // newer than the mark" catch exactly that bumped row (openai run 01a17fdd).
+  const head = ordered[0];
+  const headCursor = head ? encodePageCursor({ m: head.recencyMs, s: head.sessionId }) : null;
+  // Rows strictly ABOVE the mark in the total order (recency desc, id asc):
+  // newer recency, or equal recency with an id that sorts earlier. These are the
+  // sessions bumped above the client's newest-seen since it began paging. Only
+  // computed when the client sent a mark (load-more); the first page omits it.
+  const newerThanMark = (c: SessionPoolCand): boolean =>
+    since !== null && (c.recencyMs > since.m || (c.recencyMs === since.m && cmpId(c.sessionId, since.s) < 0));
+  // The pool is already deduped on the true sessionId, so no two window
+  // candidates share an id; the parsed rows keep that invariant.
+  const parseCand = (c: SessionPoolCand): hist.SessionMeta | null =>
+    c.row ? c.row : c.file ? hist.readSessionMeta(c.file.filePath, c.file.encodedDir) : null;
+  const byDisplayRecency = (a: hist.SessionMeta, b: hist.SessionMeta): number =>
+    // Restore the true last-human-submit ordering (the stub pass ordered by
+    // mtime, a close proxy); the client re-sorts on recencyKey too, so appended
+    // pages and merged newer rows settle into global order as they arrive.
+    (b.lastUserMessageAt ?? b.lastActivityAt ?? '').localeCompare(a.lastUserMessageAt ?? a.lastActivityAt ?? '');
+  const sessions = window.map(parseCand).filter((m): m is hist.SessionMeta => m !== null).sort(byDisplayRecency);
+  const newer = since === null
+    ? []
+    : ordered.filter(newerThanMark).map(parseCand).filter((m): m is hist.SessionMeta => m !== null).sort(byDisplayRecency);
+  return { sessions, newer, dirs: Array.from(contributingDirs), total, hasMore, nextCursor, headCursor };
+}
+
+/*
+ * FEAT-199 — resolve ONE session by id for an off-page deep link / sidebar
+ * highlight. Goes through the SAME true-id index the list pool builds
+ * (`buildSessionCandidatePool`), so a given id resolves to the EXACT row the
+ * list would show — including a file whose stem ≠ its in-file id (which the old
+ * resolveSessionFile-by-filename path could not find) and the list's chosen
+ * copy of a same-id cross-store twin. No second derivation: the id is a map key,
+ * and only the single matching candidate's file is parsed (via `readSessionMeta`
+ * for a stub; an Orchard/native row is already parsed).
+ */
+function sessionByIdForProject(p: reg.Project, sessionId: string): hist.SessionMeta | null {
+  const { byId } = buildSessionCandidatePool(p);
+  const c = byId.get(sessionId);
+  if (!c) return null;
+  if (c.row) return c.row;
+  if (c.file) return hist.readSessionMeta(c.file.filePath, c.file.encodedDir);
+  return null;
 }
 
 /* --------------------------------------------------------------- API routes */
@@ -2055,7 +2218,51 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     if (id && rest[2] === 'sessions' && m === 'GET') {
       const p = reg.getProject(id);
       if (!p) return notFound(res, `no project ${id}`);
-      const { sessions, dirs } = sessionsForProject(p);
+      /*
+       * FEAT-199 — three shapes, picked by query, so the cheap paginated path is
+       * opt-in and the full path (search, deep links, every existing caller) is
+       * byte-for-byte what it was:
+       *   ?session=<id> → resolve that ONE row (off-page deep link / highlight).
+       *   ?limit=N[&cursor=<opaque>] → the recency-ordered page of N rows after
+       *     the keyset cursor (first page when no cursor), parsed cheaply.
+       *   (neither) → the whole list, exactly as before.
+       */
+      const sessionParam = (url.searchParams.get('session') ?? '').trim();
+      const limitParam = url.searchParams.get('limit');
+      let sessions: ReturnType<typeof hist.listSessions>;
+      let newer: ReturnType<typeof hist.listSessions> = [];
+      let dirs: string[];
+      let page: { limit: number; total: number; hasMore: boolean; cursor: string | null; headCursor: string | null } | null = null;
+      if (sessionParam) {
+        const one = sessionByIdForProject(p, sessionParam);
+        sessions = one ? [one] : [];
+        dirs = one && one.encodedDir ? [one.encodedDir] : [];
+      } else if (limitParam !== null) {
+        const limit = Math.min(500, Math.max(1, Number.parseInt(limitParam, 10) || 30));
+        const cursorParam = url.searchParams.get('cursor');
+        let cursor: PageCursor | null = null;
+        if (cursorParam !== null && cursorParam !== '') {
+          cursor = decodePageCursor(cursorParam);
+          // A forged or garbage cursor is a client error, not a crash.
+          if (!cursor) return badRequest(res, 'invalid session page cursor');
+        }
+        // FEAT-199 (r8) — the client's high-water mark (newest row it has seen),
+        // echoed from the headCursor the first page returned. Same opaque shape as
+        // a cursor; a forged one is a client error, not a crash.
+        const sinceParam = url.searchParams.get('since');
+        let since: PageCursor | null = null;
+        if (sinceParam !== null && sinceParam !== '') {
+          since = decodePageCursor(sinceParam);
+          if (!since) return badRequest(res, 'invalid session page since mark');
+        }
+        const paged = sessionPageForProject(p, { limit, cursor, since });
+        sessions = paged.sessions;
+        newer = paged.newer;
+        dirs = paged.dirs;
+        page = { limit, total: paged.total, hasMore: paged.hasMore, cursor: paged.nextCursor, headCursor: paged.headCursor };
+      } else {
+        ({ sessions, dirs } = sessionsForProject(p));
+      }
       // One stat per file, reusing the same window as /api/sessions/live so a
       // badge rendered from either source cannot disagree. Orchard-owned
       // (codex) transcripts are part of the same window (FEAT-037 P2b).
@@ -2069,11 +2276,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // are unaffected — the client just folds 'agent' rows out of the default view.
       const provenance = loadProvenanceMap();
       const isClosed = sessionClosed.closedReader(); // FEAT-168 — one store read per list; the ONE closed read (r6: derived, never written on reopen)
-      sendJson(res, 200, {
-        projectId: p.id,
-        encodedDir: hist.encodeCwd(p.hostPath),
-        dirs,
-        sessions: sessions.map((s) => {
+      const shapeRow = (s: hist.SessionMeta): Record<string, unknown> => {
         /*
          * Custom title + pin come from the SAME read, so the sidebar can sort
          * pinned-first and badge "renamed" without a second request.
@@ -2142,7 +2345,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           models: s.models,
           fileBytes: s.fileBytes,
         };
-        }),
+      };
+      sendJson(res, 200, {
+        projectId: p.id,
+        encodedDir: hist.encodeCwd(p.hostPath),
+        dirs,
+        ...(page ? { page } : {}), // FEAT-199 — present only on a paginated request
+        // FEAT-199 (r8) — rows bumped above the client's high-water mark since it
+        // began paging (an external append that fired no live tick). Present only
+        // on a paginated request that carried `since`; the client merges these at
+        // the top, deduped by sessionId, so an off-page bumped row is never lost.
+        ...(page ? { newer: newer.map(shapeRow) } : {}),
+        sessions: sessions.map(shapeRow),
       });
       return true;
     }
@@ -2481,7 +2695,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       // Claude store first, then the Orchard-owned transcript store (FEAT-037
       // P2b — engines with persistedTranscript:false). Same entry shapes, so
       // tail/forward/count below serve both identically.
-      const claudeFile = hist.resolveSessionFile(encodedDir, sessionId);
+      //
+      // FEAT-199 (r7) — resolve the claude file THROUGH the one canonical-index
+      // owner (ARCH-010), NOT by filename. A plain resolveSessionFile(<id>.jsonl)
+      // re-derives the choice and loses: it serves a truncated <id>.jsonl stub
+      // over the canonical renamed copy the list shows, and serves <Y>.jsonl
+      // (which can hold a DIFFERENT session) when a stem collides with another
+      // file's in-file id. Both are the twin-shadowing the list/page/deep-link
+      // resolver already route through this index to avoid — a file whose stem ≠
+      // its in-file id (openai run 01a17fbc) is just the simplest case. Keyed by
+      // the IN-FILE id with the same twin tie-break, so the read can never
+      // disagree with the row the user clicked (IV run 5824d6f4).
+      const claudeFile = hist.resolveCanonicalSessionFile(encodedDir, sessionId);
       /*
        * FEAT-144 — opportunistically mirror the live Claude store into Orchard's
        * durable copy on read, so a session viewed after a server restart (whose
@@ -3959,6 +4184,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
 
 function notFound(res: http.ServerResponse, message: string): boolean {
   sendJson(res, 404, { error: message });
+  return true;
+}
+
+function badRequest(res: http.ServerResponse, message: string): boolean {
+  sendJson(res, 400, { error: message });
   return true;
 }
 

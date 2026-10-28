@@ -572,6 +572,18 @@ interface CacheEntry {
 const metaCache = new Map<string, CacheEntry>();
 
 /**
+ * FEAT-199 (round 6) — exact real-message counts for the canonical twin
+ * tie-break, keyed by `path\0mtimeMs\0size`. Populated ONLY on a same-id twin
+ * collision (rare), by a FULL streaming parse of the whole file (no sampling,
+ * no size cap) — see `exactRealMessageCount`. A count already in this cache is
+ * valid as long as the file's mtime and size are unchanged, so repeated list
+ * calls over a steady store never re-parse; a file that grows between calls
+ * (run d37b0ba5's "twin grows between list and deep link") gets a NEW key and a
+ * fresh exact parse.
+ */
+const exactCountCache = new Map<string, number>();
+
+/**
  * BUG-158 — `probeCwd` memoised by file PATH. A session file's `cwd` is written
  * on the first line and never changes (even as the file grows, and Claude's
  * store is append-only with per-session-id filenames that are never reused), so
@@ -587,6 +599,7 @@ const cwdProbeCache = new Map<string, string | null>();
 export function clearSessionCache(): void {
   metaCache.clear();
   cwdProbeCache.clear();
+  exactCountCache.clear();
 }
 
 /* -------------------------------------------------------- project listing */
@@ -607,6 +620,128 @@ export function listSessionFiles(encodedDir: string, opts: ScanOptions = {}): st
     .filter((d) => d.isFile() && d.name.endsWith('.jsonl'))
     .map((d) => path.join(dirPath, d.name))
     .sort();
+}
+
+/**
+ * FEAT-199 — a STAT-ONLY enumeration of an encoded dir's sessions. No file is
+ * opened or parsed, so this is O(files) stats and nothing else — the cheap pass
+ * that lets the paginated list sort by recency and parse ONLY the first page's
+ * files instead of sampling ~512 KB from every file in the store on a cold load.
+ *
+ * `sessionId` is the filename stem. That is sound and permanent: the store names
+ * each file `<sessionId>.jsonl` and never reuses an id (see the BUG-158 note on
+ * `cwdProbeCache`); `readSessionMeta` itself falls back to the stem when the
+ * in-file `sessionId` is absent. `mtimeMs` is the recency proxy the page orders
+ * by — a pin/rename/new prompt all APPEND to the file, so a touched session
+ * rises to the top exactly as the parsed `lastActivityAt` ordering would place
+ * it. The true `lastUserMessageAt` order is restored for the page once its files
+ * are parsed.
+ */
+export interface SessionStub {
+  sessionId: string;
+  encodedDir: string;
+  filePath: string;
+  mtimeMs: number;
+  fileBytes: number;
+}
+
+export function listSessionStubs(encodedDir: string, opts: ScanOptions = {}): SessionStub[] {
+  const out: SessionStub[] = [];
+  for (const f of listSessionFiles(encodedDir, opts)) {
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(f);
+    } catch {
+      continue;
+    }
+    out.push({
+      sessionId: path.basename(f).replace(/\.jsonl$/, ''),
+      encodedDir,
+      filePath: f,
+      mtimeMs: st.mtimeMs,
+      fileBytes: st.size,
+    });
+  }
+  return out;
+}
+
+/**
+ * FEAT-199 — the in-file `sessionId` and `cwd` of a session file, the two
+ * top-level head facts the canonical index needs, recovered cheaply but
+ * returning EXACTLY what `readSessionMeta` would resolve (the id before its stem
+ * fallback; the cwd as the first top-level `cwd` field). The store names each
+ * file `<sessionId>.jsonl` so the stem is almost always the id, but the full
+ * list (`listLogicalProjectSessions`) de-duplicates on the IN-FILE id and breaks
+ * same-id cross-dir twin ties by the file's OWN cwd — so the paginated pool and
+ * the deep-link resolver must key on those SAME facts, or a file whose stem was
+ * renamed/copied away from its id would surface the session twice, or a twin
+ * would resolve to a different copy than the list shows.
+ *
+ * It must NOT diverge from `readSessionMeta`: a first attempt that read only
+ * 16 KB and regex-matched the first `"sessionId"` string was BROKEN (anthropic
+ * run 0ebe209e) — a file whose first entry is a >16 KB snapshot with no
+ * top-level id would key by stem while readSessionMeta recovered the real id
+ * deeper in the head. So this PARSES JSONL lines (never a raw regex, so a
+ * `"sessionId"`/`"cwd"` inside a message body can't be mistaken for the field)
+ * over the SAME regions readSessionMeta samples — the whole file when small,
+ * else the 256 KB head and, only if a fact is still missing, the 256 KB tail —
+ * and takes the first top-level value for each. A 32 KB fast path covers every
+ * normal file (both are on the first entry) so the big reads happen only for a
+ * pathological oversized first entry. Either fact is null only when no top-level
+ * value exists anywhere readSessionMeta would look (→ id caller falls back to
+ * the stem, as readSessionMeta does).
+ */
+export function readSessionHeadFacts(filePath: string): { sessionId: string | null; cwd: string | null } {
+  let fd: number | null = null;
+  let sessionId: string | null = null;
+  let cwd: string | null = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const size = fs.fstatSync(fd).size;
+    if (size === 0) return { sessionId, cwd };
+    // Scan one sampled region; return true once BOTH facts are in hand so the
+    // bigger reads are skipped as soon as nothing more can be learned.
+    const scanInto = (buf: Buffer, dropFirst: boolean, dropLast: boolean): boolean => {
+      for (const line of linesFromSample(buf, dropFirst, dropLast)) {
+        const e = parseLine(line);
+        if (!e) continue;
+        if (!sessionId && typeof e.sessionId === 'string' && e.sessionId) sessionId = e.sessionId;
+        if (!cwd && typeof e.cwd === 'string' && e.cwd) cwd = e.cwd;
+        if (sessionId && cwd) return true;
+      }
+      return false;
+    };
+    // Fast path: in every normal file both are on the first entry.
+    const FAST = 32 * 1024;
+    if (size <= FAST) {
+      scanInto(readRange(fd, 0, size), false, false);
+      return { sessionId, cwd };
+    }
+    if (scanInto(readRange(fd, 0, FAST), false, true)) return { sessionId, cwd };
+    // Mirror readSessionMeta's sampling for an oversized first entry.
+    if (size <= DEFAULT_HEAD_BYTES + DEFAULT_TAIL_BYTES) {
+      scanInto(readRange(fd, 0, size), false, false);
+      return { sessionId, cwd };
+    }
+    if (scanInto(readRange(fd, 0, DEFAULT_HEAD_BYTES), false, true)) return { sessionId, cwd };
+    scanInto(readRange(fd, size - DEFAULT_TAIL_BYTES, DEFAULT_TAIL_BYTES), true, false);
+    return { sessionId, cwd };
+  } catch {
+    return { sessionId, cwd };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+/** FEAT-199 — the in-file sessionId alone (see `readSessionHeadFacts`). */
+export function readSessionIdHead(filePath: string): string | null {
+  return readSessionHeadFacts(filePath).sessionId;
 }
 
 /**
@@ -948,6 +1083,32 @@ export function resolveSessionFile(
   }
 }
 
+/**
+ * FEAT-199 (r7) — resolve a session id to its CANONICAL file in one encoded dir,
+ * THROUGH `canonicalSessionIndex` (the ONE owner of "which file is this id",
+ * ARCH-010). Use this, not `resolveSessionFile`, anywhere a session id must map
+ * to the SAME file the list / page / deep-link resolver chose.
+ *
+ * `resolveSessionFile` maps an id to `<id>.jsonl` by FILENAME, which re-derives
+ * the choice and loses two ways (IV run 5824d6f4): (a) a truncated/metadata
+ * `<id>.jsonl` STUB sitting next to a renamed real copy with the same in-file id
+ * wins on filename, so the read serves the stub the list already rejected; and
+ * (b) a stem COLLISION — `<Y>.jsonl` holding in-file id Z — serves session Z's
+ * transcript when the caller asked for Y. Resolving through the index keys by the
+ * IN-FILE id and applies the same twin tie-break, so it can never disagree with
+ * the list. Same path-safety guards as `resolveSessionFile` (a bad id/dir returns
+ * null rather than steering the dir scan outside the store).
+ */
+export function resolveCanonicalSessionFile(
+  encodedDir: string,
+  sessionId: string,
+  opts: ScanOptions = {},
+): string | null {
+  if (!/^[A-Za-z0-9._-]+$/.test(sessionId) || sessionId.includes('..')) return null;
+  if (encodedDir.includes('/') || encodedDir.includes('\\') || encodedDir.includes('..')) return null;
+  return canonicalSessionIndex([encodedDir], opts).get(sessionId)?.filePath ?? null;
+}
+
 /* ------------------------------------------------------------ transcripts */
 
 /**
@@ -1237,33 +1398,196 @@ export function listLogicalProjectSessions(
   project: LogicalProject,
   opts: ScanOptions = {},
 ): SessionMeta[] {
-  const byId = new Map<string, SessionMeta>();
-  for (const d of project.dirs) {
-    for (const s of listSessions(d.encodedDir, opts)) {
-      const prev = byId.get(s.sessionId);
-      if (!prev) {
-        byId.set(s.sessionId, s);
-        continue;
-      }
-      // Keep the copy in the dir whose encoding matches its own cwd; then the
-      // larger file. The other is a copy from the other install.
-      // NB: never mutate `s`/`prev` — they may be memo-cached objects.
-      const prevCanon = prev.cwd !== null && encodeCwd(prev.cwd) === prev.encodedDir;
-      const curCanon = s.cwd !== null && encodeCwd(s.cwd) === s.encodedDir;
-      const keepCur = (curCanon && !prevCanon) || (curCanon === prevCanon && s.fileBytes > prev.fileBytes);
-      const kept = keepCur ? s : prev;
-      const dropped = keepCur ? prev : s;
-      byId.set(s.sessionId, {
-        ...kept,
-        warnings: kept.warnings.concat(
-          `duplicate copy ignored: ${dropped.encodedDir}/${dropped.sessionId}.jsonl`,
+  // ARCH-010 — the choice of WHICH file is the canonical copy of each session id
+  // is owned by `canonicalSessionIndex` and read here, by the paginated pool and
+  // by the deep-link resolver alike. No reader re-derives the tie-break (an
+  // earlier second derivation in the pool chose a different twin than this list:
+  // runs b757f33e / c44745cb). This list just parses each canonical copy.
+  const index = canonicalSessionIndex(project.dirs.map((d) => d.encodedDir), opts);
+  const out: SessionMeta[] = [];
+  for (const entry of index.values()) {
+    const meta = readSessionMeta(entry.filePath, entry.encodedDir, opts);
+    if (!meta) continue;
+    // NB: never mutate the memo-cached `meta`; copy when attaching warnings.
+    if (entry.droppedCopies.length) {
+      out.push({
+        ...meta,
+        warnings: meta.warnings.concat(
+          entry.droppedCopies.map((d) => `duplicate copy ignored: ${d.encodedDir}/${d.sessionId}.jsonl`),
         ),
       });
+    } else {
+      out.push(meta);
     }
   }
-  const out = Array.from(byId.values());
   out.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
   return out;
+}
+
+/**
+ * FEAT-199 (round 6) — the EXACT count of real (`user`/`assistant`, non-meta,
+ * non-sidechain) messages in a session file, by a FULL streaming parse of the
+ * whole file: no head/tail sampling, no `maxBytes` cap. This is the ground
+ * truth the canonical tie-break needs — every proxy for completeness has
+ * broken in turn (fileBytes>0 let a metadata stub win, run 72b30fd7; a sampled
+ * messageCount let a truncated prefix win, run 459a68fa; file SIZE let an
+ * 822 KB metadata-only twin with 0 real messages beat an 80-message real
+ * transcript, run d37b0ba5). Size is a proxy for completeness, and proxies keep
+ * breaking, so on a collision we count exactly.
+ *
+ * Cost is bounded by rarity: this runs ONLY when a same-id twin collision is
+ * actually found (see `canonicalSessionIndex`), and the result is memoised in
+ * `exactCountCache` keyed by (path, mtime, size) so repeated list calls over a
+ * steady store never re-parse. Returns -1 for an unreadable file (a DEFINITE
+ * "no real transcript", strictly below any real count).
+ */
+function exactRealMessageCount(filePath: string): number {
+  let st: fs.Stats;
+  try {
+    st = fs.statSync(filePath);
+  } catch {
+    return -1;
+  }
+  const key = `${filePath}\0${st.mtimeMs}\0${st.size}`;
+  const hit = exactCountCache.get(key);
+  if (hit !== undefined) return hit;
+
+  let count = 0;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    // Full file, whole size as the byte budget — no sampling, no cap.
+    for (const ln of iterLinesFrom(fd, 0, st.size, st.size, true)) {
+      const e = parseLine(ln);
+      if (e && isRealMessage(e)) count++;
+    }
+  } catch {
+    count = -1;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+  exactCountCache.set(key, count);
+  return count;
+}
+
+/**
+ * FEAT-199 / ARCH-010 — the SINGLE owner of the fact "which file is the
+ * canonical copy of each session id" across a set of encoded dirs. Built cheaply
+ * (stat + a head parse per file via `readSessionHeadFacts` — no whole-file read),
+ * keyed by the IN-FILE sessionId (stem fallback, as `readSessionMeta` does).
+ *
+ * The tie-break for same-id cross-dir twins lives here and NOWHERE else, so the
+ * full list, the paginated page and the by-id resolver can never disagree on
+ * which copy a given id names. On a collision we compute a total-order SORT KEY
+ * per copy and pick the MAX (never pairwise "prefer" calls — a non-transitive
+ * comparator over 3+ copies could pick a loser). The key, most significant
+ * first:
+ *   1. the EXACT real-message count (full streaming parse — NO proxy). More
+ *      real messages wins, so a 0-byte / metadata-only / truncated twin can
+ *      NEVER win: it has fewer (often 0) real messages than the real
+ *      transcript. This replaces every earlier completeness proxy that broke in
+ *      turn — fileBytes>0 (run 72b30fd7), sampled messageCount (run 459a68fa)
+ *      and file SIZE (run d37b0ba5: an 822 KB metadata-only twin with 0 real
+ *      messages beat an 80-message real transcript because size was the proxy).
+ *   2. equal counts → the copy whose OWN cwd encodes to its dir is canonical
+ *      (the other is a copy carried in from another install);
+ *   3. then the NEWEST mtime;
+ *   4. then a stable path comparison (the lexicographically smaller path wins),
+ *      a deterministic, dir-order-independent final tiebreak.
+ * The exact count is computed LAZILY and ONLY on a collision (rare — twins are
+ * a same-id clash across dirs), memoised by (path, mtime, size); the common
+ * no-twin walk stays at stat + one head parse per file (no whole-file read), so
+ * the first page stays cheap. Each entry carries the copies it beat, so the
+ * full list can keep emitting its "duplicate copy ignored" warnings unchanged.
+ */
+export interface CanonicalSessionEntry {
+  sessionId: string;
+  filePath: string;
+  encodedDir: string;
+  mtimeMs: number;
+  fileBytes: number;
+  cwd: string | null;
+  messages?: number; // EXACT real-message count (lazy; filled only on a twin collision)
+  messagesExact?: boolean; // always true once filled (exact full parse); kept for callers
+  droppedCopies: { encodedDir: string; sessionId: string }[];
+}
+
+export function canonicalSessionIndex(
+  encodedDirs: string[],
+  opts: ScanOptions = {},
+): Map<string, CanonicalSessionEntry> {
+  // Collect every copy of each id first (encounter order preserved), then
+  // resolve collisions by a total-order sort key — so 3+ copies pick a unique,
+  // transitive winner independent of dir-walk order.
+  const copiesById = new Map<string, CanonicalSessionEntry[]>();
+  for (const d of encodedDirs) {
+    for (const stub of listSessionStubs(d, opts)) {
+      const facts = readSessionHeadFacts(stub.filePath);
+      const id = facts.sessionId ?? stub.sessionId;
+      const cur: CanonicalSessionEntry = {
+        sessionId: id,
+        filePath: stub.filePath,
+        encodedDir: stub.encodedDir,
+        mtimeMs: stub.mtimeMs,
+        fileBytes: stub.fileBytes,
+        cwd: facts.cwd,
+        droppedCopies: [],
+      };
+      const arr = copiesById.get(id);
+      if (arr) arr.push(cur);
+      else copiesById.set(id, [cur]);
+    }
+  }
+
+  // "Does this copy's OWN cwd resolve to the dir it sits in?" — a
+  // store-placement question, so it MUST use `sdkEncodeDir`, the SDK's real
+  // encoder, NOT plain `encodeCwd` (BUG-243): for a cwd over 200 chars the SDK
+  // truncates and appends a hash, so plain `encodeCwd` NEVER matches the real
+  // dir and rule (b) would silently never fire for long-path projects, letting
+  // a newer non-canonical twin win on mtime (independent-verify run 87bdfef5).
+  const isCanon = (e: CanonicalSessionEntry): boolean =>
+    e.cwd !== null && sdkEncodeDir(e.cwd) === e.encodedDir;
+
+  // Returns > 0 when `a` is the more-canonical copy than `b` (a total order:
+  // exact messages, then canonical-cwd, then newest mtime, then smaller path).
+  const better = (a: CanonicalSessionEntry, b: CanonicalSessionEntry): number => {
+    if (a.messages !== b.messages) return (a.messages as number) - (b.messages as number);
+    const ac = isCanon(a) ? 1 : 0;
+    const bc = isCanon(b) ? 1 : 0;
+    if (ac !== bc) return ac - bc;
+    if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs - b.mtimeMs;
+    if (a.filePath === b.filePath) return 0;
+    return a.filePath < b.filePath ? 1 : -1;
+  };
+
+  const byId = new Map<string, CanonicalSessionEntry>();
+  for (const [id, copies] of copiesById) {
+    if (copies.length === 1) {
+      byId.set(id, copies[0]);
+      continue;
+    }
+    // Collision: compute the EXACT real-message count for every copy, then pick
+    // the max by the total-order key.
+    for (const e of copies) {
+      e.messages = exactRealMessageCount(e.filePath);
+      e.messagesExact = true;
+    }
+    let winner = copies[0];
+    for (let i = 1; i < copies.length; i++) {
+      if (better(copies[i], winner) > 0) winner = copies[i];
+    }
+    winner.droppedCopies = copies
+      .filter((e) => e !== winner)
+      .map((e) => ({ encodedDir: e.encodedDir, sessionId: e.sessionId }));
+    byId.set(id, winner);
+  }
+  return byId;
 }
 
 /** Convenience: the whole store as logical projects, newest first. */

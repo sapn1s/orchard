@@ -2936,6 +2936,10 @@ button.mode:hover { color: var(--ink); text-decoration-color: var(--ink-4); }
   padding: 10px 10px; display: block;
 }
 .hint-row b { color: var(--ink-2); font-weight: 500; }
+/* FEAT-199 (r9) — the list-may-be-incomplete hint: an honest, low-key warning
+   with its retry button inline (never a silent latch). */
+.hint-row.list-incomplete { color: var(--warn, var(--ink-2)); display: flex; align-items: center; gap: 4px; }
+.hint-row.list-incomplete .more { display: inline; width: auto; padding: 2px 8px; text-decoration: underline; }
 .tree .more {
   display: block; width: 100%; text-align: left;
   padding: 5px 9px 5px 22px; border-radius: 7px;

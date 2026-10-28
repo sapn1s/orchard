@@ -100,7 +100,29 @@ export const createProject = (hostPath, name, { applyMethod = true } = {}) =>
  */
 export const ensureScratchProject = () =>
   api('/api/projects/scratch/ensure', { method: 'POST' }).then((r) => r.project);
-export const projectSessions = (id) => api(`/api/projects/${encodeURIComponent(id)}/sessions`);
+/*
+ * FEAT-199 — the session list, optionally paginated. With no opts it returns the
+ * whole list (unchanged). `{ limit, cursor }` asks for the recency-ordered page
+ * of `limit` rows after the opaque keyset `cursor` (the first page when cursor
+ * is absent) plus a `page: { total, hasMore, cursor }` field, so a cold load
+ * parses only the first page's files instead of sampling every file in the
+ * store, and a delete/insert between page fetches can't skip or double a row.
+ * `{ session }` resolves one row by id for an off-page deep link.
+ */
+export const projectSessions = (id, opts = {}) => {
+  const qs = new URLSearchParams();
+  if (opts.session) qs.set('session', opts.session);
+  else if (opts.limit != null) {
+    qs.set('limit', String(opts.limit));
+    if (opts.cursor) qs.set('cursor', String(opts.cursor));
+    // FEAT-199 (r8) — the client's high-water mark (newest row it has seen),
+    // so the server also returns rows bumped above it since paging began (an
+    // external append that fired no live tick). See loadMoreSessions.
+    if (opts.since) qs.set('since', String(opts.since));
+  }
+  const q = qs.toString();
+  return api(`/api/projects/${encodeURIComponent(id)}/sessions${q ? `?${q}` : ''}`);
+};
 /**
  * BUG-138 — directories this project might have been renamed to. Read-only and
  * decides nothing: each candidate carries its own `confidence`, and `cannotDecide`

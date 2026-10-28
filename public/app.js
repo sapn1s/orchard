@@ -60,6 +60,14 @@ const PAGE = 6;
 /** How many more a click of "N more" reveals — a screenful, not a trickle. */
 const PAGE_MORE = 20;
 /*
+ * FEAT-199 — session rows fetched from the server per page. Comfortably larger
+ * than the windowed default view (MAX_SEATS) and the first "N more" reveal, so a
+ * project of this size or smaller loads in ONE request (page.hasMore === false)
+ * and behaves exactly as the pre-pagination full load did; only a busier project
+ * fetches a second page, and only when the user pages past the first screenful.
+ */
+const SESSION_PAGE = 60;
+/*
  * Recorded agents shown per session before "N more". A real overnight run in
  * this store has 113 of them; dropping all 113 hairlines at the end of the
  * transcript is the same wall the sidebar had, so the same restraint applies.
@@ -248,7 +256,18 @@ const state = {
   // project that is merely selected (a project with no session on screen) never
   // sprouts a phantom row. Set by startNew, cleared when a real session opens.
   pendingNew: null,
-  searchLoaded: false,
+  warmLoaded: false,  // FEAT-199 — boot warm (page 1 of every project) is done
+  searchLoaded: false, // FEAT-199 — the finder's FULL cross-session corpus is loaded
+  searchLoading: false, // FEAT-199 (r7) — a loadAllSessionsFull is in flight (re-entry guard)
+  searchLoadError: false, // FEAT-199 (r7) — the last full load left ≥1 project unloaded (corpus partial)
+  // FEAT-199 — the finder's search corpus, kept SEPARATE from the paginated
+  // sidebar list (s.list). The sidebar list is replaced wholesale by a forced
+  // page-1 reload (live tick, run-finish, pin); if the finder read s.list it
+  // would lose every session beyond page 1 after any such refresh (run
+  // b757f33e). This corpus only GROWS: a full load seeds it, every page-1 or
+  // load-more merges its fresher rows in by sessionId, and a forced refresh
+  // never shrinks it. Map<projectId, Map<sessionId, sessionRow>>.
+  searchCorpus: new Map(),
   contentSearch: null, // { q, scope, showTools, loading, error, result } — tier-2 search
   git: new Map(), // projectId -> { status, at, loading } — crown chip cache
   followingLive: false, // opened a session still running server-side (e.g. after reload)
@@ -1497,25 +1516,105 @@ async function loadProjects() {
 }
 
 function sessionState(id) {
-  if (!state.sessions.has(id)) state.sessions.set(id, { loading: false, error: null, list: [], shown: PAGE, loaded: false });
+  if (!state.sessions.has(id)) state.sessions.set(id, { loading: false, error: null, list: [], shown: PAGE, loaded: false, listGen: 0 });
   return state.sessions.get(id);
 }
 
-async function loadSessions(id, { force = false } = {}) {
+/*
+ * FEAT-199 — merge freshly-loaded rows into the finder's search corpus for a
+ * project. The corpus only grows: a row keyed by sessionId is added or REFRESHED
+ * (a renamed/updated/bumped row carries its new title + recency), but a page-1
+ * reload that returns fewer rows than the corpus holds never drops the rest.
+ * `full` marks that these rows are the project's COMPLETE set, so stale corpus
+ * entries (e.g. a deleted session) are pruned to exactly what the server returned.
+ */
+function mergeSearchCorpus(id, rows, { full = false } = {}) {
+  let corpus = state.searchCorpus.get(id);
+  if (full) { corpus = new Map(); state.searchCorpus.set(id, corpus); }
+  else if (!corpus) { corpus = new Map(); state.searchCorpus.set(id, corpus); }
+  for (const row of rows) corpus.set(row.sessionId, row);
+}
+
+/*
+ * FEAT-199 — the rows the finder searches for a project: its full corpus when
+ * one has been built (seeded by a full load, kept fresh by every page load),
+ * else the page-1 sidebar list as a fallback while the full corpus is still
+ * loading. Never reads s.list once a corpus exists, so a forced page-1 refresh
+ * cannot shrink what the finder can find.
+ */
+function searchRowsFor(id) {
+  const corpus = state.searchCorpus.get(id);
+  if (corpus) return [...corpus.values()];
+  const s = state.sessions.get(id);
+  return s?.loaded ? s.list : null;
+}
+
+async function loadSessions(id, { force = false, full = false } = {}) {
   const s = sessionState(id);
-  if (s.loaded && !force) return s;
+  // A page-1 load already satisfies `loaded`; asking for the FULL list (the
+  // finder's cross-session search) must still go to the server when only the
+  // first page is in hand.
+  if (s.loaded && !force && !(full && s.serverHasMore)) return s;
   // AWAIT an in-flight load instead of returning the still-empty state.
   // Returning early here made applyRoute() see zero sessions whenever the
   // boot preload had started the same fetch first — and a session named in
   // the URL was then declared missing and silently dropped to the project.
-  if (s.loading) return s.inflight ?? s;
+  if (s.loading) {
+    // FEAT-199 — but a FULL (finder) request must NOT be satisfied by an
+    // in-flight PAGE-1 load: a forced page-1 reload racing loadAllSessionsFull
+    // would otherwise hand the finder page 1, leave the corpus at 60/N, and
+    // searchLoaded would latch true with the rest of the store unsearchable for
+    // the page's life (independent-verify run f345cc2a). A plain caller still
+    // shares the in-flight result; a full/forced caller waits for it to settle
+    // and then runs its OWN load with its own requirements.
+    if (!full && !force) return s.inflight ?? s;
+    if (!s.inflightFull || (force && !s.inflightForce)) {
+      try { await s.inflight; } catch { /* its error is recorded on s; we retry our own */ }
+      return loadSessions(id, { force, full });
+    }
+    return s.inflight ?? s; // the in-flight load already meets our need (full/force)
+  }
   s.loading = true;
+  s.inflightFull = full;
+  s.inflightForce = force;
   s.error = null;
   renderTree();
   s.inflight = (async () => {
     try {
-      const r = await api.projectSessions(id);
+      // FEAT-199 — the default sidebar load fetches ONLY the first page (recency
+      // first), so a cold server parses that page's files instead of sampling
+      // every file in the store. `full` (the finder) fetches the whole list.
+      const r = full
+        ? await api.projectSessions(id)
+        : await api.projectSessions(id, { limit: SESSION_PAGE, offset: 0 });
       s.list = (r.sessions ?? []).slice().sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+      // FEAT-199 — a new generation for the sidebar list. A loadMoreSessions that
+      // was in flight against the PREVIOUS list (and its now-stale cursor) sees
+      // the bump and drops its response instead of appending stale-cursor rows
+      // onto this fresh page 1 (mixed/duplicate rows otherwise).
+      s.listGen = (s.listGen ?? 0) + 1;
+      // FEAT-199 — feed the finder's corpus. A full load (the finder's own fetch)
+      // replaces the corpus with the complete set; a page-1 refresh only merges
+      // its fresher rows in, so it can never shrink the finder's reach.
+      mergeSearchCorpus(id, s.list, { full });
+      s.serverTotal = r.page ? r.page.total : s.list.length;
+      s.serverHasMore = r.page ? r.page.hasMore === true : false;
+      // FEAT-199 — the opaque keyset cursor for the NEXT page. Reset here on
+      // every page-1 (re)load, so a forced refresh re-anchors from the top.
+      s.serverCursor = r.page ? (r.page.cursor ?? null) : null;
+      // FEAT-199 (r8) — the high-water mark: the NEWEST row the client has seen,
+      // captured from the first page's headCursor. loadMoreSessions echoes it back
+      // as `since` so the server also returns rows bumped ABOVE it since paging
+      // began (an external append that fired no live tick never reaches page 1,
+      // so the cursor walk alone would strand it — openai run 01a17fdd). Reset on
+      // every page-1 (re)load, re-anchoring the baseline exactly like the cursor.
+      s.serverHead = r.page ? (r.page.headCursor ?? null) : null;
+      // FEAT-199 (r9) — a fresh page-1 walk re-establishes the baseline, so clear
+      // any stale "list incomplete" flag + pending reconcile retry left by the
+      // previous generation; the new walk reconciles at its own end.
+      s.listIncomplete = false;
+      s.reconcileBackoff = 0;
+      if (s.reconcileTimer) { clearTimeout(s.reconcileTimer); s.reconcileTimer = null; }
       // session-list-recency — retire an optimistic user-submit stamp once the
       // server's derived value has reached it (the transcript write settled and
       // the scan saw it). Retiring keeps a stamp from PINNING a session past the
@@ -1547,6 +1646,157 @@ async function loadSessions(id, { force = false } = {}) {
     return s;
   })();
   return s.inflight;
+}
+
+/*
+ * FEAT-199 (r8) — upsert rows into a project's in-hand list, deduped by
+ * sessionId: a session already shown is REFRESHED in place (its new title +
+ * recency), a new one is appended. Used for BOTH an appended page (rows after the
+ * cursor — never already in hand, but deduped belt-and-braces against a
+ * cross-store copy / a row that shifted pages) AND the "newer than the high-water
+ * mark" rows a load-more carries (a bumped off-page row, OR an update to a row
+ * already shown — refreshed, never doubled). Feeds the finder corpus too.
+ */
+function upsertSessionRows(id, s, rows) {
+  if (!rows || !rows.length) return;
+  const at = new Map(s.list.map((x, i) => [x.sessionId, i]));
+  for (const row of rows) {
+    const i = at.get(row.sessionId);
+    if (i == null) { at.set(row.sessionId, s.list.length); s.list.push(row); }
+    else s.list[i] = row; // an update to a session already in hand — refresh, no dup
+  }
+  s.list.sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+  mergeSearchCorpus(id, rows); // deeper pages / bumped rows feed the finder too
+}
+
+/*
+ * FEAT-199 (r9) — replace the in-hand list with the authoritative COMPLETE pool
+ * (the same canonical pool the pages read — sessionsForProject delegates to
+ * buildSessionCandidatePool), reconciling BY ID: a row the walk stranded is
+ * ADDED, a row the server no longer lists is DROPPED. Complete by construction
+ * regardless of recency / clock skew, so it fixes both the stranded-bump case
+ * (a below-mark/above-cursor append the `newer` merge cannot see — future-dated
+ * head, run b75a6a71) AND the equal-count/different-members case the r8 count
+ * guard missed (a delete of an already-shown row keeps a GHOST while a bump
+ * strands a real row, so the union COUNT stays equal to the total though the
+ * MEMBERS differ — run 6567f228).
+ *
+ * Throws on a failed fetch (api.projectSessions rejects); the caller
+ * (ensureListComplete) turns that into a visible "incomplete" hint + a retry,
+ * never a silent latch.
+ */
+async function reconcileFullList(id, s, gen) {
+  const r = await api.projectSessions(id); // authoritative, complete list (no paging)
+  if ((s.listGen ?? 0) !== gen) return;    // superseded by a forced page-1 reload
+  s.list = (r.sessions ?? []).slice().sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+  mergeSearchCorpus(id, s.list);
+  s.serverTotal = s.list.length;
+  s.serverHasMore = false;
+  s.serverCursor = null;
+  if (r.encodedDir != null) s.encodedDir = r.encodedDir;
+  if (r.dirs != null) s.dirs = r.dirs;
+}
+
+/*
+ * FEAT-199 (r9) — the keyset walk has reached the end (hasMore=false). Reconcile
+ * ONCE, ALWAYS, against the authoritative full list (no count guard): the r8
+ * guard (reconcile only when the union was SHORT of the total) missed the
+ * equal-count/different-members case — a delete plus a stranded add leave the
+ * count equal while the members differ (independent run 6567f228). Reaching the
+ * end of the list is rare, so an unconditional full-list fetch is affordable and
+ * makes completeness true BY CONSTRUCTION rather than by a count heuristic.
+ *
+ * A failed reconcile is NEVER silently latched: it flags the list incomplete
+ * (a visible "list may be incomplete — retry" hint renders in the project's
+ * group) and schedules a backoff retry; a successful reconcile, or the hint's
+ * own retry button, clears it.
+ */
+async function ensureListComplete(id, s, gen) {
+  try {
+    await reconcileFullList(id, s, gen);
+    if ((s.listGen ?? 0) !== gen) return;   // superseded by a fresh page-1 walk
+    s.listIncomplete = false;
+    s.reconcileBackoff = 0;
+    if (s.reconcileTimer) { clearTimeout(s.reconcileTimer); s.reconcileTimer = null; }
+  } catch {
+    if ((s.listGen ?? 0) !== gen) return;   // a fresh page-1 walk owns reconcile now
+    s.listIncomplete = true;                // visible hint — never a silent latch
+    scheduleReconcileRetry(id, gen);
+  }
+}
+
+/*
+ * FEAT-199 (r9) — one pending reconcile retry per project, backing off
+ * 1s,2s,4s… capped at 30s. Bails if a fresh page-1 reload has superseded this
+ * generation (the new walk reconciles at its own end) or the flag has cleared.
+ */
+function scheduleReconcileRetry(id, gen) {
+  const s = sessionState(id);
+  if (s.reconcileTimer) return;             // one in flight already
+  const n = s.reconcileBackoff ?? 0;
+  const delay = Math.min(30000, 1000 * 2 ** n);
+  s.reconcileBackoff = n + 1;
+  s.reconcileTimer = setTimeout(() => {
+    s.reconcileTimer = null;
+    if ((s.listGen ?? 0) !== gen) return;
+    if (!s.listIncomplete) return;
+    void ensureListComplete(id, s, gen).then(renderTree);
+  }, delay);
+}
+
+/* FEAT-199 (r9) — the "retry" affordance on the incomplete-list hint: reset the
+ * backoff and reconcile against the CURRENT generation immediately. */
+function retryListReconcile(id) {
+  const s = sessionState(id);
+  if (s.reconcileTimer) { clearTimeout(s.reconcileTimer); s.reconcileTimer = null; }
+  s.reconcileBackoff = 0;
+  return ensureListComplete(id, s, s.listGen ?? 0).then(renderTree);
+}
+
+/*
+ * FEAT-199 — fetch and APPEND the next recency-ordered page for a project whose
+ * list the server paginated. Called when the user reveals past the rows already
+ * in hand ("N more"). Uses the opaque keyset cursor the last page returned, so
+ * a session inserted/updated/deleted ABOVE the cursor between fetches can't make
+ * the next page skip or double a row.
+ *
+ * (r8) Also carries the high-water mark (`since` = s.serverHead, the newest row
+ * seen on the first page): the server returns, alongside the page, any rows
+ * bumped ABOVE that mark since paging began — the one case the keyset walk alone
+ * strands. A session an EXTERNAL process appends to (a CLI outside Orchard, which
+ * fires NO Orchard live tick) jumps from below the consumed cursor to above it,
+ * so no later page returns it and no page-1 refresh fires to surface it; it then
+ * vanished from the union (149 of 150 after exhausting "More" — openai run
+ * 01a17fdd). The newer-than-mark rows catch exactly that row; the final merge on
+ * hasMore=false closes the window to the moment the walk completed.
+ */
+async function loadMoreSessions(id) {
+  const s = sessionState(id);
+  if (!s.serverHasMore || s.loadingMore) return s;
+  s.loadingMore = true;
+  // FEAT-199 — the generation this append belongs to. If a forced page-1 reload
+  // commits while this request is in flight, it bumps s.listGen and resets
+  // s.serverCursor; these rows were fetched against the OLD cursor, so appending
+  // them onto the fresh list would mix stale-cursor rows in. Drop them instead.
+  const gen = s.listGen ?? 0;
+  try {
+    const r = await api.projectSessions(id, { limit: SESSION_PAGE, cursor: s.serverCursor ?? undefined, since: s.serverHead ?? undefined });
+    if ((s.listGen ?? 0) !== gen) return s; // superseded by a forced page-1 reload
+    upsertSessionRows(id, s, r.sessions ?? []); // the next page (rows after the cursor)
+    upsertSessionRows(id, s, r.newer ?? []);    // rows bumped above the mark since paging began
+    s.serverTotal = r.page ? r.page.total : s.list.length;
+    s.serverHasMore = r.page ? r.page.hasMore === true : false;
+    s.serverCursor = r.page ? (r.page.cursor ?? null) : null;
+    // (r9) Correctness by construction — see ensureListComplete. The keyset walk
+    // (+ `newer`-than-mark merge above) can strand a row and keep a ghost, so
+    // once the walk reaches the end ALWAYS reconcile ONCE against the
+    // authoritative full list BY ID — no count guard (the r8 guard missed the
+    // equal-count/different-members case, run 6567f228). A failed reconcile
+    // flags the list incomplete + retries; it never silently latches.
+    if (!s.serverHasMore) { s.loadingMore = false; await ensureListComplete(id, s, gen); }
+  } catch { /* transient — the "N more" control stays, a retry re-fetches */ }
+  finally { s.loadingMore = false; renderTree(); }
+  return s;
 }
 
 function projectDot(p) {
@@ -1714,7 +1964,9 @@ function renderProjectGroup(p) {
     // Number only — the moss pill IS the word "new"; the tooltip spells it out.
     const fresh = unseenCount(s);
     if (fresh) head.append(el('span', { class: 'unseen', text: String(fresh), title: `${fresh} session${fresh === 1 ? '' : 's'} with activity since you last opened ${fresh === 1 ? 'it' : 'them'}` }));
-    head.append(el('span', { class: 'n', text: s?.loaded ? String(listedCount(s)) : '' }));
+    // FEAT-199 — a "+" when the server paginated and more rows remain unfetched,
+    // so the count never silently claims the first page is the whole history.
+    head.append(el('span', { class: 'n', text: s?.loaded ? `${listedCount(s)}${s.serverHasMore ? '+' : ''}` : '' }));
 
     const plus = el('span', { class: 'plus', role: 'button', tabindex: '0', title: 'New session', 'aria-label': `New session in ${p.name}` });
     plus.append(iconPlus());
@@ -1794,7 +2046,15 @@ function renderProjectGroup(p) {
           const more = el('button', { class: 'more', text: `${v.hidden} more` });
           // FEAT-070: the first "N more" lifts the recency window (reveals older
           // sessions); it and each further click grow the reveal by a screenful.
-          more.addEventListener('click', () => { s.windowed = false; s.shown += PAGE_MORE; renderTree(); });
+          // FEAT-199: when the reveal reaches past the rows already in hand and
+          // the server paginated the list, fetch the next page before painting,
+          // so older sessions stay reachable by paging.
+          more.addEventListener('click', async () => {
+            s.windowed = false;
+            s.shown += PAGE_MORE;
+            if (s.serverHasMore && s.shown >= (s.list?.length ?? 0)) await loadMoreSessions(p.id);
+            renderTree();
+          });
           kids.append(more);
         }
         // BUG-085: collapse-back. Once the user has paged past the default
@@ -1805,6 +2065,18 @@ function renderProjectGroup(p) {
           const less = el('button', { class: 'more less', text: '▴ Show less' });
           less.addEventListener('click', () => { s.windowed = true; s.shown = PAGE; renderTree(); });
           kids.append(less);
+        }
+        // FEAT-199 (r9) — a reconcile against the authoritative full list failed
+        // (offline / server error) after paging reached the end. Never latch
+        // silently: surface a visible hint so the list is honestly flagged as
+        // possibly incomplete, with a one-click retry (a backoff retry also runs).
+        if (s.listIncomplete) {
+          const warn = el('div', { class: 'hint-row list-incomplete' });
+          warn.append(el('span', { text: 'list may be incomplete — ' }));
+          const retry = el('button', { class: 'more', text: 'retry' });
+          retry.addEventListener('click', (e) => { e.stopPropagation(); retryListReconcile(p.id); });
+          warn.append(retry);
+          kids.append(warn);
         }
       }
     }
@@ -2303,7 +2575,14 @@ function visibleSessions(s) {
   // Display in recency order — attention priority decides WHICH make the cut,
   // never the order the user reads the rows in.
   const shown = rest.filter((x) => keep.has(x.sessionId));
-  return { rows: [...pinned, ...shown], pinnedCount: pinned.length, hidden: rest.length - shown.length };
+  // FEAT-199 — rows the server has not sent yet (the list was paginated) are
+  // hidden too, so the "N more" count and affordance reflect them. `serverTotal`
+  // counts every row server-side; subtracting what is in hand is a close, honest
+  // "there are more" signal (it may include folded/duplicate rows, never fewer).
+  const serverRemainder = s.serverHasMore
+    ? Math.max(0, (s.serverTotal ?? s.list.length) - s.list.length)
+    : 0;
+  return { rows: [...pinned, ...shown], pinnedCount: pinned.length, hidden: (rest.length - shown.length) + serverRemainder };
 }
 
 /** Multi-line tooltip. Only states what an explicit server field says is true. */
@@ -2547,9 +2826,12 @@ function renderSearch(raw) {
   const hits = [];
   for (const p of state.projects) {
     if (scopeIds && !scopeIds.has(p.id)) continue;
-    const s = state.sessions.get(p.id);
-    if (!s?.loaded) continue;
-    for (const sess of s.list) {
+    // FEAT-199 — search the finder's corpus (the full set once loaded), NOT the
+    // paginated sidebar list, so a forced page-1 refresh can't drop off-page
+    // sessions from search results.
+    const rows = searchRowsFor(p.id);
+    if (!rows) continue;
+    for (const sess of rows) {
       // An empty scoped query ("#proj ") lists the whole project.
       if (text && !rowTitle(sess).toLowerCase().includes(text)) continue;
       const lane = foldsFromList(sess) ? 1 : 0;
@@ -2587,7 +2869,9 @@ function renderSearch(raw) {
     }
   }
 
-  const total = [...state.sessions.values()].filter((s) => s.loaded).reduce((n, s) => n + s.list.length, 0);
+  // FEAT-199 — count over the finder's corpus (what search actually scans), so
+  // "of N sessions" matches the pool being searched, not the paginated sidebar.
+  const total = state.projects.reduce((n, p) => n + (searchRowsFor(p.id)?.length ?? 0), 0);
   node.tree.append(el('div', { class: 'search-section', text: 'Sessions' }));
   node.tree.append(el('div', { class: 'found-l', text:
     `${hits.length} ${scopeIds ? `in #${pq.project.name}` : `of ${total} sessions`}` }));
@@ -2605,7 +2889,16 @@ function renderSearch(raw) {
     ctl.append(pill);
     node.tree.append(ctl);
   }
-  if (!state.searchLoaded && !scopeIds) node.tree.append(el('div', { class: 'hint-row', text: 'indexing the rest…' }));
+  if (!scopeIds && state.searchLoadError) {
+    // FEAT-199 (r7) — a full load left ≥1 project unloaded (a network blip). Say
+    // so honestly (the corpus is PARTIAL, not still loading) and offer a retry;
+    // the next finder open/focus also retries on its own.
+    const retry = el('button', { class: 'hint-row hint-retry', text: 'some sessions failed to load — results may be incomplete. Retry' });
+    retry.addEventListener('click', () => { state.searchLoadError = false; void loadAllSessionsFull(); });
+    node.tree.append(retry);
+  } else if (!state.searchLoaded && !scopeIds) {
+    node.tree.append(el('div', { class: 'hint-row', text: 'indexing the rest…' }));
+  }
   for (const { p, sess } of hits) {
     const row = sessionRow(p, sess); // already carries its own .when
     if (!scopeIds) row.append(el('span', { class: 'in', text: `  ${p.name}` }));
@@ -2889,16 +3182,55 @@ async function openSearchHit(h) {
 }
 
 async function loadAllSessions() {
-  if (state.searchLoaded) return;
+  if (state.warmLoaded) return;
   // BUG-158: fetch every project's session list in PARALLEL, not one strictly
   // after another. Each request keys on its own sessionState(id) and guards
   // with s.loading, so concurrent loads never race; renderTree() is idempotent.
   // The old serial `for … await` chained 13 round-trips end to end (~4 s of the
   // measured 7.5 s boot); once the server-side scans are memoised each request
   // is cheap, and firing them together collapses the chain to a single wave.
+  // FEAT-199 — the BOOT warm (unseen badges + per-project live dots) needs only
+  // the FIRST PAGE of each project: the recent sessions those badges describe are
+  // all on page 1, and a full load here would re-impose the whole-store cost this
+  // ticket removes. The finder's cross-session title search full-loads separately
+  // (`loadAllSessionsFull`), the one place the complete list is actually needed.
   await Promise.all(state.projects.map((p) => loadSessions(p.id)));
-  state.searchLoaded = true;
+  state.warmLoaded = true;
   renderTree();
+}
+
+/*
+ * FEAT-199 — the finder searches session TITLES across every project, so it
+ * needs the whole list, not just each project's first page. Fetched on finder
+ * open/focus (never on boot). `state.searchLoaded` gates the finder's "indexing
+ * the rest…" hint so the user knows when the full corpus is in hand.
+ */
+async function loadAllSessionsFull() {
+  if (state.searchLoaded || state.searchLoading) return;
+  state.searchLoading = true;
+  state.searchLoadError = false;
+  try {
+    const results = await Promise.all(state.projects.map((p) => loadSessions(p.id, { full: true })));
+    /*
+     * FEAT-199 (r7) — searchLoaded latches ONLY on a COMPLETE load. loadSessions
+     * NEVER rejects: a network blip (e.g. a phone dropping its connection) is
+     * caught inside it, recorded on s.error, and the promise RESOLVES — so a
+     * Promise.all that settles does NOT prove every project loaded. Before this,
+     * searchLoaded latched true unconditionally, leaving a PARTIAL corpus the
+     * finder treated as complete and a retry (guarded by searchLoaded) never ran
+     * (openai run 01a17fbc). Now: if ANY project errored, leave the corpus as is,
+     * keep searchLoaded false, and flag searchLoadError so the finder shows a
+     * "results may be incomplete" retry hint. The next finder open/focus retries
+     * the whole set — successfully-loaded projects return early inside
+     * loadSessions (s.loaded), so only the failed ones re-fetch.
+     */
+    const anyFailed = results.some((s) => s && s.error);
+    state.searchLoaded = !anyFailed;
+    state.searchLoadError = anyFailed;
+  } finally {
+    state.searchLoading = false;
+    renderTree();
+  }
 }
 
 /* ------------------------------------------- session row context menu */
@@ -16002,7 +16334,7 @@ paintProjSort();
 node.projSort?.addEventListener('click', toggleProjSort);
 $('#findBtn').addEventListener('click', () => {
   node.finder.classList.toggle('on');
-  if (node.finder.classList.contains('on')) { node.findInput.focus(); void loadAllSessions(); }
+  if (node.finder.classList.contains('on')) { node.findInput.focus(); void loadAllSessionsFull(); }
   else { node.findInput.value = ''; renderTree(); }
 });
 /*
@@ -16028,7 +16360,7 @@ async function startScratch() {
   state.expanded.add(p.id);
   startNew(p.id);
 }
-node.findInput.addEventListener('focus', () => void loadAllSessions());
+node.findInput.addEventListener('focus', () => void loadAllSessionsFull());
 node.findInput.addEventListener('input', () => { scheduleContentSearch(); renderTree(); });
 node.findInput.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
@@ -18636,6 +18968,21 @@ async function resolveRouteSession(p, route, holds = () => true) {
   // A list served from cache predates anything created since: ask once more
   // before concluding the id is absent.
   if (!matches.length && cached && holds()) { s = await loadSessions(p.id, { force: true }); matches = find(); }
+  // FEAT-199 — the sidebar list is paginated, so a deep link to an OLD session
+  // may name one that is off the first page. Resolve it directly by id (one file
+  // parsed server-side) before concluding it is missing, so old links still open.
+  if (!matches.length && holds() && s.serverHasMore) {
+    try {
+      const r = await api.projectSessions(p.id, { session: id });
+      const row = (r.sessions ?? [])[0];
+      if (row) {
+        if (route.dir && route.dir !== row.encodedDir && await transcriptReadable(route.dir, id)) {
+          return { kind: 'open', sess: { ...row, encodedDir: route.dir } };
+        }
+        return { kind: 'open', sess: row };
+      }
+    } catch { /* fall through to the live-bridge path below */ }
+  }
   if (route.dir) {
     const exact = matches.find((x) => x.encodedDir === route.dir);
     if (exact) return { kind: 'open', sess: exact };
@@ -18868,6 +19215,11 @@ async function boot() {
   if (location.hash.startsWith('#/tickets') || location.hash.startsWith('#/guide') || location.hash.startsWith('#/git')) onHashRoute();
   window.__station = {
     state, drawer, api, loadSessions, renderTree, onEvent, startTurn, viewAgent, showThread,
+    // FEAT-199 — the finder's search corpus + paging internals, exposed so a
+    // verify script can drive the real "forced page-1 refresh must not shrink
+    // what the finder finds" and the load-more/forced-reload generation race.
+    loadMoreSessions, loadAllSessionsFull, searchRowsFor, mergeSearchCorpus,
+    reconcileFullList, ensureListComplete, retryListReconcile, // FEAT-199 (r9)
     selectProject, startNew, submit, // FEAT-177 — expose for the end-to-end attachment demo
 
     // BUG-100: footer (#fine) internals, so a verify script can drive the real

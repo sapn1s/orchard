@@ -30,6 +30,7 @@ import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
 import { quarantine, readCapped } from './store-io.ts';
+import { bumpOutcomes } from './store-versions.ts';
 
 /**
  * Why a thing ended. Same vocabulary as `liveness.ts`'s `LivenessEnd` — the
@@ -175,6 +176,7 @@ function writeAll(records: AgentOutcome[]): void {
   ensureDir(dataDir());
   const trimmed = records.length > MAX_RECORDS ? records.slice(records.length - MAX_RECORDS) : records;
   writeAtomic(storeFile(), JSON.stringify(trimmed, null, 2));
+  bumpOutcomes(); // FEAT-202 — zero-latency accelerator over the stat fingerprint
 }
 
 export interface RecordInput {

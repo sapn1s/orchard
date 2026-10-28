@@ -20,6 +20,7 @@ import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
 import { quarantine, readCapped } from './store-io.ts';
+import { bumpDecisions } from './store-versions.ts';
 
 /** Largest decisions store, in bytes, a read will accept before treating the file
  *  as unreadable (bounds a hostile/corrupt file; realistic stores are far under). */
@@ -126,6 +127,7 @@ function readAll(): DecisionRecord[] {
 function writeAll(records: DecisionRecord[]): void {
   ensureDir(dataDir());
   writeAtomic(storeFile(), JSON.stringify(records, null, 2));
+  bumpDecisions(); // FEAT-202 — decisions feed the board's needsYou; zero-latency accelerator over the stat fingerprint
 }
 
 /** A stable, collision-resistant id for a new decision record. */

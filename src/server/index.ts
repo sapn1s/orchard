@@ -8,6 +8,7 @@ import * as http from 'node:http';
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as zlib from 'node:zlib';
+import * as crypto from 'node:crypto';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -196,6 +197,7 @@ import * as decisions from './decisions.ts';
 import * as outcomes from './outcomes.ts';
 import * as laneDrain from './lane-drain.ts';
 import * as lanes from './lanes.ts';
+import * as storeVersions from './store-versions.ts';
 import * as requests from './requests.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
 import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
@@ -349,6 +351,55 @@ function sendJson(res: http.ServerResponse, code: number, body: unknown): void {
   headers['content-length'] = buf.length;
   res.writeHead(code, headers);
   res.end(buf);
+}
+
+/**
+ * FEAT-202 — a CONDITIONAL JSON response for the hot rail polls (board,
+ * agent-outcomes, lanes-pending, processes-summary). Those bodies are
+ * byte-identical across the ~95%+ of polls where nothing changed, so a strong
+ * ETag (sha256 over the serialized body) plus `Cache-Control: no-cache` lets the
+ * browser REVALIDATE on every poll and get back a bodyless 304 whenever nothing
+ * moved — per-tab bytes drop ~20x while freshness stays within one poll interval.
+ *
+ * No client change is needed: fetch()'s default cache mode stores the 200,
+ * sends `If-None-Match` on the next poll, and transparently rehydrates the
+ * cached body on a 304 (the JS caller still sees a 200 with the body). The ETag
+ * is computed on the UNCOMPRESSED JSON, so it is stable whether or not the body
+ * is gzipped on the wire.
+ */
+function sendJsonConditional(req: http.IncomingMessage, res: http.ServerResponse, body: unknown): void {
+  const json = JSON.stringify(body, null, 2);
+  const etag = `"${crypto.createHash('sha256').update(json).digest('base64url')}"`;
+  if (ifNoneMatchHits(req.headers['if-none-match'], etag)) {
+    res.writeHead(304, { etag, 'cache-control': 'no-cache', vary: 'accept-encoding' });
+    res.end();
+    return;
+  }
+  let buf = Buffer.from(json);
+  const headers: http.OutgoingHttpHeaders = {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-cache',
+    etag,
+    vary: 'accept-encoding',
+  };
+  if (buf.length > 1024 && /\bgzip\b/.test(String(req.headers['accept-encoding'] ?? ''))) {
+    buf = zlib.gzipSync(buf, { level: 6 });
+    headers['content-encoding'] = 'gzip';
+  }
+  headers['content-length'] = buf.length;
+  res.writeHead(200, headers);
+  res.end(buf);
+}
+
+/** True when the client's If-None-Match (a token, a comma list, or `*`) matches
+ *  our strong ETag. Weak-prefix tolerant on both sides so a proxy that weakened
+ *  the validator still revalidates. */
+function ifNoneMatchHits(header: string | string[] | undefined, etag: string): boolean {
+  if (!header) return false;
+  const raw = Array.isArray(header) ? header.join(',') : header;
+  if (raw.trim() === '*') return true;
+  const want = etag.replace(/^W\//, '');
+  return raw.split(',').some((t) => t.trim().replace(/^W\//, '') === want);
 }
 
 async function readBody(req: http.IncomingMessage, limit = 2 * 1024 * 1024): Promise<unknown> {
@@ -1862,7 +1913,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // so the digest names them (each links to its ticket, where you can reopen it).
           try { (b as unknown as Record<string, unknown>).agentDecided = ownedDecisions.recentAgentDecisions(p.hostPath, 14); } catch { /* never break the board read */ }
           b.summary = board.boardSummary(b);
-          sendJson(res, 200, b);
+          sendJsonConditional(req, res, b); // FEAT-202 — ETag/304: the board is byte-identical across most polls
           return true;
         }
         if (m === 'POST' && action === 'dismiss') {
@@ -2364,7 +2415,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
 
   /* processes summary: what runs where, for the ambient indicators */
   if (rest[0] === 'processes' && rest[1] === 'summary' && rest.length === 2 && m === 'GET') {
-    sendJson(res, 200, { byProject: procs.summarize(reg.listProjects().map((p) => ({ id: p.id, hostPath: p.hostPath }))) });
+    sendJsonConditional(req, res, { byProject: procs.summarize(reg.listProjects().map((p) => ({ id: p.id, hostPath: p.hostPath }))) }); // FEAT-202 — ETag/304
     return true;
   }
 
@@ -3232,7 +3283,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   if (rest[0] === 'lanes' && rest[1] === 'pending' && rest.length === 2 && m === 'GET') {
     try {
       const items = laneDrain.pending({ projectId: url.searchParams.get('projectId') });
-      sendJson(res, 200, { pending: items, capacity: lanes.capacity() });
+      sendJsonConditional(req, res, { pending: items, capacity: lanes.capacity() }); // FEAT-202 — ETag/304
     } catch (err) {
       sendJson(res, 503, { error: (err as Error).message, pending: null });
     }
@@ -3315,6 +3366,26 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     }
     return true;
   }
+  if (rest[0] === 'versions' && rest.length === 1 && m === 'GET') {
+    // FEAT-202 (round 3) — the ONE aggregate "did anything change" signal. The
+    // client polls this on a single 5s timer and fires round 1's conditionalGet
+    // only for a store whose fingerprint moved. Each fingerprint is derived on
+    // demand from a cheap stat scan (dir ino + entry mtimes/sizes/inos), cached
+    // ~1s and shared across all tabs, so a recreated dir / atomic rename / edit
+    // all move it by construction — no watcher state to go deaf (round-2
+    // regression; anthropic 5b838160). `boot` prefixes the (reset-on-restart)
+    // in-process bump counters that are folded into the fingerprints, so a
+    // restart re-syncs every client (BUG-255 pattern).
+    const projects = reg.listProjects();
+    const boards = projects.map((p) => ({ id: p.id, dir: board.boardDir(p.hostPath) }));
+    // pendingTimeEpoch: pending readiness also changes when a group-close deadline
+    // or the starvation bound elapses with NO file write — fold it in so the client
+    // refetches pending within one cycle of that (pure read, no sweep/write here).
+    let pendingTimeEpoch = 0;
+    try { pendingTimeEpoch = laneDrain.pendingTimeEpoch(); } catch { /* best-effort; file fp still carries writes */ }
+    sendJsonConditional(req, res, { boot: accountFactBoot(), ...storeVersions.snapshot(dataDir(), boards, methodologyDir(), pendingTimeEpoch) });
+    return true;
+  }
   if (rest[0] === 'agent-outcomes' && rest.length === 1 && m === 'GET') {
     const list = outcomes.list({
       projectId: url.searchParams.get('projectId'),
@@ -3322,7 +3393,7 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       includeDismissed: url.searchParams.get('all') === '1',
       limit: intParam(url.searchParams.get('limit'), 50, 1, 200),
     });
-    sendJson(res, 200, { outcomes: list, headline: outcomes.headline(list) });
+    sendJsonConditional(req, res, { outcomes: list, headline: outcomes.headline(list) }); // FEAT-202 — ETag/304
     return true;
   }
   if (rest[0] === 'agent-outcomes' && rest[1] === 'dismiss' && rest.length === 2 && m === 'POST') {

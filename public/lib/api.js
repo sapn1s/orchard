@@ -79,6 +79,67 @@ export async function optional(path, init) {
   }
 }
 
+/*
+ * FEAT-202 — explicit conditional GET for the hot rail polls (board,
+ * agent-outcomes, lanes-pending, processes-summary). Those bodies are
+ * byte-identical across the ~95%+ of polls where nothing changed, so the server
+ * tags each with a strong ETag and answers 304 (empty body) when the body is
+ * unchanged. We revalidate OURSELVES rather than lean on the browser's HTTP
+ * cache: measured on Chromium, fetch() does not auto-revalidate a
+ * `Cache-Control: no-cache` response (it stores only `max-age>0` and then serves
+ * it stale WITHOUT sending If-None-Match), so an unchanged poll would otherwise
+ * re-download the full payload every time. Here we remember the last ETag +
+ * parsed body per URL, send `If-None-Match`, and on a 304 return the remembered
+ * body — so an unchanged poll transfers ~0 body bytes. `cache:'no-store'` keeps
+ * the browser's own cache out of the loop so our validator is the only one.
+ *
+ * Correctness note: freshness is UNCHANGED. A 304 is returned only when the
+ * server's hash of the current body matches what we last saw, so a changed body
+ * always comes back as a full 200 on the very next poll.
+ */
+const etagStore = new Map(); // url -> { etag, body }
+export async function conditionalGet(path) {
+  const prev = etagStore.get(path);
+  let res;
+  try {
+    const pairing = pairingToken();
+    res = await fetch(path, {
+      cache: 'no-store',
+      headers: {
+        'content-type': 'application/json',
+        ...(pairing ? { 'x-orchard-pairing': pairing } : {}),
+        ...(prev ? { 'if-none-match': prev.etag } : {}),
+      },
+    });
+  } catch (err) {
+    throw new ApiError(`server unreachable (${err.message})`, 0);
+  }
+  if (res.status === 304 && prev) return structuredClone(prev.body);
+  const text = await res.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    throw new ApiError(`non-JSON response (HTTP ${res.status})`, res.status);
+  }
+  if (!res.ok) throw new ApiError(body.error || `HTTP ${res.status}`, res.status, body);
+  const etag = res.headers.get('etag');
+  if (etag) etagStore.set(path, { etag, body: structuredClone(body) });
+  else etagStore.delete(path);
+  return body;
+}
+
+/** Conditional GET that resolves to null (instead of throwing) on a 404 — the
+ *  `optional` contract, for a route an older server may not have. */
+export async function conditionalOptional(path) {
+  try {
+    return await conditionalGet(path);
+  } catch (err) {
+    if (err instanceof ApiError && err.missing) return null;
+    throw err;
+  }
+}
+
 /* ------------------------------------------------------------- projects */
 
 export const listProjects = () => api('/api/projects').then((r) => r.projects);
@@ -595,11 +656,20 @@ export const deleteGitWritePolicy = (id) => api(gwpBase(id), { method: 'DELETE' 
 export const cutRelease = (id) =>
   api(`/api/projects/${encodeURIComponent(id)}/release`, { method: 'POST', body: '{}' });
 
+/* -------------------------------------------------------------- versions */
+/* FEAT-202 (round 3) — the ONE aggregate "did anything change" signal. A tiny
+ * ETag'd body { boot, board:{<projectId>:fp}, outcomes:fp, pending:fp } where
+ * each fp is a stat-fingerprint string (dir ino + entry mtime/size/ino). The
+ * rail poll reads this once per 5s cycle and fires the per-store conditionalGet
+ * below only for a fingerprint that moved. null = route absent (older server) →
+ * the caller falls back to round-1's poll-each-endpoint cadence. */
+export const versions = () => conditionalOptional('/api/versions');
+
 /* -------------------------------------------------------------- processes */
 /* What is running FROM this project's directory. null = route absent. */
 
 export const processSummary = () =>
-  optional('/api/processes/summary').then((r) => r?.byProject ?? null);
+  conditionalOptional('/api/processes/summary').then((r) => r?.byProject ?? null);
 export const projectProcesses = (id) =>
   optional(`/api/projects/${encodeURIComponent(id)}/processes`).then((r) => r?.processes ?? null);
 export const killProcess = (id, pid, signal) =>
@@ -637,7 +707,7 @@ export const searchLocate = (dir, sessionId, line) =>
  * error. `optional` still guards a server that predates the route entirely.
  */
 export const board = (id) =>
-  optional(`/api/projects/${encodeURIComponent(id)}/board`)
+  conditionalOptional(`/api/projects/${encodeURIComponent(id)}/board`)
     .then((r) => r ?? { hasBoard: false, needsYou: [], inflight: [], doneToday: [] });
 
 /** Answer a 👤 board item: appended to the ticket + delivered to any attached session. */
@@ -975,7 +1045,7 @@ export async function agentOutcomes({ projectId, sessionIds = [], limit, all } =
   // bounded set (incl. dismissed) so "show all" is instant and always reachable.
   if (all) p.set('all', '1');
   const q = p.toString();
-  const r = await optional(`/api/agent-outcomes${q ? `?${q}` : ''}`);
+  const r = await conditionalOptional(`/api/agent-outcomes${q ? `?${q}` : ''}`);
   if (r === null) return null;
   return Array.isArray(r.outcomes) ? r.outcomes : [];
 }
@@ -1002,7 +1072,7 @@ export const dismissOutcomes = (ids) =>
 export async function pendingLanes({ projectId } = {}) {
   const q = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
   let r;
-  try { r = await optional(`/api/lanes/pending${q}`); }
+  try { r = await conditionalOptional(`/api/lanes/pending${q}`); }
   catch (err) { return { problem: err.message }; }
   if (r === null) return null;
   if (r && r.pending === null) return { problem: r.error || 'the lane ledger is unreadable' };

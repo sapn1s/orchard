@@ -190,7 +190,7 @@ const state = {
   asks: new Map(),
   threads: new Map(), // 'main' | agentId -> thread (own .pane, own render cursor)
   viewing: 'main',
-  caps: { subagents: null, live: null, running: null, outcomes: null, requests: null, pending: null }, // null = unprobed, false = route absent on this server
+  caps: { subagents: null, live: null, running: null, outcomes: null, requests: null, pending: null, versions: null }, // null = unprobed, false = route absent on this server
   effective: null,         // EffectiveConfig — what the session really runs with
   /* FEAT-051 — the LIVE session's own tool list (session-init.tools), the
      ground truth for which MCP servers actually attached: an attached server
@@ -405,6 +405,9 @@ function unseenCount(s) {
 const PROC_POLL_MS = 15_000;
 
 async function refreshProcSummary() {
+  // FEAT-202 — don't poll the process summary while the tab is hidden
+  // (this was the one loop that kept running in a background tab).
+  if (document.hidden) return;
   try {
     const s = await api.processSummary();
     if (s === null) return; // route not on this server yet — show nothing
@@ -7742,19 +7745,25 @@ function selectProject(id, { quiet = false } = {}) {
  * in the panel indefinitely. The rail must be a LIVE mirror of the board — see
  * the poll loop below.
  */
+// FEAT-202 — returns true when the board for `pid` was actually (re)read (or
+// there was nothing to read), false on a transient failure or a navigate-away
+// discard, so the versions cycle advances its remembered board fingerprint ONLY
+// on a real refresh and otherwise retries next cycle (no lost update).
 async function refreshRail(force = false) {
   const pid = state.current.projectId;
-  if (!pid) { state.board = null; state.boardProjectId = null; renderRail(); return; }
-  if (!force && state.boardProjectId === pid && state.board) { renderRail(); return; }
-  if (state.boardBusy) return;
+  if (!pid) { state.board = null; state.boardProjectId = null; renderRail(); return true; }
+  if (!force && state.boardProjectId === pid && state.board) { renderRail(); return true; }
+  if (state.boardBusy) return false;
   state.boardBusy = true;
+  let ok = false;
   try {
     const b = await api.board(pid);
     // A late response for a project the user already navigated away from must
     // not overwrite the newer one.
-    if (state.current.projectId !== pid) return;
+    if (state.current.projectId !== pid) return false;
     state.board = b;
     state.boardProjectId = pid;
+    ok = true;
   } catch {
     // A board read never blocks the app: on failure show the quiet empty rail.
     if (state.current.projectId === pid) { state.board = null; state.boardProjectId = pid; }
@@ -7764,6 +7773,7 @@ async function refreshRail(force = false) {
   }
   void refreshOutcomes(); // FEAT-057 — deaths are project-scoped too
   void refreshRequests(); // FEAT-126 — declared request bindings for the open session
+  return ok;
 }
 
 /* ══════════════════════════ FEAT-057 — agents that stopped, and why ═══════
@@ -7803,20 +7813,46 @@ function mergeOutcomes(list) {
  * even a 50-agent mass-cut swarm.
  */
 const OUTCOMES_RECENT_MS = 48 * 60 * 60 * 1000;
+let outcomesInFlight = null;
+// FEAT-202 (round 3) — the client-clock time at which the fetch whose bytes are
+// CURRENTLY in state.outcomes STARTED. versionsRailCycle commits the outcomes
+// fingerprint only if this is >= the moment it read the versions snapshot, so a
+// COALESCED fetch that was already in flight BEFORE the snapshot (started by a
+// focus/visibilitychange/access-card refreshRail tail) — and therefore may
+// reflect pre-snapshot bytes — does not let a newer fingerprint be committed
+// against older bytes (the round-3 independent-verify coalescing race).
+let outcomesAppliedAt = 0;
+// FEAT-202 — returns true when the fetch resolved (incl. a 304 served from the
+// remembered body, and the route-absent case), false only on a transient
+// failure, so the versions cycle advances its remembered outcomes fingerprint
+// ONLY on a real refresh and retries next cycle otherwise (no lost update).
 async function refreshOutcomes() {
-  if (state.caps.outcomes === false) return;
+  if (state.caps.outcomes === false) { outcomesAppliedAt = Date.now(); return true; }
+  // FEAT-202 — coalesce concurrent callers (refreshRail's tail + pollRail's
+  // explicit call in one rail cycle) onto a SINGLE fetch, so a cycle fetches
+  // agent-outcomes at most once. The coalesced result carries the INITIATOR's
+  // start time (outcomesAppliedAt), so a joiner whose intent is newer than that
+  // fetch is detected by versionsRailCycle's `outcomesAppliedAt >= vReadAt` gate.
+  if (outcomesInFlight) return outcomesInFlight;
+  const startedAt = Date.now();
+  outcomesInFlight = (async () => {
   let list;
   try { list = await api.agentOutcomes({ projectId: state.current.projectId ?? undefined, all: true, limit: 200 }); }
-  catch { return; /* transient — the rail keeps its last honest answer */ }
-  if (list === null) { state.caps.outcomes = false; return; } // older server
+  catch { return false; /* transient — the rail keeps its last honest answer */ }
+  if (list === null) { state.caps.outcomes = false; outcomesAppliedAt = startedAt; return true; } // older server
   state.caps.outcomes = true;
   // FEAT-118 — the sidebar's died-without-answering marker reads state.outcomes,
   // so a poll that changes the death set must repaint the tree too, or a session
   // that just died would keep reading 'finished' until some unrelated re-render.
   const before = (state.outcomes ?? []).map((o) => `${o.id}:${o.dismissedAt ? 'd' : ''}`).join(',');
   state.outcomes = list;
+  outcomesAppliedAt = startedAt; // these bytes are as fresh as this fetch's start
   renderOutcomes();
   if (before !== list.map((o) => `${o.id}:${o.dismissedAt ? 'd' : ''}`).join(',')) renderTree();
+  return true;
+  })();
+  try { return await outcomesInFlight; }
+  finally { outcomesInFlight = null; }
 }
 
 /**
@@ -7984,17 +8020,21 @@ function dismissOutcomeIds(ids) {
  * waiting". They must not render the same, because this surface exists to tell
  * the user something IS waiting for them.
  */
+// FEAT-202 — returns true when the fetch resolved (incl. 304 / route-absent),
+// false only on a transient failure, so the versions cycle advances its
+// remembered pending fingerprint ONLY on a real refresh (no lost update).
 async function refreshPending() {
-  if (state.caps.pending === false) return;
+  if (state.caps.pending === false) return true;
   let r;
   try { r = await api.pendingLanes({ projectId: state.current.projectId ?? undefined }); }
-  catch { return; /* transient — the rail keeps its last honest answer */ }
-  if (r === null) { state.caps.pending = false; return; } // older server: no such route
+  catch { return false; /* transient — the rail keeps its last honest answer */ }
+  if (r === null) { state.caps.pending = false; return true; } // older server: no such route
   state.caps.pending = true;
-  if (r.problem) { state.pendingProblem = r.problem; renderPending(); return; }
+  if (r.problem) { state.pendingProblem = r.problem; renderPending(); return true; }
   state.pendingProblem = null;
   state.pending = r.items;
   renderPending();
+  return true;
 }
 
 /**
@@ -10069,6 +10109,13 @@ document.addEventListener('click', (e) => {
  * mid-typing in is left alone as long as its item is still open.
  */
 const RAIL_POLL_MS = 5000;
+// FEAT-202 — the board moves slowly (decisions/asks/findings/stalls), so poll
+// it on a longer cadence than the death-ledger and held-lane results, which
+// must surface promptly. ETag/304 already makes each board poll nearly free in
+// bytes; a longer cadence cuts the request count too. 20s keeps a board change
+// visible within one interval while quartering the board request rate.
+const BOARD_POLL_MS = 20000;
+let lastBoardPollAt = 0;
 let railPollTimer = null;
 
 function clearRailPoll() {
@@ -10083,6 +10130,101 @@ function scheduleRailPoll() {
   railPollTimer = setTimeout(() => { void pollRail(); }, RAIL_POLL_MS);
 }
 
+// FEAT-202 (round 3) — the last COMMITTED /api/versions snapshot. The versions
+// poll diffs each cycle's stat FINGERPRINTS against this and refetches only a
+// store whose fingerprint moved, committing the new fingerprint only once that
+// store's refetch succeeds (see versionsRailCycle). `state.caps.versions ===
+// false` means the server has no /api/versions route (older server) and we use
+// the round-1 poll-each cadence.
+let lastVersions = null;
+
+/* Round-1 behaviour, kept as the FALLBACK path: board on its own slow cadence,
+ * the death-ledger and held-lane results on the fast cycle. Used when the
+ * server has no /api/versions route, or for the cycle after a transient
+ * /api/versions failure, so a versions outage never makes the rail go stale —
+ * it only costs the extra per-endpoint requests round 1 already paid. */
+async function legacyRailCycle() {
+  const now = Date.now();
+  if (now - lastBoardPollAt >= BOARD_POLL_MS) {
+    lastBoardPollAt = now;
+    await refreshRail(true);
+  }
+  // FEAT-057: the death ledger rides the SAME poll — an agent that dies while
+  // nothing else is happening (the whole point of the feature) must surface
+  // without any other traffic to piggyback on.
+  await refreshOutcomes();
+  // ARCH-017 — held lane results ride the SAME poll, for the same reason.
+  await refreshPending();
+}
+
+/* FEAT-202 (round 3) — one versions snapshot drives every per-store refresh.
+ * Each store's version is now a stat FINGERPRINT (an opaque string compared with
+ * `!==`); a changed `boot` means the server restarted (its in-process bump
+ * counters, folded into the fingerprints, reset to 0) so we treat the whole
+ * snapshot as new → refetch everything, which also covers the very first poll
+ * (no prior snapshot). Otherwise refetch only the stores whose fingerprint moved;
+ * each refresh uses round 1's conditionalGet, so even an over-eager board move
+ * (lanes/decisions feed the board's needsYou) costs just a 304, never stale bytes.
+ *
+ * LOST-UPDATE FIX (round-3 verdict): we advance the REMEMBERED fingerprint for a
+ * store ONLY after that store's refetch actually succeeded. A transient refetch
+ * failure leaves the remembered value at its old fingerprint, so the next cycle
+ * still sees a mismatch and retries — the store can never be silently marked
+ * current against bytes the client never pulled. Round 2 set lastVersions = v
+ * up front, so a failed refetch stranded the store until the NEXT server change. */
+async function versionsRailCycle(v) {
+  const pid = state.current.projectId;
+  // When we read this snapshot (client clock). A store refetch only "reflects"
+  // this fingerprint if the fetch that produced its bytes STARTED at/after now;
+  // used below to reject a coalesced outcomes fetch that predates the snapshot.
+  const vReadAt = Date.now();
+  // `prev` is the last COMMITTED snapshot, but only within the same boot AND the
+  // same project. A boot change resets every server fingerprint; a PROJECT switch
+  // changes the project-scoped VIEWS (agent-outcomes and lanes-pending are both
+  // filtered by projectId) WITHOUT moving their global fingerprint, so the switch
+  // must force a refetch of those stores or the new project would show the old
+  // one's held lanes/deaths until some unrelated lane write moved the fingerprint
+  // (round 1 polled them every 5s). Treating a pid change as "no prev" refetches
+  // board + outcomes + pending for the project just opened.
+  const prev = (lastVersions && lastVersions.boot === v.boot && lastVersions.pid === pid) ? lastVersions : null;
+  // Carry forward prior per-store fingerprints; each is overwritten below ONLY
+  // when its refetch succeeds. Board is a per-project map, so other projects'
+  // remembered fingerprints survive a project switch.
+  const next = {
+    boot: v.boot,
+    pid,
+    board: { ...(lastVersions && lastVersions.boot === v.boot ? lastVersions.board : {}) },
+    outcomes: prev ? prev.outcomes : undefined,
+    pending: prev ? prev.pending : undefined,
+  };
+  // The board fingerprint catches every FILE-backed input (tickets, the .arch
+  // findings/acks, access-requests, the methodology needs-human files) to ≤5s.
+  // But the board card ALSO merges a few SERVER-DERIVED inputs with no stable
+  // backing file — the base-update notice, grant-rebuild rail items, the
+  // pilot-only ref-ledger alarm — which no stat fingerprint can observe. So the
+  // board additionally gets a slow BOARD_POLL_MS safety refresh: it bounds those
+  // derived inputs (they would otherwise be stale with no time limit — the round-3
+  // independent-verify finding), and it is cheap because round 1's conditionalGet
+  // makes every backstop poll a bodyless 304 unless the board truly changed.
+  const boardNow = v.board ? v.board[pid] : undefined;
+  const boardWas = prev && prev.board ? prev.board[pid] : undefined;
+  const boardBackstopDue = Date.now() - lastBoardPollAt >= BOARD_POLL_MS;
+  if (boardNow !== boardWas || boardBackstopDue) {
+    lastBoardPollAt = Date.now();
+    if (await refreshRail(true)) next.board[pid] = boardNow;
+  }
+  if (v.outcomes !== (prev ? prev.outcomes : undefined)) {
+    // Commit only if the applied bytes come from a fetch that started at/after we
+    // read this snapshot — otherwise we joined an older in-flight fetch and must
+    // retry next cycle (the coalescing race) rather than strand stale bytes.
+    if (await refreshOutcomes() && outcomesAppliedAt >= vReadAt) next.outcomes = v.outcomes;
+  }
+  if (v.pending !== (prev ? prev.pending : undefined)) {
+    if (await refreshPending()) next.pending = v.pending;
+  }
+  lastVersions = next;
+}
+
 async function pollRail() {
   // Self-healing: a throw anywhere in a poll cycle (e.g. a render bug in
   // refreshRail → renderRail) must NEVER kill the loop. The finally always
@@ -10091,16 +10233,25 @@ async function pollRail() {
   // propagate out here and stop scheduleRailPoll forever).
   try {
     if (!document.hidden && state.current.projectId) {
-      await refreshRail(true);
-      // FEAT-057: the death ledger rides the SAME poll — an agent that dies while
-      // nothing else is happening (the whole point of the feature) must surface
-      // without any other traffic to piggyback on.
-      await refreshOutcomes();
-      // ARCH-017 — held lane results ride the SAME poll, for the same reason the
-      // death ledger does: a background fan-out that settles while nothing else
-      // is happening is precisely the case this feature exists for, so it must
-      // surface with no other traffic to piggyback on.
-      await refreshPending();
+      if (state.caps.versions === false) {
+        await legacyRailCycle();
+      } else {
+        let v;
+        let failed = false;
+        try { v = await api.versions(); }
+        catch { failed = true; }
+        if (failed) {
+          // Transient /api/versions failure — don't go stale this cycle: poll
+          // each endpoint (round 1), and retry /api/versions next cycle.
+          await legacyRailCycle();
+        } else if (v === null) {
+          state.caps.versions = false; // older server: no /api/versions route
+          await legacyRailCycle();
+        } else {
+          state.caps.versions = true;
+          await versionsRailCycle(v);
+        }
+      }
     }
   } catch (err) {
     console.error('pollRail cycle failed (loop kept alive):', err);
@@ -10113,7 +10264,9 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) { clearRailPoll(); return; }
   // Coming back into view: refresh right away rather than waiting out a stale
   // interval — this is the server-restart-while-tab-was-away case from BUG-016.
+  lastBoardPollAt = Date.now(); // FEAT-202 — the board was just refreshed; don't double-poll it
   void refreshRail(true);
+  void refreshProcSummary(); // FEAT-202 — it was skipped while hidden; catch it up now
   scheduleRailPoll();
 });
 window.addEventListener('focus', () => { void refreshRail(true); });

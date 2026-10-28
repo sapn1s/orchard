@@ -85,6 +85,7 @@ import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 
 import { dataDir, ensureDir, writeAtomic } from '../lib/paths.ts';
+import { bumpPending } from './store-versions.ts';
 
 /*
  * STEP 2 — `pending` is a declared member that has not spawned yet.
@@ -1149,6 +1150,7 @@ function writeAll(records: LaneRecord[]): void {
     }
   }
   writeAtomic(laneStoreFile(), JSON.stringify(kept, null, 2));
+  bumpPending(); // FEAT-202 — lanes feed pending AND the board's needsYou; zero-latency accelerator over the stat fingerprint
 }
 
 /**
@@ -1572,6 +1574,7 @@ export function sealGroupDurably(groupId: string, kind: GroupSealKind, why: stri
   }
   ensureDir(dataDir());
   writeAtomic(groupSealFile(), JSON.stringify(seals, null, 2));
+  bumpPending(); // FEAT-202 — group seals change the pending grouping; zero-latency accelerator over the stat fingerprint
 }
 
 /** The durable seal for a group, or null. Independent of whether any row survives. */

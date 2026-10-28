@@ -107,6 +107,32 @@ function terminalState(s: string): boolean {
 }
 
 /**
+ * FEAT-202 (round 3) — a monotone-ish epoch over the TIME-based pending
+ * transitions, for the aggregate /api/versions fingerprint. Pending readiness
+ * changes not only on a lanes.json WRITE but when a deadline PASSES with no write
+ * at all — a group's `groupCloseDeadline` elapsing, or a held result crossing the
+ * `HELD_STARVATION_MS` bound. Those make the pending VIEW change while the file
+ * fingerprint stays still, so without this the versions-driven client would never
+ * refetch pending after a deadline (round 1 polled it every 5s — this restores
+ * that bound without a blind poll). It is a PURE read (no sweep, no write): it
+ * counts how many such transitions have already passed. The count moves exactly
+ * when a deadline crosses, so the pending fingerprint moves and the client
+ * refetches within one versions cycle (≤5s); when idle it is static, so it costs
+ * nothing. Over-counting is harmless — an extra pending refetch is a 304.
+ */
+export function pendingTimeEpoch(now: number = Date.now()): number {
+  let n = 0;
+  for (const r of lanes.readAll()) {
+    if (r.groupOpen && r.groupCloseDeadline != null && r.groupCloseDeadline <= now) n++;
+    if (r.starvationReleasedAt == null && terminalState(r.state) && lanes.isHeld(r)) {
+      const base = r.settledAt ?? r.dispatchedAt;
+      if (now - base >= lanes.HELD_STARVATION_MS) n++;
+    }
+  }
+  return n;
+}
+
+/**
  * Close every open group whose persisted deadline has passed (hazard 3, runtime
  * half). Idempotent and safe to call on every poll: `closeGroup` keeps the
  * first close and a group already closed is skipped here entirely.

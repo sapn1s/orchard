@@ -5,6 +5,10 @@ data/
 scratch/
 *.tmp
 
+# Lane scratch at the repo root (IV requirements/verdicts, screenshots, patch files) — the
+# preferred scratch home is docs/CONVENTIONS.md's scratch root (scripts/lib/scratch.mjs).
+/tmp/
+
 # Serena MCP (machine-local: abs path + cache) — see FEAT-025
 .serena/
 .mcp.json

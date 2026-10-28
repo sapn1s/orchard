@@ -7470,7 +7470,7 @@ async function openSession(p, sess, opts = {}) {
     // The NEWEST page, not the oldest. Everything before it is fetched on
     // scroll-up by loadOlder(). Fetched even when restoring at a deep index,
     // because it carries `total` — needed to know the restore IS deep.
-    const t = await api.transcriptTail(sess.encodedDir, sess.sessionId, { limit: TAIL_PAGE });
+    const t = (await opts.prefetchedTail) ?? await api.transcriptTail(sess.encodedDir, sess.sessionId, { limit: TAIL_PAGE });
     // BUG-196 round 3 — record the engine THIS session id is pinned to, as the
     // server declared it (resumeProviderOf). Keyed by the id, so it is true
     // whatever is on screen when it lands — recorded BEFORE the scope guard.
@@ -19058,11 +19058,20 @@ async function applyRoute(route) {
       return true;
     }
     const holds = () => routeIntentHolds(gen, route);
+    // FEAT-199 — the newest-page tail only needs the id + dir the URL already
+    // carries, but resolveRouteSession must first await the (cold) session list to
+    // learn which row the URL names. Start the tail NOW so it overlaps that load
+    // instead of running serially after it (deep-link / page-load / phone path).
+    // Advisory: a failure resolves to null and openSession falls back to its own
+    // fetch; a dir the resolver corrects away from is simply not consumed.
+    const tailPrefetch = route.dir ? api.transcriptTail(route.dir, route.sessionId, { limit: TAIL_PAGE }).catch(() => null) : null;
     const res = await resolveRouteSession(p, route, holds);
     if (!holds()) return true; // superseded while resolving — leave the newer view alone
     if (res.kind === 'open') {
       const sess = res.sess;
-      await openSession(p, sess, { at: route.i, agent: route.agent, routeGen: gen });
+      await openSession(p, sess, { at: route.i, agent: route.agent, routeGen: gen,
+        // only when the resolved row is the exact (dir,id) the tail was prefetched for
+        prefetchedTail: (tailPrefetch && sess.encodedDir === route.dir && sess.sessionId === route.sessionId) ? tailPrefetch : undefined });
       // The URL names where the session really is (a stale dir corrected) —
       // only while this open still owns the view.
       if (nav.routeGen === gen && state.current.sessionId === sess.sessionId && state.current.encodedDir === sess.encodedDir) {

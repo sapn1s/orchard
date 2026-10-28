@@ -19,6 +19,8 @@ export function createGitView(ctx) {
   let grant=null, policy=null, gwBusy=false;
   // FEAT-190 — the agent-git policy is managed HERE (the git page) now, not the Settings drawer.
   let gwTimed=null, gwPanelOpen=false, gwDraft=null, gwReached=[], gwSummary='', gwPanel=null, gwErr='', gwLoaded=false, gwLoadFailed=false, gwLoadSeq=0, gwRevision=null;
+  // FEAT-196 — the just-generated device-pairing token (shown ONCE), and a busy flag.
+  let gwPairResult=null, gwPairBusy=false;
   let projectId, view='changes', data, stashData={stashes:[]}, branchData, historyData, filtered=[], selected, parent, request=0, generation=0, filterTimer, fetchTimer, fetchedAt;
   let loading=false, batching=false, committing=false, syncing=false, branchBusy=false, liveConfirmed=false, historyBusy=false, failures=0; const rows=new Map(), pending=new Set();
   const project=()=>ctx.getProject(projectId), fail=(m='')=>{(view==='branches'?branchError:error).textContent=m;viewError.textContent=m}, operation=(name,state,detail='')=>{root.dataset.lastOperation=name;root.dataset.lastResponse=state;root.dataset.lastDetail=detail}, stagedCount=()=>data?.changes.filter(c=>c.staged).length??0;
@@ -321,6 +323,23 @@ export function createGitView(ctx) {
     body.push(acts);
     if(gwErr)body.push(h('div',{class:'gt-gw-err',text:gwErr}));
     body.push(h('p',{class:'gt-gw-foot',text:'Every agent commit and push is still checked for leaked secrets and private paths (the leak gate). Force-pushes stay refused. Your own commits are never blocked by this.'}));
+    // FEAT-196 — pair a phone so you can grant this from your phone over Tailscale. Only this
+    // desktop (localhost) can pair; the token is shown once and lives only in the phone's browser.
+    const pair=h('div',{class:'gt-gw-sec gt-gw-pair'},h('div',{class:'gt-gw-sec-h',text:'Grant from your phone (Tailscale)'}));
+    if(gwPairResult){
+      const frag=`#pair=${gwPairResult.token}`;
+      const inp=h('input',{class:'gt-gw-pair-tok',readonly:'readonly','aria-label':'Pairing fragment'});inp.value=frag;
+      pair.append(
+        h('p',{class:'gt-gw-note',text:`Paired “${gwPairResult.label}”. On your phone, open your Orchard URL and append this once — shown only now:`}),
+        h('div',{class:'gt-gw-pair-row'},inp,(()=>{const b=h('button',{type:'button',class:'gt-gw-chip',onclick:async()=>{try{await navigator.clipboard.writeText(frag);ctx.notify('pairing fragment copied');}catch{ctx.notify('select and copy the fragment');}}},'Copy');return b;})()),
+        h('p',{class:'gt-gw-note',text:'Then that phone can grant agent git-write here. It cannot pair other devices. Revoke any time from this desktop.'}),
+      );
+    } else {
+      const lab=h('input',{class:'gt-gw-pair-label',placeholder:'Device label (e.g. “my phone”)','aria-label':'Device label',maxlength:'120'});
+      const btn=h('button',{type:'button',class:'gt-gw-chip',onclick:async()=>{if(gwPairBusy)return;gwPairBusy=true;paintGwPanel();try{const r=await api.createPairing(lab.value.trim()||'phone');gwPairResult={token:r.token,label:r.label};}catch(e){gwErr=e.message;}gwPairBusy=false;paintGwPanel();}},gwPairBusy?'Pairing…':'Pair a phone…');btn.disabled=gwPairBusy;
+      pair.append(h('p',{class:'gt-gw-note',text:'Pair a trusted device once, from this desktop, to grant agent git-write from it while away. An agent can never pair itself or read the token.'}),h('div',{class:'gt-gw-pair-row'},lab,btn));
+    }
+    body.push(pair);
     gwPanel.replaceChildren(...body);
   }
   // FEAT-190 r3 (IV run 01a13c67 BROKEN) — opening "Manage" ALWAYS re-fetches the current policy
@@ -329,7 +348,7 @@ export function createGitView(ctx) {
   // draft from the fresh policy when loadGrant resolves, so an untouched Save cannot clobber another
   // tab's push:false with a stale default-on draft. (Residual: a sub-second TOCTOU between this
   // re-fetch and Save still needs a server-side optimistic-concurrency guard — flagged, not closed.)
-  gwSettings.onclick=()=>{if(!projectId)return;gwPanelOpen=!gwPanelOpen;if(gwPanelOpen){gwLoaded=false;gwLoadFailed=false;gwDraft=null;const token=generation;paintGwPanel();void loadGrant(token);}else paintGwPanel();};
+  gwSettings.onclick=()=>{if(!projectId)return;gwPanelOpen=!gwPanelOpen;if(gwPanelOpen){gwLoaded=false;gwLoadFailed=false;gwDraft=null;gwPairResult=null;gwPairBusy=false;const token=generation;paintGwPanel();void loadGrant(token);}else paintGwPanel();};
   projectSelect.onchange=()=>ctx.navigate(projectSelect.value,{view});root.querySelectorAll('.gt-views button').forEach(b=>b.onclick=()=>{if(b.dataset.view!==view)ctx.navigate(projectId,{view:b.dataset.view})});title.oninput=paint;branchName.oninput=paint;filter.oninput=()=>{clearTimeout(filterTimer);filterTimer=setTimeout(applyFilter,180)};all.onchange=()=>void toggleAll();
   sync.onclick=async()=>{const action=sync.dataset.action;if(sync.disabled)return;if(action==='fetch')return void fetchNow(generation,true);const token=generation,serverAction=action==='publish'?'push':action;syncing=true;paint();try{const r=await guard(token,api.gitAction(project().id,serverAction));data.status=r.status;ctx.notify(action==='publish'?`published ${r.status?.branch??'branch'} to origin`:action==='push'?'pushed to origin':'pulled from origin');ctx.onStatusChanged?.(r.status,projectId);loadChanges(true,token);syncing=false;paint()}catch(e){fail(e.message);if(e.body?.status)data.status=e.body.status;syncing=false;paint()}};
   commitForm.onsubmit=async e=>{e.preventDefault();if(commit.disabled)return;const token=generation;committing=true;paint();try{const r=await guard(token,api.gitAction(project().id,'commit',{title:title.value,description:description.value}));title.value='';description.value='';ctx.notify(`committed ${r.committed}`);loadChanges(true,token);ctx.onStatusChanged?.(r.status,projectId);committing=false;paint()}catch(x){fail(x.message);committing=false;paint()}};

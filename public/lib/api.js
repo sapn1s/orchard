@@ -10,6 +10,33 @@
  *    land — so whichever shape the server ends up speaking, the UI works.
  */
 
+/**
+ * FEAT-196 — the per-device pairing token for a trusted REMOTE device (phone over
+ * Tailscale), so the user can grant agent git-write from it. Captured ONCE from the URL
+ * fragment `#pair=<token>` (a fragment is never sent to the server, so the token stays out
+ * of request logs/referrers), stored in localStorage, and attached as x-orchard-pairing on
+ * every request. On the desktop (localhost) no token is set and nothing changes.
+ */
+const PAIR_KEY = 'orchard.pairing';
+(function capturePairingToken() {
+  try {
+    // Parse the fragment as `key=value&…` segments. Take the token, then drop EVERY `pair=…`
+    // segment and rebuild the fragment — prepending `#` only when something is left, so a
+    // residual can never glue onto location.search and become a server-visible query param
+    // (independent-verify run 01a17ef9 BROKEN: `#pair=T&pair=T` leaked a token to the server).
+    const raw = (location.hash || '').replace(/^#/, '');
+    const m = /(?:^|&)pair=([0-9a-f]{64})(?=$|&)/.exec(raw);
+    if (!m) return;
+    localStorage.setItem(PAIR_KEY, m[1]);
+    const rest = raw.split('&').filter((seg) => !/^pair=[0-9a-f]{64}$/.test(seg)).join('&');
+    history.replaceState(null, '', location.pathname + location.search + (rest ? `#${rest}` : ''));
+  } catch { /* no localStorage / malformed — ignore */ }
+})();
+function pairingToken() {
+  try { return localStorage.getItem(PAIR_KEY); } catch { return null; }
+}
+export function hasPairingToken() { return !!pairingToken(); }
+
 export class ApiError extends Error {
   constructor(message, status, body) {
     super(message);
@@ -23,9 +50,10 @@ export class ApiError extends Error {
 export async function api(path, init) {
   let res;
   try {
+    const pairing = pairingToken();
     res = await fetch(path, {
-      headers: { 'content-type': 'application/json' },
       ...init,
+      headers: { 'content-type': 'application/json', ...(pairing ? { 'x-orchard-pairing': pairing } : {}), ...(init?.headers ?? {}) },
     });
   } catch (err) {
     throw new ApiError(`server unreachable (${err.message})`, 0);
@@ -386,6 +414,11 @@ export const sessionConfig = (sessionId) =>
 
 /** Last slash-command list any session's CLI reported. null = route absent. */
 export const slashCommands = () => optional('/api/slash-commands').then((r) => r?.commands ?? null);
+
+/* FEAT-196 — device pairings (grant agent git-write from a trusted remote device). */
+export const listPairings = () => optional('/api/pairings').then((r) => r?.pairings ?? []);
+export const createPairing = (label) => api('/api/pairings', { method: 'POST', body: JSON.stringify({ label }) });
+export const revokePairing = (id) => api(`/api/pairings/${encodeURIComponent(id)}`, { method: 'DELETE' });
 
 /** The CLI's own model list (display names with versions). null = absent.
  * FEAT-045: per provider — no arg keeps the pre-045 Claude list. */

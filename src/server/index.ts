@@ -40,6 +40,7 @@ import * as gitcli from './git.ts';
 // so an agent cannot plant a grant by writing config or exporting an env var.
 import { grantGitWrite, revokeGitWrite, grantView, listGitWrites, setGitWriteAuditSink, confirmGitWrite, setPermanentGrantSource, permanentGrantOf, timedGrantView, recordCrossRepoReach, crossRepoReachFor, setCrossRepoReachSink, loadCrossRepoReach } from '../../scripts/lib/git-grant-store.mjs';
 import { requireUserCaller } from './caller-provenance.ts';
+import { enrollPairing, listPairings, revokePairing } from './device-pairing.ts';
 import { handleDelegationRoute } from './delegations.ts'; // FEAT-184
 import { grantBindingOf, bindingHolds, resolvedRemotesOf } from '../../scripts/lib/repo-identity.mjs';
 import { decideByTarget, describeRegisteredRepo, validatePolicyInput, policySummary, normalizeGitWrite, NEVER_RELEASES_PREFIX } from '../../scripts/lib/agent-git-policy.mjs';
@@ -1289,7 +1290,9 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
       if (m === 'POST') {
         // FEAT-164 option A (O1): only the USER grants. An agent session (or anything it
         // launched) is refused here before anything is written; revoking stays open to it.
-        const refusal = requireUserCaller(req, `git-write grant for ${p.id}`);
+        // FEAT-196: also accept the user's PAIRED remote device (phone over Tailscale) — the
+        // one route that opts in, so the user can grant from their phone; agents still can't.
+        const refusal = requireUserCaller(req, `git-write grant for ${p.id}`, { allowPaired: true });
         if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
         const body = (await readBody(req)) as Record<string, unknown>;
         if (body.scope === 'permanent') {
@@ -2163,6 +2166,39 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     const project = url.searchParams.get('project');
     const { windowMs: _w, ...counts } = lateAnswerCounts({ windowMs: days * 24 * 60 * 60_000, ...(project ? { projectId: project } : {}) });
     sendJson(res, 200, { windowDays: days, projectId: project ?? null, deadlineMs: approvalDeadlineConfig().deadlineMs, ...counts });
+    return true;
+  }
+
+  /*
+   * FEAT-196 — device pairings so the USER can grant agent git-write from a trusted REMOTE
+   * device (their phone over `tailscale serve`). ENROLMENT is gated to a LOCALHOST user
+   * (requireUserCaller WITHOUT allowPaired): the first pairing is created at the desktop and
+   * a paired phone cannot mint more pairings (it grants git, nothing else). The raw token is
+   * returned ONCE here and never stored (the store keeps only a sealed sha256). See
+   * device-pairing.ts and caller-provenance.ts acceptPairedCaller.
+   */
+  if (rest[0] === 'pairings' && rest.length === 1 && m === 'GET') {
+    const refusal = requireUserCaller(req, 'listing device pairings', { code: 'agent-not-user', agentError: 'device pairings are the user\'s own; only a localhost user may list them.' });
+    if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
+    sendJson(res, 200, { pairings: listPairings() });
+    return true;
+  }
+  if (rest[0] === 'pairings' && rest.length === 1 && m === 'POST') {
+    const refusal = requireUserCaller(req, 'pairing a device', { code: 'agent-not-user', agentError: 'pairing a device mints a credential that can grant agent git-write, so only a localhost user may do it (never an agent, never a paired phone).' });
+    if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
+    const body = (await readBody(req)) as Record<string, unknown>;
+    const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : 'device';
+    const result = enrollPairing(label);
+    if ('error' in result) { sendJson(res, 409, { error: result.error, code: 'pairing-store-unreadable' }); return true; }
+    console.warn(`[orchard] device pairing ENROLLED (${result.id}, "${result.label}") — a trusted remote device may now grant agent git-write (FEAT-196).`);
+    sendJson(res, 200, { ok: true, id: result.id, label: result.label, token: result.token });
+    return true;
+  }
+  if (rest[0] === 'pairings' && rest.length === 2 && m === 'DELETE') {
+    const refusal = requireUserCaller(req, 'revoking a device pairing', { code: 'agent-not-user', agentError: 'revoking a device pairing is the user\'s act; only a localhost user may do it.' });
+    if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
+    const revoked = revokePairing(decodeURIComponent(rest[1]));
+    sendJson(res, 200, { ok: true, revoked });
     return true;
   }
 

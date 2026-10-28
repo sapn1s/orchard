@@ -61,4 +61,5 @@ export declare function decideByTarget(opts: { argv: string[]; target: unknown; 
  * to whatever remote the repo has (no frozen-remote veto); the leak gate still runs. */
 export declare function decidePush(opts: { source: { commonDir?: string | null; cwd?: string | null; toplevel?: string | null }; url: string; projects: TargetProject[]; sessionProjectId: string; verb?: string; fixtureRoots?: string[]; release?: boolean }): { refusal: string | null; key: string; gateRepo: string | null };
 export declare function defaultFixtureRoots(): string[];
+export declare function isFixturePath(p: string | null | undefined, roots?: string[]): boolean;
 export declare function hostGitBuiltins(git?: string): Set<string> | null;

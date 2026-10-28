@@ -70,6 +70,21 @@ export function defaultFixtureRoots() {
 }
 
 /**
+ * TRUE iff `p` lies inside (or is) one of the fixture roots: the scratch root, the system tmp
+ * (which holds e.g. the Claude CLI's own `/tmp/claude-<uid>/bash-edit-diff/<hash>` throwaway
+ * repos) or the confined runner's work dir. Used to keep throwaway/test repos OUT of the
+ * "other repos this grant reached" display log (they are never real repos the user governs).
+ * The path is realpath'd when it still exists (else resolved), matching how the roots are built.
+ * Display/record filter only — no allow/deny decision reads it.
+ */
+export function isFixturePath(p, roots = defaultFixtureRoots()) {
+  if (typeof p !== 'string' || !p) return false;
+  let rp; try { rp = fs.realpathSync(p); } catch { rp = path.resolve(p); }
+  const cands = rp === path.resolve(p) ? [rp] : [rp, path.resolve(p)];
+  return roots.some((r) => typeof r === 'string' && !!r && cands.some((c) => c === r || c.startsWith(r.endsWith(path.sep) ? r : r + path.sep)));
+}
+
+/**
  * The evidence-based release cadence default (FEAT-164 plan, 2026-10-11): Orchard saw
  * 23 tickets with a typed HOLDS in 30 days (≈0.8/day, bursts of 6/day); the user's own
  * cadence was 4 batch commits/30 days; an ungated grant produced 26–29 commits/day.

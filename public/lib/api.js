@@ -711,6 +711,21 @@ export const board = (id) =>
     .then((r) => r ?? { hasBoard: false, needsYou: [], inflight: [], doneToday: [] });
 
 /** Answer a 👤 board item: appended to the ticket + delivered to any attached session. */
+/** FEAT-200 — the open session's container access requests (its cards). */
+export const sessionAccessRequests = (sessionId) => api(`/api/sessions/${encodeURIComponent(sessionId)}/access-requests`);
+/** FEAT-200 — the user's typed decision on a container access request: 'approve' | 'reject'. */
+export const decideAccess = (projectId, requestId, verdict) =>
+  api(`/api/projects/${encodeURIComponent(projectId)}/access-requests/${encodeURIComponent(requestId)}/decide`, {
+    method: 'POST',
+    body: JSON.stringify({ verdict }),
+  });
+
+/** FEAT-200 r6 — the project's container access requests (the drawer checks for approved-pending ones before a save). */
+export const projectAccessRequests = (projectId) => api(`/api/projects/${encodeURIComponent(projectId)}/access-requests`);
+/** FEAT-200 r6 — the user withdraws an approved access request that has not been applied yet. */
+export const cancelAccess = (projectId, requestId) =>
+  api(`/api/projects/${encodeURIComponent(projectId)}/access-requests/${encodeURIComponent(requestId)}/cancel`, { method: 'POST', body: '{}' });
+
 export const answerBoard = (id, ticketId, answer, decisionKey) =>
   api(`/api/projects/${encodeURIComponent(id)}/board/answer`, {
     method: 'POST',

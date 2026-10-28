@@ -24,7 +24,7 @@ import { normalizeLineEndings } from './board.ts';
 // (scripts/independent-verify.mjs). Never write such a path literal here.
 import { READ_THROUGH_SEED_IDS, seedSourceRelPath } from './seed-sources.mjs';
 // FEAT-157 — the container guide is GENERATED from the tables the enforcing code reads.
-import { RESERVED_ENV_RULES, LOCKDOWN_RULES, BUILD_RULES, IMAGE_ENV_ALLOWED } from './container-manager.ts';
+import { RESERVED_ENV_RULES, LOCKDOWN_RULES, BUILD_RULES, IMAGE_ENV_ALLOWED, ACCESS_DIR_ENV, ACCESS_FILE_PREFIX, PUBLISH_HOST_IP } from './container-manager.ts';
 
 export type TemplateMode = 'append' | 'replace';
 
@@ -518,6 +518,38 @@ export function containerBuildSection(opts: { imageSource: 'station' | 'dockerfi
     '**Not in the Dockerfile:** GPU, memory, environment, mounts and service sidecars are project settings (`container.gpu`, `container.memoryMb`, `container.env`, `mounts`, `services`).',
     '',
     `**Base updates:** a new release, and which base this container runs, are told to you as a \`[station]\` note on your first turn and when they change. The user answers on the Needs-You rail (Adopt / Defer / Skip; a security release cannot be skipped and is applied at the next launch with no live session).${opts.answerCmd ? ` If the user tells you to act on one: \`${opts.answerCmd} base status\`, then \`${opts.answerCmd} base adopt|defer|skip --rev <rev>\` (this project's own notice only).` : ''}`,
+  ].join('\n');
+}
+
+/**
+ * FEAT-200 — WHEN and HOW a container session asks the user for access its container lacks (an env var such as
+ * a host database URL; a port published on this machine's loopback). Injected for CONTAINER sessions only
+ * (agent-bridge), and STATIC so the cached system prefix stays byte-stable across resumes (FEAT-113). The
+ * names it prints (the inbox env var, the file prefix, the loopback address) are the constants the enforcing
+ * code reads, so the instructions cannot drift from the channel.
+ */
+export function containerAccessSection(): string {
+  const dir = `$${ACCESS_DIR_ENV}`;
+  return [
+    '## Container access (Orchard)',
+    '',
+    'You run inside this project\'s container. When the work needs something the container cannot reach, and you cannot fix it from inside the container, ask the user with an **access request**. Two kinds exist:',
+    `- **env** — a container environment variable, e.g. a URL for a service running on this machine: \`MONGODB_URI=mongodb://host.docker.internal:27017/app\` (\`host.docker.internal\` is this machine as seen from the container). Reserved names (see "Reserved environment names") are refused.`,
+    `- **ports** — publish a container port on this machine's loopback so the user can open it, e.g. a dev server on container port 3000 → \`http://${PUBLISH_HOST_IP}:3000\`. Always ${PUBLISH_HOST_IP}, never the network. Host ports below 1024, and a host port another project, container or program already uses, are refused.`,
+    '',
+    '**When:** only for a real, blocking need: a service on this machine the code must talk to, or a server the user must open. Not for anything you can install or configure inside the container, not speculatively, and not for a secret you could read from a file. One request per need, carrying every change that need takes.',
+    '',
+    '**How** — write the request under a temporary name, then move it into place:',
+    '',
+    `    f="${dir}/${ACCESS_FILE_PREFIX}$ORCHARD_SESSION.$(date +%s%N).json"`,
+    '    cat > "$f.tmp" <<\'JSON\'',
+    '    {"reason": "why, in one or two sentences", "env": {"MONGODB_URI": "mongodb://host.docker.internal:27017/app"}, "ports": [{"containerPort": 3000, "hostPort": 3000}]}',
+    '    JSON',
+    '    mv "$f.tmp" "$f"; r="${f%.json}.reply"; for i in $(seq 15); do [ -f "$r" ] && break; sleep 1; done; cat "$r"',
+    '',
+    '`env` and `ports` are each optional; `hostPort` defaults to `containerPort`. The reply says whether it was raised (`"ok": true` and its id) or why it was refused; fix a refusal and write a new file.',
+    '',
+    '**Then end your turn at once:** say what you asked for and that you are waiting for the user\'s approval. Nothing changes until the user approves it on a card. On approval Orchard rebuilds the container with it once no session in this project is working (it is saved to the project settings once the container has it), then resumes you with `[station] access granted: …, continue`. On rejection you are resumed with `[station] denied: …`. If the approved change cannot be applied (for example the host port was taken in the meantime) you are resumed with `… approved, but could not be applied: <reason>` and nothing changed. If the user edits that setting or cancels the request before it is applied, you are resumed with `… was cancelled: <reason>` and nothing changed. A published port is reached at `127.0.0.1:<host port>` on the host, not `localhost`. You cannot apply or approve an access change yourself: the request is the only path, and changing project settings from a session is refused.',
   ].join('\n');
 }
 

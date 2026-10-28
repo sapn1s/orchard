@@ -77,6 +77,15 @@ export interface ResumeSettings {
   encodedDir: string | null;
   overrides: Record<string, unknown> | null;
   templateIds: string[] | null;
+  /**
+   * BUG-284 — the project INCARNATION (registry.ts `incarnationOf`) this row was queued for. A project id can be
+   * reused (delete + re-add under the same name, scratch delete + re-ensure); an incarnation never is. Stamped by the
+   * outbox itself when the row is minted (`bindResume`, the one place both minters go through) unless the caller names
+   * the incarnation it means (FEAT-200: the request's own). Delivery never RESUMES or STARTS a session into a project
+   * whose incarnation differs (`targetOf`). Absent on rows written before BUG-284: read by the legacy rule (the
+   * project's row must predate the queue row).
+   */
+  projectIncarnation?: string;
 }
 
 export interface OutboxRow {
@@ -129,6 +138,13 @@ export interface OutboxRow {
 export interface OutboxHold { kind: string; text: string; drain?: unknown }
 
 export interface ProbeWait { kind: 'wait'; hold: OutboxHold; retryMs?: number }
+/**
+ * A go for some delivery route. BUG-284 / FEAT-200 r12: there is ONE incarnation chokepoint — `pump` checks every
+ * row is still bound to the project registered under its id BEFORE it splits on the route, so no route can opt out.
+ * (The earlier `running: true` escape hatch let a bridge/survivor route skip the check; it delivered an access
+ * request's "access granted" into a still-running session of a deleted-and-re-added project. Removed: the running
+ * route is now checked like every other.)
+ */
 export interface ProbeGo { kind: 'go'; route: string; ctx?: unknown }
 export type Probe = ProbeWait | ProbeGo;
 export type HandOutcome =
@@ -151,6 +167,12 @@ export interface OutboxWiring {
   interrupt(sessionId: string): Promise<void> | null;
   /** Something changed that a driving tab should see at once (the outbox-turn event etc.). */
   announce(sessionId: string, e: { t: 'outbox-turn'; sessionId: string; text: string; ids: string[]; attachments?: AttachmentRef[] }): void;
+  /**
+   * BUG-284 — the project row registered under `projectId` NOW: its incarnation and when the row was created (ms).
+   * null = no project has this id. THROWS when the registry cannot be read (then nothing is resumed or started).
+   * Absent (test harnesses that never resume into a project) = rows are neither stamped nor checked.
+   */
+  projectIdentity?(projectId: string): { incarnation: string; createdAt: number } | null;
 }
 
 interface Box {
@@ -671,6 +693,21 @@ function payloadOf(req: CreateRequest): string {
   return crypto.createHash('sha256').update(JSON.stringify([req.text, req.origin ?? 'queued', req.initial ?? 'queued', req.reason ?? null, attachmentManifest(req.attachments)])).digest('hex').slice(0, 24);
 }
 
+/**
+ * BUG-284 — the ONE place a row's resume target is bound to a project INCARNATION, used by both row minters
+ * (`createOutboxRow`, `mintStartRow`). A caller that names the incarnation it means keeps it (FEAT-200 passes the
+ * access request's own, which may already be gone); otherwise the project's current incarnation is stamped. Nothing
+ * is stamped when it cannot be known (no wiring yet, no such project, unreadable registry): the row then falls under
+ * the legacy rule at delivery, which can only refuse a project created after the row.
+ */
+function bindResume(resume: ResumeSettings): ResumeSettings {
+  const { projectIncarnation, ...rest } = resume;
+  if (typeof projectIncarnation === 'string' && projectIncarnation) return { ...rest, projectIncarnation };
+  let inc: string | null = null;
+  try { inc = wiring?.projectIdentity?.(resume.projectId)?.incarnation ?? null; } catch { inc = null; }
+  return inc ? { ...rest, projectIncarnation: inc } : rest;
+}
+
 export function createOutboxRow(sid: string, req: CreateRequest): { row: OutboxRow; created: boolean; view: OutboxView } {
   if (!validSessionId(sid)) throw new OutboxError('bad session id', 400);
   // BUG-253: a start box is minted only by the start route (mintStartRow), never by a client.
@@ -722,7 +759,7 @@ export function createOutboxRow(sid: string, req: CreateRequest): { row: OutboxR
     confirmed: false,
     sentAt: null,
     sizeAtSend: null,
-    resume: req.resume,
+    resume: bindResume(req.resume),
     payload,
   };
   append(box, [row]);
@@ -917,7 +954,7 @@ export function mintStartRow(req: StartRowRequest, { watched = false }: { watche
     confirmed: false,
     sentAt: now,
     sizeAtSend: null,
-    resume: { projectId: req.projectId, encodedDir: null, overrides: req.overrides ?? null, templateIds: req.templateIds ?? null },
+    resume: bindResume({ projectId: req.projectId, encodedDir: null, overrides: req.overrides ?? null, templateIds: req.templateIds ?? null }),
     payload: payloadOf({ nonce: `start:${sid}`, text: req.text, resume: { projectId: req.projectId, encodedDir: null, overrides: null, templateIds: null } }),
     attempt: 1,
   };
@@ -1043,7 +1080,28 @@ export function composeOutboxPrompt(rows: OutboxRow[], now = Date.now()): string
   }).join('\n\n');
 }
 
-const settingsKey = (r: OutboxRow) => JSON.stringify([r.resume.projectId, r.resume.encodedDir, r.resume.overrides ?? null, r.resume.templateIds ?? null]);
+const settingsKey = (r: OutboxRow) => JSON.stringify([r.resume.projectId, r.resume.encodedDir, r.resume.overrides ?? null, r.resume.templateIds ?? null, r.resume.projectIncarnation ?? null]);
+
+/**
+ * BUG-284 — may this row be RESUMED / STARTED into the project registered under its projectId now?
+ *  - 'same'    the project the row was queued for (same incarnation; for a legacy row with no stamp, a project row
+ *              created no later than the queue row — a row queued before the project existed was queued for another);
+ *  - 'gone'    no such project, or another incarnation under the same id (deleted and re-added): never delivered by
+ *              resuming — the row fails with the reason, and nobody is told anything it carried;
+ *  - 'unknown' the registry cannot be read: wait, never guess.
+ * Without the wiring's `projectIdentity` (test harnesses), every row is 'same'.
+ */
+function targetOf(r: OutboxRow): 'same' | 'gone' | 'unknown' {
+  if (!wiring?.projectIdentity) return 'same';
+  let id: { incarnation: string; createdAt: number } | null;
+  try { id = wiring.projectIdentity(r.resume.projectId); } catch { return 'unknown'; }
+  if (!id) return 'gone';
+  const stamped = r.resume.projectIncarnation;
+  if (typeof stamped === 'string' && stamped) return stamped === id.incarnation ? 'same' : 'gone';
+  if (!Number.isFinite(id.createdAt)) return 'unknown';
+  return id.createdAt <= r.createdAt ? 'same' : 'gone';
+}
+const GONE_REASON = 'not sent: the project this session belonged to was removed from Orchard (a project added later may have the same name), and Orchard never resumes a session into a different project';
 
 const hasAttachments = (r: OutboxRow): boolean => Array.isArray(r.attachments) && r.attachments.length > 0;
 
@@ -1099,6 +1157,37 @@ async function pump(sid: string): Promise<void> {
     box.hold = p.hold;
     box.nextTryAt = Date.now() + (p.retryMs ?? 0);
     return;
+  }
+  /*
+   * BUG-284 / FEAT-200 r12 — THE incarnation chokepoint, and it runs BEFORE the route is used, so no delivery route
+   * (bridge, survivor, strand, gated, resume or new) can bypass it. An id can be reused (delete + re-add under the
+   * same name); check each row is still bound to the project registered under that id. A row of a removed incarnation
+   * is FAILED with the reason — never handed to a still-running session of the old project, which would tell an agent
+   * "access granted" for a project that no longer exists (r12 ran this door through the running route). The rest go
+   * on the next pass. Earlier this was gated behind `if (!p.running)`: a running bridge/survivor skipped it.
+   */
+  {
+    const verdicts = batch.map((r) => [r, targetOf(r)] as const);
+    if (verdicts.some(([, v]) => v === 'unknown')) {
+      box.hold = { kind: 'project-unknown', text: 'Orchard cannot read its project list right now, so it is not resuming this session yet — it tries again' };
+      box.nextTryAt = Date.now() + 2000;
+      return;
+    }
+    const gone = verdicts.filter(([, v]) => v === 'gone').map(([r]) => r);
+    if (gone.length) {
+      const t = Date.now();
+      const next = gone.map((r) => ({ ...r, state: 'failed' as const, sentAt: null, sizeAtSend: null, reason: GONE_REASON, updatedAt: t }));
+      try { append(box, next); } catch (err) {
+        box.hold = { kind: 'disk', text: 'Orchard cannot write its queue to disk, so it is not sending anything yet — nothing was lost, and it tries again' };
+        box.nextTryAt = Date.now() + 5000;
+        console.error(`[orchard] BUG-284: outbox ${sid}: could not record ${gone.length} row(s) as not sent (project removed) — nothing handed over (${(err as Error).message})`);
+        return;
+      }
+      console.error(`[orchard] BUG-284: outbox ${sid}: ${gone.length} row(s) NOT sent (${gone.map((r) => r.id).join(', ')}): queued for project ${head.resume.projectId} incarnation ${head.resume.projectIncarnation ?? '(legacy, by creation time)'}, which is no longer the project under that id — a session is never resumed into another project`);
+      if (start) gcStartBox(box);
+      kick(sid);
+      return;
+    }
   }
   // The reservation is taken in the same tick as the probe: no socket path can slip a prompt in between.
   box.reserved = true;

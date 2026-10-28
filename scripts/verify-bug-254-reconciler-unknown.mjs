@@ -28,15 +28,20 @@ const HUNK_A_FIX = `      // BUG-254 r6 — PHASE-INDEPENDENT: when git is KNOWN
       // with git-matching + an 'unknown' cred probe sliding past a pending-only guard and recreating.
       // Invariant: credential UNCERTAINTY alone never recreates (nor, via the tick downgrade, holds turns)
       // WHEN GIT IS KNOWN TO MATCH. A real git mismatch (incl a0==='none') still has a0!==d and passes.
-      if (a0 === d && !credStale) return;`;
-const HUNK_A_PRE = `      if (e.phase === 'pending' && a0 === d && !credStale) return; // PRE-FIX: pending-only guard (r5 break)`;
+      if (a0 === d && !credStale && !accessStale) return;`;
+// FEAT-200: the access-config drift joined the credential in both hunks (same rule); the PRE forms keep the
+// r5 semantics with that term carried along, so the baseline still reverts exactly the r6 fix and nothing else.
+const HUNK_A_PRE = `      if (e.phase === 'pending' && a0 === d && !credStale && !accessStale) return; // PRE-FIX: pending-only guard (r5 break)`;
 
 const HUNK_B_FIX = `        if (d !== 'unknown' && a === d) {
-          if (cred === 'clean') drop(e, 'resolved: the container now matches the grant');
-          else if (cred === 'unknown') { e.phase = 'pending'; e.error = null; e.nextTryAt = 0; audit('pending', e, { from: 'failed', why: 'credential probe unknown while git matches' }); }
-          // cred === 'stale': stays failed; drive() recreates on the proven drift
+          // FEAT-200: access drift joins the credential here — clean on both drops; an unknown on either (with no
+          // PROVEN stale one) downgrades; a proven stale one keeps 'failed' for drive() to retry.
+          const proven = cred === 'stale' || access === 'stale';
+          if (cred === 'clean' && access === 'clean') drop(e, 'resolved: the container now matches the grant');
+          else if (!proven) { e.phase = 'pending'; e.error = null; e.nextTryAt = 0; audit('pending', e, { from: 'failed', why: 'credential/access probe unknown while git matches' }); }
+          // a proven stale credential or access drift: stays failed; drive() recreates on it
         }`;
-const HUNK_B_PRE = `        if (d !== 'unknown' && a === d && !credActive) drop(e, 'resolved: the container now matches the grant'); // PRE-FIX: unknown keeps it failed`;
+const HUNK_B_PRE = `        if (d !== 'unknown' && a === d && !credActive && !accessActive) drop(e, 'resolved: the container now matches the grant'); // PRE-FIX: unknown keeps it failed`;
 
 if (!src.includes(HUNK_A_FIX) || !src.includes(HUNK_B_FIX)) {
   console.log('FATAL: the fix hunks were not found verbatim — update this test to match the module.');

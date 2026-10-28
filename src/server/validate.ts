@@ -33,6 +33,38 @@ const SERVICE_NAME_RE = /^[a-z][a-z0-9-]{0,30}$/;
 const RESERVED_SERVICE_NAMES = new Set(['localhost', 'host', 'gateway', 'session', 'workspace']);
 
 /**
+ * FEAT-200 — `container.ports`: loopback port publishes. ONE validator, used by the
+ * settings PATCH, the agent's access-request channel and the approval route, so a
+ * request is refused in the same words the settings drawer would use. Host ports
+ * below 1024 are refused (privileged; no dev server needs one), and a host port may
+ * appear once. The host IP is not accepted at all: Orchard always publishes on
+ * 127.0.0.1 (container-manager `portArgs`).
+ */
+export function validatePorts(raw: unknown): reg.PortPublish[] {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) throw new Error('container.ports must be an array of { hostPort, containerPort }');
+  if (raw.length > 32) throw new Error('container.ports: at most 32 published ports');
+  const seen = new Set<number>();
+  return raw.map((r, i) => {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) throw new Error(`container.ports[${i}] must be { hostPort, containerPort }`);
+    for (const k of Object.keys(r)) {
+      if (k === 'hostIp' || k === 'host' || k === 'ip') throw new Error(`container.ports[${i}].${k}: the host address is not settable — Orchard publishes on 127.0.0.1 only`);
+      if (k !== 'hostPort' && k !== 'containerPort') throw new Error(`container.ports[${i}]: unknown field "${k}"`);
+    }
+    const { hostPort, containerPort } = r as { hostPort?: unknown; containerPort?: unknown };
+    if (typeof containerPort !== 'number' || !Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) {
+      throw new Error(`container.ports[${i}].containerPort must be an integer 1-65535`);
+    }
+    if (typeof hostPort !== 'number' || !Number.isInteger(hostPort) || hostPort < 1024 || hostPort > 65535) {
+      throw new Error(`container.ports[${i}].hostPort must be an integer 1024-65535 (ports below 1024 are privileged and refused)`);
+    }
+    if (seen.has(hostPort)) throw new Error(`container.ports: host port ${hostPort} is listed twice`);
+    seen.add(hostPort);
+    return { hostPort, containerPort };
+  });
+}
+
+/**
  * FEAT-112 — validate a declared service array. Exported so the agent-propose
  * route (services-request) rejects a bad proposal with the SAME dialect the
  * settings PATCH uses, rather than a second implementation that could drift.
@@ -219,7 +251,7 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
       // FEAT-157 — the base pin is NOT a setting: it is written only by the base-update
       // route, which names the notice it answers and enforces the security floor.
       if (k === 'base') throw new Error('container.base (the Orchard base pin) is not writable here: answer the base-update notice on the rail, or POST /api/projects/:id/base-update { action, version, rev }');
-      if (!['image', 'dockerSocket', 'memoryMb', 'pidsLimit', 'gpu', 'env', 'workspaceRoot', 'dockerfile'].includes(k)) throw new Error(`unknown container field "${k}"`);
+      if (!['image', 'dockerSocket', 'memoryMb', 'pidsLimit', 'gpu', 'env', 'workspaceRoot', 'dockerfile', 'ports'].includes(k)) throw new Error(`unknown container field "${k}"`);
     }
     const patch: Partial<reg.ContainerSettings> = {};
     if ('image' in c) {
@@ -280,6 +312,7 @@ export function validateProjectPatch(body: unknown): Partial<reg.Project> {
       }
       patch.env = env;
     }
+    if ('ports' in c) patch.ports = validatePorts(c.ports);
     settings.container = patch as reg.ContainerSettings;
   }
   if ('services' in src) {

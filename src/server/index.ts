@@ -200,7 +200,7 @@ import * as lanes from './lanes.ts';
 import * as storeVersions from './store-versions.ts';
 import * as requests from './requests.ts';
 import { emptySnapshot, snapshotOfSurvivor } from './running-set.ts';
-import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices } from './validate.ts';
+import { validateProjectPatch, validateCreateProject, validateSessionOverrides, validateSessionPatch, intParam, validateServices, validatePorts } from './validate.ts';
 import { buildRecord } from './project-dockerfile.ts'; // FEAT-155 round 5
 import { startSession, getSession, closeAllSessions, liveSessions, liveSessionsForProject, bridgeForSession, knownSlashCommands, knownModels, startZombieReaper, adoptSession, resumeDirCandidates, type AgentSession } from './agent-bridge.ts'; // BUG-196 round 3: resumeDirCandidates
 import { readGlobalDefaults, patchGlobalDefaults } from './global-settings.ts';
@@ -229,10 +229,12 @@ import {
 import {
   startOutbox, stopOutbox, outboxView, outboxExists, createOutboxRow, editOutboxRow, discardOutboxRow, sendOutboxRow, dismissOutboxDamage,
   outboxHasPending, validSessionId, OutboxError, type ResumeSettings, type OutboxWiring, type Probe, type HandOutcome,
-  nudgeOutbox,
+  nudgeOutbox, outboxRow,
   isStartBox, mintStartRow, settleStartRow, startsView, unwatchStartRow, startRowOf, type StartSettle,
 } from './outbox.ts';
 import { createGrantRebuild, type SessionLike as GrantSessionLike } from './grant-rebuild.ts'; // FEAT-175
+import * as access from './access-requests.ts'; // FEAT-200
+import * as accessChannel from './access-channel.ts'; // FEAT-200
 import { setTurnHold } from './agent-bridge.ts'; // FEAT-175
 import { setAccountLaunchNotifier } from './agent-bridge.ts'; // BUG-255 r2 — launch start/stop re-publishes the account fact
 import { onBindingChange } from './session-accounts.ts'; // BUG-255 r2 — a committed rebind re-publishes the account fact
@@ -1101,6 +1103,20 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         sendJson(res, 400, { error: (err as Error).message });
         return true;
       }
+      // FEAT-200 — creating a project that ALREADY carries env, ports, the docker socket, mounts or services is
+      // the same widening as patching them in, so it is the user's act too.
+      {
+        const touched = accessFieldsTouched(null, { settings: input.settings as Partial<reg.ProjectSettings> | undefined });
+        if (touched.length) {
+          const refusal = requireUserCaller(req, `creating a project with ${touched.join(', ')}`, { code: 'agent-not-user', agentError: `a project created with ${touched.join(', ')} widens what its sessions can reach, so only the user creates one like that.` });
+          if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
+        }
+        const adds = addedPorts(null, { settings: input.settings as Partial<reg.ProjectSettings> | undefined });
+        if (adds.length) {
+          const conflicts = await accessPortConflicts({ id: '\u0000new', name: input.name ?? 'new project', settings: input.settings ?? {} } as unknown as reg.Project, adds);
+          if (conflicts.length) { sendJson(res, 409, { error: `cannot publish: ${conflicts.join('; ')}`, code: 'port-conflict', conflicts }); return true; }
+        }
+      }
       const created = reg.createProject(input);
       /*
        * FEAT-089 — adding a project to Orchard applies the full METHOD
@@ -1206,6 +1222,20 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         sendJson(res, 400, { error: (err as Error).message });
         return true;
       }
+      // FEAT-200 — env, published ports, the docker socket, mounts, services and the isolation mode widen what the
+      // project's sessions can reach: changing any of them is the USER's act. An agent asks with an access request.
+      {
+        const touched = accessFieldsTouched(before, patch);
+        if (touched.length) {
+          const refusal = requireUserCaller(req, `change of ${touched.join(', ')} on project ${before.id}`, { code: 'agent-not-user', agentError: `${touched.join(', ')} widen what this project's sessions can reach, so only the user changes them. From a container session, raise a container access request instead (see "Container access" in your instructions); the user approves it on a card.` });
+          if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
+        }
+        const adds = addedPorts(before, patch);
+        if (adds.length) {
+          const conflicts = await accessPortConflicts(before, adds);
+          if (conflicts.length) { sendJson(res, 409, { error: `cannot publish: ${conflicts.join('; ')}`, code: 'port-conflict', conflicts }); return true; }
+        }
+      }
       /*
        * BUG-138 — a repoint is the one PATCH field that can lose something, so
        * it is the one with real preconditions. Resolve `~` and relatives the
@@ -1241,9 +1271,15 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
         patch.hostPath = to;
         pathChange = { from: before.hostPath, to, carriedSessions: 0, carriedFrom: [], pastPaths: [] };
       }
+      // FEAT-200 r6 — this save does NOT decide anything about access requests. `updateProject` stamps the edit
+      // versions of every container env key / host port it changes, in the same atomic write; the access layer's
+      // commit pass (access-channel checkResumes) is the one place an approved-pending request named by an edited
+      // key or port is cancelled. A write that throws stamps nothing, so nobody is told about an edit that never landed.
       // updateProject writes through writeAtomic(), so a crash mid-write leaves
       // the previous registry intact rather than a truncated file.
       const project = reg.updateProject(id, patch);
+      // FEAT-200 r6 — run the commit pass now (it decides; this only wakes it), so a cancelled requester hears promptly.
+      if (patch.settings?.container && ('env' in patch.settings.container || 'ports' in patch.settings.container)) setImmediate(kickAccess);
       // BUG-255 r4 — isolation or the project account decides its sessions' launch account: re-declare it.
       if ('isolation' in patch || (patch.settings && 'claudeAccount' in patch.settings)) republishAccountFactsFor(id);
       // FEAT-164 grant binding: a (user) path change voids every git-write grant of the
@@ -1739,6 +1775,95 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
     /* board: the opt-in per-project docs/bugs/ surface, read for the Needs-You
        rail. A project without docs/bugs/ returns an empty board, never a 404 —
        "no board" is a valid state, not an error (FEAT-018). */
+    /*
+     * FEAT-200 — container access requests. GET lists the project's requests (pending first). POST …/decide is
+     * the ONE way an access change is authorised, and it is the USER's: an agent caller is refused (403
+     * agent-not-user) before anything is read or written. Approval re-checks port conflicts and that the project
+     * still has the values the card showed, then records the request APPROVED-PENDING (FEAT-200 r5: it joins the
+     * desired container config; the settings are written only once a running container carries it).
+     */
+    if (id && rest[2] === 'access-requests' && rest.length === 3 && m === 'GET') {
+      if (!reg.getProject(id)) return notFound(res, `no project ${id}`);
+      const list = access.listAccessForProject(id).sort((a, b) => Number(!!a.decision) - Number(!!b.decision) || b.createdAt.localeCompare(a.createdAt));
+      sendJson(res, 200, { requests: list.slice(0, 50).map(accessView) });
+      return true;
+    }
+    if (id && rest[2] === 'access-requests' && rest[3] && rest[4] === 'decide' && rest.length === 5 && m === 'POST') {
+      const rid = rest[3];
+      const notUser = requireUserCaller(req, `deciding container access request ${rid}`, { code: 'agent-not-user', agentError: 'approving or rejecting a container access request is the USER\'s act. An agent raises the request and waits; the user decides on the card.' });
+      if (notUser) { sendJson(res, notUser.status, notUser.body); return true; }
+      const p0 = reg.getProject(id);
+      if (!p0) return notFound(res, `no project ${id}`);
+      let body: Record<string, unknown> = {};
+      try { body = ((await readBody(req)) ?? {}) as Record<string, unknown>; } catch (err) { sendJson(res, 400, { error: (err as Error).message }); return true; }
+      const verdict: access.AccessVerdict | null = body.verdict === 'approve' ? 'approved' : body.verdict === 'reject' ? 'rejected' : null;
+      if (!verdict) { sendJson(res, 400, { error: 'verdict must be "approve" or "reject"' }); return true; }
+      const rec0 = access.getAccess(rid);
+      if (!rec0 || rec0.projectId !== id) return notFound(res, `no access request ${rid} in project ${id}`);
+      // Decided once; r8: raised for an earlier incarnation of this project id (removed, then re-added): never decided here
+      // (beginDecision refuses it again inside the synchronous step); the pass closes it as removed. r11: one function,
+      // driven by the standing text property (scripts/verify-feat-200-text-property.mjs).
+      const refusal = accessChannel.decideRefusal(rec0);
+      if (refusal) { if (refusal.code === 'project-removed') kickAccess(); sendJson(res, 409, { error: refusal.error, code: refusal.code, request: accessView(rec0) }); return true; }
+      try {
+        if (verdict === 'approved') {
+          if (p0.isolation !== 'container') { sendJson(res, 409, { error: `project ${p0.name} no longer uses a container; nothing to apply`, code: 'not-container' }); return true; }
+          const ports = rec0.changes.flatMap((c) => (c.kind === 'port' ? [{ hostPort: c.hostPort, containerPort: c.containerPort }] : []));
+          const conflicts = ports.length ? await accessPortConflicts(p0, ports) : [];
+          if (conflicts.length) { sendJson(res, 409, { error: `cannot approve: ${conflicts.join('; ')}`, code: 'port-conflict', conflicts }); return true; }
+          // From here to the end, synchronous: nothing else can interleave a decision or a settings write.
+          const p = reg.getProject(id);
+          if (!p) return notFound(res, `no project ${id}`);
+          const stale = accessStaleness(p, rec0);
+          if (stale.length) { sendJson(res, 409, { error: `the project changed since this request was raised (${stale.join('; ')}); reject it and let the agent ask again`, code: 'changed-since-request', detail: stale }); return true; }
+          // FEAT-200 r5 (COMMIT ON SUCCESS): validate the desired config this approval makes, but write NO setting.
+          // The record joins the overlay; the settings are written only once a running container carries it.
+          try { accessMergedPatch(p, rec0); } catch (err) { sendJson(res, 400, { error: `cannot approve: ${(err as Error).message}` }); return true; }
+          // FEAT-200 r6: record the edit versions of the keys/ports it names, in this same synchronous step.
+          access.beginDecision(rid, 'approved', access.basisFor(rec0.changes, reg.accessEditsOf(p), p.createdAt ?? null));
+          cm.invalidate(id);
+          console.warn(`[orchard] FEAT-200: access request ${rid} APPROVED by the user for project ${id} (${p.name}): ${access.summarise(rec0.changes)}. Approved-pending: in the desired container config, written to the settings once a running container carries it (recreated once no session is working).`);
+          grantRebuild.nudge();
+        } else {
+          access.beginDecision(rid, 'rejected');
+          console.warn(`[orchard] FEAT-200: access request ${rid} REJECTED by the user for project ${id}: ${access.summarise(rec0.changes)}. Nothing written.`);
+        }
+      } catch (err) {
+        if (err instanceof access.AccessStoreError) {
+          // r8: 'project-removed' = raised for an earlier incarnation of this id; beginDecision refused it, the pass closes it.
+          if (err.code === 'project-removed') kickAccess();
+          sendJson(res, err.code === 'unknown' ? 404 : err.code === 'already-decided' || err.code === 'project-removed' ? 409 : 500, { error: err.message, code: err.code });
+          return true;
+        }
+        throw err;
+      }
+      kickAccess();
+      try { liveSessionBySdk(id, rec0.sdkSessionId)?.announce({ t: 'access-request', id: rid, projectId: id, state: 'decided' }); } catch { /* the card re-reads on open */ }
+      const after = access.getAccess(rid);
+      sendJson(res, 200, { ok: true, request: after ? accessView(after) : null });
+      return true;
+    }
+    /*
+     * FEAT-200 r6 — POST …/access-requests/:rid/cancel: the USER withdraws an approval that has not been applied yet
+     * (approved-pending). User-only (403 agent-not-user before anything is read). The request leaves the desired
+     * container config at once and its session is told "cancelled". 409 when it is not approved-pending (undecided:
+     * reject it; committed / closed: nothing to cancel).
+     */
+    if (id && rest[2] === 'access-requests' && rest[3] && rest[4] === 'cancel' && rest.length === 5 && m === 'POST') {
+      const rid = rest[3];
+      const notUser = requireUserCaller(req, `cancelling container access request ${rid}`, { code: 'agent-not-user', agentError: 'cancelling an approved container access request is the USER\'s act.' });
+      if (notUser) { sendJson(res, notUser.status, notUser.body); return true; }
+      if (!reg.getProject(id)) return notFound(res, `no project ${id}`);
+      const r = accessChannel.cancelByUser(rid, id);
+      if (!r.ok) { sendJson(res, r.code === 'unknown' ? 404 : r.code === 'unreadable' ? 500 : 409, { error: r.error, code: r.code }); return true; }
+      console.warn(`[orchard] FEAT-200: approved-pending access request ${rid} CANCELLED by the user for project ${id}: ${access.summarise(r.rec.changes)}. Never written to the settings.`);
+      cm.invalidate(id);
+      grantRebuild.nudge();
+      kickAccess();
+      try { liveSessionBySdk(id, r.rec.sdkSessionId)?.announce({ t: 'access-request', id: rid, projectId: id, state: 'decided' }); } catch { /* the card re-reads on open */ }
+      sendJson(res, 200, { ok: true, request: accessView(access.getAccess(rid) ?? r.rec) });
+      return true;
+    }
     if (id && rest[2] === 'board' && rest.length <= 4) {
       const p = reg.getProject(id);
       if (!p) return notFound(res, `board: no project ${JSON.stringify(id)}`);
@@ -1791,6 +1916,20 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           }));
           if (grItems.length) {
             b.needsYou = [...(grItems as unknown as typeof b.needsYou), ...b.needsYou];
+            b.hasBoard = true;
+          }
+          // FEAT-200 — a pending container access request leads the rail: a session is stopped waiting on it.
+          // Its own card and its own typed decide route; never the generic answer route.
+          // r10: only a request still WAITING for the user (one classification): never one already closed, nor a removed
+          // incarnation's leftover shown on a project re-added under the same id (it has nothing to decide).
+          const accMemo: access.ProjectMemo = new Map();
+          const accItems = access.listAccessForProject(p.id).filter((r) => { if (r.decision) return false; const k = access.classOf(r, accMemo).kind; return k === 'undecided' || k === 'unknown'; }).map((r) => ({
+            id: r.id, title: `Container access for ${r.projectName}: ${access.summarise(r.changes)}`, owner: '\u{1F464}', status: 'open', sev: '',
+            kind: 'decision' as const, question: r.reason, options: [] as string[],
+            access: accessView(r),
+          }));
+          if (accItems.length) {
+            b.needsYou = [...(accItems as unknown as typeof b.needsYou), ...b.needsYou];
             b.hasBoard = true;
           }
           // FEAT-047/079: WA consolidation needs-human findings (boot +
@@ -1957,6 +2096,11 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
           // board ticket — deliver the answer back to the SPECIFIC session that
           // raised it (never a ticket file), then resolve the record so it leaves
           // the rail. If that session is gone, the answer is still recorded.
+          // FEAT-200 — a container access request is decided only by its own typed, user-only route.
+          if (ticketId.startsWith('acc-')) {
+            sendJson(res, 409, { error: 'a container access request is decided with POST /api/projects/:id/access-requests/:rid/decide { verdict: "approve" | "reject" } (the card\'s Approve / Reject), not the generic answer route', code: 'use-access-decide' });
+            return true;
+          }
           const rec = decisions.get(ticketId);
           if (rec && rec.projectId === id) {
             // FEAT-164 r2 — an approval that MINTS authority (a git-write grant, a
@@ -1972,6 +2116,12 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
             // on the rail, so an agent can neither approve its own request nor clear it.
             if (rec.gitWrite) {
               const refusal = requireUserCaller(req, `answer to git-write request ${ticketId}`);
+              if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
+            }
+            // FEAT-200 (plan review finding 4) — a services proposal WRITES project settings on "Allow", so it is
+            // answered by the user only, exactly like a git-write request (it was not gated before).
+            if (rec.services) {
+              const refusal = requireUserCaller(req, `answer to services proposal ${ticketId}`, { code: 'agent-not-user', agentError: 'approving a services proposal writes the project\'s settings, so only the user answers it.' });
               if (refusal) { sendJson(res, refusal.status, refusal.body); return true; }
             }
             // FEAT-108 r3 — a git-write REQUEST is a decision that carries a
@@ -4060,6 +4210,18 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   }
 
   /*
+   * FEAT-200 — a session's own container access requests (its card). `:sid` is the SDK session id or the
+   * station id of a live session. Read-only.
+   */
+  if (rest[0] === 'sessions' && rest[1] && rest[2] === 'access-requests' && rest.length === 3 && m === 'GET') {
+    const live = getSession(rest[1]);
+    const sdk = live ? (live.sdkSessionId ?? live.resumeOf ?? rest[1]) : rest[1];
+    const list = access.listAccessForSession(sdk).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 20);
+    sendJson(res, 200, { requests: list.map(accessView) });
+    return true;
+  }
+
+  /*
    * SESSION MUTATION — rename, pin, delete. `live` is a route, not a session id.
    */
   if (rest[0] === 'sessions' && rest[1] && rest[1] !== 'live' && (m === 'PATCH' || m === 'DELETE' || m === 'POST')) {
@@ -5117,12 +5279,15 @@ async function handleContainerRoute(
           state: 'building', containerName: cm.containerName(project.id), image: cm.imageNameFor(project),
           ...(cm.imageSourceOf(project) === 'dockerfile' ? { dockerfile: cm.dockerfileStatus(project) } : {}),
           ...(grantRebuild.viewOf(project.id) ? { grantRebuild: grantRebuild.viewOf(project.id) } : {}),
+          access: accessDrawerView(project),
         });
         return true;
       }
       // FEAT-175: a pending/running/failed git-grant rebuild rides on the status the drawer already reads.
       const gr = grantRebuild.viewOf(project.id);
-      sendJson(res, 200, gr ? { ...cm.statusOf(project), grantRebuild: gr } : cm.statusOf(project));
+      // FEAT-200 r6: approved-pending requests (the drawer warns before a save that would cancel one) and a host port
+      // the user set that docker refused (shown with docker's reason, so a failing launch is not a mystery).
+      sendJson(res, 200, { ...cm.statusOf(project), ...(gr ? { grantRebuild: gr } : {}), access: accessDrawerView(project) });
       return true;
     }
     /*
@@ -5670,6 +5835,9 @@ const grantRebuild = createGrantRebuild<reg.Project>({
   // that recreate until boot lease-recovery has run, so a restart's surviving (recovered) leases
   // protect a mid-turn container before the reconciler could act on it.
   readCredDrift: (p) => cm.credBindDriftOf(p),
+  // FEAT-200 — an approved access change (container.env / container.ports) is one more level fact the SAME
+  // reconciler compares (desired settings vs the running container): recreated when idle, never holding turns.
+  readAccessDrift: (p) => cm.accessDriftOf(p),
   leasesReady: () => lifecycle.isReady(),
   sessionsOf: (pid) => liveSessionsForProject(pid).map(grantSessionLike),
   leasesOf: (pid) => lifecycle.leasesOf(pid),
@@ -5685,12 +5853,214 @@ const grantRebuild = createGrantRebuild<reg.Project>({
   settled: (pid, keys) => {
     for (const k of keys) nudgeOutbox(k);
     for (const s of liveSessionsForProject(pid)) nudgeOutbox(s.sdkSessionId ?? s.resumeOf ?? null);
+    kickAccess(); // FEAT-200: a rebuild that just landed may be what an approved access request waits for
   },
   logFile: path.join(dataDir(), 'grant-rebuild.log.jsonl'),
 });
 // FEAT-175 r2: every container create reports its declared .git mode synchronously (the ACTUAL fact).
 cm.onContainerGitMode((pid, mode) => grantRebuild.recordActual(pid, mode));
 setTurnHold((pid) => grantRebuild.turnHoldOf(pid), (pid, onStatus, abandoned) => grantRebuild.admissionGate(pid, onStatus, abandoned));
+
+/* ====================== FEAT-200: container access requests =================================
+ * access-requests.ts is the typed record; access-channel.ts the raise-only inbox, the collision check and the
+ * level-based resume checker. This is their wiring. The ONLY writer of an approved change is the user-only
+ * decide route below; the inbox can only raise.
+ * ------------------------------------------------------------------------- */
+function accessConflictDeps(): accessChannel.ConflictDeps {
+  return {
+    otherProjects: (p) => reg.listProjects().filter((q) => q.id !== p.id).map((q) => ({ id: q.id, name: q.name, ports: cm.accessSettingsOf(q).ports ?? [] })), // FEAT-200 r5: an approved-pending publish claims its port too
+    publishedElsewhere: (p) => { let own: string | null = null; try { own = cm.containerName(p.id); } catch { own = null; } return cm.publishedHostPorts(own); },
+    ownHolds: (p, hostPort) => { const live = cm.liveAccessOf(p); return !!live && live.ports.some((x) => x.startsWith(`${cm.PUBLISH_HOST_IP}:${hostPort}->`)); },
+    hostPortFree: accessChannel.hostPortFree,
+  };
+}
+function accessPortConflicts(p: reg.Project, ports: reg.PortPublish[]): Promise<string[]> {
+  return accessChannel.findPortConflicts(p, ports, accessConflictDeps());
+}
+const accessParseDeps: accessChannel.ParseDeps = {
+  // The SAME validator the settings PATCH uses, so a refused request reads exactly like a refused setting.
+  validateEnv: (env) => ((validateProjectPatch({ settings: { container: { env } } }).settings?.container as reg.ContainerSettings | undefined)?.env ?? {}),
+  validatePorts: (x) => validatePorts(x),
+  currentEnv: (p) => ({ ...(reg.containerSettingsOf(p).env ?? {}) }),
+  currentPorts: (p) => [...(reg.containerSettingsOf(p).ports ?? [])],
+  desired: (p) => cm.accessSettingsOf(p),
+};
+/**
+ * FEAT-200 r5 — the DESIRED container config approving `rec` would make (base + approved-pending overlay + rec),
+ * validated exactly as a settings write. Nothing is written; it refuses what could never be applied (a host port this
+ * project already publishes, or is approved to publish, to another container port).
+ */
+function accessMergedPatch(p: reg.Project, rec: access.AccessRequest): Partial<reg.Project> {
+  const want = cm.accessSettingsOf(p);
+  for (const c of rec.changes) {
+    if (c.kind === 'port' && want.ports.some((x) => x.hostPort === c.hostPort && x.containerPort !== c.containerPort)) {
+      throw new Error(`host port ${c.hostPort} is already published (or approved to be published) by this project to another container port`);
+    }
+  }
+  const after = access.foldAccess(want, [rec]);
+  return validateProjectPatch({ settings: { container: { env: after.env, ports: after.ports } } });
+}
+/** Reasons the project changed since the card was raised, so approving would overwrite something the user did not see. */
+function accessStaleness(p: reg.Project, rec: access.AccessRequest): string[] {
+  const cs = reg.containerSettingsOf(p);
+  const env = cs.env ?? {};
+  const out: string[] = [];
+  for (const c of rec.changes) {
+    if (c.kind === 'env') {
+      const now = Object.prototype.hasOwnProperty.call(env, c.key) ? env[c.key]! : null;
+      if (now !== c.previous && now !== c.value) out.push(`${c.key} is now ${now === null ? 'unset' : JSON.stringify(now)}, not ${c.previous === null ? 'unset' : JSON.stringify(c.previous)} as the card showed`);
+    } else {
+      const same = (cs.ports ?? []).find((x) => x.hostPort === c.hostPort);
+      if (same && same.containerPort !== c.containerPort) out.push(`host port ${c.hostPort} is now published to container port ${same.containerPort}`);
+    }
+  }
+  return out;
+}
+const accessResumeDeps: accessChannel.ResumeDeps = {
+  getProject: (id) => reg.getProject(id) ?? null,
+  accessDriftOf: (p) => cm.accessDriftOf(p),
+  rebuildPhaseOf: (p) => grantRebuild.phaseOf(p.id),
+  liveAccessOf: (p) => cm.liveAccessOf(p),
+  // FEAT-200 r5 — the COMMIT: fold the approved-pending records' ops into the CURRENT base settings (re-read; ops,
+  // not a snapshot, so a user edit made since is kept) and write. Desired is unchanged by construction (same fold).
+  commitBase: (p, recs) => {
+    const fresh = reg.getProject(p.id);
+    if (!fresh) throw new Error(`no project ${p.id}`);
+    const cs = reg.containerSettingsOf(fresh);
+    // r7: ops + the committed set naming these records, in ONE atomic registry save (commitPlanFor is the one builder).
+    const after = accessChannel.commitPlanFor({ env: { ...(cs.env ?? {}) }, ports: [...(cs.ports ?? [])] }, fresh.accessCommitted ?? [], recs);
+    // r6: { accessCommit } — folding approvals in is not a user edit, so it bumps no edit version.
+    reg.updateProject(p.id, validateProjectPatch({ settings: { container: { env: after.env, ports: after.ports } } }), { accessCommit: true, committed: after.committed });
+    cm.invalidate(p.id);
+  },
+  enqueue: (rec, nonce, text) => {
+    // BUG-284: the row is bound to the incarnation the REQUEST was raised for (not whatever holds its id now).
+    // 'direct': framed "held until the session could take it" — never "composed while the previous response…".
+    const r = createOutboxRow(rec.sdkSessionId, { nonce, text, origin: 'direct', resume: { projectId: rec.projectId, encodedDir: null, overrides: null, templateIds: null, ...(rec.projectIncarnation ? { projectIncarnation: rec.projectIncarnation } : {}) } });
+    nudgeOutbox(rec.sdkSessionId);
+    return r.row.id;
+  },
+  // FEAT-200 r3: with no running container, create it (create-only, in the slot) before anything is frozen.
+  ensureNotRunning: (p) => cm.ensureIfNotRunning(p, { current: () => reg.getProject(p.id) }),
+  kick: () => kickAccess(),
+  // r8: a removed-and-re-added project's request is told only to a RUNNING session (never resumed into the new project).
+  sessionLive: (rec) => !!liveSessionBySdk(rec.projectId, rec.sdkSessionId),
+  // r8: the same request as `enqueue` (so the payload matches its nonce) with discard: a queued row is withdrawn, a
+  // missing one is recorded withdrawn (never sendable); a row already sent/sending comes back as it is.
+  withdraw: (rec, nonce, text) => {
+    const r = createOutboxRow(rec.sdkSessionId, { nonce, text, origin: 'direct', discard: true, resume: { projectId: rec.projectId, encodedDir: null, overrides: null, templateIds: null, ...(rec.projectIncarnation ? { projectIncarnation: rec.projectIncarnation } : {}) } });
+    return { state: r.row.state, rowId: r.row.id };
+  },
+};
+/*
+ * FEAT-200 r5 (COMMIT ON SUCCESS) — docker refused a host port a recreate ADDED (taken after every pre-check). The
+ * chokepoint has already kept the previous container; here the approved-pending request(s) needing that port FAIL
+ * and leave the desired config — no setting is touched, so nothing is reverted. A retry applies the rest.
+ */
+cm.onPortRefused((r) => {
+  const p = reg.getProject(r.projectId);
+  const basePorts = p ? (reg.containerSettingsOf(p).ports ?? []).map((x) => x.hostPort) : [];
+  const out = accessChannel.failRefused(r, basePorts, undefined, p);
+  kickAccess();
+  return out === 'retry';
+});
+/*
+ * FEAT-200 r5 — the desired access config = base settings + approved-pending overlay. An unreadable store THROWS
+ * (never "no overlay"): read as no overlay, a container already carrying an approved-pending change would read as
+ * drifted and be recreated without it. The reconciler reads a throw as 'unknown' and never acts on it.
+ */
+cm.setAccessOverlay((p, base) => accessChannel.overlayFor(p, base)); // r6: LIVE records only (a user edit of a named key/port drops it at once)
+function liveSessionBySdk(projectId: string, sid: string): AgentSession | null {
+  return liveSessionsForProject(projectId).find((s) => !s.closed && (s.sdkSessionId === sid || s.resumeOf === sid)) ?? null;
+}
+const accessChannelDeps: accessChannel.ChannelDeps = {
+  listContainerProjects: () => reg.listProjects().filter((p) => p.isolation === 'container'),
+  inboxDirOf: (p) => cm.accessInboxPaths(p).host,
+  sessionLive: (p, sid) => !!liveSessionBySdk(p.id, sid),
+  parseChanges: (p, body) => accessChannel.parseChanges(p, body, accessParseDeps),
+  portConflicts: accessPortConflicts,
+  onRaised: (rec) => {
+    // The session's waiting state: its open tab paints the card at once (it also reads the list on open).
+    try { liveSessionBySdk(rec.projectId, rec.sdkSessionId)?.announce({ t: 'access-request', id: rec.id, projectId: rec.projectId, state: 'pending' }); } catch { /* the card is read on open anyway */ }
+  },
+};
+/** Run the resume checker now (after a decision, after a rebuild). Never throws. */
+function kickAccess(): void {
+  try { accessChannel.checkResumes(accessResumeDeps); } catch (err) { console.warn(`[orchard] FEAT-200: resume check failed: ${(err as Error).message}`); }
+}
+/**
+ * One record as the UI sees it: the record, plus the REAL delivery state of its resume message and any rebuild wait.
+ * The reading itself (one classification → committed / removed / cancellable) is `access.accessCardView` (pure, unit-
+ * tested against the real accessStatusText); this only supplies the outbox row's state and the rebuild wait.
+ */
+function accessView(rec: access.AccessRequest): Record<string, unknown> {
+  let delivery: string | null = null;
+  if (rec.resume?.rowId) {
+    try { delivery = outboxRow(rec.sdkSessionId, rec.resume.rowId)?.state ?? 'unknown'; } catch { delivery = 'unknown'; }
+  }
+  return access.accessCardView(rec, access.classOf(rec), delivery, (pid) => grantRebuild.viewOf(pid) ?? null);
+}
+/**
+ * FEAT-200 r6 — what the drawer needs about access requests: the LIVE approved-pending ones (with the env keys and
+ * host ports each names, so a save touching one can warn first) and a user-set host port docker refused.
+ */
+function accessDrawerView(p: reg.Project): Record<string, unknown> {
+  let pending: Array<Record<string, unknown>> = [];
+  try {
+    pending = (access.pendingOverlayFor(p.id) ?? []).filter((rec) => accessChannel.liveFor(rec, p)).map((rec) => ({
+      id: rec.id, summary: access.summarise(rec.changes), sdkSessionId: rec.sdkSessionId,
+      env: rec.changes.flatMap((c) => (c.kind === 'env' ? [c.key] : [])),
+      ports: rec.changes.flatMap((c) => (c.kind === 'port' ? [c.hostPort] : [])),
+    }));
+  } catch { pending = []; }
+  const basePorts = (reg.containerSettingsOf(p).ports ?? []).map((x) => x.hostPort);
+  const live = () => { try { return cm.liveAccessOf(p)?.ports ?? null; } catch { return null; } };
+  return { pending, portRefusal: accessChannel.userPortRefusalOf(p, basePorts, live) };
+}
+/**
+ * The settings an AGENT must not be able to write: everything that changes what the project's container RUNS or
+ * can REACH (FEAT-200 plan review findings 1/2/4; independent verify r1). Container env and published ports (this
+ * feature); the image and the Dockerfile path (an image of the agent's choosing can bake any non-reserved ENV —
+ * IV r1's break); the docker socket and GPU (device/daemon access); mounts, service sidecars, the stealth browser
+ * and the OpenAI dispatch socket (each puts something new into the container); and the isolation mode. A patch or
+ * create touching any of them needs the USER caller. Resource limits and display preferences stay open.
+ */
+function accessFieldsTouched(before: reg.Project | null, patch: { isolation?: unknown; settings?: Partial<reg.ProjectSettings> }): string[] {
+  const out: string[] = [];
+  const st = patch.settings ?? {};
+  const c = (st.container ?? null) as Partial<reg.ContainerSettings> | null;
+  const bc = before ? reg.containerSettingsOf(before) : reg.defaultContainerSettings();
+  const differs = (a: unknown, b: unknown) => JSON.stringify(a ?? null) !== JSON.stringify(b ?? null);
+  if (c && 'env' in c && differs(c.env, before ? bc.env : {})) out.push('container.env');
+  if (c && 'ports' in c && differs(c.ports, before ? bc.ports : [])) out.push('container.ports');
+  if (c && 'dockerSocket' in c && differs(c.dockerSocket, before ? bc.dockerSocket : false)) out.push('container.dockerSocket');
+  if (c && 'image' in c && differs(c.image || null, before ? (bc.image || null) : null)) out.push('container.image');
+  if (c && 'dockerfile' in c && differs(c.dockerfile || null, before ? (bc.dockerfile || null) : null)) out.push('container.dockerfile');
+  // GPU: only a move toward MORE device access is gated (off→auto/on, auto→on; created 'on').
+  if (c && 'gpu' in c) {
+    const rank = (g: unknown) => (g === 'on' ? 2 : g === 'off' ? 0 : 1);
+    if (before ? rank(c.gpu) > rank(bc.gpu) : c.gpu === 'on') out.push('container.gpu');
+  }
+  {
+    const b = (st as { browser?: { enabled?: unknown } }).browser;
+    const bb = before ? (before.settings as { browser?: { enabled?: unknown } }).browser : undefined;
+    if (b && 'enabled' in b && differs(!!b.enabled, !!bb?.enabled)) out.push('browser.enabled');
+    const t = (st as { tools?: { openaiDispatch?: unknown } }).tools;
+    const bt = before ? (before.settings as { tools?: { openaiDispatch?: unknown } }).tools : undefined;
+    if (t && 'openaiDispatch' in t && differs(!!t.openaiDispatch, !!bt?.openaiDispatch) && (before !== null || !!t.openaiDispatch)) out.push('tools.openaiDispatch');
+  }
+  if ('mounts' in st && differs(st.mounts, before ? (before.settings.mounts ?? []) : [])) out.push('mounts');
+  if ('services' in st && differs(st.services, before ? (before.settings.services ?? []) : [])) out.push('services');
+  if (before && patch.isolation !== undefined && patch.isolation !== before.isolation) out.push('isolation');
+  return out;
+}
+/** Host ports a patch ADDS (not already in the project's settings), for the collision check. */
+function addedPorts(before: reg.Project | null, patch: { settings?: Partial<reg.ProjectSettings> }): reg.PortPublish[] {
+  const want = ((patch.settings?.container ?? null) as Partial<reg.ContainerSettings> | null)?.ports;
+  if (!want) return [];
+  const had = before ? (reg.containerSettingsOf(before).ports ?? []) : [];
+  return want.filter((x) => !had.some((h) => h.hostPort === x.hostPort && h.containerPort === x.containerPort));
+}
 
 /* ─────────────────── BUG-254: re-login credential propagation ──────────────
  * A successful IN-PLACE re-login replaces an account's `.credentials.json`. But
@@ -5926,6 +6296,13 @@ const outboxWiring: OutboxWiring = {
       }
     }
     return { kind: 'go', route: 'resume' };
+  },
+
+  // BUG-284: the project under this id NOW (its incarnation + creation time); the outbox never resumes or starts a
+  // session into a project other than the one a row was queued for. getProject throws when the registry is unreadable.
+  projectIdentity(projectId) {
+    const p = reg.getProject(projectId);
+    return p ? { incarnation: reg.incarnationOf(p), createdAt: Date.parse(p.createdAt) } : null;
   },
 
   reserve(sid) {
@@ -7479,6 +7856,13 @@ void (async () => {
 // queued before this boot goes by itself, whether or not any tab ever opens.
 startOutbox(outboxWiring);
 grantRebuild.start(); // FEAT-175
+// FEAT-200 — read container-access request files and deliver decided requests' resume messages. Level-based:
+// each pass looks at the files and records as they are; a missed pass is just the next one.
+{
+  try { const kept = access.recoverAccessStoreAtBoot(); if (kept) console.warn(`[orchard] FEAT-200: the access-request store was unreadable at boot; preserved (${kept}) and started fresh.`); } catch { /* a raise refuses until it can read */ }
+  const t = setInterval(() => { void accessChannel.pollInboxes(accessChannelDeps); kickAccess(); }, Number(process.env.ORCHARD_ACCESS_POLL_MS) || 2000);
+  t.unref?.();
+}
 /*
  * BUG-217 round 9: the data dir this server locked is no longer the one at its path (moved away, a copy put
  * back). The outbox has already stopped and marked its in-flight rows "not confirmed" in the dir it holds

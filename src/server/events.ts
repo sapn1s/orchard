@@ -509,7 +509,9 @@ export type StationEvent =
    * client must expire nothing on it; `complete:true` = any card whose id is
    * absent no longer exists and settles as expired.
    */
-  | { t: 'approvals-snapshot'; requestIds: string[]; complete: boolean };
+  | { t: 'approvals-snapshot'; requestIds: string[]; complete: boolean }
+  /** FEAT-200 — this session raised (or had decided) a container access request: the tab re-reads its access cards. */
+  | { t: 'access-request'; id: string; projectId: string; state: 'pending' | 'decided' };
 
 /**
  * The login relay's server→client events, projected out of `StationEvent` so the

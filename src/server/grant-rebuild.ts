@@ -84,6 +84,14 @@ export interface GrantRebuildDeps<P extends ProjectLike = ProjectLike> {
    */
   readCredDrift?(p: P): CredDrift;
   /**
+   * FEAT-200 — the container's ACCESS-config drift (its `container.env` keys and published ports) read LIVE from
+   * docker, the third orthogonal level read, handled exactly like the credential one: 'stale' (an approved env
+   * var / port is not in the running container, or a removed one still is) recreates when idle and never holds
+   * turns; 'unknown' is retried and never acted on; 'clean' lets the entry drop. Optional: absent = 'clean'.
+   * This is not a second trigger — it is one more fact the ONE reconciler compares, level-based.
+   */
+  readAccessDrift?(p: P): CredDrift;
+  /**
    * BUG-254 r4/r9 — true once boot lease-recovery has run. EVERY recreate (a git-mode
    * mismatch as much as a stale credential) is withheld until then, so a restart's
    * surviving (recovered) leases are in place before the reconciler could ever
@@ -113,6 +121,8 @@ interface Entry {
   gitDriven: boolean;
   /** BUG-254 r4 — the last credential-bind drift read; 'stale' recreates when idle, 'unknown' is retried. */
   cred: CredDrift;
+  /** FEAT-200 — the last access-config (env/ports) drift read; same rules as `cred`. */
+  access: CredDrift;
   since: number;
   blockers: Blocker[];
   strayBlockedSince: number | null;
@@ -201,6 +211,11 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
     if (!deps.readCredDrift) return 'clean';
     try { const c = deps.readCredDrift(p); return c === 'stale' || c === 'unknown' ? c : 'clean'; } catch { return 'unknown'; }
   }
+  /** FEAT-200 — live access-config drift; any read surprise is 'unknown' (retried, never recreated on). */
+  function accessOf(p: P): CredDrift {
+    if (!deps.readAccessDrift) return 'clean';
+    try { const c = deps.readAccessDrift(p); return c === 'stale' || c === 'unknown' ? c : 'clean'; } catch { return 'unknown'; }
+  }
   /**
    * BUG-254 r9 — the reconciler may ACT (recreate) at all only once boot lease-recovery has run. Until then
    * a restart's surviving session and its lease are not yet recovered, so sessionsOf()/leasesOf() are
@@ -230,12 +245,26 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
     wake();
   }
 
+  /** What a rebuild is FOR, in words (FEAT-200: an entry may be git-, credential- or access-driven, or several). */
+  function purposeOf(e: Entry): string {
+    const parts = [
+      ...(e.gitDriven ? ['the git-write grant change'] : []),
+      ...(e.cred === 'stale' ? ['a replaced account credential'] : []),
+      ...(e.access === 'stale' ? ['an approved access change (env vars / published ports)'] : []),
+    ];
+    return parts.join(' and ') || 'the git-write grant change';
+  }
+
   /* ------------------------------------------------------------ the HOLD rule */
 
   function holdOf(projectId: string): { message: string; reason: 'rebuilding' | 'failed' | 'mismatch' | 'unknown' } | null {
     const e = entries.get(projectId);
-    if (e?.phase === 'rebuilding') return { reason: 'rebuilding', message: 'Rebuilding the container for the git-write grant change (any pending image change applies too). Messages are saved and sent when it is ready.' };
-    if (e?.phase === 'failed') return { reason: 'failed', message: `Rebuilding the container for the git-write grant failed: ${e.error ?? 'unknown error'}. New messages and sessions wait (nothing typed is lost); it retries automatically.` };
+    const forWhat = e ? purposeOf(e) : 'the git-write grant change';
+    if (e?.phase === 'rebuilding') return { reason: 'rebuilding', message: `Rebuilding the container for ${forWhat} (any pending image change applies too). Messages are saved and sent when it is ready.` };
+    // FEAT-200 r3 (design review): a FAILED rebuild holds turns only when it is reconciling the git-write grant. A
+    // credential or access recreate never holds turns (the rule both readers declare), failed or not: a failed one
+    // is retried and shown on the rail, and a session that starts meanwhile simply creates the container it needs.
+    if (e?.phase === 'failed' && e.gitDriven) return { reason: 'failed', message: `Rebuilding the container for ${forWhat} failed: ${e.error ?? 'unknown error'}. New messages and sessions wait (nothing typed is lost); it retries automatically.` };
     const d = desiredOf(projectId);
     const a = actualOf(projectId);
     if (d === 'rw' || a === 'ro' || a === 'none') return null;
@@ -262,11 +291,13 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
       names.set(p.id, p.name);
       const e = entries.get(p.id);
       let cred: CredDrift = 'clean';
+      let access: CredDrift = 'clean';
       if (!(e && (e.phase === 'rebuilding' || e.driving))) {
         let a: Actual;
         try { a = deps.readActual(p); } catch { a = 'unknown'; }
         setActual(p.id, a);
         cred = credOf(p);
+        access = accessOf(p);
       }
       if (e && (e.phase === 'rebuilding' || e.driving)) continue;
       const d = desiredOf(p.id);
@@ -276,26 +307,33 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
       // git grant. 'stale' or 'unknown' keeps an entry PENDING (unknown is retried, never recreated on);
       // it never holds turns (holdOf is git-only). A recreate heals both reasons at once.
       const credActive = (cred === 'stale' || cred === 'unknown') && a !== 'none';
-      if (!e && (mismatch || credActive)) {
-        add(p, mismatch ? d : (a === 'ro' || a === 'rw' ? a : 'ro'), { gitDriven: mismatch, cred });
+      // FEAT-200 — access-config drift: the same rule as the credential (a THIRD orthogonal level read).
+      const accessActive = (access === 'stale' || access === 'unknown') && a !== 'none';
+      if (!e && (mismatch || credActive || accessActive)) {
+        add(p, mismatch ? d : (a === 'ro' || a === 'rw' ? a : 'ro'), { gitDriven: mismatch, cred, access });
       } else if (e && e.phase === 'pending') {
         e.cred = cred;
+        e.access = access;
         e.gitDriven = mismatch;
         if (mismatch) e.desired = d;
-        if (!mismatch && !credActive) {
+        if (!mismatch && !credActive && !accessActive) {
           if (a === 'unknown' || d === 'unknown') continue; // cannot tell git: keep it (and its hold rule) as it is
-          drop(e, a === 'none' ? 'cancelled: there is no container (the next start creates it with the current grant)' : 'cancelled: the container already matches the grant and credential');
+          drop(e, a === 'none' ? 'cancelled: there is no container (the next start creates it with the current grant)' : 'cancelled: the container already matches the grant, credential and access settings');
         }
       } else if (e && e.phase === 'failed') {
         e.cred = cred;
+        e.access = access;
         // BUG-254 r6 — when git is KNOWN to match (d known, a===d), a FAILED entry must not keep holding
         // turns on credential uncertainty: drop it on a CLEAN cred; DOWNGRADE failed->pending on an
         // 'unknown' cred (clears the 'failed' turn-hold and the fixed 3s-retry churn, keeps reprobing);
         // keep 'failed' only on a PROVEN stale bind (a legitimate recreate the next drive() retries).
         if (d !== 'unknown' && a === d) {
-          if (cred === 'clean') drop(e, 'resolved: the container now matches the grant');
-          else if (cred === 'unknown') { e.phase = 'pending'; e.error = null; e.nextTryAt = 0; audit('pending', e, { from: 'failed', why: 'credential probe unknown while git matches' }); }
-          // cred === 'stale': stays failed; drive() recreates on the proven drift
+          // FEAT-200: access drift joins the credential here — clean on both drops; an unknown on either (with no
+          // PROVEN stale one) downgrades; a proven stale one keeps 'failed' for drive() to retry.
+          const proven = cred === 'stale' || access === 'stale';
+          if (cred === 'clean' && access === 'clean') drop(e, 'resolved: the container now matches the grant');
+          else if (!proven) { e.phase = 'pending'; e.error = null; e.nextTryAt = 0; audit('pending', e, { from: 'failed', why: 'credential/access probe unknown while git matches' }); }
+          // a proven stale credential or access drift: stays failed; drive() recreates on it
         }
       }
     }
@@ -305,9 +343,9 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
     wake();
   }
 
-  function add(p: P, d: Mode, how: { gitDriven: boolean; cred: CredDrift }): void {
+  function add(p: P, d: Mode, how: { gitDriven: boolean; cred: CredDrift; access: CredDrift }): void {
     const e: Entry = {
-      projectId: p.id, projectName: p.name, phase: 'pending', desired: d, gitDriven: how.gitDriven, cred: how.cred,
+      projectId: p.id, projectName: p.name, phase: 'pending', desired: d, gitDriven: how.gitDriven, cred: how.cred, access: how.access,
       since: now(), blockers: [], strayBlockedSince: null,
       error: null, attempts: 0, nextTryAt: 0, driving: false,
     };
@@ -315,6 +353,10 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
     if (how.gitDriven) {
       log(`[orchard] FEAT-175: ${p.name}: container .git is ${d === 'ro' ? 'rw' : 'ro'} but the grant wants ${d}; it is recreated once no session is working` +
         (d === 'ro' ? ' — new turns and starts are held until then' : ''));
+    } else if (how.cred === 'clean' && how.access !== 'clean') {
+      // FEAT-200 — an access-config recreate never holds turns either.
+      log(`[orchard] FEAT-200: ${p.name}: the container's env/published ports ${how.access === 'stale' ? 'differ from the desired config (an approved access change)' : 'could not be read right now'}; ` +
+        (how.access === 'stale' ? 'it is recreated once no session is working — new turns are NOT held' : 'it will be re-checked (no recreate until the drift is proven)'));
     } else {
       // BUG-254 r4 — a credential-bind recreate never holds turns: it is announced, not gated.
       log(`[orchard] BUG-254: ${p.name}: the container's bound credential is ${how.cred === 'stale' ? 'stale (the account credential was replaced on the host)' : 'unreadable right now'}; ` +
@@ -385,13 +427,14 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
       // lease-recovery readiness condition is no longer scoped to this reason; it now gates EVERY recreate
       // below — see reconcileReady, BUG-254 r9.)
       const credStale = e.cred === 'stale';
+      const accessStale = e.access === 'stale'; // FEAT-200 — same rule as the credential
       if (e.phase === 'pending' && a0 === 'none') return; // no container to act on; the next start binds fresh
       // BUG-254 r6 — PHASE-INDEPENDENT: when git is KNOWN to match (a0===d) and the credential is not
       // PROVEN stale (clean or 'unknown'), never recreate — in ANY phase. The r5 break was a FAILED entry
       // with git-matching + an 'unknown' cred probe sliding past a pending-only guard and recreating.
       // Invariant: credential UNCERTAINTY alone never recreates (nor, via the tick downgrade, holds turns)
       // WHEN GIT IS KNOWN TO MATCH. A real git mismatch (incl a0==='none') still has a0!==d and passes.
-      if (a0 === d && !credStale) return;
+      if (a0 === d && !credStale && !accessStale) return;
       // BUG-254 r9 (independent design review) — hold EVERY recreate reason (git mismatch AND stale
       // credential) until boot lease-recovery has run. A no-op (a0===d, clean cred) already returned above,
       // so only a real action reaches here; if recovery has not finished, its idleness inputs are incomplete
@@ -434,16 +477,19 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
       const captured = deps.leasesOf(e.projectId).map((l) => l.id);
       // BUG-254 r4 — name the real reason: a git-write grant change, a stale credential bind, or both.
       const gitReason = a0 !== e.desired;
-      const why = gitReason && credStale ? 'a git-write grant change and a stale credential bind'
-        : gitReason ? 'a git-write grant change (FEAT-175)'
-        : 'a stale credential bind — the account credential was replaced on the host (BUG-254)';
+      const reasonsSaid = [
+        ...(gitReason ? ['a git-write grant change (FEAT-175)'] : []),
+        ...(credStale ? ['a stale credential bind — the account credential was replaced on the host (BUG-254)'] : []),
+        ...(accessStale ? ['an approved container access change — env vars / published ports (FEAT-200)'] : []),
+      ];
+      const why = reasonsSaid.join(' and ') || 'a container settings change';
       e.phase = 'rebuilding';
       e.blockers = [];
       if (press) { press.decide(`recreating the container now — ${sessions.length} session(s) closed; they resume on their next message`); press = undefined; }
       wake();
       const started = now();
       log(`[orchard] FEAT-175/BUG-254: ${e.projectName}: recreating the container for ${why}${gitReason ? ` (.git ${e.desired})` : ''}; ${sessions.length} idle session(s) closed and resumed on their next message${force ? ' — FORCED by the user' : ''}`);
-      audit('rebuilding', e, { sessions: sessions.map((s) => s.id), force, gitReason, credStale, waitedMs: started - e.since });
+      audit('rebuilding', e, { sessions: sessions.map((s) => s.id), force, gitReason, credStale, accessStale, waitedMs: started - e.since });
       for (const s of sessions) reaped.add(s.id);
       try {
         await Promise.all(sessions.map((s) => s.close(`the container is being recreated for ${why}`, { resumable: true }).catch(() => {})));
@@ -470,7 +516,7 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
         const intact = a === 'ro' || a === 'rw';
         e.phase = intact ? 'pending' : 'failed';
         if (intact) noteBlockers(e, [{ kind: 'lease', label: `the container could not be recreated yet (${msg.slice(0, 200)})` }]);
-        log(`[orchard] FEAT-175: ${e.projectName}: recreating the container for the git-write grant ${intact ? 'was refused' : 'FAILED'} (${msg}); retry in ${Math.round((e.nextTryAt - now()) / 1000)}s`);
+        log(`[orchard] FEAT-175: ${e.projectName}: recreating the container for ${purposeOf(e)} ${intact ? 'was refused (the container is intact)' : 'FAILED'} (${msg}); retry in ${Math.round((e.nextTryAt - now()) / 1000)}s`);
         audit(intact ? 'refused' : 'failed', e, { error: msg, attempts: e.attempts, actual: a });
       } finally {
         for (const r of releases) { try { r(); } catch { /* released */ } }
@@ -525,7 +571,9 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
       desired: d,
       actual: a,
       since: new Date(e?.since ?? unknownSince.get(projectId) ?? now()).toISOString(),
-      message: h?.message ?? `Git-write grant: the container is recreated with a writable .git once no session is working.${e?.blockers.length ? ` Waiting on: ${e.blockers.map((b) => b.label).join('; ')}.` : ''}`,
+      message: h?.message ?? ((e && !e.gitDriven)
+        ? `The container is recreated for ${purposeOf(e)} once no session is working (new turns are not held).${e.blockers.length ? ` Waiting on: ${e.blockers.map((b) => b.label).join('; ')}.` : ''}`
+        : `Git-write grant: the container is recreated with a writable .git once no session is working.${e?.blockers.length ? ` Waiting on: ${e.blockers.map((b) => b.label).join('; ')}.` : ''}`),
       waitingOn: e?.blockers.map((b) => b.label) ?? [],
       error: e?.error ?? null,
       nextTryAt: e?.nextTryAt ? new Date(e.nextTryAt).toISOString() : null,
@@ -550,19 +598,46 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
       if (out.some((x) => x.id === base.id)) continue;
       if (e.phase === 'failed') {
         out.push({ ...base, severity: 'high',
-          title: e.gitDriven ? `Container rebuild for the git-write grant failed — ${e.projectName}` : `Container rebuild for a stale credential failed — ${e.projectName}`,
+          title: e.gitDriven ? `Container rebuild for the git-write grant failed — ${e.projectName}`
+            : e.cred !== 'clean' ? `Container rebuild for a stale credential failed — ${e.projectName}`
+            : `Container rebuild for an approved access change failed — ${e.projectName}`,
           question: holdOf(e.projectId)?.message ?? `Rebuild failed: ${e.error}`, actions: [{ id: 'retry', label: 'Retry now' }] });
         continue;
       }
       if (e.phase !== 'pending') continue;
+      // FEAT-200 r3: a recreate docker REFUSED with the container kept intact (every recreate is create-before-remove
+      // now) waits as 'pending' with its error — said as a refused rebuild with Retry, never as "work to stop".
+      if (e.error && e.attempts > 0) {
+        out.push({ ...base, severity: e.gitDriven && e.desired === 'ro' ? 'high' : 'medium',
+          title: `Container rebuild for ${purposeOf(e)} was refused — ${e.projectName} (the current container is kept)`,
+          question: `Rebuilding ${e.projectName}'s container for ${purposeOf(e)} was refused: ${e.error}. The current container is still in place${holdOf(e.projectId) ? '; new messages and sessions wait (nothing typed is lost)' : ' and keeps working'}. It retries automatically.`,
+          actions: [{ id: 'retry', label: 'Retry now' }] });
+        continue;
+      }
       const stray = e.strayBlockedSince !== null && e.blockers.some((b) => b.kind === 'shell' || b.kind === 'unknown' ||
         (b.kind === 'lease' && t - (e.strayBlockedSince ?? t) >= STRAY_LEASE_GRACE_MS));
       // BUG-254 r4 — the "git writes still possible" overrun card is a GIT-grant concern only; a credential
       // recreate neither makes .git writable nor holds turns, so it only ever surfaces a stuck (stray) recreate.
       const overrun = e.gitDriven && e.desired === 'ro' && t - e.since >= OVERRUN_CARD_MS;
-      if (!stray && !overrun) continue;
+      // FEAT-200 — an approved access change whose container cannot be read for 2+ minutes is said, never silent.
+      const accessBlind = !e.gitDriven && e.cred !== 'stale' && e.access === 'unknown' && t - e.since >= UNKNOWN_CARD_MS;
+      if (!stray && !overrun && !accessBlind) continue;
       const mins = Math.max(1, Math.round((t - e.since) / 60_000));
       const msg = viewOf(e.projectId)?.message ?? '';
+      if (!e.gitDriven && !stray && accessBlind) {
+        out.push({ ...base, severity: 'medium',
+          title: `Orchard cannot read ${e.projectName}'s container to apply an access change`,
+          question: `An approved access change (env vars / published ports) is waiting to reach ${e.projectName}'s container, but Docker has not answered for ${mins} min, so Orchard cannot tell whether it needs a rebuild. Nothing is recreated until it can. Check that Docker is running.`,
+          actions: [{ id: 'retry', label: 'Check again' }] });
+        continue;
+      }
+      if (!e.gitDriven && e.cred === 'clean') {
+        out.push({ ...base, severity: 'medium',
+          title: `An approved access change cannot reach ${e.projectName} — something holds the container`,
+          question: `${e.projectName}'s container is recreated with the approved env vars / published ports once nothing holds it (sessions resume on their next message), but ${e.blockers.map((b) => b.label).join('; ') || 'work'} has held it for ${mins} min. "Rebuild now" closes those sessions and stops what they are running.`,
+          actions: [{ id: 'force', label: 'Rebuild now (stops it)' }] });
+        continue;
+      }
       if (!e.gitDriven) {
         out.push({ ...base, severity: 'medium',
           title: `A stale credential cannot be healed in ${e.projectName} — something holds the container`,
@@ -628,6 +703,8 @@ export function createGrantRebuild<P extends ProjectLike>(deps: GrantRebuildDeps
     railItems,
     request,
     wasReaped: (sessionId: string) => reaped.has(sessionId),
+    /** FEAT-200 — the reconciler's phase for a project (null = nothing pending): a decided access request's resume waits while it is non-null. */
+    phaseOf: (projectId: string): Phase | null => entries.get(projectId)?.phase ?? null,
     _phaseOf: (projectId: string): Phase | null => entries.get(projectId)?.phase ?? null,
     _actualOf: actualOf,
   };

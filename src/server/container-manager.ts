@@ -44,7 +44,7 @@ import { effectiveLaunchAccount } from './launch-account.ts';
 import { provisionHash, recipeHash, serenaPin, type ProvisionState } from './provisioning.ts';
 // FEAT-157 — the release catalog, the pin and the ONE target policy (security floor included).
 import * as baseRel from './base-releases.ts';
-import { listProjects, updateProject } from './registry.ts';
+import { getProject, listProjects, updateProject } from './registry.ts';
 // FEAT-157 — the CLI a container needs is the host SDK's own boot-proven bundled binary.
 import * as rtUpdate from './runtime/runtime-update.ts';
 import {
@@ -1657,6 +1657,33 @@ function gitGuardBinds(project: Project, binds: BindSpec[]): BindSpec[] {
  * `ensureContainer` compares it against the live container's Binds and
  * recreates on any difference.
  */
+/** The session-history bind (FEAT-155): the declared host store ↔ where the in-container CLI writes. */
+function historyBind(project: Project): BindSpec {
+  return {
+    hostPath: containerHistoryDir(project),
+    containerPath: `${CONTAINER_HOME}/.claude/projects/${encodeCwdForStore(containerWorkdir(project))}`,
+    readOnly: false,
+    why: 'session history',
+  };
+}
+
+/**
+ * FEAT-200 — the container-access request INBOX: request files the agent writes into the ROOT of its
+ * session-history directory, which is already bind-mounted into every container. A new bind would be
+ * "missing bind" drift on every existing container (refusing launches under live sessions, the BUG-214
+ * class); this needs none. Flat on purpose: the only path component the agent controls is the file name,
+ * which the reader opens O_NOFOLLOW|O_NONBLOCK and the reply writer creates O_EXCL|O_NOFOLLOW; the
+ * directory itself is the bind source and cannot be swapped from inside the container. Declared once
+ * here; the poller (access-channel.ts), the exec env and the injected instructions all read it.
+ */
+export const ACCESS_FILE_PREFIX = '.orchard-access.';
+/** FEAT-200 — the exec env var naming the inbox directory inside the container (an `ORCHARD_*` name: reserved in container.env). */
+export const ACCESS_DIR_ENV = 'ORCHARD_ACCESS_DIR';
+export function accessInboxPaths(project: Project): { host: string; container: string } {
+  const b = historyBind(project);
+  return { host: b.hostPath, container: b.containerPath };
+}
+
 export function desiredBinds(project: Project): BindSpec[] {
   const cs = containerSettingsOf(project);
   const workdir = containerWorkdir(project);
@@ -1675,12 +1702,7 @@ export function desiredBinds(project: Project): BindSpec[] {
     // container side is wherever the in-container CLI will write, which does
     // follow the cwd. With workspaceRoot off the two coincide and this bind is
     // byte-identical to before (no drift for existing containers).
-    {
-      hostPath: containerHistoryDir(project),
-      containerPath: `${CONTAINER_HOME}/.claude/projects/${encodeCwdForStore(workdir)}`,
-      readOnly: false,
-      why: 'session history',
-    },
+    historyBind(project),
   ];
   /*
    * STEALTH BROWSER — exactly two mounts, both derived from THIS project's id by
@@ -1989,6 +2011,8 @@ interface Inspected {
   env: string[];
   /** FEAT-155 — the `container.env` KEYS this container was created with (label), '' when none/unlabelled. */
   envKeys: string;
+  /** FEAT-200 — the container's published ports, normalised `<hostIp>:<hostPort>-><containerPort>/<proto>`, sorted. */
+  ports: string[];
   /** FEAT-155 round 5 — the run-time identity/entry pinned by the lockdown. */
   user: string;
   entrypoint: string[];
@@ -2035,6 +2059,7 @@ function inspect(name: string): Inspected | null {
     ),
     env: (j.Config?.Env ?? []) as string[],
     envKeys: String(j.Config?.Labels?.[ENV_KEYS_LABEL] ?? ''),
+    ports: normalisePortBindings(hc.PortBindings),
     user: String(j.Config?.User ?? ''),
     entrypoint: ((j.Config?.Entrypoint ?? []) as unknown[]).map(String),
     cmd: ((j.Config?.Cmd ?? []) as unknown[]).map(String),
@@ -2101,6 +2126,142 @@ function guardLapses(project: Project, live: Inspected, guardBinds: string[]): s
     if (!m || !paths.includes(m[1]!)) continue;
     out.push(`gitguard-lapsed: the read-only .git overlay at ${m[1]} is no longer in effect inside ${containerName(project.id)} ` +
       '(the repo directory was replaced on the host while the container ran), so that repo is writable from the container until it is recreated');
+  }
+  return out;
+}
+
+/**
+ * FEAT-200 — `docker inspect` HostConfig.PortBindings → sorted `<ip>:<host>-><ctr>/<proto>` strings.
+ * An empty HostIp is how Docker records a publish on EVERY interface; it is spelled `0.0.0.0` here so
+ * a non-loopback publish can never compare equal to a wanted loopback one.
+ */
+function normalisePortBindings(pb: unknown): string[] {
+  const out: string[] = [];
+  if (!pb || typeof pb !== 'object') return out;
+  for (const [key, list] of Object.entries(pb as Record<string, unknown>)) {
+    const [ctr, proto = 'tcp'] = key.split('/');
+    for (const b of Array.isArray(list) ? list as Array<{ HostIp?: string; HostPort?: string }> : []) {
+      out.push(`${b?.HostIp || '0.0.0.0'}:${b?.HostPort || ''}->${ctr}/${proto}`);
+    }
+  }
+  return out.sort();
+}
+
+/** FEAT-200 — the ONLY host address a published port is ever bound to. */
+/*
+ * FEAT-200 r5 (COMMIT ON SUCCESS) — the DESIRED access config (container env + published ports) is the project's
+ * base settings plus the overlay of APPROVED-PENDING access requests, folded by the access layer. Every reader of
+ * env/ports that shapes or compares a container — createArgs, the drift oracle (doEnsure, status, the reconciler's
+ * level read), the env-keys label, the swap's port-clash test, the refusal report — reads it through
+ * `accessSettingsOf`, so they can never disagree. The settings are written only after a running container carries
+ * it (the access layer's commit); a refused request just leaves the overlay. No hook = the base settings.
+ */
+export interface AccessOverlay { env: Record<string, string>; ports: Array<{ hostPort: number; containerPort: number }> }
+let accessOverlayHook: ((project: Project, base: AccessOverlay) => AccessOverlay) | null = null;
+export function setAccessOverlay(fn: ((project: Project, base: AccessOverlay) => AccessOverlay) | null): void { accessOverlayHook = typeof fn === 'function' ? fn : null; }
+/** The project's DESIRED container env + ports (base settings + approved-pending overlay). Throws if the overlay cannot be read. */
+export function accessSettingsOf(project: Project): AccessOverlay {
+  const cs = containerSettingsOf(project);
+  const base: AccessOverlay = { env: { ...(cs.env ?? {}) }, ports: [...(cs.ports ?? [])] };
+  return accessOverlayHook ? accessOverlayHook(project, base) : base;
+}
+
+export const PUBLISH_HOST_IP = '127.0.0.1';
+
+/** FEAT-200 — the publishes this project's container SHOULD carry, in `normalisePortBindings` form. */
+function desiredPortStrings(project: Project): string[] {
+  return validPublishes(project).map((p) => `${PUBLISH_HOST_IP}:${p.hostPort}->${p.containerPort}/tcp`).sort();
+}
+
+/**
+ * FEAT-200 — the publishes `docker create` may carry: integers in range, nothing else. Write-time validation
+ * (validate.ts validatePorts) already refuses anything else; this keeps a hand-edited registry value (a string
+ * with extra ':' segments, a negative, a float) from ever reaching the `-p` argument. Skipped, never "fixed".
+ */
+function validPublishes(project: Project): Array<{ hostPort: number; containerPort: number }> {
+  const ok = (n: unknown, lo: number) => typeof n === 'number' && Number.isInteger(n) && n >= lo && n <= 65535;
+  return (accessSettingsOf(project).ports ?? []).filter((p) => p && ok(p.hostPort, 1024) && ok(p.containerPort, 1))
+    .map((p) => ({ hostPort: p.hostPort, containerPort: p.containerPort }));
+}
+
+/**
+ * FEAT-200 — the access-config drift between the registry and a live container: the `container.env` keys
+ * Orchard sets, and the published ports. The ONE comparison; `driftReasons` (doEnsure, status) and
+ * `accessDriftOf` (the FEAT-175 idle reconciler) both read it, so they can never disagree about whether
+ * an approved access change has reached the container.
+ */
+function accessDriftReasons(project: Project, live: Inspected): string[] {
+  const out: string[] = [];
+  const cs = accessSettingsOf(project);
+  // Subset check, not equality: Config.Env also carries the image's own defaults
+  // (PATH, etc.). We only own the keys we set, so drift is "a key we set is
+  // missing or has the wrong value" — never "the image added env we didn't ask for".
+  for (const [k, v] of Object.entries(cs.env ?? {})) {
+    if (reservedContainerEnvReason(k)) continue; // never set on create, so never drift
+    if (!live.env.includes(`${k}=${v}`)) out.push(`env ${k} not set to expected value`);
+  }
+  // …and REMOVING a key must be drift too, or the removed variable lives on in
+  // the running container forever. The keys we set are recorded in a label at
+  // create time (Config.Env alone cannot tell ours from the image's own).
+  if (live.envKeys !== envKeysOf(project)) out.push(`env keys ${live.envKeys || '(none)'} != ${envKeysOf(project) || '(none)'}`);
+  const wantPorts = desiredPortStrings(project);
+  if (wantPorts.join(',') !== live.ports.join(',')) out.push(`published ports [${live.ports.join(', ')}] != [${wantPorts.join(', ')}]`);
+  return out;
+}
+
+/**
+ * FEAT-200 — access-config drift for the FEAT-175 idle reconciler, read LIVE (never the status cache), in the
+ * same shape as `credBindDriftOf`: 'stale' (the running container lacks an approved env var / port, or still
+ * carries a removed one), 'unknown' (docker could not be read — the reconciler retries and never recreates on
+ * it), 'clean' (matches; or no container this server may act on; or stopped — the next start recreates it
+ * from the current settings anyway).
+ */
+export function accessDriftOf(project: Project): 'clean' | 'stale' | 'unknown' {
+  if (project.isolation !== 'container') return 'clean';
+  let live: Inspected | null;
+  try { live = inspect(containerName(project.id)); } catch { return 'unknown'; }
+  if (!live) return 'clean';
+  if (!mayActOn(live.owner)) return 'clean';
+  if (!live.running) return 'clean';
+  try { return accessDriftReasons(project, live).length ? 'stale' : 'clean'; } catch { return 'unknown'; }
+}
+
+/**
+ * FEAT-200 — what the project's RUNNING container actually carries right now, for the resume text (computed
+ * from the container, never from the request). null = no running container this server may act on, or docker
+ * could not be read.
+ */
+export function liveAccessOf(project: Project): { env: string[]; ports: string[] } | null {
+  let live: Inspected | null;
+  try { live = inspect(containerName(project.id)); } catch { return null; }
+  if (!live || !mayActOn(live.owner) || !live.running) return null;
+  return { env: live.env, ports: live.ports };
+}
+
+/**
+ * FEAT-200 — every host port published on THIS docker daemon by a container other than `exceptName`, with
+ * the container that holds it. Used by the access-request collision check. Throws on a docker error (the
+ * caller refuses rather than approving blind).
+ */
+export function publishedHostPorts(exceptName: string | null): Array<{ hostPort: number; hostIp: string; container: string }> {
+  const ids = dockerSync(['ps', '-q', '--no-trunc'], 15_000);
+  if (ids.code !== 0) throw new ContainerError('inspect-failed', 'docker ps failed', (ids.stderr || ids.stdout).trim().slice(0, 400));
+  const list = ids.stdout.split('\n').map((x) => x.trim()).filter(Boolean);
+  if (!list.length) return [];
+  const r = dockerSync(['inspect', '--format', '{{.Name}}\t{{json .HostConfig.PortBindings}}', ...list], 15_000);
+  if (r.code !== 0) throw new ContainerError('inspect-failed', 'docker inspect failed', (r.stderr || r.stdout).trim().slice(0, 400));
+  const out: Array<{ hostPort: number; hostIp: string; container: string }> = [];
+  for (const line of r.stdout.split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab < 0) continue;
+    const name = line.slice(0, tab).replace(/^\//, '');
+    if (exceptName && name === exceptName) continue;
+    let pb: unknown = null;
+    try { pb = JSON.parse(line.slice(tab + 1)); } catch { pb = null; }
+    for (const s2 of normalisePortBindings(pb)) {
+      const m = /^(.*):(\d+)->/.exec(s2);
+      if (m) out.push({ hostIp: m[1]!, hostPort: Number(m[2]), container: name });
+    }
   }
   return out;
 }
@@ -2211,17 +2372,8 @@ function driftReasons(project: Project, live: Inspected, useImage?: string): str
   if (live.pidsLimit !== cs.pidsLimit) out.push(`pids limit ${live.pidsLimit} != ${cs.pidsLimit}`);
   const wantGpu = gpuEnabled(project);
   if (live.gpu !== wantGpu) out.push(`gpu ${live.gpu ? 'on' : 'off'} != ${wantGpu ? 'on' : 'off'}`);
-  // Subset check, not equality: Config.Env also carries the image's own defaults
-  // (PATH, etc.). We only own the keys we set, so drift is "a key we set is
-  // missing or has the wrong value" — never "the image added env we didn't ask for".
-  for (const [k, v] of Object.entries(cs.env ?? {})) {
-    if (reservedContainerEnvReason(k)) continue; // never set on create, so never drift
-    if (!live.env.includes(`${k}=${v}`)) out.push(`env ${k} not set to expected value`);
-  }
-  // …and REMOVING a key must be drift too, or the removed variable lives on in
-  // the running container forever. The keys we set are recorded in a label at
-  // create time (Config.Env alone cannot tell ours from the image's own).
-  if (live.envKeys !== envKeysOf(project)) out.push(`env keys ${live.envKeys || '(none)'} != ${envKeysOf(project) || '(none)'}`);
+  // FEAT-200 — env and published ports: the ONE comparison, shared with the idle reconciler's level read.
+  for (const r of accessDriftReasons(project, live)) out.push(r);
   if (!live.init) out.push('Init is not enabled');
   const wantGroups = desiredGroupAdd(project).slice().sort();
   const gotGroups = live.groupAdd.slice().sort();
@@ -3920,6 +4072,8 @@ export interface EnsureOptions {
   onLog?: (s: string) => void;
   /** Recreate even without drift (Rebuild). */
   forceRecreate?: boolean;
+  /** FEAT-200 r5: how many times this ensure has already retried after docker refused approved access requests. */
+  refusalRetries?: number;
 }
 
 /** What a lifecycle request carries in. */
@@ -3994,6 +4148,23 @@ export function ensureContainer(project: Project, opts: EnsureOptions & OpReques
 }
 
 /**
+ * FEAT-200 r3 — CREATE-ONLY ensure, for an approved access change whose project has no RUNNING container: the
+ * resume checker creates (or starts) the container BEFORE it tells the requester anything, so "access granted" is
+ * never claimed before a container has it, and a port docker refuses fails its approved request (said, never written). Decided inside
+ * the project's slot: a running container, or any lease, means "do nothing" — so this never recreates a running
+ * container, never closes a session and holds nothing (it is not a second recreate trigger). Returns null when it
+ * did nothing.
+ */
+export function ensureIfNotRunning(project: Project, req: OpRequest = {}): Promise<ContainerStatus | null> {
+  return inOp(project, 'start', req, async (op, p) => {
+    if (p.isolation !== 'container') return null;
+    const live = inspect(containerName(p.id));
+    if (live?.running || lifecycle.hasLeases(op.projectId)) return null;
+    return ensureInOp(op, p, { onLog: req.onLog });
+  });
+}
+
+/**
  * ADMISSION — the only way a session gets a container. Services, the container and the network join
  * happen in the project's slot, and the LEASE for `execTag` is granted before the slot is released,
  * so no other operation can run between "the container is ready" and "a session holds it".
@@ -4033,7 +4204,25 @@ async function doEnsure(op: lifecycle.Op, project: Project, opts: EnsureOptions,
   if (mig) project = { ...project, settings: { ...project.settings, container: { ...containerSettingsOf(project), base: mig.pin } } };
   resolvedPinImage.delete(project.id);
   let st: ContainerStatus;
-  try { st = await doEnsureAdmitted(op, project, opts, deferred); } catch (e) { resolvedPinImage.delete(project.id); throw e; }
+  try { st = await doEnsureAdmitted(op, project, opts, deferred); } catch (e) {
+    resolvedPinImage.delete(project.id);
+    /*
+     * FEAT-200 r5 — docker refused a port this attempt added, and the access layer FAILED the approved-pending
+     * request(s) that needed it (they left the desired config; no setting was touched). Retry on the desired config
+     * as it is now: it applies whatever else is pending, or finds nothing to do and keeps the running container.
+     * Bounded by progress: a retry happens only when at least one pending record failed, and each record fails at
+     * most once (a finite set); the cap is a backstop. The retry is not a forced rebuild (the refused attempt was it).
+     */
+    const tries = opts.refusalRetries ?? 0;
+    if (e instanceof ReplacementRefusedError && e.dropped && tries < MAX_REFUSAL_RETRIES) {
+      const fresh = getProject(project.id);
+      if (fresh && fresh.isolation === 'container') {
+        opts.onLog?.(`[container] retrying without the refused access request(s)\n`);
+        return doEnsure(op, fresh, { onLog: opts.onLog, refusalRetries: tries + 1 }, deferred);
+      }
+    }
+    throw e;
+  }
   mig?.commit();
   recordPinImage(project.id);
   return st;
@@ -4190,10 +4379,8 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
       if (gone.length) {
         // BUG-244 IV r12: neither `docker cp` (the CLI check) nor `start` may touch it; recreate on the very image it runs.
         opts.onLog?.(`[container] recovery: ${name} is stopped and its read-only .git overlay source ${gone.join(', ')} is gone; recreating it on the image it runs (starting it would make Docker create that directory root-owned)\n`);
-        await removeContainer(name);
-        createAndStart(project, name, lv.imageId, opts);
-        invalidate(project.id);
-        return assertRunning(project);
+        // FEAT-200 r3: through the swap — the old container is kept (stopped, never started) if the new one fails.
+        return swapContainer(project, name, lv.imageId, lv, ['recovery: a read-only .git overlay source is gone'], opts, lv.imageId);
       }
       const wantCli = await hostCli();
       const haveCli = containerCliSha(lv.id);
@@ -4203,12 +4390,8 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
         }
         const img = await ensureRuntimeImage(lv.imageId, wantCli, { onLog: opts.onLog });
         opts.onLog?.(`[container] recovery: giving ${name} the host's Claude CLI on the image it already runs\n`);
-        await removeContainer(name);
-        createAndStart(project, name, img, opts);
-        invalidate(project.id);
-        const st0 = assertRunning(project);
-        assertCliResolves(project, name, img);
-        return st0;
+        // FEAT-200 r3: through the swap — the working container stays until the replacement has started.
+        return swapContainer(project, name, img, lv, ['recovery: the host\'s Claude CLI'], opts, img);
       }
       if (!lv.running) {
         const r = dockerSync(['start', lv.id], 60_000);
@@ -4229,7 +4412,8 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
   }
 
   const locked = keepsLastGood(project);
-  if (locked) {
+  // FEAT-200 r3: every image source recreates through the swap now, so EVERY project recovers an interrupted one.
+  {
     // A swap interrupted by a restart. If it died AFTER the old container was
     // removed, `-next` is the only container and is running: finish the swap
     // (rename it into place) rather than delete it. Otherwise it is a
@@ -4344,9 +4528,10 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
         throw new ContainerError('live-sessions',
           `refusing to recreate ${name} (${reasons.join('; ') || 'rebuild requested'}): sessions are live in it and this would destroy the container underneath them. Close them first, or retry with ?force=1.`);
       }
-      if (locked) return swapContainer(project, name, image, live, reasons.length ? reasons : ['rebuild requested'], opts, resolved.parent);
-      opts.onLog?.(`[container] recreating ${name}: ${reasons.join('; ') || 'rebuild requested'}\n`);
-      await removeContainer(name);
+      // FEAT-200 r3 (design review): EVERY image source recreates create-before-remove. The old remove-then-create
+      // path is gone: a replacement docker refuses (a host port taken after every pre-check, a missing GPU, …) can
+      // no longer leave the project with no container.
+      return swapContainer(project, name, image, live, reasons.length ? reasons : ['rebuild requested'], opts, resolved.parent);
     } else if (live.running) {
       invalidate(project.id);
       if (locked) noteRunningOn(project, resolved.parent);
@@ -4366,7 +4551,14 @@ async function doEnsureAdmitted(op: lifecycle.Op, project: Project, opts: Ensure
   } catch (err) {
     // Nothing was running to keep. Remember a new image that cannot run so the
     // next launch falls back to the last good one instead of retrying it.
-    if (locked) markImageBad(project, resolved.parent, err as Error);
+    // FEAT-200 — a published host port held elsewhere is not the image's fault.
+    if (locked && !isPortAllocationError(err)) markImageBad(project, resolved.parent, err as Error);
+    // FEAT-200 r3: a created-but-unstartable container would otherwise sit under the project's name, reading as
+    // "a container with the old settings" to every level read. Remove it (ours only; never a running one).
+    try { const half = inspect(name); if (half && !half.running && half.project === project.id) await removeContainer(name); } catch { /* the next ensure retries */ }
+    // An approved-pending request whose port docker refused is failed by the access layer; the ensure retries (doEnsure).
+    const dropped = reportPortRefused(project, null, err, opts.onLog);
+    if (dropped) throw new ReplacementRefusedError(`could not create ${name}: ${(err as Error).message.split('\n')[0]}`, ((err as ContainerError).detail ?? '').slice(0, 1200), { keptPrevious: false, dropped: true });
     throw err;
   }
   invalidate(project.id);
@@ -4422,7 +4614,7 @@ export function createArgs(project: Project, name: string, image: string, opts: 
   args.push(...lockdownCreateArgs());
   for (const g of desiredGroupAdd(project)) args.push('--group-add', g);
   if (gpuEnabled(project)) args.push('--gpus', 'all');
-  for (const [k, v] of Object.entries(cs.env ?? {})) {
+  for (const [k, v] of Object.entries(accessSettingsOf(project).env ?? {})) {
     // Write-time validation refuses these; a hand-edited registry must not get
     // them past create either (see reservedContainerEnvReason).
     const why = reservedContainerEnvReason(k);
@@ -4431,6 +4623,8 @@ export function createArgs(project: Project, name: string, image: string, opts: 
   }
   // Always written (possibly empty), so an image LABEL can never stand in for it.
   args.push('--label', `${ENV_KEYS_LABEL}=${envKeysOf(project)}`);
+  // FEAT-200 — published ports, LOOPBACK ONLY. The host address is this constant, never a setting.
+  for (const p of validPublishes(project)) args.push('-p', `${PUBLISH_HOST_IP}:${p.hostPort}:${p.containerPort}`);
   const binds = desiredBinds(project);
   // BUG-244: which binds are the read-only .git overlays, so drift can tell them apart later.
   args.push('--label', `${GIT_GUARD_LABEL}=${JSON.stringify(binds.filter((b) => b.why === GIT_GUARD_WHY).map((b) => b.containerPath))}`);
@@ -4453,6 +4647,12 @@ export function createArgs(project: Project, name: string, image: string, opts: 
 }
 
 function createAndStart(project: Project, name: string, image: string, opts: EnsureOptions): void {
+  const id = createOnly(project, name, image, opts);
+  startCreated(id, name);
+}
+
+/** `docker create` only: binds nothing (a published port is claimed at START), so it never disturbs a running container. */
+function createOnly(project: Project, name: string, image: string, opts: EnsureOptions): string {
   const created = dockerSync(createArgs(project, name, image, opts), 60_000);
   if (created.code !== 0) {
     throw new ContainerError('create-failed', `could not create ${name}`, (created.stderr || created.stdout).trim().slice(0, 1200));
@@ -4460,28 +4660,57 @@ function createAndStart(project: Project, name: string, image: string, opts: Ens
   // FEAT-175 r2: it exists now under this name — when that is the project's own name, its mode is a fact.
   if (name === containerName(project.id)) reportGitMode(project.id, name);
   // BUG-216: start the container this call created (its ID), not whatever holds the name by now.
-  const id = created.stdout.trim().split('\n').pop()?.trim() || name;
+  return created.stdout.trim().split('\n').pop()?.trim() || name;
+}
+
+function startCreated(id: string, name: string): void {
   const started = dockerSync(['start', id], 60_000);
   if (started.code !== 0) {
     throw new ContainerError('start-failed', `created ${name} but it would not start`, (started.stderr || started.stdout).trim().slice(0, 1200));
   }
 }
 
+/** The loopback host port of a normalised binding string `127.0.0.1:H->C/tcp`. */
+function hostPortOfBinding(b: string): number | null {
+  const m = /:(\d+)->/.exec(b);
+  return m ? Number(m[1]) : null;
+}
+
 /**
- * FEAT-155 round 5 — recreate a Dockerfile project's container WITHOUT a window
- * where it is broken or absent: the replacement is created and started as
- * `<name>-next` while the current one is untouched; only once it is proven
- * running is the current one removed and the replacement renamed into place.
- * If the replacement cannot run, it is removed and the current container stays
- * exactly as it was (restarted if it was stopped) — the last good image keeps
- * running. A `-next` left by a restart mid-swap is always safe to delete, and
- * `doEnsure` does so first.
+ * THE RECREATE — for EVERY image source (FEAT-200 r3; FEAT-155 round 5 built it for Dockerfile projects only).
+ * The working container is never removed until its replacement has STARTED: the replacement is created as
+ * `<name>.next` while the current one is untouched (create binds nothing); only if the current one publishes a
+ * host port the replacement also needs is it stopped, just before the replacement starts (a host port is held
+ * by one container). Once the replacement is proven running, the current one is removed and the replacement
+ * renamed into place. If the replacement cannot run — for ANY reason: a port docker refuses, a GPU the daemon
+ * lacks, a broken image — it is removed and the current container is restarted exactly as it was. So "a failed
+ * rebuild left the project with no container" is not a state this path can reach.
+ *
+ * Outcomes on failure:
+ *   - a Dockerfile image that would not run is marked bad and the call RETURNS on the kept container (the next
+ *     ensure falls back to the last good image, so nothing re-tries it — unchanged FEAT-155 behaviour);
+ *   - otherwise it THROWS `ReplacementRefusedError` (keptPrevious), so no caller mistakes it for applied: the
+ *     reconciler reads the container intact and goes pending with backoff instead of logging "applied" and
+ *     re-adding a fresh entry on its next tick (the loop the design review found in the return-success shape);
+ *   - a port docker refused that this attempt ADDED is handed to the access layer first (`reportPortRefused`),
+ *     which FAILS the approved-pending request(s) needing it (they leave the desired config; nothing is written); `dropped` tells the ensure to retry.
+ * A `.next` left by a restart mid-swap is adopted or deleted by `doEnsureAdmitted` first (every image source).
  */
 async function swapContainer(project: Project, name: string, image: string, live: Inspected, reasons: string[], opts: EnsureOptions, parent: string = image): Promise<ContainerStatus> {
   const next = nextName(name);
-  opts.onLog?.(`[container] recreating ${name} on ${image}: ${reasons.join('; ')} — the current container stays until the new one is running\n`);
+  const locked = keepsLastGood(project);
+  const wanted = new Set(validPublishes(project).map((p) => p.hostPort));
+  const clash = live.running ? live.ports.map(hostPortOfBinding).filter((h): h is number => h !== null && wanted.has(h)) : [];
+  let stopped = false;
+  opts.onLog?.(`[container] recreating ${name} on ${image}: ${reasons.join('; ')} — the current container stays until the new one is running${clash.length ? ` (stopped just before the new one starts: both publish host port ${clash.join(', ')})` : ''}\n`);
   try {
-    createAndStart(project, next, image, opts);
+    const id = createOnly(project, next, image, opts);
+    if (clash.length) {
+      const st = dockerSync(['stop', '-t', '10', live.id], 60_000);
+      if (st.code !== 0) throw new ContainerError('stop-failed', `could not stop ${name} to free its published port(s) ${clash.join(', ')} for the replacement`, (st.stderr || st.stdout).trim().slice(0, 600));
+      stopped = true;
+    }
+    startCreated(id, next);
     const n = inspect(next);
     if (!n?.running) {
       const logs = dockerSync(['logs', '--tail', '40', next]);
@@ -4489,29 +4718,117 @@ async function swapContainer(project: Project, name: string, image: string, live
     }
   } catch (err) {
     await removeContainer(next).catch(() => undefined);
-    markImageBad(project, parent, err as Error);
-    opts.onLog?.(`[container] could not start a container on ${image} (${(err as Error).message.split('\n')[0]}); keeping ${name} on ${live.image}\n`);
-    if (!live.running) {
+    const portRefused = isPortAllocationError(err);
+    // A host port someone else holds is not the image's fault; and only a project's OWN (Dockerfile) image is ever marked.
+    const markedBad = locked && !portRefused ? markImageBad(project, parent, err as Error) : false;
+    const why = (err as Error).message.split('\n')[0];
+    let kept = 'the previous container is still running';
+    if (!live.running || stopped) {
       const gone = missingGuardSources(live);
       if (gone.length) {
         // BUG-244 IV r12: starting the old container would make Docker create its missing overlay source root-owned.
-        throw new ContainerError('start-failed', `could not start ${name}: the new image failed, and the old container's read-only .git overlay source ${gone.join(', ')} is gone (starting it would make Docker create that directory root-owned). Press Rebuild once the image is fixed.`);
+        kept = `the previous container is kept, stopped: its read-only .git overlay source ${gone.join(', ')} is gone (starting it would make Docker create that directory root-owned)`;
+      } else {
+        const r = dockerSync(['start', live.id], 60_000);
+        if (r.code !== 0) kept = `the previous container is kept but could not be restarted (${(r.stderr || r.stdout).trim().split('\n')[0]?.slice(0, 300)})`;
       }
-      const r = dockerSync(['start', name], 60_000);
-      if (r.code !== 0) throw new ContainerError('start-failed', `could not start ${name}`, (r.stderr || r.stdout).trim().slice(0, 800));
     }
     invalidate(project.id);
-    return assertRunning(project);
+    opts.onLog?.(`[container] could not start a container on ${image} (${why}); ${kept} on ${live.image}\n`);
+    const dropped = portRefused ? reportPortRefused(project, live, err, opts.onLog) : false;
+    if (markedBad && !dropped && kept.startsWith('the previous container is still running')) return assertRunning(project);
+    throw new ReplacementRefusedError(`could not replace ${name} (${reasons.join('; ').slice(0, 300)}): ${why}; ${kept}`, ((err as ContainerError).detail ?? '').slice(0, 1200), { keptPrevious: true, dropped });
   }
   await removeContainer(name);
   const rn = dockerSync(['rename', next, name], 30_000);
   if (rn.code !== 0) throw new ContainerError('rename-failed', `could not rename ${next} to ${name}`, (rn.stderr || rn.stdout).trim().slice(0, 600));
-  reportGitMode(project.id, next); // FEAT-175 r2: the swapped-in container is now the project's container
+  reportGitMode(project.id, next); // FEAT-175 r2: the swapped-in container is now the project's container (keyed by its create name)
   invalidate(project.id);
   const st = assertRunning(project);
   assertCliResolves(project, name, image);
   noteRunningOn(project, parent);
   return st;
+}
+
+/** FEAT-200 — docker's refusal to bind a published host port (held by another container or process). */
+function isPortAllocationError(err: unknown): boolean {
+  const e = err as { message?: string; detail?: string } | null;
+  const text = `${e?.message ?? ''}\n${e?.detail ?? ''}`;
+  return /port is already allocated|address already in use|bind for .* failed|failed to bind host port/i.test(text);
+}
+
+/**
+ * FEAT-200 r3 (independent design review, REDESIGN of property (c)) — DOCKER IS THE ALLOCATION AUTHORITY.
+ * Every pre-check of a host port (other projects' settings, `docker ps`, a bind probe) is advisory: it is shown on
+ * the card, and anything can take the port after it ran. What makes a collision safe is what happens when docker
+ * refuses: the replacement never removed the working container (`swapContainer`), and an approved change that
+ * docker refused is handed to the access layer, which FAILS the approved-pending request(s) needing that port and
+ * tells each requester "approved, but could not be applied: <docker's reason>" (FEAT-200 r5: approval never wrote the
+ * settings, so nothing is reverted). Desired state returns to what can run, so the level-based reconciler reads
+ * clean and stops — no stored failure signature, no retry loop, no hold. A refused port the USER set in the project
+ * settings is left as set: the previous container is kept and the reconciler backs off (it names the port).
+ */
+export interface PortRefusal {
+  projectId: string;
+  /** The host ports this attempt ADDED (not on the previous container) that docker refused. */
+  refused: Array<{ hostPort: number; containerPort: number }>;
+  /** Docker's own words, one line. */
+  reason: string;
+}
+/** FEAT-200 r5 — backstop on the refusal retries of one ensure (each retry already requires a failed request). */
+const MAX_REFUSAL_RETRIES = 32;
+let portRefusedHook: ((r: PortRefusal) => boolean) | null = null;
+/** The access layer's handler; returns true iff a retry can help (it failed at least one approved-pending request). */
+export function onPortRefused(fn: ((r: PortRefusal) => boolean) | null): void { portRefusedHook = typeof fn === 'function' ? fn : null; }
+
+/** The loopback host ports a docker error names (both refusal wordings: "Bind for …" and "failed to bind host port …"). */
+export function refusedHostPortsOf(err: unknown): number[] {
+  const e = err as { message?: string; detail?: string } | null;
+  const text = `${e?.message ?? ''}\n${e?.detail ?? ''}`;
+  const out = new Set<number>();
+  for (const m of text.matchAll(/(?:127\.0\.0\.1|\[?::1\]?|0\.0\.0\.0):(\d{2,5})\b/g)) out.add(Number(m[1]));
+  return [...out];
+}
+
+/** Docker's refusal in one line (the line that names the port, else the first line). */
+function refusalLine(err: unknown): string {
+  const e = err as { message?: string; detail?: string } | null;
+  const lines = `${e?.message ?? ''}\n${e?.detail ?? ''}`.split('\n').map((l) => l.trim()).filter(Boolean);
+  const hit = lines.find((l) => /port is already allocated|address already in use|failed to bind host port|bind for/i.test(l)) ?? lines[0] ?? 'docker refused it';
+  return hit.replace(/^Error response from daemon:\s*/i, '').replace(/\s*\(([0-9a-f]{64})\)/g, '').slice(0, 300);
+}
+
+/**
+ * A port refusal of a create that just failed: report the ports this attempt ADDED that docker named. Returns true
+ * iff the access layer failed an approved-pending request. A refusal of a port the previous container already held (the stop
+ * window) is not an added port and is never blamed on a request here.
+ */
+function reportPortRefused(project: Project, live: Inspected | null, err: unknown, onLog?: (s: string) => void): boolean {
+  if (!isPortAllocationError(err) || !portRefusedHook) return false;
+  const named = refusedHostPortsOf(err);
+  const want = validPublishes(project);
+  const had = new Set(live?.ports ?? []);
+  const refused = want.filter((p) => named.includes(p.hostPort) && !had.has(`${PUBLISH_HOST_IP}:${p.hostPort}->${p.containerPort}/tcp`));
+  if (!refused.length) return false;
+  try {
+    const dropped = portRefusedHook({ projectId: project.id, refused, reason: refusalLine(err) });
+    if (dropped) onLog?.(`[container] docker refused host port(s) ${refused.map((p) => p.hostPort).join(', ')} (${refusalLine(err)}); the approved request(s) needing it failed and left the desired config; the requester is told\n`);
+    return dropped;
+  } catch (e2) {
+    onLog?.(`[container] could not hand docker's port refusal to the access layer: ${(e2 as Error).message}\n`);
+    return false;
+  }
+}
+
+/** FEAT-200 r3/r5 — a replacement docker refused, with the previous container kept. `dropped`: approved-pending request(s) needing a refused port failed (a retry can apply the rest). */
+export class ReplacementRefusedError extends ContainerError {
+  readonly keptPrevious: boolean;
+  readonly dropped: boolean;
+  constructor(message: string, detail: string, o: { keptPrevious: boolean; dropped: boolean }) {
+    super('replace-failed', message, detail);
+    this.keptPrevious = o.keptPrevious;
+    this.dropped = o.dropped;
+  }
 }
 
 /** A container is running on `image`: that is the project's last good image now; reclaim the superseded ones. */
@@ -4525,10 +4842,11 @@ function noteRunningOn(project: Project, image: string): void {
 }
 
 /** A validated image that still could not run a container: do not retry it on every launch. */
-function markImageBad(project: Project, image: string, err: Error): void {
+function markImageBad(project: Project, image: string, err: Error): boolean {
   const h = dfHashOf(image);
-  if (!h || recordFor(project).lastGoodImage === image) return;
+  if (!h || recordFor(project).lastGoodImage === image) return false;
   updateBuildRecord(project.id, { state: 'failed', failedHash: h, error: `a container on ${image} would not run: ${err.message.split('\n')[0]}`, finishedAt: new Date().toISOString() });
+  return true;
 }
 
 /** Never report success off an exit code alone — read the live state back. */
@@ -4858,7 +5176,7 @@ export const RESERVED_ENV_RULES: ReservedEnvRule[] = [
 
 /** Sorted, comma-joined `container.env` keys Orchard sets on create (recorded as a label for drift). */
 function envKeysOf(project: Project): string {
-  return Object.keys(containerSettingsOf(project).env ?? {}).filter((k) => !reservedContainerEnvReason(k)).sort().join(',');
+  return Object.keys(accessSettingsOf(project).env ?? {}).filter((k) => !reservedContainerEnvReason(k)).sort().join(',');
 }
 const ENV_KEYS_LABEL = 'claude-station.env-keys';
 
@@ -4875,6 +5193,8 @@ export function execArgv(project: Project, spec: ExecSpec): string[] {
   }
   argv.push('--env', `HOME=${CONTAINER_HOME}`);
   argv.push('--env', `${EXEC_TAG_VAR}=${spec.execId}`);
+  // FEAT-200 — where the access-request inbox is inside this container (exec env: not create-time config, no drift).
+  argv.push('--env', `${ACCESS_DIR_ENV}=${accessInboxPaths(project).container}`);
   /*
    * The MCP shim is spawned by the CLI *inside* this exec, so it inherits this
    * env. SBMCP_AUTOSTART=0 is the important one: a container must never try to

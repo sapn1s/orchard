@@ -35,7 +35,7 @@ import type {
   StationEvent,
 } from './events.ts';
 import type { Project } from './registry.ts';
-import { composeInstructions, appendToSystemPrompt, containerBuildSection, type ComposedPrompt } from './templates.ts';
+import { composeInstructions, appendToSystemPrompt, containerBuildSection, containerAccessSection, type ComposedPrompt } from './templates.ts';
 import { recordSessionConfig, type SessionConfigSource } from './session-config.ts';
 import { boardStateSnapshot, answerBriefingFor, markAnswersDelivered, type BoardSnapshot } from './board.ts';
 import { OpenToolCalls } from './open-tool-calls.ts';
@@ -1319,6 +1319,8 @@ export class AgentSession {
     if (opts.project.isolation === 'container') {
       const guide = containerBuildSection({ imageSource: imageSourceOf(opts.project), answerCmd: dispatchOn ? dispatchBroker.DISPATCH_COMMAND : null });
       this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, guide) };
+      // FEAT-200 — when and how to ask the user for container access (env / loopback port). Container sessions only.
+      this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, containerAccessSection()) };
     }
     for (const missing of this.composed.missingIds) {
       this.#emit({ t: 'error', message: `instruction template not found: ${missing}`, fatal: false });

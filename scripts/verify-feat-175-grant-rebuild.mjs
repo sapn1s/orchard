@@ -397,8 +397,10 @@ async function P5() {
   const msgs = ['P5-MSG-1', 'P5-MSG-2', 'P5-MSG-3'];
   for (const m of msgs) await outboxPost(s.sdk, p.id, m, 'queued');
   fs.writeFileSync(FAIL_FLAG, p.cname);
-  const failed = await waitFor(async () => { const g = (await statusOf(p.id))?.grantRebuild; return g?.phase === 'failed' ? g : null; }, REBUILD_WAIT);
-  check('P5 the injected create failure surfaces as phase failed (holds kept)', !!failed && failed.holds === true, JSON.stringify(failed), { mf: true });
+  // FEAT-200 r3: every recreate is create-before-remove, so an injected create failure keeps the old container: the
+  // entry is 'pending' carrying the error (intact), or 'failed' on a tree that removes first. Either way: held, said.
+  const failed = await waitFor(async () => { const g = (await statusOf(p.id))?.grantRebuild; return g?.phase === 'failed' || (g?.phase === 'pending' && g?.error) ? g : null; }, REBUILD_WAIT);
+  check('P5 the injected create failure surfaces (failed, or refused with the container intact) and holds are kept', !!failed && failed.holds === true && /injected docker create failure/.test(failed.error ?? ''), JSON.stringify(failed), { mf: true });
   const board = (await api(`/api/projects/${p.id}/board`)).body;
   const card = (board?.needsYou ?? []).find((x) => x.grantRebuild);
   check('P5 Needs-You carries the failed-rebuild card with Retry now', !!card && card.grantRebuild.actions.some((a) => a.id === 'retry'), JSON.stringify(card ? { title: card.title, actions: card.grantRebuild.actions } : null), { mf: true });

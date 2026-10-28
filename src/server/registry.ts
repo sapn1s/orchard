@@ -3,7 +3,7 @@
  * are atomic so a crash cannot leave a half-written registry.
  */
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -128,6 +128,15 @@ export interface ContainerSettings {
    */
   dockerfile: string | null;
   /**
+   * FEAT-200 — container ports published on this machine's LOOPBACK only
+   * (`docker create -p 127.0.0.1:<hostPort>:<containerPort>`). The host IP is
+   * deliberately not a field: `createArgs` always writes 127.0.0.1, so a
+   * non-loopback publish cannot be expressed. Written by the user (the drawer, a
+   * user-only PATCH) or by the user's approval of an agent's access request —
+   * never by the agent. Default empty.
+   */
+  ports: PortPublish[];
+  /**
    * FEAT-157 — the Orchard base release this project is pinned to, plus skipped
    * and deferred versions. Written ONLY by the base-update routes, project
    * creation and the one-time migration (never the settings PATCH); read through
@@ -138,8 +147,14 @@ export interface ContainerSettings {
   base?: import('./base-releases.ts').BasePin | null;
 }
 
+/** FEAT-200 — one loopback port publish: container port `containerPort` on 127.0.0.1:`hostPort`. */
+export interface PortPublish {
+  hostPort: number;
+  containerPort: number;
+}
+
 export function defaultContainerSettings(): ContainerSettings {
-  return { image: null, dockerSocket: false, memoryMb: 8192, pidsLimit: 4096, gpu: 'auto', env: {}, workspaceRoot: false, dockerfile: null };
+  return { image: null, dockerSocket: false, memoryMb: 8192, pidsLimit: 4096, gpu: 'auto', env: {}, workspaceRoot: false, dockerfile: null, ports: [] };
 }
 
 /** Container settings with defaults filled in for registries written earlier. */
@@ -692,8 +707,88 @@ export interface Project {
    */
   toolPreflight?: ToolPreflight;
   settings: ProjectSettings;
+  /**
+   * FEAT-200 r6 — monotonic EDIT VERSIONS of `settings.container.env` (per key) and `settings.container.ports` (per
+   * host port). Stamped ONLY by `updateProject`, in the same atomic registry write as the edit: every write that
+   * CHANGES a key's value (set, change, delete) or a host port's mapping (add, remap, remove) bumps that key's
+   * version, except the access layer's commit of approved requests (`{ accessCommit: true }`). Structural, not by
+   * value: K old→new→old is two bumps, an add-then-delete is two bumps. An approved-but-unapplied access request
+   * records the versions of the keys/ports it names; any change cancels it (access-channel.ts `editsSince`).
+   * Never accepted from a patch. Optional in stored JSON (absent = no edits yet); read through `accessEditsOf`.
+   */
+  accessEdits?: AccessEdits;
+  /**
+   * FEAT-200 r7 — the ONE owner of the fact "access request R was committed": the ids of the approved requests whose
+   * ops were folded into `settings.container` BY THE SAME atomic registry write that put this list here (written only
+   * by `updateProject(…, { accessCommit: true, committed })`; a patch can never set it, every other write keeps it).
+   * Every reader of request state (access-requests.ts `committedInSettings`) treats an id here as committed, never
+   * cancelled / refused / superseded, whatever the access store says; the store's own mark is a derived convenience
+   * reconciled from this. An id leaves the list on a later commit once the store has recorded it as committed.
+   */
+  accessCommitted?: string[];
+  /**
+   * FEAT-200 r8 — this row's INCARNATION: an immutable random token set once, when the row is created
+   * (`createProject`, `ensureScratchProject`), and copied by every later write (`updateProject` forces it; a patch
+   * can never set it). A project id can be REUSED (delete + re-add under the same name, scratch delete + re-ensure);
+   * an incarnation never is. Access requests are bound to the incarnation they were raised against, so a request of
+   * a removed project is never read against the row that took its id (access-requests.ts `classify`). Rename and
+   * repoint keep it (same project). Absent on rows created before r8: read through `incarnationOf` (= createdAt,
+   * which is just as immutable).
+   */
+  incarnation?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** FEAT-200 r8 — see Project.incarnation. Legacy rows (no token) are identified by their immutable createdAt. */
+export function incarnationOf(p: Pick<Project, 'incarnation' | 'createdAt'>): string {
+  return typeof p.incarnation === 'string' && p.incarnation ? p.incarnation : `created:${p.createdAt}`;
+}
+
+function newIncarnation(): string {
+  return `inc-${randomUUID()}`;
+}
+
+/** FEAT-200 r6 — see Project.accessEdits. Keys: env var name; host port as a decimal string. */
+export interface AccessEdits {
+  env: Record<string, number>;
+  ports: Record<string, number>;
+}
+
+/** FEAT-200 r6 — the project's container env/port edit versions (absent key = 0). */
+export function accessEditsOf(p: Project): AccessEdits {
+  const e = p.accessEdits;
+  return { env: { ...(e?.env ?? {}) }, ports: { ...(e?.ports ?? {}) } };
+}
+
+/**
+ * FEAT-200 r6 — the edit versions after a write from `before` to `after` container settings: every env key whose
+ * value or presence changed and every host port whose mapping changed (added, remapped, removed) is bumped by one.
+ * Pure. Used only by `updateProject`.
+ */
+export function bumpAccessEdits(prev: AccessEdits, before: Partial<ContainerSettings> | undefined, after: Partial<ContainerSettings> | undefined): AccessEdits {
+  const out: AccessEdits = { env: { ...prev.env }, ports: { ...prev.ports } };
+  const own = (o: object, k: string) => Object.prototype.hasOwnProperty.call(o, k);
+  const be = (before?.env && typeof before.env === 'object' ? before.env : {}) as Record<string, string>;
+  const ae = (after?.env && typeof after.env === 'object' ? after.env : {}) as Record<string, string>;
+  for (const k of new Set([...Object.keys(be), ...Object.keys(ae)])) {
+    const a = own(be, k) ? be[k] : undefined;
+    const b = own(ae, k) ? ae[k] : undefined;
+    if (a !== b) out.env[k] = (out.env[k] ?? 0) + 1;
+  }
+  const map = (list: unknown): Map<string, string> => {
+    const m = new Map<string, string>();
+    for (const x of Array.isArray(list) ? list as Array<{ hostPort?: unknown; containerPort?: unknown }> : []) {
+      if (x && (typeof x.hostPort === 'number' || typeof x.hostPort === 'string')) m.set(String(x.hostPort), JSON.stringify(x.containerPort ?? null));
+    }
+    return m;
+  };
+  const bp = map(before?.ports);
+  const ap = map(after?.ports);
+  for (const h of new Set([...bp.keys(), ...ap.keys()])) {
+    if (bp.get(h) !== ap.get(h)) out.ports[h] = (out.ports[h] ?? 0) + 1;
+  }
+  return out;
 }
 
 /** Previous hostPaths, newest first. Absent field = none. */
@@ -1039,6 +1134,7 @@ export function createProject(input: CreateProjectInput): Project {
     ...(resolved.preflight ? { isolationPreflight: resolved.preflight } : {}),
     ...(toolPreflight ? { toolPreflight } : {}),
     settings,
+    incarnation: newIncarnation(), // FEAT-200 r8
     createdAt: now,
     updatedAt: now,
   };
@@ -1086,6 +1182,7 @@ export function ensureScratchProject(): Project {
     hostPath,
     isolation: 'direct',
     settings: defaultSettings(),
+    incarnation: newIncarnation(), // FEAT-200 r8: a re-ensured scratch row is a NEW incarnation under the same id
     createdAt: now,
     updatedAt: now,
   };
@@ -1110,7 +1207,15 @@ export function ensureScratchProject(): Project {
   return project;
 }
 
-export function updateProject(id: string, patch: Partial<Omit<Project, 'id' | 'createdAt'>>): Project {
+export function updateProject(
+  id: string,
+  patch: Partial<Omit<Project, 'id' | 'createdAt' | 'incarnation' | 'accessEdits' | 'accessCommitted'>>,
+  /**
+   * FEAT-200 r6 — `accessCommit`: this write is the access layer folding approved requests in; it bumps no edit version.
+   * r7 — `committed` (only with `accessCommit`): the full new `accessCommitted` list, written in this same atomic save.
+   */
+  opts: { accessCommit?: boolean; committed?: string[] } = {},
+): Project {
   const reg = load();
   const idx = reg.projects.findIndex((p) => p.id === id);
   if (idx < 0) throw new Error(`updateProject: no project ${id}`);
@@ -1159,6 +1264,30 @@ export function updateProject(id: string, patch: Partial<Omit<Project, 'id' | 'c
     createdAt: cur.createdAt,
     updatedAt: new Date().toISOString(),
   };
+  // FEAT-200 r8 — the incarnation is the row's, never the patch's (whatever the caller sent); a legacy row stays legacy.
+  if (cur.incarnation !== undefined) next.incarnation = cur.incarnation;
+  else delete next.incarnation;
+  /*
+   * FEAT-200 r6 — the ONE place container env/port edit versions are stamped, in this same atomic save: a write that
+   * fails stamps nothing, and a patch can never set them (`patch.accessEdits` is ignored, whatever the caller sent).
+   */
+  {
+    const prevEdits = accessEditsOf(cur);
+    const edits = opts.accessCommit ? prevEdits : bumpAccessEdits(prevEdits, cur.settings.container, next.settings.container);
+    if (Object.keys(edits.env).length || Object.keys(edits.ports).length) next.accessEdits = edits;
+    else delete next.accessEdits;
+  }
+  /*
+   * FEAT-200 r7 — the committed set rides in this same atomic save, so "R's ops are in the settings" and "R is
+   * committed" land together or not at all. Only the access commit sets it; every other write keeps the current list
+   * (`patch.accessCommitted` is ignored, whatever the caller sent).
+   */
+  {
+    const list = opts.accessCommit && Array.isArray(opts.committed) ? opts.committed : cur.accessCommitted;
+    const ids = Array.isArray(list) ? [...new Set(list.filter((x): x is string => typeof x === 'string' && x.length > 0))] : [];
+    if (ids.length) next.accessCommitted = ids;
+    else delete next.accessCommitted;
+  }
   /*
    * BUG-138 — REPOINTING CARRIES THE SESSIONS.
    *

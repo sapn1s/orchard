@@ -61,6 +61,12 @@
      red = error), replacing the old single-moss overload. */
   --sess-run: #3E8CB8;
 
+  /* FEAT-200 — the container-ACCESS request hue: a muted violet that no other card,
+     tag or state uses, so an access card never reads as a command-permission ask
+     (neutral) or a git-write ask (moss). Per-theme hexes, repeated in all four blocks. */
+  --access:    #6F4FA3;
+  --on-access: #FFFFFF;
+
   --sans: "Avenir Next", "Segoe UI Variable Text", "Segoe UI", Cantarell, "Noto Sans", "DejaVu Sans", sans-serif;
   --serif: Charter, "Bitstream Charter", "Sitka Text", Cambria, "Charis SIL", "Noto Serif", Georgia, serif;
   --mono: "IBM Plex Mono", "JetBrains Mono", "SF Mono", "DejaVu Sans Mono", ui-monospace, monospace;
@@ -104,6 +110,8 @@
     --st-needs: #CBA05C;
     --st-done:  #8FA470;   /* the moss --live reads well as-is on dark */
     --st-high:  #CC7B60;
+    --access:    #B79BE3;   /* FEAT-200 — lifted for the dark surface */
+    --on-access: #131513;
     --window-shadow: 0 0 0 1px rgba(255,255,255,.05), 0 24px 60px -24px rgba(0,0,0,.8);
     --pop-shadow: 0 1px 2px rgba(0,0,0,.5), 0 18px 44px -14px rgba(0,0,0,.8);
     color-scheme: dark;
@@ -131,6 +139,8 @@
   --st-done:  #8FA470;
   --st-high:  #CC7B60;
   --sess-run: #7CBBE0;   /* FEAT-154 — running accent, lifted for the dark surface */
+  --access:    #B79BE3;   /* FEAT-200 — container-access hue, dark */
+  --on-access: #131513;
   --window-shadow: 0 0 0 1px rgba(255,255,255,.05), 0 24px 60px -24px rgba(0,0,0,.8);
   --pop-shadow: 0 1px 2px rgba(0,0,0,.5), 0 18px 44px -14px rgba(0,0,0,.8);
   color-scheme: dark;
@@ -156,6 +166,8 @@
   --st-needs: #A97A2E;
   --st-done:  #667E4B;
   --st-high:  #A8503A;
+  --access:    #6F4FA3;   /* FEAT-200 — container-access hue, light */
+  --on-access: #FFFFFF;
   --window-shadow: 0 0 0 1px rgba(27,31,29,.05), 0 1px 2px rgba(27,31,29,.04), 0 24px 60px -24px rgba(27,31,29,.28);
   --pop-shadow: 0 1px 2px rgba(27,31,29,.06), 0 18px 40px -14px rgba(27,31,29,.3);
   color-scheme: light;
@@ -2856,6 +2868,54 @@ button.mode:hover { color: var(--ink); text-decoration-color: var(--ink-4); }
 .ask[data-done] { opacity: .55; }
 .ask .verdict { font-family: var(--mono); font-size: 10.5px; color: var(--ink-4); }
 
+/* ── FEAT-200: container ACCESS request card — same shape as the permission ask, its own hue ── */
+.ask.access, .needs-card.access, .needs-card.decision.access, .acc-warn {
+  border: 1px solid color-mix(in srgb, var(--access) 45%, var(--hair));
+  border-left: 3px solid var(--access);
+  background: color-mix(in srgb, var(--access) 7%, var(--window));
+}
+.ask.access .nm, .needs-card.access .nc-id { color: var(--access); font-weight: 600; letter-spacing: .02em; }
+.ask.access .ti { color: var(--ink); }
+.acc-why { margin-top: 6px; font-size: 12.5px; color: var(--ink-2); font-style: italic; }
+.acc-why::before { content: "Reason: "; font-style: normal; color: var(--ink-3); }
+.acc-lines { list-style: none; margin: 7px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.acc-lines li { display: flex; flex-direction: column; gap: 1px; padding-left: 9px; border-left: 2px solid color-mix(in srgb, var(--access) 40%, transparent); }
+.acc-change { font-family: var(--mono); font-size: 11.5px; color: var(--ink); word-break: break-all; }
+.acc-reach { font-size: 11.5px; color: var(--ink-3); }
+.acc-conflict { margin-top: 7px; font-size: 12px; color: var(--warn); font-weight: 500; }
+.acc-acts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; align-items: center; }
+/* In the narrow rail the status takes its own line above the buttons instead of a tall sliver beside them. */
+.needs-card.access .acc-status { flex: 1 1 100%; }
+.acc-acts .grow { flex: 1; }
+.acc-status { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); min-width: 0; }
+.ask.access .solid, .needs-card.access .acc-approve, .acc-warn .acc-go {
+  background: var(--access); color: var(--on-access); border: 1px solid var(--access);
+  border-radius: 6px; padding: 4px 12px; font-size: 11.5px; cursor: pointer;
+}
+.needs-card.access .acc-reject, .acc-warn .acc-keep {
+  background: transparent; color: var(--ink-2); border: 1px solid var(--hair);
+  border-radius: 6px; padding: 4px 10px; font-size: 11.5px; cursor: pointer;
+}
+.ask.access .solid:disabled, .needs-card.access .acc-approve:disabled { opacity: .45; cursor: not-allowed; }
+.ask.access.decided, .needs-card.access.decided { opacity: .8; }
+/* FEAT-200 r6 — Cancel on an approved-but-not-applied card: a quiet outline in the access hue (never the solid approve). */
+.ask.access .acc-cancel, .needs-card.access .acc-cancel {
+  background: transparent; color: var(--access); border: 1px solid color-mix(in srgb, var(--access) 55%, var(--hair));
+  border-radius: 6px; padding: 4px 10px; font-size: 11.5px; cursor: pointer;
+}
+.ask.access .acc-cancel:hover, .needs-card.access .acc-cancel:hover { background: color-mix(in srgb, var(--access) 10%, transparent); }
+.ask.access .acc-cancel:disabled, .needs-card.access .acc-cancel:disabled { opacity: .45; cursor: not-allowed; }
+/* FEAT-200 r6 — drawer: a save that would cancel an approved-pending request asks first; a user port docker refused. */
+.acc-warn { margin: 6px 0 4px; padding: 8px 10px; border-radius: 6px; font-size: 12px; color: var(--ink-2); } /* border + hue: the access card rule above */
+.acc-warn .acc-warn-h { display: block; color: var(--access); font-weight: 600; letter-spacing: .02em; margin-bottom: 3px; }
+.acc-warn ul { margin: 4px 0 0; padding-left: 16px; }
+.acc-warn li { font-family: var(--mono); font-size: 11px; color: var(--ink); word-break: break-all; }
+.acc-warn .acc-acts { margin-top: 8px; }
+
+.port-refused { margin: 6px 0 4px; padding: 7px 10px; border-radius: 6px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--hair)); border-left: 3px solid var(--warn); font-size: 12px; color: var(--ink-2); }
+.port-refused strong { color: var(--warn); }
+.port-refused code { font-family: var(--mono); font-size: 11px; word-break: break-all; }
+
 /* ── the picker (add project) — a wide popover ── */
 .pop.wide { width: 360px; padding: 5px 5px 4px; }
 /* FEAT-069: live filter over the picker's scan/browse rows. Reuses the sidebar
@@ -4186,6 +4246,14 @@ button.lag:hover { background: var(--rail); }
   box-shadow: 0 0 0 1px color-mix(in srgb, var(--st-needs) 48%, transparent);
 }
 .tc[data-state="prog"] { border-left: 2px solid color-mix(in srgb, var(--st-prog) 60%, var(--hair)); }
+/* FEAT-200 — a container ACCESS request is a needs-you card in its own hue, never the amber ring. */
+.tc[data-access="1"], .tc[data-access="1"][data-state="needs"] {
+  border-color: color-mix(in srgb, var(--access) 60%, var(--hair));
+  border-left: 3px solid var(--access);
+  background: color-mix(in srgb, var(--access) 7%, var(--window));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--access) 30%, transparent);
+}
+.tc[data-access="1"] .tc-id { color: var(--access); font-weight: 600; }
 
 /* The rest of the board is reference, not the focus: dimmed until the pointer or
    keyboard lands on it (never below the WCAG-legible floor — .58, lifted on any

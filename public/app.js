@@ -8972,12 +8972,13 @@ function ticketCard(x) {
   const card = el('button', {
     type: 'button', class: 'tc', 'data-id': it.id, 'data-state': st,
     'data-answerable': answerable ? '1' : null,
+    'data-access': it.access ? '1' : null, // FEAT-200: a container access request wears its own hue in the grid too
     'data-sig': cardSig(x),
     'aria-label': `${it.id} — ${it.title}${isNeeds ? ' — needs you' : ''}`,
     title: `${it.id} — ${it.title}${isNeeds ? (answerable ? ' · click to answer' : ' · needs you (read-only)') : ' · open ticket'}`,
   });
   // FEAT-157: Orchard's base notice has no ticket id worth reading; it is named for what it is.
-  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.baseUpdate ? (it.baseUpdate.security ? 'Orchard base · security' : 'Orchard base') : it.grantRebuild ? 'Container · git grant' : it.id }));
+  const top = el('span', { class: 'tc-top' }, el('span', { class: 'tc-id', text: it.baseUpdate ? (it.baseUpdate.security ? 'Orchard base · security' : 'Orchard base') : it.grantRebuild ? 'Container · git grant' : it.access ? 'Container access' : it.id }));
   const mark = ncSevMark(it.sev);
   if (mark) top.append(mark);
   card.append(top);
@@ -9912,7 +9913,155 @@ function needsGrantRebuildCard(it) {
   return makeCollapsible(card, it);
 }
 
+/* ------------------------------------------------- FEAT-200: container access */
+/*
+ * A container session asked for something its container lacks (an env var, a loopback port). The user
+ * approves or rejects it here — the ONLY writer of the change; the server refuses an agent caller. The card
+ * has its own hue (--access) so it never reads as a command-permission ask. One builder serves both places
+ * it appears: the session's asks area (like the permission card) and the Needs-You rail.
+ */
+function accessStatusText(rec) {
+  // FEAT-200 r8: the project this was raised for was removed (perhaps re-added under the same id): not in effect. Whether a
+  // commit ever landed in the removed project is not claimed, so this never says "never written".
+  // r10 (IV r9 2af93888): the server reads "removed" off the one classification BEFORE finality (`projectRemoved`), so a
+  // request already committed, rejected or closed when its project was removed reads the same way — never "open the
+  // session", which would resume it inside a project re-added under the same id.
+  if (rec.projectRemoved || rec.notApplied?.cause === 'removed') {
+    // BUG-284: a resume row already queued is refused by the outbox itself (failed) — never resumed into another project.
+    const sent = rec.resume?.state === 'undeliverable' || rec.delivery === 'failed' || rec.delivery === 'discarded' ? 'not sent: the session belonged to the removed project and is not resumed into another'
+      : rec.delivery === 'delivered' ? 'the session has been told'
+      : rec.delivery === 'uncertain' ? 'the message may not have reached the session; it is not resumed into another project'
+      : 'telling the session…';
+    const na = rec.notApplied && rec.notApplied.cause !== 'removed' ? rec.notApplied : null;
+    const was = !rec.decision ? 'not decided:'
+      : rec.decision.verdict === 'rejected' ? 'rejected, and'
+      : na ? `approved, but not applied (${na.cause === 'cancelled' ? 'cancelled' : na.cause === 'superseded' ? 'superseded' : na.cause === 'save-failed' ? 'could not be saved' : 'could not be applied'}: ${na.reason}), and`
+      : 'approved, but';
+    return `${was} its project was removed from Orchard, so it is not in effect · ${sent}`;
+  }
+  if (!rec.decision) {
+    return rec.conflicts?.length ? 'cannot be approved as asked — reject it, or free the port and let the agent ask again' : 'waiting for your decision — the session has stopped for it';
+  }
+  const d = rec.delivery;
+  const told = d === 'delivered' ? 'the session has been resumed with it'
+    : d === 'failed' ? 'the resume message could not be delivered — open the session to see it'
+    : d === 'uncertain' ? 'the resume message may not have been delivered — check the session'
+    : d === 'discarded' ? 'the resume message was discarded'
+    : d ? `resume message ${d}` : null;
+  if (rec.decision.verdict === 'rejected') return `rejected · ${told ?? 'telling the session “denied”…'}`;
+  // FEAT-200 r5 (commit on success): an approval is never written to the settings until a running container has it,
+  // so a refused or superseded one was never in the settings — nothing was removed.
+  if (rec.notApplied?.cause === 'superseded') return `approved, but superseded before it was applied: ${rec.notApplied.reason} — never written to the project settings · ${told ?? 'telling the session…'}`;
+  // FEAT-200 r6: the user's own edit (or Cancel) wins over an approval not yet applied; a failed settings write says so.
+  if (rec.notApplied?.cause === 'cancelled') return `cancelled: ${rec.notApplied.reason} — never written to the project settings · ${told ?? 'telling the session…'}`;
+  if (rec.notApplied?.cause === 'save-failed') return `approved, but could not be saved: ${rec.notApplied.reason} · ${told ?? 'telling the session…'}`;
+  if (rec.notApplied) return `approved, but could not be applied: ${rec.notApplied.reason} — never written to the project settings; the container runs without it · ${told ?? 'telling the session…'}`;
+  if (rec.resume?.state === 'waiting') {
+    const why = rec.rebuild?.message ? ` — ${rec.rebuild.message}` : (rec.resume?.error ? ` — ${rec.resume.error}` : '');
+    return `approved · pending: the container is rebuilt with it once no session in the project is working; it is saved to the project settings once the container has it, then the session resumes${why}`;
+  }
+  return `approved · container ready · ${told ?? 'queuing the resume message…'}`;
+}
+
+function accessCardParts(rec, onChanged) {
+  const lines = el('ul', { class: 'acc-lines' });
+  for (const l of rec.lines || []) {
+    lines.append(el('li', {}, el('span', { class: 'acc-change', text: l.change }), el('span', { class: 'acc-reach', text: l.reach })));
+  }
+  const parts = [el('div', { class: 'acc-why', text: rec.reason }), lines];
+  if (rec.conflicts?.length) parts.push(el('div', { class: 'acc-conflict', text: `Port conflict: ${rec.conflicts.join('; ')}` }));
+  const verdict = el('span', { class: 'verdict acc-status', text: accessStatusText(rec) });
+  const acts = el('div', { class: 'acts acc-acts' }, verdict, el('span', { class: 'grow' }));
+  if (!rec.decision && !rec.notApplied && !rec.projectRemoved) {
+    const rej = el('button', { class: 'mini acc-reject', type: 'button', text: 'Reject' });
+    const ok = el('button', { class: 'solid acc-approve', type: 'button', text: 'Approve' });
+    const blocked = !!rec.conflicts?.length;
+    if (blocked) { ok.disabled = true; ok.title = 'A host port it asks for is already in use; it cannot be approved as asked.'; }
+    else ok.title = 'Save this to the project and rebuild its container once no session is working';
+    rej.title = 'Change nothing; the session is told it was denied';
+    const decide = async (v) => {
+      rej.disabled = true; ok.disabled = true;
+      verdict.textContent = v === 'approve' ? 'approving…' : 'rejecting…';
+      try {
+        const r = await api.decideAccess(rec.projectId, rec.id, v);
+        say(v === 'approve' ? `approved ${rec.summary} — the container is rebuilt once the project is idle` : `rejected ${rec.summary}`);
+        onChanged(r?.request ?? null);
+      } catch (e) {
+        verdict.textContent = e.message;
+        rej.disabled = false; ok.disabled = blocked;
+        if (e.status === 409) onChanged(null);
+      }
+    };
+    rej.addEventListener('click', () => void decide('reject'));
+    ok.addEventListener('click', () => void decide('approve'));
+    acts.append(rej, ok);
+  } else if (rec.cancellable && !rec.projectRemoved) {
+    // FEAT-200 r6 — an approval that has not been applied yet can be withdrawn; the session is told "cancelled".
+    const cancel = el('button', { class: 'mini acc-cancel', type: 'button', text: 'Cancel request' });
+    cancel.title = 'Withdraw this approval before it is applied: nothing is written to the project, and the session is told it was cancelled';
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      verdict.textContent = 'cancelling…';
+      try {
+        const r = await api.cancelAccess(rec.projectId, rec.id);
+        say(`cancelled ${rec.summary} — never written to the project`);
+        onChanged(r?.request ?? null);
+      } catch (e) {
+        verdict.textContent = e.message;
+        cancel.disabled = false;
+        if (e.status === 409) onChanged(null);
+      }
+    });
+    acts.append(cancel);
+  }
+  parts.push(acts);
+  return parts;
+}
+
+function needsAccessCard(it) {
+  const rec = it.access;
+  const card = el('div', { class: 'needs-card decision access', 'data-id': it.id, 'data-kind': 'access' },
+    el('div', { class: 'nc-head' },
+      el('span', { class: 'nc-id', text: 'Container access request' }),
+      el('span', { class: 'nc-sev', text: '' })),
+    el('div', { class: 'nc-title', text: it.title }),
+    ...accessCardParts(rec, () => { void refreshRail(true); void refreshSessionAccess(); }));
+  return card;
+}
+
+/** The open session's own access cards, in the asks area above the composer (upserted by id). */
+async function refreshSessionAccess() {
+  const sid = state.current.sessionId;
+  if (!sid) return;
+  const scope = state.txScope;
+  let list;
+  try { list = (await api.sessionAccessRequests(sid))?.requests ?? []; } catch { return; }
+  if (scope !== state.txScope || sid !== state.current.sessionId) return; // the user moved on
+  const now = Date.now();
+  const show = list.filter((r) => !r.decision || r.delivery !== 'delivered' || now - Date.parse(r.decision.at) < 60_000);
+  const keep = new Set(show.map((r) => r.id));
+  for (const box of [...node.asks.querySelectorAll('.ask.access')]) if (!keep.has(box.dataset.accessId)) box.remove();
+  for (const rec of show) {
+    const sig = JSON.stringify([rec.decision, rec.resume?.state, rec.delivery, rec.rebuild?.message, rec.conflicts, rec.notApplied, rec.cancellable, rec.projectRemoved]);
+    const prior = node.asks.querySelector(`.ask.access[data-access-id="${CSS.escape(rec.id)}"]`);
+    if (prior && prior.dataset.sig === sig) continue;
+    const box = el('div', { class: `ask access${rec.decision ? ' decided' : ''}`, 'data-access-id': rec.id },
+      el('div', { class: 'hd' },
+        el('span', { class: 'nm', text: 'container access' }),
+        el('span', { class: 'ti', text: rec.summary }),
+        el('span', { class: 'who', text: rec.decision ? rec.decision.verdict : 'request' })),
+      ...accessCardParts(rec, () => { void refreshSessionAccess(); void refreshRail(true); }));
+    box.dataset.sig = sig;
+    if (prior) prior.replaceWith(box); else node.asks.prepend(box);
+  }
+  node.asks.hidden = !node.asks.childElementCount;
+}
+setInterval(() => { if (document.visibilityState === 'visible') void refreshSessionAccess(); }, 5000);
+
+
 function needsCard(it) {
+  // FEAT-200: a container access request has its own card, colour and typed decide route.
+  if (it.access) return needsAccessCard(it);
   // FEAT-157: Orchard's base-update notice has its own card and answer route.
   if (it.baseUpdate) return needsBaseCard(it);
   // FEAT-175: a git-grant container rebuild notice has its own card and route.
@@ -13274,6 +13423,10 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       renderAsk(e);
       return;
 
+    case 'access-request': // FEAT-200 — this session raised or had decided a container access request
+      void refreshSessionAccess();
+      void refreshRail(true);
+      return;
     case 'approvals-snapshot':
       applyApprovalsSnapshot(e);
       return;

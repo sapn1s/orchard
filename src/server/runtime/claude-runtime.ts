@@ -131,7 +131,7 @@ class InputQueue implements AsyncIterable<SDKUserMessage> {
   }
 }
 
-function userMessage(text: string, content?: ReadonlyArray<Record<string, unknown>>): SDKUserMessage {
+function userMessage(text: string, content?: ReadonlyArray<Record<string, unknown>>, uuid?: string): SDKUserMessage {
   return {
     type: 'user',
     // FEAT-177: when attachments are present the caller supplies the full
@@ -140,6 +140,11 @@ function userMessage(text: string, content?: ReadonlyArray<Record<string, unknow
     message: { role: 'user', content: content ?? text },
     parent_tool_use_id: null,
     session_id: '',
+    // BUG-278: a server-owned identity uuid. The bundled Agent SDK forwards this
+    // top-level field verbatim to the CLI's stream-json stdin (proven against
+    // the SDK 0.3.281 ProcessTransport), and the CLI adopts it as the persisted
+    // user entry's `uuid`. Omitted = the CLI mints its own, exactly as before.
+    ...(uuid ? { uuid } : {}),
   } as SDKUserMessage;
 }
 
@@ -915,7 +920,7 @@ export class ClaudeRuntime implements AgentRuntime {
   #holding = false;
   /** BUG-187 C2 — whether this runtime's initialize carried hooks. */
   #hooksSent = false;
-  #heldSends: Array<{ text: string; content?: ReadonlyArray<Record<string, unknown>> }> = [];
+  #heldSends: Array<{ text: string; content?: ReadonlyArray<Record<string, unknown>>; uuid?: string }> = [];
   #closed = false;
   #mcpGate: { outcome: 'ready' | 'timeout' | 'settled'; waitedMs: number } | null = null;
   /**
@@ -1514,9 +1519,9 @@ export class ClaudeRuntime implements AgentRuntime {
     const budget = mcpReadyBudgetMs();
     if (config.mcpServers && Object.keys(config.mcpServers).length && budget > 0) {
       this.#holding = true;
-      void this.#releaseWhenMcpReady(config.firstPrompt, budget, config.firstContent);
+      void this.#releaseWhenMcpReady(config.firstPrompt, budget, config.firstContent, config.firstUuid);
     } else {
-      this.#input.push(userMessage(config.firstPrompt, config.firstContent));
+      this.#input.push(userMessage(config.firstPrompt, config.firstContent, config.firstUuid));
     }
   }
 
@@ -1528,7 +1533,7 @@ export class ClaudeRuntime implements AgentRuntime {
    * `send()`s buffered behind it, in order. A CLI too old for the control
    * request settles the gate on first error rather than burning the budget.
    */
-  async #releaseWhenMcpReady(firstPrompt: string, budgetMs: number, firstContent?: ReadonlyArray<Record<string, unknown>>): Promise<void> {
+  async #releaseWhenMcpReady(firstPrompt: string, budgetMs: number, firstContent?: ReadonlyArray<Record<string, unknown>>, firstUuid?: string): Promise<void> {
     const t0 = Date.now();
     let outcome: 'ready' | 'timeout' | 'settled' = 'timeout';
     while (Date.now() - t0 < budgetMs) {
@@ -1547,8 +1552,8 @@ export class ClaudeRuntime implements AgentRuntime {
     this.#mcpGate = { outcome, waitedMs: Date.now() - t0 };
     this.#holding = false;
     if (this.#closed) return;
-    this.#input.push(userMessage(firstPrompt, firstContent));
-    for (const h of this.#heldSends.splice(0)) this.#input.push(userMessage(h.text, h.content));
+    this.#input.push(userMessage(firstPrompt, firstContent, firstUuid));
+    for (const h of this.#heldSends.splice(0)) this.#input.push(userMessage(h.text, h.content, h.uuid));
   }
 
   /**
@@ -1575,10 +1580,10 @@ export class ClaudeRuntime implements AgentRuntime {
     }
   }
 
-  send(text: string, content?: ReadonlyArray<Record<string, unknown>>): void {
+  send(text: string, content?: ReadonlyArray<Record<string, unknown>>, uuid?: string): void {
     // FEAT-055: never let a follow-up overtake the held first prompt.
-    if (this.#holding) { this.#heldSends.push({ text, content }); return; }
-    this.#input.push(userMessage(text, content));
+    if (this.#holding) { this.#heldSends.push({ text, content, uuid }); return; }
+    this.#input.push(userMessage(text, content, uuid));
   }
 
   async interrupt(): Promise<void> {

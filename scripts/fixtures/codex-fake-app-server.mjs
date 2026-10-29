@@ -211,6 +211,73 @@ async function handleTurnStart(id, params) {
    * — FEAT-057's headline case: agents still running when the account hits its
    * limit, which must be recorded as `provider-error`, not as "completed".
    */
+  /*
+   * BUG-278 — QUIET_THEN_REPLY:<token>[;QUIET:<ms>]
+   *
+   * The exact reported shape: a turn dispatches ONE subagent, then the socket
+   * goes QUIET for a stretch (no frames flow) while that subagent works, and
+   * only after the quiet window does the FINAL assistant message land. A proxy
+   * that evicts idle flows drops the idle socket during the quiet window, so the
+   * final reply is emitted to a half-open sink and never reaches the page. Purely
+   * additive — no existing marker path changes. The quiet is `;QUIET:<ms>` or
+   * CODEX_FAKE_QUIET_MS (default 6000). The final reply text is `FINAL::<token>`
+   * — a prefix distinct from the input marker, so a test can tell the reply
+   * bubble from the prompt echo (which also contains <token>).
+   */
+  const quietReply = text.match(/QUIET_THEN_REPLY:(\S+?)(?:;QUIET:(\d+))?(?:\s|$)/);
+  if (quietReply) {
+    const token = quietReply[1];
+    const quietMs = Number(quietReply[2] ?? process.env.CODEX_FAKE_QUIET_MS ?? 6000);
+    const turn = { id: 'turn_quiet', status: 'inProgress', items: [] };
+    activeTurn = { id: turn.id, hang: true };
+    respond(id, { turn });
+    notify({ method: 'turn/started', params: { threadId, turn } });
+    // One subagent dispatched, left running through the quiet window.
+    const child = 'thr_quiet_agent_1';
+    const item = {
+      id: 'item_quiet_spawn_1',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      status: 'inProgress',
+      senderThreadId: threadId,
+      receiverThreadIds: [child],
+      agentsStates: { [child]: { status: 'pendingInit', message: null } },
+      prompt: 'quiet worker',
+      model: null,
+      reasoningEffort: null,
+    };
+    notify({ method: 'item/started', params: { threadId, turnId: turn.id, startedAtMs: Date.now(), item } });
+    notify({
+      method: 'thread/started',
+      params: {
+        thread: {
+          id: child,
+          agentRole: 'worker',
+          agentNickname: 'quiet-1',
+          source: { subAgent: { thread_spawn: { parent_thread_id: threadId, depth: 1, agent_role: 'worker', agent_nickname: 'quiet-1', agent_path: 'worker' } } },
+        },
+      },
+    });
+    notify({
+      method: 'item/completed',
+      params: {
+        threadId, turnId: turn.id, completedAtMs: Date.now(),
+        item: { ...item, status: 'completed', agentsStates: { [child]: { status: 'running', message: null } } },
+      },
+    });
+    // ...then SILENCE for the quiet window, then the final reply lands.
+    setTimeout(() => {
+      notify({
+        method: 'item/completed',
+        params: { threadId, turnId: turn.id, completedAtMs: Date.now(), item: { id: 'item_quiet_msg', type: 'agentMessage', text: `FINAL::${token}` } },
+      });
+      notify({ method: 'thread/tokenUsage/updated', params: { threadId, turnId: turn.id, tokenUsage: { last: { inputTokens: 5, cachedInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0, totalTokens: 7 }, total: { inputTokens: 5, cachedInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0, totalTokens: 7 } } } });
+      notify({ method: 'turn/completed', params: { threadId, turn: { id: turn.id, status: 'completed', items: [] } } });
+      activeTurn = null;
+    }, quietMs);
+    return;
+  }
+
   const hold = text.match(/HOLD_AGENTS:(\d+)/);
   if (hold) {
     const n = Math.max(1, Math.min(8, Number(hold[1])));

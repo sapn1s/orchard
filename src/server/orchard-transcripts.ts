@@ -112,6 +112,53 @@ export function resumeProviderOf(dirCandidates: string[], sessionId: string): st
 }
 
 /**
+ * BUG-278 r14 — collect EVERY uuid already present in the transcript a resume
+ * will continue, so the session's send-identity uniqueness guard can be seeded
+ * from the transcript ITSELF (ARCH-010 — the transcript owns the fact of which
+ * ids are taken) rather than from the empty in-memory set a fresh AgentSession
+ * starts with. Looks under both stores the id could live in — the Orchard-owned
+ * transcripts (Codex / persistedTranscript=false) resolved via `providerRoots`,
+ * and the native Claude CLI store (persistedTranscript Claude sessions) resolved
+ * against the default root — because a resumed send colliding with a historical
+ * id must be caught on whichever engine actually recorded the session.
+ *
+ * Reads are best-effort: a missing file, an unreadable file, or a half-written
+ * trailing line is tolerated (the seed only needs the ids it CAN read — a missed
+ * id falls back to the per-session guard, never worse than r13). Every entry
+ * (user AND assistant) carries a `uuid`, and all are collected: the guard must
+ * not hand a NEW send an id already minted for an assistant turn either.
+ */
+export function collectTranscriptUuids(dirCandidates: string[], sessionId: string): Set<string> {
+  const out = new Set<string>();
+  const files = new Set<string>();
+  for (const d of new Set(dirCandidates)) {
+    const orchard = resolveOrchardSessionFile(d, sessionId);
+    if (orchard) files.add(orchard.filePath);
+    const claude = hist.resolveSessionFile(d, sessionId); // default root = native Claude store
+    if (claude) files.add(claude);
+  }
+  for (const file of files) {
+    let text: string;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch {
+      continue; // missing/unreadable — the per-session guard still applies
+    }
+    for (const line of text.split('\n')) {
+      const s = line.trim();
+      if (!s) continue;
+      try {
+        const o = JSON.parse(s) as { uuid?: unknown };
+        if (typeof o.uuid === 'string' && o.uuid) out.add(o.uuid);
+      } catch {
+        // a partial/half-written trailing line — skip it, read the rest
+      }
+    }
+  }
+  return out;
+}
+
+/**
  * FEAT-144 — provider directory the Claude MIRROR lives under. `'anthropic'` is
  * the canonical Claude provider key the rest of the server already speaks (the
  * resume-provider resolver and the sidebar engine badge both test for it), so a
@@ -476,6 +523,13 @@ export interface RecorderOptions {
   encodedDir?: string;
   /** Non-fatal problem channel (append failure etc.) — reported ONCE. */
   onError?: (message: string) => void;
+  /**
+   * BUG-278 r14 — called with the uuid of EVERY entry appended (user AND
+   * assistant), so the session's send-identity uniqueness guard stays current as
+   * the transcript grows (not just seeded at load/resume): a later send can never
+   * be handed a uuid an assistant turn already took.
+   */
+  onEntry?: (uuid: string) => void;
 }
 
 interface PendingEntry {
@@ -521,6 +575,7 @@ export class TranscriptRecorder {
   #model: string | null = null;
   #failed = false;
   #onError: (message: string) => void;
+  #onEntry: (uuid: string) => void;
 
   constructor(opts: RecorderOptions) {
     this.provider = opts.provider;
@@ -530,6 +585,7 @@ export class TranscriptRecorder {
     // transcripts into one host dir.
     this.encodedDir = opts.encodedDir ?? hist.encodeCwd(opts.cwd);
     this.#onError = opts.onError ?? ((m) => console.warn(`[orchard-transcript] ${m}`));
+    this.#onEntry = opts.onEntry ?? (() => {});
   }
 
   get filePath(): string | null {
@@ -571,7 +627,7 @@ export class TranscriptRecorder {
    * balloons and the public board surface is unaffected; the client renders the
    * thumbnail from the blob store via `GET /api/uploads/:projectId/:uploadId`.
    */
-  recordUserPrompt(text: string, attachments?: AttachmentRef[]): void {
+  recordUserPrompt(text: string, attachments?: AttachmentRef[], uuid?: string): void {
     // ARCH-006 (option A) — canonicalize at the transcript ingest boundary.
     const content: Array<Record<string, unknown>> = [];
     if (!attachments || attachments.length === 0 || (text && text.trim())) {
@@ -580,7 +636,12 @@ export class TranscriptRecorder {
     for (const a of attachments ?? []) {
       content.push({ type: 'attachment', kind: a.kind, uploadId: a.uploadId, projectId: a.projectId, mediaType: a.mediaType, name: a.name, bytes: a.bytes });
     }
-    this.#push('user', { role: 'user', content });
+    // BUG-278 — a provider whose transcript Orchard OWNS (persistedTranscript
+    // false, e.g. codex) carries the send's server-owned identity by writing it
+    // straight into the entry's `uuid`, so the client reconciles the optimistic
+    // bubble by the SAME uuid identity it does for a CLI-persisted turn. Omitted
+    // = mint one, exactly as before.
+    this.#push('user', { role: 'user', content }, uuid);
   }
 
   /**
@@ -606,16 +667,24 @@ export class TranscriptRecorder {
     this.#push(m.type, message);
   }
 
-  #push(type: 'user' | 'assistant', message: Record<string, unknown>): void {
+  #push(type: 'user' | 'assistant', message: Record<string, unknown>, uuid?: string): void {
     if (this.#failed) return;
     const entry: PendingEntry = {
       type,
-      uuid: randomUUID(),
+      // BUG-278 — honour a caller-supplied identity uuid (a user prompt whose
+      // identity the client minted); otherwise mint one, as every assistant
+      // entry and every pre-BUG-278 prompt does.
+      uuid: uuid ?? randomUUID(),
       parentUuid: this.#lastUuid,
       timestamp: new Date().toISOString(),
       message,
     };
     this.#lastUuid = entry.uuid;
+    // BUG-278 r14 — report the identity of every appended entry so the session's
+    // uniqueness guard stays current (an assistant uuid minted here must not be
+    // handed to a later send). Fired whether the entry is buffered or written —
+    // the id is taken either way.
+    this.#onEntry(entry.uuid);
     if (!this.#file) {
       this.#buffer.push(entry);
       return;

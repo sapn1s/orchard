@@ -5865,6 +5865,33 @@ async function loadNewer(th) {
   }
 }
 
+/*
+ * BUG-278 round 9 (design B′) — the two genuinely UNMERGEABLE recovery cases (a
+ * rotated/truncated transcript file; a view drawn entirely indexless that a live
+ * bridge left behind, now followed from the file) cannot be reconciled forward by
+ * index. Rather than an AUTOMATIC re-render — which is what moved the user's URL,
+ * scroll and route behind their back across rounds 4–8 — surface a VISIBLE control
+ * the USER clicks. The click runs reopenAtLatest(), a real navigation, so its
+ * URL/scroll writes are the user's own and therefore correct. Idempotent: one
+ * banner at a time, pinned at the bottom of the main transcript pane.
+ */
+function showReloadView(reason) {
+  const th = mainThread();
+  if (!th) return;
+  // Already offering it — just refresh the reason; never stack banners.
+  let banner = th.paneEl.querySelector(':scope > .reload-view');
+  if (!banner) {
+    banner = el('div', { class: 'reload-view hint-row' });
+    th.paneEl.append(banner);
+  }
+  banner.textContent = '';
+  banner.append(
+    el('span', { text: `${reason} — this view may be out of date. ` }),
+    el('button', { class: 'btn reload-view-btn', text: 'Reload view', onclick: () => { banner.remove(); reopenAtLatest(); } }),
+  );
+  say(`${reason} — reload the view to catch up`, true);
+}
+
 /** What the pill promises while parked in history: "Latest" means the real end. */
 function reopenAtLatest() {
   const p = currentProject();
@@ -7385,6 +7412,16 @@ async function loadRecordedAgents(th, sessionId) {
 
 /* ---------------------------------------------------------- open a session */
 
+// BUG-278 round 9 — the r5–r7 in-place-recovery suppression machinery
+// (reopenInPlaceDepth / recoveryBaseGen / recoverySettleGen / recoverySettleTimer /
+// suppressReopenResetSync / RECOVERY_URL_SETTLE_MS, the `inPlace` openSession option,
+// atomicReopen, the viewSeq thread counter and the `internal` showThread/viewAgent
+// flag) is DELETED. Recovery no longer re-renders the session in place, so there is no
+// recovery URL/scroll/route write left to suppress: design B′ merges the gap into the
+// live transcript (dropLiveTail + catchUpFollow) and routes the two unmergeable watch
+// cases to a user-clicked reload control. openSession is now only ever a real user (or
+// route) navigation again.
+
 async function openSession(p, sess, opts = {}) {
   // BUG-252 — opening a session is a navigation: a link still resolving must not
   // take the view back afterwards (the route chokepoint, applyRoute). The route's
@@ -7466,6 +7503,17 @@ async function openSession(p, sess, opts = {}) {
   node.box.hidden = frozen;
   node.frozen.hidden = !frozen;
   const at = Number.isInteger(opts.at) && opts.at >= 0 ? opts.at : null;
+  // BUG-278 round 3 — ATOMIC SWAP-IN for the drop-recovery path. When the
+  // caller hands us a tail it already fetched OFF-SCREEN (attemptReconnect),
+  // use it instead of fetching again. The whole stretch from resetTranscript()
+  // above through renderMessages() below then runs with NO await in it, so the
+  // browser never paints the intermediate blank: the old conversation is
+  // replaced by the new one in a single synchronous frame. The prior design
+  // wiped the pane (resetTranscript) and THEN awaited its own fetch, so a server
+  // that dropped in that gap left the pane blank with an error — the r1 B1 /
+  // r2 wipe. A prefetched tail cannot fail here because it is already in hand;
+  // a failure happened OFF-SCREEN in attemptReconnect, which left the pane as-is.
+  let painted = false;
   try {
     // The NEWEST page, not the oldest. Everything before it is fetched on
     // scroll-up by loadOlder(). Fetched even when restoring at a deep index,
@@ -7500,9 +7548,11 @@ async function openSession(p, sess, opts = {}) {
       // The remembered message is OLDER than the newest page: render a window
       // around it instead, and owe the rest forward (see the gap machinery).
       await openHistoryWindow(th, sess, at, t.total ?? 0, frozen);
+      painted = true; // the pane now holds this session's content (BUG-278 r3)
       applyHookBadges(th);
     } else {
       const shown = renderMessages(th, t.messages);
+      painted = true; // the pane now holds this session's content (BUG-278 r3)
       applyHookBadges(th);
       if (!shown) th.paneEl.append(el('div', { class: 'hint-row empty-session-hint', text: 'This session has no readable messages.' }));
       th.page = pageCursor((before, beforeBytes) =>
@@ -7581,12 +7631,29 @@ async function openSession(p, sess, opts = {}) {
     }
     if (at == null && th.stick !== false && state.viewing === 'main') scrollToBottom(th);
     await fillViewport(th);
+    // The user may have navigated to a DIFFERENT session/project DURING the enrichment
+    // awaits above (liveRecordFor / sessionSubagents / fillViewport). The trailing block
+    // mutates global view state (viewAgent pulls state.viewing into a sub-thread and
+    // writes agent= onto the URL; the liveRec block flips busy/followingLive), so bail
+    // if the identity moved — the same signal txScope tracks, named explicitly here.
+    if (state.current.sessionId !== sess.sessionId || state.current.projectId !== p.id) return;
     if (opts.agent) {
       // Only enter a thread that is really recorded here — a bogus agent id in
       // a link must say so, not open an empty pane that looks like a thread.
-      if ((agents ?? []).some((a) => (a.agentId ?? a.id) === opts.agent)) await viewAgent(opts.agent);
-      else say(`this link names an agent thread not recorded in this session (${String(opts.agent).slice(0, 12)}…)`, true);
+      if ((agents ?? []).some((a) => (a.agentId ?? a.id) === opts.agent)) {
+        await viewAgent(opts.agent);
+      } else {
+        say(`this link names an agent thread not recorded in this session (${String(opts.agent).slice(0, 12)}…)`, true);
+      }
     }
+    // BUG-278 round 7 — the viewAgent restore above is the LAST await in this trailing
+    // section; re-check the identity ONE more time before the synchronous liveRec block.
+    // A user navigation DURING viewAgent's fetch await escapes the guard above, and the
+    // liveRec block then flips busy/followingLive and reattaches the DEPARTED session
+    // over the user's new one, and a late write clobbers the new URL (independent-verify
+    // openai run 01a18381). After this guard there is no further await in the try, so the
+    // whole trailing section is now guarded against a mid-recovery navigation.
+    if (state.current.sessionId !== sess.sessionId || state.current.projectId !== p.id) return;
     // HONESTY ON REOPEN: a still-running session must not present as finished
     // history (the content leaks in via file-follow and startles). Reflect the
     // real busy state from the record fetched above.
@@ -7658,6 +7725,11 @@ async function openSession(p, sess, opts = {}) {
     // session's error to render: resetTranscript()+the message would wipe and
     // scribble on the pane that now belongs to the newly-opened session.
     if (scope !== state.txScope) return;
+    // FEAT-203 — if we already rendered the prefetched transcript (the overlapped
+    // route open handed openSession an off-screen tail) and a LATER enrichment fetch
+    // (live record / sub-agents / viewport fill) then failed, the painted pane is
+    // valid and must NOT be blanked. Report the error softly and keep the view.
+    if (painted && opts.prefetchedTail) { say(err.message, true); paintQueue(); return; }
     // BUG-129 + BUG-150: the transcript could not be read, but the session's
     // queued rows are still its own. resetTranscript re-binds ownership by
     // construction (it is the sole owner of the queue↔session binding), so this
@@ -7668,6 +7740,22 @@ async function openSession(p, sess, opts = {}) {
     say(err.message, true);
     paintQueue();
   }
+}
+
+// BUG-278 round 3 — a recovery read that NEVER settles must not wedge recovery.
+// api.transcriptTail has no timeout/AbortController, and the exact fault this bug
+// is about — a NAT/keepalive that BLACK-HOLES a flow — makes an HTTP read hang
+// forever with no FIN/RST. So every recovery read is raced against a deadline;
+// a read that misses it is treated as a failure (back off and retry), never an
+// infinite await. The orphaned fetch resolves into nothing once the socket
+// finally errors. (The independent verifier wedged the round-3 controller this
+// way: inFlight stayed true, so scheduleReconnect short-circuited every later drop.)
+const RECOVERY_READ_MS = 10_000;
+function withTimeout(promise, ms, label = 'recovery read timed out') {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(label)), ms);
+    promise.then((v) => { clearTimeout(t); resolve(v); }, (e) => { clearTimeout(t); reject(e); });
+  });
 }
 
 /**
@@ -11573,8 +11661,11 @@ function connect() {
       // starting a fresh session) throws away the conversation on screen.
       if (!state.closingOnPurpose && wasLive && state.sdkSessionId) {
         state.dropped = true;
-        say('the session connection dropped — nothing on screen was lost, but the agent is no longer attached', true);
+        say('the session connection dropped — recovering the latest messages…', true);
         paintComposerFor(viewedThread());
+        // BUG-278 — recover in place instead of stranding the user on the banner
+        // until they reload.
+        recoverDroppedSession(state.current.sessionId, state.current.projectId, state.current.encodedDir, state.current.title, state.current.os);
       }
       state.closingOnPurpose = false;
       paintSessStatus();
@@ -11646,16 +11737,146 @@ function watch() {
   ws.addEventListener('error', () => { try { ws.close(); } catch { /* already gone */ } });
 }
 
+/*
+ * BUG-278 round 9 (design B′) — reconcile the INDEXLESS live tail a dropped driving
+ * socket left behind, BEFORE a store-indexed merge (catchUpFollow / applyAppend)
+ * re-appends the SAME messages with real indices. During a bridged turn the driving
+ * socket appends the optimistic `.you` bubble and the streaming assistant node with
+ * NO `data-i`, and `th.lastIndex` does not advance; so a merge from `th.lastIndex+1`
+ * would render the user's own just-sent message AND the reply a SECOND time. Settle
+ * any half-open stream and remove the trailing top-level message bubbles that carry
+ * no indexed (`[data-i]`) descendant — exactly the optimistic bubble and the settled
+ * live stream — stopping at the first node that is indexed or is not a message
+ * bubble. So the merge is the single source of those messages, deduped by index.
+ *
+ * A no-op when the tail is already all-indexed (a normal watch catch-up has no
+ * indexless live tail) and when there is NO indexed anchor at all (the whole view
+ * was drawn indexless — the caller routes that to the user-clicked reload control,
+ * because nothing can merge onto it by index).
+ */
+/** True for a stored message that renders assistant content (prose / thinking / tool
+ *  use) — i.e. a replacement for a settled live `.claude` partial. */
+function isAssistantMessage(m) {
+  return !!m && m.role !== 'user' && (m.blocks ?? []).some(
+    (b) => (b.type === 'text' && b.text?.trim()) || b.type === 'tool_use' || (b.type === 'thinking' && b.text?.trim()),
+  );
+}
+
+/*
+ * BUG-278 (round 13) — the whole r9–r12 content/count correlation
+ * (`userWords`/`freshUserTail`/`optimisticTail`/`tailCovered`, the r10
+ * `reached < total` count guard) is DELETED and replaced by IDENTITY: every send
+ * carries a server-owned uuid (the client mints it, the server validates/replaces
+ * it, the CLI — or the Orchard recorder for codex — persists it as the transcript
+ * entry's `uuid`). An optimistic bubble is reconciled against the stored message
+ * of the SAME uuid, and against nothing else. A stale snapshot, a suffix
+ * collision, a duplicate text block, an attachment-only turn or an unrelated
+ * attachment can no longer match, because none of them carries the bubble's
+ * identity — the exact class that kept re-breaking under adversarial IV.
+ */
+
+/** The TRAILING indexless optimistic `.you` bubbles a dropped driving socket drew,
+ *  newest-walk, past a transient recovery `.hint-row`, stopping at the first indexed or
+ *  non-message node: their identities (`uuids`, the `data-uuid` of each that carries one)
+ *  and the TOTAL count of trailing `.you` bubbles (`youCount`). When `youCount` exceeds
+ *  `uuids.length` the tail holds an IDENTITYLESS bubble — one no merge can ever cover,
+ *  which must still gate out an unrelated/stale read (never let it render over the
+ *  unconfirmed bubble), BUG-278 r13 IV run 01a186d6. */
+function optimisticTailUuids(th) {
+  const uuids = [];
+  let youCount = 0;
+  const pane = th.paneEl;
+  for (let n = pane.lastElementChild; n; n = n.previousElementSibling) {
+    if (n.matches('.hint-row')) continue; // a transient recovery "retrying" hint — walk past it
+    if (n.matches('[data-i]') || n.querySelector('[data-i]')) break;
+    if (!n.matches('.you, .claude')) break;
+    if (n.matches('.you')) { youCount++; if (n.dataset.uuid) uuids.push(n.dataset.uuid); }
+  }
+  return { uuids, youCount };
+}
+
+/** The set of message identities (uuid) present in a store merge `fresh`. */
+function freshUuidSet(fresh) {
+  const s = new Set();
+  for (const m of (fresh ?? [])) if (m && typeof m.uuid === 'string' && m.uuid) s.add(m.uuid);
+  return s;
+}
+
+/** True when `fresh` carries the identity of EVERY trailing optimistic `.you` bubble
+ *  (by uuid). The coverage gate accepts a merge only when this holds, so a stale
+ *  snapshot / prefix / suffix-collision that predates the current prompt — lacking the
+ *  bubble's uuid — is rejected and never rendered. */
+function tailCovered(optUuids, fresh) {
+  const have = freshUuidSet(fresh);
+  return optUuids.every((u) => have.has(u));
+}
+
+/*
+ * Reconcile the INDEXLESS live tail a dropped driving socket drew — the optimistic
+ * `.you` bubble(s) and the settled half-stream(s) — against the merge about to render
+ * (`fresh`, the store messages for the gap). BUG-278 round 13 — reconcile by IDENTITY:
+ *  - an optimistic `.you` bubble is removed ONLY when `fresh` carries a message whose
+ *    `uuid` equals the bubble's `data-uuid` (the server-owned send identity the CLI /
+ *    recorder persisted). Its text is never consulted — so the same text sent twice,
+ *    a stale snapshot, a suffix collision, an attachment-only turn and an unrelated
+ *    attachment cannot match, because none carries this bubble's identity.
+ *  - a bubble with NO identity (shouldn't happen — every send stamps one; a
+ *    survivor-inject outbox turn paints none at all) is left in place: never wiped.
+ *  - a settled assistant `.claude` partial is removed only when its TURN is confirmed:
+ *    the `.you` that opened it was matched by identity, or — for a leading partial whose
+ *    `.you` is already indexed on screen — `fresh` carries an assistant replacement.
+ * An unmatched bubble STAYS; its real store message dedupes against it later by the same
+ * identity rule. Nothing waits on a count, so a message that was never persisted cannot
+ * wipe the bubble or hang recovery. Walking the contiguous trailing run and removing only
+ * matched nodes keeps order correct: the caller only reaches a render when `fresh` covers
+ * the tail by identity (the coverage gate).
+ */
+function dropLiveTail(th, fresh = []) {
+  if (!th) return;
+  finishStream(th);
+  th.settledStream = null; // a persisted unit replaces the live body (BUG-169)
+  th.claudeBody = null;
+  const pane = th.paneEl;
+  const run = [];
+  for (let n = pane.lastElementChild; n; n = n.previousElementSibling) {
+    if (n.matches('.hint-row')) continue; // a transient recovery "retrying" hint — walk past it
+    if (n.matches('[data-i]') || n.querySelector('[data-i]')) break; // reached indexed content
+    if (!n.matches('.you, .claude')) break; // leave dividers / marks in place
+    run.push(n);
+  }
+  run.reverse(); // forward order: [you, claude, you, claude, …]
+  const have = freshUuidSet(fresh); // the identities this merge carries
+  // A LEADING `.claude` (no `.you` before it in the run → its `.you` is already indexed
+  // on screen, so the turn is real) is confirmed as soon as the merge carries an
+  // assistant replacement for it.
+  let turnConfirmed = fresh.some(isAssistantMessage);
+  const remove = [];
+  for (const node of run) {
+    if (node.matches('.you')) {
+      const u = node.dataset.uuid;
+      if (u && have.has(u)) { remove.push(node); turnConfirmed = true; } // identity match — the store carries this turn
+      else turnConfirmed = false; // no identity (or not yet in the merge) — the bubble stays
+    } else if (turnConfirmed) {
+      remove.push(node); // a settled partial whose turn is in the merge
+    }
+  }
+  for (const node of remove) node.remove();
+}
+
 /**
  * The watched file was truncated or rotated, so the appends that follow are not
- * a continuation of what is rendered. Reload the session from scratch.
+ * a continuation of what is rendered. The view cannot be merged forward by index
+ * (the file's coordinate system restarted), so this is one of the two genuinely
+ * UNMERGEABLE cases — offer the user a VISIBLE "reload the view" control instead of
+ * an automatic re-render. The click is a real navigation, so it (correctly) writes
+ * the URL/scroll; BUG-278 round 9 removed the automatic atomicReopen so recovery
+ * never touches the user's URL, scroll or route behind their back (r4–r8 class).
  */
 function resyncTranscript() {
   const cur = state.current;
   const p = state.projects.find((x) => x.id === cur.projectId);
   if (!p || !cur.sessionId || !cur.encodedDir) return;
-  say('this session file was rewritten on disk — reloading the transcript');
-  return openSession(p, { encodedDir: cur.encodedDir, sessionId: cur.sessionId, displayTitle: cur.title, os: cur.os });
+  showReloadView('this session file was rewritten on disk');
 }
 
 /** Ask the server to watch whatever session is on screen. Silent no-op if it can't. */
@@ -11710,7 +11931,7 @@ function onFollowStatus(e) {
  * rendered out of order or twice: the fetch covers everything before the watch
  * started, the watch covers everything after, and the overlap is dropped by index.
  */
-async function catchUpFollow(sessionId, dir) {
+async function catchUpFollow(sessionId, dir, opts = {}) {
   const th = mainThread();
   const cur = state.current;
   if (!cur.sessionId || cur.sessionId !== sessionId || !cur.encodedDir) return;
@@ -11727,12 +11948,31 @@ async function catchUpFollow(sessionId, dir) {
      *    one reload that converges it, instead of silently skipping the gap.
      */
     if (th.paneEl.querySelector(':scope > .you, :scope > .claude')) {
-      const p = state.projects.find((x) => x.id === cur.projectId);
-      if (!p) return;
-      say('catching this view up from the transcript');
-      return void openSession(p, { encodedDir: cur.encodedDir, sessionId, displayTitle: cur.title, os: cur.os });
+      if (opts.reconcileLiveTail) {
+        // BUG-278 round 10 — a driving-drop recovery merge EXPECTS an indexless
+        // live tail (the dropped socket's optimistic `.you` + half-streamed
+        // assistant). Read the store from #0 and let the dropLiveTail in the
+        // SUCCESSFUL-merge step below (`if (fresh.length)`) clear those bubbles in
+        // the SAME synchronous frame as renderMessages. A failed or partial gap
+        // read never reaches that step, so the user's own message bubble is left
+        // untouched — closing the r9 bug where dropLiveTail ran as a separate
+        // earlier step and repeated 503 gap reads wiped the bubble with no
+        // replacement fetched.
+        th.lastIndex = -1;
+      } else {
+        const p = state.projects.find((x) => x.id === cur.projectId);
+        if (!p) return;
+        // BUG-278 round 9 — the view was drawn ENTIRELY indexless (a live bridge
+        // filled it, now followed from the file): nothing can splice onto it by
+        // index, so it is genuinely unmergeable. Offer the user a VISIBLE reload
+        // control instead of an automatic re-render (which moved the URL/scroll
+        // behind their back across r4–r8). Their click is a real navigation.
+        showReloadView('this conversation was updated');
+        return;
+      }
+    } else {
+      th.lastIndex = -1;
     }
-    th.lastIndex = -1;
   }
   if (th.catchUp) { th.catchUp.again = true; return; } // one in flight: it loops once more instead
   const run = { buffer: [], again: false };
@@ -11778,10 +12018,49 @@ async function catchUpFollow(sessionId, dir) {
     if (fresh.length && (fresh[0].index !== next || fresh[fresh.length - 1].index - next + 1 !== fresh.length)) {
       throw new Error(`the read left a hole (#${next}…#${fresh[fresh.length - 1].index}, ${fresh.length} messages)`);
     }
+    // BUG-278 round 13 — gate the merge on IDENTITY. Whenever the pane still carries an
+    // INDEXLESS optimistic tail (a dropped driving socket's `.you` bubbles), accept this
+    // merge ONLY when it carries the `uuid` of every one of them. A self-consistent stale
+    // snapshot (its `total` equal to a short read, or no `total`), a contiguous prefix that
+    // predates the current prompt, a duplicate-text snapshot, a suffix collision AND an
+    // EMPTY read (a stale/truncated snapshot that returns zero rows after th.lastIndex, or
+    // a persist that has not landed yet) all LACK the bubble's identity, so the merge is a
+    // FAILED read (throw → retry, tail left EXACTLY intact) — never rendered out of order,
+    // never used to wipe the user's own bubble, and recovery never silently COMPLETES on an
+    // empty snapshot while a send is still unconfirmed (BUG-278 r13 IV, openai run
+    // 01a186cd: an empty read bypassed the gate because it was nested under `if
+    // (fresh.length)`). The bounded coverage-miss retry (RECONCILE_COVERAGE_MAX_MISSES)
+    // then arms resume-on-next-send if the message truly never persisted. Keyed on the
+    // optimistic tail's identities (not opts.reconcileLiveTail), so it equally guards a
+    // plain watch catch-up that reaches here after a rejected reconcile left th.lastIndex at
+    // -1. A normal catch-up with no optimistic bubbles just returns what it read (an empty
+    // read there is a true no-op — nothing to reconcile).
+    // Accept the merge ONLY when EVERY trailing optimistic `.you` bubble is covered by
+    // identity: all of them carry a uuid AND every uuid is in `fresh`. A bubble WITHOUT an
+    // identity (youCount > uuids.length) can never be covered, so it too rejects the merge
+    // — a stale/unrelated read must not render over an unconfirmed bubble (r13 IV run
+    // 01a186d6). Bounded retry (RECONCILE_COVERAGE_MAX_MISSES) then leaves the bubble and
+    // arms resume-on-next-send — the never-auto-remove fallback.
+    const opt = optimisticTailUuids(th);
+    if (opt.youCount && !(opt.uuids.length === opt.youCount && tailCovered(opt.uuids, fresh))) {
+      const e = new Error('the merge does not yet carry the message just sent (a partial, empty or stale read)');
+      e.coverageMiss = true; throw e;
+    }
     return fresh;
   };
   const RETRY_MS = [500, 1000, 2000, 4000, 8000, 15_000];
+  // BUG-278 round 11 — bound the CONTENT-coverage retries only. A merge that keeps
+  // answering but never carries the just-sent message (the rare "the send itself
+  // failed on the drop, so it was never persisted" case) must not retry forever and
+  // starve reestablishDriving's resume-on-next-send. After this many coverage misses
+  // (the backoff is at its 15s cap long before), stop: the optimistic bubble is left
+  // EXACTLY as it is (never wiped) and recovery continues to arm a resume so the user's
+  // next Enter picks the session back up. A failed/truncated/hung gap READ (no
+  // coverageMiss) is NOT bounded here — it keeps its own "retrying" hint.
+  const RECONCILE_COVERAGE_MAX_MISSES = 12;
+  let coverageMisses = 0;
   let hint = null;
+  let hadHint = false;
   try {
     for (let attempt = 0; ; attempt++) {
       let fresh;
@@ -11789,10 +12068,15 @@ async function catchUpFollow(sessionId, dir) {
         fresh = await readGap();
       } catch (err) {
         if (!stillHere()) return;
+        if (err.coverageMiss && ++coverageMisses > RECONCILE_COVERAGE_MAX_MISSES) {
+          if (hint) { hint.remove(); hint = null; }
+          say('the message just sent has not been confirmed by the server — your next message will resume this session', true);
+          return; // leave the bubble intact; reestablishDriving arms resume-on-next-send
+        }
         // Never silent: say that messages written while the view was
         // reconnecting are still being read, and keep retrying. Live appends
         // stay buffered meanwhile so nothing renders ahead of the missing ones.
-        if (!hint) { hint = el('div', { class: 'hint-row bad' }); th.paneEl.append(hint); }
+        if (!hint) { hint = el('div', { class: 'hint-row bad' }); th.paneEl.append(hint); hadHint = true; }
         hint.textContent = `could not yet read the messages written while this view was reconnecting (${err.message}) — retrying`;
         await new Promise((r) => setTimeout(r, RETRY_MS[Math.min(attempt, RETRY_MS.length - 1)]));
         if (!stillHere()) return;
@@ -11800,9 +12084,20 @@ async function catchUpFollow(sessionId, dir) {
       }
       if (fresh == null) return; // navigated away mid-read
       if (fresh.length) {
-        finishStream(th);
-        th.settledStream = null; // persisted units replace any live body (BUG-169)
-        th.claudeBody = null;
+        // BUG-278 round 10 — drop any "retrying" hint from the DOM FIRST so it is not
+        // the trailing node when dropLiveTail walks back from the pane end: a hint-row
+        // (added after a failed gap read in the fail-then-succeed case) is neither
+        // `.you`/`.claude` nor indexed, so it would STOP the walk before reaching the
+        // indexless `.you` bubble, leaving it in place — duplicating the user's own
+        // message once the store-indexed copy is appended below.
+        if (hint) { hint.remove(); hint = null; }
+        // BUG-278 round 9/11 — reconcile any INDEXLESS live tail (a dropped driving
+        // socket's optimistic `.you` bubble + settled stream) before the first
+        // store-indexed append, correlating by CONTENT against this merge so only the
+        // bubbles the merge actually replaces are removed (the coverage gate above has
+        // confirmed the merge carries them). A no-op for a normal watch catch-up (its
+        // tail is already indexed).
+        dropLiveTail(th, fresh);
         th.paneEl.querySelector(':scope > .empty-session-hint')?.remove(); // BUG-190 r5: no longer true
         renderMessages(th, fresh);
         th.lastIndex = fresh[fresh.length - 1].index;
@@ -11812,7 +12107,7 @@ async function catchUpFollow(sessionId, dir) {
       if (!run.again) break;
       run.again = false; // a later follow landed while this one ran — read once more
     }
-    if (hint) say('caught up on the messages written while this view was reconnecting');
+    if (hadHint) say('caught up on the messages written while this view was reconnecting');
   } finally {
     hint?.remove();
     if (th.catchUp === run) th.catchUp = null;
@@ -11860,13 +12155,40 @@ function applyAppend(e) {
     ? (th.lastIndex == null || m.index > th.lastIndex)
     : true); // an index-less message cannot be deduped, so show it
   if (!fresh.length) return;
+  // BUG-278 r13 (IV run 69b1a0eb) — the live-append path must honour the SAME identity
+  // coverage the gap read does. When the tail still holds optimistic `.you` bubbles this
+  // append does NOT fully cover (two sends in flight, only the first persisted so far),
+  // rendering inline would reorder: dropLiveTail removes only the covered bubble, leaving
+  // the uncovered one in place, and renderMessages then appends the indexed copy AFTER it
+  // (observed order old,second,partial2,first,reply1). Defer to the gated catch-up, which
+  // reads forward from the UNADVANCED th.lastIndex and merges in order once the append
+  // covers the whole tail. A tail with no optimistic bubbles (the ordinary live append)
+  // skips this and renders inline as before.
+  {
+    const optTail = optimisticTailUuids(th);
+    if (optTail.youCount && !(optTail.uuids.length === optTail.youCount
+      && optTail.uuids.every((u) => fresh.some((m) => m && m.uuid === u)))) {
+      return void catchUpFollow(e.sessionId, e.dir);
+    }
+  }
   for (const m of fresh) if (Number.isInteger(m.index)) th.lastIndex = Math.max(th.lastIndex ?? -1, m.index);
 
   // A persisted message is a complete unit; end any half-open stream first so
-  // it does not get appended into the previous turn's body.
-  finishStream(th);
-  th.settledStream = null; // persisted units replace the live body; no trailing 'text' will re-render (BUG-169)
-  th.claudeBody = null;
+  // it does not get appended into the previous turn's body. BUG-278 round 9 — when
+  // this append carries a store index, reconcile the INDEXLESS live tail first
+  // (dropLiveTail = finishStream + remove the optimistic bubble/settled stream), so
+  // a driving-drop's own just-sent message is not rendered twice when the same
+  // message arrives here with its real index. For a purely index-less append there
+  // is nothing to dedupe against, so only settle the stream. BUG-278 round 11 — the
+  // reconcile correlates by CONTENT against this append, so an indexed append that is
+  // NOT the optimistic bubble's own message leaves that bubble in place.
+  if (fresh.some((m) => Number.isInteger(m?.index))) {
+    dropLiveTail(th, fresh);
+  } else {
+    finishStream(th);
+    th.settledStream = null; // persisted units replace the live body; no trailing 'text' will re-render (BUG-169)
+    th.claudeBody = null;
+  }
   const shown = renderMessages(th, fresh);
   if (!shown) return;
   th.paneEl.querySelector(':scope > .empty-session-hint')?.remove(); // BUG-190 r5: no longer true
@@ -12063,6 +12385,245 @@ function closeSocket() {
   clearModelFlag();
   paintModelChip();
   setBusy(false);
+}
+
+/*
+ * BUG-278 — the driving socket dropped on a LIVE session (the server terminated a
+ * client its keepalive found dead, a real network drop, a laptop wake, a NAT that
+ * evicted an idle flow). Rather than strand the user on the "dropped" banner until
+ * they reload — the only way a reply that landed after the drop ever appeared —
+ * re-open the session from the transcript: openSession re-renders from the
+ * canonical store (so a reply delivered during the gap shows) and re-follows the
+ * live work, exactly what a reload does, without the reload.
+ *
+ * ROUND 2 — the openai verifier (run ff7ade5f) found two breaks in round 1, both
+ * fixed here BY CONSTRUCTION:
+ *
+ *   B1 "server-down wipe": round 1 called openSession immediately on a drop, and
+ *   openSession wipes the pane (resetTranscript) BEFORE it has the replacement
+ *   transcript in hand. A drop while the server was unreachable therefore blanked
+ *   the conversation and left it stuck — the fetch then failed into openSession's
+ *   "could not read this session" catch, with nothing to retry it.
+ *
+ *   ROUND 2 tried to fix this by PROBING transcriptTail(limit:1) first and only
+ *   then calling openSession. The openai verifier (run 01a18190) refuted that: a
+ *   limit:1 probe only NARROWS the race — openSession STILL calls resetTranscript()
+ *   (wipe) before awaiting its OWN tail fetch, so a server that answered the probe
+ *   and then dropped before that fetch blanked the pane exactly as in round 1.
+ *
+ *   ROUND 3 fix (atomic swap by construction): attemptReconnect fetches the FULL
+ *   canonical tail OFF-SCREEN and hands it to openSession as `prefetchedTail`.
+ *   openSession then skips its own awaited fetch, so the stretch from
+ *   resetTranscript() through renderMessages() contains NO await — the wipe and
+ *   the repaint happen in one synchronous frame and the browser never shows the
+ *   blank. A failed off-screen fetch leaves the current view EXACTLY as it is (the
+ *   dropped banner) and backs off; the pane is never touched on failure. And if a
+ *   LATER enrichment fetch inside openSession fails, the already-rendered pane is
+ *   kept (openSession's catch returns early for the prefetched path). The server
+ *   being down — at any instant — can no longer blank the screen.
+ *
+ *   B2 "flapping storm": round 1's per-drop generation token only cancelled an
+ *   OVERLAPPING drop. A link that flapped opened a fresh socket each time, and
+ *   each socket's close started its own independent recovery — 11 reopens drove
+ *   22 transcript fetches in 20s. Fix: ONE controller per session owns EVERY
+ *   recovery attempt across however many sockets the link opens and closes. At
+ *   most one attempt is ever in flight or scheduled; a repeat drop before the link
+ *   has proven stable GROWS the delay (exponential with jitter, base → cap); the
+ *   delay resets to the base only after the link has held for RECONNECT_HEALTHY_MS.
+ *   A flapping link's attempt rate is bounded by the backoff, not by the flap rate.
+ *
+ * Still conservative where round 1 was right: it starts NO model turn (openSession
+ * never does), so an ENDED session just shows its final transcript and a SECOND
+ * tab is still refused by the unchanged one-driver resume path on the next send
+ * (BUG-149). Navigation is guarded both BEFORE and AFTER the off-screen fetch, so
+ * a user who moves to another session mid-recovery gets no stale render (and
+ * openSession's own txScope guard is a second line of defence).
+ */
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_CAP_MS = 30_000;
+const RECONNECT_HEALTHY_MS = 30_000; // the link must hold this long before the delay resets to base
+let dropRecoverGen = 0;              // bumped per controller; stale timers compare against it
+let reconnectCtl = null;             // the SINGLE live reconnect controller, or null when nothing is recovering
+
+function disposeReconnect() {
+  if (!reconnectCtl) return;
+  if (reconnectCtl.timer) clearTimeout(reconnectCtl.timer);
+  if (reconnectCtl.settle) clearTimeout(reconnectCtl.settle);
+  reconnectCtl = null;
+}
+
+function recoverDroppedSession(sessionId, projectId, encodedDir, title, os) {
+  // A controller for a DIFFERENT session is stale the instant this one drops.
+  if (reconnectCtl && reconnectCtl.sessionId !== sessionId) disposeReconnect();
+  if (!reconnectCtl) {
+    reconnectCtl = {
+      sessionId, projectId, encodedDir, title, os,
+      gen: ++dropRecoverGen, delay: RECONNECT_BASE_MS,
+      timer: null, settle: null, inFlight: false,
+    };
+  } else {
+    // A repeat drop before the link proved stable: this IS a flap. Grow the
+    // backoff and refresh the coordinates (title/os can change across a reopen).
+    reconnectCtl.projectId = projectId;
+    reconnectCtl.encodedDir = encodedDir;
+    reconnectCtl.title = title;
+    reconnectCtl.os = os;
+    reconnectCtl.delay = Math.min(reconnectCtl.delay * 2, RECONNECT_CAP_MS);
+  }
+  // A new drop plainly means we are NOT healthy: cancel any pending settle-reset
+  // armed by a prior attempt that had reached openSession.
+  if (reconnectCtl.settle) { clearTimeout(reconnectCtl.settle); reconnectCtl.settle = null; }
+  scheduleReconnect();
+}
+
+function scheduleReconnect() {
+  if (!reconnectCtl) return;
+  if (reconnectCtl.timer || reconnectCtl.inFlight) return; // at most ONE attempt pending or in flight
+  const base = reconnectCtl.delay;
+  const wait = base + Math.random() * base * 0.25; // up to 25% jitter, never below the base delay
+  reconnectCtl.timer = setTimeout(() => { void attemptReconnect(); }, wait);
+}
+
+// Arm (or re-arm) the "held healthy long enough → reset to baseline" watch. The
+// controller is disposed only once the link has held for RECONNECT_HEALTHY_MS —
+// NOT the instant a socket comes up. That distinction is what bounds a flap: a
+// transient "we're live again" must never reset the grown backoff (round-2 bug:
+// disposing on a momentary state.live reset the delay to the base every cycle, so
+// a 2s flap stormed instead of backing off). A fresh drop clears this timer.
+function armReconnectSettle() {
+  if (!reconnectCtl) return;
+  if (reconnectCtl.settle) clearTimeout(reconnectCtl.settle);
+  reconnectCtl.settle = setTimeout(() => {
+    if (!reconnectCtl) return;
+    reconnectCtl.settle = null;
+    if (state.live || !state.dropped) { disposeReconnect(); return; } // held healthy, or settled idle
+    scheduleReconnect(); // a swap that did not take and we are still dropped — keep trying
+  }, RECONNECT_HEALTHY_MS);
+}
+
+async function attemptReconnect() {
+  const c = reconnectCtl;
+  if (!c) return;
+  c.timer = null;
+  // Nav / session-change guards BEFORE any fetch.
+  if (c.gen !== dropRecoverGen) return;
+  // User moved to a different session OR project → cancel. An overlay over the SAME
+  // session changes NEITHER current.sessionId NOR current.projectId, so recovery
+  // correctly proceeds behind it (BUG-278 r4). A bare sidebar project switch moves
+  // current.projectId (not sessionId), so comparing sessionId alone let recovery
+  // run and yank the sidebar back to the dropped session's project.
+  if (state.current.sessionId !== c.sessionId || state.current.projectId !== c.projectId) { disposeReconnect(); return; }
+  const p = state.projects.find((x) => x.id === c.projectId);
+  if (!p) { disposeReconnect(); return; }
+  // Already live — another path, or this controller's own prior reattach, brought
+  // a socket up. Do NOT reconnect again and do NOT reset the backoff: just watch
+  // for SUSTAINED health. A flap that drops it again keeps the grown delay.
+  if (state.live) { armReconnectSettle(); return; }
+
+  c.inFlight = true;
+  // REACHABILITY PROBE, off-screen: read the canonical tail WITHOUT touching the
+  // view. A success means the server is back; a failure (or a hang) means it is
+  // still down. Raced against RECOVERY_READ_MS so a read that hangs (a black-holed
+  // connection — the fault this bug IS about) is treated as a failure: inFlight is
+  // always cleared below and the controller can never wedge on an infinite await.
+  let reachable = false;
+  try { await withTimeout(api.transcriptTail(c.encodedDir, c.sessionId, { limit: 1 }), RECOVERY_READ_MS); reachable = true; }
+  catch { reachable = false; }
+  c.inFlight = false;
+
+  // Re-check every guard AFTER the await — the user may have navigated, a newer
+  // controller may have superseded this one, or another socket may have come up.
+  if (reconnectCtl !== c || c.gen !== dropRecoverGen) return;
+  if (state.current.sessionId !== c.sessionId || state.current.projectId !== c.projectId) { disposeReconnect(); return; }
+  if (state.live) { armReconnectSettle(); return; }
+
+  if (!reachable) {
+    // Still down (or the read hung): leave the current view EXACTLY as it is (the
+    // dropped banner), grow the backoff, and retry. No spin — the cap bounds the
+    // attempt rate. The pane is NEVER touched here.
+    reconnectCtl.delay = Math.min(reconnectCtl.delay * 2, RECONNECT_CAP_MS);
+    scheduleReconnect();
+    return;
+  }
+
+  // BUG-278 round 9 (design B′) — the server is back. Recovery MERGES the gap into
+  // the existing transcript instead of re-opening the session: it performs NO
+  // syncUrl / resetTranscript / showThread / scroll write, so it can never move the
+  // user's URL, scroll, overlay or thread behind their back (the whole r4–r8 class,
+  // removed by construction rather than guarded).
+  //  1. catchUpFollow(reconcileLiveTail) reads forward from th.lastIndex — the SAME
+  //     append path the watch socket uses — so missed messages appear exactly once,
+  //     in order, contiguity-checked by its own readGap. Its scroll is already scoped
+  //     to main and respects th.stick, so a scrolled-up user is never moved.
+  //     BUG-278 round 10 — reconciling the INDEXLESS live tail (the dropped socket's
+  //     optimistic `.you` bubble + half-streamed assistant) is done INSIDE catchUpFollow,
+  //     in the SAME synchronous step that merges a SUCCESSFULLY fetched replacement
+  //     (its `dropLiveTail(th)` runs immediately before renderMessages). It is NEVER a
+  //     separate earlier step: a failed or partial gap read (repeated 503s on the NAT
+  //     that dropped the socket) leaves the user's own message bubble EXACTLY as it is,
+  //     under the retrying hint, instead of wiping it with no replacement in hand (r9
+  //     bug). reconcileLiveTail also tells catchUpFollow a FRESH session (whole turn
+  //     drawn indexless from #0, th.lastIndex null) is a merge, not its unmergeable-view
+  //     reload-control fallback, so it reads the store from #0; a history-resumed
+  //     session keeps its persisted indexed tail and the merge reads from there.
+  //  2. reestablishDriving re-follows and reattaches the still-live bridge (or arms
+  //     resume-on-next-send if the turn ended), so future turns stream again.
+  await catchUpFollow(c.sessionId, c.encodedDir, { reconcileLiveTail: true });
+  if (reconnectCtl !== c || c.gen !== dropRecoverGen) return;
+  if (state.current.sessionId !== c.sessionId || state.current.projectId !== c.projectId) { disposeReconnect(); return; }
+  if (state.live) { armReconnectSettle(); return; }
+  await reestablishDriving(c);
+
+  // Do NOT schedule another attempt here: the settle timer resets the backoff if
+  // the link holds, and the close handler funnels a re-drop back into
+  // recoverDroppedSession with the grown delay intact.
+  armReconnectSettle();
+}
+
+/*
+ * BUG-278 round 9 — after the gap is merged, re-establish live follow and, if the
+ * session is still running server-side, reattach the DRIVING socket so future turns
+ * stream. Mirrors openSession's proven liveRec branch, but touches no URL/scroll:
+ *  - a dashboard-driven bridge that is still alive → reattach (promptless; the
+ *    server turns a promptless resume into a pure attach, answering
+ *    `nothing-to-reattach` if no bridge survives, handled gracefully).
+ *  - otherwise (the turn ended while we were down) → arm resume-on-next-send so one
+ *    Enter resumes the same SDK session, and clear the dropped banner; the final
+ *    transcript is already on screen from the merge, no turn is started.
+ * liveRecordFor's own fetches are raced against the deadline too — the same NAT that
+ * black-holed the socket can hang them.
+ */
+async function reestablishDriving(c) {
+  const th = mainThread();
+  followCurrent(!th.gap); // re-ask the watch to follow (dropped while recovering); the gap owns the tail if parked
+  let liveRec = null;
+  try { liveRec = await withTimeout(liveRecordFor(c.sessionId), RECOVERY_READ_MS); }
+  catch { liveRec = null; }
+  if (reconnectCtl !== c || c.gen !== dropRecoverGen) return;
+  if (state.current.sessionId !== c.sessionId || state.current.projectId !== c.projectId) return;
+  if (state.live) return; // a socket already came up (reattach beat us here)
+  if (liveRec && liveRec.drivenByDashboard && !th.gap) {
+    state.followingLive = true;
+    if (liveRec.busy !== false) {
+      if (Number.isFinite(liveRec.turnStartedAt) && liveRec.turnStartedAt > 0) {
+        state.turnStartedAt = liveRec.turnStartedAt;
+        state.turnStartUnknown = false;
+      } else {
+        state.turnStartedAt = 0;
+        state.turnStartUnknown = true;
+      }
+      setBusy(true);
+    }
+    paintSessStatus();
+    void reattachDriving({ encodedDir: c.encodedDir, sessionId: c.sessionId, displayTitle: c.title, os: c.os });
+  } else {
+    // The turn ended (or this is not ours to drive): the merged transcript is the
+    // final view. Arm a plain resume so one Enter continues, and clear the banner.
+    if (state.sdkSessionId) state.resumeOnNextSend = state.sdkSessionId;
+    state.dropped = false;
+    paintSessStatus();
+    paintComposerFor(viewedThread());
+  }
 }
 
 /**
@@ -12345,16 +12906,34 @@ function adoptQueuedLine(drain) {
 /** A typed prompt goes straight to the session over this tab's socket (queued rows never ride a frame — the server's outbox delivers them). */
 function sendTurn(prompt, { texts, el, attachments }) {
   const sendId = `s-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  // BUG-278 — this send's identity. The optimistic bubble carries it (data-uuid),
+  // it rides the frame to the server (which adopts it as the transcript entry's
+  // uuid, or replaces a malformed/duplicate one and echoes the replacement on the
+  // ack), and recovery reconciles the bubble against the stored entry by THIS
+  // uuid — never by its text (the r9–r12 content/count heuristics are gone).
+  const uuid = newSendUuid();
+  if (el && uuid) el.dataset.uuid = uuid;
   state.sendAttempts.set(sendId, {
     texts: (texts ?? []).filter((t) => t && t.trim()),
     el: el ?? null,
     at: Date.now(),
     resume: state.sdkSessionId ?? state.current?.sessionId ?? null,
+    uuid,
   });
   // FEAT-177: attachment references ride the existing send frame (bytes already uploaded).
-  const ok = send({ type: 'send', prompt, sendId, ...(attachments && attachments.length ? { attachments } : {}) });
+  const ok = send({ type: 'send', prompt, sendId, uuid, ...(attachments && attachments.length ? { attachments } : {}) });
   if (!ok) state.sendAttempts.delete(sendId);
   return ok;
+}
+
+/** BUG-278 — a canonical v4 UUID for a send identity (crypto.randomUUID where available). */
+function newSendUuid() {
+  try { return crypto.randomUUID(); } catch { /* fall through */ }
+  // Fallback for a context without crypto.randomUUID: a v4-shaped id.
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
 }
 
 /** Undo what one attempt painted — only its own bubble. */
@@ -12943,6 +13522,10 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       }
       // BUG-191: the server confirmed (or declined) THIS attempt — it is settled either way.
       if (e.of === 'send' && e.sendId) {
+        // BUG-278 — the server echoes the identity it actually delivered under. If
+        // it replaced a malformed/duplicate client uuid, re-stamp the optimistic
+        // bubble so recovery reconciles it against the uuid the transcript carries.
+        if (e.uuid) { const a = state.sendAttempts.get(e.sendId); if (a?.el && a.el.dataset.uuid !== e.uuid) a.el.dataset.uuid = e.uuid; }
         state.sendAttempts.delete(e.sendId);
       }
       if (e.of === 'send' && e.delivered === false) {
@@ -12953,6 +13536,10 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
       if (e.of === 'start') {
         // BUG-187 P2: a new attachment starts with no authoritative pending list.
         state.approvalsComplete = false;
+        // BUG-278 — re-stamp the optimistic first-turn bubble with the identity the
+        // server resolved for it (a replaced duplicate), so recovery reconciles it
+        // by the uuid the transcript carries.
+        if (e.uuid && state.pendingStartEl && state.pendingStartEl.dataset.uuid !== e.uuid) state.pendingStartEl.dataset.uuid = e.uuid;
         if (e.deliveredVia === 'survivor') {
           /*
            * FEAT-065: the server wrote this start's prompt straight into the
@@ -13186,7 +13773,16 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
         expectedLiveModel = e.model;
         paintModelChip();
       }
-      syncUrl('replace');
+      // BUG-278 round 7 — only an IDENTITY change (a new session's first id, a fork's
+      // new id) needs the URL to pick it up here; a REATTACH/resume names the id
+      // already on screen, so its URL is already correct and a write here is at best
+      // redundant. Worse, on a drop-RECOVERY reattach the pane can be covered (an
+      // overlay) or mid-repaint, so currentRoute() reads a spurious scroll index and
+      // this write stamped a bogus `&i=` onto the recovered session's URL (leg M
+      // settings, which owns no hash for the overlay guard to catch). r5's global
+      // syncUrl suppression hid this; r7 removed that global window, so gate the write
+      // on the identity change it was actually added for.
+      if (identityChanged) syncUrl('replace');
       // BUG-195 — the session is now ACTIVE and real. Setting state.current.sessionId
       // above makes the derived pending-new row (pendingNewFor) vanish, but the real
       // row is not yet in this project's s.list — it was fetched at startNew, before
@@ -13814,7 +14410,14 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
      */
     case 'outbox-turn': {
       if (e.sessionId && state.current?.sessionId && e.sessionId !== state.current.sessionId) return;
-      youBubble(mainThread(), e.text);
+      // BUG-278 — the server minted ONE identity for this merged batch and reports
+      // it here, so the single optimistic bubble carries the same uuid the stored
+      // entry will, and recovery reconciles it by identity. When a delivery route
+      // could NOT carry an identity (e.g. a cross-process survivor inject), no uuid
+      // is sent: rather than paint an unreconcilable bubble that would DUPLICATE
+      // against its stored copy, skip the optimistic bubble and let the transcript
+      // append render the message (a beat later, never doubled).
+      if (e.uuid) { const b = youBubble(mainThread(), e.text); if (b) b.dataset.uuid = e.uuid; }
       if (state.viewing === 'main') scrollDown();
       state.turnStartedAt = Date.now();
       state.turnStartUnknown = false; // BUG-033: the server started it just now — the clock is real
@@ -14760,6 +15363,12 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
    * is the failure this whole area exists to prevent.
    */
   const startedBubble = youBubble(mainThread(), text, attachments);
+  // BUG-278 — the first turn's send identity. Carried on the optimistic bubble
+  // and the start frame; the CLI adopts it as the first user entry's uuid, and
+  // the start ack echoes the resolved value (re-stamped below if the server
+  // replaced a duplicate). Recovery reconciles this bubble by that uuid.
+  const startUuid = newSendUuid();
+  if (startedBubble && startUuid) startedBubble.dataset.uuid = startUuid;
   if (!keepComposer) { node.prompt.value = ''; autosize(); attClear(); }
   node.box.hidden = false;
   node.frozen.hidden = true;
@@ -14796,6 +15405,7 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
     type: 'start',
     projectId: p.id,
     prompt: text,
+    uuid: startUuid, // BUG-278 — the first turn's identity
     resumeSessionId,
     // Without this the server falls back to a scan that refuses to guess
     // between diverged copies of the same session id — which is exactly the
@@ -19144,6 +19754,14 @@ function currentRoute() {
 function syncUrl(mode = 'replace') {
   if (nav.applying) return; // navigation is being driven BY the URL right now
   if (nav.applyingGen != null && nav.applyingGen === nav.routeGen) return; // BUG-252 — a link is resolving: the URL is its intent
+  // BUG-278 round 4 — while a sibling overlay (tickets / git / guide) is in front,
+  // the URL BELONGS to that overlay (#/tickets|#/git|#/guide), set by its own
+  // navigation. currentRoute() reads the BACKGROUND session, so any write from here
+  // — a background live-append's debounced scroll-sync, say — would clobber the
+  // overlay's hash and leave a bogus history entry behind it. The overlay restores
+  // the session URL itself when it closes (its home link / Esc), so suppress writes
+  // while it is up: the URL is never the background session's to claim then.
+  if (tv.open || gv.open || gitView?.isOpen()) return;
   const r = currentRoute();
   if (!r) return;
   const prev = parseHash(location.hash);
@@ -19168,7 +19786,13 @@ function paintTitle() {
 /** Trailing-debounced replace — scroll fires far too often to write through. */
 function syncUrlSoon() {
   clearTimeout(nav.scrollTimer);
-  nav.scrollTimer = setTimeout(() => syncUrl('replace'), 400);
+  nav.scrollTimer = setTimeout(() => {
+    // BUG-278 round 9 — recovery no longer scrolls or re-renders the view, so there is
+    // no recovery scroll-sync left to suppress here: the merge (dropLiveTail +
+    // catchUpFollow) does not move the viewport unless the user was at the bottom, and
+    // that scroll is the user's own intent. Every scroll-sync is now a user action.
+    syncUrl('replace');
+  }, 400);
 }
 
 /**
@@ -19615,6 +20239,15 @@ async function boot() {
     // BUG-016: expose the poll loop internals so verify scripts can force an
     // immediate cycle instead of sleeping out the full RAIL_POLL_MS.
     pollRail, RAIL_POLL_MS,
+    // BUG-278 r2: the reconnect controller, so a verify script can drive a real
+    // drop and assert the single-controller backoff (current delay, who it owns)
+    // instead of re-deriving the storm bound from the network trace alone.
+    recoverDroppedSession,
+    reconnectInfo: () => (reconnectCtl ? { sessionId: reconnectCtl.sessionId, delay: reconnectCtl.delay, inFlight: reconnectCtl.inFlight } : null),
+    // BUG-278 round 9 (design B′) — the merge-recovery surface, so a verify script can
+    // drive the real append-merge (dropLiveTail + catchUpFollow) and the user-clicked
+    // reload control instead of re-deriving them.
+    catchUpFollow, dropLiveTail, showReloadView, resyncTranscript, reopenAtLatest,
     /*
      * ARCH-001 phase 2 / BUG-034 + FEAT-057: the renderer's whole surface, so a
      * verify script can force a reconciliation cycle (instead of sleeping out

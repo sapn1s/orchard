@@ -242,6 +242,12 @@ export interface RuntimeStartConfig {
   dockerEnv?: Record<string, string>;
   firstPrompt: string;
   /**
+   * BUG-278 — the server-owned identity uuid for the FIRST turn (see `send`).
+   * The CLI adopts it as the first user entry's transcript `uuid`; omitted, the
+   * engine mints its own.
+   */
+  firstUuid?: string;
+  /**
    * FEAT-177 — the full `message.content` block array for the first turn when
    * it carries attachments (text + image/document/inlined-file blocks). Omitted
    * for a text-only first turn, which then rides as a bare string unchanged.
@@ -381,8 +387,16 @@ export interface AgentRuntime {
    * image/document/inlined-file blocks) and REPLACES the bare-string body;
    * omitted, the turn carries `text` as a bare string exactly as before (so
    * text-only sends are byte-for-byte unchanged).
+   *
+   * BUG-278 — `uuid`, when supplied, is the server-owned IDENTITY for this user
+   * turn: the CLI adopts it verbatim as the persisted transcript entry's `uuid`
+   * (proven, CLI 2.1.312 + the bundled Agent SDK forwards a top-level `uuid` on
+   * a stream-json user frame unchanged). That gives a certain send→transcript
+   * identity the client reconciles its optimistic bubble against, replacing the
+   * r9–r12 content/count heuristics. Omitted = the engine mints its own (old
+   * behaviour, e.g. a runtime whose transcript Orchard does not own).
    */
-  send(text: string, content?: ReadonlyArray<Record<string, unknown>>): void;
+  send(text: string, content?: ReadonlyArray<Record<string, unknown>>, uuid?: string): void;
   /** Interrupt the in-flight turn. */
   interrupt(): Promise<void>;
   /**

@@ -89,7 +89,7 @@ import { snapshotOfSession, type RunningSnapshot } from './running-set.ts';
 import * as outcomes from './outcomes.ts';
 import * as requests from './requests.ts';
 import { ensureUnifiedMemoryDir } from './memories.ts';
-import { TranscriptRecorder, resolveOrchardSessionFile, resumeProviderOf, mirrorClaudeStore, CLAUDE_MIRROR_PROVIDER } from './orchard-transcripts.ts';
+import { TranscriptRecorder, resolveOrchardSessionFile, resumeProviderOf, collectTranscriptUuids, mirrorClaudeStore, CLAUDE_MIRROR_PROVIDER } from './orchard-transcripts.ts';
 import { encodeCwd, defaultRoot as transcriptStoreRoot } from '../lib/session-history.ts';
 import { spawnLaneSnapshot } from '../../scripts/lib/lane-snapshot.mjs';
 import { recordSessionProvenance } from '../lib/session-provenance.mjs';
@@ -110,6 +110,20 @@ import { approvalDeadlineConfig, expiryMessage, retryRefusalMessage, requestKey,
 import { recordIncident } from './lane-incidents.ts';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+/**
+ * BUG-278 — a client-supplied send identity is trusted ONLY if it is a
+ * canonical lowercase UUID (the shape the CLI/transcript store round-trips). A
+ * malformed or missing id is replaced by a freshly minted one, and a duplicate
+ * within the same session is also replaced (two sends must never share one
+ * identity, or one bubble could wipe another's). `isCanonicalUuid` is the single
+ * format gate; the per-session uniqueness + mint lives in `AgentSession`.
+ */
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export function isCanonicalUuid(v: unknown): v is string {
+  return typeof v === 'string' && CANONICAL_UUID.test(v);
+}
 
 let lastSlashCommands: string[] = [];
 const slashFile = () => path.join(dataDir(), 'slash-commands.json');
@@ -205,6 +219,8 @@ export interface StartOptions {
   firstPrompt: string;
   /** FEAT-177 — attachments delivered with the first turn (image/document/text references). */
   firstAttachments?: AttachmentRef[];
+  /** BUG-278 — the client-minted identity uuid for the first turn (validated/replaced server-side). */
+  firstUuid?: string;
   /**
    * ARCH-022 — internal: the container exec tag `startSession` allocated BEFORE admission, so the
    * lifecycle authority's lease for it exists before the exec does. Callers never set it.
@@ -687,6 +703,16 @@ export class AgentSession {
    * work unchanged. Null for ClaudeRuntime — the CLI writes its own store.
    */
   #recorder: TranscriptRecorder | null = null;
+  /**
+   * BUG-278 — every user turn this session delivers carries a server-owned
+   * identity uuid (the client's, validated, or a freshly minted one). This set
+   * is the per-session uniqueness guard: a client that reuses a uuid (two tabs
+   * colliding, a malformed echo) gets a fresh one instead, so no two live turns
+   * share an identity the client reconciles bubbles by. Bounded — a session's
+   * turn count is self-limiting, and stale ids never need pruning because a
+   * reused id is simply replaced.
+   */
+  #sentUuids = new Set<string>();
   #emit: (e: StationEvent) => void;
   #pump: Promise<void> | null = null;
   /** Declared provenance for this session; recorded at init. Default 'user'. */
@@ -753,6 +779,13 @@ export class AgentSession {
   /** Set when `startSnapshotStatus === 'failed'`. */
   startSnapshotError: string | null = null;
   busy = false;
+  /**
+   * BUG-278 — the server-owned identity uuid the FIRST turn carried into the
+   * transcript (null for an adoption, which sends no turn). The start ack echoes
+   * it so the client re-stamps its optimistic first-turn bubble if the server
+   * replaced a malformed/duplicate client uuid.
+   */
+  firstUuid: string | null = null;
   /**
    * BUG-033 — WHEN the in-flight turn actually started (epoch ms), or null when
    * no turn is running. Stamped exactly where `busy` becomes true and cleared
@@ -1479,6 +1512,19 @@ export class AgentSession {
       const rid = opts.resumeSessionId; // the ORIGINAL id the user clicked (fork staging never applies to Orchard-owned transcripts — see startSession's refusal)
       // BUG-196 round 3 — the SAME candidate list the start-frame door check uses.
       const dirCandidates = resumeDirCandidates(opts.project, opts.resumeEncodedDir);
+      /*
+       * BUG-278 r14 — SEED the send-identity uniqueness guard from the transcript
+       * this resume continues. A fresh AgentSession starts `#sentUuids` empty, so
+       * before this seed a resumed/replayed client uuid already present in the
+       * transcript (run e132b141: the same uuid resent on a resume `start` frame)
+       * was adopted verbatim and WRITTEN A SECOND TIME — two transcript entries
+       * with one identity, which the identity-keyed reconcile cannot tell apart.
+       * Seeding from the transcript ITSELF (ARCH-010 — it owns which ids are
+       * taken) makes `#resolveSendUuid` reject the duplicate and mint a fresh id,
+       * echoed on the ack so the client rebinds. Covers a fork too: resumeSessionId
+       * is the PARENT, whose ids the fork's replayed history will also carry.
+       */
+      for (const u of collectTranscriptUuids(dirCandidates, rid)) this.#sentUuids.add(u);
       // BUG-196 — the transcript is the SINGLE owner of the resume engine
       // (resumeProviderOf, ARCH-010); the UI's per-session provider indicator
       // reads the SAME resolver via the transcript route, so no surface can imply
@@ -1821,6 +1867,10 @@ export class AgentSession {
     // FEAT-177: build the first turn's attachment content blocks (throws loudly if this engine
     // cannot take an image — the start fails rather than silently dropping the attachment).
     const firstContent = opts.adopt ? null : this.#attachmentContent(firstPrompt, opts.firstAttachments);
+    // BUG-278 — the first turn's server-owned identity (validated client uuid, or
+    // minted). An adoption sends no turn, so it needs none.
+    const firstUuid = opts.adopt ? undefined : this.#resolveSendUuid(opts.firstUuid);
+    this.firstUuid = firstUuid ?? null;
 
     /*
      * FEAT-037 P2b — arm Orchard-owned transcript capture for engines with no
@@ -1838,10 +1888,14 @@ export class AgentSession {
         cwd: this.cwd,
         encodedDir: this.storeEncodedDir,
         onError: (message) => this.#emit({ t: 'error', message, fatal: false }),
+        // BUG-278 r14 — keep the send-uuid guard current as the transcript grows:
+        // every appended entry (user prompt AND assistant reply) marks its uuid
+        // taken, so a later send can never collide with one already written.
+        onEntry: (uuid) => { this.#sentUuids.add(uuid); },
       });
       if (s.model) this.#recorder.setModel(s.model);
       if (opts.resumeSessionId && !opts.fork) this.#recorder.adoptSessionId(opts.resumeSessionId);
-      this.#recorder.recordUserPrompt(firstPrompt, opts.firstAttachments);
+      this.#recorder.recordUserPrompt(firstPrompt, opts.firstAttachments, firstUuid);
     }
 
     // Reported BEFORE the runtime spawns, so the UI knows what applied even if
@@ -1956,6 +2010,7 @@ export class AgentSession {
         env: { ...dispatchEnv, ...accountEnv },
         dockerEnv: laneDocker?.env,
         firstPrompt,
+        ...(firstUuid ? { firstUuid } : {}), // BUG-278 — the CLI adopts this as the first user entry's uuid
         ...(firstContent ? { firstContent } : {}), // FEAT-177
         permissionMode: s.permissionMode,
         onApproval: (req) => this.#onCanUseTool(req.toolName, req.input, req.meta),
@@ -2095,14 +2150,48 @@ export class AgentSession {
   }
 
   /**
+   * BUG-278 — resolve the IDENTITY uuid this delivery will carry into the
+   * transcript. A valid, not-yet-used client uuid is adopted verbatim; a
+   * malformed or already-used one (and `undefined`, e.g. the autonomous nudge or
+   * a merged-outbox batch) is replaced by a freshly minted uuid. The chosen
+   * value is recorded as used and returned to the caller so the client can bind
+   * its optimistic bubble to the identity actually in flight (a replaced one is
+   * reported back and the bubble re-stamped).
+   *
+   * UNIQUENESS SCOPE (BUG-278 r14, closing the r13 IV run e132b141 edge): a fresh
+   * AgentSession starts `#sentUuids` empty, so on a RESUMED session the guard
+   * would not know the ids already in the resumed transcript — a resumed/replayed
+   * client uuid already present (e132b141's duplicate `start`-frame uuid) was
+   * adopted verbatim and persisted a SECOND time, giving one identity two
+   * transcript entries. `startSession` now SEEDS `#sentUuids` from the resumed
+   * transcript itself (`collectTranscriptUuids`, ARCH-010 — the transcript owns
+   * which ids are taken), so a duplicate is rejected here and replaced with a
+   * freshly minted uuid, returned to the caller and echoed on the ack so the
+   * client rebinds its optimistic bubble. Uniqueness is therefore guaranteed
+   * against the transcript, not merely against ids minted in this live object.
+   *
+   * The set is also KEPT CURRENT as the transcript grows (not just seeded once):
+   * the Orchard recorder's `onEntry` callback adds every appended entry's uuid
+   * (codex — user AND assistant), and the persistedTranscript (Claude) path adds
+   * each streamed frame's top-level uuid in `#handle`. So a send can never be
+   * handed an id an assistant turn already took, on either engine.
+   */
+  #resolveSendUuid(uuid?: string): string {
+    const chosen = isCanonicalUuid(uuid) && !this.#sentUuids.has(uuid) ? uuid : randomUUID();
+    this.#sentUuids.add(chosen);
+    return chosen;
+  }
+
+  /**
    * Queue a follow-up turn into the SAME session.
    *
    * BUG-159 — a busy session HOLDS the message, it does not refuse it. Returns
-   * `{delivered, queued}`: `queued:true` means the text was pushed into the
+   * `{delivered, queued, uuid}`: `queued:true` means the text was pushed into the
    * runtime's own input channel to run at the next turn boundary rather than
-   * opening a fresh turn now. See the `this.busy` branch below.
+   * opening a fresh turn now (see the `this.busy` branch below); `uuid` is the
+   * server-owned send identity actually delivered (BUG-278).
    */
-  send(prompt: string, attachments?: AttachmentRef[]): { delivered: boolean; queued: boolean } {
+  send(prompt: string, attachments?: AttachmentRef[], uuid?: string): { delivered: boolean; queued: boolean; uuid: string } {
     if (this.closed) throw new Error('session is closed');
     if (this.budgetStopped) throw new Error('session stopped: budget exceeded');
     // FEAT-175: a container rebuild for a git-write grant holds every new turn (an interject included: it
@@ -2152,6 +2241,9 @@ export class AgentSession {
       this.#deferredPermissionMode = null;
       this.#applyPermissionMode(pending, 'client');
     }
+    // BUG-278 — the identity this turn carries into the transcript, resolved once
+    // for whichever branch (interject or fresh turn) delivers it.
+    const sendUuid = this.#resolveSendUuid(uuid);
     if (this.busy) {
       /*
        * BUG-159 — HOLD, don't throw. A user's typed message must never be
@@ -2180,14 +2272,14 @@ export class AgentSession {
       // FEAT-177: build the provider content blocks (throws loudly if the engine
       // cannot take an image/PDF — the whole message is refused, never dropped).
       const heldContent = this.#attachmentContent(held, attachments);
-      this.#runtime.send(held, heldContent ?? undefined);
+      this.#runtime.send(held, heldContent ?? undefined, sendUuid);
       heldB.delivered(); // BUG-257 r3 — only now is the answer briefing delivered
-      this.#recorder?.recordUserPrompt(held, attachments);
+      this.#recorder?.recordUserPrompt(held, attachments, sendUuid);
       // BUG-159 (round 2): the user is now awaiting a reply on the main thread —
       // even if the current `busy` was a stuck woken claim, this interject will
       // drive a real turn, so the honest-main-turn gate must stop downgrading it.
       this.#turnUserInitiated = true;
-      return { delivered: true, queued: true };
+      return { delivered: true, queued: true, uuid: sendUuid };
     }
     const textB = this.#withBriefing(prompt);
     const text = textB.text;
@@ -2211,11 +2303,11 @@ export class AgentSession {
     // busy-guard, which the race defeats).
     this.#interruptRequested = false;
     this.pushRunningSnapshot(true);  // BUG-034: the turn started — say so now
-    this.#runtime.send(text, content ?? undefined);
+    this.#runtime.send(text, content ?? undefined, sendUuid);
     textB.delivered(); // BUG-257 r3 — only now is the answer briefing delivered
     // Covers user turns AND the autonomous nudge (which routes through here).
-    this.#recorder?.recordUserPrompt(text, attachments);
-    return { delivered: true, queued: false };
+    this.#recorder?.recordUserPrompt(text, attachments, sendUuid);
+    return { delivered: true, queued: false, uuid: sendUuid };
   }
 
   /**
@@ -3609,8 +3701,8 @@ export class AgentSession {
    *    caller must NOT invite an automatic resend (the client judges it against
    *    the transcript, BUG-129's reconciliation).
    */
-  async sendGated(prompt: string, attachments?: AttachmentRef[]): Promise<
-    | { outcome: 'delivered' }
+  async sendGated(prompt: string, attachments?: AttachmentRef[], uuid?: string): Promise<
+    | { outcome: 'delivered'; uuid: string }
     | { outcome: 'refused'; message: string; drain: AdoptDrainPayload | undefined }
     | { outcome: 'uncertain'; message: string }
   > {
@@ -3620,20 +3712,26 @@ export class AgentSession {
     if (!gate.ok) return { outcome: 'refused', message: gate.message, drain: gate.drain };
     if (!this.adoptGated) {
       // Not gated (e.g. the adoption settled `adopted` since the caller checked): the ordinary path.
-      try { this.send(prompt, attachments); } catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
-      return { outcome: 'delivered' };
+      try { const r = this.send(prompt, attachments, uuid); return { outcome: 'delivered', uuid: r.uuid }; }
+      catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
     }
     const handle = this.#survivalHandle;
     if (!handle) return { outcome: 'refused', message: 'this session has no broker to deliver into', drain: undefined };
     const textB = this.#withBriefing(prompt);
     const text = textB.text;
+    // BUG-278 — the identity for this gated delivery. The frame carries it to the
+    // survivor host; a host/CLI that forwards the top-level `uuid` adopts it (the
+    // ordinary path), and an older host that strips it leaves the CLI to mint its
+    // own — the client then never matches this bubble and simply leaves it in
+    // place (the sanctioned never-auto-remove fallback), never wiping it wrongly.
+    const sendUuid = this.#resolveSendUuid(uuid);
     // FEAT-177: build content blocks (image/document/inlined-file). Throws loudly
     // for an engine that cannot take an image — caught below and returned as a refusal.
     let content: Array<Record<string, unknown>>;
     try {
       content = this.#attachmentContent(text, attachments) ?? [{ type: 'text', text }];
     } catch (err) { return { outcome: 'refused', message: (err as Error).message, drain: undefined }; }
-    const r = await handle.broker.deliver({ role: 'user', content }, GATED_DELIVER_ACK_MS);
+    const r = await handle.broker.deliver({ role: 'user', content, uuid: sendUuid }, GATED_DELIVER_ACK_MS);
     if (r && !r.accepted) {
       const g = this.sendGate();
       return {
@@ -3658,8 +3756,8 @@ export class AgentSession {
     this.#advisoryNotice = null;
     this.#interruptRequested = false;
     this.pushRunningSnapshot(true);
-    this.#recorder?.recordUserPrompt(text, attachments);
-    return { outcome: 'delivered' };
+    this.#recorder?.recordUserPrompt(text, attachments, sendUuid);
+    return { outcome: 'delivered', uuid: sendUuid };
   }
 
   /**
@@ -4902,6 +5000,17 @@ export class AgentSession {
     // assistant/user content itself). BEFORE the switch so no early `return`
     // below can drop a frame from the durable record.
     this.#recorder?.recordRuntimeMessage(m);
+    /*
+     * BUG-278 r14 — keep the send-uuid uniqueness guard current for the
+     * persistedTranscript (Claude CLI) path, which has NO Orchard recorder to
+     * fire `onEntry`: the CLI stamps each streamed assistant/user frame with the
+     * transcript entry's own top-level `uuid` (SDKAssistantMessage.uuid etc.), so
+     * marking it taken here stops a later send from being handed an id the CLI
+     * already wrote. Best-effort and idempotent — a frame without a canonical
+     * uuid (codex frames, older producers) is simply skipped, and the codex path
+     * stays covered by the recorder's onEntry callback.
+     */
+    if (this.#runtime.capabilities.persistedTranscript && isCanonicalUuid(m.uuid)) this.#sentUuids.add(m.uuid);
     switch (m.type) {
       case 'system':
         return this.#handleSystem(m);

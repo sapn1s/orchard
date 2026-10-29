@@ -148,7 +148,11 @@ export interface ProbeWait { kind: 'wait'; hold: OutboxHold; retryMs?: number }
 export interface ProbeGo { kind: 'go'; route: string; ctx?: unknown }
 export type Probe = ProbeWait | ProbeGo;
 export type HandOutcome =
-  | { kind: 'delivered'; via: string; startedAs?: string }
+  // BUG-278 — `uuid` is the server-owned identity minted for this MERGED batch
+  // (the rows become one prompt, one user turn, one transcript entry). The pump
+  // reports it on the `outbox-turn` event so a driving tab stamps its single
+  // optimistic bubble with the same identity it will later reconcile against.
+  | { kind: 'delivered'; via: string; startedAs?: string; uuid?: string }
   | { kind: 'refused'; hold: OutboxHold; retryMs?: number }
   | { kind: 'uncertain'; reason: string }
   | { kind: 'failed'; reason: string };
@@ -166,7 +170,7 @@ export interface OutboxWiring {
   /** Interrupt a busy bridge (FEAT-031); resolves once the interrupt has been sent. */
   interrupt(sessionId: string): Promise<void> | null;
   /** Something changed that a driving tab should see at once (the outbox-turn event etc.). */
-  announce(sessionId: string, e: { t: 'outbox-turn'; sessionId: string; text: string; ids: string[]; attachments?: AttachmentRef[] }): void;
+  announce(sessionId: string, e: { t: 'outbox-turn'; sessionId: string; text: string; ids: string[]; uuid?: string; attachments?: AttachmentRef[] }): void;
   /**
    * BUG-284 — the project row registered under `projectId` NOW: its incarnation and when the row was created (ms).
    * null = no project has this id. THROWS when the registry cannot be read (then nothing is resumed or started).
@@ -1254,7 +1258,7 @@ async function pump(sid: string): Promise<void> {
     }
     if (out.kind === 'delivered') {
       crashPoint('delivered');
-      try { wiring.announce(sid, { t: 'outbox-turn', sessionId: sid, text: prompt, ids: batch.map((r) => r.id), ...(head.attachments ? { attachments: head.attachments } : {}) }); } catch { /* a tab that misses it reads the transcript */ }
+      try { wiring.announce(sid, { t: 'outbox-turn', sessionId: sid, text: prompt, ids: batch.map((r) => r.id), ...(out.uuid ? { uuid: out.uuid } : {}), ...(head.attachments ? { attachments: head.attachments } : {}) }); } catch { /* a tab that misses it reads the transcript */ }
     }
   } finally {
     box.reserved = false;

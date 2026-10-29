@@ -526,6 +526,8 @@ export type ClientCommand =
       type: 'start';
       projectId: string;
       prompt: string;
+      /** BUG-278 — the client-minted identity uuid for this start's first turn (when it carries a prompt). */
+      uuid?: string;
       resumeSessionId?: string;
       fork?: boolean;
       templateIds?: string[];
@@ -566,6 +568,14 @@ export type ClientCommand =
        * refused (never a neighbour's). Optional: an older client omits it.
        */
       sendId?: string;
+      /**
+       * BUG-278 — the client-minted identity uuid for this send's user turn.
+       * Validated (and replaced if malformed/duplicate) server-side; the resolved
+       * value is echoed on the ack so the client binds its optimistic bubble to
+       * the identity the transcript entry carries. Optional: an older client omits
+       * it and the server mints one.
+       */
+      uuid?: string;
     }
   | { type: 'interrupt' }
   | { type: 'approval-response'; requestId: string; allow: boolean; message?: string }

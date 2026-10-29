@@ -6147,6 +6147,7 @@ function runNewSessionStart(a: {
   project: reg.Project;
   prompt: string;
   attachments?: AttachmentRef[]; // FEAT-177 — first-turn attachments
+  firstUuid?: string; // BUG-278 — the first turn's client identity uuid
   instructions?: { templateId: string; enabled: boolean }[];
   overrides?: Parameters<typeof startSession>[0]['overrides'];
   /** BUG-255 r4 — the new session's account pick, its initial binding (never an override). */
@@ -6181,6 +6182,7 @@ function runNewSessionStart(a: {
     project: a.project,
     firstPrompt: a.prompt,
     firstAttachments: a.attachments, // FEAT-177
+    firstUuid: a.firstUuid, // BUG-278
     instructions: a.instructions,
     overrides: a.overrides,
     ...(a.initialBinding ? { initialBinding: a.initialBinding } : {}),
@@ -6327,25 +6329,28 @@ const outboxWiring: OutboxWiring = {
       const instructions = resume.templateIds ? resume.templateIds.map((templateId) => ({ templateId, enabled: true })) : undefined;
       const row = startRowOf(sid);
       const run = runNewSessionStart({ project, prompt, attachments, instructions, overrides: split.overrides, initialBinding: split.initialBinding, onEvent: () => {}, startRow: row ? { box: sid, ...row } : null, settle: false });
-      try { (await run.session).detach(); } catch { /* the outcome says what happened */ }
+      let startedUuid: string | undefined;
+      try { const sess = await run.session; startedUuid = sess.firstUuid ?? undefined; sess.detach(); } catch { /* the outcome says what happened */ }
       const out = await run.outcome;
       if (out.kind === 'delivered') console.log(`[orchard] BUG-253: outbox started session ${out.startedAs} with a first message that had not started one (${sid})`);
-      return out;
+      // BUG-278 — carry the first turn's minted identity so the outbox-turn bubble is reconcilable.
+      return out.kind === 'delivered' ? { ...out, uuid: startedUuid } : out;
     }
     if (go.route === 'bridge' || go.route === 'strand') {
       const live = go.ctx as AgentSession;
-      try { live.send(prompt, attachments); } catch (err) {
+      let sent: { delivered: boolean; queued: boolean; uuid: string };
+      try { sent = live.send(prompt, attachments); } catch (err) {
         const e = err as Error & { retryable?: boolean; code?: string };
         if (e.code === 'rebuild-hold') return { kind: 'refused', hold: { kind: 'rebuild', text: e.message }, retryMs: 2000 }; // FEAT-175
         if (e.retryable) return { kind: 'refused', hold: { kind: 'adopting', text: e.message }, retryMs: 3000 };
         if (live.closed) return { kind: 'refused', hold: { kind: 'closing', text: 'the session just ended — resuming it' }, retryMs: 300 };
         return { kind: 'failed', reason: `the session would not take it (${e.message})` };
       }
-      return { kind: 'delivered', via: go.route };
+      return { kind: 'delivered', via: go.route, uuid: sent.uuid }; // BUG-278
     }
     if (go.route === 'gated') {
       const r = await (go.ctx as AgentSession).sendGated(prompt, attachments);
-      if (r.outcome === 'delivered') return { kind: 'delivered', via: 'gated' };
+      if (r.outcome === 'delivered') return { kind: 'delivered', via: 'gated', uuid: r.uuid }; // BUG-278
       if (r.outcome === 'refused') return { kind: 'refused', hold: { kind: 'adopting', text: r.message, ...(r.drain ? { drain: r.drain } : {}) }, retryMs: 3000 };
       return { kind: 'uncertain', reason: `${r.message}` };
     }
@@ -6388,10 +6393,11 @@ const outboxWiring: OutboxWiring = {
         overrides,
         onEvent: (e) => { if (e.t === 'error') lastError = e as typeof lastError; },
       });
+      const resumedUuid = s.firstUuid ?? undefined; // BUG-278 — the resumed turn's identity
       s.detach();
       outboxResumeFailures.delete(sid);
       console.log(`[orchard] BUG-217: outbox resumed session ${sid} (no tab driving) to deliver queued messages`);
-      return { kind: 'delivered', via: 'resume' };
+      return { kind: 'delivered', via: 'resume', uuid: resumedUuid };
     } catch (err) {
       if ((err as { mayHaveSpawned?: boolean }).mayHaveSpawned) {
         return { kind: 'uncertain', reason: `starting the session failed after it may have taken the message (${(err as Error).message}) — check the conversation, then Send anyway or Discard` };
@@ -6463,7 +6469,53 @@ const wss = new WebSocketServer({
   },
 });
 
+/*
+ * BUG-278 — WS KEEPALIVE. Without it, a stateful middlebox (carrier NAT, the
+ * tailscale `serve` proxy) silently EVICTS an idle flow during a quiet subagent
+ * turn: it stops forwarding but sends no FIN/RST, so both ends still believe the
+ * socket is open (half-open). The final event of the turn is then emitted to a
+ * sink nobody reads and lost from the live view until a reload — the exact
+ * reported symptom. A periodic ping/pong keeps bytes crossing the middlebox in
+ * both directions so an idle flow is never evicted (the reported socket stays
+ * alive end-to-end and the final reply is delivered live), AND it detects a
+ * genuinely dead client — a socket that misses a whole ping cycle without a
+ * pong is terminated, which routes through `ws.on('close')` → `releaseSocketSession`
+ * and DETACHES a busy session (the work survives; only the dead socket is
+ * reaped). So keepalive never keeps a dead client attached forever.
+ *
+ * `CLAUDE_STATION_WS_PING_MS` tunes the period (default 15000; comfortably under
+ * common NAT idle timeouts); 0 disables it — the verification harness pins it to
+ * reproduce the pre-fix loss. This is transport only: the one-driver sink model
+ * (BUG-149) is unchanged, so it is forward-compatible with a future multi-client
+ * fan-out (FEAT-197) without building any of it.
+ */
+const WS_PING_MS = (() => {
+  const raw = process.env.CLAUDE_STATION_WS_PING_MS;
+  if (raw == null || raw === '') return 15_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 15_000;
+})();
+const wsKeepalive = WS_PING_MS > 0
+  ? setInterval(() => {
+      for (const ws of wss.clients) {
+        const w = ws as WebSocket & { isAlive?: boolean };
+        if (w.readyState !== w.OPEN) continue;
+        // Missed the previous cycle with no pong → genuinely dead. Terminate it;
+        // the close handler detaches a busy session so the work is not lost.
+        if (w.isAlive === false) { try { w.terminate(); } catch { /* already gone */ } continue; }
+        w.isAlive = false;
+        try { w.ping(); } catch { /* raced a terminate between the check and the ping */ }
+      }
+    }, WS_PING_MS)
+  : null;
+wsKeepalive?.unref();
+
 wss.on('connection', (ws: WebSocket) => {
+  // BUG-278 — the keepalive's liveness flag. A `pong` (or a fresh connection)
+  // marks the socket live for the next cycle; a missed cycle terminates it.
+  const wsLive = ws as WebSocket & { isAlive?: boolean };
+  wsLive.isAlive = true;
+  ws.on('pong', () => { wsLive.isAlive = true; });
   accountFactSockets.add(ws); // BUG-255 r2 — every tab's socket hears every account-fact change
   let session: AgentSession | null = null;
   /** BUG-253: the start boxes this socket minted (its tab shows their "starting…" itself while it is open). */
@@ -6572,6 +6624,11 @@ wss.on('connection', (ws: WebSocket) => {
           if (session || starting || (delivery && !delivery.done)) return send({ t: 'error', message: 'this socket already has a session', fatal: false });
           const project = reg.getProject(cmd.projectId);
           if (!project) return send({ t: 'error', message: `no project ${cmd.projectId}`, fatal: true });
+          // BUG-278 — the client's identity uuid for this start's first turn (when
+          // it carries a prompt). Threaded into startSession / the reattach send so
+          // the first user entry's transcript uuid is the one the client's bubble
+          // carries; the ack echoes the resolved value.
+          const startUuid = typeof cmd.uuid === 'string' ? cmd.uuid : undefined;
           // FEAT-177 — resolve first-message attachments against this project's blob store (server-owned).
           let startAttachments: AttachmentRef[];
           try { startAttachments = resolveRefs(project.id, cmd.attachments); }
@@ -6916,7 +6973,7 @@ wss.on('connection', (ws: WebSocket) => {
                 deliveryInFlight.set(sid, token);
                 starting = true;
                 const live = running;
-                void live.sendGated(prompt)
+                void live.sendGated(prompt, undefined, startUuid) // BUG-278
                   .then((r) => {
                     if (r.outcome === 'refused') return send({ t: 'error', fatal: false, retryable: true, message: r.message, drain: r.drain });
                     if (r.outcome === 'uncertain') return send({ t: 'error', fatal: false, uncertain: true, message: r.message });
@@ -6924,7 +6981,9 @@ wss.on('connection', (ws: WebSocket) => {
                     // treats the silent attempt as unconfirmed (never resent).
                     if (closedEarly) return;
                     if (live.closed) return send({ t: 'error', fatal: false, uncertain: true, message: 'the message was handed to the session, which then ended before this tab could re-attach — it is not resent automatically; check the transcript before sending it again' });
-                    reattach(live, { promptDelivered: true });
+                    // BUG-278 — echo the resolved send identity so the client re-stamps its
+                    // optimistic first bubble if the server replaced a malformed/duplicate uuid.
+                    reattach(live, { promptDelivered: true, uuid: r.uuid });
                   })
                   .catch((err) => { send({ t: 'error', fatal: false, uncertain: true, message: `the delivery could not be confirmed (${(err as Error).message}) — it is not resent automatically; check the transcript before sending it again` }); })
                   .finally(() => {
@@ -6933,23 +6992,41 @@ wss.on('connection', (ws: WebSocket) => {
                   });
                 return;
               }
-              reattach(running);
-              if (prompt) {
-                if (running.busy) {
-                  // Verified mid-flight (see the refusal belt above) — the honest
-                  // "later", now with the evidence that backs it named out loud.
-                  send({
-                    t: 'status',
-                    status: `re-attached mid-turn — the running work continues (${running.livenessVerdict().reason}); deliver your message at the next pause`,
-                  });
-                } else {
-                  try { running.send(prompt); } catch (err) {
-                    const e = err as Error & { retryable?: boolean; code?: string };
-                    // FEAT-175: a rebuild hold is retryable — the tab queues the prompt instead of losing it.
-                    if (e.retryable) send({ t: 'error', message: e.message, fatal: false, retryable: true, ...(e.code === 'rebuild-hold' ? { code: 'rebuild-hold' as const } : {}) });
-                    else send({ t: 'error', message: e.message, fatal: false });
-                  }
+              /*
+               * BUG-278 r14 — a reattach carrying a prompt into an IDLE session
+               * resolves its send identity FIRST (running.send), THEN reattaches
+               * echoing the RESOLVED uuid, so a replayed/duplicate id the seeded
+               * uniqueness guard REPLACES is reported back and the client rebinds
+               * its optimistic bubble (r13 wrongly assumed the client's fresh v4
+               * is always kept verbatim; the seeded guard can now replace it). The
+               * send is enqueued synchronously before attach, so the turn's own
+               * frames (emitted on a later tick) still reach the newly-attached
+               * sink — this mirrors the gated path, which also resolves then
+               * reattaches with r.uuid. A BUSY session takes no send (status only);
+               * a promptless or failed send needs no echo.
+               */
+              if (prompt && !running.busy) {
+                let sent: { delivered: boolean; queued: boolean; uuid: string };
+                try { sent = running.send(prompt, undefined, startUuid); }
+                catch (err) {
+                  reattach(running);
+                  const e = err as Error & { retryable?: boolean; code?: string };
+                  // FEAT-175: a rebuild hold is retryable — the tab queues the prompt instead of losing it.
+                  if (e.retryable) send({ t: 'error', message: e.message, fatal: false, retryable: true, ...(e.code === 'rebuild-hold' ? { code: 'rebuild-hold' as const } : {}) });
+                  else send({ t: 'error', message: e.message, fatal: false });
+                  return;
                 }
+                reattach(running, startUuid && sent.uuid !== startUuid ? { uuid: sent.uuid } : {});
+                return;
+              }
+              reattach(running);
+              if (prompt && running.busy) {
+                // Verified mid-flight (see the refusal belt above) — the honest
+                // "later", now with the evidence that backs it named out loud.
+                send({
+                  t: 'status',
+                  status: `re-attached mid-turn — the running work continues (${running.livenessVerdict().reason}); deliver your message at the next pause`,
+                });
               }
               return;
             }
@@ -7171,6 +7248,7 @@ wss.on('connection', (ws: WebSocket) => {
           (startRow
             ? runNewSessionStart({
               project, prompt: cmd.prompt, attachments: startAttachments, instructions, overrides, initialBinding, onEvent: send,
+              firstUuid: startUuid, // BUG-278
               // FEAT-175: a start waiting for a git-grant container rebuild is dropped before admission if this socket closes.
               abandoned: () => closedEarly,
               startRow, settle: true,
@@ -7179,6 +7257,7 @@ wss.on('connection', (ws: WebSocket) => {
               project,
               firstPrompt: cmd.prompt,
               firstAttachments: startAttachments, // FEAT-177
+              firstUuid: startUuid, // BUG-278
               resumeSessionId: cmd.resumeSessionId,
               fork: cmd.fork,
               resumeEncodedDir: cmd.resumeEncodedDir,
@@ -7200,6 +7279,7 @@ wss.on('connection', (ws: WebSocket) => {
                 t: 'ack',
                 of: 'start',
                 stationSessionId: s.id,
+                uuid: s.firstUuid ?? undefined, // BUG-278 — the first turn's resolved identity
                 isolation: project.isolation,
                 containerName: s.containerName,
                 instructionMode: s.composed.mode,
@@ -7275,6 +7355,10 @@ wss.on('connection', (ws: WebSocket) => {
            * bubble for a message that was never delivered.
            */
           const sendId = typeof cmd.sendId === 'string' ? cmd.sendId : undefined;
+          // BUG-278 — the client's send-identity uuid. Validated + replaced-if-dup
+          // by the session; the resolved value is echoed on the ack so the client
+          // binds its optimistic bubble to the identity actually in flight.
+          const clientUuid = typeof cmd.uuid === 'string' ? cmd.uuid : undefined;
           // FEAT-177: resolve attachment references against this session's project store (server owns
           // media type / size / path) and refuse LOUDLY up front if the engine cannot take an image —
           // never a silent text-only send. A missing blob also fails here, before any turn opens.
@@ -7304,9 +7388,9 @@ wss.on('connection', (ws: WebSocket) => {
             }
             const token = Symbol('delivery');
             if (sid) deliveryInFlight.set(sid, token);
-            void session.sendGated(cmd.prompt, sendAttachments)
+            void session.sendGated(cmd.prompt, sendAttachments, clientUuid)
               .then((r) => {
-                if (r.outcome === 'delivered') return send({ t: 'ack', of: 'send', delivered: true, queued: false, sendId });
+                if (r.outcome === 'delivered') return send({ t: 'ack', of: 'send', delivered: true, queued: false, sendId, uuid: r.uuid });
                 if (r.outcome === 'refused') return send({ t: 'error', fatal: false, retryable: true, of: 'send', sendId, message: r.message, drain: r.drain });
                 return send({ t: 'error', fatal: false, uncertain: true, of: 'send', sendId, message: r.message });
               })
@@ -7314,15 +7398,15 @@ wss.on('connection', (ws: WebSocket) => {
               .finally(() => { if (sid && deliveryInFlight.get(sid) === token) deliveryInFlight.delete(sid); });
             return;
           }
-          let sent: { delivered: boolean; queued: boolean };
+          let sent: { delivered: boolean; queued: boolean; uuid: string };
           try {
-            sent = session.send(cmd.prompt, sendAttachments);
+            sent = session.send(cmd.prompt, sendAttachments, clientUuid);
           } catch (err) {
             const e = err as Error & { retryable?: boolean; drain?: unknown; code?: string };
             if (e.retryable) return send({ t: 'error', fatal: false, retryable: true, of: 'send', sendId, message: e.message, drain: e.drain as never, ...(e.code === 'rebuild-hold' ? { code: 'rebuild-hold' as const } : {}) });
             throw err;
           }
-          return send({ t: 'ack', of: 'send', delivered: sent.delivered, queued: sent.queued, sendId });
+          return send({ t: 'ack', of: 'send', delivered: sent.delivered, queued: sent.queued, sendId, uuid: sent.uuid });
         }
         case 'interrupt':
           if (!session) return send({ t: 'error', message: 'no session on this socket', fatal: false });
@@ -8129,6 +8213,7 @@ async function shutdown(signal: string): Promise<void> {
   } catch {
     /* best effort — never block shutdown on this */
   }
+  if (wsKeepalive) clearInterval(wsKeepalive); // BUG-278 — stop the keepalive before closing
   wss.close();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 3000).unref();

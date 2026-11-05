@@ -89,7 +89,7 @@ import { snapshotOfSession, type RunningSnapshot } from './running-set.ts';
 import * as outcomes from './outcomes.ts';
 import * as requests from './requests.ts';
 import { ensureUnifiedMemoryDir } from './memories.ts';
-import { TranscriptRecorder, resolveOrchardSessionFile, resumeProviderOf, collectTranscriptUuids, mirrorClaudeStore, CLAUDE_MIRROR_PROVIDER } from './orchard-transcripts.ts';
+import { TranscriptRecorder, resolveOrchardSessionFile, resumeProviderOf, collectTranscriptUuids, transcriptFilesFor, TranscriptUuidTailer, mirrorClaudeStore, CLAUDE_MIRROR_PROVIDER } from './orchard-transcripts.ts';
 import { encodeCwd, defaultRoot as transcriptStoreRoot } from '../lib/session-history.ts';
 import { spawnLaneSnapshot } from '../../scripts/lib/lane-snapshot.mjs';
 import { recordSessionProvenance } from '../lib/session-provenance.mjs';
@@ -713,6 +713,27 @@ export class AgentSession {
    * reused id is simply replaced.
    */
   #sentUuids = new Set<string>();
+  /**
+   * BUG-278 r15 — the incremental on-disk uuid catch-up for `#sentUuids`. Before
+   * a send's uuid is checked, this rereads only the bytes appended to the
+   * session's transcript file(s) since the last send and marks their uuids taken,
+   * so an OUT-OF-BAND append (the native Claude CLI's own store write, a
+   * named-account overlay, or any external writer) that fired neither the
+   * recorder's `onEntry` nor a streamed frame cannot be replayed into a duplicate.
+   */
+  #uuidTailer = new TranscriptUuidTailer();
+  /**
+   * BUG-278 r15 — the encoded store dir the resume was addressed with (if any),
+   * kept so the send-time catch-up resolves the SAME file the resume seed did.
+   */
+  #resumeEncodedDir: string | null = null;
+  /**
+   * BUG-278 r15 — the native Claude store root of a NAMED-account launch
+   * (`<CLAUDE_CONFIG_DIR>/projects`), null for the default account. A named
+   * account's transcript lives under this overlay, not the default root, so the
+   * catch-up must look there too. Set when the launch account dir is resolved.
+   */
+  #accountStoreRoot: string | null = null;
   #emit: (e: StationEvent) => void;
   #pump: Promise<void> | null = null;
   /** Declared provenance for this session; recorded at init. Default 'user'. */
@@ -1271,6 +1292,9 @@ export class AgentSession {
     this.#emit = opts.onEvent;
     this.#startedBy = opts.startedBy ?? 'user';
     this.#firstPromptHooks = opts.firstPromptHooks ?? null;
+    // BUG-278 r15 — remember the resume's store dir so the send-time uuid
+    // catch-up resolves the same file the resume seed read from.
+    this.#resumeEncodedDir = opts.resumeEncodedDir ?? null;
 
     const refs = opts.instructions ?? opts.project.settings.instructions ?? [];
     // FEAT-039 gap #1: fold this project's docs/CONVENTIONS.md (if any) onto the
@@ -1968,6 +1992,10 @@ export class AgentSession {
         ? resolveLaunchAccountDir((s as Overridable).claudeAccount)
         : null;
       const accountEnv: Record<string, string> = accountDir ? { CLAUDE_CONFIG_DIR: accountDir } : {};
+      // BUG-278 r15 — a named account writes its Claude store under its own
+      // CLAUDE_CONFIG_DIR overlay (`<dir>/projects`), which the default root never
+      // sees; record it so the send-time uuid catch-up reads that store too.
+      this.#accountStoreRoot = accountDir ? path.join(accountDir, 'projects') : null;
       const dispatchEnv: Record<string, string> = dispatchOn && !opts.dispatchUnavailableReason ? {
         ORCHARD_DISPATCH_ENTITLED: '1',
         ORCHARD_DISPATCH_SOCK: opts.project.isolation === 'container' ? dispatchBroker.CONTAINER_DISPATCH_SOCKET : dispatchBroker.dispatchSocketPath(opts.project),
@@ -2177,9 +2205,44 @@ export class AgentSession {
    * handed an id an assistant turn already took, on either engine.
    */
   #resolveSendUuid(uuid?: string): string {
+    // BUG-278 r15 — catch the guard up with any OUT-OF-BAND appends on disk
+    // BEFORE the uniqueness check, so a replayed uuid already written by the
+    // engine's own store, a named-account overlay, or an external writer (none of
+    // which fire onEntry or a streamed frame) is still rejected and reminted.
+    this.#catchUpSentUuids();
     const chosen = isCanonicalUuid(uuid) && !this.#sentUuids.has(uuid) ? uuid : randomUUID();
     this.#sentUuids.add(chosen);
     return chosen;
+  }
+
+  /**
+   * BUG-278 r15 — reread, at O(new bytes), the transcript file(s) this session
+   * writes to and mark every newly seen uuid taken. Covers each store the id can
+   * live in: the Orchard-owned transcript (codex / persistedTranscript=false, also
+   * known directly via the recorder's own file path), the native Claude store, and
+   * a named-account CLAUDE_CONFIG_DIR overlay. Resolution reuses the one owner
+   * (`transcriptFilesFor`, ARCH-010) so this and the resume seed cannot disagree.
+   * Entirely best-effort: a missing id just falls back to the in-memory guard.
+   */
+  #catchUpSentUuids(): void {
+    try {
+      const sid = this.sdkSessionId ?? this.resumeOf;
+      const files = new Set<string>();
+      // The recorder owns the exact codex/Orchard file path — add it directly so
+      // a dir-encoding mismatch can never hide the session's own transcript.
+      const recorderFile = this.#recorder?.filePath;
+      if (recorderFile) files.add(recorderFile);
+      if (sid) {
+        const dirCandidates = resumeDirCandidates(this.project, this.#resumeEncodedDir);
+        dirCandidates.push(this.storeEncodedDir);
+        const extraRoots = this.#accountStoreRoot ? [this.#accountStoreRoot] : [];
+        for (const f of transcriptFilesFor(dirCandidates, sid, extraRoots)) files.add(f);
+      }
+      if (files.size === 0) return;
+      for (const u of this.#uuidTailer.catchUp(files)) this.#sentUuids.add(u);
+    } catch {
+      // never let the guard's catch-up break a send — the per-session set applies
+    }
   }
 
   /**

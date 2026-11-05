@@ -36,7 +36,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 
 import * as hist from '../lib/session-history.ts';
 import { dataDir } from '../lib/paths.ts';
@@ -128,16 +128,13 @@ export function resumeProviderOf(dirCandidates: string[], sessionId: string): st
  * (user AND assistant) carries a `uuid`, and all are collected: the guard must
  * not hand a NEW send an id already minted for an assistant turn either.
  */
-export function collectTranscriptUuids(dirCandidates: string[], sessionId: string): Set<string> {
+export function collectTranscriptUuids(
+  dirCandidates: string[],
+  sessionId: string,
+  extraRoots: string[] = [],
+): Set<string> {
   const out = new Set<string>();
-  const files = new Set<string>();
-  for (const d of new Set(dirCandidates)) {
-    const orchard = resolveOrchardSessionFile(d, sessionId);
-    if (orchard) files.add(orchard.filePath);
-    const claude = hist.resolveSessionFile(d, sessionId); // default root = native Claude store
-    if (claude) files.add(claude);
-  }
-  for (const file of files) {
+  for (const file of transcriptFilesFor(dirCandidates, sessionId, extraRoots)) {
     let text: string;
     try {
       text = fs.readFileSync(file, 'utf8');
@@ -156,6 +153,223 @@ export function collectTranscriptUuids(dirCandidates: string[], sessionId: strin
     }
   }
   return out;
+}
+
+/**
+ * BUG-278 r15 — the SINGLE owner of "which on-disk files hold this session's
+ * entries" (ARCH-010), shared by the whole-file resume seed
+ * (`collectTranscriptUuids`) and the incremental send-time catch-up
+ * (`TranscriptUuidTailer`). A session id can live in EITHER store, so both are
+ * resolved against every dir candidate:
+ *   - the Orchard-owned transcripts (Codex / persistedTranscript=false), via
+ *     `resolveOrchardSessionFile` (its own provider roots);
+ *   - the native Claude CLI store, via `hist.resolveSessionFile` at the default
+ *     root, PLUS any `extraRoots` — a named-account launch overlays
+ *     CLAUDE_CONFIG_DIR, whose store is a SEPARATE `<configDir>/projects` tree
+ *     the default root never sees, so the account's own transcript is covered.
+ * Resolution is by existence (a path only joins the set once its file exists),
+ * so a tailer re-resolving each pass picks a store file up the moment it appears.
+ */
+export function transcriptFilesFor(
+  dirCandidates: string[],
+  sessionId: string,
+  extraRoots: string[] = [],
+): Set<string> {
+  const files = new Set<string>();
+  for (const d of new Set(dirCandidates)) {
+    const orchard = resolveOrchardSessionFile(d, sessionId);
+    if (orchard) files.add(orchard.filePath);
+    const claude = hist.resolveSessionFile(d, sessionId); // default root = native Claude store
+    if (claude) files.add(claude);
+    for (const root of extraRoots) {
+      if (!root) continue;
+      const overlay = hist.resolveSessionFile(d, sessionId, { root });
+      if (overlay) files.add(overlay);
+    }
+  }
+  return files;
+}
+
+interface TailState {
+  /** Bytes already consumed (always ends on a line boundary). */
+  offset: number;
+  /** The file's inode at the last read — a change means rotation/replacement. */
+  inode: bigint;
+  /** File size observed at the last read. */
+  size: number;
+  /** Modification time (ns) at the last read — a move means the file was written. */
+  mtimeNs: bigint;
+  /** Change time (ns) at the last read — moves on content OR metadata change. */
+  ctimeNs: bigint;
+  /**
+   * BUG-278 r16 — a fingerprint of the CONSUMED prefix `[0, offset)`: a hash of
+   * its first 4 KiB and its last 4 KiB (the whole prefix when it is <= 8 KiB).
+   * Lets a same-inode in-place rewrite — a copytruncate that regrows PAST the
+   * old offset, or a same-SIZE rewrite — be caught: if ino/ctime/mtime moved the
+   * prefix is re-fingerprinted, and a mismatch forces a full rescan. Bounded to
+   * an 8 KiB read, so catch-up stays O(new bytes + 8 KiB).
+   */
+  fingerprint: string;
+}
+
+/** BUG-278 r16 — bytes of the consumed prefix sampled into the fingerprint (each end). */
+const FINGERPRINT_SAMPLE = 4096;
+
+/**
+ * BUG-278 r16 — fingerprint the consumed prefix `[0, len)` of an open fd: a hash
+ * of its first `FINGERPRINT_SAMPLE` bytes and its last `FINGERPRINT_SAMPLE` bytes
+ * (the whole prefix when it is <= 2*sample), with `len` mixed in. Reads at most
+ * 8 KiB regardless of file size, keeping catch-up O(new bytes + 8 KiB). A short
+ * read (the file shrank under us) yields a DIFFERENT hash than the full prefix
+ * would, so it is treated as a mismatch → the caller full-rescans (the safe side).
+ */
+function fingerprintPrefix(fd: number, len: number): string {
+  const h = createHash('sha256');
+  h.update(`${len}:`);
+  if (len <= 0) return h.digest('hex');
+  if (len <= 2 * FINGERPRINT_SAMPLE) {
+    const buf = Buffer.alloc(len);
+    const got = readFullAt(fd, buf, len, 0);
+    h.update(buf.subarray(0, got));
+    return h.digest('hex');
+  }
+  const head = Buffer.alloc(FINGERPRINT_SAMPLE);
+  const gotH = readFullAt(fd, head, FINGERPRINT_SAMPLE, 0);
+  h.update(head.subarray(0, gotH));
+  const tail = Buffer.alloc(FINGERPRINT_SAMPLE);
+  const gotT = readFullAt(fd, tail, FINGERPRINT_SAMPLE, len - FINGERPRINT_SAMPLE);
+  h.update(tail.subarray(0, gotT));
+  return h.digest('hex');
+}
+
+/**
+ * BUG-278 r15 — INCREMENTAL on-disk uuid catch-up for the send-identity guard.
+ *
+ * THE EDGE (OpenAI IV run 01a1aa23): `AgentSession.#sentUuids` is seeded from the
+ * transcript at resume and kept current from the server's OWN appends — the
+ * Orchard recorder's `onEntry`, and the streamed Claude frames in `#handle`. An
+ * OUT-OF-BAND append fires NEITHER: the native Claude CLI writing its store, a
+ * named-account overlay, or any external writer. A send replaying a uuid already
+ * on disk but absent from the in-memory set was then adopted verbatim and WRITTEN
+ * A SECOND TIME — one identity, two entries, exactly the r14 break reopened one
+ * level down.
+ *
+ * THE FIX (close by construction, ARCH-010): at the moment a send's uuid is
+ * checked, the guard first catches up with the transcript ON DISK. This tailer
+ * remembers, per watched file, a byte offset and the file's inode, and on each
+ * pass reads ONLY the bytes appended since last time — O(new bytes) per send, not
+ * O(file). The ids of the newly completed lines are returned so the caller adds
+ * them to the guard before it checks.
+ *
+ * Truncation/rotation safety (BUG-278 r16): alongside the offset the tailer keeps
+ * (ino, size, mtimeNs, ctimeNs) AND a fingerprint of the already-consumed prefix
+ * (a hash of its first 4 KiB + last 4 KiB). On each pass, if ino/ctime/mtime
+ * moved, the prefix is re-fingerprinted from the CURRENT file; if the fingerprint
+ * no longer matches — OR the size is below the saved offset — a FULL rescan from 0
+ * is done. This catches the cases a bare `size < offset` check missed: a
+ * copytruncate rotation that regrows PAST the old offset (same inode, size back
+ * above offset), and a same-SIZE in-place rewrite (size unchanged). An ordinary
+ * append moves mtime but leaves the prefix intact, so its fingerprint still
+ * matches and only the new bytes are read. Full rescan over-reads known ids, which
+ * is harmless — re-adding an id is a no-op, missing one is the bug.
+ * Concurrency safety: only COMPLETE lines (through the last newline in the new
+ * bytes) are consumed; a half-written trailing line is left unconsumed and reread
+ * once the writer finishes it, so a line being appended as we read is never
+ * mis-parsed and never skipped. Every read is best-effort — a missing/unreadable
+ * file just falls back to the per-session guard, never worse than r14.
+ */
+export class TranscriptUuidTailer {
+  #states = new Map<string, TailState>();
+
+  /** Read each file's new bytes; return every uuid in the newly completed lines. */
+  catchUp(files: Iterable<string>): Set<string> {
+    const out = new Set<string>();
+    for (const file of files) {
+      try {
+        this.#catchUpFile(file, out);
+      } catch {
+        // best-effort: a missed id falls back to the per-session guard
+      }
+    }
+    return out;
+  }
+
+  #catchUpFile(file: string, out: Set<string>): void {
+    let st: fs.BigIntStats;
+    try {
+      st = fs.statSync(file, { bigint: true });
+    } catch {
+      return; // missing/unreadable — reread when it appears; state is kept as-is
+    }
+    if (!st.isFile()) return;
+    const ino = st.ino;
+    const size = Number(st.size);
+    const mtimeNs = st.mtimeNs;
+    const ctimeNs = st.ctimeNs;
+    const prev = this.#states.get(file);
+
+    // One fd for the whole pass: the fingerprint check AND the new-bytes read.
+    const fd = fs.openSync(file, 'r');
+    try {
+      let offset = prev ? prev.offset : 0;
+      // Decide whether the already-consumed prefix is still intact.
+      // - No prior state → start at 0.
+      // - Shrunk below the saved offset → rewritten/truncated → rescan from 0.
+      // - ino/ctime/mtime moved → the file was written; re-fingerprint the prefix
+      //   `[0, offset)` from the CURRENT bytes. A mismatch means the consumed
+      //   prefix itself changed (copytruncate regrow past offset, or a same-size
+      //   in-place rewrite) → rescan from 0. A match means an ordinary append
+      //   left the prefix intact → keep the offset, read only the new bytes.
+      // - Nothing moved → prefix intact by construction; keep the offset.
+      if (!prev || ino !== prev.inode || size < offset) {
+        offset = 0;
+      } else if (mtimeNs !== prev.mtimeNs || ctimeNs !== prev.ctimeNs || size !== prev.size) {
+        if (fingerprintPrefix(fd, offset) !== prev.fingerprint) offset = 0;
+      }
+
+      if (size <= offset) {
+        // Up to date (or fully consumed). Re-fingerprint only when we rescanned
+        // to 0 with nothing to read; otherwise the stored prefix is unchanged.
+        const fingerprint = offset === 0 ? fingerprintPrefix(fd, 0) : (prev as TailState).fingerprint;
+        this.#states.set(file, { offset, inode: ino, size, mtimeNs, ctimeNs, fingerprint });
+        return;
+      }
+
+      const want = size - offset;
+      const buf = Buffer.alloc(want);
+      const read = readFullAt(fd, buf, want, offset);
+      const text = buf.toString('utf8', 0, read);
+      const lastNl = text.lastIndexOf('\n');
+      if (lastNl < 0) {
+        // No complete line in the new bytes yet — leave them all unconsumed. The
+        // consumed prefix is still `[0, offset)`, so re-fingerprint only on a rescan.
+        const fingerprint = prev && offset === prev.offset ? prev.fingerprint : fingerprintPrefix(fd, offset);
+        this.#states.set(file, { offset, inode: ino, size, mtimeNs, ctimeNs, fingerprint });
+        return;
+      }
+      const complete = text.slice(0, lastNl); // the trailing partial line is excluded
+      for (const line of complete.split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        try {
+          const o = JSON.parse(s) as { uuid?: unknown };
+          if (typeof o.uuid === 'string' && o.uuid) out.add(o.uuid);
+        } catch {
+          // a mid-window unparseable line — skip it like the collector does
+        }
+      }
+      // Advance only through the last newline; the partial line's bytes remain for
+      // next time. Computed in BYTES (the newline is ASCII, so the prefix is whole).
+      const consumed = Buffer.byteLength(text.slice(0, lastNl + 1), 'utf8');
+      const newOffset = offset + consumed;
+      // Fingerprint the newly-consumed prefix `[0, newOffset)` (an 8 KiB read) so
+      // the next pass can detect an in-place rewrite of these very bytes.
+      const fingerprint = fingerprintPrefix(fd, newOffset);
+      this.#states.set(file, { offset: newOffset, inode: ino, size, mtimeNs, ctimeNs, fingerprint });
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
 }
 
 /**

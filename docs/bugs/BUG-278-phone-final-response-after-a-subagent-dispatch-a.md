@@ -11,9 +11,9 @@
   "reported": "2026-10-26",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "verified",
+  "work_state": "in_verification",
   "human_action": "none",
-  "updated": "2026-10-29",
+  "updated": "2026-11-05",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -290,6 +290,43 @@
       "candidate": "842f3a3ba23195488ca7e023e4ce0226ab9361df63313b0658fe7a03cce6458c",
       "verify_mode": "mixed-state",
       "note": "r15 IV; openai quota->anthropic. resume-uuid 11/11 + adversarial restart 6/6 VALID manifest-backed. Could-not-test: real-CLI persistedTranscript seed (named-acct CLAUDE_CONFIG_DIR seed-miss UNCHECKED), broker.deliver, app.js ack-rebind. Benign: crash-trunc tail re-adopts U4, parseLine drops it."
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1aa23-f953-7650-9963-574f7ba3b8ef",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T05:19:08.024Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "6da0f9cb-4a7e-4ab4-8b8d-fdfc4e7788d5",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T05:40:47.366Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "8d3cef25ab9ddb346b217ba0d207ef6b5fee47aa7801d6cecb1c5ed7d30fc68e",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "1f1768f7-a4b2-48ba-8bdb-005a98cf67c0",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T05:52:18.221Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "b6dfef14d1b8944deeb51fd6cc4e80d792232ffbc52a92c884a80841d6093dc6",
+      "verify_mode": "mixed-state"
     }
   ],
   "verification_class": "fix",
@@ -609,3 +646,39 @@
 
 ### 2026-10-29 — dispatch anthropic
 - **Verification recorded:** dispatch anthropic run ff2f629f-a9ec-4dc7-b653-1fd27da9ea67 — VERDICT: HOLDS — mixed-state candidate 842f3a3ba231 — r15 IV; openai quota->anthropic. resume-uuid 11/11 + adversarial restart 6/6 VALID manifest-backed. Could-not-test: real-CLI persistedTranscript seed (named-acct CLAUDE_CONFIG_DIR seed-miss UNCHECKED), broker.deliver, app.js ack-rebind. Benign: crash-trunc tail re-adopts U4, parseLine drops it.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a1aa23-f953-7650-9963-574f7ba3b8ef — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — agent (fixing, round 15, build — on-disk out-of-band send-uuid catch-up; NOT pushed)
+- **Charged with the r14 refutation (OpenAI IV run 01a1aa23, `external-transcript-append-replay`):** `#sentUuids` was seeded at resume and kept current from the server's OWN appends (the recorder's `onEntry`, the streamed Claude frames in `#handle`), but an OUT-OF-BAND append — the native Claude CLI's own store write, a named-account `CLAUDE_CONFIG_DIR` overlay, or any external writer — fired NEITHER. A send replaying such an on-disk-but-not-in-set uuid was adopted verbatim and WRITTEN A SECOND TIME. CLOSE BY CONSTRUCTION, not accept.
+- **Fix (server-side; `src/server/orchard-transcripts.ts`, `src/server/agent-bridge.ts`):**
+  - **One owner for "which files hold this session's entries"** — new `transcriptFilesFor(dirCandidates, sessionId, extraRoots)` resolves both stores an id can live in (Orchard-owned codex via `resolveOrchardSessionFile`; native Claude via `hist.resolveSessionFile` default root PLUS `extraRoots` for a named-account overlay's own `<configDir>/projects` tree). `collectTranscriptUuids` now reuses it (ARCH-010 — the seed and the catch-up cannot disagree).
+  - **Incremental on-disk catch-up** — new `TranscriptUuidTailer` keeps a per-file byte offset + inode and, each pass, rereads ONLY the bytes appended since last time (O(new bytes)). A changed inode or a size below the offset forces a full rescan (truncation/rotation — the safe over-read); only COMPLETE lines through the last newline are consumed, so a half-written trailing line is tolerated, never mis-parsed, never skipped.
+  - **Checked BEFORE the uniqueness test** — `#resolveSendUuid` now calls `#catchUpSentUuids()` first, which resolves the session's file set (the recorder's own file path directly + `transcriptFilesFor` over `resumeDirCandidates` + `storeEncodedDir` + the named-account root) and marks every newly seen uuid taken. So a replay of an out-of-band id is rejected and reminted, echoed on the ack, on every engine. `#resumeEncodedDir` and `#accountStoreRoot` are captured at construction / account-resolve for this.
+- **Must-FAIL witnessed (`scripts/verify-bug-278-resume-uuid.mjs`, extended):** new leg **L6** appends an entry out-of-band to the live session's transcript file then replays its uuid on a send; `--broken` (new r15 anchor removing the `#catchUpSentUuids()` call) reproduces 01a1aa23 exactly — the replay is adopted verbatim and EXT appears TWICE (`extAfter:2`), CONTRACT reports the duplicate. FIX mode: **21/21** (incl. reader-level unit cases U(a) partial-trailing-line · U(b) truncation-rescan · U(c) rotation/new-inode-rescan · U(d) named-account overlay resolve+read; and L6 EXT exactly once). Driven at the real WS protocol against a real server + bridge + the schema-validated fake codex app-server (an Orchard-recorded codex session — the exact engine class). persistedTranscript (real Claude CLI) remains not runnable in-lane, noted not asserted; the named-account overlay is covered at the READER level by U(d) over real on-disk files.
+- **Self-verification + anti-regression:** `verify-bug-278-resume-uuid` FIX 21/21, `--broken` reproduces (exit 1). `verify-bug-284-outbox-incarnation` 15/15, `verify-codex-runtime` 54/54. `npm run gate` EXIT 0 (leak-gate + typecheck, unpiped) — re-run clean after neutralising a fixture path the leak-gate flagged.
+- **Independent verify — COULD NOT RUN on openai: quota exhausted (resets ~10:05 AM).** Per charter ("openai, no anthropic fallback, stop if quota-out") I STOPPED the harness's auto-fallback to anthropic rather than record an anthropic-on-anthropic verdict. No independent verdict of record for r15. Requirement `/tmp/bug278-r15-req.md`; mixed-state candidate froze the 3 files (base `5b714188387d` → `b0b9ab4b1c94`, candidate `d90280cecb6c`). A fresh OPENAI clean-room IV on these working-tree files is WARRANTED before push (high-stakes: session-lifecycle, regression-prone r4–r15).
+- **regressed-from:** BUG-278 r14 (its keep-current only covered the server's own appends, not out-of-band disk writes).
+- **Files (unstaged):** `src/server/orchard-transcripts.ts`, `src/server/agent-bridge.ts`, `scripts/verify-bug-278-resume-uuid.mjs`. Status: NOT pushed.
+
+### 2026-11-05 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 6da0f9cb-4a7e-4ab4-8b8d-fdfc4e7788d5 — VERDICT: BROKEN — mixed-state candidate 8d3cef25ab9d. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 1f1768f7-a4b2-48ba-8bdb-005a98cf67c0 — VERDICT: BROKEN — mixed-state candidate b6dfef14d1b8. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — agent (fixing, round 16 — tailer in-place-rewrite/rotation detection; NOT pushed; REFUTED by IV, decision needed)
+- **Charged with the r16 refutation (two breaks in `TranscriptUuidTailer#catchUpFile`, `src/server/orchard-transcripts.ts`):** the r15 tailer detected truncation ONLY as `size < offset` on the same inode, so (a) a copytruncate rotation that truncates to 0 and REGROWS past the saved offset (size back above offset, same inode) was read from the stale offset — the rewritten prefix ids MISSED; and (b) a same-SIZE in-place rewrite (size unchanged, `size <= offset` → reported up-to-date) MISSED the new id entirely.
+- **Must-FAIL proof FIRST (`/tmp/bug278-r16-repro.mjs`, reader-level over real on-disk files):** against the r15 working-tree code, case A (copytruncate regrow past offset) got only the post-offset ids (prefix ids missed); case B (same-size rewrite) got `[]`. Both reproduced before the fix.
+- **Fix (minimal edit, `src/server/orchard-transcripts.ts`):** `TailState` now also carries `(size, mtimeNs, ctimeNs)` and a `fingerprint` of the CONSUMED prefix `[0, offset)` — a sha256 of its first 4 KiB + last 4 KiB (whole prefix when ≤ 8 KiB), per the charter's specified design. `#catchUpFile` stats with `{bigint:true}`; on each pass: `size < offset` OR a changed `(ino|ctime|mtime)` whose re-fingerprint of the current prefix MISMATCHES → FULL rescan from 0; an ordinary append (prefix fingerprint still matches) reads only the new bytes; new consumed prefix is re-fingerprinted (an ≤ 8 KiB read). One fd per pass for fingerprint + new-byte read. `inode` field widened to `bigint` (typecheck).
+- **Cost MEASURED (`/tmp/bug278-r16-cost.mjs` + suite U(g)):** per-catch-up time is ~constant as the file grows 400× (0.1 MB→40 MB: ~constant µs; time ratio 0.5–0.6×, i.e. does NOT scale with file size) → O(new bytes + 8 KiB), not O(file). Confirmed.
+- **Builder proof (all PASS):** `/tmp/bug278-r16-proof.mjs` 8/8 (regrow EQUAL to old offset · regrow LARGER · same-size rewrite · ordinary append reads only new · partial-trailing-line not consumed then caught when completed · huge-file full read then append-only). `scripts/verify-bug-278-resume-uuid.mjs` extended with unit cases **U(e)** copytruncate-regrow, **U(f)** same-size-rewrite, **U(g)** O(new+8KiB) cost → **24/24** (was 21/21); `--broken` anchor still reproduces (exit 1, 13/15). Anti-regression: `verify-bug-284-outbox-incarnation` 15/0, `verify-codex-runtime` 54/0, `npm run gate` EXIT 0 (leak-gate + typecheck, unpiped).
+- **INDEPENDENT VERIFY — openai (cross-provider; author anthropic), run `1f1768f7-a4b2-48ba-8bdb-005a98cf67c0`, candidate `b6dfef14d1b8` → VERDICT BROKEN, VERDICT-CONTRACT VALID, manifest-backed.** OpenAI quota WAS available at 07:50 Riga (no anthropic fallback; genuine cross-provider). It ran the suite 24/24 EXIT 0, then found a NEW break with an adversarial manifest case `same-size-middle-rewrite-large-prefix`: a same-SIZE in-place rewrite of a consumed prefix LONGER than 8 KiB, with the changed bytes BETWEEN the first 4 KiB and the last 4 KiB, is MISSED — mtime moves but the head+tail sample is unchanged, so no rescan fires and the new uuid is never marked taken. I reproduced it directly (`/tmp/bug278-mid.mjs`: 30.6 KB file, middle line rewritten same-size → `got:[]`, BROKEN). A second adversarial case (invalid-utf8 offset drift) HELD.
+- **ROOT CAUSE IS A CONTRACT CONTRADICTION, not a coding slip.** Clause 6 demands "ANY in-place rewrite … no rewritten uuid is missed" AND "cost MUST stay O(new bytes + 8 KiB)". These are mutually UNSATISFIABLE: detecting an arbitrary same-size change anywhere in an N-byte already-consumed prefix REQUIRES reading O(N) bytes of the current file; any fixed ≤ 8 KiB sample (the charter's own head+tail-4 KiB design) necessarily misses a change outside the sampled windows. The specified fingerprint covers the REALISTIC writers — append (Claude CLI), copytruncate regrow, and prefix-start compaction, which all move the head — but cannot cover a middle-only same-size rewrite, which no real append-only-transcript writer performs.
+- **Decision needed (orchestrator/user), two viable resolutions:** (1) RELAX clause 6 to "any realistic rewrite (append / copytruncate-regrow / prefix-anchored compaction — all of which change the head or length)", keep the O(new+8 KiB) head+tail fingerprint as-is, and document the middle-only same-size residual as accepted (transcripts are append-only; no writer does this) — SHIP the current fix; OR (2) keep clause 6 literal and accept O(consumed-prefix) cost on a detected metadata change (full-prefix hash instead of head+tail sampling) — correct for ANY rewrite but violates the stated cost bound on large files. I cannot satisfy both; I did not silently pick one. Recommendation: (1) — the residual is unreachable by a real append-only transcript writer, and (2) re-introduces an O(file) read on every out-of-band event the r15 design existed to avoid.
+- **regressed-from:** BUG-278 r15 (its `size < offset`-only truncation check missed same-inode regrow and same-size rewrite). The r16 fix closes BOTH charter breaks; the residual is a newly-surfaced third case inherent to the sampling design.
+- **Files (unstaged, NOT pushed):** `src/server/orchard-transcripts.ts` (the fix), `scripts/verify-bug-278-resume-uuid.mjs` (U(e)/U(f)/U(g)). `src/server/agent-bridge.ts` carries the r15 changes unchanged this round. Scratch (not committed): `/tmp/bug278-r16-repro.mjs`, `/tmp/bug278-r16-proof.mjs`, `/tmp/bug278-r16-cost.mjs`, `/tmp/bug278-mid.mjs`, contract `/tmp/bug278-r16-req.md`.
+
+### 2026-11-05 — user decision (accepted residual limit; landed)
+- The user ACCEPTED BUG-278's documented residual limit on 2026-11-05 and the ticket landed on main (rounds 15 + 16). Accepted limit: a SAME-SIZE, MIDDLE-ONLY in-place rewrite of a transcript — changed bytes lying strictly between the first 4 KiB and the last 4 KiB of a consumed prefix longer than 8 KiB — is undetected by the O(new + 8 KiB) head+tail fingerprint (openai IV run 1f1768f7, the `same-size-middle-rewrite-large-prefix` case). No real append-only transcript writer performs this. Landed with this limit accepted; the r16 fix closes both charter breaks (copytruncate-regrow and same-size rewrite that moves the head/length).

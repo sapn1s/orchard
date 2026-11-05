@@ -30,6 +30,7 @@
  */
 import { spawnSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
+import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -49,6 +50,421 @@ export function sandboxPaths() {
   const runDir = path.join(dir, 'run');
   const sock = path.join(runDir, 'docker.sock');
   return { stateBase, dir, runDir, sock, dockerHost: `unix://${sock}` };
+}
+
+/* ------------------------------------------------------ data-root relocation
+ * The dind daemon's /var/lib/docker (its whole image store + build cache) lives,
+ * by default, in the named volume orchard-docker-sandbox-data under the HOST
+ * Docker data-root (typically / — an SSD). That store grows without bound (one
+ * ~2.9 GB claude-station-rt image per CLI build, one ~2.6 GB confined-run image
+ * per distinct dependency tree) and can reach 100+ GB. `sandboxDataRoot()` lets
+ * it be moved onto another filesystem (e.g. a roomy HDD) by BIND-BACKING that
+ * same named volume with a host directory, so none of the FEAT-158 ownership
+ * checks (which key on the volume's NAME and label, not its backing dir) change.
+ */
+/**
+ * Filesystems whose overlay2/overlayfs the dind daemon can use — an ALLOWLIST,
+ * not a denylist of bad names. Anything NOT in this set (ntfs, exfat, vfat, fuse,
+ * overlay-on-overlay, or an UNDETECTABLE filesystem) is refused: the check fails
+ * CLOSED, because a store the daemon cannot back is as bad whether we recognised
+ * the filesystem or not.
+ */
+export const DIND_OK_FS = new Set(['ext4', 'xfs', 'btrfs']);
+export const SANDBOX_DATA_ENV = 'ORCHARD_DOCKER_SANDBOX_DATA';
+export const SANDBOX_DATA_BASE_ENV = 'ORCHARD_DOCKER_SANDBOX_DATA_BASE';
+export const DEFAULT_SANDBOX_DATA_BASE = '/backups';
+/** The dedicated dir name the dind store must live in (keeps device= off host/system paths). */
+export const SANDBOX_DATA_DIRNAME = 'orchard-docker-sandbox';
+const MIN_DATA_FREE_GB = 20;
+
+/* ---------------------------------------------- size-watermark store bound
+ * BUG-289 round 3 (OpenAI consult): the sandbox store is bounded BY BYTES and by a
+ * host free-space FLOOR, never by age. `pruneSandboxToCap` evicts UNUSED images
+ * least-recently-tagged/used first until the store (dedup image layers + build
+ * cache) is under the cap AND host free space on the store's filesystem is above
+ * the floor. Age tells us nothing about one busy day's growth (a 7-day age prune
+ * could not shrink a store that filled in hours), and summed image size overcounts
+ * shared layers — so the bound is LayersSize (dedup) + build cache, in bytes.
+ */
+export const DEFAULT_SANDBOX_CAP_GB = 40;
+export const DEFAULT_SANDBOX_FLOOR_GB = 50;
+export const SANDBOX_CAP_ENV = 'ORCHARD_DOCKER_SANDBOX_CAP_GB';
+export const SANDBOX_FLOOR_ENV = 'ORCHARD_DOCKER_SANDBOX_FLOOR_GB';
+const GiB = 2 ** 30;
+function gbFromEnv(env, name, dflt) {
+  const raw = (env[name] ?? '').trim();
+  if (raw === '') return dflt;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) throw new Error(`${name}=${JSON.stringify(raw)} must be a positive number of GB`);
+  return n;
+}
+export const sandboxCapGb = (env = process.env) => gbFromEnv(env, SANDBOX_CAP_ENV, DEFAULT_SANDBOX_CAP_GB);
+export const sandboxFloorGb = (env = process.env) => gbFromEnv(env, SANDBOX_FLOOR_ENV, DEFAULT_SANDBOX_FLOOR_GB);
+
+/**
+ * Resolve `input` to the REAL absolute path where the data will actually land,
+ * EXACTLY as the kernel would: component by component, following every symlink —
+ * including a DANGLING one — and NEVER collapsing `..` lexically before the
+ * symlinks on the way are expanded (path.resolve() does collapse it, so
+ * `<ok-fs>/lnk/../data` with lnk->other-fs was graded on <ok-fs> but the kernel,
+ * following lnk first, lands it on other-fs — round-2 openai finding). The tail
+ * may not exist yet (the store is mkdir -p'd there); nothing under an absent
+ * directory can be a symlink, so the remainder is joined literally. THROWS on a
+ * symlink loop or an unreadable symlink, so a path we cannot pin down never passes.
+ * The returned path is what both the fs grade AND the bind-mount device= must use.
+ */
+export function resolveDataPath(input) {
+  const abs = path.isAbsolute(input) ? input : `${process.cwd()}/${input}`;
+  const queue = abs.split('/').filter(Boolean);
+  let cur = '/';
+  let budget = 0;
+  while (queue.length) {
+    const name = queue.shift();
+    if (name === '.') continue;
+    if (name === '..') { cur = path.dirname(cur); continue; }
+    const next = cur === '/' ? `/${name}` : `${cur}/${name}`;
+    let st = null;
+    try { st = fs.lstatSync(next); }
+    catch (e) {
+      // ONLY ENOENT means "does not exist yet" (finish lexically). Any other error —
+      // EACCES on an unsearchable parent, ELOOP, EIO — means we cannot see what is
+      // there (it could be a symlink to a disallowed fs), so REFUSE rather than guess
+      // (round-2 anthropic finding: EACCES-hidden symlink was treated as absent).
+      if (e.code === 'ENOENT') st = null;
+      else throw new Error(`${input}: cannot stat ${next} (${e.code || e.message}); refusing rather than guessing its filesystem.`);
+    }
+    if (st && st.isSymbolicLink()) {
+      if (++budget > 256) throw new Error(`${input} resolves through too many symlinks (possible loop); refusing.`);
+      let tgt;
+      try { tgt = fs.readlinkSync(next); } catch (e) { throw new Error(`${input}: cannot read the symlink ${next} (${e.message}); refusing.`); }
+      if (path.isAbsolute(tgt)) cur = '/';
+      queue.unshift(...tgt.split('/').filter(Boolean)); // re-resolve the target's components next
+      continue;
+    }
+    // `next` exists as a non-symlink, OR does not exist yet (ENOENT). Either way, descend
+    // and keep resolving component by component — never switch to a lexical finish: a `..`
+    // can climb back OUT of an absent dir into an existing one whose next component is a
+    // real (possibly dangling) symlink, which must still be followed (round-2 anthropic
+    // finding: `<btrfs>/missing/../lnk` with lnk->tmpfs was accepted as btrfs). The loop
+    // terminates because every non-symlink step shifts one component off the queue.
+    cur = next;
+  }
+  return cur;
+}
+
+/** The nearest existing ancestor of an already-resolved (symlink-free) path. */
+function nearestExistingOf(resolved) {
+  let p = resolved;
+  while (p !== path.dirname(p) && !fs.existsSync(p)) p = path.dirname(p);
+  return p;
+}
+
+/** Filesystem type backing an already-resolved path, or '' if findmnt cannot say. */
+function fsTypeOf(resolved) {
+  const r = spawnSync('findmnt', ['-n', '-o', 'FSTYPE', '--target', nearestExistingOf(resolved)], { encoding: 'utf8', timeout: 10_000 });
+  if (r.status !== 0) return '';
+  return (r.stdout ?? '').trim().split('\n')[0].trim();
+}
+
+/**
+ * Filesystem type backing `dir`, resolved to where data lands (symlinks, `..` and
+ * all), or '' if undetectable. May THROW if `dir` cannot be resolved (loop / unreadable).
+ */
+export function detectFsType(dir) {
+  return fsTypeOf(resolveDataPath(dir));
+}
+
+/** Bytes free on the filesystem backing `dir` (resolved), or 0. */
+export function freeBytesAt(dir) {
+  try { const s = fs.statfsSync(nearestExistingOf(resolveDataPath(dir))); return s.bavail * s.bsize; } catch { return 0; }
+}
+
+/** The mountpoint (findmnt TARGET) backing an already-resolved path, or '' if findmnt cannot say. */
+export function mountTargetOf(resolved) {
+  const r = spawnSync('findmnt', ['-n', '-o', 'TARGET', '--target', nearestExistingOf(resolved)], { encoding: 'utf8', timeout: 10_000 });
+  if (r.status !== 0) return '';
+  return (r.stdout ?? '').trim().split('\n')[0].trim();
+}
+
+/**
+ * Grade a candidate store dir and return { dir: <resolved>, fsType }, or THROW with a
+ * clear reason. ONE place every code path (explicit AND base) funnels through, so a
+ * check added here can never be missing from a branch (round-2 anthropic finding: the
+ * base branch skipped the dedicated-dirname check and let a <base>/orchard-docker-sandbox
+ * symlink to /var/lib/docker through). Throws — failing CLOSED — when the path is
+ * relative, cannot be resolved (symlink loop / unreadable), lands on an UNDETECTABLE
+ * filesystem (findmnt failed or is absent — never 'unknown'), lands on a filesystem not
+ * on the DIND_OK_FS allowlist, or does not resolve to a DEDICATED directory named
+ * orchard-docker-sandbox (which keeps the bind device= the privileged dind daemon runs
+ * its /var/lib/docker on OFF the host daemon's data-root, /, and any shared/system path).
+ */
+function gradeStoreDir(dir, envName) {
+  if (!path.isAbsolute(dir)) throw new Error(`${envName}=${dir} must be an absolute path.`);
+  const resolved = resolveDataPath(dir); // kernel-style; throws on loop / unreadable symlink
+  const t = fsTypeOf(resolved);
+  if (!t) {
+    throw new Error(`${envName}=${dir} (resolves to ${resolved}): cannot determine its filesystem type (findmnt failed or is not on PATH). Refusing rather than building the sandbox on an unknown filesystem.`);
+  }
+  if (!DIND_OK_FS.has(t)) {
+    throw new Error(`${envName}=${dir} is on ${t} (resolves to ${resolved}), which cannot back the dind overlay2 store (need ext4/xfs/btrfs). Not creating the sandbox there.`);
+  }
+  if (path.basename(resolved) !== SANDBOX_DATA_DIRNAME) {
+    throw new Error(`${envName}=${dir} (resolves to ${resolved}) must be a dedicated directory named ${SANDBOX_DATA_DIRNAME} (e.g. /mnt/backup/${SANDBOX_DATA_DIRNAME}), not a shared or system location such as /var/lib/docker or /. Refusing.`);
+  }
+  const sens = sensitiveStoreMatch(resolved);
+  if (sens) {
+    throw new Error(`${envName}=${dir} (resolves to ${resolved}) IS ${sens} by identity (same device/inode — a bind mount or hardlink), not a dedicated store dir. Refusing to run the sandbox /var/lib/docker there.`);
+  }
+  return { dir: resolved, fsType: t };
+}
+
+/** The host locations the sandbox store must never BE (by inode), beyond just by name. */
+export const SENSITIVE_STORE_PATHS = ['/var/lib/docker', '/'];
+/**
+ * Return the sensitive path `resolved` IS (same device+inode via lstat), or ''. A bind mount
+ * (mount --bind /var/lib/docker <store>) or a hardlinked dir can carry the dedicated basename
+ * yet actually BE /var/lib/docker or / — which the basename check misses, because a bind mount
+ * is not a symlink for resolveDataPath to follow. Returns '' when `resolved` does not exist yet
+ * (a not-yet-created store dir cannot be a bind of anything).
+ */
+export function sensitiveStoreMatch(resolved) {
+  let a;
+  try { a = fs.lstatSync(resolved); } catch { return ''; }
+  for (const sens of SENSITIVE_STORE_PATHS) {
+    let b;
+    try { b = fs.lstatSync(sens); } catch { continue; } // sensitive path absent on this host
+    if (a.dev === b.dev && a.ino === b.ino) return sens;
+  }
+  return '';
+}
+
+/**
+ * Where the dind daemon's /var/lib/docker should live. Returns one of:
+ *   { mode: 'bind',   dir, fsType }               — bind-back the named volume with `dir`
+ *   { mode: 'volume', warning }                   — today's default local volume (with why)
+ *
+ * ORCHARD_DOCKER_SANDBOX_DATA=<abs .../orchard-docker-sandbox> forces a bind dir and
+ * THROWS (so `up` stops) on any gradeStoreDir() failure. With nothing set,
+ * <base>/orchard-docker-sandbox is used when that base (ORCHARD_DOCKER_SANDBOX_DATA_BASE,
+ * default /backups) is an ABSOLUTE path that exists, is writable, grades clean and has
+ * >=20 GB free; otherwise — base mode being the convenience default, not an explicit
+ * request — it falls back SAFELY to the default volume with a visible warning (it never
+ * builds a bind store it could not fully vet, and never a cwd-relative one).
+ */
+export function sandboxDataRoot(env = process.env) {
+  const explicit = (env[SANDBOX_DATA_ENV] ?? '').trim();
+  if (explicit) {
+    const g = gradeStoreDir(explicit, SANDBOX_DATA_ENV);
+    return { mode: 'bind', dir: g.dir, fsType: g.fsType };
+  }
+  const base = (env[SANDBOX_DATA_BASE_ENV] ?? DEFAULT_SANDBOX_DATA_BASE).trim();
+  const vol = (reason) => ({ mode: 'volume', warning: `${base} ${reason}; sandbox data stays on the default Docker volume (${SANDBOX_VOLUME}) under the host data-root. Set ${SANDBOX_DATA_ENV}=<dir>/${SANDBOX_DATA_DIRNAME} on a roomy ext4/xfs/btrfs filesystem to relocate it.` });
+  if (!path.isAbsolute(base)) return vol('must be an absolute path');
+  // Resolve the base KERNEL-STYLE (symlinks, incl. dangling, and `..`) BEFORE joining the
+  // dirname, so base mode behaves EXACTLY as explicit mode: path.join collapses `..`
+  // lexically, which would mis-grade `<base>/lnk/..` when lnk points at another filesystem.
+  let resolvedBase;
+  try { resolvedBase = resolveDataPath(base); }
+  catch (e) { return vol(`cannot be resolved (${e.message})`); }
+  if (!fs.existsSync(resolvedBase)) return vol('does not exist');
+  try { fs.accessSync(resolvedBase, fs.constants.W_OK); } catch { return vol('is not writable'); }
+  let g;
+  try { g = gradeStoreDir(path.join(resolvedBase, SANDBOX_DATA_DIRNAME), SANDBOX_DATA_BASE_ENV); }
+  catch (e) { return vol(`cannot host the sandbox store (${e.message})`); }
+  const freeGb = freeBytesAt(g.dir) / 2 ** 30;
+  if (freeGb < MIN_DATA_FREE_GB) return vol(`has only ${freeGb.toFixed(0)} GB free (need ${MIN_DATA_FREE_GB})`);
+  return { mode: 'bind', dir: g.dir, fsType: g.fsType };
+}
+
+/* -------------------------------------------------- pinned Docker connection
+ * One HTTP/1.1 keep-alive connection to the Docker API: every request goes over
+ * the SAME connected socket, so the daemon that answered the id check is the one
+ * that receives the deletes — replacing the socket file after connect cannot
+ * redirect it (BUG-158 rounds 5/6). Shared by `reset`, the age `prune`, and the
+ * size-watermark cap-prune, so all three pin identically.
+ */
+export function pinnedDocker(sockPath) {
+  const sock = net.connect(sockPath);
+  let buf = Buffer.alloc(0); let wake = null; let dead = null;
+  sock.on('data', (d) => { buf = Buffer.concat([buf, d]); wake?.(); });
+  const fail = (e) => { dead = e || new Error('connection closed'); wake?.(); };
+  sock.on('error', fail); sock.on('close', () => fail());
+  const more = () => new Promise((res, rej) => { if (dead) return rej(dead); wake = () => { wake = null; res(); }; });
+  const need = async (n) => { while (buf.length < n) await more(); };
+  const until = async (sep) => { let i; while ((i = buf.indexOf(sep)) < 0) await more(); return i; };
+  const take = (n) => { const out = buf.subarray(0, n); buf = buf.subarray(n); return out; };
+  const ready = new Promise((res, rej) => { sock.once('connect', res); sock.once('error', rej); });
+  return {
+    async req(method, p) {
+      await ready;
+      sock.write(`${method} ${p} HTTP/1.1\r\nHost: docker\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n`);
+      const h = await until('\r\n\r\n');
+      const head = take(h + 4).toString();
+      const code = Number(/^HTTP\/1\.[01] (\d+)/.exec(head)?.[1] ?? 0);
+      if (/\r\nconnection: *close/i.test(head)) dead = new Error('daemon closed the pinned connection');
+      let body = Buffer.alloc(0);
+      const len = /\r\ncontent-length: *(\d+)/i.exec(head);
+      if (/\r\ntransfer-encoding: *chunked/i.test(head)) {
+        for (;;) {
+          const e = await until('\r\n'); const n = parseInt(take(e + 2).toString(), 16);
+          await need(n + 2); const chunk = take(n + 2).subarray(0, n);
+          if (n === 0) break;
+          body = Buffer.concat([body, chunk]);
+        }
+      } else if (len) { await need(Number(len[1])); body = take(Number(len[1])); }
+      const text = body.toString();
+      let json = null; try { json = text ? JSON.parse(text) : null; } catch { /* not json */ }
+      if (code < 200 || code >= 300) throw new Error(`${method} ${p} -> ${code} ${text.slice(0, 200)}`);
+      return json;
+    },
+    close() { sock.destroy(); },
+  };
+}
+
+/* ----------------------------------------------- size-watermark cap-prune
+ * Bound the sandbox store by BYTES + a host free-space FLOOR (never by age).
+ */
+const gbStr = (n) => (Number.isFinite(n) ? (n / GiB).toFixed(1) + 'GB' : 'n/a');
+
+/**
+ * Remove UNUSED images (least-recently-tagged/used FIRST) and over-budget build
+ * cache until the sandbox store (dedup image layers + build cache) is at or below
+ * `capGb` AND host free space on the store's filesystem is at or above `floorGb`.
+ * Sandbox-ONLY: same isolation guard, daemon lock and pinned-connection id re-check
+ * as `reset`/`prune`, so it can never reach the host daemon and never races a guarded
+ * suite. NEVER removes:
+ *   - an image used by any container, running OR stopped (its ImageID/Image);
+ *   - an image tagged/used within `recencySec` (default 10 min) — the window in which
+ *     a just-built image has no container yet (a pending job the in-use check cannot
+ *     see; OpenAI's concern) and the gap a lock-free confined-run build sits in;
+ *   - anything while another daemon-lock holder runs (it takes that lock first).
+ *
+ * Cheap by default: it measures the store over a short unlocked pinned connection
+ * and does nothing (no lock, no deletes) when already under both watermarks, so it
+ * is safe to call after every confined run / verify job without serialising them.
+ *
+ * `freeBytes`: a function returning host free bytes on the store's filesystem, or
+ * null to enforce the cap only (e.g. from a lane that cannot measure the host fs).
+ * A measurement error MUST surface as Infinity (never 0), so the floor fails safe
+ * toward keeping images rather than deleting on a bad reading.
+ *
+ * Returns a summary object (never throws for "still over" — logs a warning).
+ */
+export async function pruneSandboxToCap(env = process.env, {
+  capGb = sandboxCapGb(env), floorGb = sandboxFloorGb(env),
+  freeBytes = null, recencySec = 600, lock = true, log = () => {},
+} = {}) {
+  const v = checkIsolatedDocker(env);
+  if (!v.ok) throw new Error(`cap-prune would not be isolated: ${v.reason}`);
+  if (!v.target.startsWith('unix://')) throw new Error(`cap-prune needs a pinned unix socket; DOCKER_HOST=${v.target} is not one`);
+  const sock = v.target.slice('unix://'.length);
+  const capBytes = capGb * GiB, floorBytes = floorGb * GiB;
+  const sum = (arr, f) => (arr ?? []).reduce((a, x) => a + (x[f] ?? 0), 0);
+  // A reading of 0 (or non-finite/negative) is treated as UNMEASURABLE -> Infinity, never as
+  // "disk full": contract 1e — the floor must fail safe toward KEEPING images, not deleting on a
+  // bad reading. freeBytesAt() returns 0 on a statfs error, so 0 here means "could not measure".
+  // If the disk is genuinely full the BYTE CAP (always measurable) still drives eviction.
+  const freeNow = () => { if (!freeBytes) return Infinity; const b = freeBytes(); return Number.isFinite(b) && b > 0 ? b : Infinity; };
+  const measure = async (api) => {
+    const df = await api.req('GET', '/system/df');
+    const imgBytes = df?.LayersSize ?? sum(df?.Images, 'Size');
+    // Build-cache records flagged Shared are layers ALSO counted in LayersSize — exclude them, or
+    // the store double-counts those bytes and over-evicts to meet a cap the real store already met
+    // (contract 1a: a DEDUPLICATED measure). Only build cache NOT shared with images adds bytes.
+    const bcBytes = sum((df?.BuildCache ?? []).filter((x) => !x.Shared), 'Size');
+    return { store: imgBytes + bcBytes, imgBytes, bcBytes, free: freeNow() };
+  };
+  const over = (m) => m.store > capBytes || m.free < floorBytes;
+  const summary = { capGb, floorGb, acted: false, removed: 0, removedTags: [], skippedIds: [], buildReclaimed: 0 };
+
+  // 1) Cheap precheck over an UNLOCKED pinned connection: id re-check + one /system/df.
+  const pre = pinnedDocker(sock);
+  let m;
+  try {
+    const info = await pre.req('GET', '/info');
+    if (info?.ID !== v.targetId) throw new Error(`the daemon on cap-prune's connection (${info?.ID ?? 'none'}) is not the one the guard checked (${v.targetId}); not touching it.`);
+    m = await measure(pre);
+  } finally { pre.close(); }
+  summary.before = m;
+  log(`cap-prune: cap ${capGb}GB floor ${floorGb}GB; store ${gbStr(m.store)} (images ${gbStr(m.imgBytes)}, buildcache ${gbStr(m.bcBytes)}), free ${gbStr(m.free)}`);
+  if (!over(m)) { summary.after = m; log('cap-prune: under cap and above floor; nothing removed'); return summary; }
+
+  // 2) Over budget: take the daemon lock, re-prove identity, act over ONE fresh pinned conn.
+  if (lock) {
+    acquireDaemonLock(v.targetId, { who: 'sandbox:docker cap-prune', dockerHost: v.target });
+    const again = checkIsolatedDocker(env);
+    if (!again.ok || again.targetId !== v.targetId) throw new Error('the sandbox daemon changed while cap-prune waited for its lock');
+  }
+  const api = pinnedDocker(sock);
+  try {
+    const info = await api.req('GET', '/info');
+    if (info?.ID !== v.targetId) throw new Error(`the daemon on cap-prune's connection (${info?.ID ?? 'none'}) is not the one the guard checked (${v.targetId}); not touching it.`);
+    summary.acted = true;
+    m = await measure(api);
+    if (!over(m)) { summary.after = m; log('cap-prune: back under budget before any delete (concurrent cleanup); nothing removed'); return summary; }
+
+    // 2a) Evict over-budget build cache first (rebuildable, cheapest to lose). keep-storage
+    //     leaves at most (cap - current image layers) bytes of cache; BuildKit drops its own LRU.
+    const keep = Math.max(0, capBytes - m.imgBytes);
+    try {
+      const bc = await api.req('POST', `/build/prune?keep-storage=${keep}`);
+      summary.buildReclaimed = bc?.SpaceReclaimed ?? 0;
+      if (summary.buildReclaimed) log(`cap-prune: build cache reclaimed ${gbStr(summary.buildReclaimed)} (keep-storage ${gbStr(keep)})`);
+    } catch (e) { log(`cap-prune: build cache prune skipped (${e.message.split('\n')[0]})`); }
+    m = await measure(api);
+    if (!over(m)) { summary.after = m; log(`cap-prune: under budget after build-cache prune; store ${gbStr(m.store)}`); return summary; }
+
+    // 2b) Remove UNUSED images, least-recently-tagged/used first.
+    const containers = (await api.req('GET', '/containers/json?all=1')) ?? [];
+    const inUse = new Set();
+    for (const c of containers) { if (c.ImageID) inUse.add(c.ImageID); if (c.Image) inUse.add(c.Image); }
+    const images = (await api.req('GET', '/images/json?all=0')) ?? [];
+    const nowSec = Date.now() / 1000;
+    const cand = [];
+    for (const img of images) {
+      if (inUse.has(img.Id)) continue; // used by a running or stopped container
+      let lastTag = 0;
+      try {
+        const insp = await api.req('GET', `/images/${encodeURIComponent(img.Id)}/json`);
+        const t = Date.parse(insp?.Metadata?.LastTagTime ?? '');
+        if (Number.isFinite(t) && t > 0) lastTag = t / 1000; // ms -> s
+      } catch { /* fall back to Created */ }
+      const lastUse = Math.max(lastTag, img.Created ?? 0);
+      if (nowSec - lastUse < recencySec) continue; // recently tagged/used: a pending job may need it
+      cand.push({ id: img.Id, lastUse, tags: (img.RepoTags ?? []).filter((t) => t && t !== '<none>:<none>') });
+    }
+    cand.sort((a, b) => a.lastUse - b.lastUse); // oldest last-use first
+    for (const c of cand) {
+      if (!over(m)) break;
+      const label = c.tags[0] || c.id.replace(/^sha256:/, '').slice(0, 12);
+      // ATOMIC removal, by IMAGE ID — never a per-tag untag loop. A loop that untags references one
+      // at a time can STRIP a tag and then fail to delete the image (a dependent child image, or a
+      // container created by a lock-free confined run mid-loop), leaving the image alive but missing
+      // a reference a queued job needs (BUG-289 rounds 4/5). force=0 delete-by-id is atomic: it
+      // either deletes, or 409s WITHOUT mutating anything.
+      let gone = false, lastMsg = '';
+      try { await api.req('DELETE', `/images/${encodeURIComponent(c.id)}?force=0&noprune=0`); gone = true; }
+      catch (e) {
+        lastMsg = e.message;
+        // Escalate to force=1 ONLY when the daemon says the SOLE obstacle is multiple TAGS
+        // ("referenced in multiple repositories") — then removing all tags + the image in one call
+        // is safe (contract 1b: a multi-tag unused image stays evictable). We NEVER force past the
+        // other 409s — "image is being used by ... container" (in use) or "has dependent child
+        // images" (parent of another image): those are KEPT, atomically, with no untag (contract
+        // 1c, and the parent-of-in-use protection). force=1 on a running-container image still 409s.
+        if (/referenced in multiple repositories/i.test(e.message)) {
+          try { await api.req('DELETE', `/images/${encodeURIComponent(c.id)}?force=1&noprune=0`); gone = true; }
+          catch (e2) { lastMsg = e2.message; }
+        }
+      }
+      if (gone) { summary.removed++; summary.removedTags.push(label); m = await measure(api); }
+      else { summary.skippedIds.push(c.id); log(`cap-prune: kept ${label} (${(lastMsg.split('\n')[0] || 'still referenced').slice(0, 100)})`); }
+    }
+    summary.after = m;
+    if (over(m)) log(`cap-prune: WARNING still over budget after removing ${summary.removed} image(s): store ${gbStr(m.store)} free ${gbStr(m.free)} — the rest are in use, recently tagged, or protected`);
+    else log(`cap-prune: under budget; removed ${summary.removed} image(s) (${summary.removedTags.slice(0, 8).join(', ')}${summary.removedTags.length > 8 ? ', …' : ''}), store ${gbStr(summary.before.store)} -> ${gbStr(m.store)}`);
+    return summary;
+  } finally { api.close(); }
 }
 
 /**

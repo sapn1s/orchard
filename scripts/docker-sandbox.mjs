@@ -2,17 +2,23 @@
 /**
  * FEAT-158 — the standing isolated Docker sandbox.
  *
- *   npm run sandbox:docker -- up [--no-preload] [--image <ref>]...
+ *   npm run sandbox:docker -- up [--no-preload] [--no-prune] [--cap-gb N] [--floor-gb N] [--image <ref>]...
  *   npm run sandbox:docker -- status
  *   eval "$(npm run -s sandbox:docker -- env)"
  *   npm run sandbox:docker -- reset          # containers/networks/volumes gone; images + build cache kept
+ *   npm run sandbox:docker -- prune [--cap-gb N] [--floor-gb N]  # size-watermark: evict UNUSED images (LRU) until store <= cap (default 40 GB, ORCHARD_DOCKER_SANDBOX_CAP_GB) AND host free >= floor (default 50 GB, ORCHARD_DOCKER_SANDBOX_FLOOR_GB); sandbox-only, runs on `up` + after each confined run
+ *   npm run sandbox:docker -- prune --days N  # legacy age prune: drop UNUSED images + build cache older than N days
  *   npm run sandbox:docker -- down [--purge] # stop + remove the container; --purge also drops the cache volume
  *   eval "$(npm run -s sandbox:docker -- host-env '<reason>')"  # BUG-223: the logged opt-out to the HOST daemon
  *
  * Shape: one `docker:dind` container (`orchard-docker-sandbox`) on the host
  * daemon, its /var/lib/docker on a named volume (warm image store and build
  * cache across restarts), its API on a Unix socket under the Orchard state dir
- * (no TCP port; the socket is group-owned by the invoking user's gid).
+ * (no TCP port; the socket is group-owned by the invoking user's gid). That
+ * volume defaults to the host Docker data-root but may be BIND-BACKED onto
+ * another filesystem (an HDD) via ORCHARD_DOCKER_SANDBOX_DATA — see
+ * sandboxDataRoot() in lib/docker-sandbox.mjs; the volume's name and label are
+ * unchanged, so every ownership check still holds.
  *
  * Host paths a test is likely to bind-mount are mounted into the sandbox at the
  * SAME path (the tooling scratch root, /tmp, and this repo read-only), so a
@@ -33,13 +39,14 @@
  */
 import { spawnSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
-import * as net from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scratchRoot } from './lib/scratch.mjs';
 import {
   SANDBOX_CONTAINER, SANDBOX_VOLUME, SANDBOX_LABEL, SANDBOX_IMAGE, SOCK_IN_CONTAINER_DIR,
   sandboxPaths, hostDockerEnv, daemonIdUnder, checkIsolatedDocker, acquireDaemonLock, acquireLock,
+  sandboxDataRoot, pinnedDocker, pruneSandboxToCap, freeBytesAt, mountTargetOf,
+  sandboxCapGb, sandboxFloorGb,
 } from './lib/docker-sandbox.mjs';
 // Importing lane-docker.mjs also applies this process's inherited declaration (DOCKER_HOST := it).
 import { inheritedLaneDocker, LANE_MARK_ENV } from './lib/lane-docker.mjs';
@@ -114,6 +121,108 @@ function lockSandbox(verb, ours) {
     process.exit(2);
   }
   return now;
+}
+
+/**
+ * Warn (never fail) when the already-existing volume is not backed by the dir the
+ * resolved data-root wants: relocating an existing sandbox needs a `down --purge`
+ * first, because `up` reuses a labelled volume as-is and never silently rebinds it.
+ */
+function warnDataRootMismatch(dataRoot) {
+  if (host(['volume', 'inspect', SANDBOX_VOLUME]).code !== 0) return; // absent: nothing to compare
+  const dev = host(['volume', 'inspect', SANDBOX_VOLUME, '--format', '{{if .Options}}{{.Options.device}}{{end}}']).out.trim();
+  const want = dataRoot.mode === 'bind' ? dataRoot.dir : '';
+  if (dev === want) return;
+  const have = dev || 'the default Docker data-root';
+  const wantMsg = want || 'the default Docker data-root';
+  log(`WARNING: existing volume ${SANDBOX_VOLUME} is backed by ${have}, not ${wantMsg}. To relocate, free the old store and recreate: npm run sandbox:docker -- down --purge && npm run sandbox:docker -- up`);
+}
+
+/**
+ * A function that returns host free bytes on the filesystem the sandbox store
+ * PHYSICALLY lives on (the cap-prune floor), or null when it cannot be located.
+ *   - bind mode: the custom data-root dir (we own it; statfs is direct).
+ *   - volume mode: the host daemon's data-root. We ask the HOST daemon for its
+ *     DockerRootDir and statfs the MOUNTPOINT that backs it (world-traversable even
+ *     when /var/lib/docker itself is root-only). A measurement error returns Infinity
+ *     (never 0), so the floor fails safe toward keeping images.
+ * Only the top-level owner (not a lane) can read the host daemon, so volume mode
+ * yields null inside a lane — the cap (bytes, from the sandbox daemon) still applies.
+ */
+/** Read a flag's value in EITHER `--flag value` or `--flag=value` form. { present, raw }. */
+function flagValue(argv, name) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === name) return { present: true, raw: argv[i + 1] };
+    if (argv[i].startsWith(`${name}=`)) return { present: true, raw: argv[i].slice(name.length + 1) };
+  }
+  return { present: false, raw: undefined };
+}
+
+/** Parse optional `--cap-gb N` / `--floor-gb N` overrides (both `--f N` and `--f=N`); absent ones fall to env/default. */
+function capOpts(argv) {
+  const o = {};
+  const cg = flagValue(argv, '--cap-gb'); if (cg.present) o.capGb = Number(cg.raw);
+  const fg = flagValue(argv, '--floor-gb'); if (fg.present) o.floorGb = Number(fg.raw);
+  for (const [k, lbl] of [['capGb', '--cap-gb'], ['floorGb', '--floor-gb']]) {
+    if (k in o && !(Number.isFinite(o[k]) && o[k] > 0)) { console.error(`${lbl} must be a positive number`); process.exit(64); }
+  }
+  return o;
+}
+
+function storeFreeBytesFn() {
+  let dataRoot;
+  try { dataRoot = sandboxDataRoot(); } catch { return null; }
+  if (dataRoot.mode === 'bind') return () => { const b = freeBytesAt(dataRoot.dir); return b > 0 ? b : Infinity; };
+  if (IN_LANE) return null; // volume mode needs the host daemon, which a lane does not touch
+  const rootDir = host(['info', '--format', '{{.DockerRootDir}}']).out.trim();
+  if (!rootDir) return null;
+  const probe = mountTargetOf(rootDir) || rootDir;
+  return () => { try { const s = fs.statfsSync(probe); const b = s.bavail * s.bsize; return b > 0 ? b : Infinity; } catch { return Infinity; } };
+}
+
+/**
+ * Bound the sandbox image store: remove unused images and build cache older than
+ * `days` days (default 7). Sandbox-ONLY — guarded by the FEAT-158 isolation check
+ * and the daemon lock, exactly like `reset`, so it can never run against the host
+ * daemon and never races a guarded suite. In-use images (any live container's)
+ * are untouched by `image prune`. Returns a short summary line.
+ */
+async function pruneSandbox(days = 7, { lock = true } = {}) {
+  if (!sandboxReady()) throw new Error('the sandbox is not running');
+  const v = checkIsolatedDocker(SBX_ENV);
+  if (!v.ok) throw new Error(`prune would not be isolated: ${v.reason}`);
+  if (lock) {
+    acquireDaemonLock(v.targetId, { who: 'sandbox:docker prune', dockerHost: v.target });
+    const again = checkIsolatedDocker(SBX_ENV);
+    if (!again.ok || again.targetId !== v.targetId) throw new Error('the sandbox daemon changed while prune waited for its lock');
+  }
+  // TOCTOU: like reset, connect ONCE and prove on that connection that it is the
+  // daemon the guard cleared, then issue every prune over the SAME socket — a `docker`
+  // CLI re-invocation would reconnect and a swapped socket could redirect it to the host.
+  if (!v.target.startsWith('unix://')) throw new Error(`prune needs a pinned unix socket; DOCKER_HOST=${v.target} is not one`);
+  const until = `${Math.round(days * 24)}h`;
+  const gb = (n) => (n / 2 ** 30).toFixed(1) + 'GB';
+  const dfSummary = (df) => {
+    const sum = (arr, f) => (arr ?? []).reduce((a, x) => a + (x[f] ?? 0), 0);
+    return `images=${gb(sum(df?.Images, 'Size'))} buildcache=${gb(sum(df?.BuildCache, 'Size'))}`;
+  };
+  const api = pinnedDocker(v.target.slice('unix://'.length));
+  let imgDel = 0, imgRec = 0, bldDel = 0, bldRec = 0;
+  try {
+    const info = await api.req('GET', '/info');
+    if (info?.ID !== v.targetId) throw new Error(`the daemon on prune's connection (${info?.ID ?? 'none'}) is not the one the guard checked (${v.targetId}); not touching it.`);
+    try { log(`prune: before: ${dfSummary(await api.req('GET', '/system/df'))}`); } catch { /* df is advisory */ }
+    log(`prune: removing unused images + build cache older than ${days}d in sandbox ${v.targetId.slice(0, 12)}`);
+    // image prune -a == dangling:false (remove ALL unused, not only <none> layers); until filters by age.
+    const imgRes = await api.req('POST', `/images/prune?filters=${encodeURIComponent(JSON.stringify({ dangling: ['false'], until: [until] }))}`);
+    imgDel = (imgRes?.ImagesDeleted ?? []).length; imgRec = imgRes?.SpaceReclaimed ?? 0;
+    const bldRes = await api.req('POST', `/build/prune?filters=${encodeURIComponent(JSON.stringify({ until: [until] }))}`);
+    bldDel = (bldRes?.CachesDeleted ?? []).length; bldRec = bldRes?.SpaceReclaimed ?? 0;
+    try { log(`prune: after: ${dfSummary(await api.req('GET', '/system/df'))}`); } catch { /* df is advisory */ }
+  } finally { api.close(); }
+  log(`prune: images: deleted ${imgDel}, reclaimed ${gb(imgRec)}`);
+  log(`prune: build cache: deleted ${bldDel}, reclaimed ${gb(bldRec)}`);
+  return `images(deleted ${imgDel}, ${gb(imgRec)}) buildcache(deleted ${bldDel}, ${gb(bldRec)})`;
 }
 
 /** The sandbox volume is ours only if it carries our label (no adoption of an unlabelled volume, legacy included). */
@@ -206,6 +315,13 @@ async function up(argv) {
   const extra = [];
   for (let i = 0; i < argv.length; i++) if (argv[i] === '--image') extra.push(argv[++i]);
   fs.mkdirSync(P.runDir, { recursive: true });
+  // Where /var/lib/docker should live. A bad explicit ORCHARD_DOCKER_SANDBOX_DATA STOPS here,
+  // before anything is created, rather than building a sandbox on a filesystem dind cannot use.
+  let dataRoot;
+  try { dataRoot = sandboxDataRoot(); } catch (e) { console.error(`REFUSED: ${e.message}`); process.exit(2); }
+  if (dataRoot.warning) log(`WARNING: ${dataRoot.warning}`);
+  if (dataRoot.mode === 'bind') { fs.mkdirSync(dataRoot.dir, { recursive: true }); log(`sandbox data-root: ${dataRoot.dir} (${dataRoot.fsType}), bind-backing volume ${SANDBOX_VOLUME}`); }
+  warnDataRootMismatch(dataRoot);
   const ours = inspectOurs();
   if (ours?.status === 'running' && sandboxReady()) {
     log('already running');
@@ -228,7 +344,12 @@ async function up(argv) {
       process.exit(2);
     }
     if (vol === 'absent') {
-      const c = host(['volume', 'create', '--label', `${SANDBOX_LABEL}=1`, SANDBOX_VOLUME]);
+      // A bind-backed local volume keeps the daemon's store on `dataRoot.dir` (another
+      // filesystem) while the volume itself is still the labelled, name-checked one.
+      const createArgs = ['volume', 'create', '--label', `${SANDBOX_LABEL}=1`];
+      if (dataRoot.mode === 'bind') createArgs.push('--driver', 'local', '--opt', 'type=none', '--opt', 'o=bind', '--opt', `device=${dataRoot.dir}`);
+      createArgs.push(SANDBOX_VOLUME);
+      const c = host(createArgs);
       if (c.code !== 0) { console.error(`volume create failed: ${c.err}`); process.exit(1); }
       // `volume create` of an existing name succeeds and returns THAT volume unchanged: re-check (round-2b race).
       if (volumeIsOurs() !== 'ours') {
@@ -277,8 +398,17 @@ async function up(argv) {
     if (!fs.existsSync(lockF)) log(`WARNING: could not create the lock ${lockF}; guarded suites will refuse until it exists`);
   }
   if (!argv.includes('--no-preload')) await preload(preloadList(extra));
-  log(`up in ${secs()}`);
+  // Emit the DOCKER_HOST export FIRST (stdout), before the best-effort cap-prune: acquireLock
+  // exits the process (exit 3) on lock contention, which a try/catch cannot catch, so a prune
+  // that cannot get the lock must not swallow the caller's `eval` export (round-2 follow-up).
   console.log(`export DOCKER_HOST=${P.dockerHost} ${LANE_MARK_ENV}=${P.dockerHost}`);
+  // Bound the store on every up by SIZE (BUG-289 round 3): evict unused images LRU-first
+  // until under the byte cap AND above the host free-space floor. Best-effort — never fails `up`.
+  if (!argv.includes('--no-prune')) {
+    try { await pruneSandboxToCap(SBX_ENV, { ...capOpts(argv), freeBytes: storeFreeBytesFn(), log }); }
+    catch (e) { log(`cap-prune on up skipped: ${e.message}`); }
+  }
+  log(`up in ${secs()}`);
 }
 
 function env() {
@@ -313,9 +443,13 @@ function status() {
   const ours = inspectOurs();
   const id = sandboxReady();
   const v = id ? checkIsolatedDocker(SBX_ENV) : null;
+  const volBacking = host(['volume', 'inspect', SANDBOX_VOLUME, '--format', '{{if .Options}}{{.Options.device}}{{end}} @ {{.Mountpoint}}']).out.trim();
+  let resolved = '';
+  try { const d = sandboxDataRoot(); resolved = d.mode === 'bind' ? `${d.dir} (${d.fsType})` : `default Docker volume${d.warning ? ` (${d.warning})` : ''}`; } catch (e) { resolved = `REFUSED: ${e.message}`; }
   const out = {
     container: ours ? `${SANDBOX_CONTAINER} (${ours.status}, ${ours.image})` : 'absent',
     volume: host(['volume', 'inspect', SANDBOX_VOLUME]).code === 0 ? SANDBOX_VOLUME : 'absent',
+    dataRoot: { resolved, currentVolumeBacking: volBacking || 'n/a' },
     DOCKER_HOST: LANE_HOST,
     daemon: id ? `answers, id ${id.slice(0, 12)}` : 'not answering',
     isolated: v ? (v.ok ? 'yes (daemon id differs from host)' : `NO: ${v.reason}`) : 'n/a',
@@ -326,50 +460,6 @@ function status() {
     out.disk = sbx(['system', 'df', '--format', '{{.Type}} {{.Size}} ({{.Reclaimable}} reclaimable)']).out.split('\n');
   }
   console.log(JSON.stringify(out, null, 2));
-}
-
-/**
- * One HTTP/1.1 keep-alive connection to the Docker API. Every request goes over the SAME
- * connected socket, so the daemon that answered the id check is the daemon that receives the
- * deletes: replacing the socket file after connect cannot redirect it (round 5 and round 6,
- * attacker c: two different socket swaps sent reset's deletes to the host).
- */
-function pinnedDocker(sockPath) {
-  const sock = net.connect(sockPath);
-  let buf = Buffer.alloc(0); let wake = null; let dead = null;
-  sock.on('data', (d) => { buf = Buffer.concat([buf, d]); wake?.(); });
-  const fail = (e) => { dead = e || new Error('connection closed'); wake?.(); };
-  sock.on('error', fail); sock.on('close', () => fail());
-  const more = () => new Promise((res, rej) => { if (dead) return rej(dead); wake = () => { wake = null; res(); }; });
-  const need = async (n) => { while (buf.length < n) await more(); };
-  const until = async (sep) => { let i; while ((i = buf.indexOf(sep)) < 0) await more(); return i; };
-  const take = (n) => { const out = buf.subarray(0, n); buf = buf.subarray(n); return out; };
-  const ready = new Promise((res, rej) => { sock.once('connect', res); sock.once('error', rej); });
-  return {
-    async req(method, p) {
-      await ready;
-      sock.write(`${method} ${p} HTTP/1.1\r\nHost: docker\r\nConnection: keep-alive\r\nContent-Length: 0\r\n\r\n`);
-      const h = await until('\r\n\r\n');
-      const head = take(h + 4).toString();
-      const code = Number(/^HTTP\/1\.[01] (\d+)/.exec(head)?.[1] ?? 0);
-      if (/\r\nconnection: *close/i.test(head)) dead = new Error('daemon closed the pinned connection');
-      let body = Buffer.alloc(0);
-      const len = /\r\ncontent-length: *(\d+)/i.exec(head);
-      if (/\r\ntransfer-encoding: *chunked/i.test(head)) {
-        for (;;) {
-          const e = await until('\r\n'); const n = parseInt(take(e + 2).toString(), 16);
-          await need(n + 2); const chunk = take(n + 2).subarray(0, n);
-          if (n === 0) break;
-          body = Buffer.concat([body, chunk]);
-        }
-      } else if (len) { await need(Number(len[1])); body = take(Number(len[1])); }
-      const text = body.toString();
-      let json = null; try { json = text ? JSON.parse(text) : null; } catch { /* not json */ }
-      if (code < 200 || code >= 300) throw new Error(`${method} ${p} -> ${code} ${text.slice(0, 200)}`);
-      return json;
-    },
-    close() { sock.destroy(); },
-  };
 }
 
 async function reset() {
@@ -396,18 +486,65 @@ async function reset() {
   log(`reset (in sandbox ${v.targetId.slice(0, 12)}): removed ${ids.length} containers, ${nets.length} networks, ${vols.length} volumes; images and build cache kept`);
 }
 
-function down(argv) {
+/**
+ * Count containers RUNNING inside the sandbox daemon, over a pinned, id-re-checked
+ * connection (a swapped socket cannot make it read the host daemon instead). 0 when
+ * the daemon is not up (nothing can be running inside a daemon that is down).
+ */
+async function sandboxRunningCount(ours) {
+  // If the dind container is not running, its daemon serves nothing — nothing can run inside it.
+  if (!ours || ours.status !== 'running') return 0;
+  // It IS running: the daemon MUST answer and prove its identity, or we CANNOT confirm it is idle.
+  // Fail CLOSED — refuse — rather than assume 0 and destroy in-flight work (contract 5a). A removed/
+  // swapped/hung socket on a running container must never read as "nothing running inside".
+  if (!sandboxReady()) { console.error(`REFUSED: the sandbox container is running but its daemon does not answer at ${LANE_HOST}; down --purge cannot confirm no work is running inside it. Not destroying the store.`); process.exit(2); }
+  const v = checkIsolatedDocker(SBX_ENV);
+  if (!v.ok) { console.error(`REFUSED: down --purge cannot confirm the sandbox daemon is isolated (${v.reason}); not removing the store.`); process.exit(2); }
+  if (!v.target.startsWith('unix://')) { console.error('REFUSED: down --purge needs a pinned unix socket to the sandbox daemon.'); process.exit(2); }
+  const api = pinnedDocker(v.target.slice('unix://'.length));
+  try {
+    const info = await api.req('GET', '/info');
+    if (info?.ID !== v.targetId) { console.error(`REFUSED: the sandbox daemon changed under down --purge (${info?.ID ?? 'none'} != ${v.targetId}); not removing the store.`); process.exit(2); }
+    return ((await api.req('GET', '/containers/json')) ?? []).length; // running only (no all=1)
+  } finally { api.close(); }
+}
+
+/**
+ * When the volume is bind-backed to a custom data-root (an HDD), assert that dir is
+ * on a REAL separate mount, not an empty mountpoint dir on `/` (the disk failed to
+ * mount — OpenAI consult: an fs-type allowlist alone does not prove the disk is
+ * present). Called before AND after removing the volume. Skipped for the default
+ * volume (no bind device). Refuses (exit 2) rather than act on the wrong filesystem.
+ */
+function assertBindMounted(device, when) {
+  if (!device) return; // default volume under the host data-root: no custom data-root to verify
+  const target = mountTargetOf(device);
+  if (!target || target === '/') {
+    console.error(`REFUSED (${when}): the sandbox volume's data-root ${device} is not on a mounted filesystem of its own (findmnt target: ${target || 'none'}). The intended disk may not be mounted — refusing to act on what could be an empty mountpoint dir on /.`);
+    process.exit(2);
+  }
+  log(`data-root ${device} is mounted at ${target} (${when} purge)`);
+}
+
+async function down(argv) {
   const purge = argv.includes('--purge');
   let ours = inspectOurs();
+  // The bind device (if any) is read while the volume still exists, for the before/after mount check.
+  const device = purge ? host(['volume', 'inspect', SANDBOX_VOLUME, '--format', '{{if .Options}}{{.Options.device}}{{end}}']).out.trim() : '';
   if (ours) {
     ours = lockSandbox(purge ? 'down --purge' : 'down', ours);
+    if (purge) {
+      // Never destroy in-flight work: refuse while anything runs inside the sandbox daemon.
+      const running = await sandboxRunningCount(ours);
+      if (running > 0) { console.error(`REFUSED: down --purge would destroy the sandbox store while ${running} container(s) run inside the sandbox daemon. Stop them first, or use down (no --purge) to keep the volume.`); process.exit(2); }
+      assertBindMounted(device, 'before');
+    }
     const r = host(['rm', '-f', ours.id]);
     log(r.code === 0 ? `removed ${SANDBOX_CONTAINER} (${ours.id.slice(0, 12)})` : `rm failed: ${r.err}`);
   } else {
     log('no sandbox container');
     // Round 5: still serialise with a creating `up` (it holds this lock from its volume check to `create`).
-    if (purge) fs.mkdirSync(P.runDir, { recursive: true });
-    if (purge) acquireLock(path.join(P.runDir, '.orchard-docker.lock'), { who: 'sandbox:docker down --purge', label: `sandbox (${P.runDir})` });
+    if (purge) { fs.mkdirSync(P.runDir, { recursive: true }); acquireLock(path.join(P.runDir, '.orchard-docker.lock'), { who: 'sandbox:docker down --purge', label: `sandbox (${P.runDir})` }); assertBindMounted(device, 'before'); }
   }
   if (!purge) { log(`kept volume ${SANDBOX_VOLUME} (warm cache)`); return; }
   // Ownership is read at the last moment, after the container is gone (round 5: reading it before
@@ -420,6 +557,8 @@ function down(argv) {
   if (vol === 'absent') { log('volume: absent'); return; }
   const r = host(['volume', 'rm', SANDBOX_VOLUME]);
   log(r.code === 0 ? `removed volume ${SANDBOX_VOLUME} (cache gone)` : `volume: ${r.err}`);
+  // After removal, re-confirm the custom data-root is still the mounted disk we acted on.
+  assertBindMounted(device, 'after');
 }
 
 const [verb = 'status', ...rest] = process.argv.slice(2);
@@ -428,7 +567,29 @@ switch (verb) {
   case 'env': env(); break;
   case 'status': status(); break;
   case 'reset': await reset(); break;
-  case 'down': if (IN_LANE) process.exit(laneRefuses('down')); down(rest); break;
+  // prune acts on the sandbox daemon only (never the host), so a lane may run it on its own daemon.
+  // Default: size-watermark cap-prune (BUG-289 round 3). `--days N` runs the legacy age prune instead.
+  case 'prune': {
+    const d = flagValue(rest, '--days');
+    if (d.present) {
+      // NEVER let --days turn into an age-0 "prune everything" sweep. Besides empty/missing/
+      // non-numeric/negative (Number('')===0, '-0'<0 is false), REJECT any value that rounds to
+      // an age window under 1 HOUR (Math.round(days*24) < 1): 0, -0, 0.01, 1e-9 all become "0h" =
+      // older-than-nothing = EVERY unused image. For a full unused sweep use cap-prune or reset.
+      const raw = d.raw;
+      const days = Number(raw);
+      const hours = Math.round(days * 24);
+      if (raw === undefined || String(raw).trim() === '' || !Number.isFinite(days) || days < 0 || hours < 1) {
+        console.error(`prune: --days must be a number giving an age window of at least 1 hour (got ${raw === undefined ? '(no value)' : JSON.stringify(raw)}); a smaller value rounds to 0h and would prune EVERY unused image.`); process.exit(64);
+      }
+      try { const s = await pruneSandbox(days); log(`prune done: ${s}`); } catch (e) { console.error(`prune: ${e.message}`); process.exit(1); }
+    } else {
+      try { const s = await pruneSandboxToCap(SBX_ENV, { ...capOpts(rest), freeBytes: storeFreeBytesFn(), log }); log(`cap-prune done: removed ${s.removed} image(s), store ${s.before ? (s.before.store / 2 ** 30).toFixed(1) : '?'}GB -> ${s.after ? (s.after.store / 2 ** 30).toFixed(1) : '?'}GB`); }
+      catch (e) { console.error(`cap-prune: ${e.message}`); process.exit(1); }
+    }
+    break;
+  }
+  case 'down': if (IN_LANE) process.exit(laneRefuses('down')); await down(rest); break;
   // BUG-223: the shell form of the one logged way a lane reaches the HOST daemon.
   case 'host-env': {
     const { hostEnvShell } = await import('./lib/lane-docker.mjs');
@@ -437,5 +598,5 @@ switch (verb) {
     console.log(hostEnvShell(reason, 'sandbox:docker host-env'));
     break;
   }
-  default: console.error('usage: sandbox:docker -- up|status|env|reset|down [--purge]|host-env <reason>'); process.exit(64);
+  default: console.error('usage: sandbox:docker -- up [--no-prune] [--cap-gb N] [--floor-gb N]|status|env|reset|prune [--cap-gb N] [--floor-gb N] | prune --days N|down [--purge]|host-env <reason>'); process.exit(64);
 }

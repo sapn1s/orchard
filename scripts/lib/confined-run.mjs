@@ -45,6 +45,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { sandboxPaths, checkIsolatedDocker } from './docker-sandbox.mjs';
 import { scratchRoot } from './scratch.mjs';
 
@@ -743,6 +744,32 @@ export async function runConfined(argv, opts = {}) {
     if (runResult.code === 0) runResult.code = 1;
     log(`run reported as FAILED: container ${id.slice(0, 12)} could not be removed`);
   }
+  // BUG-289: bound the sandbox store AFTER work (the reaper path). Spawn the sandbox CLI's
+  // cap-prune as a SHORT-LIVED, DETACHED child rather than pruning IN-PROCESS. The CLI prune
+  // takes the daemon lock, does the isolation + pinned info.ID re-check, evicts LRU-unused
+  // images only when over budget, then EXITS — releasing the lock at once. Running it in-process
+  // would be unsafe for a long-lived caller of runConfined (the server, a multi-run verify
+  // script): acquireLock holds the exclusive sandbox lock until the HOST process exits (blocking
+  // every other lane), and on lock contention / a bad timeout it calls process.exit(3), which a
+  // try/catch cannot catch — killing a run that already succeeded. A detached child confines both
+  // to itself, so this is truly best-effort: the run's result never depends on it, and the run
+  // neither blocks nor dies on it. Cap-only (a lane cannot measure the host fs; the floor is
+  // enforced on `up`, the server context). ORCHARD_DOCKER_LOCK_TIMEOUT is bounded so a child that
+  // cannot get the lock gives up instead of lingering.
+  try {
+    const cli = fileURLToPath(new URL('../docker-sandbox.mjs', import.meta.url));
+    // STRIP ORCHARD_DOCKER_LOCK from the child's env. If the host process that called runConfined
+    // holds the daemon lock (a guarded suite, the server), the child — a descendant — would
+    // RE-ENTER that lock via acquireLock's ancestor-reentrancy check and prune WHILE the holder
+    // runs its next job (breaks contract 1c/1d), and keep deleting lock-free if the holder then
+    // exits. Removing the token forces the child to acquire the lock FRESH: it waits for the real
+    // holder to finish (or times out and prunes nothing), never concurrently.
+    const childEnv = { ...env, ORCHARD_DOCKER_LOCK_TIMEOUT: env.ORCHARD_DOCKER_LOCK_TIMEOUT ?? '120' };
+    delete childEnv.ORCHARD_DOCKER_LOCK;
+    const child = spawn(process.execPath, [cli, 'prune'], { env: childEnv, detached: true, stdio: 'ignore' });
+    child.unref();
+    log('kicked off background cap-prune to bound the sandbox store (BUG-289)');
+  } catch (e) { log(`cap-prune after run not started: ${e.message.split('\n')[0]}`); }
   return runResult;
 }
 

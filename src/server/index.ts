@@ -28,6 +28,7 @@ import * as sub from './subagents.ts';
 import * as browser from './browser.ts';
 import * as tx from './transcript.ts';
 import * as watcher from './watcher.ts';
+import { startHarnessWatchdog } from './harness-watchdog.ts'; // BUG-290 — scratch-server self-defence
 import * as ot from './orchard-transcripts.ts';
 import * as cn from './codex-native.ts';
 import * as snaps from './snapshots.ts';
@@ -8040,6 +8041,29 @@ markSanctionedRealStoreWriter();
 
 ensureDir(dataDir());
 /*
+ * BUG-290 — scratch-server self-defence. Armed ONLY for a test-harness server
+ * (CLAUDE_STATION_TEST_HARNESS, injected by isolatedServerEnv) on an ISOLATED
+ * data dir, so the production server (shared data dir, neither flag) is never
+ * affected. It EXITS the moment its launcher dies or its cwd/data dir is deleted,
+ * so a killed verify script can never leave a CPU-spinning orphan behind.
+ */
+{
+  const harnessFlag = (process.env.CLAUDE_STATION_TEST_HARNESS ?? '').trim();
+  const enabled = harnessFlag !== '' && harnessFlag !== '0' && dataDirMode() === 'isolated';
+  if (enabled) {
+    const launcherPid = Number(process.env.CLAUDE_STATION_LAUNCHER_PID);
+    let cwd = '';
+    try { cwd = process.cwd(); } catch { cwd = ''; }
+    startHarnessWatchdog({
+      enabled: true,
+      launcherPid: Number.isInteger(launcherPid) && launcherPid > 1 ? launcherPid : null,
+      cwd: cwd || dataDir(),
+      dataDir: dataDir(),
+    });
+    console.log(`[orchard] test-harness self-defence armed (launcher pid ${process.env.CLAUDE_STATION_LAUNCHER_PID ?? 'unset'}, cwd ${cwd || '(gone)'})`);
+  }
+}
+/*
  * BUG-217 rounds 7–9 (and BUG-220) — ONE SERVER PER DATA DIR, enforced by the
  * kernel. Two servers on one CLAUDE_STATION_DATA each loaded the outbox into
  * their own memory and both handed the same queued message to the CLI (CLI ×2);
@@ -8339,6 +8363,21 @@ let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  /*
+   * BUG-290 — ARM THE FORCED EXIT FIRST, before any await below. The previous
+   * order placed `setTimeout(process.exit, …)` AFTER `await closeAllSessions(…)`,
+   * so if that await never resolved (a survivable-session handoff or a container
+   * exec that hangs when the cwd/data dir has vanished) the backstop was never
+   * even scheduled and SIGTERM hung indefinitely — the "ignored SIGTERM, force-
+   * killed after 10s" half of this incident. Armed here, a wedged drain can delay
+   * a clean close but can no longer stop the process from exiting within FORCE_MS.
+   */
+  const FORCE_MS = Number(process.env.CLAUDE_STATION_SHUTDOWN_FORCE_MS) || 2000;
+  const forceTimer = setTimeout(() => {
+    console.error(`[orchard] ${signal} — forced exit after ${FORCE_MS}ms (a session close or drain did not finish in time)`);
+    process.exit(0);
+  }, FORCE_MS);
+  forceTimer.unref();
   stopOutbox(); // BUG-217 round 5: hand nothing more over while going down — queued rows wait on disk for the next boot
   clearInterval(browserReaper);
   console.log(`[orchard] ${signal} — closing sessions`);

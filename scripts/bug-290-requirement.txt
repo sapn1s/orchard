@@ -1,0 +1,30 @@
+BUG-290 — a scratch (test-harness) Orchard server must reap itself when its world
+is gone, and SIGTERM must always exit promptly. Verify the fix as it sits in the tree.
+
+Claims to verify (adversarially; build your own cases, do not trust only the fixer's suite):
+
+1. ORPHAN REAP. A scratch server booted through scripts/lib/station-boot.mjs
+   `isolatedServerEnv()` (which injects CLAUDE_STATION_TEST_HARNESS=1 and
+   CLAUDE_STATION_LAUNCHER_PID) must EXIT on its own within a couple of seconds once
+   the launcher process that spawned it dies — even though on this machine an orphan
+   reparents to the systemd user manager (NOT pid 1). Confirm that WITHOUT the harness
+   flag (CLAUDE_STATION_TEST_HARNESS=0) the same server SURVIVES launcher death (the
+   pre-fix behaviour / must-fail), i.e. the fix is load-bearing and non-vacuous.
+
+2. WORLD-GONE EXIT (busy-loop cure). A scratch server whose cwd AND data dir are
+   deleted must exit by itself within a couple of seconds (src/server/harness-watchdog.ts
+   worldGoneReason: launcher dead OR cwd gone OR data dir gone).
+
+3. LIVE SERVICE UNTOUCHED. The watchdog must be armed ONLY when
+   CLAUDE_STATION_TEST_HARNESS is set AND dataDirMode()==='isolated'. A server on the
+   shared/real data dir with no flag must NOT arm it. (isolatedServerEnv refuses the
+   real data dir, so a harness env can never point at the live service.) Inspect
+   src/server/index.ts where the watchdog is armed and confirm the gating.
+
+4. SIGTERM ORDERING. In src/server/index.ts shutdown(), the forced-exit
+   setTimeout(process.exit) must be armed BEFORE `await closeAllSessions(...)`, so a
+   hung drain cannot stop the process exiting within CLAUDE_STATION_SHUTDOWN_FORCE_MS
+   (default 2000ms). Confirm the ordering and that SIGTERM on a healthy scratch server
+   exits well under 2.5s.
+
+Fixer's canonical test: node scripts/verify-bug-290-orphan-reaper.mjs (17 checks).

@@ -96,7 +96,22 @@ export function assertIsolatedEnv(env, { requireStore = false } = {}) {
   return env;
 }
 
-/** Build + assert in one call: `spawn(node, [ENTRY], { env: isolatedServerEnv({ PORT, CLAUDE_STATION_DATA: DATA }) })`. */
+/**
+ * Build + assert in one call: `spawn(node, [ENTRY], { env: isolatedServerEnv({ PORT, CLAUDE_STATION_DATA: DATA }) })`.
+ *
+ * BUG-290 — every scratch server booted through here is a TEST server by
+ * definition (isolatedServerEnv refuses the shared/real data dir), so it is
+ * armed with self-defence: `CLAUDE_STATION_TEST_HARNESS=1` tells the server to
+ * run its watchdog, and `CLAUDE_STATION_LAUNCHER_PID` records the pid of THIS
+ * launcher so the server can reap itself the instant the launcher dies (even
+ * when it reparents to the systemd user manager, not pid 1). The caller may
+ * override either (e.g. a suite that deliberately tests an un-watched server).
+ * The production server never calls this and so is never armed.
+ */
 export function isolatedServerEnv(overrides, opts) {
-  return assertIsolatedEnv({ ...process.env, ...overrides }, opts);
+  const base = {
+    CLAUDE_STATION_TEST_HARNESS: '1',
+    CLAUDE_STATION_LAUNCHER_PID: String(process.pid),
+  };
+  return assertIsolatedEnv({ ...process.env, ...base, ...overrides }, opts);
 }

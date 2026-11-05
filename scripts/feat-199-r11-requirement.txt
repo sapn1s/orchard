@@ -1,0 +1,49 @@
+FEAT-199 r11 — load the session list and history incrementally; the sidebar's
+per-project recency must be the EXACT newest-MESSAGE time, computed cheaply.
+
+Files under review: src/server/index.ts (projectRecencyAt), public/app.js (the
+r10 boot-queue hunks), scripts/verify-feat-199-r11.mjs (the builder's suite),
+scripts/r11-bootqueue-server.mjs (browser harness helper).
+
+CONTRACT the change must satisfy:
+1. Per project, /api/projects `lastActivityAt` equals the EXACT full-list
+   computation: the same value `sessionsForProject` would put in its top row —
+   i.e. readSessionMeta(file).lastActivityAt per file, max-ed by the SAME string
+   localeCompare the full list sorts by, returning the RAW stored timestamp
+   string (not re-serialised to ISO ms). It must NOT be the newest file mtime
+   (the r10 break: a restored/copied old session or a timestamp-less `summary`
+   line bumps the mtime without a newer message and wrongly looks fresh).
+2. Cheapness: the walk visits claude files in mtime-DESCending order (stat-only
+   stubs) and STOPS once the next file's mtime <= the best message-time found, so
+   it parses ~1-2 files per project rather than head/full-reading every file.
+   GET /api/projects must be much faster than a full parse (r9 ~3.9 s warm);
+   target well under ~1.5 s warm on the real store.
+3. Boot / incremental load (public/app.js): the CURRENT project's sessions load
+   first; the other projects load at concurrency EXACTLY 2, deferred to idle; a
+   user CLICK on a project jumps that project to the front of the queue; EVERY
+   project is eventually loaded EXACTLY once (no double-fetch; the loaded guard
+   holds across a click).
+
+USER-ACCEPTED documented limits — these are NOT breaks and must NOT be graded as
+failures (they are rare and benign for a coarse recency sort because the inflating
+message genuinely EXISTS in a real file of the project, unlike the r10 mtime break):
+  (A) a dropped same-id twin whose dropped copy carries a NEWER real message can
+      make r11 differ from the canonical pool's top row.
+  (B) a claude-shadowed Orchard row (same id, claude file wins the dedupe) whose
+      dropped Orchard copy has a NEWER message can likewise differ.
+  (C) a file whose mtime was rewritten BACKWARDS below its own messages (touch/
+      utimes only; cp -p / rsync -t / restore all preserve mtime >= messages) can
+      be skipped by the early-stop. Not reachable on a real single-clock machine.
+
+ATTACK everything else and report any divergence as a BREAK:
+  - restored or copied files with fresh mtimes (message time must win)
+  - timestamp-less summary lines appended to an old transcript
+  - equal mtimes across files
+  - orchard-only projects and native-codex-only projects
+  - an empty project (null recency)
+  - a project added at runtime (POST after boot)
+  - 20+ projects (the real store)
+  - the boot queue driven in a REAL headless browser (current-first, concurrency
+    2, single-load-per-project, click jumps the queue)
+
+Two-break STOP applies: stop after the second genuine break.

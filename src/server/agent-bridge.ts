@@ -1777,7 +1777,13 @@ export class AgentSession {
         spawnProcess = (o) => {
           const { proc, handle } = spawnSurvivable(
             { command: o.command, args: o.args, cwd: o.cwd, env: o.env },
-            { stationSessionId: id, resumeHint: opts.resumeSessionId ?? null, projectId: opts.project.id },
+            {
+              stationSessionId: id, resumeHint: opts.resumeSessionId ?? null, projectId: opts.project.id,
+              // FEAT-199 (r12 refuted by anthropic d542dc75): deprioritise the
+              // CPU weight ONLY for an agent/lane-started session. A user's own
+              // dashboard session (#startedBy === 'user') keeps normal weight.
+              lowPriority: this.#startedBy === 'agent',
+            },
           );
           this.#survivalHandle = handle;
           return proc as never;

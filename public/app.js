@@ -1590,7 +1590,7 @@ async function loadSessions(id, { force = false, full = false } = {}) {
       const r = full
         ? await api.projectSessions(id)
         : await api.projectSessions(id, { limit: SESSION_PAGE, offset: 0 });
-      s.list = (r.sessions ?? []).slice().sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+      s.list = (r.sessions ?? []).slice().sort((a, b) => cmpRecency(a, b));
       // FEAT-199 — a new generation for the sidebar list. A loadMoreSessions that
       // was in flight against the PREVIOUS list (and its now-stale cursor) sees
       // the bump and drops its response instead of appending stale-cursor rows
@@ -1668,7 +1668,7 @@ function upsertSessionRows(id, s, rows) {
     if (i == null) { at.set(row.sessionId, s.list.length); s.list.push(row); }
     else s.list[i] = row; // an update to a session already in hand — refresh, no dup
   }
-  s.list.sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+  s.list.sort((a, b) => cmpRecency(a, b));
   mergeSearchCorpus(id, rows); // deeper pages / bumped rows feed the finder too
 }
 
@@ -1691,7 +1691,7 @@ function upsertSessionRows(id, s, rows) {
 async function reconcileFullList(id, s, gen) {
   const r = await api.projectSessions(id); // authoritative, complete list (no paging)
   if ((s.listGen ?? 0) !== gen) return;    // superseded by a forced page-1 reload
-  s.list = (r.sessions ?? []).slice().sort((a, b) => recencyKey(b).localeCompare(recencyKey(a)));
+  s.list = (r.sessions ?? []).slice().sort((a, b) => cmpRecency(a, b));
   mergeSearchCorpus(id, s.list);
   s.serverTotal = s.list.length;
   s.serverHasMore = false;
@@ -2203,6 +2203,22 @@ const recencyKey = (x) => {
   const submit = stamp && (!server || stamp > server) ? stamp : server;
   return String(submit ?? x?.lastActivityAt ?? '');
 };
+// FEAT-199 r13: order two rows by recency using the NUMERIC instant (Date.parse),
+// with a raw-string tiebreak — mirroring the server's cmpActivity. Raw-string
+// localeCompare alone mis-ordered mixed timestamp formats (offsets, `…Z` vs
+// `…​.000Z`), so the client re-sort could put an older session above a newer one
+// even after the server fix. An unparseable/empty key sorts LAST. Returns < 0
+// when `a` is the more recent row (newest first, matching the old `b…(a)` form).
+const cmpRecency = (a, b) => {
+  const ka = recencyKey(a), kb = recencyKey(b);
+  const ma = Date.parse(ka), mb = Date.parse(kb);
+  const aNan = Number.isNaN(ma), bNan = Number.isNaN(mb);
+  if (aNan && bNan) return kb.localeCompare(ka);
+  if (aNan) return 1;
+  if (bNan) return -1;
+  if (ma !== mb) return mb - ma;
+  return kb.localeCompare(ka);
+};
 function orderedSessions(s) {
   // Order is pinned block first, then everything else by recency (last user
   // submit) desc. Plain SELECTION never moves a row — the open session keeps its
@@ -2212,7 +2228,7 @@ function orderedSessions(s) {
   // leave the order untouched.
   const rank = (x) => (api.pinnedOf(x) ? 0 : 1);
   return (s.list ?? []).slice().sort((a, b) => rank(a) - rank(b)
-    || recencyKey(b).localeCompare(recencyKey(a)));
+    || cmpRecency(a, b));
 }
 
 /*
@@ -3186,20 +3202,45 @@ async function openSearchHit(h) {
 
 async function loadAllSessions() {
   if (state.warmLoaded) return;
-  // BUG-158: fetch every project's session list in PARALLEL, not one strictly
-  // after another. Each request keys on its own sessionState(id) and guards
-  // with s.loading, so concurrent loads never race; renderTree() is idempotent.
-  // The old serial `for … await` chained 13 round-trips end to end (~4 s of the
-  // measured 7.5 s boot); once the server-side scans are memoised each request
-  // is cheap, and firing them together collapses the chain to a single wave.
+  state.warmLoaded = true; // claim the warm up front so a second caller never re-fires the sweep
   // FEAT-199 — the BOOT warm (unseen badges + per-project live dots) needs only
   // the FIRST PAGE of each project: the recent sessions those badges describe are
   // all on page 1, and a full load here would re-impose the whole-store cost this
   // ticket removes. The finder's cross-session title search full-loads separately
   // (`loadAllSessionsFull`), the one place the complete list is actually needed.
-  await Promise.all(state.projects.map((p) => loadSessions(p.id)));
-  state.warmLoaded = true;
-  renderTree();
+  //
+  // FEAT-199 r10 — the sweep no longer fires ALL projects at once. On the
+  // single-threaded server a 22-wide parallel wave was ~7 s of self-contention,
+  // and a session the user clicked right after boot had its list + tail queued
+  // BEHIND that wave. Instead:
+  //   • the CURRENT project goes first (boot already awaited it, so loadSessions
+  //     dedups it near-instantly — it is listed first only so a cold reorder is
+  //     still correct);
+  //   • the rest run with BOUNDED CONCURRENCY (2 at a time), DEFERRED to idle
+  //     (requestIdleCallback, else a 500 ms timer after the first paint), so the
+  //     warm never saturates the server;
+  //   • an explicit user action (selectProject → loadSessions) loads its project
+  //     DIRECTLY and the sweep SKIPS anything already in hand, so a click always
+  //     jumps ahead of the remaining queue.
+  const curId = state.current?.projectId ?? null;
+  const queue = [
+    ...state.projects.filter((p) => p.id === curId),
+    ...state.projects.filter((p) => p.id !== curId),
+  ].map((p) => p.id);
+  const start = () => {
+    let i = 0;
+    const worker = async () => {
+      while (i < queue.length) {
+        const id = queue[i++];
+        if (sessionState(id).loaded) continue; // a user action already loaded it — jump the queue
+        await loadSessions(id);
+      }
+    };
+    const CONCURRENCY = 2;
+    return Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
+  };
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(() => void start(), { timeout: 2000 });
+  else setTimeout(() => void start(), 500);
 }
 
 /*
@@ -5596,7 +5637,11 @@ function paintMarks(th = viewedThread()) {
  * frame is painted in between.
  */
 
-const TAIL_PAGE = 200;   // messages in the first (newest) page
+const TAIL_PAGE = 40;    // FEAT-199: messages in the first (newest) page — a small
+                         // first paint. 200 made the opening fetch ~448 KB raw /
+                         // ~117 KB gzipped on a real busy session; 40 is ~132 KB
+                         // raw / ~28 KB gzipped, and scroll-up pulls OLDER_PAGE
+                         // (120) blocks on demand through the same backward cursor.
 const OLDER_PAGE = 120;  // messages per scroll-up page
 
 function maybeLoadOlder() {

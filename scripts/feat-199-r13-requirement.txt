@@ -1,0 +1,52 @@
+FEAT-199 r13 — the sidebar's per-project recency (GET /api/projects
+`lastActivityAt`) must agree with the project's own full session list, computed
+cheaply, using ONE activity comparator everywhere recency is compared.
+
+CHANGE UNDER REVIEW (src/server/index.ts only):
+- Added `cmpActivity(a, b)` / `activityInstant(iso)`: order by the numeric INSTANT
+  (Date.parse), with a stable raw-string localeCompare tiebreak when two different
+  strings name the same instant; an unparseable/empty timestamp sorts LAST.
+- The full session list sort (`sessionsForProject`, previously raw-string
+  localeCompare) now uses `cmpActivity`.
+- `projectRecencyAt` picks its `best` with `cmpActivity` AND early-stops on the
+  SAME numeric instant (`activityInstant(best)`), so the pick and the stop can no
+  longer disagree. Orchard and native-codex rows go through `cmpActivity` too.
+- No other behaviour changed: buildSessionCandidatePool / sessionPageForProject /
+  the by-id deep-link route / listSessionStubs / the keyset cursor are untouched.
+
+THE BUG THIS FIXES (anthropic run 841cff48, BROKEN): r11/r12 picked `best` by
+raw-string localeCompare but early-stopped on Date.parse(best). Mixed timestamp
+formats (`…Z` vs `…​.000Z`, `+05:00` offsets) sort one way lexically and the
+other numerically, so the mtime-desc walk could stop on a numerically-newer file
+before reaching the lexically-larger-but-older file the full list (also
+localeCompare) ranked on top — the sidebar recency then named a different session
+than the project's own top row.
+
+CONTRACT the change must satisfy:
+1. For every project whose timestamps PARSE, GET /api/projects `lastActivityAt`
+   equals the full session list's top-row `lastActivityAt` BY INSTANT (the raw
+   string may differ only when two strings name the SAME instant — invisible to
+   the sort key and the "N ago" label).
+2. The genuinely-newest-INSTANT session wins, even when an older session carries a
+   lexically-larger timestamp string (offset/format cases). A timestamp that does
+   not parse sorts LAST, never first.
+3. Cheapness preserved: GET /api/projects stays well under ~1.5 s warm on the real
+   store (it must not regress toward the ~3.9 s full parse).
+4. An ordinary append of a newer message re-orders the sidebar (project and its
+   session move to the top).
+
+ACCEPTED, DOCUMENTED limits (NOT breaks — measure, don't assert away): (A) a
+dropped same-id twin and (B) a claude-shadowed Orchard row whose dropped copy
+carries a NEWER real message can make recency over-count vs the canonical pool's
+top row — but that message genuinely exists in a real file of the project (unlike
+r10's fresh-mtime-on-old-content). (C) a file whose mtime was rewound BELOW its
+own messages (touch/utimes to the past; NOT cp -p/rsync -t/restore, which preserve
+mtime>=messages) can be skipped by the early-stop and UNDER-estimate (bury an
+active project). Report the divergence MAGNITUDE for A/B/C; do not grade them as
+failures.
+
+ATTACK everything else and report any divergence as a BREAK: offset/format strings
+where lexical and numeric order disagree; equal instants in different string forms;
+restored/copied files with fresh mtimes; timestamp-less summary lines; orchard-only
+and native-codex-only projects; an empty project (null recency); 20+ real projects;
+an append re-ordering the sidebar.

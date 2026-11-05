@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-10-28",
+  "updated": "2026-11-05",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -230,6 +230,121 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "candidate": "93348e163b7e31458e468011b7a9a6306fcb88796be2989a9165196e2151593d",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "85032d3a-8e0e-479b-b13e-8399a3f96939",
+      "verdict": "broken",
+      "verdict_on": "2026-11-03",
+      "recorded_at": "2026-11-03T12:54:06.746Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "68182d6f25447e2fa4b96cc4487c17e6468dc5fe0db9c0f7d178b6a88447e43f",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "2c884b11-3746-4edb-8c07-700e4c8bc719",
+      "verdict": "broken",
+      "verdict_on": "2026-11-03",
+      "recorded_at": "2026-11-03T13:39:12.370Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "11c1d7e6a24cb1688d8a5fad0e33ab6b28f85a65730fc776ed149bf74702b202",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "6f0b8991-be0e-4c66-a7f2-ae11a54674c9",
+      "verdict": "broken",
+      "verdict_on": "2026-11-03",
+      "recorded_at": "2026-11-03T13:39:14.849Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "50cb55f74f02502f749e7facd66743a1456f8fe9bdc016ba426263e24ff1f864",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "841cff48-f2ef-42ad-a902-3476c7fbc80f",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T05:28:00.685Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "91b893bcbc6950645e9b6df1e3e1a0991b5a0c3e023c03708ec6e06b3b4f3315",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "7575ab04-93df-418e-a74a-3d9af02fdbdd",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T06:09:42.034Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "c12b5f3c8e0fffc524f555dbbb12472cce74988d71a8862299d028a19c53eec3",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1aac0-6596-7641-a5a1-a3dbb24a5d53",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T08:13:03.069Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "fd2b96b9956b407def968b68e147188dfea8c3130ea14b452b99eea8726f5859",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1aad4-2121-7de1-8d59-93cac101b1d1",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T08:35:31.798Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "111c802e06a8bfca91639634ab2910db7012b02125acec3eb3e618f2995dfc7f",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "d542dc75-34e2-40d4-941a-91cf1d9b3a3b",
+      "verdict": "broken",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T11:14:23.919Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "9a94351a-7a10-4ab5-bbb6-b1d8c3a28896",
+      "verdict": "holds",
+      "verdict_on": "2026-11-05",
+      "recorded_at": "2026-11-05T11:58:17.162Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "becd6cfa7faa5e72b7d32ae6492d1765dd25af3454addac864bc523fe7002b03",
       "verify_mode": "mixed-state"
     }
   ],
@@ -552,3 +667,184 @@ recent large session. Record medians of 3 once curl + store read are granted.
   INDEPENDENT VERIFY (anthropic run 64129a8c, mixed-state candidate 93348e163b7e): VERDICT **HOLDS** (VALID, manifest-backed). The verifier built its OWN adversarial runs and all passed: a REAL DOM "N more" click-walk on a 2-page store with delete+bump recovering by the AUTOMATIC backoff timer (no manual call) + an HTTP-500 (not just aborted) reconcile failure + a DOM retry-button click that keeps the flag while the server still fails and clears it on recovery; and a forced-reload-supersedes-inflight-reconcile race (3s-held full-list response, page-1 reload mid-flight → stale reconcile dropped, page 1 kept, flag cleared, re-walk == full by id, boot loads page 1 only, forged since/cursor → 400). HIGH-STAKES bucket (session-lifecycle + list-completeness) — satisfied by this fresh clean-room HOLDS; generation was not its own only verifier. Verifier's UNTESTED notes: no real-store browser run (synthetic 100–150-session stores), a forever-hanging reconcile fetch (flag set only on reject), backoff beyond n=3/the 30s cap, phone-width/collapsed-group layout, and the live tick was stubbed in every run.
 
   Files: public/app.js, public/styles.css, scripts/verify-feat-199-r9.mjs (new).
+
+### 2026-10-30 — fixing lane r10 (worker)
+- **round-10 / fast first paint: GET /api/projects stops full-parsing every session file, and the boot warm is bounded + deferred, not a 22-wide wave.** Two measured root causes on the LIVE server (2026-10-30), both separate from the r2–r9 list-completeness work (those still hold).
+
+  ROOT CAUSE 1 — the sidebar's first blocking request. `GET /api/projects` decorated all 22 projects with `lastActivityAt` via `sessionsForProject(p).sessions[0]`, which `readSessionMeta`-parses (~512 KB sampled) EVERY session file of EVERY project on every call. MEASURED on a scratch server against the real store (22 projects, ~13 k files): warm ~3.9 s, cold ~13.4 s — all paid before the sidebar titles can paint.
+
+  FIX 1 (src/server/index.ts). The project-level `lastActivityAt` is only a sort key + a coarse "N ago" label (public/app.js projRecency / the `when()` label); no consumer needs an exact message time. New `projectRecencyAt(p)` computes it STAT-ONLY: the newest session-file mtime across the project's claude stores (`listSessionStubs`, no file contents) plus the Orchard/native sources' own cheap head-only listings. The claude dir set is derived by the extracted `claudeStoreDirsForProject` — the SAME owner `buildSessionCandidatePool` now calls (ARCH-010: one dir-list derivation), and the whole-store `listProjectDirs()` scan runs ONCE for all 22 projects (new `scanLogicalProjects`, passed in) instead of per project. AFTER: warm ~0.22 s, cold ~1.6 s (3 runs each).
+
+  mtime-vs-message-time CHECKED. Computed BOTH values from the SAME real-store snapshot for all 22 projects: the recency SORT ORDER is IDENTICAL (exact message-ts order == mtime order). The per-value delta is 0.0 s for every recent/live project (mtime == last message ts there); older projects show mtime up to minutes/hours later than the last timestamped entry (untimestamped trailing summary/meta lines bump the file mtime but not `lastActivityAt`) — far too small a gap to reorder projects that are days apart, and the relative "N ago" label is unchanged. An earlier before/after that showed 20 "diffs" was a measurement artifact: the two captures were ~1 min apart against a LIVE store whose two active sessions advanced between them.
+
+  ROOT CAUSE 2 — the boot warm. `loadAllSessions()` fired page-1 loads for all 22 projects in ONE `Promise.all` wave; on the single-threaded server that self-contends (~7 s measured previously) and a session the user clicks right after boot has its list + tail queued BEHIND the wave.
+
+  FIX 2 (public/app.js). The sweep now: loads the CURRENT project first (boot already awaited it, so loadSessions dedups it); runs the rest with BOUNDED CONCURRENCY (2 at a time) DEFERRED to idle (`requestIdleCallback`, else a 500 ms timer); and SKIPS any project already loaded, so an explicit user action (selectProject → loadSessions) loads its project directly and jumps ahead of the remaining queue. `state.warmLoaded` is claimed up front so a second caller never re-fires the sweep.
+
+  PROOF (all green):
+  - scratch server vs the REAL store (read-only, isolated data dir seeded with the real registry's 22 projects): GET /api/projects warm 3858/3896 ms → 224/215 ms; cold 13439 ms → 1635 ms. Project order + lastActivityAt labels: identical sort order to the exact path on a same-snapshot comparison (20/20 non-null projects).
+  - REAL headless browser (brave/playwright) over the full 22-project real store: time to first sidebar project titles ~1.8–2.3 s (cold, includes server spawn); a clicked busy-project (trading_volume) session's first message renders in ~2.7 s — not stuck behind the warm sweep.
+  - Named suites: verify-feat-199-keyset PASS; verify-feat-070-sidebar 14/14; verify-session-recency 11/11; verify-feat-199-pagination PASS (union 3529==3529, cold first page 3115 ms vs cold full 18147 ms, real-browser row paint + deep link). npm run gate PASS (exit 0, typecheck included — read unpiped).
+
+  HIGH-STAKES bucket: NO — this is a read-only performance change (sort key + label + boot scheduling); it touches no session-lifecycle/completeness path and the r2–r9 list/page/deep-link routes are byte-for-byte unchanged (`sessionsForProject` full path untouched; `buildSessionCandidatePool` only delegates its dir derivation to the extracted helper). Per the dispatch (usage low) the independent clean-room verify is DEFERRED to when usage resets; it is warranted as a routine confirm, not because generation was its own only verifier on a risky path.
+
+  Files: src/server/index.ts (scanLogicalProjects + claudeStoreDirsForProject extracted, projectRecencyAt new, /api/projects route), public/app.js (loadAllSessions).
+
+### 2026-11-03 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 85032d3a-8e0e-479b-b13e-8399a3f96939 — VERDICT: BROKEN — mixed-state candidate 68182d6f2544. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-03 — fixing lane r11 (worker)
+- **round-11: projectRecencyAt is the newest-MESSAGE time (via readSessionMeta + a mtime-desc early-stop walk), NOT the newest file mtime.** Fixes r10 (anthropic run 85032d3a, BROKEN). regressed-from: the r10 stat-only max-mtime projectRecencyAt (same ticket, prior entry). NEEDS-DECISION + a fresh independent HOLDS (see below) before close.
+
+  THE BREAK (run 85032d3a). r10 took the newest session-file MTIME as the project's recency, assuming mtime == the last message's write time. A restored/copied OLD session, or a timestamp-less `summary` line appended to an old transcript, bumps the file mtime WITHOUT a newer message — so the project looked fresh and the sidebar reordered.
+
+  THE FIX (src/server/index.ts projectRecencyAt only; src/lib/session-history.ts unchanged this round). Each file's contribution is now `hist.readSessionMeta(...).lastActivityAt` — the SAME per-file parser the full list uses, so head/tail sampling and the no-timestamp mtime fallback agree by construction. The max is taken by the SAME string `localeCompare` the full list sorts by, keeping the RAW stored string (not `new Date(ms).toISOString()`). Cheapness is in the WALK: claude files are visited in mtime-DESC order (stat-only stubs) and the walk STOPS once the next file's mtime <= the best time found — ~1-2 memoised parses per project, not a head/full read of every file. Orchard/native rows contribute their own head-only lastActivityAt (same rows the exact path merges).
+
+  PROOF (scripts/verify-feat-199-r11.mjs, NEW — 24/24, 3 XFAIL documented):
+  - PHASE A (crafted scratch store over the REAL server, no live-write race): MUST-FAIL(summary) — old transcript (last msg 10 d) + timestamp-less `summary` so mtime≈now: the r10 max-mtime over the SAME store IS ~now (break reproduced), r11 returns the OLD message time; MUST-FAIL(restored) — mtime forced to now: same; EMPTY → null; ORCHARD-only → orchard msg time; NATIVE-only → rollout mtime; MANY-FILE (freshest mtime has an OLD msg) exercises the walk+early-stop; RUNTIME-added project surfaces correct. For every phase-A project r11 == the exact full-list top row.
+  - PHASE B (REAL store, real registry's 22 projects, read-only): r11 == exact full-list top row for ALL 22, 0 divergences. TIMING GET /api/projects: r11 warm median ~430 ms, cold ~5 s (3 runs). Reference (ticket, same machine+store): r9 full-parse ~3900 ms warm / ~13400 ms cold; r10 mtime ~220 ms warm / ~1600 ms cold. r11 is ~9x faster than the r9 full-parse warm (the cost the ticket removes) and correct, paying ~1-2 memoised parses/project over r10's pure stat.
+  - PHASE C/D (the two independent-verify runs' adversarial shapes, re-driven): #1 non-monotonic newest-ts-in-head of a 300 KB file, #3 >512 KB with timestamps only mid-file, #4 non-millisecond string, #fmt mixed ms/no-ms strings at the same second — ALL now == exact (fixed by readSessionMeta reuse + localeCompare + raw string).
+  - REAL headless browser (playwright) over a crafted 8-project store, driving the r10 boot queue (public/app.js loadAllSessions, UNCHANGED by r11), via the browser's own resource-timing on a fresh boot: CURRENT project first (current=p-5 ⇒ p-5 first), max concurrency EXACTLY 2, every project loaded EXACTLY once (8 unique, no double-fetch); a click keeps the clicked project's load-count at 1 (the `sessionState(id).loaded` skip-guard holds).
+  - Regressions: verify-feat-070-sidebar 14/14; verify-session-recency 11/11; verify-feat-199-keyset PASS. npm run gate PASS (exit 0, typecheck included — read unpiped).
+
+  INDEPENDENT VERIFY (two, both VALID BROKEN, each on a now-SUPERSEDED candidate; I used my lane's IV iteratively):
+  - openai→anthropic run 2c884b11 (candidate 11c1d7e6a24c): found the 64 KB-tail-only reader diverged from readSessionMeta for non-monotonic / >512 KB-middle / non-ms-string files, and the re-serialise-to-ms string gap. ADDRESSED: switched to readSessionMeta per file + localeCompare + raw string (PHASE C now green).
+  - openai→anthropic run 6f0b8991 (candidate 50cb55f74f02): found the re-derived recency disagreed with the exact pool's dedupe — a dropped same-id twin, or an Orchard row a claude file shadows, whose dropped copy carries a NEWER real message; plus the localeCompare-vs-numeric format case. ADDRESSED localeCompare (#fmt green). The twin/orch dedupe is NOT fixed — see decision.
+
+  DECISION FOR THE ORCHESTRATOR — exact-vs-cheap is genuinely in tension here. The exact value (sessionsForProject top row) needs the pool's `canonicalSessionIndex`, which head-reads EVERY file of EVERY project (measured ~3.7 s warm = the full-parse cost this ticket exists to remove). So three KNOWN exact-equality gaps remain in the cheap version, each RARE and benign for a coarse recency sort (unlike r10, the inflating message genuinely EXISTS in a real file of the project): (A) a dropped same-id twin with a newer message; (B) an Orchard row shadowed by a claude file of the same id, with a newer message; (C) a file whose mtime was rewritten BACKWARDS below its own messages (touch/utimes; cp -p/rsync -t/restore all preserve mtime>=messages). On the REAL 22-project store none occur (PHASE B 22/22 exact). OPTION 1 (recommended): accept the cheap version with these documented limits → run a fresh independent HOLDS scoped to exclude A/B/C as accepted, then close. OPTION 2: require byte-exact → a different design that makes canonicalSessionIndex lazy/cheap (bigger refactor, out of this lane's scope), or accept ~r9 latency. The current working tree is UNVERIFIED (newer than both BROKEN candidates) and must NOT be closed as HOLDS without the orchestrator's option pick + a fresh clean-room verify.
+
+  Files: src/server/index.ts (projectRecencyAt rewritten + doc comment; no other behaviour changed — buildSessionCandidatePool/sessionsForProject/list/page/deep-link routes byte-for-byte unchanged), scripts/verify-feat-199-r11.mjs (new), scripts/r11-bootqueue-server.mjs (new, browser-harness helper). src/lib/session-history.ts is UNCHANGED (net) this round.
+
+### 2026-11-03 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 2c884b11-3746-4edb-8c07-700e4c8bc719 — VERDICT: BROKEN — mixed-state candidate 11c1d7e6a24c. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-03 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 6f0b8991-be0e-4c66-a7f2-ae11a54674c9 — VERDICT: BROKEN — mixed-state candidate 50cb55f74f02. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — explore lane (OpenAI independent consult on the r11 exact-vs-cheap decision)
+
+**Consult:** OpenAI (codex default), thread 01a1aa25-b9a2-7ba2-be07-83ab70860724, 2026-11-05. Self-contained secret-free brief; asked it to recommend AND to refute the author's OPTION 1. Transcript: the dispatch transcripts dir, `openai/<encoded-project-dir>/01a1aa25-b9a2-7ba2-be07-83ab70860724.jsonl`.
+
+**OpenAI's recommendation:** SHIP the cheap recency path now; do NOT wait for the persistent/incremental index. 3.9 s warm is too expensive for a sidebar sort key. The persistent index is the better eventual architecture but only with invalidation, deletion handling, reconciliation and dedup-winner updates — it makes exact reads cheap, it does not make correctness easy; not worth blocking on.
+
+**What it AGREED with the author on:** cheap over exact for a sort-key + coarse label; persistent index is right eventually but shippable-later, not a blocker.
+
+**What it REFUTED / pushed back on (adopt these):**
+1. "Scope the fresh verify to EXCLUDE A/B/C" is backwards — that excludes precisely the disputed behaviour. Build TARGETED fixtures for A/B/C and record the accepted divergence magnitude, rather than asserting them away. The real-store 22/22 proves neither universal correctness nor a BOUNDED error.
+2. "The message genuinely exists somewhere" does NOT make the UI consistent: a project can label "just now" while every visible session is old, or a discarded twin can hold a project above projects with genuinely newer VISIBLE activity; coarse labels don't rescue a days-sized discrepancy.
+3. NEW failure mode the author under-weighted: case C can cause UNDER-estimation (not just over), because the mtime-desc early-stop can terminate BEFORE reaching the actual newest message and bury an active project. And `mtime >= message-time` is not guaranteed even by cp -p/rsync -t — clock skew or future-dated messages break it.
+4. Add an anti-regression that ordinary append activity re-orders the sidebar (the shared parser proves per-file agreement, NOT correctness of the stopping rule).
+
+**Net for the orchestrator:** OpenAI endorses OPTION 1's ship-cheap decision but rejects the "verify-excluding-A/B/C" plan. Recommended concrete change to the close criteria: the fresh independent HOLDS should INCLUDE crafted A/B/C fixtures (measuring divergence) + an append-reorders-sidebar anti-regression + an early-stop-underestimation (C) probe, not exclude them.
+
+### 2026-11-05 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 841cff48-f2ef-42ad-a902-3476c7fbc80f — VERDICT: BROKEN — mixed-state candidate 91b893bcbc69. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — fixing lane r12 (worker) — plan+review + quick wins (perf complaint)
+
+User (2026-11-05): session list + transcripts still take seconds, worst on the phone (tailscale serve) and when the machine is busy. Expectation: ~20 titles near-instant, a transcript is a few-KB text chunk.
+
+**IS r10/r11 LIVE? — r10 yes, r11 NO.** The systemd --user service (claude-station, PORT=4317, pid 740961 owns the socket) has `ExecMainStartTimestamp = 2026-10-30 16:41:38` and runs `src/server/index.ts` DIRECTLY (node type-strips at load). `projectRecencyAt` is NOT at HEAD (committed index.ts is Oct-29 BUG-278) — it is a working-tree-only change (r10 added, r11 rewrote). The file's mtime is 2026-11-03 15:36 (r11) > the process start, so **r11 is not loaded**; r10's stat-only projectRecencyAt WAS on disk at the Oct-30 16:41 (re)start, so **r10 is live**. Live /api/projects measured ~808 ms warm now (gzip 3659 B wire / 43914 B raw, 22 projects) — consistent with r10 (~220 ms) inflated by CPU contention, NOT the pre-r10 full-parse (~3.9 s). So the live sidebar currently carries r10's known mtime-vs-message-time ordering bug that r11 fixes; a service restart is needed to pick up r11 (and the r12 changes below). The dispatch's earlier "~4 s" live reading matches the pre-r10 path and/or a contention spike.
+
+**PART 1 — MEASURED (live, read-only GETs via a scratch http client; real store):**
+- **Compression: ALREADY LIVE and committed** (added a prior round; `sendJson`/`sendJsonConditional` gzip any body >1 KB when the client sends `accept-encoding: gzip`, `vary: accept-encoding`). /api/projects 43914 B → 3659 B wire (12x). Transcript tail=200 on a real 6 MB session: 448660 B raw → 117158 B wire (3.8x). All JSON + transcript responses go through `sendJson`, so they are all gzipped.
+- **Tail payload sizes (real 6 MB orchard session, 3228 lines):** tail=200 (the client's opening page) = 448660 B raw / 117158 B gzip wire; tail=40 = 132187 B raw / 28440 B gzip wire. Default open sends tools OFF (`includeToolResults=false`) so tool_result OUTPUTS are already empty stubs (chip + expand via `?tools=1`) — the bulk of the payload is assistant message TEXT and tool_use INPUT JSON, not tool outputs. tools=1 barely changes it (428368 B raw).
+- **Event-loop lag (GET /api/health x10):** 2 2 2 3 4 5 11 17 22 **1657** ms — median 5 ms but a 1.66 s spike on a trivial endpoint while lanes ran. This is the "worst when the machine is busy" complaint: the single-threaded server is starved.
+- **Scheduling priority:** server pid 740961 = nice 0, cgroup cpu.weight **100** (default). Lane CLIs run in `claude-station-host-*.scope` cgroups (under app.slice) also at nice 0 / cpu.weight 100, with their test/build children inheriting the scope. Server and lanes are at EQUAL weight — the server has no CPU priority over a busy lane. The unit has no Nice=/CPUWeight=.
+
+**PART 2 — BUILT (changes left UNSTAGED; independent verify deferred to landing per dispatch):**
+- **(a) compression** — already live/committed; no code change. Before/after over a tailscale-like link: 448660 → 117158 B (transcript), 43914 → 3659 B (projects). Reported, not re-built.
+- **(b) transcript first paint** — `public/app.js`: `TAIL_PAGE 200 → 40`. The opening fetch drops from 117158 B → 28440 B gzip wire (448660 → 132187 B raw) on the real 6 MB session, and renders 40 vs 200 messages. Scroll-up already pulls `OLDER_PAGE` (120) blocks through the existing backward byte-cursor (`?before/?beforeBytes`), so no history is lost — only deferred. **Tool-output preview+expand ALREADY EXISTS**: the reading route defaults `includeToolResults=false` (chip stub), expand = `?tools=1`; the single truncation owner is `src/lib/session-history.ts` `toBlocks`/`deliverText`. NOT building a server text cap: BUG-234 r7 forbids truncating assistant/tool_use TEXT in the reading view (mid-fence markdown cuts). The remaining first-paint inflators are giant single tool_use INPUTs / single huge text blocks — proposed as a separate carefully-owned follow-up, not built here.
+- **(c) lane CPU priority** — `src/server/survival.ts`: the `systemd-run --user --scope` that launches every lane host now passes `--property=CPUWeight=20` (vs the server's 100, ~5:1 under contention). LOWERING the lanes (not raising the server, which needs root). cpu.weight is proportional, not a cap, so an idle machine runs lanes at full speed; a busy one cedes CPU to the server's event loop. One property on the scope covers the whole lane subtree (claude + its Bash/test/Docker children inherit the scope cgroup).
+
+**PROOF (PART 2):** `npm run gate` PASS (exit 0, leak-gate + typecheck, read unpiped-equivalent). All 14 FEAT-199 suites exit 0 (keyset, pagination, adversarial, r3/r3-client/r3-deeplink, r4/r4-canonical, r5-sources, r6-exact-count, r7, r8, r9 PASS; r11 24/24). BUG-278 resume suite (verify-bug-278-resume-uuid) 21/21. First-paint before/after is the measured wire-byte reduction above; the full headless Fast-3G timing is folded into the deferred landing independent-verify. Throttled-link projection at ~400 Kbps: first transcript transfer ~2.3 s → ~0.56 s.
+
+**RISK BUCKET:** (b) is a low-risk client constant; (c) touches session-lifecycle code (survival.ts) — a transient-scope CPU property only, no escape-semantics change, but flag for the landing independent clean-room verify.
+
+**PART 3 — PLAN ONLY: a persistent, server-owned per-project session index.**
+
+Problem: `/api/projects` (`projectRecencyAt`) and the `/sessions` list/page/deep-link routes (`buildSessionCandidatePool` → `hist.canonicalSessionIndex` → `readSessionMeta`/`readTitleMeta`) re-derive everything by walking + head/tail-sampling every file of every project on every request (warm ~0.2–4 s, cold ~1.6–13 s), redone each request though almost nothing changed.
+
+Shape: a per-project sidecar `<stateDir>/session-index/<projectId>.sqlite` (node:sqlite builtin; JSON sidecar as the fallback shape). Table `sessions{sessionId PK, encodedDir, filePath, title, lastActivityAt, mtimeMs, sizeBytes, canonical, source, droppedCopiesJson, cwd}` + `files{filePath PK, mtimeMs, sizeBytes, sessionId, encodedDir, cwd}` (every scanned file, not just winners, so the stat-diff can detect add/change/remove). `CREATE INDEX ix_recency ON sessions(lastActivityAt DESC)`.
+
+One owner (ARCH-010): the index is a CACHE of the EXISTING owner's output, never a second canonicality derivation. Build/refresh calls the SAME `buildSessionCandidatePool`→`canonicalSessionIndex`→`readSessionMeta` path and writes the result; the four consumers READ the sidecar. CORRECTION from review: `canonicalSessionIndex` is NOT stat-only today — it head-reads up to 32 KB of every file to key by the IN-FILE sessionId, and does a full twin parse on a collision; the sidecar's real win is PERSISTING the in-file id + winner so the warm path skips the head-read.
+
+Incremental refresh (stat-diff): enumerate dirs with the cheap owner (`claudeStoreDirsForProject`/`scanLogicalProjects`/`listSessionStubs`, stat only); compare each file's (mtimeMs,sizeBytes) to `files`; unchanged → keep cached row; changed/added/vanished → mark project P dirty. If nothing dirty → answer from the sidecar (indexed SELECT / keyset cursor the page route already speaks). If dirty → re-run the pool for ALL of P (canonicality is cross-store per id, so per-id partial recompute is FORBIDDEN — a hard invariant), reusing cached parses for files whose (mtime,size) are unchanged; upsert winners + delete vanished ids in ONE transaction.
+
+Invalidation: (mtime,size) drift (same signal projectRecencyAt trusts; live store appends so both grow — the one escape is a same-size, same-ms in-place rewrite, covered by an hourly full-rebuild backstop). Registry add/rename/past-path drops that project's sidecar. Title edits rewrite the file → mtime bumps → re-read; a non-file title path (none today) would call an explicit poke. First build: lazy + bounded (sync first-page, defer the rest), cold cost paid once. Restart: sidecar persists on disk, validated lazily by the cheap stat-diff per project on first touch; a schema-version column gates format-change rebuilds. Concurrency: single writer (server is single Node; node:sqlite is sync so there is no concurrent in-process reader during a write); one-transaction atomic upsert; a mid-read append just re-reads that one file next request. Target: list page <50 ms warm.
+
+**CROSS-PROVIDER REVIEW — OpenAI was UNAVAILABLE (quota window, resets ~10:05; dispatch exited quota-window). Substituted a Claude Opus skeptic (independent fresh-context agent) per the "don't park on quota" rule.** Verdict: core bet sound (persist in-file id + winners so warm reads skip the per-file head-parse); cross-store canonicality IS covered by the whole-project recompute (the "mark id dirty" wording is a red herring — per-id partial recompute must stay forbidden, enforce by test). THREE BLOCKING findings to fold into the build:
+1. **`files` and `sessions` MUST commit in ONE transaction**, or a crash leaving files="scanned, unchanged" + sessions stale makes "nothing dirty" PERMANENT — the wrong row is served with confidence until the hourly rebuild, and the live-fallback does NOT catch it.
+2. **"Live derivation as last resort" does NOT prevent a wrong transcript** — it is gated by the same stat-diff meant to backstop it. The by-id/deep-link/transcript read currently does `SELECT … WHERE sessionId=?` and serves the stored `filePath` BLINDLY; a stale path (winner deleted/replaced between refresh and open) serves a wrong/missing file. Fix: the transcript resolver must resolve live through `canonicalSessionIndex`, or at minimum `stat` the cached filePath and confirm (mtime,size)+existence before serving.
+3. **"<50 ms independent of file count" cannot hold on the request path** — proving "nothing dirty" requires readdir+stat of every file (O(files), tens of ms, e.g. listProjectDirs ~135 ms) BEFORE the indexed SELECT. Must choose: O(files)-stat-per-request (not count-independent) OR async background sweep + fs.watch (count-independent but a bounded staleness window). The plan claims both; pick one and state the trade.
+Nice-to-have (adopt): node:sqlite is sync + experimental → the WAL/busy_timeout framing is moot (no concurrent in-proc reader); the real risk is a big sync transaction stalling the one thread → chunk first build + bound incremental tx size. Store `cwd` + the exact twin message-count in `files` so a collision recompute need not re-read unchanged twins. Store mtime as REAL (sub-ms) not truncated INTEGER. Keep the hourly rebuild as the only true net for a stat-diff/desync bug, and have it cross-check row-count/max(lastActivityAt) vs a fresh walk. JSON sidecar stays a real escape hatch if node:sqlite's experimental status bites.
+
+**ROUND CEILING:** the dispatch runner flagged round 12 ≥ ceiling 3 (WA §N) — owner orchestrator should rescope/redesign/stop. This round converged on measurements + 2 shipped quick wins + a reviewed plan; the persistent index is a NEW design (candidate ARCH-### or a fresh FEAT), not more rounds of the recency bug.
+
+Files (unstaged): public/app.js (TAIL_PAGE 200→40), src/server/survival.ts (--property=CPUWeight=20 on the lane scope). No other behaviour changed.
+
+### 2026-11-05 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 7575ab04-93df-418e-a74a-3d9af02fdbdd — VERDICT: BROKEN — mixed-state candidate c12b5f3c8e0f. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — fixing lane r13 (worker)
+- **round-13: ONE activity comparator (`cmpActivity`) used everywhere recency is compared — fixes r11 (anthropic run 841cff48, BROKEN) AND the paged-list/client under-scoping the first r13 IV caught.** regressed-from: the r11 projectRecencyAt (same ticket, prior entry: localeCompare pick + numeric early-stop).
+
+  THE BREAK (run 841cff48). r11 picked `best` by raw-string `localeCompare` but early-stopped on `Date.parse(best)`. Mixed timestamp formats (`…Z` vs `…​.000Z`, `+05:00`/offset forms) sort one way lexically and the other numerically, so the mtime-desc walk could STOP on a numerically-newer file before reaching the lexically-larger-but-OLDER file the full list (also localeCompare) ranked on top — the sidebar recency then named a different session than the project's own top row.
+
+  THE FIX (src/server/index.ts + public/app.js). Added `cmpActivity(a,b)`/`activityInstant` (src/server/index.ts): order by the numeric INSTANT (Date.parse), stable raw-string localeCompare tiebreak when two strings name the SAME instant, unparseable sorts LAST. Call sites switched to it: (1) `sessionsForProject` full-list sort (was raw-string localeCompare); (2) `projectRecencyAt` best-pick AND its early-stop (`activityInstant(best)`) — pick and stop can no longer disagree; (3) Orchard/native rows flow through `consider`→`cmpActivity`. The project-level sidebar sort (`projRecency`, public/app.js) already parsed the instant. NO other server behaviour changed (buildSessionCandidatePool / the keyset cursor / by-id deep link / listSessionStubs byte-unchanged).
+
+  IV-DRIVEN SECOND FIX (first r13 IV, anthropic run 7575ab04, BROKEN — OpenAI quota-blocked, auto-fell back to anthropic; author also anthropic → decorrelation reduced this round). It found the comparator was NOT applied EVERYWHERE: (a) `sessionPageForProject.byDisplayRecency` — the PAGED list the sidebar actually expands into (public/app.js loadSessions `?limit=SESSION_PAGE`) — still sorted raw-string, so under mixed offsets it showed an OLDER session on top while recency named the newer one (the r11 symptom, in the list the user sees); (b) public/app.js re-sorted every fetched list with `recencyKey(...).localeCompare` at 4 sites, so even a correct server order was re-lexicalised client-side. FIXED (a) byDisplayRecency→cmpActivity; (b) added client `cmpRecency` (numeric instant, mirrors cmpActivity) and routed all 4 list sorts through it.
+
+  PROOF (scripts/verify-feat-199-r13.mjs, NEW — 22/22, over the REAL server):
+  - PHASE X: x-off MUST-FAIL reproduced directly over the store (r11 projectRecencyAt=19:00Z ≠ r11 full-list-top=`…23:00+05:00`); r13 names the genuinely-newest INSTANT (19:00Z) everywhere. x-eq (same instant, `…Z` vs `…​.000Z`): r11 raw-string divergence reproduced but instants IDENTICAL (invisible); r13 matches by instant.
+  - PHASE ABC (accepted limits, MEASURED not asserted away, per the OpenAI consult): A dropped-twin over-counts 6.00 d; B shadowed-Orchard over-counts 6.00 d (both = a real message that genuinely exists in the project); C single-file reads the real newest; C-burial (mtime rewound below messages via touch/utimes) UNDER-counts 4.75 d and buries a 6 h-active session — reachable ONLY by rewinding mtime below messages (cp -p/rsync -t/restore preserve mtime≥messages), quantified.
+  - PHASE REORDER: an ordinary append moves the project AND its session to the top (recency == appended instant).
+  - PHASE PAGE (reproduces the IV's failing case): paged `?limit=30` top row == recency == full-list top by instant under mixed `+14:00`/`-12:00` offsets (session B, newer instant, on top though lexically smaller).
+  - PHASE REAL: all 22 real projects — recency == full-list top by instant, 0 divergences; GET /api/projects warm ~0.8 s (cold ~4 s), well under the 1.5 s target (≈ r11 cost, not regressed toward r9's ~3.9 s).
+  - REAL HEADLESS BROWSER (playwright): (i) boot queue over an 8-project crafted store — concurrency EXACTLY 2, every project loaded EXACTLY once in the boot burst (current-first resolves to the most-recent default project); (ii) the client re-sort fix — a mixed-offset 2-session project renders NEWER-B-zulu (instant 06:00Z, "6m") ABOVE OLDER-A-plus14 (instant 05:00Z, "1h") though A's raw string is lexically larger (pre-fix: A on top).
+  - ANTI-REGRESSION: verify-feat-199-r11 24/24, verify-feat-070-sidebar 14/14, verify-session-recency 11/11, verify-feat-199-keyset PASS. `npm run gate` EXIT 0 (leak-gate + typecheck green).
+
+  STATUS: the POST-fix tree is UNVERIFIED by an independent pass — the first r13 IV (run 7575ab04) is bound to the PRE-fix candidate c12b5f3c8e0f and found the two defects now fixed. A fresh independent HOLDS against the current files is warranted before close (OpenAI was quota-blocked; prefer OpenAI when its window resets for cross-provider decorrelation). High-stakes bucket: session-lifecycle / regression-prone (13 rounds).
+
+  Files: src/server/index.ts (cmpActivity/activityInstant added; sessionsForProject + projectRecencyAt + byDisplayRecency switched), public/app.js (cmpRecency added; 4 recency sort sites switched), scripts/verify-feat-199-r13.mjs (new), scripts/feat-199-r13-requirement.txt (new, IV brief). Left UNSTAGED for the user.
+
+### 2026-11-05 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a1aac0-6596-7641-a5a1-a3dbb24a5d53 — VERDICT: BROKEN — mixed-state candidate fd2b96b9956b. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — fixing lane r14 (worker)
+- **round-14: the unix-epoch-boundary BROKEN (openai run 01a1aac0, mixed-state fd2b96b9956b).** regressed-from: the r11 projectRecencyAt (same ticket) — its mtime-desc early-stop sentinel survived r12/r13 unchanged.
+
+  ROOT CAUSE. `projectRecencyAt`'s early-stop floor used a NUMERIC sentinel for "nothing found yet": `const bestMs = () => (best === null ? 0 : activityInstant(best) || 0)` and `for (const st of stubs) { if (st.mtimeMs <= bestMs()) break; … }`. A real session file with mtime 0 (unix epoch) satisfies `st.mtimeMs <= 0`, so the mtime-desc walk STOPPED before parsing it even though `best` was still null and no floor existed — the file's parseable epoch message was skipped and the whole project's recency came back null, burying it off the sidebar.
+
+  THE FIX (src/server/index.ts projectRecencyAt only). The floor is now a NULL, not a number: `bestFloorMs()` returns `null` when `best === null` (⇒ no floor ⇒ never early-stop ⇒ always parse) and otherwise the parsed instant, or `null` again when `best` is set-but-unparseable (NaN ⇒ no numeric floor ⇒ parse on). The loop breaks only when `floor !== null && st.mtimeMs <= floor`. No mtime value (0, negative, far-future) can collide with a null floor. GREP of the other named recency defaults: `activityInstant` already returns NaN (not 0) for unparseable; `cmpActivity` and the client `cmpRecency` already use NaN-checks (r13), not sentinel-0 — the `bestMs` sentinel was the only sentinel-0 recency collision left. (Out of charter scope but noted: client `projRecency` maps both epoch-ISO and unparseable to 0, and `recencyMs` at index.ts:891 uses `Date.parse(...)||0` — both deterministically tiebroken (name / sessionId), no false collision.)
+
+  PROOF (scripts/verify-feat-199-r14-epoch.mjs, NEW — 12/12):
+  - PHASE MUSTFAIL (standalone recompute of the OLD sentinel-0 walk): on a single file with a 3-day-old message and mtime forced to 0, OLD recency = null ≠ full-list top (the real 3d message); the new null-floor walk recovers it. Documents that `fs.utimesSync(fp,-N,-N)` does NOT yield a negative mtime on this FS (libc/Node wrap it to a far-future instant ~+57y), so mtime==0 is the reproducible `<=0`-boundary case; the null floor handles any value regardless.
+  - PHASE SERVER (REAL server, one fixture per ISOLATED store so logical-project grouping can't merge siblings): (1) epoch-mtime file with a real message → recency == full-list top == real 3d message (parsed, not skipped); (2) no-timestamp + mtime 0 → recency == epoch-ISO fallback (instant 0) == top, project not dropped; (3) boundary-mtime (negative→coerced) → real message still parsed; (4) all-unparseable → no crash, recency == file-mtime fallback == top.
+  - ANTI-REGRESSION: verify-feat-199-r13 22/22, verify-feat-070-sidebar 14/14, verify-session-recency 11/11. `npm run gate` EXIT 0 (leak-gate + typecheck green).
+
+  IV (openai run 01a1aad4, mixed-state candidate 111c802e06a8, cross-provider — author anthropic, verifier openai, NOT a fallback). VERDICT: BROKEN — but it did NOT refute the epoch fix (it ran r14-epoch 12/12 and confirmed the mtime-0/no-timestamp cases). It found a SEPARATE defect against r13 contract clause 2 ("a timestamp that does not parse sorts LAST, never first"): a session whose timestamps are ALL garbage falls back to its fresh file mtime (readSessionMeta, src/lib/session-history.ts:1043), so it sorts FIRST and sets project recency, ahead of sessions with genuine older valid timestamps. This is the PRE-EXISTING r10 mtime-fallback design (untouched by this round), not a regression from the epoch fix. ORCHESTRATOR DECISION NEEDED: (a) treat as an ACCEPTED, documented limit like A/B/C (a file whose only recency signal is its mtime sorts by mtime — the r10 cheap-recency premise), extending the contract; or (b) a new sub-bug to fix in readSessionMeta (distinguish "no timestamp fields at all" from "has timestamp fields, all unparseable" — core, regression-prone, session-lifecycle). Recommend (a): changing the r10 fallback risks the documented no-timestamp-summary case; the garbage-timestamp file is real and freshly written, so mtime is a defensible recency.
+
+  Files (UNSTAGED for the user): src/server/index.ts (projectRecencyAt: bestMs→bestFloorMs null-floor; loop break guarded on floor!==null), scripts/verify-feat-199-r14-epoch.mjs (new).
+
+### 2026-11-05 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a1aad4-2121-7de1-8d59-93cac101b1d1 — VERDICT: BROKEN — mixed-state candidate 111c802e06a8. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — user decision (accepted residual limits; landed)
+- The user ACCEPTED FEAT-199's documented residual limits on 2026-11-05 and the ticket landed on main. Accepted limits: the cheap recency's three exact-equality gaps — (A) a dropped same-id twin carrying a newer message, (B) an Orchard row shadowed by a same-id claude file carrying a newer message, (C) a file whose mtime was rewritten BACKWARDS below its own messages — AND a session whose timestamps are ALL unparseable sorting by its fresh file mtime (the r10 mtime-fallback premise; the IV finding on openai run 01a1aad4, option (a)). None occur on the real 22-project store. Landed with these limits accepted.
+
+### 2026-11-05 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run d542dc75-34e2-40d4-941a-91cf1d9b3a3b — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — landing lane (NOT landed this round; survival.ts refuted)
+- CORRECTION to the "landed" entry above: FEAT-199 did NOT land on 2026-11-05. The bundled r12 survival.ts CPUWeight=20 hunk FAILED an independent clean-room verify (openai hit quota mid-run → anthropic fallback, run d542dc75, VALID BROKEN). Finding: spawnSurvivable applies `--property=CPUWeight=20` to EVERY direct persisted session (agent-bridge.ts calls it for every `survivalEnabled() && persistedTranscript` session without checking #startedBy), so a USER-STARTED dashboard/interactive session (startedBy defaults to 'user') is also deprioritised — contradicting the contract clause "the user's own sessions are not deprioritised." The recency/boot hunks (index.ts projectRecencyAt/cmpActivity, app.js cmpRecency/boot-queue/TAIL_PAGE, verify-feat-199-r11/r13/r14) are sound (r13 22/22, r14-epoch 12/12, feat-070-sidebar 14/14, typecheck clean) but were held back WITH the survival.ts hunk per the dispatch (BUG-289 + BUG-278 were pushed; FEAT-199 was not). FIX NEEDED before relanding: gate CPUWeight=20 to lane spawns only — pass a lane/provenance flag through spawnSurvivable (or check #startedBy==='agent') so user-started sessions keep the default weight 100.
+
+### 2026-11-05 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 9a94351a-7a10-4ab5-bbb6-b1d8c3a28896 — VERDICT: HOLDS — mixed-state candidate becd6cfa7faa. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-05 — fixing lane PART A (worker) — survival CPUWeight gated to caller-declared low priority
+- **PART A fix (re-landing after d542dc75 BROKEN).** `src/server/survival.ts`: `spawnSurvivable`'s meta now takes an optional `lowPriority` flag; `--property=CPUWeight=20` is appended to the systemd-run scope args ONLY when `meta.lowPriority` is true — there is NO default deprioritisation (a call that omits it launches at systemd's default weight). `src/server/agent-bridge.ts`: the one call site passes `lowPriority: this.#startedBy === 'agent'`, so a user-started session (`#startedBy` default 'user') keeps normal weight. Fixes the refuted clause "the user's own sessions are not deprioritised" by construction.
+- **PROOF (scripts/verify-feat-199-r12-priority.mjs, NEW — 4/4).** Drives the REAL `spawnSurvivable` through real `systemd-run --user --scope` under a scratch data dir (CLAUDE_STATION_DATA → isolated mode, host keys `t-*`, live :4317 untouched) and reads each scope's actual `CPUWeight` via `systemctl --user show`: PHASE FAIL reconstructs the refuted r12 (always-append) and reproduces CPUWeight=20 on a USER session (must-FAIL, non-vacuous); current code → user session CPUWeight `[not set]` (default), lane session (lowPriority:true) CPUWeight=20; the bridge wiring is asserted from source. `npm run gate` EXIT 0 (leak-gate + typecheck green).
+- **IV: anthropic run 9a94351a-7a10-4ab5-bbb6-b1d8c3a28896 (openai hit quota → anthropic fallback), mixed-state candidate becd6cfa7faa. VERDICT: HOLDS (VALID).** Its adversarial case (argv-shim, five concurrent scopes incl. explicit-false / omitted / explicit-undefined / true / user-after-lane) confirmed no flag carries over between launches and exactly one gated call site with a 'user' default.
+- **EFFICACY FINDING — ORCHESTRATOR DECISION (the fix is SAFE but INERT for the perf goal).** Ground truth on the live machine: every session that goes through `spawnSurvivable` carries a `startedBy:"user"` provenance record (source: agent-bridge) — these are the user's own dashboard/interactive sessions. The 9636 `startedBy:"agent"` records all come from `scripts/dispatch.mjs` (`claude -p`/openai lanes, which write the record directly at dispatch.mjs:552/660) and do NOT go through `spawnSurvivable` at all — they are not survivable host scopes. No caller in `src/` ever passes `startedBy:'agent'` into `startSession`, so `#startedBy` is always `'user'` at the `spawnSurvivable` call and `lowPriority` is never true in the real app. Net: my survival hunk is behaviorally identical to HEAD (HEAD has no CPUWeight; my conditional never fires) and the r12 premise ("spawnSurvivable backs the lanes, lower their scope weight") was wrong — the real contention source (`claude -p` lanes) runs outside these scopes. The fix correctly REMOVES the refuted harm (user sessions no longer deprioritised) and leaves a safe, documented opt-in mechanism ready if lane provenance is ever threaded, but it delivers NO CPU-contention relief today. DECISION: (a) keep the safe opt-in mechanism as landed (recommended — it is inert, well-documented, and correct for when lanes do flow through here); or (b) open a follow-up to deprioritise the actual `claude -p` dispatch lane processes (dispatch.mjs cgroup/nice), which is where the real contention lives. Landed under (a) with this finding recorded.
+- Files (UNSTAGED for the user): src/server/survival.ts, src/server/agent-bridge.ts, scripts/verify-feat-199-r12-priority.mjs (new).

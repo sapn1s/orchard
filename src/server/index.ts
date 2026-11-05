@@ -551,6 +551,46 @@ function boundAccountField(sessionId: string): { boundAccount?: string | null } 
   return bound === undefined ? {} : { boundAccount: bound.account };
 }
 
+/*
+ * FEAT-199 r13 — the ONE activity comparator. Recency is ordered by the numeric
+ * INSTANT (`Date.parse`), with a stable tiebreak on the raw string for the rare
+ * case of two different strings naming the same instant. This is used EVERYWHERE
+ * recency is compared — the full list sort (`sessionsForProject`), and
+ * `projectRecencyAt`'s best-pick AND its early-stop — so the cheap per-project
+ * recency and the full list cannot disagree by construction.
+ *
+ * Why not the raw-string `localeCompare` r11/r12 used in both places: mixed
+ * timestamp formats that name the SAME or an EARLIER instant with a
+ * LEXICALLY-LARGER string (`…:05+05:00` is instant …:00Z but sorts after `…:05Z`;
+ * `…:05.000Z` vs `…:05Z`) make lexical order and numeric order disagree. r11
+ * picked `best` by `localeCompare` but early-stopped on `Date.parse(best)`: the
+ * walk could stop on a numerically-newer file before reaching the
+ * lexically-larger-but-older file the full list ranked on top, so the sidebar's
+ * recency differed from the project's actual top session (anthropic run
+ * 841cff48, BROKEN — the x-eq / x-off fixtures). One numeric comparator removes
+ * the disagreement: order and label now follow the real instant, and the
+ * full-list sort follows the same instant, so they match for every project whose
+ * timestamps parse. A timestamp that does NOT parse sorts LAST, never first.
+ *
+ * `Array.sort(cmpActivity(a, b))` yields recency-DESCending (newest first).
+ */
+function activityInstant(iso: string | null | undefined): number {
+  if (!iso) return NaN;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? NaN : ms;
+}
+function cmpActivity(a: string | null | undefined, b: string | null | undefined): number {
+  const ma = activityInstant(a);
+  const mb = activityInstant(b);
+  const aNan = Number.isNaN(ma);
+  const bNan = Number.isNaN(mb);
+  if (aNan && bNan) return (b ?? '').localeCompare(a ?? ''); // both unparseable: stable, deterministic
+  if (aNan) return 1; // a unparseable → a sorts after b (last)
+  if (bNan) return -1; // b unparseable → b sorts after a (last)
+  if (ma !== mb) return mb - ma; // newer instant first
+  return (b ?? '').localeCompare(a ?? ''); // same instant, different string: stable tiebreak
+}
+
 function sessionsForProject(p: reg.Project): { sessions: hist.SessionMeta[]; dirs: string[] } {
   /*
    * FEAT-199 r5 — ONE derivation of the canonical copy. The full list, the
@@ -598,7 +638,7 @@ function sessionsForProject(p: reg.Project): { sessions: hist.SessionMeta[]; dir
         : base;
     sessions.push(meta);
   }
-  sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));
+  sessions.sort((a, b) => cmpActivity(a.lastActivityAt, b.lastActivityAt)); // FEAT-199 r13: numeric instant, not raw-string localeCompare
   return { sessions, dirs: Array.from(contributingDirs) };
 }
 
@@ -655,17 +695,24 @@ type SessionPoolCand = {
   // warnings it always has. Only ever set on a claude `file` candidate.
   droppedCopies?: { encodedDir: string; sessionId: string }[];
 };
-function buildSessionCandidatePool(p: reg.Project): {
-  byId: Map<string, SessionPoolCand>;
-  contributingDirs: Set<string>;
-  encoded: string;
-} {
-  const encoded = hist.encodeCwd(p.hostPath);
-  const projects = hist.groupByLogicalProject(hist.listProjectDirs().map((d) => {
+/*
+ * FEAT-199 r10 — the claude-store dir set for a project, derived in ONE place
+ * and shared by the candidate pool AND the cheap recency decoration on
+ * GET /api/projects (ARCH-010: the dir list has one owner). An optional
+ * pre-scanned `logicalProjects` lets a batch caller (the projects route) run the
+ * whole-store `listProjectDirs()` scan ONCE instead of per project.
+ */
+type ClaudeStoreDirs = { encoded: string; containerDir: string; pastDirs: string[]; claudeDirs: string[] };
+function scanLogicalProjects(): hist.LogicalProject[] {
+  return hist.groupByLogicalProject(hist.listProjectDirs().map((d) => {
     if ((d.cwd ?? d.cwdGuess) !== cm.CONTAINER_WORKSPACE) return d;
     const address = cm.containerStoreAddressOfDir(d.encodedDir);
     return address ? { ...d, cwd: address } : d;
   }));
+}
+function claudeStoreDirsForProject(p: reg.Project, logicalProjects?: hist.LogicalProject[]): ClaudeStoreDirs {
+  const encoded = hist.encodeCwd(p.hostPath);
+  const projects = logicalProjects ?? scanLogicalProjects();
   const logical =
     projects.find((lp) => lp.dirs.some((d) => d.encodedDir === encoded)) ??
     projects.find((lp) => lp.key === hist.logicalKeyForCwd(p.hostPath));
@@ -685,6 +732,118 @@ function buildSessionCandidatePool(p: reg.Project): {
     if (claudeDirs.includes(d)) continue;
     if (hist.listSessionStubs(d).length) addDir(d);
   }
+  return { encoded, containerDir, pastDirs, claudeDirs };
+}
+
+/*
+ * FEAT-199 — the project's newest activity for the sidebar's recency sort +
+ * "N ago" label, computed WITHOUT the full `sessionsForProject` parse. The old
+ * decoration read `sessionsForProject(p).sessions[0].lastActivityAt`, which
+ * `readSessionMeta`-parsed (~512 KB sampled) EVERY session file of EVERY project
+ * on every GET /api/projects — ~4 s warm, ~13 s cold for 22 projects, blocking
+ * the sidebar's first paint.
+ *
+ * r10 read the newest file MTIME stat-only, assuming mtime == the last message's
+ * write time. That was BROKEN (anthropic run 85032d3a): a restored or copied old
+ * session, or a timestamp-less `summary` line appended to an old transcript,
+ * bumps the file mtime without adding a newer message, so the project looked
+ * fresh and the sidebar reordered.
+ *
+ * r11 computes the newest-message time cheaply instead: each file's value is
+ * `readSessionMeta(...).lastActivityAt` (the SAME per-file parser the full list
+ * uses, so head/tail sampling + the no-timestamp mtime fallback agree), and the
+ * max is taken by the SAME comparator the full list sorts by — `cmpActivity`
+ * (numeric instant, stable raw-string tiebreak; r13 fixed r11's lexical-vs-
+ * numeric split), keeping the raw stored string. The cheapness is in the WALK:
+ * files are visited in
+ * mtime-DESC order (stat-only stubs) and the walk STOPS once the next file's
+ * mtime <= the best time found — usually 1-2 memoised parses per project, not a
+ * head/full read of every file of every project. It is EXACTLY the full-parse
+ * value except for the rare, benign cases the function body documents (a dropped
+ * same-id twin / shadowed Orchard row with a newer real message; a file whose
+ * mtime was rewritten below its own messages) — matching those would require the
+ * pool's canonicalSessionIndex, which reads every file and costs ~3.7 s warm,
+ * the full-parse cost this ticket removes. The per-session exact `lastActivityAt`
+ * still comes from the parsed rows the list/page routes return.
+ */
+function projectRecencyAt(p: reg.Project, logicalProjects?: hist.LogicalProject[]): string | null {
+  const { encoded, containerDir, pastDirs, claudeDirs } = claudeStoreDirsForProject(p, logicalProjects);
+  // Track the max by the ONE activity comparator the full list now sorts
+  // `lastActivityAt` by (`cmpActivity` — numeric INSTANT, stable raw-string
+  // tiebreak), keeping the RAW stored string. Picking `best` and early-stopping
+  // on the SAME numeric instant is what fixes r11's BROKEN (anthropic run
+  // 841cff48): r11 picked best by raw-string localeCompare but early-stopped on
+  // Date.parse(best), so mixed formats (`…Z` vs `…​.000Z`, `+05:00` offsets) that
+  // sort one way lexically and the other numerically made the walk stop on a
+  // numerically-newer file before the lexically-larger-but-older file the full
+  // list ranked on top. cmpActivity(iso, best) < 0 ⇒ iso is the newer instant.
+  let best: string | null = null;
+  const consider = (iso: string | null | undefined): void => {
+    if (iso && (best === null || cmpActivity(iso, best) < 0)) best = iso;
+  };
+  // The mtime-desc early-stop floor. A NUMERIC sentinel (0) for "nothing found
+  // yet" was a bug (openai run 01a1aac0, BROKEN — unix-epoch boundary): a real
+  // file with mtime 0 (or a negative mtime) satisfies `mtime <= 0`, so the walk
+  // stopped before parsing it even though `best` was still null and no floor
+  // existed. The floor is now a null (`best === null` ⇒ no floor ⇒ never stop),
+  // which no mtime value can collide with. When `best` is a parseable string the
+  // floor is its instant; when `best` is set but unparseable there is still no
+  // numeric floor (NaN), so the walk parses on — correct, just not early-stopped.
+  const bestFloorMs = (): number | null => {
+    if (best === null) return null;
+    const ms = activityInstant(best);
+    return Number.isNaN(ms) ? null : ms;
+  };
+
+  // Orchard-owned and native-codex rows contribute their own already-parsed
+  // lastActivityAt (cheap head-only listings), the SAME rows the exact path
+  // merges. Folded first so the claude walk below can stop early.
+  for (const d of new Set([...claudeDirs, encoded, containerDir, ...pastDirs])) {
+    for (const s of ot.listOrchardSessions(d)) consider(s.lastActivityAt);
+  }
+  for (const cwd of [p.hostPath, ...reg.pastPathsOf(p)]) {
+    for (const s of cn.listNativeCodexSessions(cwd)) consider(s.lastActivityAt);
+  }
+
+  // r11 (fixes r10 BROKEN, anthropic run 85032d3a): the newest MESSAGE time of
+  // the claude stores, NOT the newest file mtime — a restored/copied old session
+  // or a timestamp-less `summary` appended to an old transcript bumps mtime
+  // without a newer message. Each file's value is `readSessionMeta(...)
+  // .lastActivityAt` — the SAME per-file parser the full list uses, so head/tail
+  // sampling and the no-timestamp mtime fallback agree by construction. The
+  // cheapness is in the WALK (stat-only stubs, no per-file head read of the whole
+  // store): files are visited in mtime-DESC order and the walk STOPS once the
+  // next file's mtime <= the best time found (a message's timestamp <= its file's
+  // mtime on a real single-clock machine) — ~1-2 memoised parses per project.
+  //
+  // KNOWN exact-equality limits vs the full `sessionsForProject` pool, each
+  // rare and benign for a coarse recency sort (and each only fixable by running
+  // the pool's canonicalSessionIndex here, which head-reads EVERY file of EVERY
+  // project — measured ~3.7 s warm, i.e. the full-parse cost this ticket exists
+  // to remove): (1) a same-id twin the canonical dedupe drops, or an Orchard row
+  // a claude file shadows, whose dropped/shadowed copy carries a NEWER message —
+  // but that message genuinely exists in a real file of the project, so recency
+  // is not falsely inflated the way r10's fresh-mtime-on-old-content was; (2) a
+  // file whose mtime was rewritten BACKWARDS below its own messages (touch/utimes
+  // to the past; cp -p / rsync -t / restore all preserve mtime >= messages).
+  const stubs: hist.SessionStub[] = [];
+  for (const d of claudeDirs) for (const st of hist.listSessionStubs(d)) stubs.push(st);
+  stubs.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  for (const st of stubs) {
+    const floor = bestFloorMs();
+    if (floor !== null && st.mtimeMs <= floor) break; // mtime-desc: no remaining file can beat best
+    const meta = hist.readSessionMeta(st.filePath, st.encodedDir);
+    if (meta) consider(meta.lastActivityAt);
+  }
+  return best;
+}
+
+function buildSessionCandidatePool(p: reg.Project): {
+  byId: Map<string, SessionPoolCand>;
+  contributingDirs: Set<string>;
+  encoded: string;
+} {
+  const { encoded, containerDir, pastDirs, claudeDirs } = claudeStoreDirsForProject(p);
 
   // Unified recency-ordered candidate pool, keyed by the TRUE in-file
   // sessionId. The choice of which copy of a same-id cross-dir twin is canonical
@@ -810,7 +969,11 @@ function sessionPageForProject(
     // Restore the true last-human-submit ordering (the stub pass ordered by
     // mtime, a close proxy); the client re-sorts on recencyKey too, so appended
     // pages and merged newer rows settle into global order as they arrive.
-    (b.lastUserMessageAt ?? b.lastActivityAt ?? '').localeCompare(a.lastUserMessageAt ?? a.lastActivityAt ?? '');
+    // FEAT-199 r13: the SAME cmpActivity (numeric instant) the full list sorts by,
+    // so the PAGED list the sidebar expands into cannot show an older session on
+    // top while projectRecencyAt names a newer one under mixed offsets/formats
+    // (the r11 symptom, caught by the independent verify of the first r13 pass).
+    cmpActivity(a.lastUserMessageAt ?? a.lastActivityAt, b.lastUserMessageAt ?? b.lastActivityAt);
   const sessions = window.map(parseCand).filter((m): m is hist.SessionMeta => m !== null).sort(byDisplayRecency);
   const newer = since === null
     ? []
@@ -1072,14 +1235,19 @@ async function handleApi(req: http.IncomingMessage, res: http.ServerResponse, ur
   /* projects */
   if (rest[0] === 'projects') {
     if (rest.length === 1 && m === 'GET') {
-      // `lastActivityAt` rides along from the session index (cached per scan)
-      // so the sidebar can show recency WITHOUT loading any session list —
-      // recency must never trigger the expensive operation (expansion).
+      // `lastActivityAt` rides along so the sidebar can show recency WITHOUT
+      // loading any session list — recency must never trigger the expensive
+      // operation (expansion). FEAT-199 r10: it is the newest session-file mtime
+      // of the project's stores (stat-only, `projectRecencyAt`), NOT a full
+      // `sessionsForProject` parse of every file of every project — that parse
+      // cost ~4 s warm / ~13 s cold here and blocked the first paint. The
+      // whole-store dir scan runs ONCE for all projects, not per project.
+      const logicalProjects = (() => { try { return scanLogicalProjects(); } catch { return undefined; } })();
       sendJson(res, 200, {
         projects: reg.listProjects().map((p) => {
           let lastActivityAt: string | null = null;
           try {
-            lastActivityAt = sessionsForProject(p).sessions[0]?.lastActivityAt ?? null;
+            lastActivityAt = projectRecencyAt(p, logicalProjects);
           } catch { /* store unreadable — recency is a nicety, the list is not */ }
           // BUG-138: whether the project's directory is still there. One stat,
           // on the payload every boot already fetches, so the UI can say "this

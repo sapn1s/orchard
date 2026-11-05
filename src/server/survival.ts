@@ -503,7 +503,7 @@ function recordedExit(st: HostStatus | null): [number | null, NodeJS.Signals | n
  */
 export function spawnSurvivable(
   o: SurvivalSpawnOptions,
-  meta: { stationSessionId: string; resumeHint?: string | null; projectId?: string | null },
+  meta: { stationSessionId: string; resumeHint?: string | null; projectId?: string | null; lowPriority?: boolean },
 ): { proc: SpawnedProcessLike; handle: SurvivalHandle } {
   ensureDir(hostsDir());
   const key = newHostKey();
@@ -526,9 +526,30 @@ export function spawnSurvivable(
   // The broker (and thus the CLI) lands in a fresh transient scope cgroup,
   // escaping the service's control-group kill. `--collect` reaps the scope unit
   // when it exits so nothing accumulates in systemd.
+  //
+  // FEAT-199 — CPU priority, DECLARED by the caller, never defaulted. The server
+  // is single-threaded and shares the host CPU with the lane CLIs (and every test
+  // run / build they spawn, which inherit this scope's cgroup). At equal weight
+  // (both default cpu.weight 100) a busy lane starves the server's event loop —
+  // measured ~1.6 s stalls on a trivial endpoint while lanes ran. We cannot RAISE
+  // the server without root, so we LOWER the lanes: a transient-scope `CPUWeight`
+  // well below the server's 100 means lanes only cede CPU UNDER CONTENTION
+  // (cpu.weight is proportional, not a cap), so an idle machine runs lanes at full
+  // speed while a busy one keeps the UI responsive. One property on the scope
+  // covers the whole lane subtree (claude + its Bash/test/Docker children all live
+  // in this cgroup).
+  //
+  // This MUST NOT be applied to every persisted session: spawnSurvivable also
+  // backs the user's OWN dashboard sessions, and deprioritising those made the
+  // user's work cede CPU to nothing (refuted, anthropic d542dc75). So the weight
+  // is opt-in: `meta.lowPriority` is set only by the bridge for an agent/lane
+  // -started session. A user-started session is launched at normal weight — the
+  // `--property` is simply omitted, so the scope keeps systemd's default 100.
+  const LANE_CPU_WEIGHT = 20; // vs the server's default 100 (~5:1 under contention)
   const runArgs = [
     '--user', '--scope', '--quiet', '--collect',
     `--unit=claude-station-host-${key}`,
+    ...(meta.lowPriority ? [`--property=CPUWeight=${LANE_CPU_WEIGHT}`] : []),
     process.execPath, HOST_SCRIPT, controlPath,
   ];
   // `systemd-run --user --scope` must reach the per-user systemd manager, which

@@ -595,11 +595,74 @@ const exactCountCache = new Map<string, number>();
  */
 const cwdProbeCache = new Map<string, string | null>();
 
+/**
+ * FEAT-204 (step 1 of the persistent session index) — memoised head facts for
+ * `canonicalSessionIndex`, the one request-path that OPENS and head-parses EVERY
+ * session file of a project on EVERY list request (measured ~3.5 s warm for the
+ * 4,071-file trading-volume project; the parse, not the stat walk, is the whole
+ * cost). `readSessionHeadFacts` is deterministic in the file's bytes, so a warm
+ * call needs only to confirm the file is unchanged and replay the result.
+ *
+ * Keyed by PATH, with the value carrying a stat signature `mtimeNs\0size\0ino`
+ * (a `bigint` stat — nanosecond mtime defeats a sub-millisecond head rewrite,
+ * and `ino` defeats a delete+recreate twin that reuses the path with an
+ * identical mtime/size). One entry per path, OVERWRITTEN whenever the signature
+ * changes, so an append, a head rewrite, a rename (new path → new entry) and a
+ * same-path twin all re-parse on the next request. `canonicalSessionIndex`
+ * additionally prunes entries for files that vanished from the dirs it scanned,
+ * so the cache stays bounded by the live file set. A file that cannot be
+ * stat'd is read uncached (and any stale entry dropped), never served stale.
+ */
+const headFactsCache = new Map<string, { sig: string; facts: { sessionId: string | null; cwd: string | null } }>();
+
+function headFactsStatSig(filePath: string): string | null {
+  try {
+    const st = fs.statSync(filePath, { bigint: true });
+    // ctimeNs is included deliberately: an in-place rewrite that a restore tool
+    // (cp -p, rsync -t, tar extract over an existing file) performs keeps the
+    // same inode and RESTORES the old mtime at the same byte length, so mtimeNs,
+    // size and ino can ALL be unchanged — but the inode's change-time always
+    // advances on a write and CANNOT be set backwards by utimes, so ctimeNs is
+    // the one field that still moves. Without it a same-size restore-over-file
+    // serves stale head facts (independent-verify BROKEN, run 180052d9 →).
+    return `${st.mtimeNs}\0${st.size}\0${st.ino}\0${st.ctimeNs}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * FEAT-204 — `readSessionHeadFacts` memoised by (path, mtimeNs, size, ino). A
+ * warm call that finds the file unchanged returns the cached facts after a
+ * single `stat` (no open, no read, no parse); any byte change re-parses. The
+ * uncached `readSessionHeadFacts` stays the primitive and the source of truth —
+ * this only skips redundant re-reads, so results are byte-identical to it.
+ */
+export function readSessionHeadFactsCached(filePath: string): { sessionId: string | null; cwd: string | null } {
+  const sig = headFactsStatSig(filePath);
+  if (sig === null) {
+    headFactsCache.delete(filePath);
+    return readSessionHeadFacts(filePath);
+  }
+  const hit = headFactsCache.get(filePath);
+  // Always hand back a FRESH object, never the one held in the cache: a caller
+  // that mutated the result would otherwise poison the entry and every later
+  // read would serve the mutated value (independent-verify BROKEN, run 180052d9).
+  if (hit && hit.sig === sig) return { sessionId: hit.facts.sessionId, cwd: hit.facts.cwd };
+  // Cache ONLY a read that actually succeeded. A transient open/read failure
+  // (ok=false) is returned to the caller but never memoised, so the very next
+  // call retries the read instead of replaying a stale null (run dd04fb58).
+  const { facts, ok } = readSessionHeadFactsChecked(filePath);
+  if (ok) headFactsCache.set(filePath, { sig, facts });
+  return { sessionId: facts.sessionId, cwd: facts.cwd };
+}
+
 /** Drop all memoised session metadata. Exposed for tests / forced refresh. */
 export function clearSessionCache(): void {
   metaCache.clear();
   cwdProbeCache.clear();
   exactCountCache.clear();
+  headFactsCache.clear();
 }
 
 /* -------------------------------------------------------- project listing */
@@ -692,13 +755,32 @@ export function listSessionStubs(encodedDir: string, opts: ScanOptions = {}): Se
  * the stem, as readSessionMeta does).
  */
 export function readSessionHeadFacts(filePath: string): { sessionId: string | null; cwd: string | null } {
+  return readSessionHeadFactsChecked(filePath).facts;
+}
+
+/**
+ * The implementation behind `readSessionHeadFacts`, plus an `ok` flag that is
+ * true when the file was opened and sampled without error (even if it yielded
+ * no facts — an empty or headless file is a legitimate null result) and false
+ * ONLY when an open/read error was swallowed. The null facts of a transient
+ * failure (EMFILE under fd pressure, EIO, …) are byte-identical to those of a
+ * legitimately empty file, so the facts alone cannot tell them apart — the flag
+ * exists so the memo (`readSessionHeadFactsCached`) can refuse to cache a
+ * failure (independent-verify BROKEN, run dd04fb58): a null cached under a valid
+ * stat signature would be replayed on every later call until the stat changed,
+ * and canonicalSessionIndex would key the session by its stem instead of its
+ * real in-file id.
+ */
+function readSessionHeadFactsChecked(
+  filePath: string,
+): { facts: { sessionId: string | null; cwd: string | null }; ok: boolean } {
   let fd: number | null = null;
   let sessionId: string | null = null;
   let cwd: string | null = null;
   try {
     fd = fs.openSync(filePath, 'r');
     const size = fs.fstatSync(fd).size;
-    if (size === 0) return { sessionId, cwd };
+    if (size === 0) return { facts: { sessionId, cwd }, ok: true };
     // Scan one sampled region; return true once BOTH facts are in hand so the
     // bigger reads are skipped as soon as nothing more can be learned.
     const scanInto = (buf: Buffer, dropFirst: boolean, dropLast: boolean): boolean => {
@@ -715,19 +797,19 @@ export function readSessionHeadFacts(filePath: string): { sessionId: string | nu
     const FAST = 32 * 1024;
     if (size <= FAST) {
       scanInto(readRange(fd, 0, size), false, false);
-      return { sessionId, cwd };
+      return { facts: { sessionId, cwd }, ok: true };
     }
-    if (scanInto(readRange(fd, 0, FAST), false, true)) return { sessionId, cwd };
+    if (scanInto(readRange(fd, 0, FAST), false, true)) return { facts: { sessionId, cwd }, ok: true };
     // Mirror readSessionMeta's sampling for an oversized first entry.
     if (size <= DEFAULT_HEAD_BYTES + DEFAULT_TAIL_BYTES) {
       scanInto(readRange(fd, 0, size), false, false);
-      return { sessionId, cwd };
+      return { facts: { sessionId, cwd }, ok: true };
     }
-    if (scanInto(readRange(fd, 0, DEFAULT_HEAD_BYTES), false, true)) return { sessionId, cwd };
+    if (scanInto(readRange(fd, 0, DEFAULT_HEAD_BYTES), false, true)) return { facts: { sessionId, cwd }, ok: true };
     scanInto(readRange(fd, size - DEFAULT_TAIL_BYTES, DEFAULT_TAIL_BYTES), true, false);
-    return { sessionId, cwd };
+    return { facts: { sessionId, cwd }, ok: true };
   } catch {
-    return { sessionId, cwd };
+    return { facts: { sessionId, cwd }, ok: false };
   } finally {
     if (fd !== null) {
       try {
@@ -1526,9 +1608,16 @@ export function canonicalSessionIndex(
   // resolve collisions by a total-order sort key — so 3+ copies pick a unique,
   // transitive winner independent of dir-walk order.
   const copiesById = new Map<string, CanonicalSessionEntry[]>();
+  // FEAT-204 — track the files we actually saw this pass (and the dirs we fully
+  // enumerated) so we can drop head-facts cache entries for files that vanished
+  // (renamed/deleted), keeping the cache bounded by the live file set.
+  const livePaths = new Set<string>();
+  const scannedDirs = new Set<string>();
   for (const d of encodedDirs) {
     for (const stub of listSessionStubs(d, opts)) {
-      const facts = readSessionHeadFacts(stub.filePath);
+      livePaths.add(stub.filePath);
+      scannedDirs.add(path.dirname(stub.filePath));
+      const facts = readSessionHeadFactsCached(stub.filePath);
       const id = facts.sessionId ?? stub.sessionId;
       const cur: CanonicalSessionEntry = {
         sessionId: id,
@@ -1586,6 +1675,12 @@ export function canonicalSessionIndex(
       .filter((e) => e !== winner)
       .map((e) => ({ encodedDir: e.encodedDir, sessionId: e.sessionId }));
     byId.set(id, winner);
+  }
+  // FEAT-204 — prune vanished files, but ONLY within the dirs we fully walked
+  // this pass (never other projects' cached entries): any cached path that sits
+  // in a scanned dir yet wasn't seen is gone (renamed/deleted) → drop it.
+  for (const p of headFactsCache.keys()) {
+    if (!livePaths.has(p) && scannedDirs.has(path.dirname(p))) headFactsCache.delete(p);
   }
   return byId;
 }

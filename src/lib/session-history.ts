@@ -563,23 +563,45 @@ function minIso(a: string | null, b: string | null): string | null {
 /* ------------------------------------------------------------------ cache */
 
 interface CacheEntry {
-  size: number;
-  mtimeMs: number;
+  sig: string;
   scan: 'sample' | 'full';
   meta: SessionMeta;
+}
+
+/**
+ * FEAT-204 round 2 — the ONE shared stat-identity signature every per-file memo in
+ * this module keys on: `ino\0size\0mtimeNs\0ctimeNs`. ctimeNs catches an in-place
+ * restore (cp -p, rsync -t, tar extract over an existing file) that keeps the same
+ * inode and RESTORES the old mtime at the same byte length — mtimeNs, size and ino
+ * can all be unchanged, but ctime always advances on a write and cannot be set
+ * backwards by utimes. ino catches a delete+recreate twin that reuses the path with
+ * an identical mtime/size. Before this, `exactRealMessageCount`'s memo key was
+ * (path, mtimeMs, size) only — missing exactly this pair — so a same-size rewrite
+ * with a restored mtime served a stale exact count (OpenAI run
+ * 01a1b79b-29e5-7020-a3ec-28e300f62b96). Returns null if the file cannot be stat'd;
+ * callers must then evict/skip their cache entry and never serve stale data.
+ */
+function fileIdentitySig(filePath: string): { sig: string; st: fs.BigIntStats } | null {
+  try {
+    const st = fs.statSync(filePath, { bigint: true });
+    return { sig: `${st.ino}\0${st.size}\0${st.mtimeNs}\0${st.ctimeNs}`, st };
+  } catch {
+    return null;
+  }
 }
 
 const metaCache = new Map<string, CacheEntry>();
 
 /**
  * FEAT-199 (round 6) — exact real-message counts for the canonical twin
- * tie-break, keyed by `path\0mtimeMs\0size`. Populated ONLY on a same-id twin
- * collision (rare), by a FULL streaming parse of the whole file (no sampling,
- * no size cap) — see `exactRealMessageCount`. A count already in this cache is
- * valid as long as the file's mtime and size are unchanged, so repeated list
- * calls over a steady store never re-parse; a file that grows between calls
- * (run d37b0ba5's "twin grows between list and deep link") gets a NEW key and a
- * fresh exact parse.
+ * tie-break, keyed by `path\0ino\0size\0mtimeNs\0ctimeNs` (fileIdentitySig(),
+ * shared with every other per-file memo in this module — FEAT-204 round 2).
+ * Populated ONLY on a same-id twin collision (rare), by a FULL streaming parse
+ * of the whole file (no sampling, no size cap) — see `exactRealMessageCount`.
+ * A count already in this cache is valid as long as the file's identity is
+ * unchanged, so repeated list calls over a steady store never re-parse; a file
+ * that grows between calls (run d37b0ba5's "twin grows between list and deep
+ * link") gets a NEW key and a fresh exact parse.
  */
 const exactCountCache = new Map<string, number>();
 
@@ -616,19 +638,11 @@ const cwdProbeCache = new Map<string, string | null>();
 const headFactsCache = new Map<string, { sig: string; facts: { sessionId: string | null; cwd: string | null } }>();
 
 function headFactsStatSig(filePath: string): string | null {
-  try {
-    const st = fs.statSync(filePath, { bigint: true });
-    // ctimeNs is included deliberately: an in-place rewrite that a restore tool
-    // (cp -p, rsync -t, tar extract over an existing file) performs keeps the
-    // same inode and RESTORES the old mtime at the same byte length, so mtimeNs,
-    // size and ino can ALL be unchanged — but the inode's change-time always
-    // advances on a write and CANNOT be set backwards by utimes, so ctimeNs is
-    // the one field that still moves. Without it a same-size restore-over-file
-    // serves stale head facts (independent-verify BROKEN, run 180052d9 →).
-    return `${st.mtimeNs}\0${st.size}\0${st.ino}\0${st.ctimeNs}`;
-  } catch {
-    return null;
-  }
+  // Shared with every other per-file memo in this module — see fileIdentitySig().
+  // ctimeNs is included deliberately: a same-size restore-over-file with a
+  // restored mtime would otherwise serve stale head facts (independent-verify
+  // BROKEN, run 180052d9 →).
+  return fileIdentitySig(filePath)?.sig ?? null;
 }
 
 /**
@@ -973,22 +987,17 @@ export function readSessionMeta(
   const scan = opts.scan ?? 'sample';
   const useCache = opts.useCache !== false;
 
-  let st: fs.Stats;
-  try {
-    st = fs.statSync(filePath);
-  } catch {
-    return null;
-  }
+  const id = fileIdentitySig(filePath);
+  if (id === null) return null;
+  // Plain-number view of the same stat the signature was built from — every
+  // downstream use in this function wants size/mtimeMs as numbers, not the
+  // identity signature itself.
+  const st = { size: Number(id.st.size), mtimeMs: Number(id.st.mtimeNs) / 1e6 };
 
   const cacheKey = filePath;
   if (useCache) {
     const hit = metaCache.get(cacheKey);
-    if (
-      hit &&
-      hit.size === st.size &&
-      hit.mtimeMs === st.mtimeMs &&
-      (hit.scan === 'full' || scan === 'sample')
-    ) {
+    if (hit && hit.sig === id.sig && (hit.scan === 'full' || scan === 'sample')) {
       return hit.meta;
     }
   }
@@ -1141,7 +1150,7 @@ export function readSessionMeta(
   };
 
   if (opts.useCache !== false) {
-    metaCache.set(cacheKey, { size: st.size, mtimeMs: st.mtimeMs, scan, meta });
+    metaCache.set(cacheKey, { sig: id.sig, scan, meta });
   }
   return meta;
 }
@@ -1524,22 +1533,22 @@ export function listLogicalProjectSessions(
  * "no real transcript", strictly below any real count).
  */
 function exactRealMessageCount(filePath: string): number {
-  let st: fs.Stats;
-  try {
-    st = fs.statSync(filePath);
-  } catch {
-    return -1;
-  }
-  const key = `${filePath}\0${st.mtimeMs}\0${st.size}`;
+  const id = fileIdentitySig(filePath);
+  if (id === null) return -1;
+  // Shared signature (ino, size, mtimeNs, ctimeNs) — see fileIdentitySig(). The old
+  // key here was (path, mtimeMs, size) only, so a same-size rewrite with a restored
+  // mtime served a stale exact count (FEAT-204 round 2).
+  const key = `${filePath}\0${id.sig}`;
   const hit = exactCountCache.get(key);
   if (hit !== undefined) return hit;
 
+  const size = Number(id.st.size);
   let count = 0;
   let fd: number | null = null;
   try {
     fd = fs.openSync(filePath, 'r');
     // Full file, whole size as the byte budget — no sampling, no cap.
-    for (const ln of iterLinesFrom(fd, 0, st.size, st.size, true)) {
+    for (const ln of iterLinesFrom(fd, 0, size, size, true)) {
       const e = parseLine(ln);
       if (e && isRealMessage(e)) count++;
     }

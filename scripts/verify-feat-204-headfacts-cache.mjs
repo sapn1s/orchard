@@ -195,6 +195,55 @@ section('2. invalidated by any file change');
   fs.rmSync(root, { recursive: true, force: true });
 }
 
+/* --------------------------------------- 3a. exactRealMessageCount identity */
+section('3a. exactRealMessageCount keyed on full file identity (ino+ctime), not just mtime+size');
+{
+  // OpenAI run 01a1b79b-29e5-7020-a3ec-28e300f62b96: exactRealMessageCount's memo
+  // key used to be (path, mtimeMs, size) only. Force a same-id TWIN COLLISION
+  // (the only path that calls exactRealMessageCount), establish a cached count
+  // for the LOSING twin, then rewrite that twin to have MORE real messages than
+  // the winner while keeping its byte length identical and its mtime RESTORED
+  // (cp -p-style) — only ctime moves. The twin must flip to canonical; a stale
+  // (path, mtime, size)-only cache would keep serving the OLD (lower) count and
+  // never flip the winner.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'feat204-exact-'));
+  const dirA = 'dA', dirB = 'dB';
+  fs.mkdirSync(path.join(root, dirA)); fs.mkdirSync(path.join(root, dirB));
+  const pA = path.join(root, dirA, 'twin.jsonl');
+  const pB = path.join(root, dirB, 'twin.jsonl');
+  const ID = 'TWINX-204';
+  // "user" and "meta" are both 4 chars, so flipping between them never changes
+  // byte length — the file's SIZE stays identical across the rewrite below.
+  const header = (cwd) => JSON.stringify({ type: 'user', sessionId: ID, cwd, message: { role: 'user', content: 'h' } }) + '\n';
+  const line = (type) => JSON.stringify({ type, message: { role: 'user', content: 'x' } }) + '\n';
+  let t = 1700100000;
+
+  // A starts with 1 real message (header only, 2 non-real 'meta' lines); B has
+  // 2 real messages (header + 1 'user' line, 1 non-real 'meta' line) -> B wins.
+  const aBefore = header('/a') + line('meta') + line('meta');
+  fs.writeFileSync(pA, aBefore);
+  fs.utimesSync(pA, t, t);
+  fs.writeFileSync(pB, header('/b') + line('user') + line('meta'));
+  fs.utimesSync(pB, t, t);
+  hist.clearSessionCache?.();
+
+  const before = hist.canonicalSessionIndex([dirA, dirB], { root }).get(ID);
+  ok(before?.encodedDir === dirB && before?.messages === 2, `baseline: B wins with 2 real messages (got dir=${before?.encodedDir} messages=${before?.messages})`);
+
+  // Rewrite A to 3 real messages (now MORE than B's 2), same byte length (both
+  // 'meta' lines flipped to 'user', 4 chars either way), mtime RESTORED to the
+  // old t (as cp -p / rsync -t would) — only ctime moves.
+  const aAfter = header('/a') + line('user') + line('user'); // A: 1 -> 3 real messages
+  ok(aAfter.length === aBefore.length, 'rewrite precondition: byte length unchanged');
+  fs.writeFileSync(pA, aAfter);
+  fs.utimesSync(pA, t, t);
+
+  const after = hist.canonicalSessionIndex([dirA, dirB], { root }).get(ID);
+  ok(after?.encodedDir === dirA && after?.messages === 3, `after same-size restore-mtime rewrite: A flips to canonical with 3 real messages (got dir=${after?.encodedDir} messages=${after?.messages})`);
+
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 /* ------------------------------------------------------------- 3. warm speed */
 section('3. warm page 1 much faster');
 {

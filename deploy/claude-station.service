@@ -12,6 +12,17 @@ WorkingDirectory=%h/projects/orchard
 Environment=PORT=4317
 Restart=on-failure
 RestartSec=2
+# Priority: the server must win CPU against lanes (claude -p dispatch scopes and
+# in-session subagent Bash children) that share this user session. Those run in
+# sibling claude-station-host-*.scope / lane .service units under app.slice at the
+# default cpu.weight=100; raising the server to 1000 gives it ~10x the share of
+# each sibling when cores are saturated (FEAT-199). Lowering lane priority from
+# inside Orchard is inert because lanes live outside the server's cgroup — raising
+# the server is the robust lever. IOWeight needs the io controller delegated to the
+# user manager (it usually is NOT by default), so it is a no-op until then; it is
+# left here harmlessly for hosts that do delegate io.
+CPUWeight=1000
+IOWeight=1000
 
 [Install]
 WantedBy=default.target

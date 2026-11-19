@@ -1512,9 +1512,25 @@ export function createDrawer(ctx) {
     }
     grp.append(seg);
     if (refusal) {
-      const warn = note(refusal);
+      // FEAT-120 — a pinned session can be CONTINUED on the other engine (a
+      // server-seeded new session; the original is untouched). Offered ONLY when
+      // the source engine is KNOWN and pinned (se.source==='pinned') — never
+      // while it is still unknown (loading / read failed), or we would seed from
+      // an unresolved source, and never for a live session being written now.
+      const canContinue = !!(se && se.source === 'pinned' && (cur === 'anthropic' || cur === 'openai') && ctx.continueOnEngine);
+      // When the action is available, drop the old dead-end "Start a new session
+      // to use X." sentence from the lock note — the button IS the supported way.
+      const warn = note(canContinue ? refusal.replace(/\s*Start a new session to use [^.]*\.\s*$/, '') : refusal);
       warn.dataset.warn = 'true';
       grp.append(warn);
+      if (canContinue) {
+        const other = cur === 'openai' ? 'anthropic' : 'openai';
+        const otherLabel = other === 'openai' ? 'OpenAI Codex' : 'Claude';
+        const act = el('button', { class: 'mini primary', type: 'button', 'data-continue-engine': other, text: `Continue this conversation on ${otherLabel}` });
+        act.addEventListener('click', () => void ctx.continueOnEngine(other));
+        grp.append(act);
+        grp.append(note(`Starts a NEW ${otherLabel} session seeded with this conversation. Tool actions and private reasoning do not carry over (they are summarised); this conversation stays untouched as the original.`));
+      }
     } else if (isOvr('provider')) grp.append(note('Overridden for this session only — the next launch uses this engine; the project default is untouched.'));
     else if (sessionScope) grp.append(note('Applies to the next session launched from here.'));
 

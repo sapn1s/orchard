@@ -547,6 +547,15 @@ export type ClientCommand =
       overrides?: Partial<Pick<ProjectSettings, SessionOverridable>>;
       /** FEAT-177 — attachment references for the first turn (bytes already uploaded to the blob store). */
       attachments?: AttachmentRef[];
+      /**
+       * FEAT-120 — start this NEW session as a CROSS-PROVIDER CONTINUATION of an
+       * existing conversation. The client sends only the SOURCE id (never the
+       * transcript); the server reads it read-only, builds the handoff seed and
+       * uses it as the first turn, and records a write-once continuation link on
+       * the new session. The target engine is `overrides.provider`. Ignored when
+       * `resumeSessionId` is set (a resume is not a cross-provider move).
+       */
+      continueFrom?: { sessionId: string; encodedDir?: string };
     }
   | {
       type: 'send';

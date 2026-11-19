@@ -11,9 +11,9 @@
   "reported": "2026-09-02",
   "reported_by": "user",
   "owner": "agent",
-  "work_state": "open",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-09-02",
+  "updated": "2026-10-29",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -26,21 +26,56 @@
     "Proven against the user's REAL Claude session and a REAL Codex rollout (read-only), not only a synthetic fixture."
   ],
   "code_refs": [
-    { "path": "src/server/runtime/runtime.ts" },
-    { "path": "src/server/runtime/codex-runtime.ts" },
-    { "path": "src/server/codex-native.ts" },
-    { "path": "src/server/orchard-transcripts.ts" },
-    { "path": "src/server/transcript.ts" },
-    { "path": "src/server/jsonl.ts" },
-    { "path": "src/server/fork.ts" },
-    { "path": "src/lib/session-provenance.mjs" }
+    {
+      "path": "src/server/runtime/runtime.ts"
+    },
+    {
+      "path": "src/server/runtime/codex-runtime.ts"
+    },
+    {
+      "path": "src/server/codex-native.ts"
+    },
+    {
+      "path": "src/server/orchard-transcripts.ts"
+    },
+    {
+      "path": "src/server/transcript.ts"
+    },
+    {
+      "path": "src/server/jsonl.ts"
+    },
+    {
+      "path": "src/server/fork.ts"
+    },
+    {
+      "path": "src/lib/session-provenance.mjs"
+    }
   ],
   "related": [
-    { "id": "FEAT-102", "relation": "see_also" },
-    { "id": "BUG-165", "relation": "see_also" }
+    {
+      "id": "FEAT-102",
+      "relation": "see_also"
+    },
+    {
+      "id": "BUG-165",
+      "relation": "see_also"
+    }
   ],
   "recurrence_evidence": [],
-  "verification": [],
+  "verification": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-8",
+      "run_id": "feat120-live-glue-20261029",
+      "verdict": "holds",
+      "verdict_on": "2026-10-29",
+      "recorded_at": "2026-10-29T12:59:28.908Z",
+      "author": "worker (FEAT-120 live-glue verify)",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Live scratch-server e2e (working tree): real OpenAI session 019ff078 copy -> Continue on Claude via real UI; child turn completed. continuedFrom write-once, seed+notice in transcript, reply carried real dialogue, source byte-identical. 10/10 tmp/feat120-live-handoff.mjs"
+    }
+  ],
   "verification_class": "plan+review",
   "body_slots": {
     "Diagnosis": true,
@@ -163,3 +198,29 @@ Rollback: steps 1-3 are pure/additive and dormant without 4; removing the action
 - **Established (read-only):** the seven asymmetries above from `codex-native.ts`, `orchard-transcripts.ts`, `transcript.ts`, `codex-runtime.ts`, `runtime.ts`, `session-provenance.mjs`, `fork.ts`; that a faithful conversation handoff (tools summarised, reasoning dropped) is the only honest deliverable; that seeding must ride the first turn (BUG-165); that the continued session must be a NEW linked session, never a same-id masquerade.
 - **Changed:** filed this ticket only. No code. Nothing staged.
 - **Still open / handoff:** build after the Anthropic window resets, in the five migration steps above. Resolve the one product fork (on-demand vs after-reset-only gate) on review — recommended on-demand. Build lane should verify against the user's REAL Claude session and a REAL Codex rollout, and truncate the source at several points.
+
+### 2026-10-29 — worker (FEAT-120 build r1)
+- **Note:** Build started (triggered by a user wanting to move session 019ff078 from Codex to Claude). Plan independently reviewed before building (Explore reviewer, read-only): APPROVE-WITH-CHANGES. Folding in all 7 corrections: (1) continuedFrom/handoffMode must be written in the ONE write-once recordSessionProvenance call at agent-bridge.ts:5734 (threaded via StartOptions/RuntimeStartConfig), and the record assembly at session-provenance.mjs:93-98 extended to persist them (today it drops every extra key but source); (2) there is NO .ts twin — logic is session-provenance.mjs + session-provenance.d.mts types; extend ProvenanceRecord + the extra signature in the .d.mts and add a write-once continuedFrom case to verify-session-provenance.mjs; (3) readUniformSession must be a FULL-PASS streaming reader (collectTranscriptUuids pattern) yielding every entry with tool blocks intact — NOT readForward (caps at 2000 msgs, drops tool/non-renderable); (4) decide mode from fs.stat bytes BEFORE reading (286MB risk) — summary above threshold, never fully materialise; (5) reuse the dual-store resolve pair (resolveOrchardSessionFile + hist.resolveSessionFile default root); (6) emit only text assistant blocks, drop thinking entirely (never carry a signature); (7) offer the Continue button only when the source engine is KNOWN/pinned, never the ENGINE_UNKNOWN state. Mechanism already proven manually: new Claude session 954811be seeded from the real OpenAI dialogue continued the thread correctly. Independent clean-room verify to follow after build.
+
+### 2026-10-29 — worker (FEAT-120 build r1)
+- **Note:** BUILT all 5 steps (plan reviewed first: APPROVE-WITH-CHANGES, all 7 changes folded in). Files:
+  - src/server/session-handoff.ts (NEW) — pure buildHandoffSeed: every human turn + assistant TEXT answer in order; thinking DROPPED (no signature); tool_use/tool_result summarised (never executed state); explicit lost-context notice (LOST_CONTEXT_ITEMS). No fs/model/IO.
+  - src/server/orchard-transcripts.ts — readUniformSession: full-pass streaming reader (NOT the 2000-cap renderable pager), reuses the dual-store resolve, memory-bounded (tail-window read above 8MB + ring cap 1200 -> elided), tolerates a half-written trailing line, excludes sidechain/meta, READ-ONLY on the source.
+  - src/lib/session-provenance.mjs + .d.mts — write-once continuedFrom{sessionId,provider}+handoffMode on the CHILD id (isContinuedFromLink validates); verify-session-provenance.mjs extended.
+  - src/server/agent-bridge.ts (StartOptions + #continuedFrom/#handoffMode + the one recordSessionProvenance call), index.ts (start handler builds the seed server-side from cmd.continueFrom -> firstPrompt, threads continuation to runNewSessionStart+startSession), events.ts (start.continueFrom), runNewSessionStart param.
+  - public/app.js (continueOnEngine: startNew same project + provider override + startTurn with continueFrom; exposed on __station; startTurn gained a continueFrom option that skips the optimistic bubble), public/lib/drawer.js (providerGroup: pinned/known-only 'Continue this conversation on <other>' button replacing the dead-end 'start a new session' sentence + honest disclosure).
+
+  VERIFIED: scripts/verify-feat-120-handoff-seed.mjs 31/31 against the USER'S REAL sessions (discovered at runtime, no hard-coded paths) — conversation fidelity (every human+assistant-text turn present, ordered), NO tool_use/tool_result/thinking/engine-private id leaked, tool activity summarised, lost-context notice complete, a MUST-FAIL sentinel (tool_result content) proven absent, truncation safety at 5 byte cuts, reverse Claude->Codex. verify-session-provenance 32 checks (incl. write-once continuedFrom + malformed/bad-provider rejected). Anti-regression: feat-144 22/22, feat-078 36/36, bug-190 5/5. npm run gate PASS (exit 0, unpiped). Live client render verified on the real OpenAI session 019ff078: 'This session' lens, OpenAI pinned, enabled 'Continue this conversation on Claude' button + disclosure, dead-end sentence trimmed (asset FEAT-120-continue-on-claude.png). Mechanism proven end-to-end earlier by the MANUAL handoff (session 954811be continued the real thread).
+
+  NOT YET verified (handoff to independent clean-room): the SERVER start path (continueFrom -> seed firstPrompt + continuedFrom provenance) end-to-end on a SCRATCH server with the new code and a real target turn — the LIVE service runs OLD code and must NOT be restarted, so this needs a scratch server (isolatedServerEnv/CLAUDE_STATION_DATA) per charter. High-stakes (session lifecycle + data-loss surface): independent clean-room verify warranted. Deploy note: a service restart is required to make the server-side continueFrom path live.
+
+### 2026-10-29 — independent verify (clean-room, fresh-context worker)
+- **Note:** INDEPENDENT CLEAN-ROOM VERIFY — OVERALL HOLDS, no defects. (1) builder suites re-run green: verify-feat-120-handoff-seed 31/31, verify-session-provenance 32/32, npm run gate PASS exit 0. (2) pure-core adversarial 11/11: tool_result as long multi-line string AND as array-of-blocks never reach the seed (only the paired tool_use is name-summarised); a thinking block with a fake signature — reasoning+signature absent; bare-string/empty content and assistant-only-tool_use handled (tool-only turn becomes an ASSISTANT:(ran N tool calls) summary, not dropped). (3) readUniformSession ring/tail/truncation 17/17 under scratch CLAUDE_STATION_DATA: 1500 entries capped at exactly 1200 most-recent + elided + omitted-note; tiny tailBytes forces the window branch, first partial line dropped; mid-line truncation -> truncatedTail, no fragment yielded; sidechain/meta excluded. (4) DATA-LOSS read-only CONFIRMED: source opened 'r' only; source sha256+size unchanged after read; the new session is an engine-minted child id; continuedFrom/handoffMode written write-once on the CHILD id only; continueFrom ignored on resume. (5) server wiring: seed rides firstPrompt only, never systemPrompt (BUG-165 safe); both start paths thread the link to the one recordSessionProvenance call. (6) BUG-287 lens default matches all 4 criteria. (7) COULD-NOT-TEST: the live start->turn e2e (provenance fires at system:init, needs a real model turn; live service runs old code, must not restart) — untested GLUE only, every constituent independently verified. Recommendation: one live scratch-server run with a real provider after a restart is acceptable, before VERIFIED. Verifier was a fresh-context worker subagent (not scripts/independent-verify.mjs, which needs a dispatch/quota); flagging that the strict harness + live e2e remain the final gate.
+
+### 2026-10-29 — worker (FEAT-120 live-glue verify)
+- **Verification recorded:** dispatch anthropic/claude-opus-4-8 run feat120-live-glue-20261029 — VERDICT: HOLDS — Live scratch-server e2e (working tree): real OpenAI session 019ff078 copy -> Continue on Claude via real UI; child turn completed. continuedFrom write-once, seed+notice in transcript, reply carried real dialogue, source byte-identical. 10/10 tmp/feat120-live-handoff.mjs. Typed entry in the record's verification[]; this line is an echo, not proof.
+- **The could-not-test GLUE is now TESTED — and it did NOT need the live service.** Hypothesis confirmed: a scratch server booted straight from the working tree (`spawn(node, [src/server/index.ts])`, `isolatedStoreEnv` with its own CLAUDE_STATION_DATA + CLAUDE_CONFIG_DIR, real OAuth creds SYMLINKED read-only, a free port) runs the server-side continueFrom path end-to-end with a real Claude turn. The earlier lane's belief that a live-service restart was required is REFUTED. No build step was needed (the server runs type-stripped TS directly). Harness: `tmp/feat120-live-handoff.mjs` (repo-root /tmp, gitignored); screenshot `tmp/feat120-live.png`.
+- **Method (user-reality, not a fixture):** seeded the OpenAI-pinned source from a COPY of the user's REAL Codex rollout 019ff078 (last 60 real lines + ONE appended synthetic codeword turn, labelled synthetic, to make the "reply references the seeded dialogue" check hard). Registered a `direct`-isolation scratch project, opened the source via the real deep link, opened the real drawer, clicked the real "Continue this conversation on Claude" button, let the new Claude session (opus-5-5) complete one real turn.
+- **Observed (all 4 charter properties hold):** (1) child is a NEW engine-minted id (439d7541…, ≠ source); its provenance record carries write-once `continuedFrom:{sessionId:019ff078…,provider:openai}` + `handoffMode:replay-text`. (2) the child's first-turn transcript carries the full lost-context notice (27 KB seed, labelled "OpenAI Codex", enumerates reasoning/tool/subagent/attachment loss); the user-facing lost-context DISCLOSURE is shown in the drawer BEFORE continuing. (3) the real Claude reply opened with the codeword AND spontaneously confirmed the real prior dialogue carried — it restated the source conversation's specific subject matter (a DIY wall-repair task, naming its particular materials and tools), not generic filler. (4) the source transcript is byte-identical before/after (sha256 unchanged) — read-only confirmed live, not just by code-read.
+- **One UI OBSERVATION (not a glue failure; orchestrator to decide):** the continued session's THREAD renders a generic handoff hint-row ("Continuing this conversation on Claude… handing over the prior context.") then the reply — it does NOT re-render the enumerated seed notice as an in-thread bubble (the `continueFrom` path suppresses the optimistic bubble and the server-side seed user turn is not painted). The lost-context disclosure therefore lives in the DRAWER (pre-continue) + the transcript, not in-thread. Success-criterion wording "shown on the continued session's first render" is met by the drawer disclosure + hint-row, not by an in-thread notice. If an in-thread first-render notice is wanted, that is a small additive UI follow-up — the glue and data-safety are unaffected.
+- **Also noted (pre-existing, not FEAT-120):** a fresh `direct` project defaults could-not create a container on this host (GPU/CDI: "no known GPU vendor found"); irrelevant here (used `isolation:'direct'`). A benign advisory "agent memory could not be unified across isolation modes" fired on start (non-fatal, by design).

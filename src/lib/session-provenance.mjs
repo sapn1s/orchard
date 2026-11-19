@@ -78,6 +78,17 @@ function provenanceFile(sessionId) {
 }
 
 /**
+ * FEAT-120 — a valid cross-provider continuation link: the SOURCE session's id
+ * (a safe id) and the engine it ran on. Rejected shapes write no link (the
+ * handoff still works; only the provenance badge is absent).
+ */
+export function isContinuedFromLink(link) {
+  return !!link && typeof link === 'object'
+    && isSafeSessionId(link.sessionId)
+    && (link.provider === 'openai' || link.provider === 'anthropic');
+}
+
+/**
  * Record who started a session. WRITE-ONCE — a later call for the same id is a
  * no-op (returns false), so provenance can never be flipped after the fact, and
  * two racing writers cannot disagree. Best-effort and NEVER throws: a failed
@@ -95,6 +106,16 @@ export function recordSessionProvenance(sessionId, startedBy, extra = {}) {
       startedBy,
       source: typeof extra.source === 'string' ? extra.source : null,
       at: new Date().toISOString(),
+      // FEAT-120 — a write-once link to the session this one was CONTINUED FROM
+      // on the other engine (a cross-provider conversation handoff). Present only
+      // when the caller passes a well-formed link; because the record is the
+      // CHILD's own id file and write-once, the link can never be flipped.
+      ...(isContinuedFromLink(extra.continuedFrom)
+        ? { continuedFrom: { sessionId: extra.continuedFrom.sessionId, provider: extra.continuedFrom.provider } }
+        : {}),
+      ...(extra.handoffMode === 'replay-text' || extra.handoffMode === 'summary'
+        ? { handoffMode: extra.handoffMode }
+        : {}),
     };
     // Atomic: write to a unique temp then rename, so a crash mid-write cannot
     // leave a half-written record that reads as malformed.

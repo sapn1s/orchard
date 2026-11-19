@@ -1418,6 +1418,9 @@ const drawer = createDrawer({
   // through pickProvider (the one guarded writer, same pattern as
   // pickSessionAccount/pickAccount), and disables itself on the same guard.
   pickSessionProvider: (next) => pickProvider(next),
+  // FEAT-120 — the supported in-session engine switch: continue this
+  // conversation on the other engine via a server-seeded new session.
+  continueOnEngine: (target) => continueOnEngine(target),
   pickSessionAccount: (next) => pickAccount(next),
   notify: say,
   openGit: (pid) => void gitView?.open(pid ? { projectId: pid } : {}),
@@ -15420,7 +15423,7 @@ async function reattachDriving(sess) {
  * entered message"). The flag rides on state so the refusal path (which runs
  * later, from the socket) can honour it without re-deriving who started the turn.
  */
-async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepComposer, attachments } = {}) {
+async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepComposer, attachments, continueFrom } = {}) {
   const p = currentProject();
   if (!p) return;
   // BUG-252 — starting a session is a navigation too: a link still resolving must
@@ -15453,7 +15456,13 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
    * delivered message was the one removed. Both are the transcript lying, which
    * is the failure this whole area exists to prevent.
    */
-  const startedBubble = youBubble(mainThread(), text, attachments);
+  // FEAT-120 — a cross-provider CONTINUATION has no user message: the first turn
+  // is the handoff seed, built SERVER-SIDE from the source conversation and
+  // persisted there (BUG-253 startRow). So there is no optimistic user bubble to
+  // show — a short note stands in until the seeded turn's reply streams in.
+  const startedBubble = continueFrom
+    ? (mainThread().paneEl.append(el('div', { class: 'hint-row', text: `Continuing this conversation on ${text}… handing over the prior context.` })), null)
+    : youBubble(mainThread(), text, attachments);
   // BUG-278 — the first turn's send identity. Carried on the optimistic bubble
   // and the start frame; the CLI adopts it as the first user entry's uuid, and
   // the start ack echoes the resolved value (re-stamped below if the server
@@ -15507,6 +15516,7 @@ async function startTurn(text, { resumeSessionId, fork, resumeEncodedDir, keepCo
     fork,
     templateIds,
     ...(attachments && attachments.length ? { attachments } : {}), // FEAT-177
+    ...(continueFrom ? { continueFrom } : {}), // FEAT-120 — server builds the seed from this source, read-only
     overrides: sessionOverrides({ resuming: !!resumeSessionId, forking: !!fork }), // BUG-196 round 4 — a resume never carries a provider
   });
   renderTree();
@@ -16035,6 +16045,33 @@ function providerSwitchRefusal() {
   // derivation: pinned → the lock explanation; an existing id with no declared
   // engine (loading / read failed) → refused; a live session in view → refused.
   return sessionEngine().refusal;
+}
+
+/**
+ * FEAT-120 — continue THIS conversation on the OTHER engine. The engine is
+ * pinned per-transcript, so this is a cross-provider HANDOFF, not a resume: a
+ * NEW session is started in the same project on `target`, and its first turn is
+ * the handoff seed the SERVER builds from this conversation (read-only — the
+ * original session is never touched; it stays as the fallback). `target` is the
+ * engine to continue ON ('anthropic' | 'openai').
+ */
+async function continueOnEngine(target) {
+  if (target !== 'anthropic' && target !== 'openai') return false;
+  const cur = state.current;
+  const source = cur?.sessionId ? { sessionId: cur.sessionId, ...(cur.encodedDir ? { encodedDir: cur.encodedDir } : {}) } : null;
+  if (!source) { say('open the conversation you want to continue first', true); return false; }
+  const projectId = cur.projectId;
+  const label = target === 'openai' ? 'OpenAI Codex' : 'Claude';
+  drawer.close?.();
+  // A fresh pending-new session in the SAME project (startNew resets overrides).
+  startNew(projectId);
+  // Arm the engine this continuation runs on (the project default may already be
+  // it; arming is explicit so a claude→openai move carries the override).
+  state.overrides.provider = target;
+  paintProvSurfaces();
+  // No user text: the server supplies the seed as the first turn (continueFrom).
+  await startTurn(label, { continueFrom: source });
+  return true;
 }
 
 /**
@@ -20251,6 +20288,7 @@ async function boot() {
     loadMoreSessions, loadAllSessionsFull, searchRowsFor, mergeSearchCorpus,
     reconcileFullList, ensureListComplete, retryListReconcile, // FEAT-199 (r9)
     selectProject, startNew, submit, // FEAT-177 — expose for the end-to-end attachment demo
+    continueOnEngine, // FEAT-120 — cross-provider conversation handoff
 
     // BUG-100: footer (#fine) internals, so a verify script can drive the real
     // status/turn-end paths and assert the isolation label is never displaced by

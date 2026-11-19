@@ -30,6 +30,7 @@ import * as tx from './transcript.ts';
 import * as watcher from './watcher.ts';
 import { startHarnessWatchdog } from './harness-watchdog.ts'; // BUG-290 — scratch-server self-defence
 import * as ot from './orchard-transcripts.ts';
+import { buildHandoffSeed } from './session-handoff.ts'; // FEAT-120 — cross-provider conversation handoff seed
 import * as cn from './codex-native.ts';
 import * as snaps from './snapshots.ts';
 import * as smut from './session-mutations.ts';
@@ -6321,6 +6322,9 @@ function runNewSessionStart(a: {
   overrides?: Parameters<typeof startSession>[0]['overrides'];
   /** BUG-255 r4 — the new session's account pick, its initial binding (never an override). */
   initialBinding?: { account: string | null };
+  /** FEAT-120 — cross-provider continuation link, forwarded to provenance. */
+  continuedFrom?: { sessionId: string; provider: 'openai' | 'anthropic' };
+  handoffMode?: 'replay-text' | 'summary';
   onEvent: (e: StationEvent) => void;
   abandoned?: () => boolean;
   startRow: { box: string; id: string; attempt: number } | null;
@@ -6355,6 +6359,8 @@ function runNewSessionStart(a: {
     instructions: a.instructions,
     overrides: a.overrides,
     ...(a.initialBinding ? { initialBinding: a.initialBinding } : {}),
+    ...(a.continuedFrom ? { continuedFrom: a.continuedFrom } : {}),
+    ...(a.handoffMode ? { handoffMode: a.handoffMode } : {}),
     onEvent,
     abandoned: a.abandoned,
     firstPromptHooks: {
@@ -7394,6 +7400,32 @@ wss.on('connection', (ws: WebSocket) => {
            * and an admission failure, a closed tab, a restart or a CLI that died before init lost it without a
            * trace. If it cannot be saved, the session is not started: nothing runs that Orchard could not keep.
            */
+          /*
+           * FEAT-120 — a CROSS-PROVIDER CONTINUATION. The client asked to carry
+           * this conversation onto the other engine; it sent only the SOURCE id
+           * (`continueFrom`), never the transcript. The seed is built SERVER-SIDE
+           * from the source's uniform entries (read-only — the original session
+           * is never touched), rides the FIRST TURN as the prompt (BUG-165: never
+           * the system prompt), and the continuation link is recorded write-once
+           * on the new (child) session's provenance. The target engine is the
+           * start's own provider override; on-demand, no after-reset gate.
+           */
+          let continuation: { sessionId: string; provider: 'openai' | 'anthropic' } | undefined;
+          let handoffMode: 'replay-text' | 'summary' | undefined;
+          if (!cmd.resumeSessionId && cmd.continueFrom && typeof cmd.continueFrom === 'object') {
+            const cf = cmd.continueFrom as { encodedDir?: unknown; sessionId?: unknown };
+            const srcDir = typeof cf.encodedDir === 'string' && cf.encodedDir ? cf.encodedDir : hist.encodeCwd(project.hostPath);
+            const srcId = typeof cf.sessionId === 'string' ? cf.sessionId : '';
+            if (!srcId) return send({ t: 'error', fatal: true, message: 'continueFrom.sessionId is required to continue a conversation' });
+            const read = ot.readUniformSession(srcDir, srcId);
+            if (!read.found || !read.entries.length) {
+              return send({ t: 'error', fatal: true, message: `cannot continue: no readable conversation for ${JSON.stringify(srcId)}` });
+            }
+            const sourceProvider = read.provider === 'openai' || read.provider === 'anthropic' ? read.provider : null;
+            cmd.prompt = buildHandoffSeed(read.entries, { sourceProvider, elided: read.elided }).seed;
+            handoffMode = 'replay-text';
+            if (sourceProvider) continuation = { sessionId: srcId, provider: sourceProvider };
+          }
           let startRow: { box: string; id: string; attempt: number } | null = null;
           if (!cmd.resumeSessionId && ((typeof cmd.prompt === 'string' && cmd.prompt.trim()) || startAttachments.length)) {
             try {
@@ -7417,6 +7449,7 @@ wss.on('connection', (ws: WebSocket) => {
           (startRow
             ? runNewSessionStart({
               project, prompt: cmd.prompt, attachments: startAttachments, instructions, overrides, initialBinding, onEvent: send,
+              ...(continuation ? { continuedFrom: continuation, handoffMode } : {}), // FEAT-120
               firstUuid: startUuid, // BUG-278
               // FEAT-175: a start waiting for a git-grant container rebuild is dropped before admission if this socket closes.
               abandoned: () => closedEarly,
@@ -7433,6 +7466,7 @@ wss.on('connection', (ws: WebSocket) => {
               instructions,
               overrides,
               ...(initialBinding ? { initialBinding } : {}),
+              ...(continuation ? { continuedFrom: continuation, handoffMode } : {}), // FEAT-120
               onEvent: send,
               // FEAT-175: a start waiting for a git-grant container rebuild is dropped before admission if this socket closes.
               abandoned: () => closedEarly,

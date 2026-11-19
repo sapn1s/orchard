@@ -48,6 +48,7 @@ import { asOrchardWrite } from './own-writes.ts';
 import { reclaimReason, FILE_LOCK_TTL_MS } from '../../scripts/lib/file-lock.mjs';
 import { normalizeLineEndings } from './board.ts';
 import type { AttachmentRef } from './attachments.ts';
+import type { UniformEntry } from './session-handoff.ts'; // FEAT-120 — the uniform entry shape the handoff seed consumes
 
 /** Root of all Orchard-owned transcripts. */
 export function orchardTranscriptsRoot(): string {
@@ -370,6 +371,103 @@ export class TranscriptUuidTailer {
       fs.closeSync(fd);
     }
   }
+}
+
+/**
+ * FEAT-120 — read a session's conversation as uniform entries for a CROSS-PROVIDER
+ * HANDOFF seed (buildHandoffSeed, session-handoff.ts). Read-only on the source:
+ * the original session and its transcript are NEVER touched.
+ *
+ * Reuses the one dual-store resolver pair (ARCH-010): the native Claude store
+ * (`hist.resolveSessionFile` default root) OR the Orchard-owned store
+ * (`resolveOrchardSessionFile`). Does NOT route through the renderable pager
+ * (`transcript.ts#readForward` caps at 2000 messages and strips tool blocks); a
+ * handoff must see EVERY main-thread turn with its tool blocks intact so they
+ * can be summarised.
+ *
+ * Memory-bounded so a 286 MB Claude source cannot OOM: above `tailBytes` only
+ * the final window is read (and its first, partial line dropped), and at most
+ * `maxEntries` of the MOST RECENT main-thread entries are retained — `elided` is
+ * set when older turns were dropped, so the seed can say so. Sidechain/meta
+ * entries (subagent internals) are excluded; their activity is summarised by the
+ * seed builder, not replayed. A half-written trailing line is tolerated and
+ * never yielded (truncation safety).
+ */
+export interface UniformSessionRead {
+  found: boolean;
+  file: string | null;
+  provider: string | null;
+  bytes: number;
+  entries: UniformEntry[];
+  elided: boolean;
+  truncatedTail: boolean;
+}
+
+export function readUniformSession(
+  encodedDir: string,
+  sessionId: string,
+  opts: { maxEntries?: number; tailBytes?: number } = {},
+): UniformSessionRead {
+  const maxEntries = opts.maxEntries ?? 1200;
+  const tailBytes = opts.tailBytes ?? 8_000_000;
+
+  // The authoritative file, same precedence the transcript route uses: native
+  // Claude store first, then the Orchard-owned store.
+  const claude = hist.resolveSessionFile(encodedDir, sessionId);
+  const orchard = claude ? null : resolveOrchardSessionFile(encodedDir, sessionId);
+  const file = claude ?? orchard?.filePath ?? null;
+  const provider = claude ? CLAUDE_MIRROR_PROVIDER : (orchard?.provider ?? null);
+  if (!file) return { found: false, file: null, provider: null, bytes: 0, entries: [], elided: false, truncatedTail: false };
+
+  let bytes = 0;
+  try { bytes = fs.statSync(file).size; } catch { /* unreadable stat — treated as empty below */ }
+
+  let text = '';
+  let droppedPartialHead = false;
+  if (bytes > tailBytes) {
+    // Read only the final window; its first line is almost certainly a fragment.
+    const fd = fs.openSync(file, 'r');
+    try {
+      const buf = Buffer.alloc(tailBytes);
+      const read = fs.readSync(fd, buf, 0, tailBytes, bytes - tailBytes);
+      text = buf.toString('utf8', 0, read);
+    } finally {
+      fs.closeSync(fd);
+    }
+    droppedPartialHead = true;
+  } else {
+    try { text = fs.readFileSync(file, 'utf8'); } catch { text = ''; }
+  }
+
+  const lines = text.split('\n');
+  const startIdx = droppedPartialHead ? 1 : 0; // the tail window's first line is partial
+  const ring: UniformEntry[] = [];
+  let elided = droppedPartialHead; // tail-read means earlier history was not seen
+  let truncatedTail = false;
+  // Index of the last non-empty line, so a trailing fragment can be recognised.
+  let lastNonEmpty = -1;
+  for (let i = lines.length - 1; i >= startIdx; i--) { if (lines[i].trim()) { lastNonEmpty = i; break; } }
+
+  for (let i = startIdx; i < lines.length; i++) {
+    const s = lines[i].trim();
+    if (!s) continue;
+    let o: Record<string, unknown>;
+    try {
+      o = JSON.parse(s) as Record<string, unknown>;
+    } catch {
+      // A half-written trailing line (a concurrent writer) is tolerated and
+      // never yielded; an unparseable line mid-file is skipped like the UUID
+      // collector does. Only the genuine trailing fragment flags truncatedTail.
+      if (i === lastNonEmpty) truncatedTail = true;
+      continue;
+    }
+    if ((o.type === 'user' || o.type === 'assistant') && o.isSidechain !== true && o.isMeta !== true) {
+      ring.push(o);
+      if (ring.length > maxEntries) { ring.shift(); elided = true; }
+    }
+  }
+
+  return { found: true, file, provider, bytes, entries: ring, elided, truncatedTail };
 }
 
 /**

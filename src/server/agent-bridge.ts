@@ -243,6 +243,15 @@ export interface StartOptions {
    */
   startedBy?: 'user' | 'agent';
   /**
+   * FEAT-120 — this session is a CROSS-PROVIDER CONTINUATION of another engine's
+   * session (its first turn was seeded from that conversation). Recorded
+   * write-once in the child's own provenance at `system:init`, alongside
+   * `startedBy`. The link is the SOURCE session's id + the engine it ran on.
+   */
+  continuedFrom?: { sessionId: string; provider: 'openai' | 'anthropic' };
+  /** FEAT-120 — how the continuation seed was built (recorded with the link). */
+  handoffMode?: 'replay-text' | 'summary';
+  /**
    * Per-session settings overrides. Already validated by validate.ts. Applied to
    * this session only; nothing here is ever written back to the registry.
    */
@@ -753,6 +762,9 @@ export class AgentSession {
   #pump: Promise<void> | null = null;
   /** Declared provenance for this session; recorded at init. Default 'user'. */
   #startedBy: 'user' | 'agent';
+  /** FEAT-120 — cross-provider continuation link, recorded write-once at init. */
+  #continuedFrom?: { sessionId: string; provider: 'openai' | 'anthropic' };
+  #handoffMode?: 'replay-text' | 'summary';
   /** BUG-253: the first-message record's callbacks, consumed once (init, or a close before it). */
   #firstPromptHooks: StartOptions['firstPromptHooks'] | null;
 
@@ -1306,6 +1318,8 @@ export class AgentSession {
     this.cwd = opts.project.hostPath;
     this.#emit = opts.onEvent;
     this.#startedBy = opts.startedBy ?? 'user';
+    this.#continuedFrom = opts.continuedFrom;
+    this.#handoffMode = opts.handoffMode;
     this.#firstPromptHooks = opts.firstPromptHooks ?? null;
     // BUG-278 r15 — remember the resume's store dir so the send-time uuid
     // catch-up resolves the same file the resume seed read from.
@@ -5731,7 +5745,13 @@ export class AgentSession {
         // Declare who started this session, write-once, now that the engine's
         // session id exists (session-provenance.mjs). Default 'user' keeps a row
         // visible; the picker folds only rows explicitly recorded 'agent'.
-        recordSessionProvenance(this.sdkSessionId, this.#startedBy, { source: 'agent-bridge' });
+        recordSessionProvenance(this.sdkSessionId, this.#startedBy, {
+          source: 'agent-bridge',
+          // FEAT-120 — write the continuation link on the CHILD's own id,
+          // write-once (no flip surface). Omitted keys are ignored by the writer.
+          ...(this.#continuedFrom ? { continuedFrom: this.#continuedFrom } : {}),
+          ...(this.#handoffMode ? { handoffMode: this.#handoffMode } : {}),
+        });
         // FEAT-132 — write the SESSION CONFIGURATION record, write-once, keyed by
         // the engine's session id (same moment provenance is declared). This is
         // the only place the composed docs, the live board snapshot, the CLI's

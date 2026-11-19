@@ -64,6 +64,28 @@ recordSessionProvenance(uuser, 'user', { source: 'agent-bridge' });
 const map = loadProvenanceMap();
 ok('loadProvenanceMap sees both', map.get(uid)?.startedBy === 'agent' && map.get(uuser)?.startedBy === 'user');
 
+// --- FEAT-120: cross-provider continuation link (write-once on the child) ----
+const ucont = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const srcId = '019ff078-a6eb-72b0-b51d-c0a6cacd82e0';
+ok('continued session records continuedFrom + handoffMode',
+  recordSessionProvenance(ucont, 'user', { source: 'agent-bridge', continuedFrom: { sessionId: srcId, provider: 'openai' }, handoffMode: 'replay-text' }) === true);
+const crec = readSessionProvenance(ucont);
+ok('continuedFrom link persisted', crec?.continuedFrom?.sessionId === srcId && crec?.continuedFrom?.provider === 'openai');
+ok('handoffMode persisted', crec?.handoffMode === 'replay-text');
+ok('write-once: a re-record cannot flip/remove the link', recordSessionProvenance(ucont, 'user', { continuedFrom: { sessionId: 'different', provider: 'anthropic' } }) === false);
+ok('write-once kept the original link', readSessionProvenance(ucont)?.continuedFrom?.sessionId === srcId);
+ok('malformed link writes NO link but still records', (() => {
+  const u2 = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+  const wrote = recordSessionProvenance(u2, 'user', { continuedFrom: { sessionId: '../bad', provider: 'openai' } });
+  const r = readSessionProvenance(u2);
+  return wrote === true && r?.continuedFrom === undefined;
+})());
+ok('bad provider in link is rejected (no link)', (() => {
+  const u3 = 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa';
+  recordSessionProvenance(u3, 'user', { continuedFrom: { sessionId: srcId, provider: 'gemini' } });
+  return readSessionProvenance(u3)?.continuedFrom === undefined;
+})());
+
 // --- the conservative pre-existing fallback --------------------------------
 ok('real machine Dispatch line -> agent',
   looksAgentDispatched('Dispatch: ticket=BUG-099 phase=fixing round=2 class=fix\n\nDo the thing.'));

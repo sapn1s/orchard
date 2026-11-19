@@ -11,9 +11,9 @@
   "reported": "2026-10-05",
   "reported_by": "agent",
   "owner": "agent",
-  "work_state": "in_verification",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-10-05",
+  "updated": "2026-10-20",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -87,6 +87,20 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "Clean-room r3 (anthropic->openai), VALID manifest-backed. Answer-STATE HOLDS (fixer 37/37 in-room). BROKEN sub-property: board:check does not flag a post-freeze forged user-answer heading wrapped in a code fence; it still counts for nothing (state null). Two-break STOP. See Activity entry."
+    },
+    {
+      "provider": "anthropic",
+      "model": "default",
+      "run_id": "f66078de-fa28-476d-b762-0a4d2d2e23d6",
+      "verdict": "holds",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T05:33:04.423Z",
+      "author": "worker (verifying r4)",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "2db674867be468b0b3f75338b0ca9d304e74f5d0a8a0f63e2cf2a4d7defdec5a",
+      "verify_mode": "mixed-state",
+      "note": "Clean-room r4 via independent-verify (SAME-provider anthropic; openai quota mid-run). Fixer 37/37 + adversarial 26/26. r3 fenced-heading gap FIXED: board:check WARNs every forged heading incl. fenced; all inert. Detail in Activity."
     }
   ],
   "verification_class": "fix",
@@ -193,3 +207,9 @@ scripts/board-tool.mjs has verbs to file, update and record verification, but no
   The verifier invoked the two-break STOP rule ("enumerated property, route to single-authority redesign") because the board:check-flagging property broke via a path the fixer suite did not cover. Not tested (STOP invoked): concurrent-writer answer-vs-re-decide, and live-HTTP 409 bypasses (omit/stale/foreign key) beyond the module-level rail-409 leg the fixer suite exercises. Artifacts KEPT: clean room ~/.local/state/claude-station/scratch/cleanroom-verify-vusdFI; manifest ~/.local/state/claude-station/scratch/cleanroom-record-WzdMwE/manifest.jsonl; verdict /tmp/feat166-iv-verdict2.txt; run log /tmp/feat166-iv-run2.log; scratch base/head repo ~/.local/state/claude-station/scratch/feat166-r3-iv.1afO8E (range 738bd00bdcb1..5de841828f36). First openai attempt (run 01a10de5-696c-74b3-b750-e50cb8d7277d) died as an INVALID provider content-safety flag mid-probe, not a verdict; this VALID run is the immediate retry.
 
   DECISION for the orchestrator: answered-state is single-authority and holds; the open gap is that board:check — an inherently prose-scanning advisory linter — does not warn on a fenced forged heading that is itself inert. Decide whether an r4 is warranted (tighten the board:check heading scan to catch user-reply-shaped headings even inside fences, since a real Activity entry heading is never legitimately fenced) or whether the gap is accepted given the hidden heading has no functional effect.
+
+### 2026-10-20 — worker (verifying r4)
+- **Verification recorded:** dispatch anthropic/default run f66078de-fa28-476d-b762-0a4d2d2e23d6 — VERDICT: HOLDS — mixed-state candidate 2db674867be4 — Clean-room r4 via independent-verify (SAME-provider anthropic; openai quota mid-run). Fixer 37/37 + adversarial 26/26. r3 fenced-heading gap FIXED: board:check WARNs every forged heading incl. fenced; all inert. Detail in Activity.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-20 — worker (verifying r4)
+- **verifying r4:** Independent clean-room verify r4 via scripts/independent-verify.mjs — VALID, verdict HOLDS. Run f66078de-fa28-476d-b762-0a4d2d2e23d6 (dispatch.mjs). MIXED-STATE candidate 2db674867be4 (base ce21cd0=HEAD; FEAT-166 landed in batch e79aada, so its delta is in base — the 48KB diff shown the verifier was co-tenant hunks on shared files, correctly disclosed as not-this-change; the verifier read the real current FEAT-166 source in the room and ran the cited fixer test). PROVIDER: SAME-provider anthropic. openai (the standing preferred verifier) was usable at start but hit a quota-window mid-run (reset ~11:45), returning INVALID (nothing verified); per the standing 'don't wait for OpenAI, finish on Claude' instruction the verify was re-run on anthropic — decorrelation reduced (author was also anthropic). EVIDENCE: fixer verify-feat-166-typed-answer.mjs 37/37 in-room (manifest 501f10b660c0, exit 0) + an adversarial probe 26/26 (manifest 8ed16b3f00c7, exit 0). The r3 BROKEN sub-property is FIXED and confirmed: 8 forged user-answer heading variants (``` and ~~~ and 4-backtick fences, indented-in-note, unclosed fence, pre-freeze date, uppercase YOU, rail-shaped) ALL count for nothing AND board:check WARNs every one — including a fenced verbatim copy of the genuine heading — while the genuine heading is not warned. Also held: the three prior-round breaks (follow-up resurrection, fenced Decision-declared clearing, forged heading) fixed live + must-FAIL on pinned r1/r2; decision_key unbinds the answer on an option-label or question edit; rail answer for an old decision key → 409, file unchanged; board-tool update --answer/--chose/--by refused and a --log answer-imitation never counts; adopt with NO user delegation writes nothing counted (the FEAT-184 delegated-adopt path is a sanctioned agent-under-delegation writer, out of scope per the threat model); frozen snapshot missing or 1-byte-tampered FAILs board:check and counts for nothing; 585 truncation cuts never flip the answer. UNTESTED (none reopens an in-scope property): HTTP route layer vs direct module calls, delegation-store damaged/legacy trust paths, ENTRY_HEADING_RE edge forms (inert anyway), concurrent recordAnswer race under withTicketLock. Artifacts: verdict /tmp/feat166-r4-verdict-anthropic.txt, run log /tmp/feat166-r4-run-anthropic.log.

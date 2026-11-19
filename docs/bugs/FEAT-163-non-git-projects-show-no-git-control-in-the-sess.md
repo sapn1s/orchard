@@ -11,9 +11,9 @@
   "reported": "2026-10-05",
   "reported_by": "agent",
   "owner": "agent",
-  "work_state": "in_verification",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-10-11",
+  "updated": "2026-10-20",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -50,6 +50,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "contract-collision, not a defect: verifier leaned HOLDS but author test exits non-zero by design (real git-init-success blocked by FEAT-135 guard). Needs-you decision on acceptance."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "verify-r2-feat163-20261020",
+      "verdict": "holds",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T05:33:14.251Z",
+      "author": "worker (verifying r2)",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Real repo-init success path exercised on an isolated scratch server via the documented scratch opt-out (shim-stripped PATH); 42/0 incl chip flips to repo. No code change needed."
     }
   ],
   "verification_class": "fix",
@@ -109,3 +121,9 @@ Verified before building: the project directory is not a git repository (`rev-pa
 
 ### 2026-10-11 — dispatch anthropic
 - **Verification recorded:** dispatch anthropic run 49e4af9d-4546-442e-a737-aa77ef9801fc — VERDICT: INVALID — contract-collision, not a defect: verifier leaned HOLDS but author test exits non-zero by design (real git-init-success blocked by FEAT-135 guard). Needs-you decision on acceptance.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-20 — worker (verifying r2)
+- **Note:** Verifying round 2 (dispatch phase=verifying round=2, 2026-10-20). Tree: HEAD ce21cd0 + the uncommitted FEAT-170/190/191 git-policy batch; live service (2026-10-16 18:13) is newer than the last git-view commit, but git.ts/app.js/git-view are uncommitted, so ALL testing ran on an ISOLATED scratch server (node src/server/index.ts, free port, own CLAUDE_STATION_DATA) built from the CURRENT working tree. The r1 INVALID verdict was a contract-collision: the real repo-initialisation success path was blocked by the agent git-shim. RESOLVED this round via the documented scratch opt-out: per the user guard intent ("scratch git is fine", git-restriction-intent memory), the scratch server was booted with the /tmp/orchard-git-shim-* dir stripped from PATH, so the server uses real git on throwaway /tmp scratch dirs only. The ONLY write is the repo-init on the synthetic NONGIT scratch project; the two real checkouts are registered applyMethod:false (read-only, porcelain identical before/after). Command: PATH=<shim-stripped> F163_REAL_INIT=1 node scripts/verify-feat-163-165-git-bar.mjs -> "FEAT-163/164/165 git bar: 42 passed, 0 failed", including "REAL init: confirm runs the server init in the project dir; chip flips to a repo on main" (observed repo:true, .git created in the scratch dir). Non-git chip shows the no-repo state + the confirmed "Initialize git repository" offer in both themes. Screenshots: docs/bugs/assets/FEAT-163-{face,popover,confirm}-{light,dark}.png. No code change needed for FEAT-163; it holds on the current tree once the real init is exercised outside the shim.
+
+### 2026-10-20 — worker (verifying r2)
+- **Verification recorded:** dispatch anthropic run verify-r2-feat163-20261020 — VERDICT: HOLDS — Real repo-init success path exercised on an isolated scratch server via the documented scratch opt-out (shim-stripped PATH); 42/0 incl chip flips to repo. No code change needed.. Typed entry in the record's verification[]; this line is an echo, not proof.

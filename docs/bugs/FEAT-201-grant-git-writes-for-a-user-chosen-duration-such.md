@@ -11,9 +11,9 @@
   "reported": "2026-10-27",
   "reported_by": "agent",
   "owner": "unassigned",
-  "work_state": "in_progress",
+  "work_state": "done",
   "human_action": "none",
-  "updated": "2026-10-27",
+  "updated": "2026-11-19",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -94,3 +94,6 @@
   - Independent verify (scripts/independent-verify.mjs --ticket FEAT-201, mixed-state candidate 50e08dc96736): VERDICT HOLDS, manifest-backed. Verifier added an adversarial suite — all 1440 whole-minute durations exact-expiry, last-ms allowed, above-ceiling clamp to 24h, revoke/replace deny all prior claims, and the actual POST route refuses creation AND extension. Its UNTESTED items (end-to-end caller classification; browser picker) are covered by verify-feat-164-self-grant (65/0) and verify-feat-201-ui (8/8) above.
 
   Files changed (unstaged, left for the user): scripts/lib/git-grant-store.mjs, public/lib/git-view.js, public/git-view.css; new tests scripts/verify-feat-201-duration-grant.mjs, scripts/verify-feat-201-ui.mjs.
+
+### 2026-11-19 — worker (BUG-289/FEAT-201/BUG-217 lane)
+- **bookkeeping: closed:** Original request (user, session 1e52191a, 2026-10-27T17:59Z, verbatim): "git granted, btw if u finish all, feel free to also work on new feature: abil;ity for me to grant arbitrary times of git, eg 24h, othereiwse with 30 min i need to keep granting it to so often". No acceptance test was given beyond "eg 24h". Satisfied: presets 30m/1h/8h/24h + custom minutes up to 1440, and "Until I turn it off" for anything longer (the server cap MAX_GRANT_MS is 24h, scripts/lib/git-grant-store.mjs:117). No user requirement was dropped. Independent verify HOLDS: openai run 01a17ea9-c751-7e72-bc0d-15eaf7f6ff7e (typed entry above). Code is committed in 7415c45 ("FEAT-201: grant git writes for a user-chosen duration"), which is on origin/main (`git branch -r --contains 7415c45`). Triage 2026-11-19 also noted an 8h grant visible live in health. Set work_state=done; no code change in this lane.

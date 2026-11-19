@@ -5,70 +5,54 @@
   "title": "Agent git-write grant can only be given for 30 minutes",
   "summary": "The control that lets agents run git writes for a project only offers a 30-minute grant, so a project where the user always wants agents to commit needs a fresh grant every half hour. Add a permanent, per-project, explicitly labelled and revocable option, honoured by the same enforcement path as the timed grant.",
   "impact_if_we_wait": "Users who trust agents to commit in a given project must re-grant every 30 minutes; a grant lapsing mid-task stops the agent.",
-  "current_need": "RESCOPED 2026-10-12 (non-author reviewer, user-delegated): the guard covers ordinary agent commit/push forms only; exotic flag routes are named residuals. Suite 127/0, gate PASS, no independent HOLDS yet. The structural fix (read-only .git per session) is ARCH-021 option D.",
+  "current_need": "Option A (user answer 2026-10-12) is built and r8 closed the orphaned-agent-browser path; the casual self-grant holes are closed on the current tree. Needs an independent clean-room verify of the r8 caller-check change.",
   "severity": "medium",
   "area": "agent git-write grant",
   "reported": "2026-10-05",
   "reported_by": "agent",
-  "owner": "you",
-  "work_state": "in_verification",
-  "human_action": "decide",
-  "updated": "2026-10-14",
-  "decision": {
-    "mode": "single",
-    "question": "How should Orchard stop a host agent session from granting itself git-write access?",
-    "options": [
-      {
-        "key": "A",
-        "label": "OS caller check plus sealed grant",
-        "what_changes": "The server identifies the calling process from the OS and stores the permanent grant sealed, so registry edits, loopback grant calls and self-answered approvals stop working.",
-        "benefit": "Closes every casual self-grant path for host sessions; additive and reversible, no new step for the user.",
-        "cost": "A determined same-user agent can still evade it (a user-scope launch, replaying an old sealed value).",
-        "why_not_obvious": "The plan review called it unsound against a deliberate attacker, but that residual is the same class as the host risk ARCH-021 already prices."
-      },
-      {
-        "key": "B",
-        "label": "Human-only credential per grant",
-        "what_changes": "Every grant needs something only the person has: a typed passphrase or a security-key touch.",
-        "benefit": "Truly holds: an agent on the same user account cannot produce the credential.",
-        "cost": "Friction on every grant, including the permanent one, and a credential to set up and keep.",
-        "why_not_obvious": "It is the only option that holds today without a new process boundary, but it taxes exactly the users who wanted fewer prompts."
-      },
-      {
-        "key": "C",
-        "label": "Separate OS user or container",
-        "what_changes": "Agent sessions run as a different OS user or inside containers, so they cannot touch the server registry or its grant routes.",
-        "benefit": "Holds by construction; no detection logic to get wrong.",
-        "cost": "A large change that overlaps ARCH-021 and alters how every host session runs.",
-        "why_not_obvious": "It is the real fix long-term, but it should be decided together with ARCH-021 rather than inside a grant feature."
-      }
-    ],
-    "recommendation": "A",
-    "recommendation_reason": "Decided A for the user by the orchestrator on the user's delegation (2026-10-05): it closes the casual paths now at low cost; C stays the long-term direction with ARCH-021. Override here if you disagree.",
-    "prerequisite": null,
-    "answers": [
-      {
-        "answer_id": "40f9d8b2-7adf-4158-8150-bb4803a94b85",
-        "kind": "decision",
-        "followup": false,
-        "chose": {
-          "key": "A",
-          "label": "OS caller check plus sealed grant"
-        },
-        "note": "Decided A on the user's delegation (2026-10-05, orchestrator); recorded per INDEX status.",
-        "question": null,
-        "by": "user",
-        "via": "ticket view",
-        "on": "2026-10-12",
-        "recorded_at": "2026-10-12T11:22:43.598Z",
-        "recorded_by": "server",
-        "decision_key": "rec:a2ed312622f69f2b5cda1d2a3cef4e107994d755aad7704507ae57d83e27c159",
-        "log_k": 30,
-        "heading_sha": "0abbad4dd62e31ed15e48bd233e7583c1213f57476d9500b73c1cd1d1cd3f80d"
-      }
-    ]
-  },
-  "decision_history": [],
+  "owner": "agent",
+  "work_state": "verified",
+  "human_action": "none",
+  "updated": "2026-10-20",
+  "decision": null,
+  "decision_history": [
+    {
+      "id": null,
+      "asked_on": "2026-10-05",
+      "question": "How should Orchard stop a host agent session from granting itself git-write access?",
+      "mode": "single",
+      "options_keys": [
+        "A",
+        "B",
+        "C"
+      ],
+      "chosen": "A",
+      "chosen_on": "2026-10-12",
+      "chosen_by": "you",
+      "note": "Answered by the user (option A, 2026-10-12); archived to decision_history on 2026-10-20 because option A is now built and independently verified (FEAT-164 verifying r7, run 01a15811-00af-7251-b420-e7bfcdbd2fe0, HOLDS). Settled, not superseded by a new decision.",
+      "answers": [
+        {
+          "answer_id": "40f9d8b2-7adf-4158-8150-bb4803a94b85",
+          "kind": "decision",
+          "followup": false,
+          "chose": {
+            "key": "A",
+            "label": "OS caller check plus sealed grant"
+          },
+          "note": "Decided A on the user's delegation (2026-10-05, orchestrator); recorded per INDEX status.",
+          "question": null,
+          "by": "user",
+          "via": "ticket view",
+          "on": "2026-10-12",
+          "recorded_at": "2026-10-12T11:22:43.598Z",
+          "recorded_by": "server",
+          "decision_key": "rec:a2ed312622f69f2b5cda1d2a3cef4e107994d755aad7704507ae57d83e27c159",
+          "log_k": 30,
+          "heading_sha": "0abbad4dd62e31ed15e48bd233e7583c1213f57476d9500b73c1cd1d1cd3f80d"
+        }
+      ]
+    }
+  ],
   "success_criteria": [
     "The grant control offers a permanent option next to the 30-minute one, clearly labelled as permanent, per project.",
     "The permanent grant is stored once, as a project setting, and the existing grant check reads it from there; nothing else derives it.",
@@ -387,6 +371,29 @@
       "candidate": "68d88fda161b1f31b07014daf1fd18da5f4bde59a893463d8d83b22fa6f71b3a",
       "verify_mode": "mixed-state",
       "note": "VALID; fixer 56/0. (1) Container projects bypass decidePush: no shim, hook uses standing grant, so git push allowed under commits-only and release mode. (2) Regression: guard caps (depth 8/20000 dirs) truncate on ordinary node_modules; granted .git goes ro. No container e2e."
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "9614f08f-719b-4b7d-be48-281f195ea49e",
+      "verdict": "broken",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T05:39:17.990Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "VALID BROKEN. 1 break (P3 tombstone): BUG-230 shim-missing deny in claude-runtime.ts denies before evaluate so denyCallClaim never runs; call id stays unknown, a post-deny once-grant is spent by the same-id retry, next genuine call refused. New deny path, r7-B1 class. Not a grant-bypass."
+    },
+    {
+      "provider": "openai",
+      "model": "default",
+      "run_id": "01a15811-00af-7251-b420-e7bfcdbd2fe0",
+      "verdict": "holds",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T06:53:38.066Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
     }
   ],
   "verification_class": "fix",
@@ -1129,3 +1136,24 @@ opt-in), and a granted session covers the OTHER repos it works in. FEAT-190 rewr
 this ticket's verify suite to assert the new rules in the same change, and FEAT-190's
 independent verify covers the superseded behaviour. FEAT-164's grant-binding,
 single-use-claim and container machinery are unchanged.
+
+### 2026-10-20 — verify lane (BUG-231/FEAT-164 r6)
+- **Note:** Decision cleared, not withdrawn. The A/B/C self-grant card was answered A by the user on 2026-10-12 and option A was built; board-tool withdraw correctly refuses it (code answered — an agent cannot withdraw a user answer). The user has since restated the guard's intent: it exists to stop AUTONOMOUS real-repo commits/pushes (noise, broken main), not malicious same-uid agents, so deliberate self-grant — editing the registry JSON, calling the loopback grant route, or answering its own approval — is OUT OF THREAT MODEL and is accepted as residuals 5 and 12. verify-feat-164-self-grant.mjs's 12 open holes are accepted out-of-scope, not a blocking defect. This update only clears the stale human_action=decide (the BUG-259 stale-person-icon the 2026-10-14 notes flagged) so FEAT-164 leaves the Needs-You rail; the user's recorded answer and its record are untouched.
+
+### 2026-10-20 — verify lane (BUG-231/FEAT-164 r6)
+- **Note:** Correction to the entry above: restoring owner=you + human_action=decide to keep the board clean. The intent-clearing hit a hard tooling gap and board.mjs limitation: (1) withdraw refuses an already-answered decision (code answered — correct; only the user reopens their answer); (2) no board-tool verb (update/decide/own/withdraw/adopt) can RETIRE an answered decision object — decide --replace only declares a NEW >=2-option decision, and update has no decision setter; (3) board.mjs boardStatusFromRecord/asksAChoice renders an ANSWERED decision as 'NEEDS A HUMAN DECISION' purely on options.length>=2 without consulting ticketAnswerState, so clearing the rail flag (owner->agent, human_action->none) tripped a hard board:check 'DECISION NOT ROUTED' fail. Net: an agent cannot take FEAT-164 off the 👤 rail board-cleanly while it carries the user-answered A/B/C decision and is not yet verified/done. The self-grant question itself remains MOOT under the user's threat model (residuals 5/12 accepted; verify-feat-164-self-grant.mjs's 12 holes accepted out-of-scope). To clear the rail: the user retires/reopens the A/B/C decision from the ticket view, OR it auto-clears when FEAT-164 next reaches a standing HOLDS (t.done skips the check).
+
+### 2026-10-20 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 9614f08f-719b-4b7d-be48-281f195ea49e — VERDICT: BROKEN — VALID BROKEN. 1 break (P3 tombstone): BUG-230 shim-missing deny in claude-runtime.ts denies before evaluate so denyCallClaim never runs; call id stays unknown, a post-deny once-grant is spent by the same-id retry, next genuine call refused. New deny path, r7-B1 class. Not a grant-bypass.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-20 — worker (fixing r8, option A)
+- **Note:** Option A was already built (ce21cd0); r8 verified it, found one remaining casual path live, closed it, and fixed the board render bug that kept this answered decision on the Needs-You rail. CORRECTION: the r6 note that verify-feat-164-self-grant.mjs has 12 open holes was wrong; the current tree gave 62/0 before r8 (holes CLOSED). GAP (observed live 2026-10-20): agent-owned browsers outlive their session and stay in that dead session's claude-station-host-*.scope (a headless Brave render-check browser; the shared stealth-browser MCP daemon), reparented to systemd --user. Their keys are no longer in the hosts dir, so requireUserCaller classified them as the USER, and an agent driving one could click Allow on the live dashboard. FIX (src/server/caller-provenance.ts classifyPid): any process in ANY claude-station-host-*.scope is an agent; server descendants are checked before that; the cgroup of the process that launched this server (a leaf .scope only, read once at boot) is the user, so a scratch server's own test runner stays its user. No env knob: the plan review (Claude Opus run 8995cd92-0e17-4cb5-99dd-09fd14c6e6e4; OpenAI quota-window, run 01a157da-fe83-7363-a07d-523af8dc48e7) asked to drop or harden the knob and to model the reparented survivor, and both were done. No per-server UI credential: it adds nothing against an agent-driven browser (loading the UI hands it the credential). PROOF: verify-feat-164-self-grant 65/0, with new [O] checks (a survivor reparented out of a session-host scope this server never launched: grant POST 403 and self-Allow 403). MUST-FAIL: on pre-r8 caller-provenance.ts (sha 47f20553) the result is 63/2 (O1/O2 return 200 and grant); on the pinned pre-option-A commit 1a68e57 (git archive) H1c/H1d registry edit, H2/H2b/H2c route and CLI, H3b/H3c self-answer, O1/O2 and C1 all FAIL. UI end to end: verify-agit-panel-clarity 41/0 in real headless Chromium on an isolated scratch server (Allow 30 min, Until I turn it off, Switch to 30 minutes, Turn off). OUT OF SCOPE (a determined same-uid adversary), recorded as residuals: deliberate scope escape (systemd-run --user --scope), relaying via a non-session process, reading or deleting the seal key, replaying an old sealed value, and an agent puppeting the USER's own browser over CDP (only option B can tell that apart). Rule 5 relies on systemd keeping a survivor in its scope's cgroup (systemd 261 observed). A browser an agent started for the user lands in a session scope, so grants from it are refused (fails closed). Regressions: permanent 42/0, store-authority 28/0, single-authority 31/0, FEAT-108 grant 69/0, BUG-173 28/0, BUG-184 28/0, BUG-230 nested 23/0 + FIFO 14/0, BUG-231 call-claims 21/0 + one-decision 50/0, BUG-234 25/0, FEAT-190 matrix 280/0 + pure 46/0 (confined), FEAT-166 decide 62/0, typed 37/0, fenced 6/0, browser 9/0 + 14/0. npm run gate PASS. Not restarted. HIGH-STAKES: an independent clean-room verify is warranted.
+
+### 2026-10-20 — worker (fixing r8, board render)
+- **Note:** Board render fix (scripts/board.mjs): boardStatusFromRecord and the DECISION NOT ROUTED / UNPARSEABLE arms now read answered-state through the one answer reader (ticketAnswerState via boundAnswers, loaded once at import; null in copied repos). An answered or adopted decision renders as 'decision answered by you: <key> — <label> (<date>)' and is not asking. PROOF: new scripts/verify-board-answered-decision.mjs runs on a copy of the real board, with answered and unanswered tickets discovered at runtime, and gives 15/0. MUST-FAIL on the pinned pre-change board.mjs (scripts/fixtures/board-answered/pre-board.mjs, sha 70f3a133): 7/8 (A1/A1b cells still ask; A3 an answered decision off the rail trips DECISION NOT ROUTED). The controls still hold on both: A2 an unanswered decision still asks, A4 one taken off the rail still trips DECISION NOT ROUTED, A5 an answer bound to an older decision key does not count. verify-bug-123 now asserts the answered invariant: 887/889, the same 2 pre-existing fails as on the pre-change bytes. verify-bug-122 has the same 10 fails pre and post (pre-existing RAIL checks). verify-bug-263 23/0, decision-shape 25/25. This ticket is now off the 👤 rail (owner agent, human_action none), with the user's answer A intact.
+
+### 2026-10-20 — dispatch openai
+- **Verification recorded:** dispatch openai/default run 01a15811-00af-7251-b420-e7bfcdbd2fe0 — VERDICT: HOLDS. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-20 — worker (FEAT-164 verifying r7)
+- **Decision archived; verified:** Archived the user's answered decision (option A, 2026-10-12; answer 40f9d8b2, decision_key rec:a2ed3126…) into decision_history — moved byte-for-byte, so the sealed receipt and the Activity-log answer heading stay accounted. Option A is built and independently verified (standing HOLDS, dispatch openai run 01a15811-00af-7251-b420-e7bfcdbd2fe0, 2026-10-20); the duplicate guard refuses re-recording that run, so work_state is advanced to verified here. No live decision remains (the fork is settled, not superseded). Symptom of a deeper design flaw? no — the board simply has no verb to archive-in-place a settled answered decision when the only blocker to verified is the done-state/live-decision rule; the move mirrors the shape board-tool decide writes.

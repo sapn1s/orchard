@@ -291,6 +291,44 @@ try {
   check('H3c the request is still pending on the rail for the user', (feed.d?.needsYou ?? []).some((x) => x.id === rq.d?.id), (feed.d?.needsYou ?? []).map((x) => x.id));
   if (gAns) userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
 
+  /* ═══ O — FEAT-164 r8: an agent's browser that OUTLIVED its session ═════════
+   * Observed live 2026-10-20: an agent's headless render-check Brave and the shared
+   * stealth-browser MCP daemon kept running after their sessions ended, still in those
+   * sessions' claude-station-host-<key>.scope cgroups, reparented to systemd --user, the
+   * keys gone from the hosts dir. Before r8 such a process classified as the USER, so an
+   * agent driving it could click "Allow" on the dashboard. Modelled exactly: a session-host
+   * scope this server never launched (key not in its hosts dir), whose main process exits
+   * at once, leaving a reparented survivor that then calls the grant route and answers the
+   * agent's pending request. */
+  console.log('\n[O] an agent process that outlived its session (dead session scope, reparented)');
+  {
+    const [rqO] = await agent.run([{ kind: 'http', method: 'POST', url: `${BASE}/api/sessions/${agent.sid}/git-write-request`, body: { reason: 'orphan-browser probe', scope: 'duration', minutes: 30 } }]);
+    const orphanJs = path.join(RUN, 'orphan.mjs');
+    const orphanOut = path.join(RUN, 'orphan-out.json');
+    fs.writeFileSync(orphanJs, `
+import * as fs from 'node:fs';
+const ppid0 = Number(process.argv[3]); // the session's main process (the bash that started us)
+const t0 = Date.now();
+while (process.ppid === ppid0 && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 50));
+const post = async (url, body) => { const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }); let d = null; try { d = await r.json(); } catch {} return { status: r.status, code: d?.code ?? null }; };
+const grant = await post(${JSON.stringify(grantUrl(A))}, { scope: 'duration', minutes: 30 });
+const answer = await post(${JSON.stringify(`${BASE}/api/projects/${encodeURIComponent(A)}/board/answer`)}, { id: process.argv[2], answer: 'Allow' });
+fs.writeFileSync(${JSON.stringify(orphanOut)}, JSON.stringify({ ppid0, ppid: process.ppid, cgroup: fs.readFileSync('/proc/self/cgroup', 'utf8').trim(), grant, answer }));
+`);
+    const orphanUnit = `claude-station-host-t-orph${tag}${randomBytes(2).toString('hex')}.scope`;
+    spawnSync('systemd-run', ['--user', '--scope', '--quiet', '--collect', `--unit=${orphanUnit}`, 'bash', '-c', `"${process.execPath}" "${orphanJs}" "${rqO.d?.id ?? ''}" "$$" >/dev/null 2>&1 & disown; exit 0`], { encoding: 'utf8', env: { ...process.env }, timeout: 30_000 });
+    for (let i = 0; i < 200 && !fs.existsSync(orphanOut); i++) await sleep(100);
+    let o = null; try { o = JSON.parse(fs.readFileSync(orphanOut, 'utf8')); } catch { /* not written */ }
+    const orphanKey = orphanUnit.slice('claude-station-host-'.length, -'.scope'.length);
+    const inHostsDir = fs.existsSync(path.join(DATA, 'session-hosts', `${orphanKey}.json`));
+    check('O0 setup: the probe outlived its session (reparented) and still sits in that dead session-host scope, which this server never launched',
+      !!o && o.ppid !== o.ppid0 && o.cgroup.includes(`/${orphanUnit}`) && !inHostsDir, { ppid0: o?.ppid0, ppid: o?.ppid, cgroup: o?.cgroup, inHostsDir });
+    const gO = await grantOf(A);
+    check('O1 its POST of the grant route is refused as an agent (403 agent-self-grant) and grants nothing', o?.grant?.status === 403 && o?.grant?.code === 'agent-self-grant' && gO === null, { grant: o?.grant, after: gO?.scope ?? null });
+    check('O2 its "Allow" on the agent\'s pending request is refused (403) and mints nothing', o?.answer?.status === 403 && (await grantOf(A)) === null, { answer: o?.answer });
+    if (await grantOf(A)) userHttp('DELETE', `/api/projects/${A}/git-write-grant`);
+  }
+
   /* ═══ USER — the user's grants still work, and take effect live ════════════ */
   console.log('\n[USER] the user grants; the running agent session honours it');
   const [gitBlocked] = await agent.run([{ kind: 'git', args: ['add', 'x'], cwd: PA }]);

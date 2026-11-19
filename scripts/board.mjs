@@ -72,6 +72,37 @@ import {
   WORK_STATE_STATUS_WORD,
 } from './lib/ticket-schema.mjs';
 
+/*
+ * FEAT-164 r8 (board render fix) — "was this decision answered?" is read through THE one
+ * answer reader, `ticketAnswerState` (src/server/board.ts → boundAnswers: typed entries
+ * bound to the CURRENT decision, sealed receipts verified), never re-derived here. Before
+ * this, boardStatusFromRecord and the DECISION NOT ROUTED check treated any decision with
+ * >=2 options as still asking, so a decision the user had answered stayed on the 👤 rail
+ * and clearing it tripped board:check. Loaded once, at import, so the synchronous
+ * readTickets (gen AND check) both see the same answer. board.mjs is COPIED into
+ * onboarded repos with no board.ts: there the reader is null and nothing changes.
+ */
+const ticketAnswerStateReader = await (async () => {
+  const boardTs = path.resolve(path.dirname(url.fileURLToPath(import.meta.url)), '..', 'src', 'server', 'board.ts');
+  if (!fs.existsSync(boardTs)) return null;
+  try {
+    const m = await import(url.pathToFileURL(boardTs).href);
+    return typeof m.ticketAnswerState === 'function' ? m.ticketAnswerState : null;
+  } catch (err) {
+    process.stderr.write(`board.mjs — answer reader unavailable (answered decisions render as asking): ${err?.message ?? err}\n`);
+    return null;
+  }
+})();
+
+/** The answer that settles this ticket's CURRENT decision (a choice made by the user, or
+ * adopted under their delegation), or null when nothing settles it. `file` = full path. */
+function decisionAnswerOf(markdown, file) {
+  if (!ticketAnswerStateReader) return null;
+  let st = null;
+  try { st = ticketAnswerStateReader(markdown, file); } catch { return null; } // unreadable → still asking (fails toward the human)
+  return st && st.kind === 'decision' ? st : null;
+}
+
 /**
  * BUG-073 — git merge conflict markers are non-table junk that `readIndex`
  * sweeps into the Open-table `trailer` (any non-empty line after the separator),
@@ -251,15 +282,29 @@ function asCell(s) {
  */
 const DECISION_ACTIONS = ['decide', 'staged_decision', 'multi_select_decision'];
 
-function boardStatusFromRecord(record) {
+/** Cheap pre-filter: only a record that carries a choice can have an answer that settles it. */
+function recordAsksOrAnswered(rec) {
+  const d = rec && rec.decision && typeof rec.decision === 'object' && !Array.isArray(rec.decision) ? rec.decision : null;
+  return DECISION_ACTIONS.indexOf(rec?.human_action) !== -1 || (!!d && Array.isArray(d.options) && d.options.length >= 2);
+}
+
+function boardStatusFromRecord(record, answer = null) {
   const rec = record && typeof record === 'object' ? record : {};
   const word = WORK_STATE_STATUS_WORD[rec.work_state] ?? 'OPEN';
   const parts = [];
   const d = rec.decision && typeof rec.decision === 'object' && !Array.isArray(rec.decision) ? rec.decision : null;
   const options = d && Array.isArray(d.options) ? d.options : [];
-  const asksAChoice = DECISION_ACTIONS.indexOf(rec.human_action) !== -1 || options.length >= 2;
+  // FEAT-164 r8 — an ANSWERED decision is not asking. `answer` comes from the one answer
+  // reader (decisionAnswerOf → ticketAnswerState); a caller that has none passes null.
+  const asksAChoice = !answer && (DECISION_ACTIONS.indexOf(rec.human_action) !== -1 || options.length >= 2);
 
-  if (asksAChoice) {
+  if (answer) {
+    const key = answer.chose && typeof answer.chose.key === 'string' ? answer.chose.key.trim() : '';
+    const label = answer.chose && typeof answer.chose.label === 'string' ? answer.chose.label.trim() : '';
+    const who = answer.by === 'agent-under-delegation' ? 'adopted under your delegation' : 'answered by you';
+    parts.push(`${word} — decision ${who}${key ? `: ${key}${label ? ` — ${label}` : ''}` : ''}${answer.on ? ` (${answer.on})` : ''}.`);
+    if (typeof rec.current_need === 'string' && rec.current_need.trim()) parts.push(rec.current_need.trim());
+  } else if (asksAChoice) {
     parts.push(options.length >= 2
       ? `${word} — NEEDS A HUMAN DECISION (${options.length} options).`
       : `${word} — NEEDS A HUMAN DECISION.`);
@@ -326,7 +371,7 @@ function readTickets(dir) {
       // comes from its prose header", which is what `gen` falls back to, so a
       // legacy row is produced by exactly the code that produced it before.
       boardStatus: parsed.format === 'block' && parsed.record
-        ? boardStatusFromRecord(parsed.record)
+        ? boardStatusFromRecord(parsed.record, recordAsksOrAnswered(parsed.record) ? decisionAnswerOf(text, full) : null)
         : null,
       workState: t.work_state,
       // Carried per-ticket as well as in `errors`, so every consumer of this
@@ -1073,6 +1118,10 @@ async function decisionShapeFails(dir) {
 
     let md = '';
     try { md = fs.readFileSync(path.join(dir, t.file), 'utf8'); } catch { continue; }
+    // FEAT-164 r8 — a decision the user answered (or that was adopted under their
+    // delegation) asks nothing of anyone: it needs no Decide card, so it is neither
+    // UNPARSEABLE nor NOT ROUTED. Read through the one answer reader, as the rail does.
+    if (decisionAnswerOf(md, path.join(dir, t.file))) continue;
 
     const row = idx?.openRows.get(t.id) ?? null;
     const hasRow = !!row || !!idx?.doneRows.has(t.id);

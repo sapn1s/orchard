@@ -36,6 +36,10 @@ import * as path from 'node:path';
 
 import { extractTicketBlock, TICKET_FILE_RE } from '../scripts/lib/ticket-schema.mjs';
 import * as boardTool from '../scripts/board.mjs';
+// FEAT-164 r8 — an ANSWERED decision is not asking: the cell reads the one answer reader.
+const { ticketAnswerState } = await import('../src/server/board.ts');
+const BUGS_DIR = path.join(path.resolve(import.meta.dirname, '..'), 'docs', 'bugs');
+const answeredChoice = (t) => { try { const st = ticketAnswerState(t.text, path.join(BUGS_DIR, t.file)); return st && st.kind === 'decision' ? st : null; } catch { return null; } };
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const BUGS = path.join(ROOT, 'docs', 'bugs');
@@ -119,7 +123,7 @@ const rowsAfter = openRows(generated);
  * risk of letting a suite choose its own subjects.
  */
 const gradable = promoted
-  .map((t) => ({ t, rec: JSON.parse(extractTicketBlock(t.text).block) }))
+  .map((t) => ({ t, rec: JSON.parse(extractTicketBlock(t.text).block), answered: answeredChoice(t) }))
   .map((x) => ({ ...x, row: rowsAfter.get(x.rec.id) }))
   .filter((x) => x.row);
 
@@ -142,7 +146,7 @@ check('coverage: …one whose RECOMMENDATION points at a real option', withRecom
 check('coverage: …one carrying a CONSEQUENCE OF DELAY', withImpact.length > 0, `${withImpact.length} with impact_if_we_wait`);
 check('coverage: …and an ARCH ticket (the "no build starts" clause)', archTickets.length > 0, `${archTickets.length} architecture tickets`);
 
-for (const { rec, row } of gradable) {
+for (const { rec, row, answered } of gradable) {
   const cell = row.split('|')[4]?.trim() ?? '';
 
   // MUST-FAIL, anchored to a SYNTHESIZED pre-change state: before this change a
@@ -159,7 +163,13 @@ for (const { rec, row } of gradable) {
 
   const d = rec.decision && typeof rec.decision === 'object' ? rec.decision : null;
   const options = d && Array.isArray(d.options) ? d.options : [];
-  if (options.length >= 2) {
+  if (options.length >= 2 && answered) {
+    // FEAT-164 r8 — the user ANSWERED this decision (one answer reader): it no longer asks.
+    check(`${rec.id}: an ANSWERED decision's cell does not ask, and names the answer`,
+      !/NEEDS A HUMAN DECISION/.test(cell) && /decision (answered by you|adopted under your delegation)/.test(cell)
+        && (!answered.chose?.key || cell.includes(`: ${answered.chose.key}`)),
+      JSON.stringify(cell.slice(0, 90)));
+  } else if (options.length >= 2) {
     check(`${rec.id}: the cell says a human must choose, and how many options`,
       /NEEDS A HUMAN DECISION/.test(cell) && cell.includes(`(${options.length} options)`),
       JSON.stringify(cell.slice(0, 70)));
@@ -360,7 +370,7 @@ console.log('\n=== F. the cell reaches the ticket API, whole ===');
      */
     const apiTickets = boardTool.readTickets(genBugs).tickets;
     let decisionBearing = 0;
-    for (const { rec } of gradable) {
+    for (const { rec, answered } of gradable) {
       const row = (list.tickets ?? []).find((x) => x.id === rec.id);
       const expected = rowsAfter.get(rec.id)?.split('|')[4]?.trim() ?? '';
       if (!expected) continue;
@@ -374,7 +384,10 @@ console.log('\n=== F. the cell reaches the ticket API, whole ===');
         `${got.length} chars vs pre-change ${JSON.stringify(preChange)}`);
 
       const opts = Array.isArray(rec.decision?.options) ? rec.decision.options : [];
-      if (opts.length >= 2) {
+      if (opts.length >= 2 && answered) {
+        check(`API: ${rec.id}'s decision is ANSWERED, so the API does not say a human must choose`,
+          !/NEEDS A HUMAN DECISION/.test(got), JSON.stringify(got.slice(0, 60)));
+      } else if (opts.length >= 2) {
         decisionBearing++;
         check(`API: ${rec.id} declares a decision, so the API says a human must choose`,
           /NEEDS A HUMAN DECISION/.test(got), JSON.stringify(got.slice(0, 60)));

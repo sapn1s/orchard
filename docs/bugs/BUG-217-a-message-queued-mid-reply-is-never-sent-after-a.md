@@ -5,7 +5,7 @@
   "title": "A message queued mid-reply is never sent after a reload",
   "summary": "The user typed a message while Claude was working, so it waited in the queue. The tab then reloaded or switched away, the reply finished and the session closed. On return the message sat under \"this tab is not driving the session\" and nothing would ever send it. It went eleven minutes later only because the user re-sent it.",
   "impact_if_we_wait": "Any message typed mid-reply can silently stall after an ordinary reload or session switch, and the dock gives no clear way out, so the user either waits forever or retypes it.",
-  "current_need": "A queued message restored into a tab that is not driving the session is sent by itself, exactly once and never into a running turn, or the dock says in plain words why not and offers Send now.",
+  "current_need": "Fix late delivery after a tab closes mid-turn: outbox waits ~2 min behind a survivor host under a false 'after a restart' hold (survivorAdmits; tangled with BUG-159). Then re-run user-criteria legs and IV on the five criteria.",
   "severity": "high",
   "area": "dashboard client / queue delivery",
   "reported": "2026-09-30",
@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "in_progress",
   "human_action": "none",
-  "updated": "2026-09-30",
+  "updated": "2026-11-19",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -1737,3 +1737,26 @@
 
 ### 2026-09-30 — dispatch anthropic
 - **Verified-by:** dispatch anthropic run f6129491-8551-4023-85b6-d0acfb81b82b (clean-room, `scripts/independent-verify.mjs`) — VERDICT: BROKEN
+
+### 2026-11-11 — agent (FEAT-197 fix lane r2)
+- **verify leg D re-pointed (FEAT-197):** Leg D of scripts/verify-bug-217-queued-message-strand.mjs asserted BUG-149's single-driver lock: a second tab was refused ('another tab is driving') and its Enter parked as a failed row for a manual Send again. FEAT-197 removed that lock deliberately (a second tab now JOINS the live session as a co-driver), so the leg tested a behaviour that no longer exists. What BUG-217 needs from that scenario never depended on the lock, so D now asserts the invariant it still protects: a message typed mid-turn in a tab that did NOT start the running turn is held by the SERVER outbox (a row the server acknowledged), is never written into the running turn (fake-CLI tap count 0 mid-turn), is delivered exactly once AFTER the turn (tap index after the seed frame), and BOTH tabs show it. Plus one FEAT-197 check that the second tab joined (live, busy, no live-elsewhere). Result on the FEAT-197 round-2 tree: `node scripts/verify-bug-217-queued-message-strand.mjs --only D` -> 4 PASS / 0 FAIL, exit 0 (raw ~/scratch/feat197-r2/b217-D-2.txt). Not run: a must-FAIL for the re-pointed leg (e.g. a client that sends straight into a busy co-driven session) — unverified that D would catch that regression.
+
+### 2026-11-19 — worker (BUG-289/FEAT-201/BUG-217 lane)
+- **rescope to the user's request; data-dir scope split to BUG-299:** Original request (user, session 70531fb4, 2026-09-29T23:43Z, verbatim, after pasting the stranded dock: "1 queued message · this tab is not driving the session … restored after a reload, still unsent"): "well there are 2 things: - why was my message not sent, clearly it should have been - ui/ux as said it is not intuitive". No acceptance test was given. The five success_criteria in this record restate those two asks (sent by itself exactly once after reload / switch / mid-turn / another tab; plain status text with visible actions). Intent check: I searched every user turn in the orchard transcripts 2026-09-29..10-02 for data-dir / two-server / queued / double; the user never asked for the data-dir guarantee. It entered at round 6 through the verifier requirement ("two server processes pointed at one data dir", see the round-6 verify entry: "The requirement handed to this verifier explicitly names …"), and the round-6 entry itself left "rule the two-server case out of scope" as an orchestrator option. Rounds 7-10 were spent on it; both round-10 breaks (ABA dir swap, idle holder) are in that agent-added scope. Rescope: those guarantees and their open breaks move to BUG-299 (filed now, severity low, see_also BUG-217); no user requirement is dropped. No code changed in this lane; BUG-159 hunks in index.ts / agent-bridge.ts untouched. Next: run the user-criteria legs (N,A,B,C,D,E,F,G,I,U,PA) and an independent verify limited to the five criteria.
+
+### 2026-11-19 — worker (BUG-289/FEAT-201/BUG-217 lane)
+- **user-criteria legs not green; stopped:** User-criteria legs, run on the working tree with --only N,A,B,C,D,E,F,G,I,U,PA: 41 passed / 5 failed. No independent verify was launched, because this lane changed no code and the legs are not green.
+
+  FAILURES
+  (1) N2, "queued in a real tab that then CLOSED mid-turn": fails 4 of 5 runs on the working tree and 1 of 2 on an export of committed HEAD 5d035a4. It is intermittent on both trees, so it is not shown to be a regression from the uncommitted tree.
+  - A diagnostic run showed the message is NOT lost. It reached the CLI about 120 s after it was queued (87 s past the 30 s check), via route "resume".
+  - While it waited, the outbox hold was {kind:"draining", text:"the session is still finishing earlier work after a restart"} with drain {backgroundLive:0, backgroundLifetime:"no", brokerState:"running"}. That text is false: there was no restart.
+  - Mechanism: the closed tab's host survives as a survivor. survivorAdmits() (src/server/survivor-delivery.ts:103) requires state 'draining' plus a deliverable background lifetime, so the outbox waits (src/server/index.ts, the survivor branch at about line 6779) until the survivor exits, then resumes.
+
+  (2) B, switch away and back: failed 1 of 2 runs. The dock stayed at "waiting for the previous turn to finish draining", queue 1, atCli 0. The probable cause is the same survivor wait.
+
+  (3) PA, the must-FAIL baseline: harness rot. The round-4 pinned tree cannot boot (src/server/outbox.ts is missing in that tree), so this is not a product failure.
+
+  SCOPE: the fix lives in survivor admission and outbox routing, which is session-lifecycle code in index.ts and survivor-delivery.ts, tangled with BUG-159's uncommitted hunks. That is beyond this lane's M bound and its BUG-159 no-touch rule, so I stopped here.
+
+  Logs are in the lane scratch directory lane-289-201-217: b217-user.log, b217-NB-{1,2,3}.log, b217-diag2.log, and b217-head-N*.log.

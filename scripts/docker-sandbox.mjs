@@ -40,7 +40,7 @@
 import { spawnSync, spawn } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { scratchRoot } from './lib/scratch.mjs';
 import {
   SANDBOX_CONTAINER, SANDBOX_VOLUME, SANDBOX_LABEL, SANDBOX_IMAGE, SOCK_IN_CONTAINER_DIR,
@@ -169,15 +169,38 @@ function capOpts(argv) {
   return o;
 }
 
-function storeFreeBytesFn() {
+// `storeFreeBytesFn()` returning the bare value `null` means "no measurement was even
+// attempted" and resolveFreeBytes() treats that as DELIBERATE (floor disabled, Infinity)
+// — the one case that applies here is IN_LANE (a lane does not touch the host daemon by
+// design). Every OTHER no-measurement path below is a FAILURE (docker info failed,
+// sandboxDataRoot() threw), which is "unknown", not "deliberate" — those must return a
+// FUNCTION that itself resolves to null, so it is classified "unknown" (not "disabled"):
+// the floor fails CLOSED on it (no image removed) but pruneSandboxToCap logs a WARNING for
+// every such reading, so a broken measurement is never silent (BUG-289 2026-11-19).
+export function storeFreeBytesFn() {
   let dataRoot;
-  try { dataRoot = sandboxDataRoot(); } catch { return null; }
-  if (dataRoot.mode === 'bind') return () => { const b = freeBytesAt(dataRoot.dir); return b > 0 ? b : Infinity; };
-  if (IN_LANE) return null; // volume mode needs the host daemon, which a lane does not touch
-  const rootDir = host(['info', '--format', '{{.DockerRootDir}}']).out.trim();
-  if (!rootDir) return null;
-  const probe = mountTargetOf(rootDir) || rootDir;
-  return () => { try { const s = fs.statfsSync(probe); const b = s.bavail * s.bsize; return b > 0 ? b : Infinity; } catch { return Infinity; } };
+  try { dataRoot = sandboxDataRoot(); } catch { return () => null; }
+  // Return the RAW reading here (0 is a valid "disk full" result, null means "could not
+  // measure") and let pruneSandboxToCap's classifyFreeBytes() tell them apart (a real 0
+  // fires the floor; unknown keeps images, loudly) — not a `b > 0 ? b : Infinity` trap here.
+  if (dataRoot.mode === 'bind') return () => freeBytesAt(dataRoot.dir);
+  if (IN_LANE) return null; // volume mode needs the host daemon, which a lane deliberately does not touch
+  // Discovery itself (the `docker info` spawn, mountTargetOf's own lookups) can throw, not
+  // just return an empty root — that is exactly as much a FAILURE as an empty root, and
+  // must fail the same safe way (independent-verify: an exception here used to propagate
+  // out of storeFreeBytesFn() uncaught instead of degrading to fail-safe null).
+  try {
+    // A failed `docker info` is a discovery failure even if it printed something (independent-
+    // verify, BUG-289 round 3 of 2026-11-19: partial stdout + exit 1 was read as a real root).
+    const info = host(['info', '--format', '{{.DockerRootDir}}']);
+    if (info.code !== 0) return () => null;
+    const rootDir = String(info.out ?? '').trim();
+    if (!rootDir || !path.isAbsolute(rootDir) || /[\r\n]/.test(rootDir)) return () => null;
+    const probe = mountTargetOf(rootDir) || rootDir;
+    return () => { try { const s = fs.statfsSync(probe); return s.bavail * s.bsize; } catch { return null; } };
+  } catch {
+    return () => null;
+  }
 }
 
 /**
@@ -561,6 +584,9 @@ async function down(argv) {
   assertBindMounted(device, 'after');
 }
 
+// Guarded so this file can be imported (e.g. by a verify script, to unit-test
+// storeFreeBytesFn's discovery-failure -> fail-safe mapping) without running the CLI.
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
 const [verb = 'status', ...rest] = process.argv.slice(2);
 switch (verb) {
   case 'up': if (IN_LANE) process.exit(laneRefuses('up')); await up(rest); break;
@@ -599,4 +625,5 @@ switch (verb) {
     break;
   }
   default: console.error('usage: sandbox:docker -- up [--no-prune] [--cap-gb N] [--floor-gb N]|status|env|reset|prune [--cap-gb N] [--floor-gb N] | prune --days N|down [--purge]|host-env <reason>'); process.exit(64);
+}
 }

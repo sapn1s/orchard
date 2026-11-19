@@ -5,7 +5,7 @@
   "title": "Docker sandbox image store grows unbounded, fills the SSD",
   "summary": "The Orchard Docker sandbox had grown to ~120 GB of old images on the SSD (765 dangling plus 160+ claude-station-rt and orchard-confined-run images, most weeks old) because nothing ever removed superseded images. The leak crowded a nearly-full SSD.",
   "impact_if_we_wait": "The sandbox store keeps growing ~2.6-2.9 GB per rt/confined build with no ceiling, eventually exhausting the SSD and stalling every session and verify suite that needs the sandbox.",
-  "current_need": "Independent clean-room verify of the data-sandbox.mjs changes (security-critical file); then user to run the relocation procedure and decide /mnt/backup as the data-root.",
+  "current_need": "none; optional: user may still run the HDD relocation (see 2026-11-05 entry).",
   "severity": "high",
   "area": "docker-sandbox",
   "reported": "2026-11-03",
@@ -13,7 +13,7 @@
   "owner": "unassigned",
   "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-11-05",
+  "updated": "2026-11-19",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -64,6 +64,83 @@
       "harness": "scripts/independent-verify.mjs",
       "candidate": "4a55c714e07080cde6a6062078c646c60240cec57f2718a20a32b4d3f06fb117",
       "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1b796-989e-77a2-b6d5-83b824ba4f0d",
+      "verdict": "broken",
+      "verdict_on": "2026-11-07",
+      "recorded_at": "2026-11-07T19:58:22.177Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "e4400899-2770-4b91-bb6e-ec8f4af8f4be",
+      "verdict": "broken",
+      "verdict_on": "2026-11-19",
+      "recorded_at": "2026-11-19T15:13:37.862Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "d1963fec165e17761b78e7a4c3f4f4d766ef52cd600e2ac219ac34ac7e4e7b35",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1f45e-e887-7663-922b-136ce32c27d7",
+      "verdict": "broken",
+      "verdict_on": "2026-11-19",
+      "recorded_at": "2026-11-19T15:15:41.265Z",
+      "author": "lane BUG-289/FEAT-201/BUG-217",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "b1ff98f9232c588b7d079fbc290851c6226fe1c0def70a9ba63bae83bbd22c85",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1f460-ee38-7621-8adf-f809ac6ae1e1",
+      "verdict": "broken",
+      "verdict_on": "2026-11-19",
+      "recorded_at": "2026-11-19T15:19:23.183Z",
+      "author": "lane BUG-289/FEAT-201/BUG-217",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "19cc32084f6f955cea8477f1698345b6b7faf09fff5d95f7dfcf83a2a226ac77",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1f464-f4d3-7ff0-bb23-0f13efd757c3",
+      "verdict": "holds",
+      "verdict_on": "2026-11-19",
+      "recorded_at": "2026-11-19T15:29:39.648Z",
+      "author": "lane BUG-289/FEAT-201/BUG-217",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "5e1c59d3e134ebc832d1580671a0e2e3828a07764074695edc211037baa35f8f",
+      "verify_mode": "mixed-state"
+    },
+    {
+      "provider": "openai",
+      "model": null,
+      "run_id": "01a1f479-a79b-7ce0-92be-172d036e1895",
+      "verdict": "holds",
+      "verdict_on": "2026-11-19",
+      "recorded_at": "2026-11-19T15:54:46.327Z",
+      "author": "lane BUG-289/BUG-287 r2",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "10c326d00ce96ab2fcde4ded3dd64e1b6a1107b9a6a38dbb1c3c26bfe5e826e6",
+      "verify_mode": "mixed-state",
+      "note": "Unknown free-space reading now fails CLOSED (keeps images, WARNING logged + counted); real 0 still prunes; byte cap unchanged."
     }
   ],
   "verification_class": "fix",
@@ -212,3 +289,70 @@ Nothing bounded the sandbox daemon's image store. `container-manager.pruneSupers
 **Still UNTESTED (out of a lane's reach, judged from code by the verifier):** `down --purge`'s refusals (no-running-containers, bind-mount before/after) cannot be driven from inside a lane (`down` hard-refuses there and would wreck the shared store); a socket swapped in the microsecond between force=0's 409 and force=1 on a multi-tag image (narrow, lock-free-confined-run only, recency+in-use base images make it near-impossible).
 
 **High-stakes (security + session-lifecycle + data-loss-adjacent):** `docker-sandbox.mjs` is host-daemon-isolation critical. The charter asked for an OpenAI, no-fallback independent verify; OpenAI quota was exhausted across all six attempts, so the final HOLDS is an ANTHROPIC fallback (author anthropic too → reduced decorrelation). An OpenAI cross-provider clean-room pass remains WARRANTED when quota resets.
+
+### 2026-11-07 — dispatch openai
+- **Verification recorded:** dispatch openai run 01a1b796-989e-77a2-b6d5-83b824ba4f0d — VERDICT: BROKEN. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run e4400899-2770-4b91-bb6e-ec8f4af8f4be — VERDICT: BROKEN — mixed-state candidate d1963fec165e. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — lane BUG-289/FEAT-201/BUG-217
+- **Verification recorded:** dispatch openai run 01a1f45e-e887-7663-922b-136ce32c27d7 — VERDICT: BROKEN — mixed-state candidate b1ff98f9232c. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — lane BUG-289/FEAT-201/BUG-217
+- **Verification recorded:** dispatch openai run 01a1f460-ee38-7621-8adf-f809ac6ae1e1 — VERDICT: BROKEN — mixed-state candidate 19cc32084f6f. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — lane BUG-289/FEAT-201/BUG-217
+- **Verification recorded:** dispatch openai run 01a1f464-f4d3-7ff0-bb23-0f13efd757c3 — VERDICT: HOLDS — mixed-state candidate 5e1c59d3e134. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — worker (BUG-289/FEAT-201/BUG-217 lane)
+- **fix verified, done:** Free-space fix: a real zero is now told apart from a measurement error. Independent verify HOLDS: openai 01a1f464-f4d3-7ff0-bb23-0f13efd757c3, candidate 5e1c59d3e134.
+
+  INTENT: the ticket was agent-filed (worker fix lane, 2026-11-03). Its only user-stated input on record is the user's approval of the HDD relocation (the 2026-11-05 entry above). This lane neither dropped nor changed that. Relocation stays optional per triage; the orchestrator chose the bounded-SSD cap. No transcript turn with a narrower user acceptance test was found (searched the orchard transcripts 2026-10-31..11-04).
+
+  CHANGE: scripts/lib/docker-sandbox.mjs exports classifyFreeBytes(fn), which returns one of three states:
+  - measured: includes a real 0, which fires the floor;
+  - unknown: a throw, null, NaN, a negative, a promise or thenable, or a tampered promise. The floor treats it as 0 and prunes (fail-safe, per the orchestrator 2026-11-07);
+  - disabled: the parameter itself is null, so the cap applies only.
+  Logs show "free unknown (could not measure; …)", never "0.0GB", for a failed reading. Every unknown reading during the prune is logged and counted in summary.unknownFreeReadings, even when a later reading recovers.
+  scripts/docker-sandbox.mjs storeFreeBytesFn now treats a non-zero `docker info` exit, or non-absolute output, as unknown. It sits on top of the uncommitted 2026-11-07 hunks: freeBytesAt returns null on error, the guarded CLI switch, and the base-mode volume fallback.
+
+  PROOF (new scripts/verify-bug-289-floor-zero.mjs runs against a fake Docker API in a child process; it is synthetic because the live store is about 29.7 GB, under the cap):
+  - must-FAIL, pinned ef7d2c0: 5/10. A zero-free reading deleted 0 of 3, reproducing 01a1b796.
+  - As-found tree: 11/4.
+  - Mid-prune unknown before its hunk: 24/2.
+  - Discovery exit-1 before its hunk: 27/2.
+  - After: 29/0.
+  - Anti-regressions: verify-bug-289-resolver 23/0. verify-bug-289-cap-prune 39/2. Both failures are environmental (C-store-starts-over-cap and C-reclaimed-something need a store over 40 GB) and identical to the pre-change baseline.
+
+  IV ROUNDS THIS LANE:
+  - anthropic e4400899: BROKEN (tampered-species promise threw synchronously). Fixed.
+  - openai 01a1f45e: BROKEN (unknown mid-prune readings not logged). Fixed.
+  - openai 01a1f460: BROKEN (discovery exit status ignored). Fixed.
+  - openai 01a1f464: HOLDS.
+
+  The prior lane's 8 rounds on 2026-11-07 were never recorded here.
+
+  RESIDUAL (declared out of scope in the requirement, which is agent-written; the user never asked for it): a deliberately broken Promise species can leave one unhandled rejection; the prune is still correct.
+
+  DECISION FOR USER: the unknown→prune policy replaces the earlier contract 1e (unknown→keep).
+
+  HIGH-STAKES: docker-sandbox is host-isolation critical. The verify was clean-room and cross-provider, so a further skeptic is optional.
+
+### 2026-11-19 — lane BUG-289/BUG-287 r2
+- **Verification recorded:** dispatch openai run 01a1f479-a79b-7ce0-92be-172d036e1895 — VERDICT: HOLDS — mixed-state candidate 10c326d00ce9 — Unknown free-space reading now fails CLOSED (keeps images, WARNING logged + counted); real 0 still prunes; byte cap unchanged.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — lane BUG-289/BUG-287 r2
+- **Note:** Round r2 (2026-11-19): unknown free-space reading changed from PRUNE to FAIL CLOSED. regressed-from: BUG-289 2026-11-07 orchestrator policy (unknown->prune), which replaced contract 1e (unknown->keep).
+
+  INTENT (searched transcripts): the user's own words, 2026-11-03 session 1e52191a: move the sandbox to the HDD instead of filling the low-space SSD, and prune unused images older than a few days. On 2026-11-05 the user approved the HDD move. No user turn asks for pruning when the reading fails. The unknown->prune rule was the orchestrator's (its 2026-11-07 dispatch said "treat it as below the floor (prune) or refuse"). So deleting on a measurement error is not user-backed, and it now fails closed.
+
+  CHANGE: in scripts/lib/docker-sandbox.mjs, classifyFreeBytes now returns unknown with bytes Infinity, so the floor cannot fire on it. over() fires the floor only when the reading's state is measured. Every unknown reading, at precheck or mid-prune, logs "WARNING: free space unknown (could not be measured); the free-space floor is NOT enforced ..." and is counted in summary.unknownFreeReadings. The final line says "stopped (cap met; free space unknown ...)" rather than "under budget". A real 0 still prunes. The byte cap is a real /system/df measurement, so it still evicts. In scripts/docker-sandbox.mjs only comments changed. Tests updated: verify-bug-289-floor-zero.mjs and verify-bug-289-cap-prune.mjs.
+
+  PROOF (synthetic fake Docker API; the live store is 30.9 GB, under the cap):
+  - must-FAIL on the as-found tree with the new expectations: floor-zero 21/11. An unknown reading deleted 3/3; a throw deleted 3/3; nothing was logged as a WARNING.
+  - After the change: floor-zero 32/0. Real zero deletes 3/3. Unknown deletes 0/3 with a WARNING. A throw deletes 0/3. A real 0 then unknown mid-prune deletes 1/3 and stops. Unknown with the store over the cap deletes 2/3, down to the cap.
+  - Anti-regressions: resolver 23/0. cap-prune 39/2, the same two environmental C-* failures as the baseline (they need a store over the cap).
+  - IV: openai 01a1f479-a79b-7ce0-92be-172d036e1895 HOLDS, mixed candidate 10c326d00ce9, cross-provider. Its adversarial run tried 14 invalid readings at 4 measurement boundaries with protected images. UNTESTED: a real full disk, and live over-cap reclamation.
+
+  HIGH-STAKES: docker-sandbox is critical to host isolation, and this change only REMOVES a delete path. The IV was clean-room and cross-provider; no further skeptic is needed.

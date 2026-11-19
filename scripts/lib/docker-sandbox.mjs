@@ -33,6 +33,7 @@ import * as fs from 'node:fs';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { types } from 'node:util';
 
 /** The one sandbox. Names are fixed so every lane finds the same one. */
 export const SANDBOX_CONTAINER = 'orchard-docker-sandbox';
@@ -174,10 +175,71 @@ export function detectFsType(dir) {
   return fsTypeOf(resolveDataPath(dir));
 }
 
-/** Bytes free on the filesystem backing `dir` (resolved), or 0. */
+/**
+ * Bytes free on the filesystem backing `dir` (resolved), or `null` if it could not be
+ * measured (statfs failure). A genuine 0 (disk truly full) is a VALID reading and is
+ * returned as 0 — it must NEVER be confused with "measurement failed" (BUG-289 round 4:
+ * `0` used to double as both, so callers mapped a real full-disk reading to Infinity).
+ */
 export function freeBytesAt(dir) {
-  try { const s = fs.statfsSync(nearestExistingOf(resolveDataPath(dir))); return s.bavail * s.bsize; } catch { return 0; }
+  try { const s = fs.statfsSync(nearestExistingOf(resolveDataPath(dir))); return s.bavail * s.bsize; } catch { return null; }
 }
+
+// Captured at module load, before anything could replace it, so resolveFreeBytes can
+// attach a rejection handler to an arbitrary thenable/Promise even if ITS OWN `then`/
+// `catch` own-properties were stripped or overridden (independent-verify round 3).
+const NATIVE_PROMISE_THEN = Promise.prototype.then;
+
+/**
+ * Normalize a free-bytes reading for the cap-prune floor check. A genuine 0 (disk full)
+ * is a VALID reading and must enforce the floor. A failed/non-finite read is "unknown",
+ * and unknown FAILS CLOSED: the floor cannot fire on it (Infinity), so a measurement error
+ * never deletes an image (BUG-289 2026-11-19; the user asked to bound the store, never to
+ * prune on a broken reading). It is never SILENT: pruneSandboxToCap logs a WARNING for
+ * every unknown reading and counts them. The byte cap is a separate, real measurement and
+ * still applies. A `freeBytesFn` that THROWS (a real disk fault raises EIO from statfs) is
+ * caught here and is just as "unknown" — it never propagates and crashes the caller.
+ */
+export function resolveFreeBytes(freeBytesFn) {
+  return classifyFreeBytes(freeBytesFn).bytes;
+}
+
+/**
+ * The ONE place a free-space reading is classified (BUG-289, independent verify 01a1b796):
+ *   - `measured`: a finite, non-negative number — INCLUDING 0, a genuinely full disk,
+ *                 which fires the floor;
+ *   - `unknown`:  the measurement failed (null/undefined, NaN, negative, a throw, a
+ *                 non-number, a promise) — bytes Infinity: fail CLOSED, the floor cannot
+ *                 fire on a reading nobody took (callers must log it loudly);
+ *   - `disabled`: no measurement wired up at all (the parameter itself null/undefined) —
+ *                 bytes Infinity, the floor is off and only the byte cap applies.
+ * A real 0 and a failed read act OPPOSITELY on the floor (prune vs keep); `state` says which.
+ */
+export function classifyFreeBytes(freeBytesFn) {
+  if (freeBytesFn === null || freeBytesFn === undefined) return { state: 'disabled', bytes: Infinity };
+  let b;
+  try { b = freeBytesFn(); } catch { return UNKNOWN_FREE(); }
+  if (typeof b === 'number') return Number.isFinite(b) && b >= 0 ? { state: 'measured', bytes: b } : UNKNOWN_FREE();
+  // Not a number: unknown. The measurement is documented as synchronous; if it handed back
+  // something async anyway, swallow its eventual rejection so it cannot crash the process.
+  // A native Promise is handled by the CAPTURED Promise.prototype.then BEFORE any property of
+  // it is read, so a stripped/undefined/throwing own `then` or `catch` cannot bypass it.
+  // `then` still reads the promise's constructor/Symbol.species; a tampered one can throw
+  // here. That must not escape: the reading is unknown regardless (and keeps images).
+  // (A promise whose species is deliberately broken can then still report its own rejection
+  // as unhandled; no caller here returns a promise at all — the contract is synchronous.)
+  if (types.isPromise(b)) {
+    try { NATIVE_PROMISE_THEN.call(b, undefined, () => {}); } catch { /* tampered species: still unknown */ }
+    return UNKNOWN_FREE();
+  }
+  try {
+    if (b !== null && (typeof b === 'object' || typeof b === 'function') && typeof b.then === 'function') {
+      NATIVE_PROMISE_THEN.call(Promise.resolve(b), undefined, () => {});
+    }
+  } catch { /* a malformed thenable is still just "unknown" */ }
+  return UNKNOWN_FREE();
+}
+const UNKNOWN_FREE = () => ({ state: 'unknown', bytes: Infinity });
 
 /** The mountpoint (findmnt TARGET) backing an already-resolved path, or '' if findmnt cannot say. */
 export function mountTargetOf(resolved) {
@@ -271,7 +333,9 @@ export function sandboxDataRoot(env = process.env) {
   let g;
   try { g = gradeStoreDir(path.join(resolvedBase, SANDBOX_DATA_DIRNAME), SANDBOX_DATA_BASE_ENV); }
   catch (e) { return vol(`cannot host the sandbox store (${e.message})`); }
-  const freeGb = freeBytesAt(g.dir) / 2 ** 30;
+  const freeRaw = freeBytesAt(g.dir);
+  if (freeRaw === null) return vol('free space could not be measured');
+  const freeGb = freeRaw / 2 ** 30;
   if (freeGb < MIN_DATA_FREE_GB) return vol(`has only ${freeGb.toFixed(0)} GB free (need ${MIN_DATA_FREE_GB})`);
   return { mode: 'bind', dir: g.dir, fsType: g.fsType };
 }
@@ -325,6 +389,11 @@ export function pinnedDocker(sockPath) {
  * Bound the sandbox store by BYTES + a host free-space FLOOR (never by age).
  */
 const gbStr = (n) => (Number.isFinite(n) ? (n / GiB).toFixed(1) + 'GB' : 'n/a');
+// A failed reading is logged as such, never as "0.0GB" — a full disk and a broken
+// measurement must stay distinguishable in the record (BUG-289).
+const UNKNOWN_FREE_WARNING = 'WARNING: free space unknown (could not be measured); the free-space floor is NOT enforced for this reading (no image is removed because of it; the byte cap still applies)';
+const freeStr = (m) => (m.freeState === 'unknown' ? 'unknown (could not measure; floor not enforced, images kept)'
+  : m.freeState === 'disabled' ? 'not measured (floor off; cap only)' : gbStr(m.free));
 
 /**
  * Remove UNUSED images (least-recently-tagged/used FIRST) and over-budget build
@@ -343,10 +412,12 @@ const gbStr = (n) => (Number.isFinite(n) ? (n / GiB).toFixed(1) + 'GB' : 'n/a');
  * and does nothing (no lock, no deletes) when already under both watermarks, so it
  * is safe to call after every confined run / verify job without serialising them.
  *
- * `freeBytes`: a function returning host free bytes on the store's filesystem, or
- * null to enforce the cap only (e.g. from a lane that cannot measure the host fs).
- * A measurement error MUST surface as Infinity (never 0), so the floor fails safe
- * toward keeping images rather than deleting on a bad reading.
+ * `freeBytes`: a function returning host free bytes on the store's filesystem (0 is a
+ * valid "disk full" reading), a non-finite/negative value to signal "could not measure",
+ * or the whole parameter as null to enforce the cap only (e.g. from a lane that cannot
+ * measure the host fs at all). A measurement error fails CLOSED: it never fires the floor
+ * (no image is deleted because of it), and every such reading is logged as a WARNING and
+ * counted in `summary.unknownFreeReadings` — never silent, never logged as "0.0GB".
  *
  * Returns a summary object (never throws for "still over" — logs a warning).
  */
@@ -360,21 +431,27 @@ export async function pruneSandboxToCap(env = process.env, {
   const sock = v.target.slice('unix://'.length);
   const capBytes = capGb * GiB, floorBytes = floorGb * GiB;
   const sum = (arr, f) => (arr ?? []).reduce((a, x) => a + (x[f] ?? 0), 0);
-  // A reading of 0 (or non-finite/negative) is treated as UNMEASURABLE -> Infinity, never as
-  // "disk full": contract 1e — the floor must fail safe toward KEEPING images, not deleting on a
-  // bad reading. freeBytesAt() returns 0 on a statfs error, so 0 here means "could not measure".
-  // If the disk is genuinely full the BYTE CAP (always measurable) still drives eviction.
-  const freeNow = () => { if (!freeBytes) return Infinity; const b = freeBytes(); return Number.isFinite(b) && b > 0 ? b : Infinity; };
-  const measure = async (api) => {
+  // A genuine 0 (disk full) is a VALID reading and must fire the floor; a failed/non-finite
+  // read is "unknown" and fails CLOSED (floor not enforced, loud warning) — see classifyFreeBytes().
+  const freeNow = () => classifyFreeBytes(freeBytes);
+  const measure = async (api, precheck = false) => {
     const df = await api.req('GET', '/system/df');
     const imgBytes = df?.LayersSize ?? sum(df?.Images, 'Size');
     // Build-cache records flagged Shared are layers ALSO counted in LayersSize — exclude them, or
     // the store double-counts those bytes and over-evicts to meet a cap the real store already met
     // (contract 1a: a DEDUPLICATED measure). Only build cache NOT shared with images adds bytes.
     const bcBytes = sum((df?.BuildCache ?? []).filter((x) => !x.Shared), 'Size');
-    return { store: imgBytes + bcBytes, imgBytes, bcBytes, free: freeNow() };
+    const f = freeNow();
+    // BUG-289: every unknown reading is a WARNING in the log and counted, even when a later reading
+    // recovers — the floor was not enforced for it, and that must never be silent.
+    if (f.state === 'unknown') {
+      summary.unknownFreeReadings = (summary.unknownFreeReadings ?? 0) + 1;
+      log(`cap-prune: ${UNKNOWN_FREE_WARNING}${precheck ? '' : ' [mid-prune]'}`);
+    }
+    return { store: imgBytes + bcBytes, imgBytes, bcBytes, free: f.bytes, freeState: f.state };
   };
-  const over = (m) => m.store > capBytes || m.free < floorBytes;
+  // The floor fires ONLY on a real measurement; an unknown reading never deletes (fail closed).
+  const over = (m) => m.store > capBytes || (m.freeState === 'measured' && m.free < floorBytes);
   const summary = { capGb, floorGb, acted: false, removed: 0, removedTags: [], skippedIds: [], buildReclaimed: 0 };
 
   // 1) Cheap precheck over an UNLOCKED pinned connection: id re-check + one /system/df.
@@ -383,10 +460,10 @@ export async function pruneSandboxToCap(env = process.env, {
   try {
     const info = await pre.req('GET', '/info');
     if (info?.ID !== v.targetId) throw new Error(`the daemon on cap-prune's connection (${info?.ID ?? 'none'}) is not the one the guard checked (${v.targetId}); not touching it.`);
-    m = await measure(pre);
+    m = await measure(pre, true);
   } finally { pre.close(); }
   summary.before = m;
-  log(`cap-prune: cap ${capGb}GB floor ${floorGb}GB; store ${gbStr(m.store)} (images ${gbStr(m.imgBytes)}, buildcache ${gbStr(m.bcBytes)}), free ${gbStr(m.free)}`);
+  log(`cap-prune: cap ${capGb}GB floor ${floorGb}GB; store ${gbStr(m.store)} (images ${gbStr(m.imgBytes)}, buildcache ${gbStr(m.bcBytes)}), free ${freeStr(m)}`);
   if (!over(m)) { summary.after = m; log('cap-prune: under cap and above floor; nothing removed'); return summary; }
 
   // 2) Over budget: take the daemon lock, re-prove identity, act over ONE fresh pinned conn.
@@ -461,8 +538,8 @@ export async function pruneSandboxToCap(env = process.env, {
       else { summary.skippedIds.push(c.id); log(`cap-prune: kept ${label} (${(lastMsg.split('\n')[0] || 'still referenced').slice(0, 100)})`); }
     }
     summary.after = m;
-    if (over(m)) log(`cap-prune: WARNING still over budget after removing ${summary.removed} image(s): store ${gbStr(m.store)} free ${gbStr(m.free)} — the rest are in use, recently tagged, or protected`);
-    else log(`cap-prune: under budget; removed ${summary.removed} image(s) (${summary.removedTags.slice(0, 8).join(', ')}${summary.removedTags.length > 8 ? ', …' : ''}), store ${gbStr(summary.before.store)} -> ${gbStr(m.store)}`);
+    if (over(m)) log(`cap-prune: WARNING still over budget after removing ${summary.removed} image(s): store ${gbStr(m.store)} free ${freeStr(m)} — the rest are in use, recently tagged, or protected`);
+    else log(`cap-prune: ${m.freeState === 'unknown' ? 'stopped (cap met; free space unknown, floor not enforced)' : 'under budget'}; removed ${summary.removed} image(s) (${summary.removedTags.slice(0, 8).join(', ')}${summary.removedTags.length > 8 ? ', …' : ''}), store ${gbStr(summary.before.store)} -> ${gbStr(m.store)}`);
     return summary;
   } finally { api.close(); }
 }

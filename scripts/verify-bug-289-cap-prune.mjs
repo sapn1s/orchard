@@ -15,10 +15,12 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 import * as net from 'node:net';
 import {
   sandboxDataRoot, resolveDataPath, sensitiveStoreMatch, SANDBOX_DATA_BASE_ENV,
-  pruneSandboxToCap, checkIsolatedDocker, freeBytesAt, mountTargetOf, sandboxCapGb,
+  pruneSandboxToCap, checkIsolatedDocker, freeBytesAt, resolveFreeBytes, classifyFreeBytes, mountTargetOf, sandboxCapGb,
 } from './lib/docker-sandbox.mjs';
 
 let pass = 0, fail = 0;
@@ -66,6 +68,145 @@ if (fs.existsSync('/var/lib/docker')) {
 ok('item3-normal-dir-not-sensitive', sensitiveStoreMatch('/mnt') === '' && sensitiveStoreMatch('/tmp') === '', 'normal dirs clear');
 // And a not-yet-existing dir is never sensitive (store is mkdir'd later).
 ok('item3-missing-dir-not-sensitive', sensitiveStoreMatch('/mnt/backup/does-not-exist-b289') === '', 'absent clear');
+
+// --- round 4: a genuine 0 free-bytes reading must NOT disable the floor ---
+// Before the fix, `b > 0 ? b : Infinity` mapped a real "disk full" (0) reading to Infinity,
+// the same as a failed read — the floor could never fire on a genuinely full filesystem.
+ok('r4-zero-is-not-infinite', resolveFreeBytes(() => 0) === 0, `got ${resolveFreeBytes(() => 0)} (must be 0, not Infinity)`);
+ok('r4-real-reading-passes-through', resolveFreeBytes(() => 5) === 5, `got ${resolveFreeBytes(() => 5)}`);
+// A failed/non-finite read is "unknown" — classified apart from a real 0 and from "disabled".
+// Policy (BUG-289 2026-11-19): unknown fails CLOSED (the floor cannot fire on it, no image is
+// removed because of it, a WARNING is logged); see verify-bug-289-floor-zero.mjs end to end.
+const unk = (f) => { const c = classifyFreeBytes(f); return c.state === 'unknown' && c.bytes === Infinity; };
+ok('r4-nan-is-unknown-fail-closed', unk(() => NaN), `got ${resolveFreeBytes(() => NaN)}`);
+ok('r4-negative-is-unknown-fail-closed', unk(() => -1), `got ${resolveFreeBytes(() => -1)}`);
+// No freeBytes function at all (the lane-can't-measure case) deliberately disables the floor.
+ok('r4-no-fn-means-floor-disabled', resolveFreeBytes(null) === Infinity, `got ${resolveFreeBytes(null)}`);
+// independent-verify (openai, adversarial): a measurement callback that THROWS (a real
+// disk fault can raise EIO from statfs synchronously) is exactly as "unknown" as a
+// non-finite return and must fail the same safe way (0), never propagate/crash.
+ok('r4-throwing-fn-is-unknown-fail-closed', unk(() => { throw new Error('EIO: statfs failed'); }),
+  `got ${(() => { try { return resolveFreeBytes(() => { throw new Error('x'); }); } catch (e) { return `THREW ${e.message}`; } })()}`);
+// independent-verify (openai, adversarial): a non-null, non-function, FALSY argument
+// (0, false, '') is not "deliberately no measurement" — only null/undefined is. Each
+// must be classified unknown (calling it throws, caught as unknown), never "disabled".
+for (const bad of [0, false, '']) {
+  ok(`r4-falsy-non-null-arg-${JSON.stringify(bad)}-is-unknown`, unk(bad), `got ${resolveFreeBytes(bad)}`);
+}
+// independent-verify (openai, adversarial): an ASYNC measurement callback (returns a
+// Promise) that eventually REJECTS must not leave an unhandled rejection that can crash
+// the process later — resolveFreeBytes must swallow it and treat the reading as 0 NOW.
+{
+  const before = process.listenerCount('unhandledRejection');
+  let sawUnhandled = false;
+  const guard = () => { sawUnhandled = true; };
+  process.on('unhandledRejection', guard);
+  const result = classifyFreeBytes(() => Promise.reject(new Error('EIO: async measurement failure')));
+  ok('r4-async-rejecting-fn-is-unknown-fail-closed', result.state === 'unknown' && result.bytes === Infinity, `got ${JSON.stringify({ ...result, bytes: String(result.bytes) })}`);
+  await new Promise((r) => setImmediate(r)); // let the rejection's microtask settle
+  await new Promise((r) => setImmediate(r));
+  process.removeListener('unhandledRejection', guard);
+  ok('r4-async-rejecting-fn-no-unhandled-rejection', !sawUnhandled, `sawUnhandled=${sawUnhandled}`);
+  ok('r4-unhandledRejection-listener-count-restored', process.listenerCount('unhandledRejection') === before, 'listener cleaned up');
+}
+// independent-verify (openai, adversarial): a MALFORMED thenable — a `then` getter that
+// itself throws, or a `.catch` that throws — must fail safe too, not propagate out of
+// resolveFreeBytes (the thenable probe/call must live inside the same try as the call).
+ok('r4-malformed-thenable-throwing-then-getter-is-unknown-fail-closed', unk(() => ({ get then() { throw new Error('bad then'); } })),
+  `got ${(() => { try { return resolveFreeBytes(() => ({ get then() { throw new Error('x'); } })); } catch (e) { return `THREW ${e.message}`; } })()}`);
+ok('r4-malformed-thenable-throwing-catch-is-unknown-fail-closed', unk(() => ({ then() {}, catch() { throw new Error('bad catch'); } })),
+  `got ${(() => { try { return resolveFreeBytes(() => ({ then() {}, catch() { throw new Error('x'); } })); } catch (e) { return `THREW ${e.message}`; } })()}`);
+// independent-verify (openai, round 2): a BARE thenable — has a real `then(resolve, reject)`
+// that eventually rejects, but NO `.catch` method at all (not a real Promise) — must still
+// get its rejection suppressed (not just return 0 synchronously); calling `b.catch` directly
+// would throw (missing method) and never attach a handler to the real thenable at all.
+{
+  const before2 = process.listenerCount('unhandledRejection');
+  let sawUnhandled2 = false;
+  const guard2 = () => { sawUnhandled2 = true; };
+  process.on('unhandledRejection', guard2);
+  const bareThenable = { then(_resolve, reject) { queueMicrotask(() => reject(new Error('bare thenable rejection'))); } };
+  const result2 = classifyFreeBytes(() => bareThenable);
+  ok('r4-bare-thenable-no-catch-is-unknown-fail-closed', result2.state === 'unknown' && result2.bytes === Infinity, `got ${JSON.stringify({ ...result2, bytes: String(result2.bytes) })}`);
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  process.removeListener('unhandledRejection', guard2);
+  ok('r4-bare-thenable-no-catch-no-unhandled-rejection', !sawUnhandled2, `sawUnhandled=${sawUnhandled2}`);
+  ok('r4-unhandledRejection-listener-count-restored-2', process.listenerCount('unhandledRejection') === before2, 'listener cleaned up');
+}
+// independent-verify (openai, round 3): a REAL native Promise with its OWN `.catch`
+// stripped (set undefined) must still get its rejection suppressed. Promise.resolve(p)
+// returns the SAME object when p is already a native Promise, so `.catch` on the
+// result is still p's own stripped `.catch` — only the captured native
+// `Promise.prototype.then`, called directly, reaches the real promise machinery.
+{
+  const before3 = process.listenerCount('unhandledRejection');
+  let sawUnhandled3 = false;
+  const guard3 = () => { sawUnhandled3 = true; };
+  process.on('unhandledRejection', guard3);
+  const strippedPromise = Promise.reject(new Error('stripped-catch rejection'));
+  strippedPromise.catch = undefined;
+  const result3 = classifyFreeBytes(() => strippedPromise);
+  ok('r4-native-promise-stripped-catch-is-unknown-fail-closed', result3.state === 'unknown' && result3.bytes === Infinity, `got ${JSON.stringify({ ...result3, bytes: String(result3.bytes) })}`);
+  await new Promise((r) => setImmediate(r));
+  await new Promise((r) => setImmediate(r));
+  process.removeListener('unhandledRejection', guard3);
+  ok('r4-native-promise-stripped-catch-no-unhandled-rejection', !sawUnhandled3, `sawUnhandled=${sawUnhandled3}`);
+  ok('r4-unhandledRejection-listener-count-restored-3', process.listenerCount('unhandledRejection') === before3, 'listener cleaned up');
+}
+// freeBytesAt() itself: a statfs failure must surface as null, never as a 0 that would be
+// confused with a genuine "disk full" reading downstream.
+// Force a REAL resolution failure (ELOOP via a symlink cycle), not just a missing leaf dir
+// (nearestExistingOf climbs to an existing ancestor like `/`, so a missing leaf alone still
+// resolves to a real, measurable filesystem).
+{
+  const tdir = fs.mkdtempSync(path.join(os.tmpdir(), 'b289r4-'));
+  const loopA = path.join(tdir, 'a'), loopB = path.join(tdir, 'b');
+  fs.symlinkSync(loopB, loopA); fs.symlinkSync(loopA, loopB);
+  ok('r4-freeBytesAt-error-is-null', freeBytesAt(loopA) === null, `got ${freeBytesAt(loopA)}`);
+  fs.rmSync(tdir, { recursive: true, force: true });
+}
+ok('r4-freeBytesAt-root-is-finite-number', Number.isFinite(freeBytesAt('/')) && freeBytesAt('/') >= 0, `got ${freeBytesAt('/')}`);
+
+// --- round 5 (independent-verify, openai): storeFreeBytesFn() discovery FAILURE must
+// not be mapped to the same bare `null` as a DELIBERATE no-measurement decision (IN_LANE).
+// A bare null makes resolveFreeBytes() return Infinity (floor disabled); a discovery
+// failure is "unknown" and must resolve through a function that itself returns null, so
+// resolveFreeBytes() fails safe to 0.
+{
+  const { storeFreeBytesFn } = await import('./docker-sandbox.mjs');
+  const prevEnv = process.env.ORCHARD_DOCKER_SANDBOX_DATA;
+  process.env.ORCHARD_DOCKER_SANDBOX_DATA = 'relative/not-absolute/orchard-docker-sandbox'; // gradeStoreDir throws
+  try {
+    const fn = storeFreeBytesFn();
+    ok('r5-discovery-failure-returns-fn-not-bare-null', typeof fn === 'function', `got ${typeof fn}`);
+    ok('r5-discovery-failure-fn-resolves-unknown', typeof fn === 'function' && unk(fn),
+      `got ${typeof fn === 'function' ? resolveFreeBytes(fn) : '(n/a: not a function)'}`);
+  } finally {
+    if (prevEnv === undefined) delete process.env.ORCHARD_DOCKER_SANDBOX_DATA;
+    else process.env.ORCHARD_DOCKER_SANDBOX_DATA = prevEnv;
+  }
+}
+
+// --- round 5b (independent-verify, openai): the HOST-DISCOVERY call itself (the `docker
+// info` spawn, mountTargetOf) can throw, not just return an empty root — that must
+// degrade to the same fail-safe function, not propagate out of storeFreeBytesFn()
+// uncaught. A LIVE repro needs `docker info`/findmnt to actually throw, which the real
+// spawnSync wrapper here never does on its own (ENOENT/non-zero exit are returned, not
+// thrown) — the independent verifier's own adversarial harness got there only by
+// injecting exceptions directly into spawnSync, a mocking depth not worth reproducing
+// here. This is a STATIC structural check instead (source inspection, not a dynamic
+// repro — same technique the verifier itself used for its "remaining-infinity-defaults"
+// finding): the discovery block must be wrapped in a try/catch that returns `() => null`
+// on any throw, so a FUTURE exception source there is caught here first.
+{
+  const src = fs.readFileSync(path.resolve('./scripts/docker-sandbox.mjs'), 'utf8');
+  const m = /if \(IN_LANE\) return null;[^]*?\n}\n/.exec(src);
+  const block = m ? m[0] : '';
+  ok('r5b-discovery-block-wrapped-in-try', /try \{[^]*host\(\['info'/.test(block), 'the `docker info` host() call is inside a try block');
+  ok('r5b-discovery-catch-returns-fn-not-bare-null', /\} catch \{\s*return \(\) => null;\s*\}\s*\n\}/.test(block),
+    'the discovery catch returns a FUNCTION resolving to null, not the bare value null');
+}
 
 // === Part C: LIVE cap-prune against the real over-cap sandbox store ===
 const haveDaemon = (() => { const v = checkIsolatedDocker(process.env); return v.ok ? v : null; })();
@@ -135,7 +276,9 @@ if (!haveDaemon) {
   }
 
   // RUN the real cap-prune (default cap/floor), measuring host free space on `/` (volume mode).
-  const freeBytes = () => { const b = freeBytesAt('/'); return b > 0 ? b : Infinity; };
+  // Pass the RAW reading through (0 is valid, null means unmeasurable) — pruneSandboxToCap's
+  // own resolveFreeBytes() applies the fail-safe normalization; don't re-trap it here.
+  const freeBytes = () => freeBytesAt('/');
   const summary = await pruneSandboxToCap(process.env, { freeBytes, log: (m) => console.log(`   ${m}`) });
 
   const api2 = pin(sock);

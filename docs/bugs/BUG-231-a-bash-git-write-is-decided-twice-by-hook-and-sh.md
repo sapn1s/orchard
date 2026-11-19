@@ -11,9 +11,9 @@
   "reported": "2026-10-05",
   "reported_by": "agent",
   "owner": "agent",
-  "work_state": "in_verification",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-10-11",
+  "updated": "2026-10-20",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -122,6 +122,29 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "compound Bash command (an absolute-path commit chained with a bare add via &&) under a direct once-grant writes TWO ledger records for one Bash call (git-grant.mjs:232-241 and 486-492); the hook's commit record stays permitted forever = the phantom pending record BUG-231 aimed to remove"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "9614f08f-719b-4b7d-be48-281f195ea49e",
+      "verdict": "broken",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T05:39:15.700Z",
+      "author": "dispatch anthropic",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "VALID BROKEN. 1 break (P3 tombstone): BUG-230 shim-missing deny in claude-runtime.ts denies before evaluate so denyCallClaim never runs; call id stays unknown, a post-deny once-grant is spent by the same-id retry, next genuine call refused. New deny path, r7-B1 class. Not a grant-bypass."
+    },
+    {
+      "provider": "openai",
+      "model": "default",
+      "run_id": "01a15811-00af-7251-b420-e7bfcdbd2fe0",
+      "verdict": "holds",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T06:52:08.213Z",
+      "author": "dispatch openai",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs"
     }
   ],
   "verification_class": "plan+review",
@@ -396,3 +419,12 @@ On 2026-09-25 at 16:53:30.456Z, the hook recorded `w1-93fc2b16ddc2` (`git add �
 
 ### 2026-10-11 — FEAT-175 lane
 - **coordination:** Coordination note from FEAT-175 (container grant rebuild lane). FEAT-175 does not touch git-grant-store.mjs, git-grant.mjs, git-shim.mjs or leak-gate-host.ts. It READS grantView() only, and it now makes a live DURATION or permanent grant switch a container's .git mount by recreating the container once the project is idle. ONCE grants stay inert in containers: a mount cannot express one write. Semantics question for this lane, not acted on here: in a container project a once grant is spent by the hook claim even when the in-container write then fails EROFS, so a once grant there buys nothing. Hiding or refusing once grants for container projects, or not spending the claim on EROFS, is your call.
+
+### 2026-10-20 — dispatch anthropic
+- **Verification recorded:** dispatch anthropic run 9614f08f-719b-4b7d-be48-281f195ea49e — VERDICT: BROKEN — VALID BROKEN. 1 break (P3 tombstone): BUG-230 shim-missing deny in claude-runtime.ts denies before evaluate so denyCallClaim never runs; call id stays unknown, a post-deny once-grant is spent by the same-id retry, next genuine call refused. New deny path, r7-B1 class. Not a grant-bypass.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-20 — worker (FEAT-164 r8)
+- **Note:** Pointer: the P3 tombstone gap on the BUG-230 shim-missing deny (verify 9614f08f) is fixed under BUG-267: one deny exit (denyGitWriteToolCall) for every hook, canUseTool and PermissionDenied deny. BUG-231 suites: call-claims 21/0, one-decision 50/0 (variant loaders repaired, see BUG-267).
+
+### 2026-10-20 — dispatch openai
+- **Verification recorded:** dispatch openai/default run 01a15811-00af-7251-b420-e7bfcdbd2fe0 — VERDICT: HOLDS. Typed entry in the record's verification[]; this line is an echo, not proof.

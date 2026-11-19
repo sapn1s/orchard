@@ -289,6 +289,9 @@ async function loadVariant(tag, grantSrc, storeSrc) {
   fs.writeFileSync(path.join(dir, 'git-grant.mjs'), grantSrc);
   fs.writeFileSync(path.join(dir, 'git-grant-store.mjs'), storeSrc);
   fs.copyFileSync(path.join(LIB, 'git-write-policy.mjs'), path.join(dir, 'git-write-policy.mjs'));
+  // The store's other sibling imports (agent-git-policy.mjs since the 2026-10-16 reach filter, and
+  // its own imports) resolve to this checkout's lib: only the two varied modules are swapped.
+  for (const n of fs.readdirSync(LIB)) if (!fs.existsSync(path.join(dir, n))) fs.symlinkSync(path.join(LIB, n), path.join(dir, n));
   const grant = await import(pathToFileURL(path.join(dir, 'git-grant.mjs')).href);
   const store = await import(pathToFileURL(path.join(dir, 'git-grant-store.mjs')).href);
   return { tag, grant, store };

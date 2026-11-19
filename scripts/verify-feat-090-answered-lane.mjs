@@ -233,18 +233,24 @@ console.log('\n=== STEP 3 — launch snapshot: placement + survives truncation =
     b.answeredAwaiting.length === 3 && b.needsYou.length === 12 && b.inflight.length === 10,
     { answered: b.answeredAwaiting.length, needs: b.needsYou.length, inflight: b.inflight.length });
 
-  const full = boardStateSection(proj);
+  // A cap large enough to hold the whole snapshot, so the ORDER invariant (answered
+  // before needs-you) is checked with both sections present; tail-truncation at the
+  // default/overfull cap is exercised separately below.
+  const full = boardStateSection(proj, { maxChars: 5000 });
   const idxAnswered = full.indexOf('Answered — awaiting action');
   const idxNeeds = full.indexOf('Needs you (');
   check('snapshot has the answered section, placed BEFORE the needs-you list',
     idxAnswered !== -1 && idxNeeds !== -1 && idxAnswered < idxNeeds, { idxAnswered, idxNeeds });
-  // BUG-257: the answer IS the go for a picked option (was "ask before you begin",
-  // which turned every answered card into a second question); a question, a
-  // rejection or an explicit wait in the answer is still not a go.
-  check('snapshot states the answered-not-started instruction: a picked option is the go, a question/rejection/wait is not',
-    // BUG-257 r2: the rule now also says a NOTE governs over the pick (do NOT start on a wait/condition/rejection/question).
-    /no agent has started/.test(full) && /picked option with no note is the user's go/.test(full) && /note governs over the pick/.test(full)
-      && /do NOT start/.test(full) && !/ask before you begin/.test(full), 'instruction present');
+  // BUG-288: the answered section is CONTEXT ONLY — it records what the user already
+  // decided, and must NOT tell the agent to start work. The user's typed message decides
+  // the work. So the properties asserted are the NEW ones (background/not-a-request, do
+  // NOT start, note governs) and the ABSENCE of the old "go"/"scoped work" framing — not
+  // the exact wording. The verbatim-note facts are still carried (checked in bug-257).
+  check('snapshot frames the answered section as CONTEXT ONLY (BUG-288): background/not-a-request + do NOT start + note governs, and NOT the old "go"/"scoped work" framing',
+    /no agent has started/.test(full) && /background context/i.test(full) && /not a request/i.test(full)
+      && /do NOT start/i.test(full) && /note governs/i.test(full)
+      && !/is the user's go/i.test(full) && !/start that option's scoped work/i.test(full) && !/ask before you begin/.test(full),
+    'instruction present');
   check('snapshot lists an answered ticket with its chosen answer + date',
     // BUG-257 r2: the answer is quoted whole (`> chose option B`), not `chose: <60-char cut>`.
     full.includes('BUG-600') && /> chose option B/.test(full) && full.includes(`answered ${TODAY}`),
@@ -255,7 +261,7 @@ console.log('\n=== STEP 3 — launch snapshot: placement + survives truncation =
   // needs/inflight tail is what truncates.
   const tight = boardStateSection(proj, { maxChars: 300 });
   check('OVERFULL board (maxChars 300): answered section STILL fully present',
-    tight.includes('Answered — awaiting action (3)') && /note governs over the pick/.test(tight) &&
+    tight.includes('Answered — awaiting action (3)') && /note governs/i.test(tight) &&
       tight.includes('BUG-600') && tight.includes('BUG-620'),
     { len: tight.length });
   check('OVERFULL board: the TAIL is what truncates (ends with the …ellipsis)',

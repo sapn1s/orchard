@@ -182,10 +182,12 @@ function partA() {
   /* the briefing: once per (id,date), silent when empty, seeded from the snapshot. */
   const seen = new Set();
   const b1 = boardAnswerBriefing(host, seen);
-  // BUG-257: the briefing tells the agent a picked option is the user's go (not "ask before you begin").
-  check('boardAnswerBriefing: announces the answered decision once, as a not-started fact whose picked option is the go',
-    !!b1 && b1.includes(NEEDS_ID) && /picked option with no note is the user's go/i.test(b1) && /note governs over the pick/.test(b1)
-      && !/ask before you begin/i.test(b1), (b1 ?? '').split('\n')[0]);
+  // BUG-288: the briefing is CONTEXT ONLY — it announces what the user already decided,
+  // as a not-started fact, and does NOT tell the agent to start the work (the user's own
+  // message decides that). Assert the new context-only properties, not the old "go" text.
+  check('boardAnswerBriefing: announces the answered decision once, as background context — do NOT start, note governs, not the old "go" framing',
+    !!b1 && b1.includes(NEEDS_ID) && /background context|not a request/i.test(b1) && /do NOT start/i.test(b1) && /note governs/i.test(b1)
+      && !/is the user's go/i.test(b1) && !/ask before you begin/i.test(b1), (b1 ?? '').split('\n')[0]);
   check('boardAnswerBriefing: the SAME answer is never announced twice (second call → null)',
     boardAnswerBriefing(host, seen) === null, 'second call null');
   // BUG-257 r3: a session's seen-set is written only once the launch snapshot carrying

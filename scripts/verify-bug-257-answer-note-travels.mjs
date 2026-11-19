@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * BUG-257 r2 — a picked option is the go, and the user's NOTE always travels with it,
- * verbatim and untruncated, in BOTH agent briefings.
+ * BUG-257 r2 — the user's NOTE always travels with a picked option, verbatim and
+ * untruncated, in BOTH agent briefings. (BUG-288, 2026-10-29: the injection is now
+ * CONTEXT ONLY — the FACTS below still travel in full, but the briefing no longer tells
+ * the agent a pick "is the go — start it"; checks [1][2][5][6][7] grade the surviving
+ * facts, [3] now asserts the context-only framing instead of the old "go" text.)
  *
  *   node scripts/verify-bug-257-answer-note-travels.mjs
  *
@@ -76,6 +79,13 @@ const opt = (id, i = 0) => { const o = readTicket(HOST, id).decision.options[i];
 const answer = (id, input) => answerTicket(HOST, id, { kind: 'decision', question: readTicket(HOST, id).decision?.question ?? null, ...input }, readTicket(HOST, id).rev);
 
 // Real decision tickets on the copied board (each 👤 with options).
+// NOTE (BUG-288, 2026-10-29): these hard-coded ids are STALE — the board has drifted and
+// most no longer carry a decision block, so this suite FATALs at setup on the current
+// board (and [7] below needs FEAT-023 to be answered-awaiting, which it no longer is).
+// That breakage pre-dates BUG-288 and is the docs/CONVENTIONS.md anti-pattern (pinning
+// real ticket ids whose decisions legitimate use removes). BUG-288's own text change is
+// verified by verify-feat-090-answered-lane and verify-feat-090-answer-handoff; this
+// suite needs its own re-fixture (seed synthetic 👤 decision carriers) to run again.
 const CASES = [
   { id: 'ARCH-013', note: 'Go with this, but wait until I approve the schema before touching any data.' },
   { id: 'ARCH-021', note: "Actually no — don't do this one, close it instead." },
@@ -115,12 +125,13 @@ try {
   check('snapshot carries the whole free-text answer (its trailing "wait for my approval" survives)', snap.includes(FREE.text), snap.split('\n').filter((l) => l.includes(FREE.id)).join(' | '));
   check('live briefing carries the whole free-text answer', live.includes(FREE.text), live.split('\n').filter((l) => l.includes(FREE.id)).join(' | '));
 
-  console.log('\n[3] control: a plain pick with no note is briefed as the go');
+  console.log('\n[3] control: a plain pick with no note is listed as context, NOT as a go-to-start (BUG-288)');
   {
     const o = opt(PLAIN.id);
     const ln = live.split('\n').filter((l) => l.includes(PLAIN.id) || l.includes(`${o.key} — ${o.label}`));
-    check('the plain pick is listed with its option, and the instruction says a pick with no note is the go — start it',
-      live.includes(`${o.key} — ${o.label}`) && /no note is the user's go/i.test(live) && /report it as started/i.test(live), ln.join(' | '));
+    check('the plain pick is listed with its option, framed as context only — not an instruction to start it (no "go"/"report it as started")',
+      live.includes(`${o.key} — ${o.label}`) && /background context|not a request/i.test(live)
+        && /do NOT start/i.test(live) && !/is the user's go/i.test(live) && !/report it as started/i.test(live), ln.join(' | '));
   }
 
   console.log('\n[4] a same-day follow-up after the pick was briefed is briefed again');

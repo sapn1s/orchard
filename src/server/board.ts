@@ -956,14 +956,22 @@ export function readBoard(hostPath: string): Board {
  * "pick" shown was the Question line), and a long free-text answer was cut — so "CSV"
  * and "CSV; not yet, wait for my approval" briefed identically. An independent design
  * review chose STRUCTURE over parsing notes for "wait"/"no" (enumeration an answer can
- * phrase around): the pick is the go, and every word the user wrote on the decision
- * travels with it, verbatim and untruncated, for the agent to read under an explicit
- * precedence rule. Nothing here starts a turn (FEAT-090). */
-export const ANSWERED_GO_RULE =
-  "How to act on these: a picked option with no note is the user's go — start that option's scoped work and report it as started. "
-  + 'A note governs over the pick: if it says to wait, sets a condition not yet met, rejects the option, or asks a question, do NOT start — '
-  + 'do what the note says (answer it, or say what you are waiting on). A free-text answer is a go only if it plainly says to proceed. '
-  + 'Notes are quoted verbatim below; read each in full before acting.';
+ * phrase around): every word the user wrote on the decision travels with it, verbatim
+ * and untruncated, for the agent to read. Nothing here starts a turn (FEAT-090). */
+/* ── BUG-288 (2026-10-29) — this injection is CONTEXT ONLY ──
+ * The user ruled: what the user TYPES in their own message decides the work; these
+ * answered cards do not. BUG-257/FEAT-090 had framed "a picked option is the user's
+ * go — start that option's scoped work", which, glued above the user's first message
+ * with only a `---`, made an agent read an answered card as part of the user's request
+ * (regressed-from: BUG-257). So the rule no longer tells the agent to START anything.
+ * It still carries every FACT — the ticket ids, the pick, and every user note verbatim
+ * (that was BUG-257's real win) — now framed so the agent knows what the user decided
+ * WITHOUT treating it as a thing to act on this turn. */
+export const ANSWERED_CONTEXT_RULE =
+  'How to read these: this is BACKGROUND CONTEXT, not a request. What the user types in their own message this turn decides what you work on — these cards do not. '
+  + 'Each records a decision the user already made on the board: a picked option (with any note), or a free-text answer. A note governs the pick: a wait, an unmet condition, a rejection, or a question is what the user decided — not a go-ahead. '
+  + "Do NOT start a card's work, and do NOT answer it as if the user had just asked, unless the user's own message this turn tells you to. You may mention a card in one line where it bears on what the user actually asked. "
+  + 'Notes are quoted verbatim below; read each in full before relying on it.';
 /** Default per-list cap of the launch snapshot (BoardSnapshot.answeredKeys carries the shown ones). */
 export const SNAPSHOT_MAX_ITEMS = 5;
 function quoteLines(text: string, indent: string): string[] {
@@ -1074,12 +1082,12 @@ export function boardStateSnapshot(
     // and the live briefing delivers them in full on the user's next message.
     if (answered.length > maxItems) shown.push(`- …+${answered.length - maxItems} more — each is briefed in full with the user's next message`);
     parts.push(
-      `✋ **Answered — awaiting action (${answered.length}):**`,
-      // BUG-257: an answer that picks an option IS the user's go (this line used to say
-      // "ask before you begin", which turned every answered card into a second question;
-      // FEAT-090's own start-or-wait question was never answered). Nothing here starts a
+      `✋ **Answered — awaiting action (${answered.length}) — background context, not a request:**`,
+      // BUG-288: this section is CONTEXT ONLY. It records what the user already decided
+      // on the board; it does NOT tell the agent to start work. The user's typed message
+      // this turn is what decides the work (ANSWERED_CONTEXT_RULE). Nothing here starts a
       // turn — it rides the user's next message, as before.
-      `The user answered these on the board and no agent has started them yet. ${ANSWERED_GO_RULE}`,
+      `The user answered these on the board and no agent has started them yet. ${ANSWERED_CONTEXT_RULE}`,
       ...shown,
       '',
     );
@@ -2000,7 +2008,7 @@ export function answerBriefingFor(hostPath: string, seen: ReadonlySet<string>): 
   const text = [
     `[station] The user just recorded a decision on the board — answered, not started yet:`,
     ...fresh.flatMap((it) => answeredItemLines(it, '  ')),
-    `[station] This is a server-recorded fact from the ticket board (BUG-257). ${ANSWERED_GO_RULE}`,
+    `[station] This is a server-recorded fact from the ticket board (BUG-257), and it is background context, not a request. ${ANSWERED_CONTEXT_RULE}`,
   ].join('\n');
   return { text, keys: fresh.map(answerKey) };
 }

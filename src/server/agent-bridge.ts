@@ -585,6 +585,21 @@ const AUTONOMOUS_MAX_TURNS_CEILING = 50;
 export const BRIEFING_TERMINATOR = '⟦STATION-BRIEFING-END⟧';
 
 /*
+ * BUG-288 — the human- AND agent-readable boundary that closes the auto-injected
+ * background (board snapshot + any briefing) and names where the user's OWN message
+ * begins. Before this, the first-turn board snapshot was glued above the user's typed
+ * prompt with a bare `---` and no statement that the text above was injected, so an
+ * agent read an answered card's "start that option's scoped work" line as part of the
+ * user's request (user, 2026-10-29). The injected block is CONTEXT ONLY: what the user
+ * typed decides the work. On a `[station]` turn the machine BRIEFING_TERMINATOR still
+ * does the client-side peel; this line sits just before it so the AGENT reading the raw
+ * prompt sees the boundary too, and the client keeps it in the collapsed notice chip.
+ */
+export const USER_MESSAGE_BOUNDARY =
+  '--- END OF AUTO-INJECTED BACKGROUND CONTEXT (everything above this line was added by the server, not written by the user) ---\n'
+  + "The user's own message for this turn follows below. It — and only it — is your request for this turn; everything above is background context.";
+
+/*
  * BUG-157 — a container close requires a POSITIVE quiet signal: NO frame for at
  * least this long. It complements (does NOT replace) the container process probe
  * (`#probeContainerLiveness`) — a session actively STREAMING frames (a woken
@@ -2174,13 +2189,21 @@ export class AgentSession {
     // (empty prompt) still emits the terminator; the client renders the empty
     // remainder as no bubble (just the chip).
     if (briefings.length) {
-      return `${prefixParts.join('\n\n')}\n\n${BRIEFING_TERMINATOR}\n\n${prompt}`;
+      // BUG-288: the human-readable boundary sits BEFORE the machine terminator, so it
+      // stays in the collapsed notice chip (the client peels on BRIEFING_TERMINATOR) and
+      // the agent reading the raw prompt still sees where the injected context ends.
+      // Pure-briefing turns (empty prompt) carry no boundary — nothing follows it.
+      const boundary = prompt.trim() ? `${USER_MESSAGE_BOUNDARY}\n\n` : '';
+      return `${prefixParts.join('\n\n')}\n\n${boundary}${BRIEFING_TERMINATOR}\n\n${prompt}`;
     }
-    // Board-snapshot-only first turn (no briefing) — unchanged from FEAT-113: the
-    // snapshot leads the user's prompt joined by a `---` rule. This path is NOT the
-    // BUG-168 symptom (it carries no `[station]` sentinel the client collapses), so
-    // its rendering is left exactly as it was rather than widened here.
-    return [extraPrefix, prompt].filter((s): s is string => !!s && !!s.trim()).join('\n\n---\n\n');
+    // Board-snapshot-only first turn (no briefing). BUG-288: the snapshot is CONTEXT
+    // ONLY, so it is closed with the explicit USER_MESSAGE_BOUNDARY (not a bare `---`)
+    // naming where the injected background ends and the user's own message begins —
+    // otherwise the agent reads the board context as part of the user's request. With no
+    // user prompt (empty), the snapshot stands alone, no boundary.
+    if (!extraPrefix) return prompt;
+    if (!prompt.trim()) return extraPrefix;
+    return `${extraPrefix}\n\n${USER_MESSAGE_BOUNDARY}\n\n${prompt}`;
   }
 
   /**

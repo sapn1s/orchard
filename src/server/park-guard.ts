@@ -238,7 +238,7 @@ export function blockReason(children: OwnedChild[], remaining: { ignoredLeft: nu
   }
   lines.push(
     'Do ONE of these, then end your turn:',
-    '  1. WAIT in the foreground: make a Bash call with timeout 600000 that blocks, e.g. `timeout 300 tail -f /dev/null; true` (plain `sleep` is rejected), or `timeout 580 tail --pid=<PID> -f /dev/null; true` if you know the process id (end each wait with `; true` so the normal timeout exit is not reported as a failed agent). Repeat until the child\'s completion notice reaches you (notices arrive between your tool calls), then read its result.',
+    '  1. WAIT in the foreground: make a Bash call with timeout 600000 that blocks, e.g. `timeout 240 tail -f /dev/null; true` (plain `sleep` is rejected), or `timeout 240 tail --pid=<PID> -f /dev/null; true` if you know the process id (end each wait with `; true` so the normal timeout exit is not reported as a failed agent). No single wait may block longer than 240 s — a longer block outlives your 5-minute prompt cache and re-writes your whole context; run anything longer in the background and wait in 240 s chunks. Repeat until the child\'s completion notice reaches you (notices arrive between your tool calls), then read its result.',
     '  2. STOP it (TaskStop with its id, or kill the process you started) if you no longer need it, and say so in your report.',
     `(Trying to end again without a successful tool call first counts as declining to wait; after ${remaining.ignoredLeft} such attempt(s) the stop goes through and is reported to the user as parked work.)`,
   );

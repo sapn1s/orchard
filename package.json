@@ -290,6 +290,7 @@
     "verify:late-answers:unit": "node scripts/verify-late-answers.mjs --unit",
     "verify:bug-231-call-claims": "node scripts/verify-bug-231-call-claims.mjs",
     "verify:bug-239-bound-hangs": "node scripts/verify-bug-239-bound-hangs-no-park.mjs",
+    "verify:feat-205-wait-cap": "node scripts/verify-feat-205-wait-cap.mjs",
     "verify:bug-239-bound-hangs:fast": "node scripts/verify-bug-239-bound-hangs-no-park.mjs --fast",
     "verify:feat-145-usage": "node scripts/verify-feat-145-usage.mjs",
     "verify:feat-145-login": "node scripts/verify-feat-145-login-flow.mjs",

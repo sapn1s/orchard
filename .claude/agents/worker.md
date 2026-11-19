@@ -20,10 +20,12 @@ Standing rules that apply to every dispatch here:
   addressed to the orchestrator, not to you.
 - Never end your turn while a background child you started (run_in_background Bash, Monitor,
   background Agent) is still running or unread: in a foreground lane the CLI kills it at hand-back
-  (BUG-239). Wait in the foreground (Bash timeout 600000: `timeout 580 tail --pid=<PID> -f
-  /dev/null; true`, or repeated `timeout 300 tail -f /dev/null; true` until its notice arrives —
+  (BUG-239). Wait in the foreground (Bash timeout 600000: `timeout 240 tail --pid=<PID> -f
+  /dev/null; true`, or repeated `timeout 240 tail -f /dev/null; true` until its notice arrives —
   end each with `; true` so the timeout exit is not reported as a failed agent) or stop it and say
-  so.
+  so. No single foreground wait may block longer than 240 s: your prompt cache lives 5 minutes, so
+  a longer block re-writes your whole context. Run anything longer in the background and wait on it
+  in 240 s chunks.
 - Never touch, restart, or kill port 4317, systemd claude-station, claude-station-host-* scopes,
   or processes you did not start. Scratch servers use free ephemeral ports + scratch dataDirs.
   No pkill — kill only by pid, only what you spawned.

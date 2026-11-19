@@ -434,12 +434,15 @@ deepest result when parents hit a limit.
     on that: it lets you go after three attempts without a successful tool call and reports you to
     the user as parked work.
   When you have nothing to overlap, WAIT IN THE FOREGROUND: a Bash call with timeout 600000 that
-  blocks — `timeout 580 tail --pid=<PID> -f /dev/null; true` when you know the pid, else repeated
-  `timeout 300 tail -f /dev/null; true` until the child's completion notice arrives (plain `sleep`
+  blocks — `timeout 240 tail --pid=<PID> -f /dev/null; true` when you know the pid, else repeated
+  `timeout 240 tail -f /dev/null; true` until the child's completion notice arrives (plain `sleep`
   is rejected; a Monitor does not keep you alive; end each wait with `; true` so the normal timeout
-  exit is not reported on the user's rail as a failed agent). Then read the result. Waiting on a
-  notification is only safe for work owned by a process that outlives you (a service, another
-  session).
+  exit is not reported on the user's rail as a failed agent). Then read the result. **No single
+  foreground wait may block longer than 240 s:** a lane's prompt cache lives 5 minutes, so a longer
+  block re-writes your whole context (measured: 299 re-writes, $375 in 30 days). Run anything longer
+  (a suite, `independent-verify.mjs`) in the background and wait on it in 240 s chunks until its
+  notice arrives; hand-rolled `until … sleep` loops obey the same cap. Waiting on a notification is
+  only safe for work owned by a process that outlives you (a service, another session).
 
 **Fan out as one batch, not N background lanes.** When you dispatch several independent lanes at
 once, emit them as ONE assistant message of N parallel Agent calls awaited together (foreground, not

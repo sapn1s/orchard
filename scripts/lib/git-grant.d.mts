@@ -101,6 +101,8 @@ export declare function beginGitWriteToolCall(opts: { binding: string; toolUseId
 export declare function endGitWriteToolCall(binding: string, toolUseId: string, now?: number): void;
 /** BUG-231 — end every window of a session (turn end, session close). */
 export declare function endGitWriteToolCalls(binding: string, now?: number): void;
+/** BUG-267 — THE deny exit for one tool call: tombstones the id (even with no record) and ends it. */
+export declare function denyGitWriteToolCall(binding: string, toolUseId: string, agentKey?: string | null, now?: number): void;
 /** BUG-231 — end every window one (sub)agent left open (SubagentStop). */
 export declare function endGitWriteAgent(binding: string, agentKey: string, now?: number): void;
 export declare function _resetGitWriteWindowsForTest(): void;

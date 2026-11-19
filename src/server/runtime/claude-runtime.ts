@@ -34,7 +34,7 @@ import { getShimSecret, getShimBootId } from '../../../scripts/lib/git-shim-secr
 // the block WITHOUT relaunching, and a granted commit/push still runs the
 // mandatory leak gate. evaluateGitWrite folds all three onto the round-1
 // classifier; the leak-gate runner is injected from here (a real subprocess).
-import { evaluateGitWriteAsync, beginGitWriteToolCall, endGitWriteToolCall, endGitWriteToolCalls, endGitWriteAgent } from '../../../scripts/lib/git-grant.mjs';
+import { evaluateGitWriteAsync, beginGitWriteToolCall, endGitWriteToolCall, endGitWriteToolCalls, endGitWriteAgent, denyGitWriteToolCall } from '../../../scripts/lib/git-grant.mjs';
 import { hostLeakGatePath, ownProjectArgs, ownProjectArgsAsync, passReport, hostGateBanner, capGateOutput, repoContentFingerprintAsync } from '../leak-gate-host.ts';
 // FEAT-124 — an UNJUSTIFIED Fable (`model: fable`) dispatch is rerouted UP to
 // Opus on this same PreToolUse callback. A different axis again: model-keyed, not
@@ -1029,6 +1029,18 @@ export class ClaudeRuntime implements AgentRuntime {
     const endGitCall = (toolUseId: unknown) => {
       if (gitWindowKey && typeof toolUseId === 'string' && toolUseId) endGitWriteToolCall(gitWindowKey, toolUseId);
     };
+    /**
+     * BUG-267 — THE one exit for a DENIED tool call (BUG-231 r7: every terminal outcome
+     * tombstones). Called from exactly three places, which are every way a call is denied:
+     * the PreToolUse wrapper `settleGitCallOnDeny` (every `deny` any hook stage returns
+     * passes through it), canUseTool's deny, and the PermissionDenied hook. A deny before
+     * the git-write stage opened a claim (BUG-230 shim-missing, branch-mode, file lock,
+     * profile) used to leave the id unknown, so a once-grant issued afterwards was spent by
+     * the same id's retry; denyGitWriteToolCall tombstones it.
+     */
+    const denyGitCall = (toolUseId: unknown, agentKey: unknown) => {
+      if (gitWindowKey && typeof toolUseId === 'string' && toolUseId) denyGitWriteToolCall(gitWindowKey, toolUseId, typeof agentKey === 'string' && agentKey ? agentKey : 'main');
+    };
     const sessionEnv = gitShim ? gitShim.env : baseSessionEnv;
     const options: Options = {
       cwd: config.cwd,
@@ -1037,7 +1049,7 @@ export class ClaudeRuntime implements AgentRuntime {
       canUseTool: async (toolName, input, o) => {
         const r = await (config.onApproval({ toolName, input, meta: o as never }) as Promise<PermissionResult>);
         // BUG-231 — a denied call never runs: release any git decision it reserved.
-        if (r?.behavior === 'deny') endGitCall((o as { toolUseID?: unknown } | undefined)?.toolUseID);
+        if (r?.behavior === 'deny') denyGitCall((o as { toolUseID?: unknown } | undefined)?.toolUseID, (o as { agentID?: unknown } | undefined)?.agentID);
         return r;
       },
       /*
@@ -1223,7 +1235,7 @@ export class ClaudeRuntime implements AgentRuntime {
     const settleGitCallOnDeny = <I, R>(fn: (input: I) => Promise<R>) => async (input: I): Promise<R> => {
       const r = await fn(input);
       const d = (r as { hookSpecificOutput?: { permissionDecision?: string } } | undefined)?.hookSpecificOutput?.permissionDecision;
-      if (d === 'deny') endGitCall((input as { tool_use_id?: unknown } | undefined)?.tool_use_id);
+      if (d === 'deny') denyGitCall((input as { tool_use_id?: unknown } | undefined)?.tool_use_id, (input as { agent_id?: unknown } | undefined)?.agent_id);
       return r;
     };
     if (gitBlockOn || config.orchestratorProfile || fableGateOn || fileLockDir) {
@@ -1418,7 +1430,11 @@ export class ClaudeRuntime implements AgentRuntime {
           ...options.hooks,
           PostToolUse: [...(options.hooks.PostToolUse ?? []), { hooks: [settle] }],
           PostToolUseFailure: [...(options.hooks.PostToolUseFailure ?? []), { hooks: [settle] }],
-          PermissionDenied: [...(options.hooks.PermissionDenied ?? []), { hooks: [settle] }],
+          // BUG-267 — a permission-layer deny is a DENY, not an ordinary end: tombstone the id.
+          PermissionDenied: [...(options.hooks.PermissionDenied ?? []), { hooks: [async (input: unknown) => {
+            denyGitCall((input as { tool_use_id?: unknown } | undefined)?.tool_use_id, (input as { agent_id?: unknown } | undefined)?.agent_id);
+            return {};
+          }] }],
         };
       }
     }

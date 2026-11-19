@@ -369,6 +369,25 @@ export function endGitWriteToolCall(binding, toolUseId, now = Date.now()) {
   if (binding && toolUseId) endCallClaims(binding, (c) => c.toolUseId === toolUseId, now);
 }
 
+/**
+ * BUG-267 — THE deny exit for one tool call. Every way a call is DENIED (any PreToolUse
+ * hook stage, canUseTool, the PermissionDenied hook) ends here, so "every terminal outcome
+ * tombstones" (BUG-231 r7) holds by construction instead of per deny site: a call id with
+ * NO record yet (a deny before the git-write stage ever opened a claim — the BUG-230
+ * shim-missing branch, a branch-mode guard, the file lock, the orchestrator profile) gets
+ * a tombstone via denyCallClaim, and an existing record is withdrawn; both then END. The
+ * id can never be decided again, so a once-grant issued after the deny reaches only the
+ * agent's NEXT call, never this id's retry. Idempotent; never throws.
+ */
+export function denyGitWriteToolCall(binding, toolUseId, agentKey = 'main', now = Date.now()) {
+  if (!binding || !toolUseId) return;
+  try {
+    denyCallClaim({ binding, toolUseId, agentKey: agentKey ?? 'main', projectKey: null, data: { mode: 'denied', decision: null, slots: [], view: null, gatedFp: null, hookRecord: null } }, now);
+  } finally {
+    endCallClaims(binding, (c) => c.toolUseId === toolUseId, now);
+  }
+}
+
 /** End every call of a session (turn end, session close). Idempotent. */
 export function endGitWriteToolCalls(binding, now = Date.now()) {
   if (binding) endCallClaims(binding, () => true, now);

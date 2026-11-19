@@ -10,7 +10,8 @@
  *   if the runtime registered those hooks.
  *
  * A user turn whose text is `[[bash]]{json}` runs one Bash "tool call". json:
- *   { tag, command, skipPost?: bool, permissionDeny?: bool, background?: bool }
+ *   { tag, command, skipPost?: bool, permissionDeny?: bool, background?: bool, toolUseId?: string }
+ *   toolUseId      — reuse this tool_use_id instead of minting one (BUG-267: a retried id)
  *   skipPost       — never send the Post hook (a killed tool call: an ORPHAN)
  *   permissionDeny — after a PreToolUse allow, the permission layer denies: the
  *                    command never runs; a PermissionDenied hook is sent if registered
@@ -59,7 +60,8 @@ function verdictOf(resp) {
 
 let calls = 0;
 async function bashCall(spec) {
-  const toolUseId = `toolu_231_${process.pid}_${++calls}`;
+  // BUG-267 — `toolUseId` re-sends a PreToolUse for an id already used (the CLI retry shape).
+  const toolUseId = typeof spec.toolUseId === 'string' && spec.toolUseId ? spec.toolUseId : `toolu_231_${process.pid}_${++calls}`;
   const tool_input = { command: spec.command };
   const out = { tag: spec.tag ?? null, toolUseId, pre: null, ran: false, exit: null, stderr: '', post: null };
   out.pre = await callHook('PreToolUse', { tool_input, tool_use_id: toolUseId });

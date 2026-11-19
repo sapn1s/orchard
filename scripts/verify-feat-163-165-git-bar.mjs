@@ -355,16 +355,14 @@ try {
   const p0 = await pill();
   check('initial: blocked; "Allow 30 min" + "Settings…" offered; the old "Allow permanently…" is GONE', p0.on === 'false' && p0.allow && p0.settings && !p0.perm && !p0.revoke, p0);
   if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, 'FEAT-164-blocked-light.png'), clip: await headClip() });
-  // "Settings…" closes the panel and opens the drawer AT the Agent git section.
+  // FEAT-190 — "Manage…" opens the agent-git panel IN PLACE on the Git page (the controls moved
+  // off the Settings drawer); the drawer does not open. (This step predated FEAT-190 and still
+  // waited for the drawer; updated 2026-10-16.)
   await page.click('.gt-gw-settings');
-  await page.waitForFunction(() => !document.querySelector('#smodal').hidden && !!document.querySelector('[data-focus="agentGit"]'), null, { timeout: 15_000 });
-  await sleep(350);
-  const opened = await page.evaluate(() => { const g = document.querySelector('[data-focus="agentGit"]'); const r = g.getBoundingClientRect(); return { modal: !document.querySelector('#smodal').hidden, inView: r.top >= 0 && r.top < innerHeight - 40 }; });
-  check('"Settings…" opens the Settings drawer scrolled to the Agent git section', opened.modal && opened.inView, opened);
-  // Close the drawer before reopening the git panel, or its modal overlay
-  // intercepts the pill clicks below.
-  await page.keyboard.press('Escape');
-  await page.waitForFunction(() => document.querySelector('#smodal').hidden, null, { timeout: 10_000 }).catch(() => {});
+  await page.waitForFunction(() => { const p = document.querySelector('.gt-gw-panel'); return p && !p.hidden && p.querySelector('.gt-gw-save'); }, null, { timeout: 15_000 });
+  const opened = await page.evaluate(() => ({ panel: !document.querySelector('.gt-gw-panel').hidden, drawerHidden: document.querySelector('#smodal').hidden }));
+  check('"Manage…" opens the agent-git panel in place (the Settings drawer stays closed)', opened.panel && opened.drawerHidden, opened);
+  await page.click('.gt-gw-panel .gt-gw-x');
   // The 30-minute grant still works through the pill.
   await openPanel();
   await page.click('.gt-gw-allow');
@@ -376,17 +374,18 @@ try {
   await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.on === 'false', null, { timeout: 10_000 }).catch(() => {});
   check('Revoke clears the timed grant', (await j('GET', gw)).d.grant === null && (await pill()).on === 'false');
   // A STANDING policy, set through the ONE writer route, is reflected in the pill.
-  await j('PUT', pol, { commit: true, push: false, scope: null });
+  // FEAT-190 r3: a policy PUT carries the current revision; release mode is an explicit opt-in.
+  await j('PUT', pol, { commit: true, push: false, scope: null, release: { opt_in: true }, revision: (await j('GET', gw)).d?.revision });
   await openPanel();
   await page.waitForFunction(() => document.querySelector('.gt-gitwrite')?.dataset.mode === 'release', null, { timeout: 30_000 }).catch(() => {});
   const p5 = await pill();
   check('a standing release policy reads "Agent git · soft releases" (Revoke shown, Allow hidden)', p5.mode === 'release' && p5.state === 'Agent git · soft releases' && p5.revoke && !p5.allow, p5);
   for (const theme of ['light', 'dark']) { await setTheme(theme); await sleep(120); if (SHOTS) await page.screenshot({ path: path.join(OUTDIR, `FEAT-164-standing-${theme}.png`), clip: await headClip() }); }
   await setTheme('light');
-  await j('PUT', pol, { commit: true, push: true, scope: 'commit to main' });
+  await j('PUT', pol, { commit: true, push: true, scope: 'commit to main', release: { opt_in: false }, revision: (await j('GET', gw)).d?.revision });
   await openPanel();
   await page.waitForFunction(() => document.querySelector('.gt-gitwrite')?.dataset.mode === 'scoped', null, { timeout: 30_000 }).catch(() => {});
-  check('a standing scoped policy reads "Agent git · scoped"', (await pill()).state === 'Agent git · scoped');
+  check('a standing direct-commit policy reads "Agent git on · until you turn it off"', (await pill()).state === 'Agent git on · until you turn it off');
   // Revoke on the pill clears the standing commit grant via DELETE git-write-grant.
   await page.click('.gt-gw-revoke');
   await page.waitForFunction(() => document.querySelector('.gt-gitwrite').dataset.on === 'false', null, { timeout: 10_000 }).catch(() => {});

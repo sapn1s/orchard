@@ -204,8 +204,21 @@ const grant = (pid, body) => api(`/api/projects/${pid}/git-write-grant`, 'POST',
 const revoke = (pid) => api(`/api/projects/${pid}/git-write-grant`, 'DELETE');
 // FEAT-164 resolved model: a STANDING grant opens the container .git only in mode 'scoped' (commit + a scope
 // note) via the policy route; release mode (commit, no note) keeps it read-only by design.
-const scopedGrant = (pid, note) => api(`/api/projects/${pid}/git-write-policy`, 'PUT', { commit: true, push: false, scope: note });
-const releaseGrant = (pid) => api(`/api/projects/${pid}/git-write-grant`, 'POST', { scope: 'permanent' });
+// FEAT-190 optimistic-concurrency: the policy PUT must carry the `revision` it was rendered from. Fetch the
+// current revision first (the panel always has one from GET), then save — otherwise the route refuses with 400.
+const scopedGrant = async (pid, note) => {
+  const cur = await api(`/api/projects/${pid}/git-write-policy`, 'GET');
+  return api(`/api/projects/${pid}/git-write-policy`, 'PUT', { commit: true, push: false, scope: note, revision: cur.body?.revision });
+};
+// FEAT-190 (ticket decision 2026-10-14, orchestrator): RELEASE (soft-release) mode holds ONLY on an EXPLICIT
+// `release.opt_in === true`; a legacy `{permanent:true}` / blank-scope record now READS as SCOPED (opens the
+// container), never release. So a release-mode grant is requested through the policy route with opt_in — that
+// is the only shape that keeps the container read-only by design. (The old `{scope:'permanent'}` helper tested
+// a pre-FEAT-190 expectation that no longer holds.)
+const releaseGrant = async (pid) => {
+  const cur = await api(`/api/projects/${pid}/git-write-policy`, 'GET');
+  return api(`/api/projects/${pid}/git-write-policy`, 'PUT', { commit: true, push: false, scope: null, release: { opt_in: true }, revision: cur.body?.revision });
+};
 const revokePolicy = (pid) => api(`/api/projects/${pid}/git-write-policy`, 'DELETE');
 /** The client's queueRefusedSend path: POST /api/outbox for a session (keyed on its sdkSessionId). */
 const outboxPost = (sdk, projectId, text, origin = 'direct') => api('/api/outbox', 'POST', { session: sdk, project: projectId, nonce: `n-${crypto.randomUUID()}`, text, origin });

@@ -248,3 +248,6 @@ Plan source: `~/.local/state/claude-station/scratch/orchestration-cost-2026-11-1
 
 ### 2026-11-19 — dispatch openai
 - **Verification recorded:** dispatch openai run 01a1f188-bde6-7e51-bae6-d539379a9a1a — VERDICT: HOLDS — mixed-state candidate afe5ab673cec. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — commit lane — committed 40c1df0, pushed to origin/main
+- **Commit:** `40c1df0` (one commit for this ticket; shared files staged hunk-by-hunk). `npm run gate` exit 0, the committed tree typechecks on its own, `orchard-leak-check --push` PASS; pushed `d4db9a4..d8b1b57`.

@@ -479,3 +479,6 @@ systemctl --user start claude-station
 
 ### 2026-11-19 — verify lane (round 1)
 - **Verification recorded:** dispatch anthropic/claude-opus-4-8 run 38471cd4-1871-4223-9f50-d610b27dd288 — VERDICT: HOLDS — verified, awaiting user switch. Clean-room (openai) BROKEN spurious: strips .claude + ran pre-restart 2.1.281 not 2.1.328. Decisive: real 0.3.328 install, fixer 42/0 on 2.1.328 (compaction 192034; cancel/resume/agent_id PASS) + own mid-tool-cancel attack: tool killed exit137, AbortError, no hang.. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-11-19 — commit lane — committed d8b1b57, pushed to origin/main
+- **Commit:** `d8b1b57` (one commit for this ticket; shared files staged hunk-by-hunk). `npm run gate` exit 0, the committed tree typechecks on its own, `orchard-leak-check --push` PASS; pushed `d4db9a4..d8b1b57`.

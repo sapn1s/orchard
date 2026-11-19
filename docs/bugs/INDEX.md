@@ -460,7 +460,7 @@ FE = frontend (app.js / drawer.js), serialized with each other. SV = server.
 | FEAT-189 | Session search buries the session you worked in under dispatch lanes | (uncommitted) |
 | FEAT-190 | Unify agent git grant on the git page; grants cover other repos | (uncommitted) |
 | BUG-263 | A mis-filed hard-stop card the agent already decided has no take-back | (uncommitted) |
-| FEAT-205 | Lane waits re-write the whole prompt cache every ten minutes | (uncommitted) |
+| FEAT-205 | Lane waits re-write the whole prompt cache every ten minutes | 40c1df0 |
 
 ## Shipped earlier (pre-tracker)
 Routing, search, recency, memories, OOM, git, sidebar attention, diff chips,

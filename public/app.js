@@ -1554,10 +1554,16 @@ function searchRowsFor(id) {
 
 async function loadSessions(id, { force = false, full = false } = {}) {
   const s = sessionState(id);
+  // BUG-286 — once a project has been escalated to the full list (its first
+  // recency page was all folded lanes), it STAYS on the full list: a later
+  // page-1 reload would drop the user's own sessions back out of hand and
+  // flicker the count to "0+". `needsFullList` makes every subsequent load
+  // fetch the whole list directly, so there is one fetch and no regression.
+  const wantFull = full || s.needsFullList === true;
   // A page-1 load already satisfies `loaded`; asking for the FULL list (the
   // finder's cross-session search) must still go to the server when only the
   // first page is in hand.
-  if (s.loaded && !force && !(full && s.serverHasMore)) return s;
+  if (s.loaded && !force && !(wantFull && s.serverHasMore)) return s;
   // AWAIT an in-flight load instead of returning the still-empty state.
   // Returning early here made applyRoute() see zero sessions whenever the
   // boot preload had started the same fetch first — and a session named in
@@ -1578,7 +1584,7 @@ async function loadSessions(id, { force = false, full = false } = {}) {
     return s.inflight ?? s; // the in-flight load already meets our need (full/force)
   }
   s.loading = true;
-  s.inflightFull = full;
+  s.inflightFull = wantFull;
   s.inflightForce = force;
   s.error = null;
   renderTree();
@@ -1587,7 +1593,7 @@ async function loadSessions(id, { force = false, full = false } = {}) {
       // FEAT-199 — the default sidebar load fetches ONLY the first page (recency
       // first), so a cold server parses that page's files instead of sampling
       // every file in the store. `full` (the finder) fetches the whole list.
-      const r = full
+      const r = wantFull
         ? await api.projectSessions(id)
         : await api.projectSessions(id, { limit: SESSION_PAGE, offset: 0 });
       s.list = (r.sessions ?? []).slice().sort((a, b) => cmpRecency(a, b));
@@ -1599,7 +1605,7 @@ async function loadSessions(id, { force = false, full = false } = {}) {
       // FEAT-199 — feed the finder's corpus. A full load (the finder's own fetch)
       // replaces the corpus with the complete set; a page-1 refresh only merges
       // its fresher rows in, so it can never shrink the finder's reach.
-      mergeSearchCorpus(id, s.list, { full });
+      mergeSearchCorpus(id, s.list, { full: wantFull });
       s.serverTotal = r.page ? r.page.total : s.list.length;
       s.serverHasMore = r.page ? r.page.hasMore === true : false;
       // FEAT-199 — the opaque keyset cursor for the NEXT page. Reset here on
@@ -2022,7 +2028,13 @@ function renderProjectGroup(p) {
       const pend = pendingNewFor(p.id);
       if (pend) kids.append(sessionRow(p, pend));
       if (s?.loading) kids.append(el('div', { class: 'hint-row', text: 'reading history…' }));
-      else if (s?.error) kids.append(el('div', { class: 'hint-row', text: `history unavailable: ${s.error}` }));
+      // BUG-286 — a FAILED refresh must not HIDE sessions already loaded: show
+      // the bare "unavailable" only when there is no listed content to fall back
+      // to (IV run 01a1824e — a redundant/failed reload hid interactive rows that
+      // a prior load had already fetched). With a loaded listed list, fall
+      // through to render it; the loaded branch adds a small "couldn't refresh"
+      // hint so the failure is not silent.
+      else if (s?.error && !(s?.loaded && listedCount(s))) kids.append(el('div', { class: 'hint-row', text: `history unavailable: ${s.error}` }));
       // A pending row already fills the group; the "no history" note would then
       // read as a contradiction under a visible session, so suppress it there.
       // All-hidden counts as empty: every row folds out of the default view, so
@@ -2033,10 +2045,36 @@ function renderProjectGroup(p) {
       // note instead of the false "no .jsonl files" text. Folded rows stay
       // reachable via search and their URL.
       else if (s?.loaded && !listedCount(s)) {
-        if (!pend) kids.append(s.list.length ? allHiddenNote(s) : emptyProjectNote(p, s));
+        // BUG-286 — listedCount here measures only the rows IN HAND. FEAT-199
+        // loads just the first recency PAGE, so a dispatch-heavy project whose
+        // newest page is entirely folded lanes (the reported trading_volume:
+        // 2900+ lanes burying a handful of the user's own interactive sessions)
+        // would render the FALSE "No interactive sessions here" note — a claim
+        // only the COMPLETE list can support. While the server has more, we do
+        // not yet KNOW the list is interactive-empty: escalate ONCE to the full
+        // list so the buried sessions surface, showing a loading hint meanwhile
+        // — never the false claim. Only fires for an all-folded first page, the
+        // exact case that needs it; normal projects (page 1 has listed rows)
+        // never reach here, so FEAT-199's cold-start cost is unchanged.
+        if (s.serverHasMore) {
+          // Mark the project as needing the full list (sticky: later reloads
+          // fetch full directly instead of dropping back to a page — IV run
+          // 51074bff) and kick that load OUT of this synchronous render:
+          // loadSessions() calls renderTree() before its first await, and a
+          // nested renderTree mid-loop re-appends every later project a second
+          // time (duplicate groups — IV run 4648fc31). queueMicrotask runs it
+          // after this render's loop unwinds.
+          if (!s.needsFullList) { s.needsFullList = true; queueMicrotask(() => { void loadSessions(p.id, { full: true }); }); }
+          if (!pend) kids.append(el('div', { class: 'hint-row', text: 'reading history…' }));
+        } else if (!pend) {
+          kids.append(s.list.length ? allHiddenNote(s) : emptyProjectNote(p, s));
+        }
       }
       else if (s?.loaded) {
         const v = visibleSessions(s);
+        // BUG-286 — a refresh errored but a previously-loaded list is in hand:
+        // keep the sessions visible, say the refresh failed (never hide them).
+        if (s.error) kids.append(el('div', { class: 'hint-row', text: `couldn’t refresh (${s.error}) — showing the sessions already loaded` }));
         v.rows.forEach((sess, i) => {
           const row = sessionRow(p, sess);
           // A hairline under the last pinned row. The pinned block needs an

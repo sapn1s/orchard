@@ -11,9 +11,9 @@
   "reported": "2026-10-05",
   "reported_by": "agent",
   "owner": "agent",
-  "work_state": "in_verification",
+  "work_state": "verified",
   "human_action": "none",
-  "updated": "2026-10-11",
+  "updated": "2026-10-20",
   "decision": null,
   "decision_history": [],
   "success_criteria": [
@@ -56,6 +56,18 @@
       "recorded_by": "board-tool",
       "harness": "scripts/independent-verify.mjs",
       "note": "git.ts:169-176 prefers worktree code over index: rename RM renders M (not R), add AM renders M (not A); busy popover runs off-screen at 900x420. Author suite could not run in room (no .git); rests on synthetic-git adversarial"
+    },
+    {
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "verify-r2-feat165-20261020",
+      "verdict": "holds",
+      "verdict_on": "2026-10-20",
+      "recorded_at": "2026-10-20T05:33:21.880Z",
+      "author": "worker (verifying r2)",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "note": "Both r1 BROKEN defects fixed on current tree: changeType now prefers index (AM->A, RM->R; new guard 8/8 w/ must-FAIL); popover fits short viewport (900x420 in-view, footer visible). Suite 42/0; gate PASS."
     }
   ],
   "verification_class": "fix",
@@ -113,3 +125,9 @@ This reverses part of the FEAT-139 round-3 design, which deliberately moved the 
 
 ### 2026-10-11 — dispatch anthropic
 - **Verification recorded:** dispatch anthropic run 8faf47b6-09c0-4f66-afb4-34d35e464760 — VERDICT: BROKEN — git.ts:169-176 prefers worktree code over index: rename RM renders M (not R), add AM renders M (not A); busy popover runs off-screen at 900x420. Author suite could not run in room (no .git); rests on synthetic-git adversarial. Typed entry in the record's verification[]; this line is an echo, not proof.
+
+### 2026-10-20 — worker (verifying r2)
+- **Fixed + verified (r2):** Verifying round 2 (dispatch phase=verifying round=2, 2026-10-20). The r1 BROKEN verdict named two real, still-live defects on the current tree; both FIXED and verified. (1) STATUS LETTER (changeType, src/server/git.ts): the mapping preferred the worktree code over the index code (const c = y!=" " ? y : x), so a staged-add-then-edited file ("AM") rendered "M" instead of "A" and a staged-rename-then-edited file ("RM") rendered "M" instead of "R". Fixed to prefer the INDEX code (c = (x!=" " && x!="?") ? x : y), falling back to the worktree code only when the index side is clean. New durable guard scripts/verify-feat-165-status-letters.mjs builds a SYNTHETIC scratch repo (real git, shim-stripped PATH) in AM/RM/A/M/D/U states and drives the REAL /git/changes endpoint on an isolated scratch server. Must-FAIL on the old code: new.txt=modified, ren_dst.txt=modified (2 FAIL). After fix: 8 passed, 0 failed (AM->added, RM->renamed+oldPath, A->added, M->modified x2, D->deleted, U->untracked). (2) POPOVER OFF-SCREEN at short viewport: measured on the real page over the 95-file busy checkout — at 900x420 the popover ran off the bottom (rect.bottom=506 > innerH=420, footer hidden) because head+summary+footer stacked over a 46vh list with no viewport clamp. Fixed: #gitPopBody is now the flex column + clip boundary (overflow kept OFF .git-pop so its ::before hover bridge is not clipped), .gp-list is the only flexible child (flex:0 1 auto; min-height:0) and openGitPop() sets .gitPop maxHeight to the space below where place() put it. Re-measured: 900x420 bottom=407<=420, footer visible, list scrolls; 1280x600 and 1440x900 unchanged in-view. Files: public/app.js (openGitPop), public/styles.css. (3) POLISH from an independent design review of the screenshots: +added/-removed are now right-aligned fixed-width cells (.gp-n) so the two columns line up row-to-row (the others the review raised were by-design: letters ARE tinted by type per styles.css but the real checkouts are mostly M; the "no git" italic is the app-wide provisional idiom; the thin scrollbar is overlay-only in headless shots). Commands: PATH=<shim-stripped> F163_REAL_INIT=1 node scripts/verify-feat-163-165-git-bar.mjs -> 42 passed, 0 failed (real checkouts porcelain identical before/after); node scripts/verify-feat-165-status-letters.mjs -> 8 passed, 0 failed; npm run gate -> GATE: PASS (exit 0). Screenshots: docs/bugs/assets/FEAT-165-{face,popover,busy-popover}-{light,dark}.png, FEAT-165-busy-narrow-light.png. Harm class: contained render + a pure display-mapping server change (not lifecycle/security/data-loss) -> zero adversarial rounds; the status-letter guard is an independent endpoint-level check.
+
+### 2026-10-20 — worker (verifying r2)
+- **Verification recorded:** dispatch anthropic run verify-r2-feat165-20261020 — VERDICT: HOLDS — Both r1 BROKEN defects fixed on current tree: changeType now prefers index (AM->A, RM->R; new guard 8/8 w/ must-FAIL); popover fits short viewport (900x420 in-view, footer visible). Suite 42/0; gate PASS.. Typed entry in the record's verification[]; this line is an echo, not proof.

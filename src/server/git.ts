@@ -168,7 +168,12 @@ async function porcelain(hostPath: string): Promise<Array<{ x: string; y: string
 
 function changeType(x: string, y: string): GitChangeType {
   if (x === '?' && y === '?') return 'untracked';
-  const c = y !== ' ' ? y : x;
+  // Prefer the INDEX (staged) code over the worktree code: a file staged as an
+  // add and then further edited reports "AM" and is fundamentally an Add; a staged
+  // rename then edited reports "RM" and is a Rename. Falling through to the worktree
+  // code (y) rendered both as plain "modified" (FEAT-165 r1 verifier). Fall back to
+  // the worktree code only when the index side is clean (" M", " D").
+  const c = (x !== ' ' && x !== '?') ? x : y;
   if (c === 'A') return 'added';
   if (c === 'D') return 'deleted';
   if (c === 'R' || c === 'C') return 'renamed';

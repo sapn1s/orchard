@@ -913,6 +913,17 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
    name survives; the status letter is tinted by kind (added green, deleted red,
    renamed ochre, untracked quiet) and a staged file's letter is a filled tile. */
 .pop.git-pop { width: 380px; max-width: calc(100vw - 16px); padding: 4px 4px 2px; }
+/* FEAT-165 — a column layout + a JS-set max-height (openGitPop) keep the whole
+   popover inside the viewport on a short window: the file list is the only part
+   that shrinks + scrolls, so the branch header and the "Open Git panel" footer
+   stay visible. Without this the head+summary+footer stacked on top of a 46vh
+   list ran the popover off the bottom edge at e.g. 900×420 (FEAT-165 r1). */
+.pop.git-pop.open { display: flex; flex-direction: column; }
+/* #gitPopBody is the column that actually holds the header/summary/list/footer;
+   it fills the popover and is the clip boundary, so the list (its only flexible
+   child) shrinks + scrolls. Overflow stays OFF the .git-pop itself so the
+   ::before hover-gap bridge above it is never clipped. */
+#gitPopBody { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow: hidden; }
 .pop.git-pop::before { content: ""; position: absolute; left: 0; right: 0; top: -8px; height: 8px; }
 .gp-head { display: flex; align-items: baseline; gap: 8px; padding: 9px 10px 2px; }
 .gp-branch { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
@@ -928,6 +939,7 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .gp-conflict { margin-left: auto; color: var(--danger); font-weight: 600; }
 .gp-note { padding: 4px 10px; font-size: 11.5px; line-height: 1.45; color: var(--ink-4); }
 .gp-list {
+  flex: 0 1 auto; min-height: 0;
   max-height: min(46vh, 360px); overflow-y: auto; scrollbar-width: thin;
   margin: 2px 2px 4px; padding: 2px 0;
 }
@@ -951,8 +963,11 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 .gp-path { display: flex; min-width: 0; white-space: nowrap; }
 .gp-dir { color: var(--ink-4); overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 0 1 auto; }
 .gp-base { color: var(--ink); flex: none; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
-.gp-n { display: inline-flex; gap: 6px; font: 11px var(--mono); font-variant-numeric: tabular-nums; }
-.gp-n .gp-add, .gp-n .gp-del { font-weight: 500; }
+.gp-n { display: inline-flex; gap: 8px; justify-content: flex-end; font: 11px var(--mono); font-variant-numeric: tabular-nums; }
+/* Right-align the +added / −removed counts in their own fixed-width cells so the
+   two columns line up row-to-row (small counts, the common case); a wide count
+   expands only its own row. */
+.gp-n .gp-add, .gp-n .gp-del { font-weight: 500; min-width: 2.9em; text-align: right; }
 .gp-bin { color: var(--ink-4); }
 .gp-more { text-align: center; }
 .git-pop .pop-foot { border-top: 1px solid var(--hair); margin-top: 2px; }

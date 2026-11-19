@@ -6457,7 +6457,15 @@ function openGitPop() {
   if (p && g?.status?.repo && g.status.dirty && Date.now() - (g.changesAt ?? 0) > 5_000) void loadGitChanges(p.id);
   paintGitPop();
   node.gitPop.classList.add('open');
+  // FEAT-165 — the chip opens the popover downward from the top bar. On a short
+  // window the header + summary + footer stacked over the file list could run it
+  // off the bottom edge (observed off-screen at 900×420). Cap its height to the
+  // space left below where place() put it; .gp-list (the only flexible child)
+  // shrinks and scrolls so the footer stays reachable. Cleared/recomputed each open.
+  node.gitPop.style.maxHeight = '';
   place(node.gitPop, node.gitBtn, node.gitPop.offsetWidth || 380);
+  const top = node.gitPop.getBoundingClientRect().top;
+  node.gitPop.style.maxHeight = `${Math.max(160, Math.round(window.innerHeight - top - 10))}px`;
   node.gitBtn.setAttribute('aria-expanded', 'true');
 }
 function closeGitPopSoon() {

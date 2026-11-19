@@ -2,6 +2,7 @@
 name: worker
 description: Default fix/verify/feature worker for dispatched lanes. Pinned to Opus 4.8 per the standing model-tier rule (2026-08-11) — Fable/Opus 5 only for truly complex problems, via an explicit different agent type.
 model: claude-opus-4-8
+autoCompactWindow: 200000
 ---
 
 You are a dispatched worker agent for this repository. Follow the charter in your task prompt
@@ -73,6 +74,9 @@ Standing rules that apply to every dispatch here:
   falls back by itself to a mixed-tree freeze (other tickets' hunks disclosed to the verifier); add
   `--files a,b` if the ticket has no candidate or claim. Never hand-build a candidate (exported HEAD
   plus re-applied hunks, untangle scripts, scratch two-commit repos): measured 34 min lost in one lane.
+- **If your context is compacted mid-lane, re-read before continuing (FEAT-206).** Worker lanes
+  auto-compact near 200k tokens. After a compaction, re-read your ticket's Activity log and your
+  charter's Dispatch line before your next step: the ticket, not your memory, is the state.
 - **Your FINAL message to your orchestrator is a compact handoff, not a report (ARCH-016).** State
   only: the verdict (done / refuted / needs-you + which decision); the decisions the orchestrator
   must take; and a durable pointer — the ticket id + its Activity-log entry, and your report id +

@@ -38,6 +38,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { waitRuntimeReady } from './lib/host-admission.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const ENTRY = path.join(ROOT, 'src', 'server', 'index.ts');
@@ -247,6 +248,9 @@ async function main() {
   const port = await freePort();
   startServerService(unit, port);
   if (!(await waitHealth(port))) throw new Error('scratch --user service never became healthy');
+  // FEAT-206: a fresh server refuses host session starts until its FEAT-151 boot runtime
+  // check passes ("runtime check pending") — wait on its own readiness signal first.
+  if (!(await waitRuntimeReady(port, { ms: 120_000 }))) throw new Error('boot runtime check never admitted host sessions');
   const projectId = await registerProject(port);
   const marker = path.join(WORK, 'survived-deployed.txt');
   try { fs.rmSync(marker, { force: true }); } catch { /* ignore */ }
@@ -322,6 +326,7 @@ async function main() {
   });
   server2.stderr?.on('data', (d) => process.stderr.write(`  [server2!] ${d}`));
   if (!(await waitHealth(port2))) throw new Error('restarted server never became healthy');
+  if (!(await waitRuntimeReady(port2, { ms: 120_000 }))) throw new Error('restarted server: boot runtime check never admitted host sessions');
   let reaped = false;
   for (let i = 0; i < 120 && !reaped; i++) { reaped = !pidAlive(host.hostPid); if (!reaped) await sleep(1000); }
   check('RE-ADOPT: the restarted server drained + reaped the surviving broker (no orphan)', reaped,

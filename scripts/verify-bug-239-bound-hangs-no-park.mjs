@@ -32,6 +32,7 @@ import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 import { isolatedServerEnv, isolatedStoreEnv } from './lib/station-boot.mjs';
+import { waitRuntimeReady } from './lib/host-admission.mjs';
 
 const args = process.argv.slice(2);
 const FAST = args.includes('--fast');
@@ -368,6 +369,9 @@ async function bootServer(label, extraEnv) {
   let up = false;
   for (let k = 0; k < 120 && !up; k++) { try { await fetch(`${BASE}/api/health`); up = true; } catch { await sleep(250); } }
   if (!up) throw new Error(`${label}: server never became healthy:\n${log.join('').slice(-2000)}`);
+  // FEAT-206: a fresh server refuses host session starts ("runtime check pending") until its
+  // FEAT-151 boot runtime check passes; without this wait every real-CLI arm's start was refused.
+  if (!(await waitRuntimeReady(PORT, { ms: 120_000 }))) throw new Error(`${label}: boot runtime check never admitted host sessions`);
   return { PORT, BASE, DATA, WORK, CFG, child, log, dirs: [DATA, WORK, CFG] };
 }
 

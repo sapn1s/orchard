@@ -466,6 +466,7 @@ FE = frontend (app.js / drawer.js), serialized with each other. SV = server.
 | FEAT-205 | Lane waits re-write the whole prompt cache every ten minutes | 40c1df0 |
 | FEAT-201 | Grant git writes for a user-chosen duration such as 24 hours | (uncommitted) |
 | BUG-289 | Docker sandbox image store grows unbounded, fills the SSD | (uncommitted) |
+| BUG-287 | Settings opens in project scope: Provider reads Claude for OpenAI session | (uncommitted) |
 | BUG-283 | A refused mount save is invisible behind the settings drawer | (uncommitted) |
 
 ## Shipped earlier (pre-tracker)

@@ -1379,6 +1379,20 @@ const assistantProse = (text) => renderAssistantText(text, {
 let gitView;
 const drawer = createDrawer({
   getProject: currentProject,
+  // BUG-287 — the id of the session the drawer is OPENED OVER (null for a
+  // pending-new / project view). The lens default reads this so opening Settings
+  // from a session lands on "This session" — the scope whose Provider shows the
+  // session's real pinned engine, not the project default that contradicts it.
+  // A FOREIGN dock (session of project A open, project B selected in the sidebar,
+  // BUG-106) is not "a session in view" for B: Settings for B must open on B's
+  // project lens, not show A's pinned engine under B's name (BUG-287 IV r1).
+  getSessionId: () => (dockIsForeign() ? null : state.current?.sessionId ?? null),
+  // BUG-287 IV r2 — under a FOREIGN dock the selected project has NO session in view, so
+  // its Settings has no session to show or override: "This session" there would paint the
+  // docked session's engine (and act on it) under the other project's name. The drawer
+  // disables that lens and names the real owner. Returns the owner's name, or null.
+  getForeignDockOwner: () => (dockIsForeign()
+    ? (state.projects.find((p) => p.id === state.openProjectId)?.name ?? 'another project') : null),
   overrides: state.overrides,
   getEffective: () => state.effective,
   // BUG-135 — the drawer needs the running session's OWN attach report to say

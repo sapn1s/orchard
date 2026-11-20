@@ -5834,6 +5834,10 @@ const WIRING_STATE = {
     // BUG-283 r4 — a project change under an open drawer drops every draft: text
     // typed for one project must never be saved into another.
     if ((project()?.id ?? null) !== edit.pid) resetEdit(true);
+    // BUG-287 IV r3 — the dock can turn foreign UNDER an open drawer (another project
+    // selected): leave the session lens on every paint, not only in open(), so the docked
+    // session's engine/actions are never painted under this project's name.
+    if (d.scope === 'session' && ctx.getForeignDockOwner?.()) { resetEdit(false); d.scope = 'project'; }
     // An IME composition dies if its input is rebuilt: hold background paints until it ends.
     if (edit.composing) { edit.paintPending = true; return; }
     if (d.view === 'editor') { paintChrome(); return; }
@@ -5912,16 +5916,23 @@ const WIRING_STATE = {
     /* The lens is a WRITE TARGET, not navigation: absent where there is
        nothing to write to. */
     node.scope.hidden = machine || d.view === 'editor';
-    const sessionOk = !!project();
+    // BUG-287 IV r2 — "This session" means a session OF the project named above. Under a
+    // foreign dock (a session of another project is open, this one is only selected) there
+    // is none, so the lens is disabled exactly like the no-project case — never painting
+    // (or acting on) the docked session under this project's name.
+    const foreignOwner = project() ? (ctx.getForeignDockOwner?.() ?? null) : null;
+    const sessionOk = !!project() && !foreignOwner;
     for (const b of node.scope.querySelectorAll('[data-scope]')) {
       b.setAttribute('aria-pressed', b.dataset.scope === d.scope ? 'true' : 'false');
       if (b.dataset.scope === 'session') {
         b.disabled = !sessionOk;
-        b.title = sessionOk ? '' : 'No project selected, so there is no session to override.';
+        b.title = sessionOk ? ''
+          : foreignOwner ? `No ${project().name} session is open — the open session belongs to ${foreignOwner}. Open a ${project().name} session to override its settings.`
+          : 'No project selected, so there is no session to override.';
       }
     }
     node.hint.textContent = machine ? 'Applies to every project on this machine'
-      : !sessionOk ? 'No project selected — nothing to write to'
+      : !project() ? 'No project selected — nothing to write to'
       : d.scope === 'project' ? 'Writing to this project · sessions inherit these'
       : 'Writing to this session only · the project default is untouched';
     // Round 4 — the live-state line is a note at the TOP OF THE PANE, not a
@@ -6135,6 +6146,16 @@ const WIRING_STATE = {
        machine is a rail group now, so it maps to the Accounts category. */
     const machineAsked = opts?.scope === 'machine' || view === 'globals';
     if (opts?.scope === 'project' || opts?.scope === 'session') d.scope = opts.scope;
+    // BUG-287 — with no scope asked, the lens follows WHAT IS ON SCREEN: opened
+    // over a session it lands on "This session" (so Provider shows that session's
+    // real pinned engine, not the project default that reads as a contradiction);
+    // opened with no session in view it lands on "This project". Machine-scope
+    // opens hide the lens entirely, so they keep their own routing.
+    else if (!machineAsked) d.scope = ctx.getSessionId?.() ? 'session' : 'project';
+    // BUG-287 IV r2 — under a foreign dock there is no session of this project to show, so
+    // no path (an explicit {scope:'session'}, or a scope left over from an earlier open)
+    // may land on the session lens.
+    if (d.scope === 'session' && ctx.getForeignDockOwner?.()) d.scope = 'project';
     const focusKey = opts?.focus ? String(opts.focus) : null;
     let cat = machineAsked ? 'accounts'
       : focusKey ? (FOCUS_CATEGORY[focusKey] ?? null)

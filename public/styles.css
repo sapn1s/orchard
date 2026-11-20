@@ -2048,6 +2048,25 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   max-width: 62ch;
 }
 .slive[hidden] { display: none; }
+/* A save the server refused, shown INSIDE the drawer (the footer strip the old
+   code used is covered by the open drawer). It is the first child of the scroll
+   host and STICKS to the top of the pane: a refused add-form (mounts, ports,
+   services) is often below the fold, so a top-of-pane note that scrolls away
+   with the content would be as invisible as the footer was. Sticky keeps the
+   refusal on screen while the user's typed value stays put where they typed it.
+   .port-refused error treatment; a solid background so scrolled content can't
+   show through it. A static child of the scroll host — paint() never rebuilds it. */
+.smerr {
+  display: block; position: sticky; top: 0; z-index: 2;
+  margin: 0 0 12px; padding: 7px 10px;
+  border-radius: 6px; border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--hair));
+  border-left: 3px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, var(--window));
+  font-size: 12px; line-height: 1.5; color: var(--ink-2);
+  max-width: 62ch; word-break: break-word;
+}
+.smerr::before { content: "⚠ "; color: var(--warn); font-weight: 600; }
+.smerr[hidden] { display: none; }
 .spane::-webkit-scrollbar { width: 9px; }
 .spane::-webkit-scrollbar-thumb { background: var(--hair); border-radius: 9px; border: 3px solid var(--window); }
 /* Cards are capped and LEFT-aligned — a centred column inside a 700px pane

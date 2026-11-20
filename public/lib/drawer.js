@@ -76,6 +76,7 @@ const PROJECT_ONLY = new Set(['isolation', 'mounts', 'container', 'laneDocker'])
 
 export function createDrawer(ctx) {
   /* ctx: { getProject(), refreshProject(), overrides, notify(msg,isErr), onStackChanged() } */
+  let painting = false; // BUG-283 r3 — true while paint() rebuilds the pane (see bindField)
   const d = {
     view: 'settings',
     back: null,
@@ -89,8 +90,21 @@ export function createDrawer(ctx) {
     runtimeBusy: false,   // a host update POST is in flight
     runtimePinBusy: false, // a container-pin POST is in flight
     composed: null,
+    /* A save the server refused, shown inline at the top of the pane (the footer
+       strip `say()` used is covered by the open drawer, so it reached the user
+       as nothing but a console line). Cleared on any successful notify, on a
+       category switch, and on open/close. */
+    saveErr: null,
+    /* Which add-forms are open. Their typed text lives in the edit model
+       (`edit.drafts`, BUG-283 r4), not here. */
     addingMount: false,
     addingEnv: false,
+    /* FEAT-200 — a save that would cancel an approved access request waits here for
+       the user's confirm: { patch, hits, group }. Cleared by resetEdit(). */
+    accessConfirm: null,
+    /* Machine Defaults: the user chose "Custom model id…" and the free-text row is
+       open (BUG-283 r5: kept across repaints; cleared by resetEdit()). */
+    gModelCustomOpen: false,
     armSocket: false,
     browser: undefined, // undefined = unfetched, null = route absent
     providers: undefined, // FEAT-037 P3: /api/providers verdicts (undefined = unfetched, null = route absent)
@@ -184,6 +198,7 @@ export function createDrawer(ctx) {
     hint: $('#dHint'),
     whyAll: $('#dWhyAll'),
     liveLine: $('#dLive'),
+    saveErr: $('#dSaveErr'),
     title: $('#dTitle'),
     eyebrow: $('#dEyebrow'),
     back: $('#dBack'),
@@ -245,6 +260,7 @@ export function createDrawer(ctx) {
     iso: 'isolation',
     mounts: 'isolation',
     env: 'isolation',
+    ports: 'isolation',
     services: 'isolation',
     laneDocker: 'isolation',
     git: 'workspace',
@@ -330,32 +346,371 @@ export function createDrawer(ctx) {
   }
   const isOvr = (field) => overriddenNow(field);
 
-  async function put(field, value) {
+  /**
+   * Update the inline save-error line directly. It is a static child of the
+   * scroll host (a sibling of the `.view` hosts), so paint() never rebuilds it;
+   * this writes it the same way paintChrome writes `node.liveLine`.
+   */
+  function paintSaveErr() {
+    if (!node.saveErr) return;
+    node.saveErr.textContent = d.saveErr ?? '';
+    const shown = !!d.saveErr && d.view !== 'editor';
+    node.saveErr.hidden = !shown;
+    // The banner is position:sticky at the top of the scroll host. Reserve its
+    // height as scroll-padding ONLY while it is shown, so a scrollIntoView target
+    // (the preserved add-form input) lands BELOW the banner instead of under it —
+    // the banner then stays visible on scroll without ever covering a control.
+    // BUG-283 r4 (F3): the banner sticks at the pane's CONTENT edge, i.e. #dBody's
+    // own padding-top below the scrollport, so the reservation is padding + height
+    // + gap — height + gap alone left the landing line 4 px under the banner.
+    // BUG-283 r6: sticking at the CONTENT edge left a padding-high strip ABOVE the banner
+    // through which scrolled controls showed (a cut-off button peeking over the warning).
+    // A negative `top` of the same padding pins it flush on the scrollport's top edge, so
+    // the reservation is just height + gap.
+    if (node.body) {
+      const pad = shown ? parseFloat(getComputedStyle(node.body).paddingTop) || 0 : 0;
+      node.saveErr.style.top = shown ? `${-pad}px` : '';
+      node.body.style.scrollPaddingTop = shown ? `${node.saveErr.offsetHeight + 12}px` : '';
+    }
+  }
+
+  /**
+   * The ONE place a drawer message is shown. It still goes to `ctx.notify`
+   * (the footer strip + console, for when the drawer is closed), but an error
+   * ALSO lands on the inline line at the top of the pane — inside the drawer,
+   * where the user can actually see it. Any non-error message (a success toast)
+   * clears a standing error: the thing it was blocking now worked.
+   */
+  function notify(msg, isErr = false) {
+    ctx.notify(msg, isErr);
+    d.saveErr = isErr ? String(msg ?? '') : null;
+    paintSaveErr();
+  }
+
+  /* ───────── BUG-283 r4 / BUG-285 — the ONE edit model and the ONE commit path ─────────
+   *
+   * paint() rebuilds the whole pane on every background event, and Chrome fires
+   * `blur` on a focused node as it is removed. Rounds 1-3 guarded one save-on-blur
+   * call site at a time, and each round the attacker found a site still saving a
+   * render's blur (a truncated value), a flag read from the wrong place (a refused
+   * value resent on close), or a focus grab aimed at a field the user had left.
+   *
+   * So the transient edit state lives in ONE place and has ONE writer path:
+   *   - `edit.drafts`  what the user typed and has not committed, per field key;
+   *                    every render renders FROM it (never reads truth from the DOM),
+   *                    so a repaint can neither lose typed text nor need to save it.
+   *   - bindField()    the ONLY place a free-text field gets its save-on-blur/Enter
+   *                    listeners (scripts/verify-bug-283-r4-edit-model.mjs (S) greps it).
+   *   - commitField()  the ONLY function that saves such a field. It takes the value
+   *                    from the draft; saves only a value that differs from the stored
+   *                    one and (unless it is an explicit Enter) from the last refused
+   *                    one; one save per field in flight, one queued re-run at most.
+   *   - resetEdit()    the ONLY place this state is cleared: open, close, category or
+   *                    lens switch, project change.
+   * A blur is the USER leaving only if, a microtask later, the field is still in the
+   * document, the drawer is open and the window still has it focused — a blur from
+   * removal (whatever removed it), from closing, or from the window losing focus never
+   * saves.
+   */
+  const edit = {
+    epoch: 0,        // bumped by every resetEdit(): a result from an older epoch never touches drafts/confirms
+    openSeq: 0,      // bumped on open/close/project change: an older result never reaches the inline banner
+    pid: null,       // the project the drafts belong to
+    drafts: new Map(),   // key -> { value, refused }   (refused: the last value the save refused, or null)
+    reg: new Map(),      // key -> the latest render's binding { base, commit, equals?, onEmpty? }
+    busy: new Set(),     // keys with a save in flight
+    queued: new Map(),   // key -> { v, r }: the value committed while busy (re-run once, never re-read)
+    focusKey: null,      // the bound field the user is in (focusin sets it, a user blur clears it)
+    sel: null,           // its caret, captured at paint start
+    reveal: null,        // scroll this field into view after the next paint (a form opened / refused)
+    composing: false,    // an IME composition is open: background paints wait for it
+    paintPending: false,
+  };
+
+  function resetEdit(hard) {
+    edit.epoch++;
+    if (hard) edit.openSeq++;
+    edit.pid = project()?.id ?? null;
+    edit.drafts.clear();
+    edit.busy.clear();
+    edit.queued.clear();
+    edit.focusKey = null;
+    edit.sel = null;
+    edit.reveal = null;
+    edit.composing = false;
+    edit.paintPending = false;
+    d.saveErr = null;
+    d.addingMount = false; d.addingEnv = false; d.addingPort = false; d.addingService = false;
+    // BUG-283 r5 (verify r4 d1) — EVERY armed confirm card and per-visit edit buffer is
+    // cleared here, in the one reset. scripts/verify-bug-283-r4-edit-model.mjs (S2)
+    // fails if a `d` key named *confirm*/*arm* is not reset in this function.
+    d.accessConfirm = null;
+    d.acctConfirm = null;
+    d.confirmDelete = null;
+    d.memConfirm = null;
+    d.procConfirm = null;
+    d.gitArm = null;
+    d.wiringArm = null;
+    d.armSocket = false;
+    d.restore = null;
+    if (d.repoint) d.repoint.arm = null;
+    d.customEdit = null;
+    d.gModelCustomOpen = false;
+    if (!d.acctAdd?.busy) d.acctAdd = null;
+  }
+
+  /** The field's draft differs from what is stored (normalised by the binding). */
+  function isDirty(key) {
+    const r = edit.reg.get(key);
+    const dr = edit.drafts.get(key);
+    return !!(r && dr) && !(r.equals ?? Object.is)(dr.value, r.base);
+  }
+
+  /**
+   * Bind a free-text field to the edit model. `o.base` is the stored value as text;
+   * `o.commit(value, settle)` saves it and returns true / false (refused) / 'same'
+   * (normalises to the stored value) — calling settle(ok) before its own repaint;
+   * `o.equals` normalises; `o.onEmpty` marks an add-form (empty text closes it, Enter
+   * commits and stays); `o.multiline` makes Ctrl/⌘+Enter the commit key.
+   */
+  function bindField(input, key, o) {
+    input.dataset.ek = key;
+    edit.reg.set(key, o);
+    const dr = edit.drafts.get(key);
+    input.value = dr ? dr.value : o.base;
+    if (dr && dr.refused !== null && dr.refused === dr.value) input.setAttribute('aria-invalid', 'true');
+    input.addEventListener('input', () => {
+      const cur = edit.drafts.get(key);
+      edit.drafts.set(key, { value: input.value, refused: cur ? cur.refused : null });
+      input.removeAttribute('aria-invalid');
+    });
+    input.addEventListener('compositionstart', () => { edit.composing = true; });
+    input.addEventListener('compositionend', () => {
+      edit.composing = false;
+      if (edit.paintPending) { edit.paintPending = false; paint(); }
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter' && (!o.multiline || e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        takeLive(input);
+        void commitField(key, 'enter');
+        if (!o.onEmpty) input.blur(); // a row's Enter also leaves the field (its blur is then a no-op)
+      } else if (e.key === 'Escape' && (o.onEmpty || edit.drafts.has(key))) {
+        // Innermost first: Esc in an add-form closes the form; Esc in an edited row
+        // reverts it. Neither may also close the drawer on the same keypress.
+        e.preventDefault();
+        e.stopPropagation();
+        edit.drafts.delete(key);
+        if (o.onEmpty) o.onEmpty();
+        paint();
+      }
+    });
+    input.addEventListener('blur', () => { // BUG-283 r4: the one save-on-blur listener in this file
+      if (painting || !isOpenNow) return;
+      queueMicrotask(() => {
+        if (!input.isConnected || !isOpenNow) return;   // removed by a render, or the drawer closed
+        if (document.activeElement === input) return;   // the WINDOW lost focus; the user is still here
+        if (edit.focusKey === key) edit.focusKey = null;
+        takeLive(input);
+        void commitField(key, 'blur');
+      });
+    });
+  }
+
+  /** At an explicit commit, the LIVE (connected) field the user acted in is the
+   *  truth for its own text — e.g. a value set without an `input` event. Never
+   *  called for a removed node, so a render can't feed a stale twin's text in. */
+  function takeLive(el) {
+    const key = el?.dataset?.ek;
+    const r = key ? edit.reg.get(key) : null;
+    if (!r || !el.isConnected) return;
+    const cur = edit.drafts.get(key);
+    if (el.value !== (cur ? cur.value : r.base)) edit.drafts.set(key, { value: el.value, refused: cur ? cur.refused : null });
+  }
+
+  /** The ONE save path for a bound field. `how`: enter | blur | close | queued. */
+  async function commitField(key, how, fixed = null) {
+    // `fixed` = a commit queued while this field's save was in flight: it carries the
+    // VALUE the user committed then and the binding it was committed through. It is
+    // never re-read from the draft — text typed after that commit is not committed
+    // (BUG-283 r5, verify r4 b1) — and it does not need the row to be rendered now.
+    const r = fixed ? fixed.r : edit.reg.get(key);
+    if (!r || r.draftOnly) return; // not rendered (category switched), or an explicit-Save field
+    const dr = edit.drafts.get(key);
+    if (!fixed && !dr && !r.onEmpty) return;
+    const v = fixed ? fixed.v : (dr ? dr.value : r.base);
+    if (r.onEmpty && !v.trim()) {
+      if (how !== 'close' && how !== 'queued') { edit.drafts.delete(key); r.onEmpty(); paint(); }
+      return;
+    }
+    if (dr && dr.refused === v && how !== 'enter') return; // refused, unchanged: only an explicit Enter retries
+    // While a save of this field is in flight the rendered "stored" value is about to be
+    // stale, so a commit is queued BEFORE comparing with it: committing the old value
+    // back right after another commit is a real change (verify r5: "alpine:3" then
+    // "debian:12" when debian:12 was stored before). The queued run compares afresh.
+    if (edit.busy.has(key)) { if (how !== 'close') edit.queued.set(key, { v, r }); return; }
+    // the stored value as of the latest render; a queued run whose row is not rendered now
+    // has no fresh base, so it lets the commit itself compare against fresh settings ('same')
+    const latest = edit.reg.get(key);
+    if ((!fixed || latest) && (r.equals ?? Object.is)(v, (latest ?? r).base)) { if (dr && dr.value === v) edit.drafts.delete(key); return; }
+    const ep = edit.epoch;
+    const tk = ticket();
+    edit.busy.add(key);
+    let settled = false;
+    const settle = (ok) => { settled = true; settleDraft(key, v, ok, ep); };
+    let res = false;
+    try {
+      res = await r.commit(v, settle);
+    } catch (err) {
+      tell(tk, `could not save: ${err?.message ?? err}`, true);
+      res = false;
+    } finally {
+      if (ep === edit.epoch) edit.busy.delete(key);
+    }
+    if (!settled) {
+      settleDraft(key, v, res !== false, ep);
+      if (ep === edit.epoch) paint();
+    }
+    const q = ep === edit.epoch ? edit.queued.get(key) : null;
+    // a queued commit of the very value just sent adds nothing (saved, or refused unchanged)
+    if (q) { edit.queued.delete(key); if (q.v !== v) void commitField(key, 'queued', q); }
+  }
+
+  /** The user has typed past `v` in this field (text newer than the value just saved). */
+  const newerThan = (key, v) => { const dr = edit.drafts.get(key); return !!dr && dr.value !== v; };
+
+  /**
+   * A field whose text the edit model owns but which saves only through its own
+   * explicit button (custom model ids, the repo name, the restore confirmation,
+   * the account label, the sign-in code). A repaint renders it FROM the draft and
+   * puts the user's focus and caret back; it has no save-on-blur and commitField
+   * never saves it. `base` is the text to show when there is no draft.
+   */
+  function bindDraft(input, key, base) {
+    input.dataset.ek = key;
+    edit.reg.set(key, { base, draftOnly: true });
+    const dr = edit.drafts.get(key);
+    input.value = dr ? dr.value : base;
+    input.addEventListener('input', () => { edit.drafts.set(key, { value: input.value, refused: null }); });
+    input.addEventListener('compositionstart', () => { edit.composing = true; });
+    input.addEventListener('compositionend', () => {
+      edit.composing = false;
+      if (edit.paintPending) { edit.paintPending = false; paint(); }
+    });
+  }
+
+  function settleDraft(key, v, ok, ep) {
+    if (ep !== edit.epoch) return;
+    const dr = edit.drafts.get(key);
+    if (!dr) return;
+    if (ok) {
+      if (dr.value === v) edit.drafts.delete(key); // kept typing meanwhile? keep the newer text
+      else dr.refused = null;
+    } else {
+      dr.refused = v;
+      if (edit.focusKey === key) edit.reveal = key;
+    }
+  }
+
+  /** Open an add-form and put the user in it (focus is restored by paint()). */
+  function openAddForm(flag, key) {
+    d[flag] = true;
+    edit.drafts.delete(key);
+    edit.focusKey = key;
+    edit.sel = null;
+    edit.reveal = key;
+    d.saveErr = null;
+    paint();
+  }
+
+  /* Saves to one server resource run one at a time, each building its value when it
+     RUNS (from the settings the previous save refreshed), not from a list captured
+     at render time — a × click racing an add-form's blur-save cannot drop or revive
+     an entry. `ticket()` pins the project, edit epoch and open-sequence the save was
+     made in; a result from another one only reaches the footer and never the drafts. */
+  const chains = new Map();
+  function serial(res, task) {
+    const p = (chains.get(res) ?? Promise.resolve()).then(task);
+    chains.set(res, p.then(() => {}, () => {}));
+    return p;
+  }
+  const ticket = () => ({
+    pid: project()?.id ?? null, ep: edit.epoch, seq: edit.openSeq,
+    // where the save was made, so a refusal that lands after a section/lens switch says so
+    where: `${catOf(d.cat).label}${d.scope === 'session' ? ' · this session' : ''}`,
+  });
+  const current = (t) => t.seq === edit.openSeq && isOpenNow;
+  /* A refusal is the user's to see, so within one open of the drawer it always reaches
+     the inline banner (the footer is under the drawer). If the user has moved to
+     another section or lens since, it is LABELLED with the section it came from
+     (orchestrator decision after verify r4 d2) — never shown as if it were this one's. */
+  function saveFailed(t, msg) { tell(t, msg, true); }
+  /* BUG-283 r6 (verify r5 d1/d2) — the ONE way a message that lands AFTER an await, in a
+     catch or in a later event reaches the user: `tk = ticket()` is taken when the user
+     acts, and the result is shown against THAT open of the drawer. Made in an open that
+     has since closed: footer only (ctx.notify), never the banner of a reopened drawer.
+     Same open, another section/lens: an error is labelled with where it came from; a
+     success goes to the footer and does not clear that section's standing error.
+     scripts/verify-bug-283-r4-edit-model.mjs (S4) fails on a bare notify call after an await. */
+  function tell(t, msg, isErr = false) {
+    if (!current(t)) { ctx.notify(msg, isErr); return; }
+    if (t.ep !== edit.epoch) {
+      if (isErr) notify(`${t.where} — ${msg}`, true); else ctx.notify(msg, false);
+      return;
+    }
+    notify(msg, isErr);
+  }
+  function saveOk(t) { if (current(t) && t.ep === edit.epoch) d.saveErr = null; } // the save that was refused now worked
+  function settleIf(t, settle, ok) { if (t.ep === edit.epoch) settle?.(ok); }
+  const valueOf = (v) => (typeof v === 'function' ? v() : v);
+  function projectMoved(t, what) {
+    if ((project()?.id ?? null) === t.pid) return false;
+    ctx.notify(`not saved: the project changed before ${what} could be saved`, true);
+    return true;
+  }
+
+  /* `settle(ok)` (optional) lets a caller set its own state for the outcome
+     BEFORE the one repaint put() does, so a save is one render, not two.
+     `value` may be a function, evaluated when the save runs (see serial()). */
+  async function put(field, value, settle = null) {
     // BUG-196 round 5 — a SESSION-scope provider never lands in ctx.overrides from
     // here: it goes through the app's one guarded writer (pickProvider), which
     // refuses a switch for an existing session id, pinned yet or not.
     if (d.scope === 'session' && field === 'provider') {
-      ctx.pickSessionProvider?.(value ?? null);
+      ctx.pickSessionProvider?.(valueOf(value) ?? null);
+      settle?.(true);
       paint();
-      return;
+      return true;
     }
     if (d.scope === 'session') {
-      if (JSON.stringify(value) === JSON.stringify(base(field))) delete ctx.overrides[field];
-      else ctx.overrides[field] = value;
+      const v = valueOf(value);
+      if (JSON.stringify(v) === JSON.stringify(base(field))) delete ctx.overrides[field];
+      else ctx.overrides[field] = v;
       ctx.onStackChanged?.();
+      settle?.(true);
       paint();
-      return;
+      return true;
     }
-    try {
-      await api.patchProject(project().id, { [field]: value });
-      await ctx.refreshProject();
-      ctx.onStackChanged?.();
-      d.composed = null;
-      paint();
-    } catch (err) {
-      ctx.notify(`could not save ${field}: ${err.message}`, true);
-      paint();
-    }
+    const t = ticket();
+    return serial(`project.${field}`, async () => {
+      if (projectMoved(t, field)) { settleIf(t, settle, false); return false; }
+      try {
+        await api.patchProject(t.pid, { [field]: valueOf(value) });
+        await ctx.refreshProject();
+        ctx.onStackChanged?.();
+        d.composed = null;
+        saveOk(t);
+        settleIf(t, settle, true);
+        paint();
+        return true;
+      } catch (err) {
+        saveFailed(t, `could not save ${field}: ${err.message}`);
+        settleIf(t, settle, false);
+        paint();
+        return false;
+      }
+    });
   }
 
   const show = (v) =>
@@ -675,6 +1030,7 @@ export function createDrawer(ctx) {
       if (v === CUSTOM_OPT) {
         const stored = isSet(cur) ? String(cur) : '';
         d.customEdit = { field, text: stored, focus: true };
+        edit.drafts.delete(`custom:${field}`); // a fresh editor starts from the stored value
         paint();
         return;
       }
@@ -700,7 +1056,7 @@ export function createDrawer(ctx) {
       type: 'text', class: 'gtext', id: `cust-${cssId(field)}`, spellcheck: 'false', autocomplete: 'off',
       placeholder: spec.placeholder ?? '', 'aria-label': `Custom ${label.toLowerCase()}`, 'aria-describedby': errId,
     });
-    input.value = d.customEdit.text ?? '';
+    bindDraft(input, `custom:${field}`, d.customEdit.text ?? '');
     const save = el('button', { type: 'button', class: 'mini primary', text: 'Save' });
     const cancel = el('button', { type: 'button', class: 'mini', text: 'Cancel' });
     const err = el('div', { class: 'set-edit-err', id: errId, role: 'alert' });
@@ -760,21 +1116,24 @@ export function createDrawer(ctx) {
       type: 'text', inputmode: 'decimal', class: 'snum', id: `num-${cssId(field)}`,
       spellcheck: 'false', autocomplete: 'off', placeholder: 'No cap', 'aria-label': `${label} in US dollars`,
     });
-    input.value = isSet(cur) ? String(Number(cur)) : '';
-    const commit = () => {
-      const t = input.value.trim().replace(/^\$/, '');
-      if (!t) { if (isSet(cur)) void put(field, null); return; }
-      const nval = Number(t);
-      if (!Number.isFinite(nval) || nval <= 0) {
-        ctx.notify(`${label}: enter an amount above zero, or leave it empty for no cap`, true);
-        input.value = isSet(cur) ? String(Number(cur)) : '';
-        return;
-      }
-      if (nval === Number(cur)) return;
-      void put(field, nval);
-    };
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
+    const amount = (t) => t.trim().replace(/^\$/, '');
+    bindField(input, `money:${field}`, {
+      base: isSet(cur) ? String(Number(cur)) : '',
+      equals: (a, b) => amount(a) === amount(b) || (amount(a) !== '' && Number(amount(a)) === Number(amount(b))),
+      commit: (v, settle) => {
+        const cur = val(field); // fresh when the commit runs (a queued commit may outlive this render)
+        const t = amount(v);
+        if (!t) return isSet(cur) ? put(field, null, settle) : 'same';
+        const nval = Number(t);
+        if (!Number.isFinite(nval) || nval <= 0) {
+          // BUG-283 r4: the typed text is kept (with the banner), not reset under the user
+          notify(`${label}: enter an amount above zero, or leave it empty for no cap`, true);
+          return false;
+        }
+        if (nval === Number(cur)) return 'same';
+        return put(field, nval, settle);
+      },
+    });
     wrap.append(el('span', { class: 'smoney-u', 'aria-hidden': 'true', text: '$' }), input);
     return wrap;
   }
@@ -793,18 +1152,15 @@ export function createDrawer(ctx) {
       placeholder: 'None (e.g. Bash, Read)',
       'aria-label': label,
     });
-    input.value = Array.isArray(cur) ? cur.join(', ') : '';
-    const commit = () => {
-      const next = input.value.split(',').map((s) => s.trim()).filter(Boolean);
-      if (JSON.stringify(next) === JSON.stringify(cur)) return;
-      void put(field, next);
-    };
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        input.blur();
-      }
+    const parse = (t) => t.split(',').map((s) => s.trim()).filter(Boolean);
+    bindField(input, `list:${field}`, {
+      base: Array.isArray(cur) ? cur.join(', ') : '',
+      equals: (a, b) => JSON.stringify(parse(a)) === JSON.stringify(parse(b)),
+      commit: (v, settle) => {
+        const next = parse(v);
+        if (JSON.stringify(next) === JSON.stringify(val(field) ?? [])) return 'same'; // fresh, not the render's
+        return put(field, next, settle);
+      },
     });
     n.append(input);
     // No `why`: what a session may or may not reach is security posture, and
@@ -985,6 +1341,7 @@ export function createDrawer(ctx) {
 
   function openRepoint(p) {
     d.repoint = { offer: undefined, arm: null, manual: '', busy: false, result: null };
+    edit.drafts.delete('repoint.manual'); // a new panel starts empty
     paint();
     api.repointCandidates(p.id)
       .then((offer) => { if (d.repoint) d.repoint.offer = offer; paint(); })
@@ -1035,7 +1392,8 @@ export function createDrawer(ctx) {
     /* Always a manual path: the right directory may be nowhere near the old one. */
     const manual = el('div', { class: 'cand', 'data-conf': 'manual' });
     const mrow = el('div', { class: 'top' });
-    const input = el('input', { class: 'dir-input', type: 'text', placeholder: '/path/to/the/directory', value: r.manual });
+    const input = el('input', { class: 'dir-input', type: 'text', placeholder: '/path/to/the/directory', 'aria-label': 'New project directory' });
+    bindDraft(input, 'repoint.manual', r.manual ?? '');
     input.addEventListener('input', () => { d.repoint.manual = input.value; });
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && input.value.trim()) { d.repoint.manual = input.value; d.repoint.arm = input.value.trim(); paint(); }
@@ -1069,6 +1427,7 @@ export function createDrawer(ctx) {
   }
 
   async function applyRepoint(p, hostPath) {
+    const tk = ticket();
     d.repoint.busy = true;
     paint();
     try {
@@ -1086,7 +1445,7 @@ export function createDrawer(ctx) {
     } catch (err) {
       d.repoint.busy = false;
       d.repoint.arm = null;
-      ctx.notify(`could not repoint: ${err.message}`, true);
+      tell(tk, `could not repoint: ${err.message}`, true);
       paint();
     }
   }
@@ -1254,7 +1613,8 @@ export function createDrawer(ctx) {
         r.append(el('span', { class: 'm', text: m.readOnly ? 'ro' : 'rw' }));
         if (!sessionScope) {
           const x = el('button', { class: 'x', 'aria-label': 'Remove mount', text: '×' });
-          x.addEventListener('click', () => put('mounts', mounts.filter((_, j) => j !== i)));
+          // BUG-283 r4: built when the save runs, by identity (not a render-time index)
+          x.addEventListener('click', () => put('mounts', () => (settings().mounts ?? []).filter((q) => !(q.hostPath === m.hostPath && q.containerPath === m.containerPath))));
           r.append(x);
         }
         access.append(r);
@@ -1263,7 +1623,7 @@ export function createDrawer(ctx) {
         if (d.addingMount) access.append(mountForm(mounts));
         else {
           const add = el('button', { class: 'addrow', text: '+ Add mount' });
-          add.addEventListener('click', () => { d.addingMount = true; paint(); });
+          add.addEventListener('click', () => openAddForm('addingMount', 'add:mount'));
           access.append(add);
         }
       }
@@ -1271,7 +1631,7 @@ export function createDrawer(ctx) {
       if (sessionScope) access.append(projectOnlyNote('Mounts and the socket flag'));
     }
 
-    return catWrap('isoSection', runtime, laneDockerGroup(p, sessionScope), access, envGroup(p, sessionScope), servicesGroup(p, sessionScope));
+    return catWrap('isoSection', runtime, laneDockerGroup(p, sessionScope), access, envGroup(p, sessionScope), portsGroup(p, sessionScope), servicesGroup(p, sessionScope));
   }
 
   /* ---- BUG-223 round 4 — which Docker daemon this project's sessions and lanes
@@ -1739,6 +2099,7 @@ export function createDrawer(ctx) {
   }
 
   async function putTools(patch) {
+    const tk = ticket();
     try {
       /*
        * BUG-088: send the COMPLETE tool state, not a one-key partial.
@@ -1758,7 +2119,7 @@ export function createDrawer(ctx) {
       await ctx.refreshProject();
       paint();
     } catch (err) {
-      ctx.notify(`could not save tool settings: ${err.message}`, true);
+      tell(tk, `could not save tool settings: ${err.message}`, true);
       paint();
     }
   }
@@ -1833,40 +2194,51 @@ export function createDrawer(ctx) {
       placeholder: 'Optional per-project nudge — verbosity, detail, style, when to emit. Steers tone only; the JSON format stays fixed.',
       'aria-label': 'Response-format guidance',
     });
-    ta.value = cur;
+    // Cmd/Ctrl+Enter commits; plain Enter is a newline (multiline).
+    bindField(ta, 'responseDigest.guidance', {
+      base: cur,
+      multiline: true,
+      equals: (a, b) => a.trim() === b.trim(),
+      commit: (v, settle) => {
+        const next = v.trim();
+        const now = settings().responseDigest?.guidance; // fresh, not the render's
+        if (next === (typeof now === 'string' ? now : '').trim()) return 'same';
+        return putResponseDigest({ guidance: next || null }, settle);
+      },
+    });
     if (readOnly) ta.disabled = true;
     const count = el('div', { class: 'grp-note guidance-count' });
     const paintCount = () => { count.textContent = `${ta.value.length} / ${GUIDANCE_MAX}`; };
     paintCount();
     ta.addEventListener('input', paintCount);
-    const commit = () => {
-      const next = ta.value.trim();
-      if (next === cur.trim()) return;
-      void putResponseDigest({ guidance: next || null });
-    };
-    ta.addEventListener('blur', commit);
-    ta.addEventListener('keydown', (e) => {
-      // Cmd/Ctrl+Enter commits without leaving the field; plain Enter is a newline.
-      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); ta.blur(); }
-    });
     wrap.append(ta, count);
     return wrap;
   }
 
-  async function putResponseDigest(patch) {
-    try {
-      // Send the resolved full object (defaults filled), same reason as putTools
-      // (BUG-088): patchProject's echo-check compares sent leaves against the
-      // server echo, and a partial on a project with no stored responseDigest
-      // would be echoed as a defaults-filled superset.
-      await api.patchProject(project().id, { responseDigest: { ...effectiveDigest(), ...patch } });
-      await ctx.refreshProject();
-      d.composed = null;
-      paint();
-    } catch (err) {
-      ctx.notify(`could not save response-format settings: ${err.message}`, true);
-      paint();
-    }
+  async function putResponseDigest(patch, settle = null) {
+    const t = ticket();
+    return serial('project.responseDigest', async () => {
+      if (projectMoved(t, 'the response format')) { settleIf(t, settle, false); return false; }
+      try {
+        // Send the resolved full object (defaults filled), same reason as putTools
+        // (BUG-088): patchProject's echo-check compares sent leaves against the
+        // server echo, and a partial on a project with no stored responseDigest
+        // would be echoed as a defaults-filled superset. Resolved when the save
+        // RUNS, so a queued save builds on the one before it.
+        await api.patchProject(t.pid, { responseDigest: { ...effectiveDigest(), ...patch } });
+        await ctx.refreshProject();
+        d.composed = null;
+        saveOk(t);
+        settleIf(t, settle, true);
+        paint();
+        return true;
+      } catch (err) {
+        saveFailed(t, `could not save response-format settings: ${err.message}`);
+        settleIf(t, settle, false);
+        paint();
+        return false;
+      }
+    });
   }
 
   /* ------------------------------------------------------- wiring (FEAT-076) */
@@ -1966,6 +2338,7 @@ const WIRING_STATE = {
   }
 
   async function applyWiring(p, c) {
+    const tk = ticket();
     d.wiringBusy = c.key;
     d.wiringReport = null;
     paint();
@@ -1989,7 +2362,7 @@ const WIRING_STATE = {
       // The registry changed (WA attach) — refresh so the stack view agrees.
       if (c.apply === 'attach-wa') { await ctx.refreshProject(); d.composed = null; }
     } catch (err) {
-      ctx.notify(`could not apply ${c.label}: ${err.message}`, true);
+      tell(tk, `could not apply ${c.label}: ${err.message}`, true);
       d.wiring = undefined; // force a clean re-read
     } finally {
       d.wiringBusy = null;
@@ -2038,11 +2411,12 @@ const WIRING_STATE = {
     const act = (label, action) => {
       const btn = el('button', { class: 'mini', text: label });
       btn.addEventListener('click', async () => {
+        const tk = ticket();
         btn.disabled = true; btn.textContent = '…';
         const r = await api.browserAction(p.id, action);
-        if (r === null) ctx.notify(`browser ${action} is not implemented on the server yet`, true);
-        else if (r.problem) ctx.notify(`browser ${action}: ${r.problem}`, true);
-        else ctx.notify(`browser ${action} → ${r.running === true ? 'running' : r.running === false ? 'stopped' : (r.state ?? 'ok')}`);
+        if (r === null) tell(tk, `browser ${action} is not implemented on the server yet`, true);
+        else if (r.problem) tell(tk, `browser ${action}: ${r.problem}`, true);
+        else tell(tk, `browser ${action} → ${r.running === true ? 'running' : r.running === false ? 'stopped' : (r.state ?? 'ok')}`);
         d.browser = undefined;
         paint();
       });
@@ -2069,13 +2443,14 @@ const WIRING_STATE = {
   }
 
   async function putBrowser(patch) {
+    const tk = ticket();
     try {
       await api.patchProject(project().id, { browser: { ...(settings().browser ?? {}), ...patch } });
       await ctx.refreshProject();
       d.browser = undefined;
       paint();
     } catch (err) {
-      ctx.notify(`could not save browser settings: ${err.message}`, true);
+      tell(tk, `could not save browser settings: ${err.message}`, true);
       paint();
     }
   }
@@ -2097,18 +2472,28 @@ const WIRING_STATE = {
   const keepN = () => (Number.isFinite(snapCfg().keep) ? snapCfg().keep : 10);
   const excludes = () => (Array.isArray(snapCfg().exclude) ? snapCfg().exclude : DEFAULT_EXCLUDE);
 
-  async function putSnapshots(patch) {
-    try {
-      await api.patchProject(project().id, {
-        snapshots: { enabled: snapOn(), keep: keepN(), exclude: excludes(), ...patch },
-      });
-      await ctx.refreshProject();
-      d.snaps = undefined;
-      paint();
-    } catch (err) {
-      ctx.notify(`could not save snapshot settings: ${err.message}`, true);
-      paint();
-    }
+  async function putSnapshots(patch, settle = null) {
+    const t = ticket();
+    return serial('project.snapshots', async () => {
+      if (projectMoved(t, 'snapshot settings')) { settleIf(t, settle, false); return false; }
+      try {
+        // the whole object, resolved when the save RUNS (a queued keep/exclude save builds on the last)
+        await api.patchProject(t.pid, {
+          snapshots: { enabled: snapOn(), keep: keepN(), exclude: excludes(), ...patch },
+        });
+        await ctx.refreshProject();
+        d.snaps = undefined;
+        saveOk(t);
+        settleIf(t, settle, true);
+        paint();
+        return true;
+      } catch (err) {
+        saveFailed(t, `could not save snapshot settings: ${err.message}`);
+        settleIf(t, settle, false);
+        paint();
+        return false;
+      }
+    });
   }
 
   /**
@@ -2294,15 +2679,17 @@ const WIRING_STATE = {
     const input = el('input', {
       class: 'vin', type: 'text', spellcheck: 'false', placeholder: 'nothing excluded', 'aria-label': 'Excluded directories',
     });
-    input.value = cur.join(', ');
+    const parse = (t) => t.split(',').map((s) => s.trim()).filter(Boolean);
+    bindField(input, 'snapshots.exclude', {
+      base: cur.join(', '),
+      equals: (a, b) => JSON.stringify(parse(a)) === JSON.stringify(parse(b)),
+      commit: (v, settle) => {
+        const next = parse(v);
+        if (JSON.stringify(next) === JSON.stringify(excludes())) return 'same'; // fresh, not the render's
+        return putSnapshots({ exclude: next }, settle);
+      },
+    });
     if (readOnly) input.disabled = true;
-    const commit = () => {
-      const next = input.value.split(',').map((s) => s.trim()).filter(Boolean);
-      if (JSON.stringify(next) === JSON.stringify(cur)) return;
-      void putSnapshots({ exclude: next });
-    };
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
     n.append(input);
     return n;
   }
@@ -2327,15 +2714,16 @@ const WIRING_STATE = {
 
   async function gitDo(action, body, okText) {
     const p = project();
+    const tk = ticket();
     d.gitBusy = true;
     paint();
     try {
       const r = await api.gitAction(p.id, action, body);
-      ctx.notify(okText(r));
+      tell(tk, okText(r));
       d.git = r.status ?? undefined;
       if (action === 'commit') d.gitMsg = '';
     } catch (err) {
-      ctx.notify(`git ${action}: ${err.message}`, true);
+      tell(tk, `git ${action}: ${err.message}`, true);
     }
     d.gitArm = null;
     d.gitBusy = false;
@@ -2402,7 +2790,7 @@ const WIRING_STATE = {
     } else if (d.gitArm === 'create') {
       acts.dataset.armed = 'true';
       const nameIn = el('input', { class: 'gtext narrow', type: 'text', spellcheck: 'false', 'aria-label': 'Repository name' });
-      nameIn.value = (p.hostPath.split('/').pop() ?? 'repo');
+      bindDraft(nameIn, 'git.repoName', p.hostPath.split('/').pop() ?? 'repo');
       const no = el('button', { class: 'mini', text: 'Not now' });
       no.addEventListener('click', () => { d.gitArm = null; paint(); });
       const yes = el('button', { class: 'mini', text: 'Create private repo' });
@@ -2424,7 +2812,7 @@ const WIRING_STATE = {
       } else {
         const create = el('button', { class: 'mini', text: 'Create GitHub repo…' });
         create.disabled = d.gitBusy;
-        create.addEventListener('click', () => { d.gitArm = 'create'; paint(); });
+        create.addEventListener('click', () => { d.gitArm = 'create'; edit.drafts.delete('git.repoName'); paint(); });
         acts.append(create);
       }
       const rf = el('button', { class: 'mini', text: 'Refresh', title: 'Re-read git status' });
@@ -2438,11 +2826,12 @@ const WIRING_STATE = {
   function terminalRow(p) {
     const t = el('button', { class: 'mini', text: 'Open a terminal (kitty)', title: p.hostPath });
     t.addEventListener('click', async () => {
+      const tk = ticket();
       try {
         const r = await api.openTerminal(p.id);
-        ctx.notify(`launched ${r.launched}`);
+        tell(tk, `launched ${r.launched}`);
       } catch (err) {
-        ctx.notify(err.message, true);
+        tell(tk, err.message, true);
       }
     });
     return t;
@@ -2491,6 +2880,7 @@ const WIRING_STATE = {
   }
 
   async function saveGitPolicy(id, body, okMsg) {
+    const tk = ticket();
     d.gitPolicyBusy = true; d.gitPolicyErr = ''; paint();
     try {
       if (body === null) await api.deleteGitWritePolicy(id);
@@ -2498,7 +2888,7 @@ const WIRING_STATE = {
       d.gitPolicy = undefined; // refetch (release status recomputes)
       d.gitDraft = null;       // reset the buffer from the server's new truth
       d.gitReleaseMsg = null;
-      ctx.notify(okMsg);
+      tell(tk, okMsg);
     } catch (err) {
       d.gitPolicyErr = err.message || String(err);
     }
@@ -2665,12 +3055,13 @@ const WIRING_STATE = {
       no.addEventListener('click', () => { d.procConfirm = null; paint(); });
       const yes = el('button', { class: 'mini', text: 'Stop it' });
       yes.addEventListener('click', async () => {
+        const tk = ticket();
         yes.disabled = true;
         try {
           const r = await api.killProcess(p.id, pr.pid);
-          ctx.notify(`sent SIG${r.signal} to pid ${r.killed}`);
+          tell(tk, `sent SIG${r.signal} to pid ${r.killed}`);
         } catch (err) {
-          ctx.notify(err.message, true);
+          tell(tk, err.message, true);
         }
         d.procConfirm = null;
         d.procs = undefined; // re-list from /proc — prove it is gone (or not)
@@ -2778,12 +3169,13 @@ const WIRING_STATE = {
             no.addEventListener('click', () => { d.memConfirm = null; paint(); });
             const yes = el('button', { class: 'mini', text: 'Delete it' });
             yes.addEventListener('click', async () => {
+              const tk = ticket();
               yes.disabled = true;
               try {
                 const r = await api.deleteMemory(p.id, f.dir, f.name);
-                ctx.notify(`memory deleted · backed up to ${r.backup.path}${r.indexEdited ? ' · index line removed' : ''}`);
+                tell(tk, `memory deleted · backed up to ${r.backup.path}${r.indexEdited ? ' · index line removed' : ''}`);
               } catch (err) {
-                ctx.notify(`delete failed: ${err.message}`, true);
+                tell(tk, `delete failed: ${err.message}`, true);
               }
               d.memConfirm = null;
               d.memOpen = null;
@@ -2839,17 +3231,18 @@ const WIRING_STATE = {
 
     const take = el('button', { class: 'addrow', text: '+ Take one now' });
     take.addEventListener('click', async () => {
+      const tk = ticket();
       take.disabled = true;
       take.textContent = 'taking…';
       const r = await api.takeSnapshot(p.id);
-      if (r === null) ctx.notify('taking a snapshot is not implemented on the server yet', true);
-      else if (r.problem) ctx.notify(`snapshot failed: ${r.problem}`, true);
+      if (r === null) tell(tk, 'taking a snapshot is not implemented on the server yet', true);
+      else if (r.problem) tell(tk, `snapshot failed: ${r.problem}`, true);
       else {
         const s = r.snapshot ?? {};
         const size = `${s.fileCount ?? '?'} files · ${bytes(s.sizeBytes ?? NaN)}${s.durationMs != null ? ` · ${s.durationMs} ms` : ''}`;
         // A dedupe is NOT a new snapshot. Saying "taken" would put a success
         // message next to a list that did not grow.
-        ctx.notify(r.deduped
+        tell(tk, r.deduped
           ? `nothing changed since the last snapshot — reused it rather than making a second identical one · ${size}`
           : `snapshot taken · ${size}${r.pruned ? ` · ${r.pruned} pruned to stay under keep` : ''}`);
       }
@@ -2903,6 +3296,7 @@ const WIRING_STATE = {
       const rest = el('button', { class: 'mini', text: 'Restore' });
       rest.addEventListener('click', () => {
         d.restore = { id: s.id, typed: '', conflict: null, busy: false };
+        edit.drafts.delete('restore.typed'); // a new ceremony starts empty
         d.confirmDelete = null;
         paint();
       });
@@ -2914,11 +3308,12 @@ const WIRING_STATE = {
         no.addEventListener('click', () => { d.confirmDelete = null; paint(); });
         const yes = el('button', { class: 'mini', text: 'Delete it' });
         yes.addEventListener('click', async () => {
+          const tk = ticket();
           yes.disabled = true;
           const r = await api.deleteSnapshot(p.id, s.id);
-          if (r === null) ctx.notify('deleting a snapshot is not implemented on the server yet', true);
-          else if (r.problem) ctx.notify(`delete failed: ${r.problem}`, true);
-          else ctx.notify('snapshot deleted');
+          if (r === null) tell(tk, 'deleting a snapshot is not implemented on the server yet', true);
+          else if (r.problem) tell(tk, `delete failed: ${r.problem}`, true);
+          else tell(tk, 'snapshot deleted');
           d.confirmDelete = null;
           d.snaps = undefined;
           paint();
@@ -3038,7 +3433,7 @@ const WIRING_STATE = {
       id: 'snapConfirm', class: 'vin', type: 'text', spellcheck: 'false',
       autocomplete: 'off', placeholder: p.name, 'aria-label': `Type ${p.name} to confirm the restore`,
     });
-    input.value = st.typed;
+    bindDraft(input, 'restore.typed', st.typed ?? '');
     field.append(lbl, input);
     box.append(field);
 
@@ -3096,16 +3491,17 @@ const WIRING_STATE = {
   }
 
   async function doRestore(p, s, force, btn) {
+    const tk = ticket();
     btn.disabled = true;
     btn.textContent = 'restoring…';
     const r = await api.restoreSnapshot(p.id, s.id, { force });
     if (r === null) {
-      ctx.notify('restore is not implemented on the server yet', true);
+      tell(tk, 'restore is not implemented on the server yet', true);
       d.restore = null;
     } else if (r.conflict) {
       d.restore = { ...d.restore, conflict: r, busy: false };
     } else if (r.problem) {
-      ctx.notify(`restore failed: ${r.problem} — nothing was overwritten`, true);
+      tell(tk, `restore failed: ${r.problem} — nothing was overwritten`, true);
       d.restore = null;
     } else {
       /* Report the server's actual counts, not "done". `removed` is the number
@@ -3119,7 +3515,7 @@ const WIRING_STATE = {
       if (n(res.removed)) parts.push(`${n(res.removed)} removed (in the pre-restore snapshot)`);
       if (n(res.preservedExcluded)) parts.push(`${n(res.preservedExcluded)} excluded dirs left untouched`);
       if (pre) parts.push(`undo: ${pre}`);
-      ctx.notify(parts.join(' · '));
+      tell(tk, parts.join(' · '));
       d.restore = null;
     }
     d.snaps = undefined;
@@ -3147,28 +3543,24 @@ const WIRING_STATE = {
     input.style.width = '100%';
     input.style.textAlign = 'left';
     box.append(input);
-    const commit = () => {
-      const raw = input.value.trim();
-      d.addingMount = false;
-      if (!raw) return paint();
+    const closeForm = () => { d.addingMount = false; edit.drafts.delete('add:mount'); };
+    const commit = (v, settle) => {
+      const raw = v.trim();
       const [hostPath, containerPath, flag] = raw.split(':');
       const host = hostPath.trim();
       const name = host.replace(/\/+$/, '').split('/').pop() || 'workspace';
       // FEAT-155 — with workspaceRoot the repo IS /workspace, so the old default
       // `/workspace/<name>` would nest the mount inside the repo. Default beside it.
       const base = settings().container?.workspaceRoot ? '/mnt' : '/workspace';
-      void put('mounts', [...mounts, {
+      // The typed text stays in the edit model: on success the form closes, on a
+      // refusal it stays put so the user can correct it (e.g. a host path that does not exist).
+      return put('mounts', () => [...(settings().mounts ?? []), {
         hostPath: host,
         containerPath: (containerPath || `${base}/${name}`).trim(),
         readOnly: (flag || '').trim() === 'ro',
-      }]);
+      }], (ok) => { settle(ok); if (ok && !newerThan('add:mount', v)) closeForm(); });
     };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      if (e.key === 'Escape') { d.addingMount = false; paint(); }
-    });
-    input.addEventListener('blur', commit);
-    queueMicrotask(() => input.focus());
+    bindField(input, 'add:mount', { base: '', onEmpty: closeForm, commit });
     return box;
   }
 
@@ -3196,7 +3588,7 @@ const WIRING_STATE = {
       if (Array.isArray(s.env) && s.env.length) r.append(el('span', { class: 'm', text: `${s.env.length} env` }));
       if (!sessionScope) {
         const x = el('button', { class: 'x', 'aria-label': 'Remove service', text: '×' });
-        x.addEventListener('click', () => put('services', services.filter((_, j) => j !== i)));
+        x.addEventListener('click', () => put('services', () => (settings().services ?? []).filter((q) => q.name !== s.name)));
         r.append(x);
       }
       g.append(r);
@@ -3205,7 +3597,7 @@ const WIRING_STATE = {
       if (d.addingService) g.append(serviceForm(services));
       else {
         const add = el('button', { class: 'addrow', text: '+ Add service' });
-        add.addEventListener('click', () => { d.addingService = true; paint(); });
+        add.addEventListener('click', () => openAddForm('addingService', 'add:service'));
         g.append(add);
       }
     } else {
@@ -3226,25 +3618,18 @@ const WIRING_STATE = {
     input.style.width = '100%';
     input.style.textAlign = 'left';
     box.append(input);
-    const commit = () => {
-      const raw = input.value.trim();
-      d.addingService = false;
-      if (!raw) return paint();
-      const [name, image, dataPath] = raw.split(/\s+/);
-      if (!name || !image) { ctx.notify('a service needs a name and an image', true); return paint(); }
-      void put('services', [...services, {
+    const closeForm = () => { d.addingService = false; edit.drafts.delete('add:service'); };
+    const commit = (v, settle) => {
+      const [name, image, dataPath] = v.trim().split(/\s+/);
+      if (!name || !image) { notify('a service needs a name and an image', true); return false; }
+      return put('services', () => [...(settings().services ?? []), {
         name: name.toLowerCase(),
         image,
         env: [],
         dataPath: dataPath && dataPath.startsWith('/') ? dataPath : null,
-      }]);
+      }], (ok) => { settle(ok); if (ok && !newerThan('add:service', v)) closeForm(); });
     };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      if (e.key === 'Escape') { d.addingService = false; paint(); }
-    });
-    input.addEventListener('blur', commit);
-    queueMicrotask(() => input.focus());
+    bindField(input, 'add:service', { base: '', onEmpty: closeForm, commit });
     return box;
   }
 
@@ -3320,16 +3705,110 @@ const WIRING_STATE = {
    * partially. They are infrastructure for the whole project, so they are
    * always written at project scope — the note below says so in session scope.
    */
-  async function putContainer(patch) {
-    try {
-      await api.patchProject(project().id, { container: { ...(settings().container ?? {}), ...patch } });
-      await ctx.refreshProject();
-      d.container = undefined;
-      paint();
-    } catch (err) {
-      ctx.notify(`could not save container settings: ${err.message}`, true);
-      paint();
+  /*
+   * FEAT-200 r6 — a save that changes an env key or host port an APPROVED-but-not-yet-applied access request names
+   * cancels that request (the server decides it; the user's own edit is the newest intent). Say so BEFORE saving:
+   * the save is held behind a warning naming each request, with "Save and cancel" / "Keep editing".
+   */
+  function accessHits(patch, pend) {
+    if (!pend.length) return [];
+    const cur = settings().container ?? {};
+    const envT = new Set();
+    const portT = new Set();
+    if ('env' in patch) {
+      const a = cur.env ?? {};
+      const b = patch.env ?? {};
+      for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) if ((k in a) !== (k in b) || a[k] !== b[k]) envT.add(k);
     }
+    if ('ports' in patch) {
+      const m = (l) => new Map((l ?? []).map((x) => [x.hostPort, x.containerPort]));
+      const a = m(cur.ports);
+      const b = m(patch.ports);
+      for (const h of new Set([...a.keys(), ...b.keys()])) if (a.get(h) !== b.get(h)) portT.add(h);
+    }
+    return pend.flatMap((r) => {
+      const touched = [...r.env.filter((k) => envT.has(k)).map((k) => `env ${k}`), ...r.ports.filter((h) => portT.has(h)).map((h) => `port 127.0.0.1:${h}`)];
+      return touched.length ? [{ ...r, touched }] : [];
+    });
+  }
+  function accessWarnBlock(group) {
+    const w = d.accessConfirm;
+    if (!w || w.group !== group) return null;
+    const box = el('div', { class: 'acc-warn', role: 'alert' });
+    box.append(el('span', { class: 'acc-warn-h', text: w.hits.length === 1 ? 'This save cancels an approved access request' : `This save cancels ${w.hits.length} approved access requests` }));
+    box.append(el('span', { text: 'Approved, but not applied to the container yet. Your setting will stand; the session that asked is told it was cancelled.' }));
+    const ul = el('ul');
+    for (const h of w.hits) ul.append(el('li', { text: `${h.summary}  (you change ${h.touched.join(', ')})` }));
+    box.append(ul);
+    const go = el('button', { class: 'acc-go', type: 'button', text: w.hits.length === 1 ? 'Save and cancel the request' : 'Save and cancel the requests' });
+    const keep = el('button', { class: 'acc-keep', type: 'button', text: 'Keep editing' });
+    go.addEventListener('click', () => { const pt = w.patch; d.accessConfirm = null; void putContainer(pt, { confirmed: true }); });
+    keep.addEventListener('click', () => { d.accessConfirm = null; paint(); });
+    box.append(el('div', { class: 'acts acc-acts' }, el('span', { class: 'grow' }), keep, go));
+    return box;
+  }
+
+  /* `patch` may be a function, evaluated when the save RUNS (serial(): one container
+     save at a time, each building on the settings the previous one refreshed). */
+  async function putContainer(patch, opts = {}, settle = null) {
+    const t = ticket();
+    return serial('project.container', async () => {
+      if (projectMoved(t, 'container settings')) { settleIf(t, settle, false); return false; }
+      // BUG-283 r6 (verify r5 b1): a confirmed save re-builds its patch from settings as
+      // they are NOW — the card can sit armed while another tab or an approved request
+      // writes env/ports, and the map frozen at arm time would delete that write.
+      if (opts.confirmed && typeof patch === 'function') {
+        try { await ctx.refreshProject(); } catch { /* build on the cached settings */ }
+        if (projectMoved(t, 'container settings')) { settleIf(t, settle, false); return false; }
+      }
+      const p = valueOf(patch);
+      if (!opts.confirmed && ('env' in p || 'ports' in p)) {
+        // Read the approved-pending requests NOW (not from a status that may not have loaded yet, or is minutes old).
+        let pend = d.container?.access?.pending ?? [];
+        try {
+          const list = (await api.projectAccessRequests(t.pid))?.requests ?? [];
+          const fresh = list.filter((r) => r.cancellable).map((r) => ({
+            id: r.id, summary: r.summary, sdkSessionId: r.sdkSessionId,
+            env: (r.changes ?? []).filter((c) => c.kind === 'env').map((c) => c.key),
+            ports: (r.changes ?? []).filter((c) => c.kind === 'port').map((c) => c.hostPort),
+          }));
+          // union with the status's live list (the request list is capped at 50 records)
+          pend = [...fresh, ...pend.filter((x) => !fresh.some((f) => f.id === x.id))];
+        } catch { /* fall back to the status's list; the server cancels and tells the requester either way */ }
+        const hits = accessHits(p, pend);
+        if (hits.length) {
+          // BUG-283 r4 (F5): a confirm belongs to the edit epoch that asked for it. If the
+          // drawer closed, reopened, or the user moved on meanwhile, no card is planted
+          // into that later state — the save just doesn't happen, and the footer says so.
+          if (t.ep !== edit.epoch || !isOpenNow) {
+            saveFailed(t, 'not saved: that change would cancel an approved access request — make it again to confirm it');
+            return false;
+          }
+          d.accessConfirm = { patch, hits, group: hits.some((h) => h.touched.some((x) => x.startsWith('env '))) && 'env' in p ? 'env' : 'ports' };
+          settle?.(false);
+          paint();
+          return false; // a confirm is pending — nothing was saved
+        }
+      }
+      if (t.ep === edit.epoch) d.accessConfirm = null;
+      try {
+        // Only the fields this save changes: the server merges `container` one level deep (updateProject). Re-sending the
+        // whole cached object would also re-send `container.base` (FEAT-157: not writable here, so the save was refused)
+        // and could write back stale env/ports a commit or another tab changed since this drawer loaded.
+        await api.patchProject(t.pid, { container: { ...p } });
+        await ctx.refreshProject();
+        d.container = undefined;
+        saveOk(t);
+        settleIf(t, settle, true);
+        paint();
+        return true;
+      } catch (err) {
+        saveFailed(t, `could not save container settings: ${err.message}`);
+        settleIf(t, settle, false);
+        paint();
+        return false;
+      }
+    });
   }
 
   /**
@@ -3345,15 +3824,16 @@ const WIRING_STATE = {
     const chip = provChip(pv);
     if (chip) n.append(chip);
     const input = el('input', { class: 'vin', type: 'text', spellcheck: 'false', 'aria-label': 'Dockerfile', placeholder: 'none — a path in the repo' });
-    input.value = cur ?? '';
+    bindField(input, 'container.dockerfile', {
+      base: cur ?? '',
+      equals: (a, b) => a.trim() === b.trim(),
+      commit: (v, settle) => {
+        const next = v.trim() || null;
+        if (next === (settings().container?.dockerfile ?? null)) return 'same'; // fresh, not the render's
+        return putContainer({ dockerfile: next }, {}, settle);
+      },
+    });
     if (readOnly) input.disabled = true;
-    const commit = () => {
-      const v = input.value.trim() || null;
-      if (v === cur) return;
-      void putContainer({ dockerfile: v });
-    };
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
     n.append(input);
     n.append(gutter(n, {
       key: 'container.dockerfile', label: 'Dockerfile', prov: pv, why: WHY['container.dockerfile'], control: input,
@@ -3410,15 +3890,16 @@ const WIRING_STATE = {
     const chip = provChip(p);
     if (chip) n.append(chip);
     const input = el('input', { class: 'vin', type: 'text', spellcheck: 'false', 'aria-label': 'Base image', placeholder: effective ?? 'default' });
-    input.value = cur ?? '';
+    bindField(input, 'container.image', {
+      base: cur ?? '',
+      equals: (a, b) => a.trim() === b.trim(),
+      commit: (v, settle) => {
+        const next = v.trim() || null;
+        if (next === (settings().container?.image ?? null)) return 'same'; // fresh, not the render's
+        return putContainer({ image: next }, {}, settle);
+      },
+    });
     if (readOnly) input.disabled = true;
-    const commit = () => {
-      const v = input.value.trim() || null;
-      if (v === cur) return;
-      void putContainer({ image: v });
-    };
-    input.addEventListener('blur', commit);
-    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); input.blur(); } });
     n.append(input);
     n.append(gutter(n, {
       key: 'container.image', label: 'Base image', prov: p, why: WHY['container.image'], control: input,
@@ -3576,6 +4057,8 @@ const WIRING_STATE = {
   function envGroup(p, sessionScope) {
     if ((p.isolation ?? project().isolation) !== 'container') return null;
     const g = el('div', { class: 'grp', 'data-focus': 'env' }, groupLabel('Environment'));
+    const warnEnv = accessWarnBlock('env');
+    if (warnEnv) g.append(warnEnv);
     const env = settings().container?.env ?? {};
     const keys = Object.keys(env);
     if (!keys.length) {
@@ -3590,9 +4073,11 @@ const WIRING_STATE = {
       if (!sessionScope) {
         const x = el('button', { class: 'x', 'aria-label': `Remove ${k}`, text: '×' });
         x.addEventListener('click', () => {
-          const next = { ...env };
-          delete next[k];
-          void putContainer({ env: next });
+          void putContainer(() => {
+            const next = { ...(settings().container?.env ?? {}) };
+            delete next[k];
+            return { env: next };
+          });
         });
         r.append(x);
       }
@@ -3602,11 +4087,79 @@ const WIRING_STATE = {
       if (d.addingEnv) g.append(envForm(env));
       else {
         const add = el('button', { class: 'addrow', text: '+ Add variable' });
-        add.addEventListener('click', () => { d.addingEnv = true; paint(); });
+        add.addEventListener('click', () => openAddForm('addingEnv', 'add:env'));
         g.append(add);
       }
     } else {
       g.append(projectOnlyNote('Environment variables'));
+    }
+    return g;
+  }
+
+  /**
+   * FEAT-200 — published ports (settings.container.ports): a container port reachable at
+   * 127.0.0.1:<hostPort> on this machine only. The host address is never a choice — the server always
+   * publishes on loopback. Added here by the user, or by approving a session's access request; changing
+   * them recreates the container. The server refuses a host port another project, container or program uses.
+   */
+  function portsGroup(p, sessionScope) {
+    if ((p.isolation ?? project().isolation) !== 'container') return null;
+    const g = el('div', { class: 'grp', 'data-focus': 'ports' }, groupLabel('Published ports'));
+    const warnPorts = accessWarnBlock('ports');
+    if (warnPorts) g.append(warnPorts);
+    /* FEAT-200 r6 — a host port the USER set that docker refused stays in the settings (removing it behind the user's
+       back is the bug class r5 closed), so it must be visible: docker's own words, and what it means for launches. */
+    const refusal = d.container?.access?.portRefusal ?? null;
+    if (refusal) {
+      g.append(el('div', { class: 'port-refused', role: 'status' },
+        el('strong', { text: `Docker refused host port${refusal.ports.length > 1 ? 's' : ''} ${refusal.ports.join(', ')}. ` }),
+        el('span', { text: 'The previous container is kept, and new sessions in this project cannot start until you change or remove the port. Docker said: ' }),
+        el('code', { text: refusal.reason })));
+    }
+    const ports = settings().container?.ports ?? [];
+    if (!ports.length) {
+      g.append(note('No published ports. A port added here (or approved from a session\'s access request) is reachable at 127.0.0.1 on this machine only, never the network. Changing these recreates the container.'));
+    }
+    for (const pp of ports) {
+      const r = el('div', { class: 'mrow' });
+      r.append(el('span', { class: 'p' },
+        el('span', { class: 'dst', text: `127.0.0.1:${pp.hostPort}` }),
+        el('span', { class: 'to', text: '  →  ' }),
+        document.createTextNode(`container ${pp.containerPort}`)));
+      if (!sessionScope) {
+        const x = el('button', { class: 'x', 'aria-label': `Remove port ${pp.hostPort}`, text: '×' });
+        x.addEventListener('click', () => void putContainer(() => ({ ports: (settings().container?.ports ?? []).filter((q) => q.hostPort !== pp.hostPort) })));
+        r.append(x);
+      }
+      g.append(r);
+    }
+    if (!sessionScope) {
+      if (d.addingPort) {
+        const box = el('div', { class: 'mrow' });
+        const input = el('input', { class: 'vin', type: 'text', spellcheck: 'false', placeholder: 'HOST:CONTAINER   e.g.  3000:3000', 'aria-label': 'New published port' });
+        input.style.width = '100%';
+        input.style.textAlign = 'left';
+        const closeForm = () => { d.addingPort = false; edit.drafts.delete('add:port'); };
+        const commit = (v, settle) => {
+          const m = /^(\d{1,5})(?::(\d{1,5}))?$/.exec(v.trim());
+          if (!m) { notify('a published port is HOST:CONTAINER, e.g. 3000:3000', true); return false; }
+          const hostPort = Number(m[1]);
+          const containerPort = Number(m[2] ?? m[1]);
+          // ok=false with a confirm pending is NOT a failure — the confirm card
+          // carries this patch, so close the add form as the pre-confirm flow did.
+          return putContainer(() => ({ ports: [...(settings().container?.ports ?? []), { hostPort, containerPort }] }), {},
+            (ok) => { settle(ok); if ((ok || d.accessConfirm) && !newerThan('add:port', v)) closeForm(); });
+        };
+        bindField(input, 'add:port', { base: '', onEmpty: closeForm, commit });
+        box.append(input);
+        g.append(box);
+      } else {
+        const add = el('button', { class: 'addrow', text: '+ Publish a port' });
+        add.addEventListener('click', () => openAddForm('addingPort', 'add:port'));
+        g.append(add);
+      }
+    } else {
+      g.append(projectOnlyNote('Published ports'));
     }
     return g;
   }
@@ -3623,24 +4176,24 @@ const WIRING_STATE = {
     input.style.width = '100%';
     input.style.textAlign = 'left';
     box.append(input);
-    const commit = () => {
-      const raw = input.value.trim();
-      d.addingEnv = false;
-      if (!raw) return paint();
+    const closeForm = () => { d.addingEnv = false; edit.drafts.delete('add:env'); };
+    const commit = (v, settle) => {
+      // Only leading space is dropped (before the KEY); the value is kept exactly as
+      // typed, trailing space included (BUG-283 r5, verify r4 b2).
+      const raw = v.replace(/^\s+/, '');
       // Split on the FIRST '=' only: a value may contain '=' (e.g. a query
       // string), but a key never can. eq<1 rejects both "=v" and a bare name.
       const eq = raw.indexOf('=');
-      if (eq < 1) { ctx.notify('an environment variable needs KEY=value', true); return paint(); }
+      if (eq < 1) { notify('an environment variable needs KEY=value', true); return false; }
       const key = raw.slice(0, eq).trim();
       const value = raw.slice(eq + 1); // not trimmed: a value may intentionally carry spaces
-      void putContainer({ env: { ...env, [key]: value } });
+      // ok=false with a confirm pending is NOT a failure — the confirm card
+      // carries this patch, so close the add form as the pre-confirm flow did —
+      // unless the user has typed past what was saved (verify r4 c2): keep that.
+      return putContainer(() => ({ env: { ...(settings().container?.env ?? {}), [key]: value } }), {},
+        (ok) => { settle(ok); if ((ok || d.accessConfirm) && !newerThan('add:env', v)) closeForm(); });
     };
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); commit(); }
-      if (e.key === 'Escape') { d.addingEnv = false; paint(); }
-    });
-    input.addEventListener('blur', commit);
-    queueMicrotask(() => input.focus());
+    bindField(input, 'add:env', { base: '', onEmpty: closeForm, commit });
     return box;
   }
 
@@ -3683,12 +4236,13 @@ const WIRING_STATE = {
     const act = (label, action) => {
       const b = el('button', { class: 'mini', text: label });
       b.addEventListener('click', async () => {
+        const tk = ticket();
         b.disabled = true;
         b.textContent = '…';
         const r = await api.containerAction(p.id, action);
-        if (r === null) ctx.notify(`container ${action} is not implemented on the server yet`, true);
-        else if (r.problem) ctx.notify(`container ${action}: ${r.problem}`, true);
-        else ctx.notify(`container ${action} → ${r.state ?? 'ok'}`);
+        if (r === null) tell(tk, `container ${action} is not implemented on the server yet`, true);
+        else if (r.problem) tell(tk, `container ${action}: ${r.problem}`, true);
+        else tell(tk, `container ${action} → ${r.state ?? 'ok'}`);
         d.container = undefined;
         paint();
       });
@@ -3729,11 +4283,12 @@ const WIRING_STATE = {
      line moves from "pending" to "rebuilding" to gone without the user pressing Check again. */
   let grantPoll = null;
   async function refreshContainer(id) {
+    const tk = ticket();
     try {
       d.container = await api.containerStatus(id);
     } catch (err) {
       d.container = null;
-      ctx.notify(`container status: ${err.message}`, true);
+      tell(tk, `container status: ${err.message}`, true);
     }
     if (isOpenNow) paint();   // FEAT-146: the rail dots read this too — see prefetchForDots
     clearTimeout(grantPoll);
@@ -4031,12 +4586,13 @@ const WIRING_STATE = {
   /* ------------------------------------------------------------- editor */
 
   async function openEditor(id) {
+    const tk = ticket();
     let t = { id: '', name: 'Untitled template', description: '', defaultMode: 'append', living: false, body: '' };
     if (id) {
       try {
         t = await api.readTemplate(id);
       } catch (err) {
-        ctx.notify(`could not read template: ${err.message}`, true);
+        tell(tk, `could not read template: ${err.message}`, true);
         return;
       }
     }
@@ -4070,6 +4626,7 @@ const WIRING_STATE = {
 
   node.edSave.addEventListener('click', async () => {
     if (!d.editing) return;
+    const tk = ticket();
     const name = d.editing.name === 'Untitled template'
       ? (window.prompt('Template name', 'Untitled template') || '').trim()
       : d.editing.name;
@@ -4085,10 +4642,10 @@ const WIRING_STATE = {
       });
       d.editing = saved;
       d.templates = await api.listTemplates();
-      ctx.notify(`saved ${saved.name} · ${saved.bytes ?? node.edText.value.length} bytes`);
+      tell(tk, `saved ${saved.name} · ${saved.bytes ?? node.edText.value.length} bytes`);
       node.title.textContent = saved.name;
     } catch (err) {
-      ctx.notify(`save failed: ${err.message}`, true);
+      tell(tk, `save failed: ${err.message}`, true);
     }
   });
 
@@ -4149,18 +4706,19 @@ const WIRING_STATE = {
   }
 
   async function saveGlobal(field, value) {
+    const tk = ticket();
     try {
       const next = await api.patchSettings({ [field]: value });
       d.globals = next;
       // A project the user is looking at inherits this — refresh so the settings
       // view's "inherits global" line is truthful on the next visit.
       d.globalProjects = undefined;
-      ctx.notify?.(value == null ? `global default ${field} cleared` : `global default ${field} set to ${value}`);
+      tell(tk, value == null ? `global default ${field} cleared` : `global default ${field} set to ${value}`);
       // Reload the override list against the just-saved value.
       api.listProjects().then((ps) => { d.globalProjects = Array.isArray(ps) ? ps : []; if (d.view === 'globals') paint(); }).catch(() => {});
       paint();
     } catch (err) {
-      ctx.notify(`could not save global ${field}: ${err.message}`, true);
+      tell(tk, `could not save global ${field}: ${err.message}`, true);
     }
   }
 
@@ -4220,6 +4778,7 @@ const WIRING_STATE = {
    * cancel/close. This side only renders and relays.
    */
   function startLogin(account) {
+    const tk = ticket();
     const L = {
       accountId: account.id,
       label: account.label,
@@ -4243,6 +4802,10 @@ const WIRING_STATE = {
         'aria-label': 'Authorization code from the Claude sign-in page',
       }),
     };
+    // an owned node (re-appended, not rebuilt): the model only tags it so a repaint
+    // that moves it puts the user's focus back in it
+    edit.drafts.delete('acct.code');
+    bindDraft(L.codeInput, 'acct.code', '');
     d.acctLogin = L;
     let ws;
     try {
@@ -4272,7 +4835,7 @@ const WIRING_STATE = {
         L.done = e;
         closeLoginSocket(L);
         if (e.ok) {
-          ctx.notify(`Claude account “${L.label}” is signed in${e.subscriptionType ? ` (${e.subscriptionType})` : ''}`);
+          tell(tk, `Claude account “${L.label}” is signed in${e.subscriptionType ? ` (${e.subscriptionType})` : ''}`);
           void refreshAccounts();
         } else if (e.accountRemoved) {
           void refreshAccounts();
@@ -4307,16 +4870,18 @@ const WIRING_STATE = {
       type: 'text', class: 'gtext', id: 'gAcctLabel',
       placeholder: 'e.g. Work Max plan',
       'aria-label': 'Name for the new Claude account',
-      value: d.acctAdd?.label ?? '',
     });
+    bindDraft(input, 'acct.label', d.acctAdd?.label ?? '');
     const go = el('button', { type: 'button', class: 'gbtn', id: 'gAcctCreate', text: 'Add' });
     const cancel = el('button', { type: 'button', class: 'mini', text: 'Cancel' });
     cancel.addEventListener('click', () => { d.acctAdd = null; paint(); });
     const submit = async () => {
       const label = input.value.trim();
-      if (!label) { ctx.notify('give the account a name so you can tell the two subscriptions apart', true); return; }
+      if (!label) { notify('give the account a name so you can tell the two subscriptions apart', true); return; }
       go.disabled = true;
       d.acctAdd = { label, busy: true };
+      const ep = edit.epoch;
+      const tk = ticket();
       try {
         const account = await api.createClaudeAccount(label);
         d.acctAdd = null;
@@ -4324,8 +4889,9 @@ const WIRING_STATE = {
         startLogin(account);
         paint();
       } catch (err) {
-        d.acctAdd = { label, busy: false };
-        ctx.notify(`could not add the account: ${err.message}`, true);
+        // a failure landing after close/reopen or a section switch does not reopen the form
+        d.acctAdd = ep === edit.epoch ? { label, busy: false } : null;
+        tell(tk, `could not add the account: ${err.message}`, true);
         paint();
       }
     };
@@ -4372,12 +4938,13 @@ const WIRING_STATE = {
       // FEAT-146 round 4 — `joined`: a field and the button that acts on that
       // field are one control, not two bordered boxes 15px apart.
       const urlRow = el('div', { class: 'gcustom joined' });
-      const urlField = el('input', { type: 'text', class: 'gtext mono', readonly: true, value: L.url, 'aria-label': 'Claude sign-in URL' });
+      const urlField = el('input', { type: 'text', class: 'gtext mono', readonly: true, value: L.url, 'aria-label': 'Claude sign-in URL' }); // edit-model: exempt — read-only display, the user never types here
       urlField.addEventListener('focus', () => urlField.select());
       const copy = el('button', { type: 'button', class: 'gbtn', text: 'Copy' });
       copy.addEventListener('click', async () => {
-        try { await navigator.clipboard.writeText(L.url); ctx.notify('sign-in link copied'); }
-        catch { urlField.select(); ctx.notify('press ⌘/Ctrl-C to copy the selected link', true); }
+        const tk = ticket();
+        try { await navigator.clipboard.writeText(L.url); tell(tk, 'sign-in link copied'); }
+        catch { urlField.select(); tell(tk, 'press ⌘/Ctrl-C to copy the selected link', true); }
       });
       urlRow.append(urlField, copy);
       box.append(urlRow);
@@ -4394,8 +4961,8 @@ const WIRING_STATE = {
     const sendCode = el('button', { type: 'button', class: 'gbtn', id: 'gAcctCodeSend', text: L.sent ? 'Resend' : 'Send code' });
     const submitCode = () => {
       const code = L.codeInput.value.trim();
-      if (!code) { ctx.notify('paste the code from the sign-in page first', true); return; }
-      if (!L.ws || L.ws.readyState !== WebSocket.OPEN) { ctx.notify('the sign-in connection is closed — cancel and try again', true); return; }
+      if (!code) { notify('paste the code from the sign-in page first', true); return; }
+      if (!L.ws || L.ws.readyState !== WebSocket.OPEN) { notify('the sign-in connection is closed — cancel and try again', true); return; }
       L.ws.send(JSON.stringify({ type: 'claude-login-code', code }));
       // Clear it immediately: the code is a credential, and it is never needed
       // again on this side (the server holds it only to redact it from output).
@@ -4473,12 +5040,13 @@ const WIRING_STATE = {
           no.addEventListener('click', () => { d.acctConfirm = null; paint(); });
           const yes = el('button', { class: 'mini danger', text: `Delete “${a.label}”` });
           yes.addEventListener('click', async () => {
+            const tk = ticket();
             yes.disabled = true;
             try {
               await api.deleteClaudeAccount(a.id);
-              ctx.notify(`Claude account “${a.label}” deleted — its credential is gone`);
+              tell(tk, `Claude account “${a.label}” deleted — its credential is gone`);
             } catch (err) {
-              ctx.notify(`could not delete “${a.label}”: ${err.message}`, true);
+              tell(tk, `could not delete “${a.label}”: ${err.message}`, true);
             }
             d.acctConfirm = null;
             await refreshAccounts();
@@ -4511,7 +5079,7 @@ const WIRING_STATE = {
       box.append(note('Name it however you think of it — “Work Max”, “Personal”. The Claude CLI reports no name for a subscription login, so this label is the only way to tell two plans apart.'));
     } else {
       const add = el('button', { class: 'addrow', id: 'gAcctAdd', text: '+ Add account' });
-      add.addEventListener('click', () => { d.acctAdd = { label: '', busy: false }; paint(); });
+      add.addEventListener('click', () => { d.acctAdd = { label: '', busy: false }; edit.drafts.delete('acct.label'); paint(); });
       box.append(add);
       box.append(note('Signs a second Claude subscription in through the Claude CLI: Orchard shows you the sign-in link, you paste back the code, and the credential is stored in that account’s own overlay of ~/.claude. Nothing is swapped by hand and the transcript history stays shared.'));
     }
@@ -4640,11 +5208,12 @@ const WIRING_STATE = {
       btn.addEventListener('click', async () => {
         if (d.runtimeBusy) return;
         if (!canUpdate) { d.runtime = undefined; runtimeTried = false; ensureRuntime(); paint(); return; }
+        const tk = ticket();
         d.runtimeBusy = true; paint();
         d.runtimeError = null;
         try {
           const res = await api.runtimeUpdate('host', latest.sdk);
-          ctx.notify(`Host runtime updated to ${res.installedSdk ?? latest.sdk} — restart Orchard to apply`);
+          tell(tk, `Host runtime updated to ${res.installedSdk ?? latest.sdk} — restart Orchard to apply`);
         } catch (err) {
           const msg = err.status === 409 ? 'an update is already running'
             : (err.body?.error || err.message);
@@ -4653,7 +5222,7 @@ const WIRING_STATE = {
           // one, so a partial state stays recoverable.
           const rb = err.body?.rollbackCommand ? ` If node_modules is left partial, reconcile with: ${err.body.rollbackCommand}` : '';
           d.runtimeError = `Update failed: ${msg}.${rb}`;
-          ctx.notify(`could not update the host runtime: ${msg}`, true);
+          tell(tk, `could not update the host runtime: ${msg}`, true);
         }
         d.runtimeBusy = false;
         await refreshRuntime();
@@ -4817,15 +5386,17 @@ const WIRING_STATE = {
       type: 'text', class: 'gtext', id: 'gModelCustomInput',
       placeholder: 'e.g. claude-opus-4-8',
       'aria-label': 'Custom global default model id',
-      value: isCustom ? g.model : '',
     });
+    // BUG-283 r5 (verify r4 c1): the typed id and the open row live in the edit model,
+    // so a repaint neither empties nor hides it, nor drops the user's focus.
+    bindDraft(customInput, 'global.modelCustom', isCustom ? g.model : '');
     const customApply = el('button', { type: 'button', class: 'gbtn', id: 'gModelCustomApply', text: 'Set' });
     const applyCustom = () => {
       const v = customInput.value.trim();
       if (!v) { saveGlobal('model', null); return; }
       // Mirror the server's MODEL_RE so a bad shape is caught before the round trip.
       if (!/^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,79}$/.test(v)) {
-        ctx.notify('model id has forbidden characters — letters, digits and . _ : - [ ] only', true);
+        notify('model id has forbidden characters — letters, digits and . _ : - [ ] only', true);
         return;
       }
       saveGlobal('model', v);
@@ -4833,10 +5404,19 @@ const WIRING_STATE = {
     customApply.addEventListener('click', applyCustom);
     customInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); applyCustom(); } });
     customRow.append(customInput, customApply);
-    customRow.hidden = !isCustom;
+    const customOpen = !isCustom && (d.gModelCustomOpen || edit.drafts.has('global.modelCustom'));
+    customRow.hidden = !isCustom && !customOpen;
+    if (customOpen) sel.value = CUSTOM;
 
     sel.addEventListener('change', () => {
-      if (sel.value === CUSTOM) { customRow.hidden = false; customInput.focus(); return; }
+      if (sel.value === CUSTOM) {
+        d.gModelCustomOpen = true;
+        customRow.hidden = false;
+        customInput.focus();
+        return;
+      }
+      d.gModelCustomOpen = false;
+      edit.drafts.delete('global.modelCustom');
       customRow.hidden = true;
       saveGlobal('model', sel.value || null);
     });
@@ -5177,6 +5757,9 @@ const WIRING_STATE = {
     d.cat = c.id;
     d.view = c.view;
     d.back = null;
+    // A refusal belongs to the section the user was on; leaving it clears the
+    // line, the drafts and any open add-form or confirm (BUG-283 r4: one reset).
+    resetEdit(false);
     d.focus = opts?.focus ? { key: String(opts.focus), applied: false } : null;
     markRail();
     paint();
@@ -5214,12 +5797,20 @@ const WIRING_STATE = {
    *  after every paint, because every commit in this panel triggers one. */
   function stampBaselines() {
     for (const n of node.body.querySelectorAll('input[type="text"], input[type="search"], input:not([type]), textarea')) {
-      if (n.readOnly || n.disabled) { delete n.dataset.base146; continue; }
+      // a bound field's dirtiness is the edit model's (a draft rendered into it is NOT clean)
+      if (n.readOnly || n.disabled || n.dataset.ek) { delete n.dataset.base146; continue; }
       n.dataset.base146 = n.value;
     }
   }
 
   function paint() {
+    // A save that settles after close repaints nothing: the next open builds fresh.
+    if (!isOpenNow) return;
+    // BUG-283 r4 — a project change under an open drawer drops every draft: text
+    // typed for one project must never be saved into another.
+    if ((project()?.id ?? null) !== edit.pid) resetEdit(true);
+    // An IME composition dies if its input is rebuilt: hold background paints until it ends.
+    if (edit.composing) { edit.paintPending = true; return; }
     if (d.view === 'editor') { paintChrome(); return; }
     const v = VIEWS[d.view] ?? VIEWS.settings;
     const host = node.views[v.el];
@@ -5227,10 +5818,53 @@ const WIRING_STATE = {
     // wiring…) repaint constantly, and a lens flip repaints too — none of them
     // is a navigation, so none of them may move the page under the reader.
     const keep = node.body.scrollTop;
-    clear(host).append(v.build());
+    // BUG-283 r3/r4 — removing the focused field fires `blur`; that blur is the
+    // render's, not the user's (bindField ignores it). A bound field is rebuilt
+    // FROM the edit model (its draft), and focus goes back to the field the user
+    // is in (edit.focusKey) with their caret — never to one they have left.
+    const act = document.activeElement;
+    const actKey = act && host.contains(act) ? act.dataset?.ek ?? null : null;
+    if (actKey && actKey === edit.focusKey) {
+      try { edit.sel = { start: act.selectionStart, end: act.selectionEnd }; } catch { /* not a text field */ }
+    }
+    const carry = !actKey && act && host.contains(act) && act.matches?.('input[aria-label], textarea[aria-label]')
+      ? { label: act.getAttribute('aria-label'), tag: act.tagName, start: act.selectionStart, end: act.selectionEnd }
+      : null;
+    edit.reg.clear(); // bindings are per-render: build() re-registers what it renders
+    painting = true;
+    try {
+      clear(host).append(v.build());
+    } finally {
+      painting = false;
+    }
+    const now = document.activeElement;
+    const lost = !now || now === document.body || !now.isConnected;
+    const one = (key) => { const l = host.querySelectorAll(`[data-ek="${CSS.escape(key)}"]`); return l.length === 1 ? l[0] : null; };
+    if (lost && edit.focusKey) {
+      const t = one(edit.focusKey);
+      if (t && !t.disabled) {
+        t.focus({ preventScroll: true });
+        const n = t.value.length;
+        const sel = edit.sel ?? { start: n, end: n };
+        try { t.setSelectionRange(Math.min(sel.start, n), Math.min(sel.end, n)); } catch { /* not a text field */ }
+      }
+    } else if (lost && carry && !act.isConnected) {
+      // an unbound field (a search box…): its unique aria-label twin (r3)
+      const twins = [...host.querySelectorAll(`${carry.tag}[aria-label="${CSS.escape(carry.label)}"]`)];
+      if (twins.length === 1 && !twins[0].disabled) {
+        twins[0].focus({ preventScroll: true });
+        try { twins[0].setSelectionRange(carry.start, carry.end); } catch { /* not a text field */ }
+      }
+    }
     for (const [k, n] of Object.entries(node.views)) n.classList.toggle('on', k === v.el);
     node.editor.classList.remove('on');
     node.body.scrollTop = keep;
+    if (edit.reveal) {
+      const t = one(edit.reveal);
+      edit.reveal = null;
+      // `nearest` lands it below the sticky banner (scroll-padding reserves it: paintSaveErr)
+      if (t) { paintSaveErr(); t.scrollIntoView({ block: 'nearest', behavior: 'instant' }); }
+    }
     applyFocus(host);
     stampBaselines();
     paintChrome();
@@ -5271,6 +5905,7 @@ const WIRING_STATE = {
     const liveText = liveStateText();
     node.liveLine.textContent = liveText;
     node.liveLine.hidden = !liveText || d.view === 'editor';
+    paintSaveErr(); // the inline save-refusal line, if one is standing
     node.hint.title = node.hint.textContent;
     node.whyAll?.setAttribute('aria-pressed', String(d.whyAll));
     paintRailDots();
@@ -5278,10 +5913,11 @@ const WIRING_STATE = {
 
   async function ensureTemplates() {
     if (d.templates.length) return;
+    const tk = ticket();
     try {
       d.templates = await api.listTemplates();
     } catch (err) {
-      ctx.notify(`templates: ${err.message}`, true);
+      tell(tk, `templates: ${err.message}`, true);
     }
   }
 
@@ -5325,6 +5961,8 @@ const WIRING_STATE = {
     if (isOpenNow) return;
     isOpenNow = true;
     d.returnFocus = document.activeElement;
+    // No stale refusal, draft, open add-form or pending confirm carries across an open.
+    resetEdit(true);
     d.paneScroll.clear();
     node.modal.hidden = false;
     appRoot?.setAttribute('inert', '');
@@ -5334,6 +5972,14 @@ const WIRING_STATE = {
 
   function closeModal() {
     if (!isOpenNow) return;
+    // BUG-283 r4 (F2): closing is the user leaving the field they are in — judged
+    // NOW, with the edit model intact (a just-refused, unchanged value is not
+    // resent). Then the model is reset in one place, and every later blur (the
+    // hide, the focus return) is ignored because the drawer is no longer open.
+    const here = document.activeElement;
+    const k = here && node.modal.contains(here) ? here.dataset?.ek : null;
+    if (k) { takeLive(here); void commitField(k, 'close'); }
+    resetEdit(true);
     isOpenNow = false;
     d.focus = null;
     node.modal.hidden = true;
@@ -5353,7 +5999,7 @@ const WIRING_STATE = {
     const armed = node.body.querySelector('[data-armed="true"]');
     if (armed) return armed;
     for (const n of node.body.querySelectorAll('input, textarea')) {
-      if (n.dataset.base146 !== undefined && n.value !== n.dataset.base146) return n;
+      if (n.dataset.ek ? isDirty(n.dataset.ek) : (n.dataset.base146 !== undefined && n.value !== n.dataset.base146)) return n;
     }
     return null;
   }
@@ -5382,6 +6028,7 @@ const WIRING_STATE = {
 
   /** Disarm the innermost armed ceremony. Returns true if one was disarmed. */
   function disarmOne() {
+    if (d.accessConfirm) { d.accessConfirm = null; paint(); return true; } // = "Keep editing"
     if (d.acctConfirm) { d.acctConfirm = null; paint(); return true; }
     if (d.restore) { d.restore = null; paint(); return true; }
     if (d.confirmDelete) { d.confirmDelete = null; paint(); return true; }
@@ -5521,11 +6168,18 @@ const WIRING_STATE = {
   node.rail.addEventListener('scroll', () => updateRailEdges(), { passive: true });
   window.addEventListener('resize', () => { if (isOpenNow) updateRailEdges(); }, { passive: true });
   node.close.addEventListener('click', () => closeModal());
+  // BUG-283 r4 — which bound field the user is in. Any focus that lands elsewhere in
+  // the drawer (another form, a button) means a refusal or repaint must not pull
+  // them back; a user blur to nowhere clears it in bindField.
+  node.modal.addEventListener('focusin', (e) => { edit.focusKey = e.target?.dataset?.ek ?? null; });
+  window.addEventListener('resize', () => { if (isOpenNow) paintSaveErr(); }, { passive: true });
   node.whyAll?.addEventListener('click', () => setWhyAll(!d.whyAll));
   node.back0.addEventListener('click', () => backdropClose());
   node.scope.addEventListener('click', (e) => {
     const b = e.target.closest('[data-scope]');
     if (!b || b.disabled) return;
+    // BUG-283 r4: a draft typed under one write target must not save to the other.
+    if (b.dataset.scope !== d.scope) resetEdit(false);
     d.scope = b.dataset.scope;
     // Lens only: the rail is NOT rebuilt and the pane is NOT scrolled. paint()
     // restores scrollTop byte-for-byte across the rebuild.

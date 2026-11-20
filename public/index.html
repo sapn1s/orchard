@@ -643,6 +643,13 @@
                A static child of the scroll host on purpose: paint() only clears
                the `.view` hosts, so this survives every repaint. -->
           <p class="slive" id="dLive" role="status" aria-live="polite" hidden></p>
+          <!-- A save the server refused (e.g. a mount whose host path does not
+               exist). It used to surface ONLY through the footer strip (say()),
+               which the open drawer covers, so the refusal reached the user as
+               nothing but a console line. A static child of the scroll host at
+               the top of the pane, inside the drawer, role="alert": paint() only
+               clears the `.view` hosts, so it survives every repaint. -->
+          <p class="smerr" id="dSaveErr" role="alert" aria-live="assertive" hidden></p>
           <div class="view on" id="vSettings"></div>
           <div class="view" id="vInstructions"></div>
           <div class="view" id="vLibrary"></div>

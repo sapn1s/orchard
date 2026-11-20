@@ -1583,7 +1583,7 @@ export function createDrawer(ctx) {
     const seg = el('div', { class: 'seg' });
     for (const [key, meta] of Object.entries(ISO)) {
       const b = el('button', { 'aria-pressed': iso === key ? 'true' : 'false', text: meta.n });
-      if (sessionScope) b.disabled = true;
+      if (sessionScope) lockProjectOnlySeg(b, 'iso');
       else b.addEventListener('click', () => put('isolation', key));
       seg.append(b);
     }
@@ -1647,7 +1647,7 @@ export function createDrawer(ctx) {
     const seg = el('div', { class: 'seg', role: 'group', 'aria-label': 'Docker daemon for sessions and lanes' });
     for (const [key, label] of [['sandbox', 'Sandbox'], ['host', 'Host']]) {
       const b = el('button', { 'aria-pressed': cur === key ? 'true' : 'false', 'data-lane-docker': key, text: label });
-      if (sessionScope) b.disabled = true;
+      if (sessionScope) lockProjectOnlySeg(b, 'laneDocker');
       else b.addEventListener('click', () => { if (declared !== key) void put('laneDocker', key); });
       seg.append(b);
     }
@@ -3524,6 +3524,31 @@ const WIRING_STATE = {
 
   const projectOnlyNote = (what) =>
     note(`${what} can only be set for the whole project — a session cannot change it without rebuilding the container for every other session. Switch to “This project” to change it.`);
+
+  /* Switch the drawer to "This project" scope and deep-link to a section: the
+     BUG-292 / BUG-296 forward idiom. Reused by the locked segmented controls
+     and by the project-only add/edit affordances (`projectOnlyEdit`). The
+     focus/flash is applied by applyFocus() on the next paint. */
+  function switchToProjectScope(focusKey) {
+    if (d.scope !== 'project') { resetEdit(false); d.scope = 'project'; }
+    d.focus = { key: focusKey, applied: false };
+    paint();
+  }
+
+  /* BUG-292 — a project-only segmented control (isolation, the lane-docker
+     daemon) shown at session scope. The option can't be changed here (it would
+     rebuild every other session's container), but a native `<button disabled>`
+     SWALLOWS the click AND looks identical to a live option — no dim, no
+     not-allowed cursor — so the user clicks "Direct" and nothing happens, with
+     no hint why or what to do. Instead mark the button aria-disabled (styled
+     dimmed + not-allowed in styles.css) and keep it CLICKABLE: a click is a way
+     FORWARD — switch to "This project" scope and flash the control the user
+     reached for, reusing the deep-link focus/flash idiom (applyFocus + d.focus).
+     `focusKey` is the group's data-focus anchor ('iso', 'laneDocker'). */
+  function lockProjectOnlySeg(b, focusKey) {
+    b.setAttribute('aria-disabled', 'true');
+    b.addEventListener('click', () => switchToProjectScope(focusKey));
+  }
 
   function stackSummaryRow(name, mode) {
     return el('div', { class: 'set' },

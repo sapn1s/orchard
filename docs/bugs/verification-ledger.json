@@ -1212,6 +1212,21 @@
       "harness": "scripts/independent-verify.mjs",
       "candidate": "735ecb3437ad6796037014d980b4e916109be966c2d6a89df83b80a3cad59b2b",
       "verify_mode": "mixed-state"
+    },
+    {
+      "id": "BUG-292",
+      "provider": "anthropic",
+      "model": null,
+      "run_id": "00433981-62fb-495c-bb77-a5ea61f4b3a3",
+      "verdict": "holds",
+      "verdict_on": "2026-11-19",
+      "recorded_at": "2026-11-19T15:07:46.661Z",
+      "author": "verify lane",
+      "recorded_by": "board-tool",
+      "harness": "scripts/independent-verify.mjs",
+      "candidate": "370280dd6a91cdc401c5fc22fad3572469f20614ac14ee9bf67bcb31df0c7431",
+      "verify_mode": "mixed-state",
+      "note": "Clean-room IV (OpenAI quota -> Anthropic fallback). 17/0 adversarial: session click writes nothing, Enter path, laneDocker host persists after forward. Author suite 27/0 re-run. Intent met: Direct now routes to This project where it applies."
     }
   ]
 }

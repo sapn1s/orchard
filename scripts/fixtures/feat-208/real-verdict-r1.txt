@@ -1,0 +1,104 @@
+VERDICT: BROKEN
+CLAIM: A real REACHABLE defect must never get its ticket recorded as independently verified unless a sealed verifier run of that ticket's change found nothing reachable; board-tool has to take verdict, reach and residuals only from the harness's sealed record.
+
+=== FIXER-TEST ===
+RAN: node scripts/verify-feat-208-reach-residuals.mjs
+EXIT: 1
+MANIFEST: 68b10f0c646f sha256=8745f3a26b08183d exit=1
+OUTPUT:
+FEAT-208 suite against <scratch>/cleanroom-verify-jLDMkw
+
+── A the proof rule (C4, C5)
+  PASS  A1 [must-fail] REACHABLE BROKEN then a residual-only HOLDS stays UNVERIFIED (a residual never clears a reachable defect)
+  PASS  A2 REACHABLE BROKEN then a clean HOLDS is verified (the normal fix round still closes)
+  PASS  A3 a residual-only HOLDS on its own is verified (residuals do not block a first pass)
+  PASS  A4 reopening the residual un-verifies the ticket
+  PASS  A5 a reopened residual needs a CLEAN HOLDS — another residual-only HOLDS does not clear it
+  PASS  A6 [must-fail] openResiduals lists the residual, and not after it is reopened
+  PASS  A7 [must-fail] entryProblems refuses residuals on an entry the verifier did not answer BROKEN
+  PASS  A8 [must-fail] entryProblems refuses a residual-only HOLDS that claims a reachable finding
+  PASS  A9 the well-formed residual-only HOLDS and reopen entries pass entryProblems
+node:fs:481
+      path = getValidatedPath(path);
+             ^
+
+TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string or an instance of Buffer or URL. Received undefined
+    at Module.readFileSync (node:fs:481:14)
+    at file://<scratch>/cleanroom-verify-jLDMkw/scripts/verify-feat-208-reach-residuals.mjs:96:138
+    at file://<scratch>/cleanroom-verify-jLDMkw/scripts/verify-feat-208-reach-residuals.mjs:96:193 {
+  code: 'ERR_INVALID_ARG_TYPE'
+}
+
+Node.js v24.22.1
+
+=== ADVERSARIAL: unbound-holds-from-other-lane ===
+WHY-UNCOVERED: The suite never records a HOLDS sealed with ticket null, which every --range run produces because independent-verify seals ticket as opts.ticket ?? candidate ticket ?? null. sealedEntryFields checks the ticket only when rec.ticket is set. So another lane's genuine HOLDS on an unrelated requirement is accepted on a ticket carrying a recorded REACHABLE BROKEN, and the ticket goes to work_state verified.
+RAN: node adv-unbound-holds.mjs
+EXIT: 1
+MANIFEST: a5475bd11aea sha256=e81487ae1af0dd8f exit=1
+OUTPUT:
+file -> 0 {
+  "ok": true,
+  "verb": "file",
+  "id": "BUG-001",
+  "file": "docs/bugs/BUG-001-total-counts-falsy-entries.md",
+  "rev": "1795144002978:1501",
+  "defaulted": [
+    "reported",
+    "updated",
+    "ow
+record REACHABLE BROKEN on BUG-001 -> exit 0 {
+  "ok": true,
+  "verb": "verified",
+  "id": "BUG-001",
+  "file": "docs/bugs/BUG-001-total-counts-falsy-entries.md",
+  "rev": "1795144003164:2327",
+  "format":
+record OTHER-LANE HOLDS (README requirement) on BUG-001 -> exit 0 {
+  "ok": true,
+  "verb": "verified",
+  "id": "BUG-001",
+  "file": "docs/bugs/BUG-001-total-counts-falsy-entries.md",
+  "rev": "1795144004460:3170",
+  "format": "block",
+  "entry": {
+    "provider": "anthropic",
+    "model": null,
+    "run_id": "adv-run-holds-2-otherlane",
+    "verdict": "holds",
+  
+BUG-001: work_state=verified isIndependentlyVerified=true entries=[["adv-run-broken-1","broken"],["adv-run-holds-2-otherlane","holds"]]
+DEFECT: a reachable BROKEN was closed by a HOLDS from an unrelated verify run
+
+=== ADVERSARIAL: stale-holds-newer-sealed-broken ===
+WHY-UNCOVERED: The suite's stale check (B9) covers only a BROKEN that is already recorded on the ticket. It never puts a newer REACHABLE BROKEN sealed for the same ticket in the store, left unrecorded. Here board-tool records the older clean HOLDS and closes the ticket even though the newest sealed verdict for that ticket is a REACHABLE BROKEN.
+RAN: node adv-stale-sealed.mjs
+EXIT: 1
+MANIFEST: b3901fb0cd5e sha256=336036ab6dbd19c7 exit=1
+OUTPUT:
+file -> 0 {
+  "ok": true,
+  "verb": "file",
+  "id": "BUG-001",
+  "file": "docs/bugs/BUG-001-total-counts-falsy-entries.md",
+  "rev": "1795144015293:1501",
+  "defaulted": [
+    "reported",
+    "updated",
+    "ow
+record STALE HOLDS (newer sealed REACHABLE BROKEN exists for BUG-001 ) -> exit 0 {
+  "ok": true,
+  "verb": "verified",
+  "id": "BUG-001",
+  "file": "docs/bugs/BUG-001-total-counts-falsy-entries.md",
+  
+BUG-001: work_state=verified isIndependentlyVerified=true entries=[["adv-run-holds-1a","holds"]]
+DEFECT: ticket verified while its newest sealed verdict is a REACHABLE BROKEN
+
+=== UNTESTED ===
+The fixer suite could not get past section A in this working copy because docs/bugs/threat-model.json is absent from the clean room: the REAL_TM read throws at line 96. So sections B–E did not run, and requirement 3 (pinned declaration, board:check FAIL, exit 2) and the real-board E checks were not exercised.
+Git writes are blocked in scratch dirs by the leak gate, so independent-verify could not run end to end. Both adversarial runs therefore call sealVerdict directly, with exactly the fields independent-verify passes (ticket null for a --range run; the same ticket id in the stale case), against a non-git scratch board using the .orchard-verdicts fallback store.
+Residual-only HOLDS paths under an enabled threat model and residual-reopen --all --cause=revert were not exercised end to end, because no pinned threat-model.json exists in this tree to enable residuals.
+
+FINDING: board-tool verified accepts a sealed HOLDS whose record has ticket null (every independent-verify --range run) on any ticket: scripts/lib/verdict-store.mjs sealedEntryFields skips the ticket check when rec.ticket is null. A careless agent copying another lane's run id (the printed command says --id=<TICKET>) clears a recorded REACHABLE BROKEN on BUG-001 and sets work_state verified, even though src is unchanged and no run ever verified that ticket's requirement as HOLDS
+FINDING: The stale-verdict refusal in sealedEntryFields consults only BROKENs already recorded on the ticket, never the verdict store. A clean HOLDS sealed for ticket BUG-001 before a later sealed REACHABLE BROKEN for the same ticket is still recorded and closes the ticket (work_state verified) when the agent records the older printed command and never records the newer BROKEN

@@ -469,6 +469,7 @@ FE = frontend (app.js / drawer.js), serialized with each other. SV = server.
 | BUG-289 | Docker sandbox image store grows unbounded, fills the SSD | (uncommitted) |
 | BUG-287 | Settings opens in project scope: Provider reads Claude for OpenAI session | (uncommitted) |
 | BUG-283 | A refused mount save is invisible behind the settings drawer | (uncommitted) |
+| FEAT-208 | Verifiers break fixes with inputs no real user or agent produces | (uncommitted) |
 
 ## Shipped earlier (pre-tracker)
 Routing, search, recency, memories, OOM, git, sidebar attention, diff chips,

@@ -1,0 +1,51 @@
+VERDICT: BROKEN
+CLAIM: Once a reachable BROKEN is sealed for a ticket, no path may leave that ticket independently verified or at work_state verified/done unless a later, ticket-bound clean HOLDS clears the BROKEN; the decision is made only by sealedProof over the sealed store.
+
+=== FIXER-TEST ===
+RAN: node scripts/verify-feat-208-reach-residuals.mjs
+EXIT: 1
+MANIFEST: 4e156bdd5794 sha256=9ec5d164aa2452f2 exit=1
+OUTPUT:
+FEAT-208 suite against <scratch>/cleanroom-verify-RBbcIW
+
+── A the proof rule (C4, C5)
+  PASS  A1 [must-fail] REACHABLE BROKEN then a residual-only HOLDS stays UNVERIFIED (a residual never clears a reachable defect)
+  PASS  A2 REACHABLE BROKEN then a clean HOLDS is verified (the normal fix round still closes)
+  PASS  A3 a residual-only HOLDS on its own is verified (residuals do not block a first pass)
+  PASS  A4 reopening the residual un-verifies the ticket
+  PASS  A5 a reopened residual needs a CLEAN HOLDS — another residual-only HOLDS does not clear it
+  PASS  A6 [must-fail] openResiduals lists the residual, and not after it is reopened
+  PASS  A7 [must-fail] entryProblems refuses residuals on an entry the verifier did not answer BROKEN
+  PASS  A8 [must-fail] entryProblems refuses a residual-only HOLDS that claims a reachable finding
+  PASS  A9 the well-formed residual-only HOLDS and reopen entries pass entryProblems
+node:fs:481
+      path = getValidatedPath(path);
+             ^
+
+TypeError [ERR_INVALID_ARG_TYPE]: The "path" argument must be of type string or an instance of Buffer or URL. Received undefined
+    at Module.readFileSync (node:fs:481:14)
+    at file://<scratch>/cleanroom-verify-RBbcIW/scripts/verify-feat-208-reach-residuals.mjs:96:138
+    at file://<scratch>/cleanroom-verify-RBbcIW/scripts/verify-feat-208-reach-residuals.mjs:96:193 {
+  code: 'ERR_INVALID_ARG_TYPE'
+}
+
+Node.js v24.22.1
+
+=== ADVERSARIAL: broken-after-holds-stays-verified ===
+WHY-UNCOVERED: The existing tests check work_state only after recording a HOLDS (B10, F7, F8). They never take a ticket that is already work_state verified, seal a reachable BROKEN for it the way independent-verify --ticket does, record that BROKEN with board-tool verified, and then read the record's work_state and the INDEX Done section. F4 only checks the proof object, never the stored work_state.
+RAN: node adv/broken-after-holds-stays-verified.mjs
+EXIT: 1
+MANIFEST: 6041d99130a4 sha256=1f69779293e0c40e exit=1
+OUTPUT:
+record HOLDS exit 0 -> work_state verified verified true
+record BROKEN exit 0 | tool says work_state null | record work_state verified | independently_verified false | blockers [{"run_id":"run-broken-00002","key":2,"from":"sealed"},{"run_id":"run-broken-00002","key":2,"from":"recorded"}]
+INDEX Done section lists the ticket: true
+update --work-state=done exit 1 { "ok": false, "verb": "update", "refusal": { "code": "outstanding-broken", "message": "update: BUG-001 cannot be set done — a reachable BROKEN stands unresolve
+BROKEN: ticket left work_state verified with a recorded reachable BROKEN outstanding
+
+=== UNTESTED ===
+The fixer suite could not run in this checkout. It crashed at start-up in run 4e156bdd5794 because docs/bugs/threat-model.json is missing, so the B, C, D, E and F sections never ran. The pinned declaration (sha 77993ea6…) is not available here to supply through FEAT208_TM_FILE.
+I did not drive the server's decision-reopen route (src/server/owned-decisions.ts calls reopenRecord, which restores owned.prior.work_state with no proof check) end to end. The decide → withdraw setup refused a live decision while work_state is verified, so I could not set up a prior work_state of verified that way.
+I did not test real concurrent seq/ reservations between two processes, a crash during sealVerdict's write-temp-then-link step, the candidate-store ticketSatisfied path, or FEAT-191 branch-flow verification.
+
+FINDING: board-tool verified (scripts/board-tool.mjs, verbVerified) never moves a verified ticket off work_state verified when a reachable BROKEN is recorded. In the normal flow, independent-verify seals the BROKEN before board-tool records it. The sealed BROKEN alone already makes current.verified false (the round-2 path-2 union), so wasVerified is false, derivedState is null and the record keeps work_state "verified". Seen in run 6041d99130a4: the tool reported work_state null, the record still said verified, independently_verified was false with blocker run-broken-00002 (from: sealed and from: recorded), and the INDEX still listed the ticket under Done. This breaks the requirement that no ticket with a reachable BROKEN stays at work_state verified/done without a later clean HOLDS, and it undoes the BUG-225 r5 rule that the state is derived both ways.

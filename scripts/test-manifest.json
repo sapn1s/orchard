@@ -1258,6 +1258,12 @@
       "why": "launches a real browser (CDP/Brave/chromium)",
       "needsGit": true
     },
+    "verify:feat-208": {
+      "tier": "pure",
+      "file": "scripts/verify-feat-208-advisory-reach.mjs",
+      "why": "no server/browser/docker/network signal",
+      "needsGit": true
+    },
     "verify:release-no-verdicts": {
       "tier": "browser",
       "file": "scripts/verify-release-no-verdicts.mjs",

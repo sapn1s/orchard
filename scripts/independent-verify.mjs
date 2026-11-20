@@ -87,6 +87,8 @@ import {
   CITATION_CONTRACT, validateVerdict, formatVerifiedBy, parseManifest,
   parseCitationReply, composeVerdict,
 } from './lib/verdict-contract.mjs';
+// FEAT-208 (advisory only): per-finding reach tags are recorded and counted; they never change a verdict.
+import { REACH_RULE, buildReachRecord, appendReachRecord } from './lib/reach-tags.mjs';
 // Clean rooms are both EXPENSIVE (a 374 MB reflink copy) and LONG-LIVED (a kept
 // room and its record dir are the artifacts a verdict cites, read after the
 // run), and `/tmp` on this machine is wiped on every boot. See scratch.mjs.
@@ -1629,6 +1631,8 @@ run it through ./vrun.mjs, and cite the run id.
 
 ${CITATION_CONTRACT}
 
+${REACH_RULE}
+
 FINAL REMINDER: every evidence command goes through \`node ./vrun.mjs …\`, and
 your ENTIRE answer is the labelled citation block above — nothing else counts.`;
 }
@@ -2058,7 +2062,9 @@ Then answer with ONLY the labelled citation block — no markdown, no headings,
 no explanation outside the labels. The case-slug after ADVERSARIAL: must be a
 SHORT tag (letters/digits/hyphen, ≤40 chars), e.g. \`ADVERSARIAL: empty-input run <id>\`:
 
-${CITATION_CONTRACT}`;
+${CITATION_CONTRACT}
+
+${REACH_RULE}`;
       const second = await runDispatch(corrective, sessionForReprompt, 'dispatch-meta-2.json');
       reprompted = true;
       if (second.code === 0) { active = second; cite = parseCitationReply(second.stdout); }
@@ -2135,6 +2141,15 @@ ${CITATION_CONTRACT}`;
   console.log(composed.text.trim());
   console.log('');
   const exit = reportValidation(v);
+  if (v.valid && runId) {
+    // FEAT-208 (advisory only): store the verifier's reach tags beside the verdict. The verdict
+    // word is copied from the validation above; the tags decide nothing. Best-effort.
+    try {
+      const file = appendReachRecord(buildReachRecord({ runId, ticket: opts.ticket ?? candidate?.manifest?.ticket ?? null, repo,
+        provider: opts.provider, model: opts.model ?? null, candidate: candidate?.manifest?.hash ?? null, verdict: v.verdict, findingLines: v.findings }));
+      console.log(`  reach tags recorded (advisory) → ${file}`);
+    } catch (e) { console.log(`  WARNING: reach tags not recorded (${e.message}) — the verdict is unaffected`); }
+  }
   if (v.valid) {
     console.log('');
     // BUG-225 r3: proof is a TYPED entry written by the board tool — a pasted

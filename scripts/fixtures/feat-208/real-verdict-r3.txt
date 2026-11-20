@@ -1,0 +1,63 @@
+VERDICT: BROKEN
+CLAIM: A ticket with a reachable sealed BROKEN must never end up verified/done unless a verifier run whose input was frozen after that BROKEN's input, bound to the same ticket, finds nothing reachable; verdict order must follow when the input was frozen, not when the run started.
+
+=== FIXER-TEST ===
+RAN: node scripts/verify-feat-208-reach-residuals.mjs
+EXIT: 2
+MANIFEST: 8f267b8b2ec4 sha256=99d5bf0cbcd10ed6 exit=2
+OUTPUT:
+FEAT-208 suite against <scratch>/cleanroom-verify-AdrSWJ
+
+── A the proof rule (C4, C5)
+  PASS  A1 [must-fail] REACHABLE BROKEN then a residual-only HOLDS stays UNVERIFIED (a residual never clears a reachable defect)
+  PASS  A2 REACHABLE BROKEN then a clean HOLDS is verified (the normal fix round still closes)
+  PASS  A3 a residual-only HOLDS on its own is verified (residuals do not block a first pass)
+  PASS  A4 reopening the residual un-verifies the ticket
+  PASS  A5 a reopened residual needs a CLEAN HOLDS — another residual-only HOLDS does not clear it
+  PASS  A6 [must-fail] openResiduals lists the residual, and not after it is reopened
+  PASS  A7 [must-fail] entryProblems refuses residuals on an entry the verifier did not answer BROKEN
+  PASS  A8 [must-fail] entryProblems refuses a residual-only HOLDS that claims a reachable finding
+  PASS  A9 the well-formed residual-only HOLDS and reopen entries pass entryProblems
+COULD NOT RUN: git writes refused even in a scratch repo; run it confined:
+  node scripts/confined-run.mjs --timeout-sec 600 -- node scripts/verify-feat-208-reach-residuals.mjs
+
+=== ADVERSARIAL: stale-candidate-retry ===
+WHY-UNCOVERED: The suite's ordering checks (B9, F6, F9-F12) call sealVerdict or reserveVerdictSeq directly, or use --ticket and --range runs, which freeze their input inside the run. None of them runs independent-verify --candidate on a candidate that was frozen before another candidate. This run freezes C1, then freezes C2 for the same ticket. A reachable BROKEN on C2 is sealed and auto-recorded. Then the earlier command is retried on the superseded C1: it gets a HIGHER store seq (it is reserved when the run starts, not when C1 was frozen). Recording that HOLDS exactly as the harness printed it leaves the ticket verified=true and work_state=verified.
+RAN: node scripts/confined-run.mjs --timeout-sec 300 -- node adv-stale-candidate.mjs
+EXIT: 1
+MANIFEST: e3df7ab4ba07 sha256=44effeee06f8babf exit=1
+OUTPUT:
+[confined-run] shipping 998 entries from <scratch>/cleanroom-verify-AdrSWJ (container 9322bd1cbba4)
+BUG-001 claims 1 file(s): src/thing.mjs
+
+C1 3b4caf1d20d656e9b9e8fa282a80f3eb713ae2687dccae7301631ac3ddadd735 C2 728465f924235fffca8a4f8d7922990ce70f97bc299ccd2d4a714e24f4333158
+C2 run exit 1 EFFECTIVE: BROKEN (verifier answered BROKEN; 1 reachable, 0 unreachable finding(s); threat model careless-agent) |   sealed     /work/.home/.local/state/claude-station/scratch/adv-stale-cand-I49PBz/.git/orchard-verdicts/adv-stale-broken-c2.json |   recorded   BROKEN on BUG-001 (typed entry; work_state demoted if it read verified/done) | Already recorded on BUG-001 by this harness — do not record it again. |   (bound to clean candidate 728465f92423: a later edit to its files makes a new candidate, which needs its own verdict; board-tool records the mode from the candidate itself) |   inputs    
+C1 run exit 0 EFFECTIVE: HOLDS (verifier answered HOLDS; 0 reachable, 0 unreachable finding(s); threat model careless-agent) |   sealed     /work/.home/.local/state/claude-station/scratch/adv-stale-cand-I49PBz/.git/orchard-verdicts/adv-stale-holds-c1.json |   node scripts/board-tool.mjs verified --id=BUG-001 --provider=anthropic --run=adv-stale-holds-c1 --verdict=HOLDS --candidate=3b4caf1d20d656e9b9e8fa282a80f3eb713ae2687dccae7301631ac3ddadd735 |   (bound to clean candidate 3b4caf1d20d6: a later edit to its files makes a new candidate, which needs its own verdict; board-tool records the mode from the candid
+record HOLDS on C1: 0 {
+  "ok": true,
+  "verb": "verified",
+  "id": "BUG-001",
+  "file": "docs/bugs/BUG-001-stale-candidate-retry-fixture.md",
+  "rev": "1795147386950:3644",
+  "format": "block",
+  "entry": {
+    "provider": "anthropic",
+    "model": null,
+    "run_id": "adv-stale-holds-c1",
+    "verdict": "holds",
+    "verdict_on": "2026-11-20",
+    "recorded_at": "2026-11-20T04:03:06.933Z",
+    "author": "dispatch ant
+entries: [["adv-stale-broken-c2","broken","728465f9",1],["adv-stale-holds-c1","holds","3b4caf1d",2]]
+sealed: [["adv-stale-broken-c2","broken",1,"728465f9"],["adv-stale-holds-c1","holds",2,"3b4caf1d"]]
+RESULT: verified=true work_state=verified (BROKEN was on the NEWER candidate C2; HOLDS on the OLDER C1)
+[confined-run] kicked off background cap-prune to bound the sandbox store (BUG-289)
+
+=== UNTESTED ===
+The fixer suite cannot run in this sandbox without confinement. Run 8f267b8b2ec4 stopped at the git-write probe with exit 2.
+I ran the confined suite outside vrun.mjs, so it is not evidence. There, every A-G check passed and only E1 failed, because the clean room has no docs/bugs.
+Not run: concurrent races between the auto-record and a lane's own HOLDS write (rev-conflict refusal of the auto-record), and the board UI (public/app.js), which still folds only recorded entries.
+Not run: a BROKEN on a legacy prose-format ticket. There is no record work_state to demote there, so its INDEX Status line may stay Done.
+Not checked: whether the git-common-dir store and the board-dir store diverge for a board that is not in a git repo.
+
+FINDING: independent-verify --candidate reserves the verdict seq when the run starts (scripts/independent-verify.mjs, reserveVerdictSeq after the prompt is composed), not when the candidate was frozen. A retried verify on an older, superseded candidate C1 (frozen before C2) therefore outranks a reachable BROKEN sealed on the newer C2. board-tool verified --candidate=C1 accepts the HOLDS: sealedProof sees seq 2 > 1 and nothing checks that C1 is still the ticket's current candidate. Result: the ticket reads independently verified with work_state verified over an outstanding reachable BROKEN

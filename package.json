@@ -283,6 +283,8 @@
     "verify:feat-164-store-authority": "node scripts/verify-feat-164-store-authority.mjs",
     "verify:feat-164-release": "node scripts/verify-feat-164-release.mjs",
     "verify:feat-164-settings-ui": "node scripts/verify-feat-164-settings-ui.mjs",
+    "verify:feat-208": "node scripts/verify-feat-208-advisory-reach.mjs",
+    "reach:report": "node scripts/reach-report.mjs",
     "verify:release-no-verdicts": "node scripts/verify-release-no-verdicts.mjs",
     "verify:codex-instructions": "node scripts/verify-codex-instructions.mjs",
     "verify:codex-instructions:wire": "node scripts/verify-codex-instructions.mjs --no-e2e",

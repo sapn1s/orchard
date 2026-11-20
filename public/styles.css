@@ -2567,6 +2567,17 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 }
 .addrow:hover { color: var(--ink-2); }
 
+/* BUG-296 — a project-only add/edit affordance shown at "This session" scope.
+   It looks like the real "+ Add …" row (so the capability stays discoverable —
+   the user who came to add a mount sees it), but it routes to "This project"
+   scope rather than acting here. It IS clickable (it navigates + focuses the
+   section), so cursor stays a pointer, not not-allowed; aria-disabled only
+   marks that it cannot perform the add in this scope. The trailing "→ in
+   project settings" is the signpost. Slightly dimmer than a live add row, and
+   brightens on hover like one. */
+.addrow.proj-only { color: var(--ink-3); cursor: pointer; }
+.addrow.proj-only:hover { color: var(--ink); }
+
 /* FEAT-118 — global-default pickers in the drawer.
    BUG-183 — these three rules were written against FIVE tokens that have never
    existed here (--ink-1 / --bg-2 / --line-1 / --line-2 / --accent). Every one of
@@ -2662,6 +2673,11 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
 }
 .sw[aria-pressed="true"] { background: var(--solid); }
 .sw[aria-pressed="true"] i { transform: translateX(12px); background: var(--on-solid); }
+/* BUG-296 — a project-only socket switch at session scope: dimmed and locked,
+   but clickable to route to "This project" scope (not a freely toggleable
+   switch). Matches the .addrow.proj-only forward idiom. */
+.sw[aria-disabled="true"] { opacity: .45; cursor: pointer; }
+.sw[aria-disabled="true"]:hover { opacity: .6; }
 
 /* instruction stack */
 .trow {

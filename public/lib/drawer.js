@@ -305,6 +305,24 @@ export function createDrawer(ctx) {
     accounts: 'accounts',
   };
 
+  /* BUG-296 — openForm tokens for the add-form deep links ("+ Add mount" in the
+     session header, and the env/port/service equivalents). Each opens the
+     editable add form (`flag`), focuses its bound input (`key`) and lands on its
+     section (`focus`). Every one is project-only, so `open()` forces "This
+     project" scope — landing the user on the session-scope affordance that only
+     ROUTES to the control is the BUG-296 trap they just clicked past. */
+  const ADD_FORM = {
+    mount: { flag: 'addingMount', key: 'add:mount', focus: 'mounts' },
+    env: { flag: 'addingEnv', key: 'add:env', focus: 'env' },
+    port: { flag: 'addingPort', key: 'add:port', focus: 'ports' },
+    service: { flag: 'addingService', key: 'add:service', focus: 'services' },
+  };
+  /* Focus keys whose whole SECTION is project-only (the BUG-296 family: mounts,
+     env, ports, services, the container/isolation fields, the lane Docker
+     daemon). A deep link at one lands in "This project" scope so its control is
+     editable here, never on the passive session-scope affordance. */
+  const PROJECT_ONLY_FOCUS = new Set(['mounts', 'env', 'ports', 'services', 'iso', 'isoSection', 'laneDocker']);
+
   /* ---------------------------------------------------------- value model */
 
   const project = () => ctx.getProject();
@@ -1626,9 +1644,10 @@ export function createDrawer(ctx) {
           add.addEventListener('click', () => openAddForm('addingMount', 'add:mount'));
           access.append(add);
         }
+      } else {
+        access.append(projectOnlyEdit('Add mount', 'mounts'));
       }
       access.append(dockerSocketBlock(sessionScope));
-      if (sessionScope) access.append(projectOnlyNote('Mounts and the socket flag'));
     }
 
     return catWrap('isoSection', runtime, laneDockerGroup(p, sessionScope), access, envGroup(p, sessionScope), portsGroup(p, sessionScope), servicesGroup(p, sessionScope));
@@ -3535,6 +3554,32 @@ const WIRING_STATE = {
     paint();
   }
 
+  /* BUG-296 — a project-only section (mounts, env, ports, services, the
+     container fields, the docker socket) viewed at "This session" scope. The
+     old treatment HID the add/edit control and left only a grey note, so a user
+     who came to add a mount saw no "+ Add mount" and concluded the feature did
+     not exist (their words). Production apps (VS Code user/workspace, GitHub
+     org↔repo, Vercel team↔project) never hide the capability: they render the
+     control where it belongs and put a one-click route to the scope that owns it
+     right there. So instead of the note, render a LIVE affordance in the add
+     control's own place — it reads as the real action ("+ Add mount"), is marked
+     aria-disabled (dimmed, not-allowed) because it can't act here, and on click
+     switches to "This project" scope and focuses + flashes the section. The WHY
+     (shared-container rebuild) stays one short line beneath.
+     `label` is the action word shown ("Add mount", "Add variable", …);
+     `focusKey` is the section's data-focus anchor. */
+  function projectOnlyEdit(label, focusKey) {
+    const frag = document.createDocumentFragment();
+    const b = el('button', {
+      class: 'addrow proj-only', 'aria-disabled': 'true',
+      title: 'Set for the whole project — switch to “This project” to change it',
+      text: `+ ${label} — in project settings →`,
+    });
+    b.addEventListener('click', () => switchToProjectScope(focusKey));
+    frag.append(b, note('Set for the whole project — a session can’t change it without rebuilding the container shared by every other session.'));
+    return frag;
+  }
+
   /* BUG-292 — a project-only segmented control (isolation, the lane-docker
      daemon) shown at session scope. The option can't be changed here (it would
      rebuild every other session's container), but a native `<button disabled>`
@@ -3626,7 +3671,7 @@ const WIRING_STATE = {
         g.append(add);
       }
     } else {
-      g.append(projectOnlyNote('Services'));
+      g.append(projectOnlyEdit('Add service', 'services'));
     }
     return g;
   }
@@ -3715,7 +3760,11 @@ const WIRING_STATE = {
     }
     risk.append(why);
 
-    if (readOnly) sw.disabled = true;
+    // BUG-296 — at session scope the socket is project-only. A bare disabled
+    // switch is a dead end (BUG-292's lesson); keep it clickable-to-switch so a
+    // click routes to "This project" scope at the Access section, where it is
+    // editable, with the same forward idiom the segmented controls use.
+    if (readOnly) lockProjectOnlySeg(sw, 'mounts');
     else sw.addEventListener('click', () => {
       if (on) return void putContainer({ dockerSocket: false }); // switching off is always safe
       d.armSocket = true; // arm; the confirm button commits
@@ -4116,7 +4165,7 @@ const WIRING_STATE = {
         g.append(add);
       }
     } else {
-      g.append(projectOnlyNote('Environment variables'));
+      g.append(projectOnlyEdit('Add variable', 'env'));
     }
     return g;
   }
@@ -4184,7 +4233,7 @@ const WIRING_STATE = {
         g.append(add);
       }
     } else {
-      g.append(projectOnlyNote('Published ports'));
+      g.append(projectOnlyEdit('Publish a port', 'ports'));
     }
     return g;
   }
@@ -4237,6 +4286,11 @@ const WIRING_STATE = {
       return frag;
     }
     frag.append(imageRow(readOnly), dockerfileRow(p, readOnly), memoryRow(readOnly), gpuRow(readOnly), wsRootRow(p, readOnly));
+    // BUG-296 — at session scope these rows are read-only (project-only fields).
+    // Don't leave the user stranded at a wall of disabled controls: offer the
+    // same forward route the add sections do — one click to project scope,
+    // focused on the isolation section where these fields become editable.
+    if (readOnly) frag.append(projectOnlyEdit('Edit the image, Dockerfile, memory and GPU', 'iso'));
     const c = d.container;
     if (c.problem) {
       // The route exists and said no — quote it rather than inventing a reason.
@@ -5599,11 +5653,15 @@ const WIRING_STATE = {
     f.applied = true;
     f.at = Date.now();
     const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true;
-    target.setAttribute('tabindex', '-1');
+    // BUG-296 — a deep-linked add form (openForm) wants focus IN its input, not
+    // on the section wrapper; the section still owns the scroll and the flash.
+    const formInput = edit.focusKey ? target.querySelector?.(`[data-ek="${CSS.escape(edit.focusKey)}"]`) : null;
+    const landing = formInput && !formInput.disabled ? formInput : target;
+    if (landing === target) target.setAttribute('tabindex', '-1');
     // Next frame: the drawer may still be sliding open; geometry settles first.
     requestAnimationFrame(() => {
       target.scrollIntoView({ behavior: reduced ? 'auto' : 'smooth', block: 'start' });
-      target.focus({ preventScroll: true });
+      landing.focus({ preventScroll: true });
       flash(FLASH_MS);
     });
   }
@@ -6145,7 +6203,17 @@ const WIRING_STATE = {
        `{scope:'machine'}` was the sidebar-foot door into the machine panel;
        machine is a rail group now, so it maps to the Accounts category. */
     const machineAsked = opts?.scope === 'machine' || view === 'globals';
+    // BUG-296 — an add-form deep link ("+ Add mount" and its env/port/service
+    // siblings) opens the editable form itself. Its focus key comes from ADD_FORM.
+    const addForm = opts?.openForm ? ADD_FORM[opts.openForm] : null;
+    const focusKey = addForm ? addForm.focus : (opts?.focus ? String(opts.focus) : null);
     if (opts?.scope === 'project' || opts?.scope === 'session') d.scope = opts.scope;
+    // BUG-296 — a deep link whose target section is project-only (mounts, env,
+    // ports, services, the container fields, the lane Docker daemon) opens in
+    // "This project" scope, where its control is editable. Otherwise the user
+    // lands on the passive session-scope affordance that merely routes there —
+    // the exact dead end they clicked "+ Add mount" to escape.
+    else if (addForm || (focusKey && PROJECT_ONLY_FOCUS.has(focusKey))) d.scope = 'project';
     // BUG-287 — with no scope asked, the lens follows WHAT IS ON SCREEN: opened
     // over a session it lands on "This session" (so Provider shows that session's
     // real pinned engine, not the project default that reads as a contradiction);
@@ -6156,7 +6224,6 @@ const WIRING_STATE = {
     // no path (an explicit {scope:'session'}, or a scope left over from an earlier open)
     // may land on the session lens.
     if (d.scope === 'session' && ctx.getForeignDockOwner?.()) d.scope = 'project';
-    const focusKey = opts?.focus ? String(opts.focus) : null;
     let cat = machineAsked ? 'accounts'
       : focusKey ? (FOCUS_CATEGORY[focusKey] ?? null)
       : null;
@@ -6182,6 +6249,16 @@ const WIRING_STATE = {
     // A focus is per-open: a plain open (cog button) clears any previous one
     // and lands at the default position — no sticky deep-link.
     d.focus = focusKey ? { key: focusKey, applied: false } : null;
+    // BUG-296 — open the add form so the user lands IN it. Mirrors openAddForm()
+    // (which runs from an in-drawer click); set after openModal()'s resetEdit()
+    // so the flag and the input focus survive to paint(). applyFocus() then puts
+    // focus on the form input (not the section wrapper) and scrolls it in.
+    if (addForm) {
+      d[addForm.flag] = true;
+      edit.focusKey = addForm.key;
+      edit.sel = null;
+      edit.reveal = addForm.key;
+    }
     markRail();
     prefetchForDots();
     paint();
@@ -6193,7 +6270,12 @@ const WIRING_STATE = {
     // edge and takes its group heading off screen with it, which is the one
     // piece of structure that strip has.
     const seat = node.rail.querySelector(`.srail-item[data-cat="${d.cat}"]`);
-    if (seat) {
+    if (addForm) {
+      // BUG-296 — land IN the add form, not on the rail seat: paint() + applyFocus()
+      // placed focus on the form input and scrolled its section into view. Still
+      // bring the selected rail item into view so the strip shows where we are.
+      if (seat) revealSelectedCat();
+    } else if (seat) {
       seat.focus({ preventScroll: true });
       // preventScroll, then an explicit reveal: a plain focus() in the narrow
       // horizontal rail scrolls the item flush to the scrollport start.

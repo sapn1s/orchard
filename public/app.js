@@ -4036,7 +4036,9 @@ function paintCrown() {
       node.sealBreak.before(pill);
     }
     const add = el('button', { class: 'pill addm', text: '+ Add mount' });
-    add.addEventListener('click', () => void drawer.open('settings', { focus: 'mounts' })); // FEAT-054
+    // BUG-296 — open the editable mount form directly (project scope, form open
+    // and focused), not the session-scope affordance that merely routes there.
+    add.addEventListener('click', () => void drawer.open('settings', { focus: 'mounts', openForm: 'mount' })); // FEAT-054 / BUG-296
     node.sealBreak.before(add);
   }
 

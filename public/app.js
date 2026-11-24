@@ -14492,6 +14492,23 @@ function onEvent(e, fromWs = null) { // BUG-198 round 2 — fromWs: the driving 
         return;
       }
       say(e.message, true);
+      /*
+       * BUG-265 — an ADVISORY non-fatal error (the server marks it `advisory`:
+       * the session-start snapshot failed, agent-memory could not be unified, a
+       * template is missing, an optional capability is down…) does NOT refuse the
+       * start and does NOT interrupt the turn — the session proceeds and its own
+       * `start` ack settles `pendingStart` the normal way. Before this guard, such
+       * a frame arrived while `pendingStart` was still set (it is emitted during
+       * startup, BEFORE the ack) and fell through to the generic "refused before
+       * ack" branch below, which ran rollBackPendingStart: it put the
+       * just-cleared composer text BACK while the message was actually sent, so
+       * every send left a duplicate in the composer (the reported bug, seen on the
+       * "snapshot FAILED (copy-failed)" session). Show it (say, above) and stop:
+       * never roll back a pending start/send on an advisory. `!e.fatal` is belt-
+       * and-braces — the server never sets both — so a fatal frame is never
+       * swallowed here.
+       */
+      if (e.advisory && !e.fatal) return;
       if (e.fatal && state.pendingStart != null) {
         /*
          * BUG-215 round 2 — a FATAL error on a start/fork that never began (e.g. a

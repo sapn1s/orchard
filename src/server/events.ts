@@ -394,6 +394,23 @@ export type StationEvent =
        */
       uncertain?: boolean;
       /**
+       * BUG-265 — an ADVISORY non-fatal error: an "insurance failed" warning
+       * emitted WHILE a session is starting or running that does NOT refuse the
+       * start and does NOT interrupt the turn — the session proceeds and its own
+       * `ack` settles the pending start. Examples: the session-start snapshot
+       * failed (no restore point), agent-memory could not be unified, an
+       * instruction template is missing, or an OPTIONAL capability (OpenAI
+       * dispatch, the stealth browser) is unavailable.
+       *
+       * The client MUST NOT treat an advisory frame as a pre-ack refusal: doing
+       * so rolled the just-cleared composer text BACK on top of a message that
+       * was actually sent, so every send left a duplicate in the composer
+       * (BUG-265, reported against the "snapshot FAILED (copy-failed)" session).
+       * `message` stays the readable text shown either way. Never set together
+       * with `fatal`, `retryable`, or `uncertain`.
+       */
+      advisory?: boolean;
+      /**
        * BUG-149 — a machine-readable name for a refusal whose `fatal` flag does
        * NOT mean "this session is dead". `message` stays the readable fallback.
        *

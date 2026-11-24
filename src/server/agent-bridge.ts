@@ -1409,7 +1409,7 @@ export class AgentSession {
       this.composed = { ...this.composed, systemPrompt: appendToSystemPrompt(this.composed.systemPrompt, containerAccessSection()) };
     }
     for (const missing of this.composed.missingIds) {
-      this.#emit({ t: 'error', message: `instruction template not found: ${missing}`, fatal: false });
+      this.#emit({ t: 'error', message: `instruction template not found: ${missing}`, fatal: false, advisory: true });
     }
 
     /*
@@ -1946,7 +1946,7 @@ export class AgentSession {
         provider,
         cwd: this.cwd,
         encodedDir: this.storeEncodedDir,
-        onError: (message) => this.#emit({ t: 'error', message, fatal: false }),
+        onError: (message) => this.#emit({ t: 'error', message, fatal: false, advisory: true }),
         // BUG-278 r14 — keep the send-uuid guard current as the transcript grows:
         // every appended entry (user prompt AND assistant reply) marks its uuid
         // taken, so a later send can never collide with one already written.
@@ -4602,7 +4602,7 @@ export class AgentSession {
     if (sid === this.resumeOf || getSessionAccount(sid) !== undefined) return;
     try { setSessionAccount(sid, lb.account); }
     catch (err) {
-      this.#emit({ t: 'error', fatal: false, message: `Orchard could not record this session's Claude account (${(err as Error).message}); it runs on it now, but its next resume uses the project's account` });
+      this.#emit({ t: 'error', fatal: false, advisory: true, message: `Orchard could not record this session's Claude account (${(err as Error).message}); it runs on it now, but its next resume uses the project's account` });
     }
   }
 
@@ -4690,7 +4690,7 @@ export class AgentSession {
     } else {
       // Loud, not silent: a leftover copy would show up as a phantom session.
       console.warn(`[orchard] could not remove staged fork copy ${f} (${why})`);
-      this.#emit({ t: 'error', message: `fork: staged transcript copy left behind at ${f}`, fatal: false });
+      this.#emit({ t: 'error', message: `fork: staged transcript copy left behind at ${f}`, fatal: false, advisory: true });
     }
   }
 
@@ -5354,7 +5354,7 @@ export class AgentSession {
         if (this.#runtime.capabilities.persistedTranscript && this.sdkSessionId) {
           try {
             mirrorClaudeStore(this.storeEncodedDir, this.sdkSessionId, {
-              onError: (message) => this.#emit({ t: 'error', message, fatal: false }),
+              onError: (message) => this.#emit({ t: 'error', message, fatal: false, advisory: true }),
             });
           } catch { /* the durable mirror must never break a turn */ }
         }
@@ -6213,7 +6213,7 @@ export async function prepareDispatchForSession(opts: Pick<StartOptions, 'projec
     return undefined;
   } catch (err) {
     const reason = `host broker could not start: ${(err as Error).message}`;
-    opts.onEvent({ t: 'error', message: `OpenAI dispatch broker unavailable: ${reason}`, fatal: false });
+    opts.onEvent({ t: 'error', message: `OpenAI dispatch broker unavailable: ${reason}`, fatal: false, advisory: true });
     opts.onEvent({ t: 'status', status: 'starting session without OpenAI dispatch capability' });
     return reason;
   }
@@ -6432,7 +6432,7 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
       const e = err as Error;
       const be = err instanceof browser.BrowserError ? err : null;
       browserUnavailableReason = `${be ? `${be.code}: ` : ''}${e.message}${be?.detail ? `\n${be.detail}` : ''}`;
-      opts.onEvent({ t: 'error', message: `stealth browser unavailable — ${browserUnavailableReason}`, fatal: false });
+      opts.onEvent({ t: 'error', message: `stealth browser unavailable — ${browserUnavailableReason}`, fatal: false, advisory: true });
       opts.onEvent({
         t: 'status',
         status: 'starting session WITHOUT the stealth browser; no `mcp__stealth-browser__*` tools are attached',
@@ -6604,7 +6604,7 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
       opts.onEvent({ t: 'status', status: parts.join('; ') });
     }
   } catch (err) {
-    opts.onEvent({ t: 'error', message: `agent memory could not be unified across isolation modes (memory may not carry over): ${(err as Error).message}`, fatal: false });
+    opts.onEvent({ t: 'error', message: `agent memory could not be unified across isolation modes (memory may not carry over): ${(err as Error).message}`, fatal: false, advisory: true });
   }
 
   const id = `cs-${Date.now().toString(36)}-${(++seq).toString(36)}`;
@@ -6624,7 +6624,7 @@ async function startSessionAdmitting(opts: StartOptions): Promise<AgentSession> 
    */
   const snap = snapshots.snapshotOnSessionStart(opts.project, id, {
     onStatus: (status) => opts.onEvent({ t: 'status', status }),
-    onError: (message) => opts.onEvent({ t: 'error', message, fatal: false }),
+    onError: (message) => opts.onEvent({ t: 'error', message, fatal: false, advisory: true }),
   });
 
   let s: AgentSession;

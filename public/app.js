@@ -5274,13 +5274,69 @@ function toolsGroup(th) {
   return g;
 }
 
+// BUG-308 (verify r2, P3c) — the collapsed/expanded choice is remembered PER
+// SESSION. Native <details>.open is per-DOM state: on an SPA session switch
+// (A → B → A) the transcript is torn down and rebuilt, so A's ran-stack came
+// back collapsed and the user lost the expansion. One declared place — a Map
+// keyed by session id — read when the stack is built and written on toggle (no
+// checks scattered across call sites). Default stays COLLAPSED (absent key);
+// the state never leaks to another session (distinct keys); it is in-memory, so
+// it need not survive a full page reload. The session id is the MAIN session's
+// (`state.current.sessionId`): the ran-stack always hangs off the main thread.
+const ranOpenBySession = new Map();
+
 function ranStack(th) {
   const body = claudeBody(th);
   const last = body.lastElementChild;
   if (last && last.classList.contains('ran-stack')) return last;
-  const s = el('div', { class: 'ran-stack' }, el('div', { class: 'ran-lbl', text: '' }));
+  // BUG-308 — the "N agents ran in this session" stack is COLLAPSED by default:
+  // a <details> whose <summary> is the single count row. Agent-heavy sessions
+  // (187+) otherwise flooded the transcript with one hairline row per agent.
+  // Expanding reveals every agent (each `open ›` still opens its thread); the
+  // native `open` state persists across live appends and scroll paging with no
+  // extra bookkeeping. The count text lives in `.rlbl-text` so callers can set
+  // it without clobbering the disclosure triangle.
+  const s = el('details', { class: 'ran-stack' },
+    el('summary', { class: 'ran-lbl' },
+      el('span', { class: 'rtw', text: '▶' }),
+      el('span', { class: 'rlbl-text', text: '' })));
+  const sid = state.current?.sessionId ?? null;
+  if (sid) {
+    // Restore this session's remembered choice; absence defaults to collapsed.
+    if (ranOpenBySession.get(sid)) s.open = true;
+    // Persist every toggle (summary click or programmatic) under this session.
+    s.addEventListener('toggle', () => { ranOpenBySession.set(sid, s.open); });
+  }
   body.append(s);
   return s;
+}
+
+// BUG-308 — the collapsed label's count and status tally are DECLARED facts
+// carried on the stack element (data-ran-total / -running / -failed), NOT
+// recomputed from the paged DOM rows. A recorded stack renders only ~8 of its
+// (e.g. 187) rows, so re-counting `.ran` would shrink "187 agents … · 1 failed"
+// to "9 agents ran in this session" and silently drop the failure the instant a
+// live agent appended to it (ARCH-010: no reader recomputes a fact).
+const RAN_RUNNING_RE = /^(running|active|in[-_ ]?progress|pending)$/i;
+// `killed` / `provider-error` are server outcome kinds (events.ts AgentInfo, outcomes.ts) — a
+// killed agent is a failure the collapsed row must count, never hide.
+const RAN_FAILED_RE = /^(failed|killed|provider[-_ ]?error|error|errored|cut|timeout|timed[-_ ]?out|denied|cancelled|canceled|aborted)$/i;
+function ranStackTally(stack) {
+  return {
+    total: Number(stack.dataset.ranTotal || 0),
+    running: Number(stack.dataset.ranRunning || 0),
+    failed: Number(stack.dataset.ranFailed || 0),
+  };
+}
+function setRanStackTally(stack, { total, running, failed }) {
+  stack.dataset.ranTotal = String(total);
+  stack.dataset.ranRunning = String(running);
+  stack.dataset.ranFailed = String(failed);
+  const text = `${total} agent${total === 1 ? '' : 's'} ran in this session`
+    + (running ? ` · ${running} running` : '')
+    + (failed ? ` · ${failed} failed` : '');
+  const lbl = stack.querySelector('.rlbl-text');
+  if (lbl) lbl.textContent = text;
 }
 
 /**
@@ -7451,9 +7507,16 @@ function ranRow(th, { agentId, agentType, description, status, stats, body }, op
   summary.querySelector('.ty').addEventListener('click', enter);
   ranStack(th).append(det);
   if (!opts.silent) {
+    // BUG-308 — advance the DECLARED tally by this one agent; never recount the
+    // paged DOM rows (that loses the recorded total + failure tally on an
+    // already-paged recorded stack). See ranStackTally / ARCH-010.
     const stack = det.parentElement;
-    const n = stack.querySelectorAll('.ran').length;
-    stack.querySelector('.ran-lbl').textContent = `${n} agent${n === 1 ? '' : 's'} ran in this session`;
+    const t = ranStackTally(stack);
+    t.total += 1;
+    const st = status ?? 'completed';
+    if (RAN_RUNNING_RE.test(st)) t.running += 1;
+    else if (RAN_FAILED_RE.test(st)) t.failed += 1;
+    setRanStackTally(stack, t);
   }
   return det;
 }
@@ -7479,8 +7542,20 @@ async function loadRecordedAgents(th, sessionId) {
   // because the agents you want after an overnight run are the recent ones.
   let shown = 0;
   const stack = ranStack(th);
-  const label = stack.querySelector('.ran-lbl');
   const moreBtn = el('button', { class: 'more' });
+
+  // BUG-308 — the collapsed row carries the count plus any running/failed
+  // totals, so a problem agent is not hidden by the default collapse. Computed
+  // once over the WHOLE list and DECLARED on the stack (ranStackTally), so it
+  // stays authoritative while "more" pages reveal only part of the DOM and a
+  // later live append advances the same declared count instead of recounting
+  // rows. Only EXPLICIT failure/running statuses are tallied: `unknown` is an
+  // indeterminate outcome (the result frame was never recorded), not a failure,
+  // so counting it as "failed" would cry wolf on a healthy session.
+  const statusOf = (a) => a.status ?? 'completed';
+  const running = agents.filter((a) => RAN_RUNNING_RE.test(statusOf(a))).length;
+  const failed = agents.filter((a) => RAN_FAILED_RE.test(statusOf(a))).length;
+  setRanStackTally(stack, { total: agents.length, running, failed });
 
   const renderSlice = (n) => {
     const next = agents.slice(Math.max(0, agents.length - shown - n), agents.length - shown).reverse();
@@ -7507,8 +7582,6 @@ async function loadRecordedAgents(th, sessionId) {
       ranRow(th, { agentId, ...meta, body: fields }, { silent: true });
     }
     shown += next.length;
-    label.textContent = `${agents.length} agent${agents.length === 1 ? '' : 's'} ran in this session`
-      + (shown < agents.length ? ` · newest ${shown}` : '');
     const left = agents.length - shown;
     moreBtn.textContent = `${left} older`;
     moreBtn.hidden = left <= 0;
@@ -20508,6 +20581,12 @@ async function boot() {
     // card and drive the REAL submit()/computeSessState paths against it — the
     // lockout + mislabel — rather than re-deriving the busy-vs-awaiting rule.
     submit, awaitingUserDecision, renderQuestion, settleDecisionFromResult,
+    // BUG-308: the recorded-agent summary builder, the live-append row, and the
+    // DECLARED tally reader, exposed so a verify script can load a real paged
+    // recorded stack and drive a live agent appending into it — asserting the
+    // collapsed label keeps the authoritative total + failure tally (never a
+    // recount of the ~8 paged DOM rows). See ranStackTally / ARCH-010.
+    loadRecordedAgents, ranRow, ranStack, ranStackTally,
   };
 }
 

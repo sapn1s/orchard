@@ -1443,6 +1443,20 @@ button.settings-pill:focus-visible .g { color: var(--ink); }
   font-family: var(--mono); font-size: 10px; color: var(--ink-4);
   letter-spacing: .04em; padding: 7px 2px 6px;
 }
+/* BUG-308 — the stack's own <summary> is the collapsed count row: clickable,
+   with a disclosure triangle that rotates when the agent list is expanded. */
+.ran-stack > summary.ran-lbl {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 7px;
+  transition: color .12s;
+}
+.ran-stack > summary.ran-lbl::-webkit-details-marker { display: none; }
+.ran-stack > summary.ran-lbl::marker { content: ''; }
+.ran-stack > summary.ran-lbl:hover { color: var(--ink-3); }
+.ran-stack > summary .rtw {
+  font-size: 7px; color: var(--ink-4); transition: transform .16s; flex: none;
+}
+.ran-stack[open] > summary .rtw { transform: rotate(90deg); }
 .ran { border-top: 1px solid var(--hair-2); }
 .ran:first-of-type { border-top: 0; }
 .ran > summary {

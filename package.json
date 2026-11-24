@@ -63,6 +63,7 @@
     "verify:reload-live": "node scripts/verify-reload-live.mjs",
     "verify:agent-summary": "node scripts/verify-agent-summary.mjs",
     "verify:agent-summary-bridge": "node scripts/verify-agent-summary-bridge.mjs",
+    "verify:bug-308": "node scripts/verify-bug-308-agent-summary-collapse.mjs",
     "verify:deep-index-agent-summary": "node scripts/verify-deep-index-agent-summary.mjs",
     "verify:reload-live-summary": "node scripts/verify-reload-live-summary.mjs",
     "verify:processes": "node scripts/verify-processes.mjs",

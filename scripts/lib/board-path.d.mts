@@ -4,6 +4,7 @@ export function resolveOrchardDir(hostPath: string): string;
 export function resolveConfigFile(hostPath: string): string;
 export function readOrchardConfig(hostPath: string): Record<string, unknown> | null;
 export function resolveBoardDir(hostPath: string): string;
+export function resolveBoardRoot(cwd?: string, env?: Record<string, string | undefined>): { root: string; via: "env" | "cwd" } | null;
 export function boardLayout(hostPath: string): 'declared' | 'orchard' | 'legacy' | 'none';
 export function resolveLibDir(hostPath: string): string;
 export function resolveConventionsFile(hostPath: string): string;

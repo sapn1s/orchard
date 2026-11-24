@@ -233,3 +233,28 @@ export function resolveStopHookFile(hostPath) {
     'file',
   );
 }
+
+/**
+ * BUG-303 — the ONE board-root resolver for an entry point with no explicit root.
+ * Precedence: `env.ORCHARD_BOARD_TOOL_ROOT` if set, else the nearest ancestor of `cwd`
+ * (cwd included, stopping at the git toplevel) that has a board (`boardLayout !== 'none'`: declared / .orchard/bugs / docs/bugs).
+ * Returns `{ root, via: 'env'|'cwd' }` or `null` when neither names one. NEVER falls back to the
+ * tool's install dir — that silently wrote an unrelated project's tickets onto Orchard's board.
+ * The cwd is read only AFTER the env check, and a removed cwd (process.cwd() throws ENOENT)
+ * names no board, so it returns null instead of throwing.
+ */
+export function resolveBoardRoot(cwd, env = process.env) {
+  if (env.ORCHARD_BOARD_TOOL_ROOT) return { root: path.resolve(env.ORCHARD_BOARD_TOOL_ROOT), via: 'env' };
+  let start = cwd;
+  if (start === undefined) {
+    try { start = process.cwd(); } catch { return null; }
+  }
+  let dir = path.resolve(start);
+  for (;;) {
+    if (boardLayout(dir) !== 'none') return { root: dir, via: 'cwd' };
+    if (fs.existsSync(path.join(dir, '.git'))) return null; // git toplevel without a board: do not climb into an unrelated parent project
+    const up = path.dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+}

@@ -118,7 +118,7 @@ import { warnIfLaneWorkLost } from './lib/lane-snapshot.mjs';
 // FEAT-106 — resolve the board dir (docs/bugs legacy / .orchard/bugs flat) for
 // whatever root the tool is pointed at; ORCHARD_BOARD_TOOL_ROOT semantics are
 // unchanged (it still names the host, the resolver just finds the board under it).
-import { resolveBoardDir } from './lib/board-path.mjs';
+import { resolveBoardDir, resolveBoardRoot } from './lib/board-path.mjs';
 // FEAT-184 — the shared per-ticket write lock (the server's answer/adopt writers take it too).
 import { withTicketLock, READS_AS_USER } from './lib/delegation-source.mjs';
 // BUG-259 — the ONE closed hard-stop list and verdict, shared with the turn-end ask check.
@@ -1631,7 +1631,18 @@ const VERBS = {
  * reason has to be in the value.
  */
 export async function boardTool(argv, opts = {}) {
-  const root = path.resolve(opts.root || process.env.ORCHARD_BOARD_TOOL_ROOT || DEFAULT_ROOT);
+  // BUG-303 — never default to the tool's install dir: explicit root > ORCHARD_BOARD_TOOL_ROOT > the
+  // nearest board above cwd; else refuse (a different project's cwd must not write Orchard's board).
+  let root;
+  if (opts.root) root = path.resolve(opts.root);
+  else {
+    const r = resolveBoardRoot();
+    if (!r) {
+      let cwd; try { cwd = process.cwd(); } catch { cwd = '(the current directory no longer exists)'; }
+      return { ok: false, refusal: { code: 'no-board-root', message: `no board found from cwd ${cwd} (no docs/bugs or .orchard/bugs in it or any parent) and ORCHARD_BOARD_TOOL_ROOT is not set; run from inside the project, or set ORCHARD_BOARD_TOOL_ROOT=<project root>`, detail: [] } };
+    }
+    root = r.root;
+  }
   const { verb, flags, unknown } = parseArgs(argv);
   if (!Object.prototype.hasOwnProperty.call(VERBS, verb)) {
     return {
